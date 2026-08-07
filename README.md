@@ -1,0 +1,156 @@
+# claude-ai-harness
+
+A multi-lens planning and review harness for [Claude Code](https://code.claude.com),
+orchestrated by [dynamic workflows](https://code.claude.com/docs/en/workflows)
+rather than by an agent's chat context.
+
+One agent carrying six concerns does the first two well. This harness splits
+non-trivial planning and review across **single-focus specialist lenses**
+(security and privacy, QA, data integrity, accessibility, design, architecture,
+operability, product, simplicity) that run **in parallel as subagents**, each
+with one job and no licence to drift into another's. A deterministic workflow
+script does the orchestration, so lens reports never flood your conversation's
+context window: only one synthesised report comes back.
+
+The contract between planning and review is the **acceptance criterion**. At
+planning, each lens writes numbered `AC-<LENS>-<n>` criteria into your spec. At
+review, each lens verifies its own criteria against the built change. A review
+finding with no AC behind it is recorded as a spec bug: that list is how the
+harness improves rather than merely runs.
+
+## Why workflows
+
+Agent-orchestrated multi-agent review has a structural problem: every lens
+report lands in the orchestrating conversation's context, and long sessions
+lose the early reports to compaction. A dynamic workflow moves the plan into
+code: the script holds the loop, the fan-out and the intermediate results in
+an isolated background runtime, and the model's context holds only the final
+answer. The orchestration is also rerunnable and diffable, because it is a
+file, not a chat transcript.
+
+## Requirements
+
+- Claude Code **v2.1.154+** with dynamic workflows available (all paid plans;
+  on Pro, enable Dynamic workflows in `/config`).
+- No API key needed: workflows bill against your Claude Code subscription.
+
+## Install
+
+### As a plugin
+
+```
+/plugin marketplace add bassings/claude-ai-harness
+/plugin install claude-ai-harness@claude-ai-harness
+```
+
+Then run the workflows namespaced:
+
+```
+/claude-ai-harness:plan-cycle {"spec": "specs/MY-FEATURE.md"}
+/claude-ai-harness:review-cycle
+```
+
+### Manual copy (per-user, unnamespaced)
+
+```bash
+git clone https://github.com/bassings/claude-ai-harness
+cp claude-ai-harness/agents/*.md ~/.claude/agents/
+cp claude-ai-harness/workflows/*.js ~/.claude/workflows/
+cp claude-ai-harness/AGENT-HARNESS.md ~/.claude/
+```
+
+Then in any project:
+
+```
+/plan-cycle {"spec": "specs/MY-FEATURE.md"}
+/review-cycle
+```
+
+## Usage
+
+**Planning** (once per spec, before implementation):
+
+```
+/plan-cycle {"spec": "specs/MY-FEATURE.md"}
+```
+
+Triggered lenses read the spec and the relevant code in parallel, then a
+synthesis step applies the simplicity veto, merges the surviving criteria and
+writes an `## Acceptance criteria` section into the spec file.
+
+**Review** (per push, before the PR):
+
+```
+/review-cycle
+/review-cycle {"base": "develop", "spec": "specs/MY-FEATURE.md"}
+/review-cycle {"lenses": ["lens-security", "lens-qa"]}
+/review-cycle {"adversarial": true}
+```
+
+The scope step diffs your branch against the base (default branch if omitted)
+and pins the tip SHA. Lenses trigger deterministically from the changed paths,
+review in parallel in **isolated git worktrees** (so mutation experiments are
+safe), and a synthesis step deduplicates findings, arbitrates conflicts by a
+fixed precedence order (irrecoverable data loss, security, accessibility floor,
+operability, product and design intent, performance) and returns one report.
+Ties above the accessibility line are escalated to you, never resolved
+silently.
+
+`adversarial: true` adds `reviewer-verification`: an adversarial fresh-eyes
+pass with no plan context, as a counterweight to lenses that verify only their
+own criteria.
+
+## Per-repo trigger customisation
+
+The review cycle ships generic path globs for deciding which lenses a diff
+triggers. To tune them for a repo, add `.claude/harness-triggers.json` at the
+repo root; any key you supply replaces the default list for that key:
+
+```json
+{
+  "ui": ["src/components/**", "**/*.vue", "e2e/**"],
+  "data": ["migrations/**", "src/db/**"],
+  "architecture": ["package.json", "src/core/**"],
+  "operability": ["Dockerfile", "deploy/**", ".github/workflows/**"]
+}
+```
+
+`lens-security` and `lens-qa` always run at review. `lens-simplicity` always
+runs at planning (and only at planning: its veto is spent before anything is
+built, the only point where cutting scope is free).
+
+## What's in the box
+
+| Path | What |
+|---|---|
+| `AGENT-HARNESS.md` | The contract: lens roster, output format, severity scale, evidence discipline, conflict precedence, exit condition |
+| `agents/lens-*.md` | Nine single-focus lens definitions (read-only tools) |
+| `agents/reviewer-verification.md` | Adversarial correctness pass, no plan context |
+| `agents/reviewer-experience.md` | User-facing text reviewed as the person receiving it |
+| `workflows/plan-cycle.js` | Planning orchestration: scope, parallel lenses, simplicity veto, AC write-back |
+| `workflows/review-cycle.js` | Review orchestration: scope + SHA pin, deterministic triggering, parallel worktree-isolated lenses, synthesis |
+
+## Cost and proportionality
+
+A full review run spawns one subagent per triggered lens plus scope and
+synthesis; on a large diff that is real token spend against your plan limits
+(a 108-file review during development of this harness cost ~1.5M tokens).
+The harness is built to scale down: lenses trigger only when the diff touches
+their surface, `lenses: [...]` restricts a run explicitly, and lens-qa's
+mutation experiments are capped per run. Running everything on everything
+trains people to skim the output, which is worse than not running it.
+
+## Design notes
+
+- Lens agents pin `model: opus` in their frontmatter; scope and synthesis
+  inherit your session model. Edit the frontmatter to change the trade-off.
+- Review lenses run in worktrees because QA's job (break the guard, watch the
+  test fail, restore) mutates files; parallel lenses sharing one tree would
+  corrupt each other's evidence. Planning lenses are pure readers.
+- Every lens must return a coverage statement including what it **could not
+  check**. A lens returning CLEAN because it never looked is the failure this
+  harness exists to prevent; CLEAN itself is a legitimate, expected outcome.
+
+## License
+
+MIT

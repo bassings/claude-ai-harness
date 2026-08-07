@@ -1,0 +1,13 @@
+{
+  "name": "claude-ai-harness",
+  "description": "Marketplace for the claude-ai-harness plugin: multi-lens planning and review for Claude Code via dynamic workflows.",
+  "owner": { "name": "Scott Bassingthwaighte-Hatch" },
+  "plugins": [
+    {
+      "name": "claude-ai-harness",
+      "source": "./",
+      "description": "Multi-lens planning and review harness: single-focus specialist lenses run in parallel via dynamic workflows, with acceptance criteria as the contract between planning and review.",
+      "license": "MIT"
+    }
+  ]
+}
