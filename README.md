@@ -119,6 +119,40 @@ repo root; any key you supply replaces the default list for that key:
 runs at planning (and only at planning: its veto is spent before anything is
 built, the only point where cutting scope is free).
 
+## Loop conducting: long plans that cannot stall
+
+Executing a multi-PR plan across CI waits has a failure mode the harness
+alone does not fix: the orchestrating agent ends a turn "waiting for CI",
+nothing ever re-invokes it, and hours are lost before anyone notices. The
+conductor pieces make that state unrepresentable:
+
+- **The invariant**: a conductor turn may end only (a) done, (b) blocked on a
+  human decision with the plan marked so, or (c) holding an armed wake
+  source: a background task (`gh pr checks <n> --watch`), a Monitor, or a
+  ScheduledWakeup.
+- **`skills/conduct-plan`** encodes each turn as one controller tick:
+  reconcile the plan file against reality (`gh`, git, CI), act on every
+  unblocked task (fanning out where independent), re-arm watches, log, stop.
+  Run it under `/loop /conduct-plan <plan-file>` so a heartbeat guarantees
+  liveness even if a watch dies.
+- **`hooks/plan-guard-stop.py`** is a Stop hook that enforces the invariant
+  mechanically: while `<repo>/.claude/active-plan` points at a plan with
+  open tasks, a stop with no wake source armed that turn is blocked with
+  instructions. It never fires outside conducted plans, never double-blocks
+  (`stop_hook_active`), and allows `status: blocked-on-human`.
+
+Installing as a plugin wires the hook automatically. For manual installs,
+copy the hook and add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "python3",
+      "args": ["~/.claude/hooks/plan-guard-stop.py"], "timeout": 10 }] }]
+  }
+}
+```
+
 ## What's in the box
 
 | Path | What |
@@ -129,6 +163,8 @@ built, the only point where cutting scope is free).
 | `agents/reviewer-experience.md` | User-facing text reviewed as the person receiving it |
 | `workflows/plan-cycle.js` | Planning orchestration: scope, parallel lenses, simplicity veto, AC write-back |
 | `workflows/review-cycle.js` | Review orchestration: scope + SHA pin, deterministic triggering, parallel worktree-isolated lenses, synthesis |
+| `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling |
+| `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
 
 ## Cost and proportionality
 
