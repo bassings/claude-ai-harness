@@ -100,6 +100,22 @@ silently.
 pass with no plan context, as a counterweight to lenses that verify only their
 own criteria.
 
+**Building** (one scoped change, TDD enforced by control flow):
+
+```
+/tdd-task {"task": "reject a settings save whose path escapes the soft chroot", "suite_command": "make verify-fast"}
+```
+
+Four phases: a test-writer writes only the failing test; an independent
+verifier runs it and must confirm it fails **for the right reason** (the
+missing behaviour, not a typo or import error) — the implementation phase is
+literally unreachable in the script until then; the implementer writes the
+minimum code with the test files frozen; a final verifier confirms the pass,
+runs the broader suite, and compares test-file hashes against RED time, so a
+test edited into passing voids the run instead of shipping. Three failed
+attempts at either gate stops the workflow with "the frame is wrong" rather
+than trying a fourth.
+
 ## Per-repo trigger customisation
 
 The review cycle ships generic path globs for deciding which lenses a diff
@@ -163,6 +179,7 @@ copy the hook and add to `~/.claude/settings.json`:
 | `agents/reviewer-experience.md` | User-facing text reviewed as the person receiving it |
 | `workflows/plan-cycle.js` | Planning orchestration: scope, parallel lenses, simplicity veto, AC write-back |
 | `workflows/review-cycle.js` | Review orchestration: scope + SHA pin, deterministic triggering, parallel worktree-isolated lenses, synthesis |
+| `workflows/tdd-task.js` | Script-enforced TDD for one scoped change: implement is unreachable until RED is verified for the right reason; commit refused if tests changed between RED and GREEN |
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
 
