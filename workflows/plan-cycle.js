@@ -53,7 +53,13 @@ if (scope.ui) lenses.push('lens-design', 'lens-accessibility')
 if (scope.data) lenses.push('lens-data')
 if (scope.architecture) lenses.push('lens-architecture')
 if (scope.operability) lenses.push('lens-operability')
-if (Array.isArray(opts.lenses) && opts.lenses.length) lenses = opts.lenses.slice()
+// An override ADDS to the mandatory roster, it does not replace it. At
+// planning the always-on set includes lens-simplicity, which holds the veto:
+// the only counterweight to specialists adding requirements none remove.
+const MANDATORY = ['lens-security', 'lens-qa', 'lens-simplicity']
+if (Array.isArray(opts.lenses) && opts.lenses.length) {
+  lenses = [...new Set([...MANDATORY, ...opts.lenses])]
+}
 
 const ALL = ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product', 'lens-design', 'lens-accessibility', 'lens-data', 'lens-architecture', 'lens-operability']
 const skipped = ALL.filter(l => !lenses.includes(l))

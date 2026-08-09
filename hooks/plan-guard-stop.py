@@ -19,6 +19,7 @@ import sys
 WAKE_MARKERS = (
     '"name":"ScheduleWakeup"', '"name": "ScheduleWakeup"',
     '"name":"Monitor"', '"name": "Monitor"',
+    '"name":"Workflow"', '"name": "Workflow"',  # a launched workflow re-invokes on completion
     '"run_in_background":true', '"run_in_background": true',
     '"subagent_type"',  # a spawned agent re-invokes on completion
 )

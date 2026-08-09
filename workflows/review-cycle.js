@@ -67,12 +67,13 @@ if (!scope || !scope.files.length) return { report: 'No changes found between th
 const base = scope.base
 const rules = Object.assign({}, DEFAULT_RULES, scope.custom_rules || {})
 const paths = scope.files.map(f => f.path)
-const addedOrModified = scope.files.filter(f => f.status !== 'D').map(f => f.path)
 
 // ---- deterministic lens triggering (AGENT-HARNESS.md roster) ----
 let lenses = ['lens-security', 'lens-qa'] // always on at review
 const uiHit = matches(paths, rules.ui)
-const dataHit = matches(addedOrModified, rules.data)
+// Deletions included deliberately: removing a schema, adapter or migration is
+// at least as destructive as modifying one.
+const dataHit = matches(paths, rules.data)
 const archHit = matches(paths, rules.architecture)
 const opsHit = matches(paths, rules.operability)
 const specHit = matches(paths, ['specs/**'])
@@ -81,9 +82,16 @@ if (uiHit.length) lenses.push('lens-design', 'lens-accessibility')
 if (dataHit.length) lenses.push('lens-data')
 if (archHit.length || scope.new_modules || scope.new_dependency_entries) lenses.push('lens-architecture')
 if (opsHit.length) lenses.push('lens-operability')
-if (specHit.length || uiHit.length) lenses.push('lens-product')
+// specPath too: a caller can supply an existing, unchanged spec for a
+// user-facing backend change that touches neither a spec file nor a UI glob.
+if (specHit.length || uiHit.length || specPath) lenses.push('lens-product')
 
-if (Array.isArray(opts.lenses) && opts.lenses.length) lenses = opts.lenses.slice()
+// An override ADDS to the mandatory roster, it does not replace it: the
+// always-on lenses cannot be silently dropped by {lenses: [...]}.
+const MANDATORY = ['lens-security', 'lens-qa']
+if (Array.isArray(opts.lenses) && opts.lenses.length) {
+  lenses = [...new Set([...MANDATORY, ...opts.lenses])]
+}
 if (opts.adversarial) lenses.push('reviewer-verification')
 
 const ALL = ['lens-security', 'lens-qa', 'lens-design', 'lens-accessibility', 'lens-data', 'lens-architecture', 'lens-operability', 'lens-product']
@@ -127,8 +135,8 @@ const lensPrompt = (lens) =>
   (lens === 'lens-qa' ? qaBudget : '') +
   `You are in an isolated git worktree: mutation experiments (break the guard, watch the test fail, restore) are safe here. ` +
   `The worktree will not contain uncommitted tooling from the main checkout (virtualenvs, node_modules); if you need the ` +
-  `project's interpreter or test runner, invoke the main checkout's copy by absolute path, and never modify anything ` +
-  `under the main checkout.\n\n` +
+  `project's interpreter or test runner, invoke the main checkout's copy by absolute path (locate the main checkout ` +
+  `with \`cd "$(git rev-parse --git-common-dir)/.." && pwd\`), and never modify anything under the main checkout.\n\n` +
   `Your final structured output maps the AGENT-HARNESS.md output contract onto the schema fields: verdict, coverage ` +
   `(could_not_check is mandatory and must be honest, not "nothing"), ac_verdicts, findings (each with file:line in location). ` +
   `You are licensed to return CLEAN with empty findings.`
