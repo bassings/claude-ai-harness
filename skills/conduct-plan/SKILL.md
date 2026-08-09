@@ -30,8 +30,11 @@ task, a Monitor, or a ScheduleWakeup.
    States: `queued → building → pr-open #N → awaiting-ci #N → in-review #N →
    merged` (tick the box only at merged). `(needs: ...)` declares ordering;
    everything unblocked MAY run in parallel.
-2. Write the plan file's path into `<repo>/.claude/active-plan`. This arms
-   the Stop hook.
+2. Write the plan file's path into `<repo>/.claude/active-plan` (with a
+   trailing newline). This arms the Stop hook. The hook stamps the conducting
+   session into that file automatically on your first properly-armed stop
+   (`conductor: <session id>`); from then on it enforces the invariant against
+   the conducting session only, and other sessions in the repo stop freely.
 3. If not already running under /loop, recommend it once:
    `/loop /conduct-plan <plan-path>` (dynamic pacing), then proceed with the
    first tick anyway.
