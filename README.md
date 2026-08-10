@@ -55,7 +55,9 @@ Then run the workflows namespaced:
 ```bash
 git clone https://github.com/bassings/claude-ai-harness
 cp claude-ai-harness/agents/*.md ~/.claude/agents/
-cp claude-ai-harness/workflows/*.js ~/.claude/workflows/
+cp -r claude-ai-harness/workflows/. ~/.claude/workflows/
+cp -r claude-ai-harness/skills/. ~/.claude/skills/
+cp -r claude-ai-harness/hooks/. ~/.claude/hooks/
 cp claude-ai-harness/AGENT-HARNESS.md ~/.claude/
 ```
 
@@ -169,6 +171,74 @@ copy the hook and add to `~/.claude/settings.json`:
 }
 ```
 
+## Run ledger
+
+Every `tdd-task`, `review-cycle` and `plan-cycle` run -- conducted or
+invoked directly, there is no way to opt a single run out -- appends two
+JSON lines to `.claude/harness-ledger.jsonl` **inside the repo the workflow
+ran against** (the main checkout root, never a worktree): a `started` record
+before any work begins and a terminal record after, sharing a `run_id`, so a
+run killed mid-flight is recorded as incomplete rather than simply absent.
+`conduct-plan`'s task-level wait/PR events add one line each. The file is
+created and ignored automatically on first write, via `.git/info/exclude`
+rather than your tracked `.gitignore` (so writing the ledger never shows up
+as a diff on a file you own); it is never staged, committed or pushed by
+any code in this repo, and if you want it committed as a deliberate
+opt-in, remove that line from `.git/info/exclude` yourself.
+
+Each line records: which workflow ran and its outcome, which lenses ran/were
+skipped and their verdicts, findings as `{id, lens, severity, ac_id,
+disposition}` only (never the lens's evidence text or the markdown report),
+round/spec identity, attempt counts, and `budget.spent()` if available. See
+`workflows/lib/ledger-append.mjs`'s `LEDGER_ENTRY_SCHEMA` for the exact,
+exhaustive field list (the workflow scripts themselves cannot host this: the
+runtime statically rejects any `import` before execution, so the schema,
+validation and the write itself live in this one real-Node script instead,
+invoked via Bash from each workflow's final step).
+
+**Retention**: kept indefinitely as an ordinary untracked file; nothing in
+this repo prunes or rotates it. Because the ledger is gitignored, `git clean
+-xdf` deletes it too -- `-x` explicitly targets ignored files by design, and
+this is a routine cleanup command, not an edge case. To keep the ledger
+through a `git clean -xdf`, exclude the path yourself (`git clean -xdf -e
+.claude/harness-ledger.jsonl`) or move it outside the working tree before
+cleaning. **Delete it** with `rm .claude/harness-ledger.jsonl`
+-- the next workflow run recreates it automatically, since there is no way to
+opt a single run out (see above), and no setting to turn ledger writes off.
+**Export**: it already is one — the file itself is newline-delimited JSON,
+readable with any JSONL tool. If a line is ever deliberately committed (the
+opt-in above), it survives in git history like any other tracked change.
+
+**Arbitration (AC-DATA-4 vs. AC-SEC-1)**: AC-DATA-4 (the ledger survives a
+routine `git clean -xdf`) and AC-SEC-1 (the ledger is gitignored) are
+mutually unsatisfiable for a single in-tree, ignored path -- `-x` removes
+ignored files by definition, so a path that satisfies AC-SEC-1 cannot also
+satisfy AC-DATA-4. Resolved in favour of AC-SEC-1: an accidentally
+committed ledger (the risk an ungitignored path invites) is a live,
+standing exposure, while a `git clean`-lost ledger is user-initiated,
+telemetry-only, and fully preventable by the exclusion above. This is a
+deliberate, accepted trade-off, not an oversight: AC-DATA-4's git-clean-
+survival clause is an accepted FAIL for this path.
+
+## Tests
+
+This repo's own tests need only Node (no `npm install`, no dependency
+manifest):
+
+```bash
+node --test test/*.test.js
+```
+
+(`node --test` with no args also picks up `test/helpers/` and `test/fixtures/`
+as if they were test files, since Node's default discovery matches every
+`.js` file under a directory named `test`; the explicit glob avoids that.)
+
+`test/helpers/fake-runtime.js` loads a workflow script from disk and runs it
+against stubbed `agent`, `parallel`, `pipeline`, `phase`, `log`, `args` and
+`budget`, recording every agent call, so the three instrumented workflows are
+tested by driving them to completion with scripted responses rather than by
+invoking real subagents.
+
 ## What's in the box
 
 | Path | What |
@@ -180,8 +250,10 @@ copy the hook and add to `~/.claude/settings.json`:
 | `workflows/plan-cycle.js` | Planning orchestration: scope, parallel lenses, simplicity veto, AC write-back |
 | `workflows/review-cycle.js` | Review orchestration: scope + SHA pin, deterministic triggering, parallel worktree-isolated lenses, synthesis |
 | `workflows/tdd-task.js` | Script-enforced TDD for one scoped change: implement is unreachable until RED is verified for the right reason; commit refused if tests changed between RED and GREEN |
-| `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling |
+| `workflows/lib/ledger-append.mjs` | Real-Node script (invoked via Bash, never imported: workflow scripts cannot import) owning the ledger envelope schema, path resolution, `.git/info/exclude` ignore-ensure and the atomic single-line append; invoked by all three workflows above |
+| `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
+| `test/` | This repo's own test suite (`node --test test/*.test.js`); see "Tests" above |
 
 ## Cost and proportionality
 
