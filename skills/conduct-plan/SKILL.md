@@ -68,23 +68,29 @@ task, a Monitor, or a ScheduleWakeup.
    payload's JSON to its stdin) with a payload of `{kind:
    "conduct_plan_event", outcome: "started", event:
    "<ci_wait_started|ci_wait_ended|human_wait_started|human_wait_ended|
-   pr_raised|pr_merged>", event_key: "<plan file>:<task id>:<event>:<occurrence>"}`.
+   pr_raised|pr_merged>", event_scope: "<plan file>:<task id>:<event>"}`.
    `<plan file>` must be repo-relative (e.g. `specs/optimise-cycle.md`), never
    an absolute path: the ledger writer redacts an absolute path it finds
-   embedded in event_key, and a redacted-away path can collide across two
-   different plans, which a repo-relative one never does.
-   `event_key` is required for this kind: the script refuses a
-   conduct_plan_event line without one. `<occurrence>` exists because a task
-   can genuinely pass through the same event twice (a task that waits on CI,
-   gets findings, pushes a fix, and waits on CI again produces two real
-   `ci_wait_started`/`ci_wait_ended` pairs) -- count how many existing lines
-   in the ledger already have an `event_key` starting with `<plan
-   file>:<task id>:<event>:` and use that count + 1. The script itself is
-   idempotent by construction (a re-tick appending an `event_key` that
-   already exists in the ledger is a no-op, reported back as
-   `duplicate: true`, never a second line), so this tick does not need to
-   grep the ledger first to decide whether to skip the append -- only to
-   compute the next occurrence number for a genuinely new one.
+   embedded in the resulting event_key, and a redacted-away path can collide
+   across two different plans, which a repo-relative one never does.
+   `event_scope` (never a pre-built `event_key`) is required for this kind:
+   the script refuses a conduct_plan_event line without one. The script
+   itself computes the occurrence number and mints `event_key` as
+   `<event_scope>:<occurrence>` -- it does not trust the caller's own count.
+   A task can genuinely pass through the same event twice (a task that waits
+   on CI, gets findings, pushes a fix, and waits on CI again produces two
+   real `ci_wait_started`/`ci_wait_ended` pairs); the script counts existing
+   lines whose `event_key` starts with `<event_scope>:` and mints the next
+   occurrence itself (M2: a conducting agent's own count, in prose, silently
+   read a genuinely new event as a duplicate on a miscount -- the script
+   already reads this exact file for its dedup check, so it counts here
+   instead of trusting a supplied number). The script's response includes
+   the minted `event_key`; log or display it from there, never recompute it.
+   The write is idempotent by construction (a re-tick that ends up minting
+   an `event_key` that already exists -- only possible if the ledger already
+   holds more matching lines than this tick expects -- is a no-op, reported
+   back as `duplicate: true`, never a second line), so this tick does not
+   need to grep the ledger first to decide whether to skip the append.
 4. **Re-arm before stopping.** Every external wait needs a live watcher.
    If nothing external is in flight but tasks remain, act on them now rather
    than stopping. Under /loop, always ScheduleWakeup: match the delay to the

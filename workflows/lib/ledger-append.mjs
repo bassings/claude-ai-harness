@@ -502,6 +502,38 @@ export function main() {
   } catch (e) {
     return result(run_id, ts, false, 'could not resolve the main checkout via git rev-parse: ' + stripRoot(e.message, root))
   }
+  const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
+
+  // M2: the occurrence discriminator inside a conduct_plan_event's event_key
+  // ("<plan file>:<task id>:<event>:<occurrence>") used to be computed by
+  // the conducting AGENT, in prose, by counting matching lines itself
+  // before calling this script -- an uncounted or mis-counted occurrence
+  // silently reads as a benign duplicate (the dedup check below matches on
+  // the whole key), so a genuinely new event vanishes with a success
+  // response and no way to detect it after the fact. The script already
+  // reads this exact file for that same dedup check, so it mints the key
+  // itself instead of trusting the caller's count: a caller supplies
+  // event_scope ("<plan file>:<task id>:<event>", no occurrence), and this
+  // counts existing event_key values starting with "<event_scope>:" to
+  // mint occurrence = count + 1, returned in the result so the caller can
+  // log or display it, never re-derived by the caller itself.
+  if (payload.kind === 'conduct_plan_event' && typeof payload.event_scope === 'string' && payload.event_scope) {
+    const prefix = payload.event_scope + ':'
+    let count = 0
+    if (fs.existsSync(ledgerPath)) {
+      const existing = fs.readFileSync(ledgerPath, 'utf8')
+      for (const existingLine of existing.split('\n')) {
+        if (!existingLine.trim()) continue
+        try {
+          const parsed = JSON.parse(existingLine)
+          if (typeof parsed.event_key === 'string' && parsed.event_key.startsWith(prefix)) count += 1
+        } catch (e) {
+          // a truncated/corrupt line is not a match; never let it crash the count
+        }
+      }
+    }
+    payload.event_key = `${payload.event_scope}:${count + 1}`
+  }
 
   // Relativise every recorded path against the repo root BEFORE truncation
   // (H2, AC-SEC-3): an absolute path under the root becomes repo-relative,
@@ -544,7 +576,11 @@ export function main() {
   const specBugs = computeFindings(payload.spec_bugs, 'spec_bug')
   const rejected = computeFindings(payload.rejected_findings, 'rejected')
   const open = computeFindings(payload.open_findings, 'open')
-  const { spec_bugs, rejected_findings, open_findings, ...restPayload } = payload
+  // event_scope is consumed above to mint event_key (M2) and must never
+  // itself reach the schema-validated entry: it is not a declared field, and
+  // additionalProperties:false would reject the whole write if it leaked
+  // through here.
+  const { spec_bugs, rejected_findings, open_findings, event_scope, ...restPayload } = payload
   const allFindings = [...specBugs.entries, ...rejected.entries, ...open.entries]
   // M2: bound the findings array at MAX_FINDINGS rather than letting an
   // unusually finding-heavy run (a 7-lens envelope, or H5's open_findings
@@ -643,7 +679,6 @@ export function main() {
 
   try {
     ensureGitignored(root)
-    const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
     fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
 
     // M3: a conduct_plan_event replay (the conducting agent re-ticking and
@@ -686,7 +721,9 @@ export function main() {
     return result(run_id, ts, false, 'append failed: ' + stripRoot(e.message, root))
   }
 
-  return result(run_id, ts, true, null)
+  // M2: the caller passed event_scope, not the full key -- return the
+  // minted key so the caller can log/display it, never re-derive it itself.
+  return entry.event_key ? { ...result(run_id, ts, true, null), event_key: entry.event_key } : result(run_id, ts, true, null)
 }
 
 // Only run as a CLI when invoked directly (`node ledger-append.mjs`), never

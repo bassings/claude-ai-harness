@@ -947,3 +947,49 @@ test('ledger-append: two DIFFERENT event_key values (a genuine second occurrence
   assert.equal(lines.length, 2)
   assert.notEqual(lines[0].event_key, lines[1].event_key)
 })
+
+// M2: the occurrence discriminator inside event_key used to be computed by
+// the CONDUCTING AGENT, in prose, before ever calling this script -- an
+// uncounted or mis-counted occurrence silently reads as a benign duplicate
+// (the dedup check matches on the whole key), so a genuinely new event
+// vanishes with a success response. The script already reads this exact
+// file for the dedup check, so it counts and mints the key itself: the
+// caller supplies event_scope ("<plan file>:<task id>:<event>", no
+// occurrence number at all) and trusts nothing else.
+test('ledger-append: given event_scope (no occurrence number), the script mints occurrence 1 for the first event of its kind (M2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_scope: 'specs/plan.md:T1:ci_wait_started' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(out.event_key, 'specs/plan.md:T1:ci_wait_started:1', 'the minted key must be returned to the caller, not re-derived by it')
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.event_key, 'specs/plan.md:T1:ci_wait_started:1')
+})
+
+test('ledger-append: given the SAME event_scope on a second real call, the script mints occurrence 2, not a duplicate of occurrence 1 (M2)', () => {
+  const repo = makeTempRepo()
+  const scope = 'specs/plan.md:T1:ci_wait_started'
+  const first = JSON.parse(runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_scope: scope }).stdout.trim().split('\n').pop())
+  const second = JSON.parse(runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_scope: scope }).stdout.trim().split('\n').pop())
+  assert.equal(first.event_key, `${scope}:1`)
+  assert.equal(second.event_key, `${scope}:2`, 'a genuinely new event at the same scope must mint the NEXT occurrence, never read as a duplicate of the first')
+  assert.equal(second.duplicate, undefined, 'this must not be reported as a duplicate replay')
+  const lines = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.equal(lines.length, 2, 'both events must actually be written -- the exact loss M2 describes if occurrence counting is wrong')
+})
+
+test('ledger-append: event_scope with a DIFFERENT task id or event name mints its own occurrence 1, independent of an unrelated scope\'s count (M2)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_scope: 'specs/plan.md:T1:ci_wait_started' })
+  runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_scope: 'specs/plan.md:T1:ci_wait_started' })
+  const res = runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'human_wait_started', event_scope: 'specs/plan.md:T1:human_wait_started' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.event_key, 'specs/plan.md:T1:human_wait_started:1', 'a different event name is a different scope, unaffected by another scope\'s count')
+})
+
+test('ledger-append: event_scope is never itself written to the ledger line -- only the minted event_key is (M2)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_scope: 'specs/plan.md:T1:ci_wait_started' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(!('event_scope' in entry), 'event_scope is not a declared schema field and must not leak into the written line')
+})
