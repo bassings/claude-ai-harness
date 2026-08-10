@@ -1,3 +1,5 @@
+import { writeLedgerEntry, safeBudgetSpent } from './lib/ledger.mjs'
+
 export const meta = {
   name: 'tdd-task',
   description: 'Script-enforced TDD for one scoped change: implementation is unreachable until the failing test is verified RED for the right reason, and GREEN is proven against unmodified tests',
@@ -20,10 +22,20 @@ const specNote = opts.spec ? `The governing spec is ${opts.spec}; the task shoul
 const hintNote = opts.test_hint ? `Test location/runner hint: ${opts.test_hint}.` : ''
 const MAX_ATTEMPTS = 3
 
+// Attempt counters live outside run(): they are ledger telemetry only, never
+// part of the existing, publicly-documented return shape (AC-ARCH-10).
+const rounds = { test_attempts: 0, implement_attempts: 0 }
+
+// The entire pre-existing workflow body, unchanged in behaviour, is wrapped
+// in run() so every one of its terminating returns funnels through exactly
+// ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
+async function run() {
+
 // ---- Phase 1 + 2: write the test, verify RED; loop until genuinely red ----
 let test = null
 let red = null
 for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  rounds.test_attempts = attempt
   phase('Test')
   test = await agent(
     `TDD, step one only. Task: ${opts.task}\n${specNote} ${hintNote}\n` +
@@ -87,6 +99,7 @@ log(`RED confirmed: ${test.test_files.join(', ')} fail for the right reason.`)
 let impl = null
 let green = null
 for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  rounds.implement_attempts = attempt
   phase('Implement')
   impl = await agent(
     `TDD, step two. Task: ${opts.task}\n${specNote}\n` +
@@ -163,3 +176,17 @@ return {
   implementation: impl.summary,
   commit: commit,
 }
+
+} // end run()
+
+const OUTCOME_BY_VERDICT = { DONE: 'done', BLOCKED: 'blocked', ABORTED: 'aborted' }
+
+const result = await run()
+const telemetry = {
+  outcome: OUTCOME_BY_VERDICT[result.verdict] || 'aborted',
+  spec: opts.spec || null,
+  budget_spent: safeBudgetSpent(budget),
+  rounds: { test_attempts: rounds.test_attempts, implement_attempts: rounds.implement_attempts },
+}
+await writeLedgerEntry({ agent, log }, { kind: 'tdd_task', task: opts.task, ...telemetry })
+return { ...result, telemetry }
