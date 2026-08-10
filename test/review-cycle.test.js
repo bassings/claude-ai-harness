@@ -185,6 +185,54 @@ test('review-cycle.js: two fixtures differing only in whether ANY lens has files
   assert.equal(somethingInScope.result.telemetry.trigger_counts['lens-data'], 1)
 })
 
+// M5 (AC-QA-14 guard gap): the three tests above for lens-data and
+// lens-product each use a SINGLE-file diff, where the matched count and the
+// total changed-file count are numerically identical -- a mutation reading
+// `paths.length` (the total) instead of the correct matched-subset count
+// survives unnoticed (measured: `= paths.length` for lens-data and
+// lens-product left the suite green). lens-operability had no trigger_counts
+// test at all (measured: `= 999` left it green). Every fixture below is a
+// MULTI-file diff where the matched subset is strictly smaller than the
+// total, so a wrong count (paths.length, or any other value) is
+// distinguishable from the correct one.
+test('review-cycle.js: lens-operability\'s trigger_counts reflects only the files that matched its glob, not the total changed-file count (M5, AC-QA-14)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'Dockerfile', status: 'M' }, { path: 'src/unrelated1.js', status: 'M' }, { path: 'src/unrelated2.js', status: 'M' }] },
+      'lens-operability': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-operability'), 'sanity: lens-operability must actually be triggered here')
+  assert.equal(result.telemetry.trigger_counts['lens-operability'], 1, 'exactly one of the three changed files (Dockerfile) matched the operability glob')
+})
+
+test('review-cycle.js: lens-data\'s trigger_counts reflects only the files that matched its glob, not the total changed-file count (M5, AC-QA-14, non-vacuous multi-file fixture)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'migrations/001.sql', status: 'A' }, { path: 'src/unrelated1.js', status: 'M' }, { path: 'src/unrelated2.js', status: 'M' }] },
+      'lens-data': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-data'), 'sanity: lens-data must actually be triggered here')
+  assert.equal(result.telemetry.trigger_counts['lens-data'], 1, 'exactly one of the three changed files (migrations/001.sql) matched the data glob')
+})
+
+test('review-cycle.js: lens-product\'s trigger_counts reflects only the files that actually triggered it, not the total changed-file count (M5, AC-QA-14, non-vacuous multi-file fixture)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/foo.css', status: 'M' }, { path: 'src/unrelated1.js', status: 'M' }, { path: 'src/unrelated2.js', status: 'M' }] },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-product'), 'sanity: lens-product must actually be triggered by the ui surface here')
+  assert.equal(result.telemetry.trigger_counts['lens-product'], 1, 'exactly one of the three changed files (foo.css) is in the ui surface')
+})
+
 test('review-cycle.js: synthesis missing spec_bugs/rejected_findings fields is treated as a failed step, not a ledger line with silently empty arrays (AC-QA-13)', async () => {
   const { result } = await runWorkflow(WF, {
     args: {},
