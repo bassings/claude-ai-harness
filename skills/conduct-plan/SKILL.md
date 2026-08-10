@@ -59,6 +59,18 @@ task, a Monitor, or a ScheduleWakeup.
      tick the box. If merging needs the user, mark blocked-on-human.
 3. **Log the tick**: append one line to `## Conductor log`: what changed,
    what is armed, what the next wake expects to find.
+   Also log task-level state transitions to the run ledger, so wall-clock can
+   later be decomposed into agent compute vs CI wait vs human wait: at each
+   `pr-open`→`awaiting-ci` transition and its resolution, and at each
+   `blocked-on-human` entry/exit, PR raised and PR merged, run
+   `workflows/lib/ledger-append.mjs` (found the same way as any harness file:
+   this repo, `~/.claude/workflows/lib/`, or an installed plugin) with a
+   payload of `{kind: "conduct_plan_event", outcome: "started", event:
+   "<ci_wait_started|ci_wait_ended|human_wait_started|human_wait_ended|
+   pr_raised|pr_merged>", event_key: "<plan file>:<task id>:<event>"}`.
+   Before appending, check whether that `event_key` already appears in the
+   ledger (e.g. `grep -F` it); if it does, this tick is re-recording an
+   already-logged event and must skip the append, not double-count it.
 4. **Re-arm before stopping.** Every external wait needs a live watcher.
    If nothing external is in flight but tasks remain, act on them now rather
    than stopping. Under /loop, always ScheduleWakeup: match the delay to the
