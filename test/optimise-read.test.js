@@ -294,11 +294,19 @@ test('optimise-read: aggregateCi sets truncated:true when the returned run count
 test('optimise-read: citationPool is deduplicated, most-recent-first, capped at the stated size, and contains only real run_ids present in the window', () => {
   const records = []
   for (let i = 0; i < 60; i++) records.push({ run_id: `run-${i}` })
-  records.push({ run_id: 'run-0' }) // a duplicate re-appended later must not appear twice, and its position counts as the most-recent occurrence
+  // 20 MORE duplicate occurrences of 'run-59' appended after the original
+  // 60, landing well inside the scan window (size 50): without dedup, these
+  // alone would fill 20+ of the 50 pool slots with the same id, so the
+  // "no duplicates" assertion below is genuinely discriminating -- a single
+  // trailing duplicate (the original version of this fixture) coincidentally
+  // never got revisited within the scan window and let a broken dedup check
+  // pass silently (a real, self-caught vacuous mutant; see
+  // docs/pr2-mutation-proofs.md).
+  for (let i = 0; i < 20; i++) records.push({ run_id: 'run-59' })
   const pool = mod.citationPool(records, 50)
   assert.equal(pool.length, 50)
   assert.equal(new Set(pool).size, 50, 'no duplicates')
-  assert.equal(pool[0], 'run-0', 'the most recent occurrence of a run_id wins position, even if it also appeared earlier')
+  assert.equal(pool[0], 'run-59', 'the most recent occurrence of a run_id wins position, even if it also appeared earlier')
   for (const id of pool) assert.ok(records.some((r) => r.run_id === id), `${id} must be a real run_id present in the window`)
 })
 
