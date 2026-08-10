@@ -10,12 +10,11 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
-const { makeTempRepo, cleanupTempRepos, APPEND_SCRIPT } = require('./helpers/temp-repo.js')
+const { makeTempRepo, cleanupTempRepos, APPEND_SCRIPT, SUITE_TMPDIR } = require('./helpers/temp-repo.js')
 
 test.after(cleanupTempRepos)
 
@@ -72,8 +71,18 @@ function runReviewCycleAndGetTerminalPrompt(hostileClaim) {
   })
 }
 
+// Round 3 item 4: these marker files previously lived directly in the
+// shared os.tmpdir(), the same class of leak M4 fixed for temp-repo.js's
+// repos, and cleanup only ran via fs.rmSync calls reached on the happy
+// path -- if an assertion above them threw (exactly what happens when the
+// injection genuinely succeeds, the very case this file exists to guard
+// against), the rmSync line was never reached and the marker leaked.
+// Reusing temp-repo.js's SUITE_TMPDIR (isolated root, removed
+// unconditionally on process exit) closes it the same way M4 did, without
+// duplicating a second isolated-root mechanism in this file.
 test('shell-injection: a hostile claim containing a shell metacharacter breakout does NOT execute when the prompt\'s own example command is run verbatim (H1)', async () => {
-  const marker = path.join(os.tmpdir(), 'PWNED_LEDGER_' + process.pid + '_' + Date.now())
+  const marker = path.join(SUITE_TMPDIR, 'PWNED_LEDGER_' + process.pid + '_' + Date.now())
+  assert.equal(path.dirname(marker), SUITE_TMPDIR, 'the marker must live under the isolated suite root, not the bare shared TMPDIR (round 3 item 4)')
   fs.rmSync(marker, { force: true })
   const claim = HOSTILE_CLAIM.replace('$MARKER', marker)
   const prompt = await runReviewCycleAndGetTerminalPrompt(claim)
@@ -91,7 +100,7 @@ test('shell-injection: a hostile claim containing a shell metacharacter breakout
 })
 
 test('shell-injection: the same hostile claim still lands intact as DATA in the ledger line once piped through the fixed example command (H1: safety, not silent data loss)', async () => {
-  const marker = path.join(os.tmpdir(), 'PWNED_LEDGER_' + process.pid + '_' + Date.now() + '_b')
+  const marker = path.join(SUITE_TMPDIR, 'PWNED_LEDGER_' + process.pid + '_' + Date.now() + '_b')
   const claim = HOSTILE_CLAIM.replace('$MARKER', marker)
   const prompt = await runReviewCycleAndGetTerminalPrompt(claim)
   const command = buildCommandAsACompliantAgentWould(prompt).replace(/\$MARKER/g, marker)

@@ -1,7 +1,10 @@
 // Shared helper for tests that need a real, throwaway git repo to run
 // workflows/lib/ledger-append.mjs against. Used by test/ledger-append.test.js
 // and test/ledger-seam.test.js (>=2 call sites, so a shared module rather
-// than duplicated per file).
+// than duplicated per file). SUITE_TMPDIR (round 3, item 4) is also reused
+// directly by test/shell-injection.test.js for its PWNED_LEDGER marker
+// files -- same class of leak (M4), same isolated-root-plus-exit-hook fix,
+// so it reuses this module's existing mechanism rather than duplicating it.
 //
 // M4: every directory created via makeTempRepo() used to sit directly in the
 // developer's shared TMPDIR, and cleanup only ran via test.after
@@ -91,4 +94,4 @@ function cleanupTempRepos() {
   }
 }
 
-module.exports = { APPEND_SCRIPT, LEDGER_REL, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos }
+module.exports = { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos }
