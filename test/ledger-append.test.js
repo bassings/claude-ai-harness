@@ -457,3 +457,45 @@ test('ledger-append: open, spec_bug and rejected findings all coexist in the sam
   assert.equal(byDisposition.open.claim === undefined, true, 'claim text itself must never reach the ledger (AC-SEC-2), only id/lens/severity/disposition')
   assert.ok(byDisposition.open && byDisposition.spec_bug && byDisposition.rejected)
 })
+
+test('ledger-append: a finding\'s "lens" field is constrained to the roster pattern, so routing a secret through it is rejected rather than written verbatim (M6)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec_bugs: [{ lens: 'secret sk-live-CANARY-9999 seen at ... process.env.API_KEY', location: 'x', claim: 'y' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a lens field that is not a real roster identifier must be rejected, not written')
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
+test('ledger-append: a finding\'s "ac_id" field is constrained to the AC-<LENS>-<n> pattern, so a quoted source line routed through it is rejected rather than written verbatim (M6)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec_bugs: [{ lens: 'lens-qa', location: 'x', claim: 'y', ac_id: 'AC-X-1 quoted source: const key = 0xdeadbeef' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'an ac_id field that is not a real AC-<LENS>-<n> identifier must be rejected, not written')
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
+test('ledger-append: a genuine lens name and a genuine AC id both pass through normally (M6, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec_bugs: [{ lens: 'lens-security', location: 'x', claim: 'y', ac_id: 'AC-SEC-1' }],
+    rejected_findings: [{ lens: 'reviewer-verification', location: 'x', claim: 'y' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings.find((f) => f.disposition === 'spec_bug').ac_id, 'AC-SEC-1')
+  assert.equal(entry.findings.find((f) => f.disposition === 'rejected').lens, 'reviewer-verification')
+})

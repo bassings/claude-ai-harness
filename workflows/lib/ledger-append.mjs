@@ -95,9 +95,15 @@ export const LEDGER_ENTRY_SCHEMA = {
         required: ['id', 'lens', 'severity', 'disposition'],
         properties: {
           id: { type: 'string' },
-          lens: { type: 'string' },
+          // M6: the evidence-exclusion guarantee ("lens evidence and
+          // location strings are never written") was enforced by field
+          // name only -- `lens` and `ac_id` were bare strings, so a secret
+          // or a quoted source line routed through either field wrote
+          // verbatim. additionalProperties:false on `evidence` itself
+          // cannot catch this: it is a different route into the same line.
+          lens: { type: 'string', pattern: '^(lens|reviewer)-[a-z]+$' },
           severity: { type: 'string', enum: SEVERITIES },
-          ac_id: { type: ['string', 'null'] },
+          ac_id: { type: ['string', 'null'], pattern: '^AC-[A-Z]+-[0-9]+$' },
           disposition: { type: 'string', enum: DISPOSITIONS },
         },
       },
@@ -162,6 +168,9 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
     const value = entry[key]
     if (propSchema.enum && value !== null && value !== undefined && !propSchema.enum.includes(value)) {
       errors.push(`${pathPrefix}${key}: "${value}" is not one of ${JSON.stringify(propSchema.enum)}`)
+    }
+    if (propSchema.pattern && value !== null && value !== undefined && !new RegExp(propSchema.pattern).test(value)) {
+      errors.push(`${pathPrefix}${key}: "${value}" does not match ${propSchema.pattern}`)
     }
     if (propSchema.type === 'array' && propSchema.items && Array.isArray(value)) {
       const itemsSchema = propSchema.items
