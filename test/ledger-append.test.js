@@ -236,25 +236,151 @@ test('ledger-append: findings_truncated is absent/null when no finding arrays we
   assert.ok(entry.findings_truncated === null || entry.findings_truncated === undefined)
 })
 
-test('ledger-append: when the record still cannot fit even after truncating text and bounding findings, it degrades to a minimal valid record instead of dropping the whole line (M2)', () => {
+// H3 round 2: at the OLD 2048-byte cap, a realistic review round (roughly
+// 10-12 findings across a full lens roster) degraded to a ~221-byte
+// envelope-only record -- the ledger kept LEAST data for the BUSIEST
+// rounds, discarding lenses_run, verdicts, trigger_counts and every
+// finding while still reporting write_ok:true. This PR's own round-1
+// review (21 findings) would have recorded nothing. The fix: raise the cap
+// to 16 KB, and when a record still does not fit, degrade PROGRESSIVELY --
+// drop findings one at a time (recording the growing count in
+// findings_truncated) while keeping every other field intact -- rather
+// than collapsing straight to the minimal envelope.
+//
+// Per the explicit lesson repeated in this round's brief (a fixture shaped
+// to sit away from the real threshold passes green while the guard is
+// vacuous -- exactly what the PREVIOUS version of this test did, at the
+// old 2048-byte cap, and would have kept doing at the new 16384-byte cap
+// had its size not been rescaled to match): every fixture below is sized
+// to demonstrably cross the boundary it exercises, verified by a direct
+// byte-length assertion rather than assumed from its shape.
+
+function triggerCountsOfSize(n) {
+  return Object.fromEntries(Array.from({ length: n }, (_, i) => [`lens-fake-${i}`, i]))
+}
+function verdictsOfSize(n) {
+  const opts = ['CLEAN', 'FINDINGS', 'BLOCKED']
+  return Object.fromEntries(Array.from({ length: n }, (_, i) => [`lens-fake-${i}`, opts[i % 3]]))
+}
+
+test('ledger-append: a realistic 6-lens round with ~20 findings (H3\'s measured shape) keeps lens-level telemetry -- lenses_run, verdicts, trigger_counts, spec, round_key, budget_spent -- fully intact, past the point the OLD cap would have discarded everything (H3 round 2)', () => {
   const repo = makeTempRepo()
-  // Even 20 bounded findings at full-length ids/lens/severity/disposition
-  // plus a large verdicts/trigger_counts object can still be built to
-  // exceed the cap; construct a payload designed to do exactly that.
-  const many = Array.from({ length: 100 }, (_, i) => ({ lens: 'lens-security', location: `f${i}.js:1`, claim: `finding number ${i} with some extra descriptive text to pad it out` }))
-  const verdicts = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`lens-fake-${i}`, 'FINDINGS']))
-  // trigger_counts values are declared integers (H2 round 2): reusing
-  // `verdicts` here (string values) would now be rejected by validateEntry's
-  // type check rather than degraded, which is a different code path than
-  // this test means to exercise -- a same-shaped, correctly-typed object.
-  const triggerCounts = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`lens-fake-${i}`, i]))
+  const lenses = ['lens-security', 'lens-qa', 'lens-architecture', 'lens-product', 'lens-data', 'lens-operability']
+  const many = Array.from({ length: 20 }, (_, i) => ({
+    lens: lenses[i % lenses.length],
+    location: `src/file${i}.js:${i + 1}`,
+    claim: `finding number ${i}: a realistic-length claim describing a real defect found in review`,
+    severity: ['Critical', 'High', 'Medium', 'Low'][i % 4],
+  }))
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec: 'specs/optimise-cycle.md',
+    round_key: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+    lenses_run: lenses,
+    lenses_skipped: [],
+    trigger_counts: triggerCountsOfSize(lenses.length),
+    verdicts: verdictsOfSize(lenses.length),
+    budget_spent: 4.5,
+    open_findings: many,
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  const bytes = Buffer.byteLength(line, 'utf8')
+  // The non-vacuous check: this exact fixture must genuinely exceed the OLD
+  // cap (otherwise this test would prove nothing about the OLD bug), and
+  // must fit under the NEW one.
+  assert.ok(bytes > 2048, `fixture must exceed the OLD 2048-byte cap to prove anything about the fix; was only ${bytes} bytes`)
+  assert.ok(bytes <= 16384, `fixture must fit under the NEW cap: was ${bytes} bytes`)
+  const entry = JSON.parse(line)
+  assert.ok(!entry.degraded, 'must not have collapsed to the minimal envelope')
+  assert.deepEqual(entry.lenses_run, lenses)
+  assert.deepEqual(entry.lenses_skipped, [])
+  assert.equal(Object.keys(entry.trigger_counts).length, lenses.length)
+  assert.equal(Object.keys(entry.verdicts).length, lenses.length)
+  assert.equal(entry.spec, 'specs/optimise-cycle.md')
+  assert.equal(entry.round_key, 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2')
+  assert.equal(entry.budget_spent, 4.5)
+  assert.ok(entry.findings.length > 0, 'at least some findings must survive at a realistic size')
+})
+
+test('ledger-append: when trigger_counts/verdicts alone are large enough to leave little headroom, findings are dropped ONE AT A TIME (findings_truncated growing beyond the ordinary MAX_FINDINGS bound) to rescue the write, rather than collapsing the whole record to the minimal envelope (H3 round 2, progressive degrade)', () => {
+  const repo = makeTempRepo()
+  // Calibrated locally (no subprocess) against the real entry shape closely
+  // enough to land the envelope-without-findings just under MAX_LINE_BYTES,
+  // so that adding MAX_FINDINGS-bounded findings tips it over and forces a
+  // genuine progressive drop -- not a fixture merely "shaped to look big".
+  function approxEnvelopeBytes(n) {
+    const approx = {
+      schema_version: 1,
+      run_id: 'x'.repeat(36),
+      ts: new Date().toISOString(),
+      repo: 'ledger-append-test-approx',
+      kind: 'review_cycle',
+      outcome: 'done',
+      spec: null,
+      task: null,
+      round_key: null,
+      lenses_run: [],
+      lenses_skipped: [],
+      trigger_counts: triggerCountsOfSize(n),
+      verdicts: verdictsOfSize(n),
+      spec_bug_count: null,
+      rejected_finding_count: null,
+      findings_truncated: 0,
+      write_ok: true,
+      write_error: null,
+    }
+    return Buffer.byteLength(JSON.stringify(approx), 'utf8')
+  }
+  let n = 100
+  // MAX_FINDINGS-bounded findings add up to roughly 15 * 110 =~ 1650 bytes;
+  // aiming the findings-free envelope at 14500-16000 leaves headroom for
+  // findings to push it over 16384 while staying rescuable by dropping only
+  // some (not all) of them.
+  for (let i = 0; i < 40 && (approxEnvelopeBytes(n) < 14500 || approxEnvelopeBytes(n) > 16000); i++) {
+    const bytes = approxEnvelopeBytes(n)
+    n = bytes < 14500 ? Math.ceil(n * 1.25) : Math.floor(n * 0.9)
+  }
+  const calibrated = approxEnvelopeBytes(n)
+  assert.ok(calibrated >= 14000 && calibrated <= 16384, `calibration failed to converge near the cap: n=${n}, ${calibrated} bytes`)
+
+  const many = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-security', location: `f${i}.js:1`, claim: `finding ${i}` }))
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
     open_findings: many,
-    verdicts,
-    trigger_counts: triggerCounts,
+    trigger_counts: triggerCountsOfSize(n),
+    verdicts: verdictsOfSize(n),
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assert.ok(Buffer.byteLength(line, 'utf8') <= 16384, `written line must still fit: ${Buffer.byteLength(line, 'utf8')} bytes`)
+  const entry = JSON.parse(line)
+  assert.ok(!entry.degraded, 'trigger_counts/verdicts fit comfortably alone -- this must be rescued by dropping findings, not by collapsing to the minimal envelope')
+  assert.equal(Object.keys(entry.trigger_counts).length, n, 'trigger_counts must survive fully intact, not itself truncated')
+  assert.equal(Object.keys(entry.verdicts).length, n, 'verdicts must survive fully intact, not itself truncated')
+  assert.ok(entry.findings.length < 15, `findings must be dropped below the ordinary MAX_FINDINGS bound of 15 to make room: kept ${entry.findings.length}`)
+  assert.ok(entry.findings_truncated > 20 - 15, `findings_truncated must exceed the ordinary MAX_FINDINGS-only truncation (5 for 20 submitted): got ${entry.findings_truncated}`)
+})
+
+test('ledger-append: a payload so large that even dropping every finding cannot rescue it (trigger_counts/verdicts alone hugely exceed the cap) still degrades to the minimal valid record as a last resort, rather than failing the write (H3 round 2, last-resort collapse)', () => {
+  const repo = makeTempRepo()
+  const many = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-security', location: `f${i}.js:1`, claim: `finding ${i}` }))
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: many,
+    // Deliberately hugely oversized (2000 entries each): comfortably over
+    // 16384 bytes even with every finding dropped, so this exercises the
+    // genuine last-resort path, not the progressive one.
+    trigger_counts: triggerCountsOfSize(2000),
+    verdicts: verdictsOfSize(2000),
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, `expected a degraded record to still be written: ${out.write_error}`)
@@ -265,7 +391,7 @@ test('ledger-append: when the record still cannot fit even after truncating text
   assert.equal(entry.kind, 'review_cycle')
   assert.equal(entry.outcome, 'done')
   assert.ok(entry.run_id && entry.ts && entry.repo)
-  assert.ok(Buffer.byteLength(lines[0], 'utf8') <= 2048)
+  assert.ok(Buffer.byteLength(lines[0], 'utf8') <= 16384)
 })
 
 test('ledger-append: an ordinary well-formed record is NOT marked degraded (M2, not vacuous)', () => {
@@ -644,9 +770,9 @@ test('ledger-append module: findings schema entries only carry lens, severity, a
   assert.equal(LEDGER_ENTRY_SCHEMA.properties.findings.items.additionalProperties, false)
 })
 
-test('ledger-append module: MAX_LINE_BYTES is a small fixed bound suitable for a single atomic write()', async () => {
+test('ledger-append module: MAX_LINE_BYTES is 16 KB (H3 round 2: 2048 made a realistic review round degrade to a ~221-byte envelope, discarding everything)', async () => {
   const { MAX_LINE_BYTES } = await import(APPEND_MODULE_URL)
-  assert.ok(MAX_LINE_BYTES > 0 && MAX_LINE_BYTES <= 4096)
+  assert.equal(MAX_LINE_BYTES, 16384)
 })
 
 test('ledger-append: computes an "open" disposition for open_findings, alongside spec_bug/rejected (H5)', () => {

@@ -47,11 +47,23 @@ export const SCHEMA_VERSION = 1
 // --git-common-dir` below (AC-DATA-1, AC-SEC-5).
 export const LEDGER_RELATIVE_PATH = '.claude/harness-ledger.jsonl'
 
-// A single ledger line is written with one write() call (AC-DATA-3). This
-// bounds the line so that append stays within the POSIX guarantee that a
-// write() smaller than PIPE_BUF to an O_APPEND file descriptor is atomic;
-// free-text fields are truncated to fit before the line is ever built.
-export const MAX_LINE_BYTES = 2048
+// A single ledger line is written with one write() call (AC-DATA-3), which
+// keeps a concurrent append from interleaving with this one regardless of
+// size (not because of PIPE_BUF, which governs pipe writes specifically,
+// not an O_APPEND write to a regular file -- the real guarantee is simply
+// that one write() syscall's bytes land contiguously). Free-text fields are
+// truncated to fit before the line is ever built.
+//
+// H3 round 2: this was 2048, and a realistic review round (roughly 10-12
+// findings across a full lens roster) measured at ~2300-2500 bytes once
+// bounded -- already over the old cap, so the record degraded to a
+// ~221-byte envelope-only line, discarding lenses_run, verdicts,
+// trigger_counts and every finding while still reporting write_ok:true.
+// The ledger kept least data for the busiest rounds. 16 KB leaves ample
+// headroom for a realistic round (see the fixture in
+// test/ledger-append.test.js measuring the real shape) while still being a
+// generous, not unbounded, ceiling on a single write().
+export const MAX_LINE_BYTES = 16384
 
 // M2: a stated bound on the findings array, so a run with an unusually
 // large number of findings (a 7-lens envelope, or open_findings covering
@@ -545,11 +557,35 @@ export function main() {
   }
 
   let line = JSON.stringify(entry)
+
+  // H3 round 2: the record used to jump straight from "fits" to "collapsed
+  // to the bare envelope" the moment it exceeded MAX_LINE_BYTES, discarding
+  // lenses_run, verdicts, trigger_counts and every finding together even
+  // though findings are, by a wide margin, the least valuable data to lose
+  // first (a lens's verdict and trigger count survive as one entry each; a
+  // finding is many). Drop findings ONE AT A TIME instead, recording the
+  // growing count in findings_truncated, before ever touching anything
+  // else -- lenses_run, lenses_skipped, verdicts, trigger_counts, spec,
+  // round_key and budget_spent all survive this loop untouched. Bounded by
+  // Array.isArray(entry.findings): a kind with no findings concept at all
+  // must not gain an empty findings array as a side effect of this loop.
+  if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES && Array.isArray(entry.findings)) {
+    const baseTruncated = entry.findings_truncated || 0
+    let dropped = 0
+    while (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES && entry.findings.length > 0) {
+      entry.findings = entry.findings.slice(0, -1)
+      dropped += 1
+      entry.findings_truncated = baseTruncated + dropped
+      line = JSON.stringify(entry)
+    }
+  }
+
   if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
-    // M2: even after byte-truncating free text and bounding findings to
-    // MAX_FINDINGS, the record can still be too large (many verdict/
-    // trigger_counts keys, for instance). Degrade to the minimal valid
-    // record -- envelope plus outcome plus a degraded flag -- rather than
+    // Every finding has already been dropped (or there were none to drop)
+    // and the record still does not fit -- some other field (an unusually
+    // large trigger_counts/verdicts object, most plausibly) is the actual
+    // cause. Degrade to the minimal valid record -- envelope plus outcome
+    // plus a degraded flag -- as the genuine last resort, rather than
     // writing nothing: a run with an unusually large amount of data is
     // exactly the run whose trace matters most downstream, not the one
     // that should vanish from the ledger entirely.
