@@ -3,13 +3,17 @@
 Per AC-QA-3 and standard §11: for the guards below, the guarded behaviour was
 actually broken (edited in the working file, not "mentally mutated"), the
 suite was run, the exact failing test and message recorded, and the file was
-then restored and the suite re-run green. Thirty-five proofs were executed
-across two passes: 17 in the initial build (11 in the first pass, 6 more --
-5 re-verifications plus one new guard -- in the "Rework" section, after a
-coordinator probe found workflow scripts cannot import anything in
-production), and 18 more (proofs 18-35) in the "Review remediation round 1"
-section, fixing every finding from a full multi-lens review (1 Critical,
-5 High, 9 Medium, 6 Low -- 21 findings, all fixed, none rejected).
+then restored and the suite re-run green. Sixty-seven proofs have been
+executed across three passes: 17 in the initial build (11 in the first pass,
+6 more -- 5 re-verifications plus one new guard -- in the "Rework" section,
+after a coordinator probe found workflow scripts cannot import anything in
+production), 18 more (proofs 18-35) in the "Review remediation round 1"
+section (1 Critical, 5 High, 9 Medium, 6 Low -- 21 findings, all fixed, none
+rejected), and 32 more (proofs 36-67) in the "Review remediation round 2"
+section (0 Critical, 4 High, 6 Medium, 12 Low -- 22 findings; 20 fixed, one
+deferred to PR 2 with reasoning recorded (L11), one triaged as a docs-only
+addition with a mechanical guard rather than a mutation-proved code guard
+(L9, this section itself)).
 
 **Proofs 1, 6 and 7 below reference `workflows/lib/ledger.mjs`, which no
 longer exists**: that was accurate at the time each proof was first run, and
@@ -450,16 +454,261 @@ intended, committed change), and the full suite re-run green after each
 revert -- 128/128 as of the last commit in this round, stable across
 repeated runs including from a fresh clean clone.
 
+## Review remediation round 2 (proofs 36-67)
+
+A second full multi-lens review (0 Critical, 4 High, 6 Medium, 12 Low --
+22 findings) found guard-vacuity holes in the round-1 fixes themselves,
+most pointedly H3 (the round-1 M2 findings-bounding test was itself sized
+away from the real 2048-byte threshold, so it never actually proved a
+realistic review round survives) and H2 (round-1's redaction fix covered
+`spec`/`task` by field name, missing the conduct_plan_event route
+entirely). Every mutation below was applied to the working file (never
+"mentally"), backed up first via `cp` to a scratch path -- never `git
+checkout --`, per the lesson recorded at the end of the "Rework" section
+above -- restored the same way, and the affected test file(s) re-run green
+after every revert. Full detail and reasoning is in each fix's own commit
+message; this section is the proof ledger's continuation.
+
+**36. H1 -- ledger-append.mjs resolution order.** `tdd-task.js`'s
+`ledgerWritePrompt` step-1 text reverted to the pre-fix repo-local-first
+order. Caught independently by three of the ten new
+`test/ledger-write-resolution.test.js` assertions (the exact vulnerable
+order) AND by the pre-existing L5 static byte-identity check. Reverted.
+
+**37-40. H2 -- four sub-fixes, four separate mutations.** (a) The
+`TRUNCATABLE_FIELDS`-loop redaction reverted to the round-1 shape
+(`spec`/`task` only): caught by exactly the 3 new tests naming the
+newly-covered fields (event_key, round_key, lenses_run/skipped). (b) The
+base `type` check in `validateEntry` disabled: caught by exactly the
+scalar-type unit test (`task: 42`). (c) The dict-value check
+(`trigger_counts`/`verdicts`/`rounds` inner values) disabled: caught by
+exactly the hostile-payload integration test and its module-level unit
+test. (d) The origin-remote host-form gate disabled (`if (true ||
+REMOTE_HOST_RE.test(url))`): caught by exactly the local-path-origin test.
+All four reverted; 145/145 green.
+
+**41-42. H3 -- the cap and the progressive-drop loop, separately.** The
+progressive-drop loop disabled (`if (false && ...)`): caught by exactly
+the calibrated progressive-degrade test. `MAX_LINE_BYTES` reverted to
+2048: caught by exactly the three tests measuring against the cap (the
+realistic-round test, the progressive-degrade calibration, and the
+module-level pinned-value test). Both reverted; full suite run three times
+(147/147 each) to rule out flakiness in the calibration loop.
+
+**43-45. H4 -- schema, aggregation and lens-schema, three separate
+mutations.** `ac_verdicts`' `additionalProperties: false` loosened to
+`true`: caught by exactly the schema-shape and evidence-rejection tests.
+The `acVerdicts` aggregation in `review-cycle.js` disabled (`acVerdicts =
+[]`): caught by exactly the aggregation test. `ac_id` removed from
+`REVIEW_SCHEMA`'s findings items: caught by exactly the
+schema-declaration test (reading the real schema off a captured lens
+call, not a hand-typed copy). All three reverted; 154/154 green.
+
+**46-47. M1 -- outcome=aborted, both workflows.** `review-cycle.js`'s and
+`plan-cycle.js`'s outcome logic each reverted to the pre-fix shape
+(computed purely from lens verdicts). Both new "synthesis fails/returns
+empty" tests, in each file, failed for the right reason before reverting.
+158/158 green after.
+
+**48. M2 -- event_scope occurrence minting.** The minting block gated
+behind `if (false && ...)`. Caught by exactly the four new
+event_scope-specific tests. Reverted; 162/162 green.
+
+**49-51. M3 -- start-write-first, one mutation per workflow.** Swapped
+the start-write/`run()` call order in `tdd-task.js`, `review-cycle.js` and
+`plan-cycle.js` in turn. Each swap was caught by exactly the one new test
+in that file asserting `calls[0].opts.label === 'ledger:write'`; the
+other 16+ tests in each suite stayed green, confirming the assertion is
+what detects the regression, not an incidental side effect. All three
+reverted; 165/165 green.
+
+**52. M4 -- unconditional exit-hook cleanup.** The `process.on('exit',
+...)` handler in `test/helpers/temp-repo.js` disabled. Caught by exactly
+the real-child-process test (the only way to actually exercise an `exit`
+handler firing). Leftover directory from the mutation removed by hand
+before reverting. Full suite run three times (168/168 each) with zero
+leftover directories in TMPDIR after each run.
+
+**53-55. M5 -- three per-lens trigger counts, three separate
+mutations.** `triggerCounts['lens-operability'] = 999`: caught by exactly
+the new lens-operability test. `triggerCounts['lens-data'] =
+paths.length`: caught by exactly the new lens-data test. Same for
+`lens-product`. All three fixtures are multi-file diffs where the matched
+subset is strictly smaller than the total, closing the exact vacuity the
+finding named (a single-file fixture cannot distinguish "matched count"
+from "total count"). All three reverted; 171/171 green.
+
+**56. M6 -- synthesis schema's required list.** `required: ['report',
+'spec_bugs', 'rejected_findings']` reduced to `['report']`. Caught by
+exactly the new schema-reading test (deep-equalling `synthesisCall.opts
+.schema.required`). Reverted; 172/172 green.
+
+**57. L1 -- check-ignore verification.** The `git check-ignore -q`
+refusal after `ensureGitignored` removed. Caught by exactly the new
+negation-pattern `.gitignore` test. Reverted; 173/173 green.
+
+**58. L2 -- submodule detection.** `resolveMainCheckoutRoot`'s
+`--show-superproject-working-tree` check removed. Caught by exactly the
+real-submodule-fixture test (`git submodule add` against a second
+`makeTempRepo()`). This test's first draft was itself a near-miss: it
+initially asserted `write_ok:false` and a bogus path that turned out to
+be the WRONG bogus path (guessed `.git/modules/subrepo/...`; the real one,
+found by inspecting the actual directory tree created on disk, was
+`.git/modules/.git/info/exclude`) -- the first draft passed against the
+UNFIXED code because the round-2 L1 fix (check-ignore) incidentally also
+produced `write_ok:false` here, for an unrelated reason (`git check-ignore`
+itself failing against the bogus root). Tightened to require the
+write_error name "submodule" specifically before it failed for the right
+reason. Reverted; 174/174 green.
+
+**59. L3 -- AGENT-HARNESS.md's two added sentences.** Removed. Caught by
+exactly the new static test. The test's own first version was also a
+near-miss: `/git history/i` failed against the CORRECT prose because
+markdown hard-wrapping split "git" and "history" across a line break;
+fixed to `/git\s+history/i`. Reverted; 175/175 green.
+
+**60. L4 -- outcome's conditional-required rule.** The three
+`requiredWhen` rules (`tdd_task`/`review_cycle`/`plan_cycle`) removed,
+`outcome` restored to the unconditional `required` list. Caught by
+exactly the two tests exercising the conduct_plan_event-with-no-outcome
+path. Reverted; 178/178 green.
+
+**61-63. L5 -- the exact top-level key set, three workflows.** `raw`
+returned directly instead of destructuring out `__outcome` in
+`review-cycle.js` and `plan-cycle.js` (each caught by exactly the new
+test in that file); an extra key (`debug_leak: true`) added to
+`tdd-task.js`'s DONE-path return (caught by exactly its new test). All
+three reverted; 181/181 green.
+
+**64. L7 -- telemetry.rounds counter swap.** `{test_attempts:
+rounds.implement_attempts, implement_attempts: rounds.test_attempts}`.
+Caught by exactly the two asymmetric-count tests; the DONE-path test
+(both counters equal 1) could not and did not catch it, confirming why
+the asymmetric fixtures were necessary. Reverted; 183/183 green.
+
+**65-66. L10 -- findingId's location argument and its normalisation,
+separately.** `location` dropped from the hash entirely: caught by
+exactly the location-varies test. `trim()`/`toLowerCase()` removed:
+caught by exactly the normalisation test. Both reverted; 186/186 green.
+
+**67. L12 -- README's added clause.** The recreates-automatically/no-off-
+switch clause next to the "Delete it" instruction removed. Caught by
+exactly the new static test. Reverted; 187/187 green.
+
+**L6 (dead code deletion) and L8 (unwritable-directory coverage) carry no
+mutation number**: L6 deleted `truncate()` and the unused `makeAgentStub`
+export rather than guarding new behaviour, verified instead by the full
+suite staying green (180/180, exactly one fewer test than before -- the
+deleted `truncate` unit test, nothing else) after the deletion, confirming
+nothing else depended on either removed path. L8 added coverage for an
+EXISTING guard (the `try`/`catch` around the append, already mutation-proven
+in round 1 as proof #7/#15) at a new failure site (EACCES rather than
+EISDIR); its own non-vacuity was confirmed by direct reproduction outside
+the suite (see its commit message) rather than a fresh mutation of a
+guard the test itself introduces. **L9** is this section plus the AC
+traceability table below, not a mutation-proved code guard: see its own
+subsection. **L11** was triaged as deferred to PR 2, with the reasoning
+recorded in its commit; no PR 1 code exists to prove.
+
+Every mutation above was confirmed applied (via the failing test's message
+matching the intended defect, not just "some test failed"), confirmed
+reverted (via `git diff --stat` on the touched file showing only the
+intended, committed change, and via snapshot `cp` rather than `git
+checkout --` throughout), and the full suite re-run green after each
+revert -- 187/187 as of the last commit in this round.
+
+## AC-to-test traceability (L9, AC-QA-3)
+
+AC-QA-3 requires each acceptance criterion to name its proving test. No
+central table existed; this one is derived mechanically (grep across
+`test/*.test.js` test names for `AC-[A-Z]+-[0-9]+`, not hand-curated), so
+it stays checkable rather than becoming another doc that quietly drifts
+from the code. Regenerate it with:
+
+```bash
+node -e '
+const fs = require("fs"), path = require("path");
+const acToTests = {};
+const re = /AC-[A-Z]+-[0-9]+/g;
+for (const f of fs.readdirSync("test").filter(f => f.endsWith(".test.js"))) {
+  const src = fs.readFileSync(path.join("test", f), "utf8");
+  const testRe = /\btest(?:\.\w+)?\(\s*(`[^`]*`|"(?:[^"\\]|\\.)*"|\x27(?:[^\x27\\]|\\.)*\x27)/g;
+  let m;
+  while ((m = testRe.exec(src))) {
+    for (const ac of new Set((m[1].slice(1, -1).match(re)) || [])) {
+      (acToTests[ac] ||= new Set()).add(f);
+    }
+  }
+}
+for (const k of Object.keys(acToTests).sort()) console.log(k, [...acToTests[k]].join(","));
+'
+```
+
+| AC | Test file(s) (tag present in test name) | Notes |
+|---|---|---|
+| AC-SEC-1 | ledger-append.test.js | Proof 9, 57 |
+| AC-SEC-2 | ledger-append.test.js | Proof 12; findings/ac_verdicts exclusion |
+| AC-SEC-3 | ledger-append.test.js, static-checks.test.js | Proof 10, 37-40, 58 |
+| AC-SEC-4 | static-checks.test.js | Proof 59 |
+| AC-SEC-5 | ledger-append.test.js | Proof 3, 58 |
+| AC-SEC-6 | ledger-append.test.js | Proof 2, 19 |
+| AC-SEC-7..10 | **no test, PR 2** | Optimiser scope, absent by design |
+| AC-QA-1 | **no test tag** -- proven by `test/fake-runtime.test.js`'s static-rejection tests (`runWorkflow rejects a script containing...`), cited in `fake-runtime.js`'s own header comment | Untagged coverage, not a gap |
+| AC-QA-2 | **no test tag** -- proven by `test/fake-runtime.test.js`'s schema-validation tests (`a scripted agent response missing a required field is rejected...`) | Untagged coverage, not a gap |
+| AC-QA-3 | this table + `docs/pr1-mutation-proofs.md` itself | Was the round-1 and round-2 FAIL (L9); closed by this table |
+| AC-QA-6 | ledger-append.test.js | |
+| AC-QA-7 | ledger-append.test.js, plan-cycle.test.js, review-cycle.test.js, tdd-task.test.js | Proof 7, 15; L8 adds the unwritable-directory variant |
+| AC-QA-9 | ledger-append.test.js, static-checks.test.js | Proof 34-35, 48 |
+| AC-QA-10 | **no test tag** -- proven by `ledger-append.test.js`'s `ts is real ISO-8601 UTC with milliseconds...` and `two successive writes have non-decreasing timestamps` (both M5) | Untagged coverage, not a gap |
+| AC-QA-11 | ledger-append.test.js, review-cycle.test.js | Proof 65-66 |
+| AC-QA-12 | review-cycle.test.js | |
+| AC-QA-13 | ledger-append.test.js, review-cycle.test.js | Proof 8, 13, 56 |
+| AC-QA-14 | review-cycle.test.js | Proof 53-55 |
+| AC-QA-15 | plan-cycle.test.js, review-cycle.test.js, tdd-task.test.js | Proof 6, 14 |
+| AC-QA-16, 17, 19, 20, 21, 25 | **no test, PR 2** | |
+| AC-QA-23 | tdd-task.test.js | Proof 5 |
+| AC-ARCH-3 | plan-cycle.test.js, review-cycle.test.js, tdd-task.test.js | Proof 4, 46-47 |
+| AC-ARCH-5 | static-checks.test.js | Single-definition-site check |
+| AC-ARCH-8 | static-checks.test.js | Scope-boundary only |
+| AC-ARCH-9 | static-checks.test.js | No hardcoded absolute paths |
+| AC-ARCH-10 | plan-cycle.test.js, review-cycle.test.js, tdd-task.test.js | Proof 61-63 |
+| AC-ARCH-13, 14 | **no test, PR 2** | |
+| AC-DATA-1 | ledger-append.test.js | Worktree resolution |
+| AC-DATA-2 | ledger-append.test.js | Append-only, no rewrite |
+| AC-DATA-3 | ledger-append.test.js | Concurrent writers, atomic write |
+| AC-DATA-4 | ledger-append.test.js | Checkout survival (checkout half only) |
+| AC-DATA-5 | ledger-append.test.js, tdd-task.test.js | Proof 11, 16; start/terminal pairing |
+| AC-DATA-7 | tdd-task.test.js | **Also proven, untagged, by H4's new ac_verdicts/ac_id tests in review-cycle.test.js and ledger-append.test.js** (proof 43-45) -- the round-2 effective FAIL this round's H4 closed |
+| AC-OPS-3 | ledger-append.test.js | null-vs-zero distinguishability |
+| AC-PROD-4, 5, 7 | **no test, PR 2** | |
+| AC-PROD-9 | static-checks.test.js | Proof 67 (L12); H3/L12 accuracy gaps closed |
+| AC-PROD-10 | static-checks.test.js | Scope-boundary only (no optimiser reference in this PR); substantive criteria are PR 2 |
+| AC-SIMP-1, 2, 4, 7, 12 | ledger-append.test.js, static-checks.test.js | Mechanical, checked directly against the diff per harness convention, not by a lens |
+| AC-SIMP-10, 11 | **not testable, PR 2** | |
+
+Rows with no `AC-` tag in any test name (AC-QA-1, AC-QA-2, AC-QA-10) are
+genuinely covered -- untagged, not un-tested -- as the notes column states;
+the fix is optional future tidiness (adding the tag string), not a
+coverage gap. Rows marked "no test, PR 2" name real, currently-absent
+coverage for criteria this PR does not implement, not a hidden gap in what
+it does implement.
+
 ## Caveat
 
-Thirty-five proofs across two passes cover the guards judged highest-risk
-(data integrity, injection safety, the single-write-path invariant, the
-RED/GREEN control-flow invariant, null-vs-zero telemetry correctness, and
-every finding from the full multi-lens review) rather than every assertion
-in the suite. Two genuine findings are left in this document rather than
-quietly fixed and forgotten, because a surviving mutant that gets patched
-without a record is exactly the kind of near-miss this process exists to
-catch: mutation #5 (the original RED-gate two-condition gap) and the M2
-byte-truncation test's own first version (documented under proofs 31-33
-above), which was itself a surviving mutant against a single-field fixture
-before being strengthened to a genuinely discriminating two-field one.
+Sixty-seven proofs across three passes cover the guards judged
+highest-risk (data integrity, injection safety, the single-write-path
+invariant, the RED/GREEN control-flow invariant, null-vs-zero telemetry
+correctness, and every finding from two full multi-lens reviews) rather
+than every assertion in the suite. Genuine findings are left in this
+document rather than quietly fixed and forgotten, because a surviving
+mutant that gets patched without a record is exactly the kind of
+near-miss this process exists to catch: mutation #5 (the original RED-gate
+two-condition gap), the M2 byte-truncation test's own first version
+(documented under proofs 31-33), which was itself a surviving mutant
+against a single-field fixture before being strengthened to a genuinely
+discriminating two-field one, and -- from round 2 -- the L2 submodule test
+and L3 static-doc test near-misses documented under proofs 58 and 59
+above, both caught and fixed before being trusted, both by the same
+mechanism: reading the actual evidence (a real bogus directory tree on
+disk; the raw file with its line wrap intact) rather than assuming the
+fixture or the regex was correct.
