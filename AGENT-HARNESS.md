@@ -23,7 +23,9 @@ run, conducted or invoked directly, appends two lines to
 `.claude/harness-ledger.jsonl` (untracked; see
 `workflows/lib/ledger-append.mjs`), recording spec bugs, rejected findings
 and rounds to clean as structured data: that ledger is how the harness
-improves rather than merely runs. Retained indefinitely with no rotation;
+improves rather than merely runs, read on a weekly cadence (never per-PR)
+by `/optimise-cycle` (`skills/optimise-cycle/`), which proposes measured,
+cited changes -- it never applies one itself. Retained indefinitely with no rotation;
 delete with `rm .claude/harness-ledger.jsonl`; export format is the file
 itself (newline-delimited JSON) -- see README.md's "Run ledger" section
 for the full field list. Each line's timestamp is an absolute wall-clock

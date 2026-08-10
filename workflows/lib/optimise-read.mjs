@@ -9,18 +9,19 @@
 // inside workflows/optimise-cycle.js.
 //
 // AC-ARCH-8: this file is the optimiser's own reading of "the ledger
-// envelope, git and gh" -- it deliberately reuses no plan-cycle.js,
-// review-cycle.js or tdd-task.js internals, and none of those three
-// reference this file (see test/static-checks.test.js). It DOES read the
-// envelope constants ledger-append.mjs already defines as the single
-// definition site (AC-ARCH-5), rather than re-declaring them, since
-// ledger-append.mjs is not one of the three workflows AC-ARCH-8 fences off.
+// envelope, git and gh" -- it deliberately reuses none of the three
+// original PR1 workflows' own internals (plan cycle, review cycle, or the
+// TDD task runner), and none of those three reference this file in turn
+// (see test/optimise-static.test.js). It DOES read the envelope constants
+// ledger-append.mjs already defines as the single definition site
+// (AC-ARCH-5), rather than re-declaring them, since ledger-append.mjs is
+// not one of the three workflows AC-ARCH-8 fences off.
 //
-// AC-SEC-9: every function below is READ-ONLY. Nothing in this file calls
-// fs.writeFileSync, fs.rmSync, fs.appendFileSync, or any git/gh mutating
-// command. Proven directly in test/optimise-read.test.js (sha256/mtime
-// identity before and after a real CLI invocation against a real repo) and
-// mechanically in test/static-checks.test.js (a grep for write-shaped calls).
+// AC-SEC-9: every function below is READ-ONLY. Nothing in this file
+// modifies a file on disk, in any form. Proven directly in
+// test/optimise-read.test.js (sha256/mtime identity before and after a
+// real CLI invocation against a real repo) and mechanically in
+// test/optimise-static.test.js (a grep for write-shaped fs calls by name).
 //
 // AC-QA-21: every number the optimiser reports is computed here, in real
 // script code, from parsed records -- never asserted by an agent. The same
@@ -36,9 +37,10 @@ import { LEDGER_RELATIVE_PATH } from './ledger-append.mjs'
 // AC-ARCH-14: the default bound on how much ledger history a single
 // aggregation pass reads -- proven against a >=2000-line synthetic ledger
 // in test/optimise-read.test.js. Not configurable via env or a config file
-// (AC-SIMP-2); a caller may override it via the workflow's own `args`
-// (the same surface plan-cycle/review-cycle already expose for e.g. `base`),
-// which the workflow passes through to this CLI as an explicit --window flag.
+// (AC-SIMP-2); a caller may override it via the optimiser workflow's own
+// `args` (the same input surface the other PR1 workflows already expose
+// for their own options), which is passed through to this CLI as an
+// explicit --window flag.
 export const DEFAULT_LEDGER_WINDOW_LINES = 2000
 
 // AC-SIMP-10 / AC-QA-17: below this many usable ledger records, the
