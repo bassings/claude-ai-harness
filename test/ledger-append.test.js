@@ -457,6 +457,32 @@ test('ledger-append: a write failure (ledger path occupied by a directory) never
   assert.ok(out.write_error && out.write_error.length > 0)
 })
 
+// L8: AC-QA-7 names two failure modes "separately" (directory-occupied and
+// unwritable), but only the directory-occupied case had a test -- the
+// unwritable case is the more likely real production failure (a permissions
+// mistake, a read-only mount) and was completely unguarded. Skipped when
+// running as root: permission bits are bypassed for root, so the failure
+// this test exercises cannot actually occur in that environment.
+test(
+  'ledger-append: a write failure due to an UNWRITABLE directory never throws; reports write_ok false with a reason, and no absolute path in write_error (L8, AC-QA-7)',
+  { skip: typeof process.getuid === 'function' && process.getuid() === 0 ? 'running as root: permission checks are bypassed, so this failure mode cannot occur' : false },
+  () => {
+    const repo = makeTempRepo()
+    fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+    fs.chmodSync(path.join(repo, '.claude'), 0o500) // read + execute only, no write
+    try {
+      const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+      assert.equal(res.status, 0, 'the script itself must exit cleanly even on a write failure: ' + res.stderr)
+      const out = JSON.parse(res.stdout.trim().split('\n').pop())
+      assert.equal(out.write_ok, false)
+      assert.ok(out.write_error && out.write_error.length > 0)
+      assert.ok(!out.write_error.includes(repo), `write_error echoed the repo's absolute path: ${out.write_error}`)
+    } finally {
+      fs.chmodSync(path.join(repo, '.claude'), 0o700) // restore write access so cleanup can remove it
+    }
+  }
+)
+
 test('ledger-append: a write-failure error message does not echo the repo\'s absolute path (L6, the failure-path variant of H2)', () => {
   const repo = makeTempRepo()
   fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
