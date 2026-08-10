@@ -92,7 +92,7 @@ const DISPOSITIONS = ['open', 'rejected', 'spec_bug', 'fixed']
 export const LEDGER_ENTRY_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['schema_version', 'run_id', 'ts', 'repo', 'kind', 'outcome', 'write_ok', 'write_error'],
+  required: ['schema_version', 'run_id', 'ts', 'repo', 'kind', 'write_ok', 'write_error'],
   // M3: event_key is unconditionally optional above (some kinds have no
   // concept of it) but must be present for conduct_plan_event specifically
   // -- AC-QA-9's idempotent-replay dedup depends entirely on it, so a
@@ -100,7 +100,22 @@ export const LEDGER_ENTRY_SCHEMA = {
   // written, defeating the whole mechanism. Declared here, in the schema
   // (AC-ARCH-5's single definition site), rather than as an ad-hoc check
   // in main(), so the rule stays discoverable from the schema object alone.
-  requiredWhen: [{ when: { kind: 'conduct_plan_event' }, require: ['event_key'] }],
+  //
+  // L4: outcome used to be unconditionally required, so every
+  // conduct_plan_event line -- including the ones recording an ENDING
+  // (ci_wait_ended, human_wait_ended, pr_merged) -- had to carry
+  // outcome: "started" just to satisfy the schema, purely to have
+  // something valid to put there. Grouping ledger lines by (kind, outcome)
+  // then read every conduct_plan_event line as "started", never empty or
+  // honest about what it actually records. outcome is not a meaningful
+  // concept for this kind at all, so it is required only for the three
+  // kinds that actually have a terminal outcome.
+  requiredWhen: [
+    { when: { kind: 'conduct_plan_event' }, require: ['event_key'] },
+    { when: { kind: 'tdd_task' }, require: ['outcome'] },
+    { when: { kind: 'review_cycle' }, require: ['outcome'] },
+    { when: { kind: 'plan_cycle' }, require: ['outcome'] },
+  ],
   properties: {
     schema_version: { type: 'integer', const: SCHEMA_VERSION },
     run_id: { type: 'string', minLength: 1 },

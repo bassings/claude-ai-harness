@@ -66,9 +66,13 @@ task, a Monitor, or a ScheduleWakeup.
    `workflows/lib/ledger-append.mjs` (found the same way as any harness file:
    this repo, `~/.claude/workflows/lib/`, or an installed plugin; pipe the
    payload's JSON to its stdin) with a payload of `{kind:
-   "conduct_plan_event", outcome: "started", event:
+   "conduct_plan_event", event:
    "<ci_wait_started|ci_wait_ended|human_wait_started|human_wait_ended|
    pr_raised|pr_merged>", event_scope: "<plan file>:<task id>:<event>"}`.
+   Do not include `outcome`: it is not a meaningful concept for this kind
+   (an event recording an ENDING has no natural "started" value), and the
+   script does not require it here -- only for `tdd_task`/`review_cycle`/
+   `plan_cycle`, whose lines are meaningfully terminal.
    `<plan file>` must be repo-relative (e.g. `specs/optimise-cycle.md`), never
    an absolute path: the ledger writer redacts an absolute path it finds
    embedded in the resulting event_key, and a redacted-away path can collide

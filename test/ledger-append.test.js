@@ -815,6 +815,17 @@ test('ledger-append module: findings schema entries only carry lens, severity, a
   assert.equal(LEDGER_ENTRY_SCHEMA.properties.findings.items.additionalProperties, false)
 })
 
+// L4: outcome must not be unconditionally required -- it is not a
+// meaningful concept for conduct_plan_event (an "ended" event has no
+// natural outcome value), so it is required only for the three run kinds.
+test('ledger-append module: outcome is required only for tdd_task/review_cycle/plan_cycle, not unconditionally (L4)', async () => {
+  const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
+  assert.ok(!LEDGER_ENTRY_SCHEMA.required.includes('outcome'), 'outcome must not be in the unconditional required list')
+  const outcomeRules = LEDGER_ENTRY_SCHEMA.requiredWhen.filter((rule) => rule.require.includes('outcome'))
+  const kindsRequiringOutcome = outcomeRules.map((rule) => rule.when.kind).sort()
+  assert.deepEqual(kindsRequiringOutcome, ['plan_cycle', 'review_cycle', 'tdd_task'])
+})
+
 // H4: AC verdicts were collected from every lens (review-cycle.js) and then
 // discarded -- LEDGER_ENTRY_SCHEMA had no field that could hold them, so
 // "which ACs never fail" had no data source. ac_verdicts carries {ac_id,
@@ -1037,4 +1048,31 @@ test('ledger-append: event_scope is never itself written to the ledger line -- o
   runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_scope: 'specs/plan.md:T1:ci_wait_started' })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.ok(!('event_scope' in entry), 'event_scope is not a declared schema field and must not leak into the written line')
+})
+
+// L4: outcome was unconditionally required, so SKILL.md had every
+// conduct_plan_event line -- including the ones recording an ENDING
+// (ci_wait_ended, human_wait_ended, pr_merged) -- carry outcome: "started"
+// just to satisfy the schema. Grouping ledger lines by (kind, outcome)
+// then reads every conduct_plan_event line as "started", never empty or
+// honest about what it actually records. outcome is now required only for
+// the three run kinds (tdd_task/review_cycle/plan_cycle), via the same
+// requiredWhen mechanism M3 already uses for event_key.
+test('ledger-append: a conduct_plan_event payload with NO outcome at all is accepted -- outcome is not a meaningful concept for this kind (L4)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'human_wait_ended', event_key: 'plan.md:T1:human_wait_ended:1' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(!('outcome' in entry) || entry.outcome === undefined, 'outcome must not be forced onto a conduct_plan_event line that never supplied one')
+})
+
+test('ledger-append: a tdd_task/review_cycle/plan_cycle payload with NO outcome is still rejected -- outcome remains required for the three run kinds (L4, not vacuous)', () => {
+  for (const kind of ['tdd_task', 'review_cycle', 'plan_cycle']) {
+    const repo = makeTempRepo()
+    const res = runAppend(repo, { schema_version: 1, kind })
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, false, `${kind}: outcome must still be required`)
+    assert.equal(readLedgerLines(repo).length, 0)
+  }
 })
