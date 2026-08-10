@@ -380,7 +380,14 @@ rejectedFindingsRaw = synthesis && Array.isArray(synthesis.rejected_findings) ? 
 specBugCount = specBugsRaw ? specBugsRaw.length : null
 rejectedFindingCount = rejectedFindingsRaw ? rejectedFindingsRaw.length : null
 
-const outcome = lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
+// M1: outcome was computed purely from lens verdicts, so a run whose
+// synthesis agent failed or returned nothing usable (undefined, or a
+// non-string/empty "report") was still recorded as "done" -- with an empty
+// report, inflating the denominator of "rounds to clean" (the spec's
+// headline measure) and giving the operator no visible sign the run
+// actually produced nothing.
+const reportOk = synthesis && typeof synthesis.report === 'string' && synthesis.report.length > 0
+const outcome = !reportOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
 
 return {
   base,
@@ -388,7 +395,7 @@ return {
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: synthesis && typeof synthesis.report === 'string' ? synthesis.report : '',
+  report: reportOk ? synthesis.report : '',
   __outcome: outcome,
 }
 

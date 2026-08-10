@@ -62,6 +62,20 @@ test('plan-cycle.js: the "every lens agent failed" early return (line 98 histori
   assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
 })
 
+// M1: a run whose synthesis:write-back agent fails (undefined response) or
+// returns an empty summary string was previously recorded as outcome
+// "done" -- see review-cycle.js's identical fix and rationale.
+test('plan-cycle.js: outcome is aborted (not done) when the synthesis:write-back agent call fails entirely (undefined response), even though every lens completed cleanly (M1)', async () => {
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'synthesis:write-back': undefined }) })
+  assert.equal(result.telemetry.outcome, 'aborted')
+  assert.equal(result.report, '', 'an aborted run must not carry a stale or partial report string')
+})
+
+test('plan-cycle.js: outcome is aborted (not done) when synthesis:write-back returns an empty string (M1)', async () => {
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'synthesis:write-back': '' }) })
+  assert.equal(result.telemetry.outcome, 'aborted')
+})
+
 test('plan-cycle.js: outcome is blocked when any lens returns BLOCKED', async () => {
   const { result } = await runWorkflow(WF, {
     args: { spec: 'specs/foo.md' },

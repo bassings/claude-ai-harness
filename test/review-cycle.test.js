@@ -50,6 +50,25 @@ test('review-cycle.js: normal completion preserves the existing return shape and
   assert.ok(calls.find((c) => c.opts.label === 'ledger:write'))
 })
 
+// M1: a run whose synthesis agent fails (undefined response) or returns a
+// structurally-valid-but-empty report was previously recorded as outcome
+// "done" -- inflating the denominator of "rounds to clean", the spec's
+// headline measure, and giving the operator no visible sign the run
+// produced nothing.
+test('review-cycle.js: outcome is aborted (not done) when the synthesis agent call fails entirely (undefined response), even though every lens completed cleanly (M1)', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent({ synthesis: undefined }) })
+  assert.equal(result.telemetry.outcome, 'aborted')
+  assert.equal(result.report, '', 'an aborted run must not carry a stale or partial report string')
+})
+
+test('review-cycle.js: outcome is aborted (not done) when synthesis returns a structurally-valid response with an empty report string (M1)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ synthesis: { report: '', spec_bugs: [], rejected_findings: [] } }),
+  })
+  assert.equal(result.telemetry.outcome, 'aborted')
+})
+
 test('review-cycle.js: the "no changes found" early return (line 65 historically) still reaches the ledger write, with outcome no-op (AC-ARCH-3)', async () => {
   const { result, calls } = await runWorkflow(WF, {
     args: {},

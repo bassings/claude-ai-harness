@@ -214,13 +214,20 @@ const synthesis = await agent(
   { label: 'synthesis:write-back', phase: 'Synthesis' }
 )
 
+// M1: outcome was computed purely from lens verdicts, so a run whose
+// synthesis:write-back agent failed or returned nothing usable (undefined,
+// or an empty/non-string summary) was still recorded as "done" -- see
+// review-cycle.js for the identical fix and its rationale.
+const reportOk = typeof synthesis === 'string' && synthesis.length > 0
+const outcome = !reportOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
+
 return {
   spec: specPath,
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: synthesis,
-  __outcome: lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done',
+  report: reportOk ? synthesis : '',
+  __outcome: outcome,
 }
 
 } // end run()
