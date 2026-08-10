@@ -1,3 +1,5 @@
+import { writeLedgerEntry, safeBudgetSpent, findingId } from './lib/ledger.mjs'
+
 export const meta = {
   name: 'review-cycle',
   description: 'Multi-lens review of the branch diff per AGENT-HARNESS.md: single-focus lenses in parallel, one synthesised report',
@@ -35,6 +37,20 @@ opts = opts || {}
 
 const specPath = opts.spec || null
 
+// Ledger telemetry accumulators, populated inside run() as each value
+// becomes available, read after run() resolves. Never part of the
+// pre-existing, publicly-documented return shape (AC-ARCH-10).
+const triggerCounts = {}
+let headSha = null
+let findingsAccumulator = []
+let specBugCount = null
+let rejectedFindingCount = null
+
+// The entire pre-existing workflow body, unchanged in behaviour, is wrapped
+// in run() so every one of its terminating returns funnels through exactly
+// ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
+async function run() {
+
 // ---- Phase 1: scope ----
 phase('Scope')
 const scope = await agent(
@@ -62,7 +78,9 @@ const scope = await agent(
     },
   }
 )
-if (!scope || !scope.files.length) return { report: 'No changes found between the base ref and HEAD. Nothing to review.' }
+if (!scope || !scope.files.length) return { report: 'No changes found between the base ref and HEAD. Nothing to review.', __outcome: 'no-op' }
+
+headSha = scope.head_sha
 
 const base = scope.base
 const rules = Object.assign({}, DEFAULT_RULES, scope.custom_rules || {})
@@ -77,6 +95,11 @@ const dataHit = matches(paths, rules.data)
 const archHit = matches(paths, rules.architecture)
 const opsHit = matches(paths, rules.operability)
 const specHit = matches(paths, ['specs/**'])
+triggerCounts.ui = uiHit.length
+triggerCounts.data = dataHit.length
+triggerCounts.architecture = archHit.length
+triggerCounts.operability = opsHit.length
+triggerCounts.product = specHit.length
 
 if (uiHit.length) lenses.push('lens-design', 'lens-accessibility')
 if (dataHit.length) lenses.push('lens-data')
@@ -146,7 +169,7 @@ const reports = await parallel(lenses.map(lens => () =>
     .then(r => (r ? { lens, ...r } : null))
 ))
 const lensReports = reports.filter(Boolean)
-if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.' }
+if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
 
 // AC-SIMP constraints are mechanical: checked directly against the diff, not by an agent lens (harness rule)
 let simpCheck = null
@@ -177,9 +200,38 @@ const synthesis = await agent(
   `4. ${specPath ? 'AC verdict summary, and any finding with no AC behind it flagged as a SPEC BUG.' : 'AC verdict summary if the lenses found a spec; otherwise note that no spec existed, so every finding is unanchored to an AC.'}\n` +
   `5. A closing line: overall CLEAN / FINDINGS / BLOCKED and what must happen before push.\n` +
   `Do not soften findings and do not invent any. If a lens returned BLOCKED, say so prominently. ` +
-  `Return only the markdown report.`,
-  { label: 'synthesis', phase: 'Synthesis' }
+  `Also return spec_bugs (findings with no AC behind them) and rejected_findings (findings investigated and shown to be ` +
+  `false alarms) as structured arrays, each item carrying lens, location and claim, so capture is mechanical rather than ` +
+  `left in the prose. Return only the markdown report as "report".`,
+  {
+    label: 'synthesis',
+    phase: 'Synthesis',
+    schema: {
+      type: 'object',
+      required: ['report', 'spec_bugs', 'rejected_findings'],
+      properties: {
+        report: { type: 'string' },
+        spec_bugs: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
+        rejected_findings: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
+      },
+    },
+  }
 )
+
+// A synthesis response missing the required structured fields (e.g. an
+// older or misbehaving agent that only returned prose) must not silently
+// masquerade as "zero spec bugs, zero rejected findings": null means
+// unmeasured, distinguishable from a genuine zero (AC-QA-13, AC-OPS-3).
+const specBugs = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_bugs : null
+const rejectedFindings = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
+specBugCount = specBugs ? specBugs.length : null
+rejectedFindingCount = rejectedFindings ? rejectedFindings.length : null
+findingsAccumulator = [
+  ...(specBugs || []).map(f => ({ id: findingId(f.lens, f.location, f.claim), lens: f.lens, severity: f.severity || 'Low', ac_id: f.ac_id || null, disposition: 'spec_bug' })),
+  ...(rejectedFindings || []).map(f => ({ id: findingId(f.lens, f.location, f.claim), lens: f.lens, severity: f.severity || 'Low', ac_id: f.ac_id || null, disposition: 'rejected' })),
+]
+
+const outcome = lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
 
 return {
   base,
@@ -187,5 +239,26 @@ return {
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: synthesis,
+  report: synthesis && typeof synthesis.report === 'string' ? synthesis.report : '',
+  __outcome: outcome,
 }
+
+} // end run()
+
+const raw = await run()
+const { __outcome, ...result } = raw
+const telemetry = {
+  outcome: __outcome || 'aborted',
+  spec: specPath,
+  round_key: headSha,
+  lenses_run: result.lenses || [],
+  lenses_skipped: result.skipped || [],
+  trigger_counts: triggerCounts,
+  verdicts: result.verdicts || {},
+  findings: findingsAccumulator,
+  spec_bug_count: specBugCount,
+  rejected_finding_count: rejectedFindingCount,
+  budget_spent: safeBudgetSpent(budget),
+}
+await writeLedgerEntry({ agent, log }, { kind: 'review_cycle', ...telemetry })
+return { ...result, telemetry }
