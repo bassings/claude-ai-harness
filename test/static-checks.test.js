@@ -123,6 +123,15 @@ test('static: AGENT-HARNESS.md\'s ledger paragraph carries the absolute-timestam
   assert.ok(/git\s+history/i.test(doc), 'AGENT-HARNESS.md must state that a deliberately committed line survives in git history')
 })
 
+test('static: README.md\'s "Delete it" instruction also states that the next run recreates the ledger and there is no off switch (L12, AC-PROD-9)', () => {
+  const readme = readAll('README.md')
+  const deleteIdx = readme.indexOf('Delete it')
+  assert.ok(deleteIdx !== -1, 'expected a "Delete it" instruction in README.md')
+  const nearby = readme.slice(deleteIdx, deleteIdx + 400)
+  assert.ok(/recreates it|recreated/i.test(nearby), 'must state that the next run recreates the deleted ledger, near the delete instruction')
+  assert.ok(/no (way to|setting)|no off switch|cannot.*opt/i.test(nearby), 'must state there is no way to turn ledger writes off, near the delete instruction')
+})
+
 test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, ledgerWritePrompt, writeLedger) is byte-identical across all three workflow files. Workflow scripts cannot import, so this trio is necessarily duplicated three times; without a guard pinning them, a fix landed in one or two copies fails silently in the third -- the same failure class as C1.', () => {
   function extractBlock(fileName) {
     const contents = readAll('workflows', fileName)

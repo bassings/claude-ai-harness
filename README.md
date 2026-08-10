@@ -197,7 +197,9 @@ validation and the write itself live in this one real-Node script instead,
 invoked via Bash from each workflow's final step).
 
 **Retention**: kept indefinitely as an ordinary untracked file; nothing in
-this repo prunes or rotates it. **Delete it** with `rm .claude/harness-ledger.jsonl`.
+this repo prunes or rotates it. **Delete it** with `rm .claude/harness-ledger.jsonl`
+-- the next workflow run recreates it automatically, since there is no way to
+opt a single run out (see above), and no setting to turn ledger writes off.
 **Export**: it already is one — the file itself is newline-delimited JSON,
 readable with any JSONL tool. If a line is ever deliberately committed (the
 opt-in above), it survives in git history like any other tracked change.
