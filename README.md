@@ -197,12 +197,28 @@ validation and the write itself live in this one real-Node script instead,
 invoked via Bash from each workflow's final step).
 
 **Retention**: kept indefinitely as an ordinary untracked file; nothing in
-this repo prunes or rotates it. **Delete it** with `rm .claude/harness-ledger.jsonl`
+this repo prunes or rotates it. Because the ledger is gitignored, `git clean
+-xdf` deletes it too -- `-x` explicitly targets ignored files by design, and
+this is a routine cleanup command, not an edge case. To keep the ledger
+through a `git clean -xdf`, exclude the path yourself (`git clean -xdf -e
+.claude/harness-ledger.jsonl`) or move it outside the working tree before
+cleaning. **Delete it** with `rm .claude/harness-ledger.jsonl`
 -- the next workflow run recreates it automatically, since there is no way to
 opt a single run out (see above), and no setting to turn ledger writes off.
 **Export**: it already is one — the file itself is newline-delimited JSON,
 readable with any JSONL tool. If a line is ever deliberately committed (the
 opt-in above), it survives in git history like any other tracked change.
+
+**Arbitration (AC-DATA-4 vs. AC-SEC-1)**: AC-DATA-4 (the ledger survives a
+routine `git clean -xdf`) and AC-SEC-1 (the ledger is gitignored) are
+mutually unsatisfiable for a single in-tree, ignored path -- `-x` removes
+ignored files by definition, so a path that satisfies AC-SEC-1 cannot also
+satisfy AC-DATA-4. Resolved in favour of AC-SEC-1: an accidentally
+committed ledger (the risk an ungitignored path invites) is a live,
+standing exposure, while a `git clean`-lost ledger is user-initiated,
+telemetry-only, and fully preventable by the exclusion above. This is a
+deliberate, accepted trade-off, not an oversight: AC-DATA-4's git-clean-
+survival clause is an accepted FAIL for this path.
 
 ## Tests
 
