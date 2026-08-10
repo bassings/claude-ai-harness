@@ -35,6 +35,126 @@ opts = opts || {}
 
 const specPath = opts.spec || null
 
+// Ledger telemetry accumulators, populated inside run() as each value
+// becomes available, read after run() resolves. Never part of the
+// pre-existing, publicly-documented return shape (AC-ARCH-10).
+const triggerCounts = {}
+let headSha = null
+// Raw finding descriptors ({lens, location, claim, severity?, ac_id?}), or
+// null when the synthesis response was malformed. Passed to
+// ledger-append.mjs as opaque data: workflow scripts have no node:crypto,
+// so finding-id hashing (AC-QA-11) happens there, not here.
+let specBugsRaw = null
+let rejectedFindingsRaw = null
+let specBugCount = null
+let rejectedFindingCount = null
+// H5: every finding each lens actually reported, not just the two synthesis
+// dispositions (spec_bug/rejected) -- without this, an accepted finding
+// that gets fixed leaves no trace on any ledger line, so "which lenses
+// produce findings that get fixed" (the spec's own first stated question)
+// is uncomputable no matter how the ledger is later read.
+let openFindingsRaw = []
+// H4: {ac_id, verdict} pairs aggregated from every lens's ac_verdicts --
+// previously collected here and then simply never reaching the ledger
+// payload, so "which ACs never fail" had no data source at all.
+let acVerdicts = []
+
+// ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
+// tdd-task.js for the identical pattern and its rationale). ----
+
+// Reads budget.spent() defensively: null (never 0) when budget is absent or
+// throws, so "unmeasured" stays distinguishable from "measured zero"
+// (AC-QA-15, AC-OPS-3).
+function readBudgetSpent() {
+  if (!budget || typeof budget.spent !== 'function') return null
+  try {
+    const v = budget.spent()
+    return typeof v === 'number' && Number.isFinite(v) ? v : null
+  } catch (e) {
+    return null
+  }
+}
+
+// Builds the prompt for the ledger-write agent step. `payload` is passed as
+// opaque base64-encoded data via stdin (AC-SEC-6, H1): the payload may
+// contain arbitrary lens-authored or task text (a finding's claim, a task
+// string) with no sanitisation, and JSON.stringify does not escape a
+// single quote, so embedding raw JSON in a prompt that recommends a
+// single-quoted shell template lets that text break out of the quoting and
+// run as a shell command. Base64 has no shell metacharacters in its
+// alphabet at all, which removes the escaping problem entirely rather than
+// trying to sanitise every free-text field that could reach this prompt.
+// The script locates ledger-append.mjs itself; H1 (round 2): the search
+// order is installed-mirror-first, repo-local-last-and-gated. /review-cycle
+// runs against untrusted diffs, and the ledger:write agent call has no
+// isolation option, so it executes in the reviewed checkout -- a repo-local
+// workflows/lib/ledger-append.mjs planted by the diff under review must
+// never be the one that runs, in any repo except this harness's own.
+function ledgerWritePrompt(payload) {
+  const payloadBase64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
+  return (
+    `Append one line to the harness run ledger. Never let this step fail the caller's run: catch every error ` +
+    `yourself and report it in your structured output instead of throwing or retrying.\n\n` +
+    `1. Find this harness's ledger-append.mjs script, in this exact order, and use the FIRST one that exists: ` +
+    `(a) ~/.claude/workflows/lib/ledger-append.mjs (the global mirror install); (b) any installed claude-ai-harness ` +
+    `plugin directory's workflows/lib/ledger-append.mjs; (c) "$(git rev-parse --show-toplevel)/workflows/lib/ledger-append.mjs" ` +
+    `in the current repo, but ONLY if the current repo is claude-ai-harness itself -- check the basename of ` +
+    `\`git rev-parse --show-toplevel\` equals "claude-ai-harness", or (if that fails) \`git remote get-url origin\` ` +
+    `names claude-ai-harness. NEVER use a repo-local copy in any OTHER repo, even if (a) and (b) are both absent: ` +
+    `report write_ok false instead. A repo-local workflows/lib/ledger-append.mjs is exactly what a hostile diff ` +
+    `under review could plant, and this step must never execute it as you.\n` +
+    `2. The payload below is base64-encoded SPECIFICALLY so its raw text (which may contain quotes or other shell ` +
+    `metacharacters authored by a reviewed diff, a lens finding, or task text) never has to be embedded in a shell ` +
+    `command. Do not decode it yourself, inspect it, or reconstruct the JSON by hand: pipe the base64 text straight ` +
+    `through base64 -d and into the script, exactly like this, substituting only the real path in the last segment:\n` +
+    `   \`printf '%s' '${payloadBase64}' | base64 -d | node <path-to-ledger-append.mjs>\`\n` +
+    `3. The script always exits 0 and prints one line of JSON: {run_id, ts, write_ok, write_error}. It already ` +
+    `handles locating the main checkout, ensuring the ledger stays gitignored, sourcing the timestamp from the ` +
+    `system clock, and the single atomic append -- do not attempt any of that yourself, and do not construct the ` +
+    `ledger line by hand.\n` +
+    `4. If the script could not be found or failed to run at all (rather than reporting write_ok:false itself), ` +
+    `treat that the same way: write_ok false, write_error naming what happened.\n\n` +
+    `Return only what the script printed: run_id, ts, write_ok, write_error (null when write_ok is true).`
+  )
+}
+
+// Calls the ledger-write agent step and never throws: a ledger write failure
+// must never fail the harness run (AC-QA-7).
+async function writeLedger(payload) {
+  let response
+  try {
+    response = await agent(ledgerWritePrompt(payload), {
+      label: 'ledger:write',
+      phase: 'Ledger',
+      effort: 'low',
+      schema: {
+        type: 'object',
+        required: ['run_id', 'ts', 'write_ok', 'write_error'],
+        properties: {
+          run_id: { type: 'string' },
+          ts: { type: 'string' },
+          write_ok: { type: 'boolean' },
+          write_error: { type: ['string', 'null'] },
+        },
+      },
+    })
+  } catch (e) {
+    response = null
+  }
+  if (!response || response.write_ok !== true) {
+    const reason = (response && response.write_error) || 'ledger agent failed or returned no result'
+    const runId = (response && response.run_id) || 'unknown'
+    log(`Ledger write failed for run ${runId}: ${reason}`)
+    return { write_ok: false, write_error: reason, run_id: runId }
+  }
+  return { write_ok: true, write_error: null, run_id: response.run_id }
+}
+
+// The entire pre-existing workflow body, unchanged in behaviour, is wrapped
+// in run() so every one of its terminating returns funnels through exactly
+// ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
+async function run() {
+
 // ---- Phase 1: scope ----
 phase('Scope')
 const scope = await agent(
@@ -62,7 +182,9 @@ const scope = await agent(
     },
   }
 )
-if (!scope || !scope.files.length) return { report: 'No changes found between the base ref and HEAD. Nothing to review.' }
+if (!scope || !scope.files.length) return { report: 'No changes found between the base ref and HEAD. Nothing to review.', __outcome: 'no-op' }
+
+headSha = scope.head_sha
 
 const base = scope.base
 const rules = Object.assign({}, DEFAULT_RULES, scope.custom_rules || {})
@@ -78,13 +200,44 @@ const archHit = matches(paths, rules.architecture)
 const opsHit = matches(paths, rules.operability)
 const specHit = matches(paths, ['specs/**'])
 
-if (uiHit.length) lenses.push('lens-design', 'lens-accessibility')
-if (dataHit.length) lenses.push('lens-data')
-if (archHit.length || scope.new_modules || scope.new_dependency_entries) lenses.push('lens-architecture')
-if (opsHit.length) lenses.push('lens-operability')
+// M1: keyed BY LENS NAME (matching entries in `lenses` below), not by rule
+// group -- a lens's count must reflect the files that actually triggered
+// IT, so it can be looked up directly rather than requiring the reader to
+// know the rule-group mapping. Always-on lenses get the total changed-file
+// count (they are never "triggered by" a subset), so an absent key always
+// means "not triggered", never "triggered with 0 files".
+triggerCounts['lens-security'] = paths.length
+triggerCounts['lens-qa'] = paths.length
+
+if (uiHit.length) {
+  lenses.push('lens-design', 'lens-accessibility')
+  triggerCounts['lens-design'] = uiHit.length
+  triggerCounts['lens-accessibility'] = uiHit.length
+}
+if (dataHit.length) {
+  lenses.push('lens-data')
+  triggerCounts['lens-data'] = dataHit.length
+}
+if (archHit.length || scope.new_modules || scope.new_dependency_entries) {
+  lenses.push('lens-architecture')
+  // Honestly 0 when triggered purely by new_modules/new_dependency_entries
+  // with no file matching the architecture globs: a real, measured zero,
+  // not a stand-in borrowed from an unrelated rule group.
+  triggerCounts['lens-architecture'] = archHit.length
+}
+if (opsHit.length) {
+  lenses.push('lens-operability')
+  triggerCounts['lens-operability'] = opsHit.length
+}
 // specPath too: a caller can supply an existing, unchanged spec for a
 // user-facing backend change that touches neither a spec file nor a UI glob.
-if (specHit.length || uiHit.length || specPath) lenses.push('lens-product')
+if (specHit.length || uiHit.length || specPath) {
+  lenses.push('lens-product')
+  // Credits whichever files actually caused the trigger (specs/** and/or
+  // the ui surface), deduplicated -- not just specHit.length, which was
+  // always 0 for the common case of a UI-only diff triggering this lens.
+  triggerCounts['lens-product'] = new Set([...specHit, ...uiHit]).size
+}
 
 // An override ADDS to the mandatory roster, it does not replace it: the
 // always-on lenses cannot be silently dropped by {lenses: [...]}.
@@ -110,7 +263,12 @@ const REVIEW_SCHEMA = {
       properties: { examined: { type: 'string' }, verified_by: { type: 'string' }, could_not_check: { type: 'string' } },
     },
     ac_verdicts: { type: 'array', items: { type: 'object', required: ['id', 'verdict', 'evidence'], properties: { id: { type: 'string' }, verdict: { type: 'string', enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] }, evidence: { type: 'string' } } } },
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'location', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' } } } },
+    // H4: ac_id was previously undeclared here, so a schema-following agent
+    // had no field inviting it to attribute an individual finding to an AC
+    // -- finding-to-AC attribution was always null downstream, not because
+    // the aggregation code couldn't carry a value through, but because no
+    // lens was ever told this field existed to fill in.
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'location', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
   },
 }
 
@@ -146,7 +304,21 @@ const reports = await parallel(lenses.map(lens => () =>
     .then(r => (r ? { lens, ...r } : null))
 ))
 const lensReports = reports.filter(Boolean)
-if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.' }
+if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
+
+// H5: capture every finding each lens reported, as-is, before synthesis
+// dedupes/arbitrates them -- this is the "open" (accepted) side that was
+// previously never recorded at all.
+openFindingsRaw = lensReports.flatMap(r =>
+  (r.findings || []).map(f => ({ lens: r.lens, location: f.location, claim: f.claim, severity: f.severity, ac_id: f.ac_id || null }))
+)
+
+// H4: {ac_id, verdict} ONLY -- evidence text is dropped here, before the
+// payload is ever built, preserving the same AC-SEC-2 exclusion the
+// findings pipeline already holds to.
+acVerdicts = lensReports.flatMap(r =>
+  (r.ac_verdicts || []).map(v => ({ ac_id: v.id, verdict: v.verdict }))
+)
 
 // AC-SIMP constraints are mechanical: checked directly against the diff, not by an agent lens (harness rule)
 let simpCheck = null
@@ -177,9 +349,45 @@ const synthesis = await agent(
   `4. ${specPath ? 'AC verdict summary, and any finding with no AC behind it flagged as a SPEC BUG.' : 'AC verdict summary if the lenses found a spec; otherwise note that no spec existed, so every finding is unanchored to an AC.'}\n` +
   `5. A closing line: overall CLEAN / FINDINGS / BLOCKED and what must happen before push.\n` +
   `Do not soften findings and do not invent any. If a lens returned BLOCKED, say so prominently. ` +
-  `Return only the markdown report.`,
-  { label: 'synthesis', phase: 'Synthesis' }
+  `Also return spec_bugs (findings with no AC behind them) and rejected_findings (findings investigated and shown to be ` +
+  `false alarms) as structured arrays, each item carrying lens, location and claim, so capture is mechanical rather than ` +
+  `left in the prose. Return only the markdown report as "report".`,
+  {
+    label: 'synthesis',
+    phase: 'Synthesis',
+    schema: {
+      type: 'object',
+      required: ['report', 'spec_bugs', 'rejected_findings'],
+      properties: {
+        report: { type: 'string' },
+        spec_bugs: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
+        rejected_findings: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
+      },
+    },
+  }
 )
+
+// A synthesis response missing the required structured fields (e.g. an
+// older or misbehaving agent that only returned prose) must not silently
+// masquerade as "zero spec bugs, zero rejected findings": null means
+// unmeasured, distinguishable from a genuine zero (AC-QA-13, AC-OPS-3).
+// The raw descriptor arrays (not finding ids: no node:crypto here) are
+// carried through to the ledger payload, where ledger-append.mjs computes
+// ids and dispositions (AC-QA-11 -- mechanical, just in real-Node script
+// code instead of a sandboxed one).
+specBugsRaw = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_bugs : null
+rejectedFindingsRaw = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
+specBugCount = specBugsRaw ? specBugsRaw.length : null
+rejectedFindingCount = rejectedFindingsRaw ? rejectedFindingsRaw.length : null
+
+// M1: outcome was computed purely from lens verdicts, so a run whose
+// synthesis agent failed or returned nothing usable (undefined, or a
+// non-string/empty "report") was still recorded as "done" -- with an empty
+// report, inflating the denominator of "rounds to clean" (the spec's
+// headline measure) and giving the operator no visible sign the run
+// actually produced nothing.
+const reportOk = synthesis && typeof synthesis.report === 'string' && synthesis.report.length > 0
+const outcome = !reportOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
 
 return {
   base,
@@ -187,5 +395,39 @@ return {
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: synthesis,
+  report: reportOk ? synthesis.report : '',
+  __outcome: outcome,
 }
+
+} // end run()
+
+// Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
+// pattern and its rationale.
+const startWrite = await writeLedger({ kind: 'review_cycle', outcome: 'started', spec: specPath })
+const startRunId = startWrite.write_ok ? startWrite.run_id : null
+
+const raw = await run()
+const { __outcome, ...result } = raw
+const telemetry = {
+  outcome: __outcome || 'aborted',
+  spec: specPath,
+  round_key: headSha,
+  lenses_run: result.lenses || [],
+  lenses_skipped: result.skipped || [],
+  trigger_counts: triggerCounts,
+  verdicts: result.verdicts || {},
+  spec_bug_count: specBugCount,
+  rejected_finding_count: rejectedFindingCount,
+  budget_spent: readBudgetSpent(),
+  // H4: already shaped as {ac_id, verdict} pairs (see acVerdicts above), so
+  // -- unlike spec_bugs/rejected_findings/open_findings -- it needs no
+  // further processing by ledger-append.mjs and rides in telemetry proper.
+  ac_verdicts: acVerdicts,
+}
+// spec_bugs/rejected_findings ride along as raw descriptors for
+// ledger-append.mjs to hash into finding ids; they are NOT part of the
+// workflow's own public telemetry (which only carries the counts above).
+const terminalEntry = { kind: 'review_cycle', spec_bugs: specBugsRaw, rejected_findings: rejectedFindingsRaw, open_findings: openFindingsRaw, ...telemetry }
+if (startRunId) terminalEntry.run_id = startRunId
+await writeLedger(terminalEntry)
+return { ...result, telemetry }
