@@ -291,14 +291,24 @@ function resolveRepoIdentity(cwd) {
   }
 }
 
+// M7: ignores the ledger via .git/info/exclude rather than editing the
+// operator's own tracked .gitignore. Both have identical ignore effect
+// (git reads .git/info/exclude exactly like a repo-root .gitignore), but
+// info/exclude is itself untracked and repo-local -- it was never the
+// operator's file to begin with, so writing to it can never turn up as a
+// diff on a tracked file, never needs staging, and never gets swept into
+// an unrelated `git add -A`.
 function ensureGitignored(root) {
-  const gitignorePath = path.join(root, '.gitignore')
+  const gitDir = path.join(root, '.git')
+  const infoDir = path.join(gitDir, 'info')
+  const excludePath = path.join(infoDir, 'exclude')
+  fs.mkdirSync(infoDir, { recursive: true })
   let contents = ''
-  if (fs.existsSync(gitignorePath)) contents = fs.readFileSync(gitignorePath, 'utf8')
+  if (fs.existsSync(excludePath)) contents = fs.readFileSync(excludePath, 'utf8')
   const lines = contents.split('\n')
   if (!lines.some((l) => l.trim() === LEDGER_RELATIVE_PATH)) {
     const sep = contents.length && !contents.endsWith('\n') ? '\n' : ''
-    fs.writeFileSync(gitignorePath, contents + sep + LEDGER_RELATIVE_PATH + '\n')
+    fs.writeFileSync(excludePath, contents + sep + LEDGER_RELATIVE_PATH + '\n')
   }
 }
 

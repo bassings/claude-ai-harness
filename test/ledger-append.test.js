@@ -77,6 +77,29 @@ test('ledger-append: ensures the ledger is gitignored before the first write, an
   assert.equal(lsFiles.trim(), '')
 })
 
+test('ledger-append: a repo with a COMMITTED .gitignore is left completely untouched -- no diff, nothing to stage (M7: the old ensureGitignored edited the user\'s own tracked .gitignore in place, so `git status --porcelain` reported it modified; .git/info/exclude is untracked, repo-local, and has the identical ignore effect without touching anything the operator owns)', () => {
+  const repo = makeTempRepo()
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n*.log\n')
+  sh('git add .gitignore && git commit -q -m "add gitignore"', repo)
+  const gitignoreBefore = fs.readFileSync(path.join(repo, '.gitignore'), 'utf8')
+
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+
+  const gitignoreAfter = fs.readFileSync(path.join(repo, '.gitignore'), 'utf8')
+  assert.equal(gitignoreAfter, gitignoreBefore, 'the tracked .gitignore must be byte-identical: it must never be edited')
+  const status = sh('git status --porcelain', repo)
+  assert.equal(status.trim(), '', `the working tree must be completely clean, nothing to stage: got ${JSON.stringify(status)}`)
+  const checkIgnore = spawnSync('git', ['check-ignore', '-q', LEDGER_REL], { cwd: repo })
+  assert.equal(checkIgnore.status, 0, 'the ledger must still be ignored (via .git/info/exclude, not .gitignore)')
+})
+
+test('ledger-append: the ledger is ignored via .git/info/exclude, which is itself untracked and repo-local (M7)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const excludeContents = fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8')
+  assert.ok(excludeContents.includes(LEDGER_REL), '.git/info/exclude must list the ledger path')
+})
+
 test('ledger-append: writing from inside a worktree lands the line in the MAIN checkout, not the worktree (AC-DATA-1, AC-SEC-5)', () => {
   const repo = makeTempRepo()
   const worktreeDir = path.join(os.tmpdir(), 'ledger-append-wt-' + Date.now())

@@ -180,9 +180,11 @@ ran against** (the main checkout root, never a worktree): a `started` record
 before any work begins and a terminal record after, sharing a `run_id`, so a
 run killed mid-flight is recorded as incomplete rather than simply absent.
 `conduct-plan`'s task-level wait/PR events add one line each. The file is
-created and gitignored automatically on first write; it is never staged,
-committed or pushed by any code in this repo, and if you want it committed
-as a deliberate opt-in, remove that `.gitignore` line yourself.
+created and ignored automatically on first write, via `.git/info/exclude`
+rather than your tracked `.gitignore` (so writing the ledger never shows up
+as a diff on a file you own); it is never staged, committed or pushed by
+any code in this repo, and if you want it committed as a deliberate
+opt-in, remove that line from `.git/info/exclude` yourself.
 
 Each line records: which workflow ran and its outcome, which lenses ran/were
 skipped and their verdicts, findings as `{id, lens, severity, ac_id,
@@ -230,7 +232,7 @@ invoking real subagents.
 | `workflows/plan-cycle.js` | Planning orchestration: scope, parallel lenses, simplicity veto, AC write-back |
 | `workflows/review-cycle.js` | Review orchestration: scope + SHA pin, deterministic triggering, parallel worktree-isolated lenses, synthesis |
 | `workflows/tdd-task.js` | Script-enforced TDD for one scoped change: implement is unreachable until RED is verified for the right reason; commit refused if tests changed between RED and GREEN |
-| `workflows/lib/ledger-append.mjs` | Real-Node script (invoked via Bash, never imported: workflow scripts cannot import) owning the ledger envelope schema, path resolution, gitignore-ensure and the atomic single-line append; invoked by all three workflows above |
+| `workflows/lib/ledger-append.mjs` | Real-Node script (invoked via Bash, never imported: workflow scripts cannot import) owning the ledger envelope schema, path resolution, `.git/info/exclude` ignore-ensure and the atomic single-line append; invoked by all three workflows above |
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
 | `test/` | This repo's own test suite (`node --test test/*.test.js`); see "Tests" above |
