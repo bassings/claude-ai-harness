@@ -1,3 +1,5 @@
+import { writeLedgerEntry, safeBudgetSpent } from './lib/ledger.mjs'
+
 export const meta = {
   name: 'plan-cycle',
   description: 'Multi-lens planning cycle: triggered lenses write AC-<LENS>-<n> criteria into the spec, per AGENT-HARNESS.md',
@@ -15,6 +17,11 @@ if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts
 opts = opts || {}
 if (typeof opts !== 'object' || !opts.spec) throw new Error('plan-cycle requires args.spec: the path to the spec file to plan against')
 const specPath = opts.spec
+
+// The entire pre-existing workflow body, unchanged in behaviour, is wrapped
+// in run() so every one of its terminating returns funnels through exactly
+// ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
+async function run() {
 
 // ---- Phase 1: scope ----
 phase('Scope')
@@ -45,7 +52,7 @@ const scope = await agent(
     },
   }
 )
-if (!scope) return { report: 'Scope agent failed; no plan produced.' }
+if (!scope) return { report: 'Scope agent failed; no plan produced.', __outcome: 'aborted' }
 
 // ---- deterministic lens triggering (AGENT-HARNESS.md roster; simplicity is planning-only and always on) ----
 let lenses = ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product']
@@ -95,7 +102,7 @@ const reports = await parallel(lenses.map(lens => () =>
     .then(r => (r ? { lens, ...r } : null))
 ))
 const lensReports = reports.filter(Boolean)
-if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no plan produced.' }
+if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no plan produced.', __outcome: 'aborted' }
 
 // ---- Phase 3: synthesis, simplicity veto, write-back ----
 phase('Synthesis')
@@ -124,4 +131,20 @@ return {
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
   report: synthesis,
+  __outcome: lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done',
 }
+
+} // end run()
+
+const raw = await run()
+const { __outcome, ...result } = raw
+const telemetry = {
+  outcome: __outcome || 'aborted',
+  spec: specPath,
+  lenses_run: result.lenses || [],
+  lenses_skipped: result.skipped || [],
+  verdicts: result.verdicts || {},
+  budget_spent: safeBudgetSpent(budget),
+}
+await writeLedgerEntry({ agent, log }, { kind: 'plan_cycle', ...telemetry })
+return { ...result, telemetry }
