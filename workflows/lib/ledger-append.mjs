@@ -73,6 +73,10 @@ export const MAX_LINE_BYTES = 16384
 // alone pushes it over MAX_LINE_BYTES.
 export const MAX_FINDINGS = 15
 
+// H4: a defensive bound on ac_verdicts, mirroring MAX_FINDINGS's shape
+// rather than its expected frequency of use.
+export const MAX_AC_VERDICTS = 200
+
 const KINDS = ['tdd_task', 'review_cycle', 'plan_cycle', 'conduct_plan_event']
 const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
@@ -141,6 +145,23 @@ export const LEDGER_ENTRY_SCHEMA = {
           severity: { type: 'string', enum: SEVERITIES },
           ac_id: { type: ['string', 'null'], pattern: '^AC-[A-Z]+-[0-9]+$' },
           disposition: { type: 'string', enum: DISPOSITIONS },
+        },
+      },
+    },
+    // H4: AC verdicts, collected from every lens's structured response
+    // (review-cycle.js), were computed and then simply discarded -- no
+    // field existed to hold them, so "which ACs never fail" had no data
+    // source at all. {ac_id, verdict} pairs only, same evidence-exclusion
+    // discipline as `findings` (AC-SEC-2: no free text, ever).
+    ac_verdicts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ac_id', 'verdict'],
+        properties: {
+          ac_id: { type: 'string', pattern: '^AC-[A-Z]+-[0-9]+$' },
+          verdict: { type: 'string', enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] },
         },
       },
     },
@@ -550,6 +571,14 @@ export function main() {
     write_ok: true,
     write_error: null,
   }
+  // H4: bounded defensively like `findings`, though in practice ac_verdicts
+  // is sized by the spec's own AC count times the lens roster -- a few
+  // dozen entries at most -- so this is a safety net against a pathological
+  // input, not a path expected to fire on a real run (unlike MAX_FINDINGS,
+  // which does fire routinely; no separate truncated-count field is kept
+  // for the same reason AC-SIMP-4 favours the simplest guard that closes
+  // the real risk).
+  if (Array.isArray(entry.ac_verdicts)) entry.ac_verdicts = entry.ac_verdicts.slice(0, MAX_AC_VERDICTS)
 
   const errors = validateEntry(entry)
   if (errors.length) {

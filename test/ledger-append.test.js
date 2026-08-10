@@ -770,6 +770,55 @@ test('ledger-append module: findings schema entries only carry lens, severity, a
   assert.equal(LEDGER_ENTRY_SCHEMA.properties.findings.items.additionalProperties, false)
 })
 
+// H4: AC verdicts were collected from every lens (review-cycle.js) and then
+// discarded -- LEDGER_ENTRY_SCHEMA had no field that could hold them, so
+// "which ACs never fail" had no data source. ac_verdicts carries {ac_id,
+// verdict} pairs ONLY (AC-SEC-2: no evidence text), same exclusion
+// discipline as `findings`.
+test('ledger-append module: LEDGER_ENTRY_SCHEMA declares ac_verdicts as a bounded array of {ac_id, verdict} pairs only, no evidence (H4, AC-SEC-2)', async () => {
+  const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
+  const acVerdictsSchema = LEDGER_ENTRY_SCHEMA.properties.ac_verdicts
+  assert.ok(acVerdictsSchema, 'expected an ac_verdicts property on the schema')
+  assert.equal(acVerdictsSchema.type, 'array')
+  const itemProps = Object.keys(acVerdictsSchema.items.properties)
+  assert.deepEqual(itemProps.sort(), ['ac_id', 'verdict'], 'ac_verdicts items must carry only ac_id and verdict, never evidence')
+  assert.equal(acVerdictsSchema.items.additionalProperties, false)
+  assert.deepEqual(acVerdictsSchema.items.properties.verdict.enum.sort(), ['FAIL', 'PASS', 'UNVERIFIABLE'])
+})
+
+test('ledger-append: ac_verdicts pairs survive to the written line verbatim (H4)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [
+      { ac_id: 'AC-SEC-3', verdict: 'FAIL' },
+      { ac_id: 'AC-QA-9', verdict: 'PASS' },
+    ],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.deepEqual(entry.ac_verdicts, [
+    { ac_id: 'AC-SEC-3', verdict: 'FAIL' },
+    { ac_id: 'AC-QA-9', verdict: 'PASS' },
+  ])
+})
+
+test('ledger-append: an ac_verdicts entry carrying an "evidence" key is rejected outright, not silently stripped (H4, AC-SEC-2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: 'AC-SEC-3', verdict: 'FAIL', evidence: 'a secret source line' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'an ac_verdicts entry with a disallowed property must fail validation, never write the evidence text')
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
 test('ledger-append module: MAX_LINE_BYTES is 16 KB (H3 round 2: 2048 made a realistic review round degrade to a ~221-byte envelope, discarding everything)', async () => {
   const { MAX_LINE_BYTES } = await import(APPEND_MODULE_URL)
   assert.equal(MAX_LINE_BYTES, 16384)

@@ -54,6 +54,10 @@ let rejectedFindingCount = null
 // produce findings that get fixed" (the spec's own first stated question)
 // is uncomputable no matter how the ledger is later read.
 let openFindingsRaw = []
+// H4: {ac_id, verdict} pairs aggregated from every lens's ac_verdicts --
+// previously collected here and then simply never reaching the ledger
+// payload, so "which ACs never fail" had no data source at all.
+let acVerdicts = []
 
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
@@ -259,7 +263,12 @@ const REVIEW_SCHEMA = {
       properties: { examined: { type: 'string' }, verified_by: { type: 'string' }, could_not_check: { type: 'string' } },
     },
     ac_verdicts: { type: 'array', items: { type: 'object', required: ['id', 'verdict', 'evidence'], properties: { id: { type: 'string' }, verdict: { type: 'string', enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] }, evidence: { type: 'string' } } } },
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'location', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' } } } },
+    // H4: ac_id was previously undeclared here, so a schema-following agent
+    // had no field inviting it to attribute an individual finding to an AC
+    // -- finding-to-AC attribution was always null downstream, not because
+    // the aggregation code couldn't carry a value through, but because no
+    // lens was ever told this field existed to fill in.
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'location', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
   },
 }
 
@@ -302,6 +311,13 @@ if (!lensReports.length) return { report: 'Every lens agent failed or was stoppe
 // previously never recorded at all.
 openFindingsRaw = lensReports.flatMap(r =>
   (r.findings || []).map(f => ({ lens: r.lens, location: f.location, claim: f.claim, severity: f.severity, ac_id: f.ac_id || null }))
+)
+
+// H4: {ac_id, verdict} ONLY -- evidence text is dropped here, before the
+// payload is ever built, preserving the same AC-SEC-2 exclusion the
+// findings pipeline already holds to.
+acVerdicts = lensReports.flatMap(r =>
+  (r.ac_verdicts || []).map(v => ({ ac_id: v.id, verdict: v.verdict }))
 )
 
 // AC-SIMP constraints are mechanical: checked directly against the diff, not by an agent lens (harness rule)
@@ -396,6 +412,10 @@ const telemetry = {
   spec_bug_count: specBugCount,
   rejected_finding_count: rejectedFindingCount,
   budget_spent: readBudgetSpent(),
+  // H4: already shaped as {ac_id, verdict} pairs (see acVerdicts above), so
+  // -- unlike spec_bugs/rejected_findings/open_findings -- it needs no
+  // further processing by ledger-append.mjs and rides in telemetry proper.
+  ac_verdicts: acVerdicts,
 }
 // spec_bugs/rejected_findings ride along as raw descriptors for
 // ledger-append.mjs to hash into finding ids; they are NOT part of the

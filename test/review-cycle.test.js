@@ -257,3 +257,70 @@ test('review-cycle.js: a CLEAN run with no findings from any lens sends an empty
   const payload = extractLedgerPayload(terminalCall.prompt)
   assert.deepEqual(payload.open_findings, [])
 })
+
+// H4: AC verdicts were collected from every lens (each lens's structured
+// response already carries ac_verdicts, per REVIEW_SCHEMA) and then simply
+// discarded -- never reaching the ledger payload at all, so "which ACs
+// never fail" had no data source downstream.
+test('review-cycle.js: every lens\'s ac_verdicts are aggregated into the ledger payload as {ac_id, verdict} pairs, with evidence text stripped (H4)', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-security': {
+        verdict: 'FINDINGS',
+        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+        findings: [],
+        ac_verdicts: [{ id: 'AC-SEC-3', verdict: 'FAIL', evidence: 'a secret quoted source line' }],
+      },
+      'lens-qa': {
+        verdict: 'CLEAN',
+        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+        findings: [],
+        ac_verdicts: [{ id: 'AC-QA-3', verdict: 'PASS', evidence: 'another secret line' }],
+      },
+    }),
+  })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.ok(Array.isArray(payload.ac_verdicts), 'expected an ac_verdicts array in the terminal payload')
+  assert.deepEqual(
+    payload.ac_verdicts.slice().sort((a, b) => a.ac_id.localeCompare(b.ac_id)),
+    [
+      { ac_id: 'AC-QA-3', verdict: 'PASS' },
+      { ac_id: 'AC-SEC-3', verdict: 'FAIL' },
+    ]
+  )
+  const serialised = JSON.stringify(payload.ac_verdicts)
+  assert.ok(!serialised.includes('secret'), 'evidence text must never reach the ledger payload (AC-SEC-2)')
+})
+
+test('review-cycle.js: a run where no lens returns ac_verdicts sends an empty ac_verdicts array, not null (a real measured zero)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.deepEqual(payload.ac_verdicts, [])
+})
+
+test('review-cycle.js: the schema each lens is called with declares ac_id on a finding, so a schema-following agent is actually invited to attribute a finding to an AC (H4: previously undeclared, so f.ac_id || null at the aggregation site was always null in practice, even though the JS itself would have carried a supplied value through)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const lensCall = calls.find((c) => c.opts.label === 'lens-security')
+  assert.ok(lensCall, 'expected a lens-security call')
+  const findingProps = lensCall.opts.schema.properties.findings.items.properties
+  assert.ok('ac_id' in findingProps, 'the findings schema each lens is called with must declare ac_id')
+})
+
+test('review-cycle.js: a finding\'s ac_id survives into open_findings when a lens supplies one, instead of always being null (H4)', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-security': {
+        verdict: 'FINDINGS',
+        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+        findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-3' }],
+      },
+    }),
+  })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.open_findings[0].ac_id, 'AC-SEC-3', 'a lens-supplied ac_id must survive, not be discarded to null')
+})
