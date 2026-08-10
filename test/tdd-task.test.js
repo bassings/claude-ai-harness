@@ -242,6 +242,16 @@ test('tdd-task.js: telemetry.budget_spent reflects budget.spent() when supplied'
   assert.equal(result.telemetry.budget_spent, 5000)
 })
 
+test('tdd-task.js: telemetry.budget_spent is null (not 0) when budget.spent() throws, and the verdict is unchanged (L2: this branch lost its only test in the no-imports rework, when readBudgetSpent was inlined out of the deleted workflows/lib/ledger.mjs)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { task: 'do the thing' },
+    agent: DONE_AGENT,
+    budget: { spent: () => { throw new Error('budget backend unavailable') } },
+  })
+  assert.equal(result.telemetry.budget_spent, null)
+  assert.equal(result.verdict, 'DONE')
+})
+
 test('tdd-task.js: the terminal ledger write requests reuse of the start write\'s run_id (AC-DATA-5 pairing)', async () => {
   const { calls } = await runWorkflow(WF, {
     args: { task: 'x' },
