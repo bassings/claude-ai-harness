@@ -173,7 +173,8 @@ copy the hook and add to `~/.claude/settings.json`:
 
 ## Run ledger
 
-Every conducted `tdd-task`, `review-cycle` and `plan-cycle` run appends two
+Every `tdd-task`, `review-cycle` and `plan-cycle` run -- conducted or
+invoked directly, there is no way to opt a single run out -- appends two
 JSON lines to `.claude/harness-ledger.jsonl` **inside the repo the workflow
 ran against** (the main checkout root, never a worktree): a `started` record
 before any work begins and a terminal record after, sharing a `run_id`, so a
@@ -232,7 +233,7 @@ invoking real subagents.
 | `workflows/lib/ledger-append.mjs` | Real-Node script (invoked via Bash, never imported: workflow scripts cannot import) owning the ledger envelope schema, path resolution, gitignore-ensure and the atomic single-line append; invoked by all three workflows above |
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
-| `test/` | This repo's own test suite (`node --test test/`); see "Tests" above |
+| `test/` | This repo's own test suite (`node --test test/*.test.js`); see "Tests" above |
 
 ## Cost and proportionality
 
