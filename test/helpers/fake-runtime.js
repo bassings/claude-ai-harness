@@ -52,15 +52,49 @@ function getValidateEntry() {
   return validateEntryPromise
 }
 
-// Static rejection patterns, matched against the source with `//` line
-// comments stripped first so a script may still MENTION these patterns in
-// prose without being rejected (only executable code is checked).
+// Round 3 LOW (speculative, reviewer-verification): this is a BEST-EFFORT
+// approximation of the production dynamic-workflow runtime's static
+// rejection check, matched by regex against source text -- not an AST or
+// evaluation-based check, because the spec states production rejects these
+// constructs "statically at submission" but does not pin the mechanism it
+// uses, and this helper cannot probe the live production runtime from a
+// test's own process. It fails CLOSED on a `//` comment mention (stripped
+// before matching, so a script may document these patterns in prose
+// without being rejected) but is inherently unable to catch every possible
+// obfuscation (e.g. re-deriving the literal strings "Date"/"import" via
+// string concatenation or Unicode escapes, or reaching them through
+// `globalThis`/`this` indirection). Accepted as a residual risk: the three
+// real workflow scripts in this repo are clean (confirmed by grep finding
+// zero mentions of "Date" or "Math" in any of them), so nothing ships
+// broken today; the risk is a future workflow author writing an obfuscated
+// form this regex set does not recognise. Re-derive this list whenever the
+// production rejection mechanism is re-probed, rather than assuming it
+// stays regex-shaped forever.
+//
+// Widened past the literal call forms (Date.now(), new Date(),
+// Math.random()) to also catch the cheapest real obfuscations: Date
+// accessed via bracket notation or aliased through a variable before being
+// called (a bare `Date` token, since there is no legitimate reason for a
+// workflow script to reference the Date class at all), and Math.random
+// aliased through a variable before being called (`Math.random` as a bare
+// property access, not requiring an immediate `(`). Math is NOT banned as
+// a bare token -- only Math.random specifically -- since Math.floor,
+// Math.max and similar ARE legitimate and are not restricted by the
+// runtime; banning the whole Math object would be a real false positive
+// against future legitimate code, not just today's three scripts.
+// "import used as a bare identifier" (also named in the finding) was
+// deliberately NOT added: `import` is a reserved word in JS syntax, so
+// `const i = import` is a SyntaxError, not valid code that could ever
+// reach this check -- there is no cheap, meaningful token-level guard to
+// add for a bypass that the language itself does not allow.
 const REJECTIONS = [
   { name: 'a static import declaration', re: /^\s*import\b/m },
   { name: 'a dynamic import() call', re: /\bimport\s*\(/ },
   { name: 'Date.now()', re: /\bDate\.now\s*\(/ },
   { name: 'new Date(...)', re: /\bnew\s+Date\s*\(/ },
   { name: 'Math.random()', re: /\bMath\.random\s*\(/ },
+  { name: 'a bare reference to Date (bracket access or aliasing can reach Date.now() without matching the literal call forms above)', re: /\bDate\b/ },
+  { name: 'Math.random accessed without an immediate call (aliasing through a variable can reach it without matching the literal call form above)', re: /\bMath\.random\b/ },
 ]
 
 function stripLineComments(source) {

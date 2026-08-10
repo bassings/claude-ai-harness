@@ -100,6 +100,40 @@ test('runWorkflow does NOT reject a script that only mentions these patterns ins
   assert.equal(result.verdict, 'DONE')
 })
 
+// Round 3 LOW (speculative): the original patterns matched only the exact
+// literal call forms (Date.now(), new Date(), Math.random()). A script
+// reaching the same banned APIs through bracket access or an aliased
+// reference matched none of them, so it would load green here even though
+// the spec says production statically rejects any use of these APIs.
+// Widened cheaply (token-level, not a full AST) after confirming no false
+// positive against the three real workflow scripts (grep found zero
+// mentions of "Date" or "Math" in any of them).
+test('runWorkflow rejects Date accessed via bracket notation (Date[\'now\']())', async () => {
+  await assert.rejects(
+    () => runWorkflow(path.join(__dirname, 'fixtures', 'rejects-date-bracket-access.js'), { args: {}, agent: {} }),
+    /Date/
+  )
+})
+
+test('runWorkflow rejects Date aliased through a variable before being called (const D = Date; D.now())', async () => {
+  await assert.rejects(
+    () => runWorkflow(path.join(__dirname, 'fixtures', 'rejects-date-aliased.js'), { args: {}, agent: {} }),
+    /Date/
+  )
+})
+
+test('runWorkflow rejects Math.random aliased through a variable before being called (const r = Math.random; r())', async () => {
+  await assert.rejects(
+    () => runWorkflow(path.join(__dirname, 'fixtures', 'rejects-math-random-aliased.js'), { args: {}, agent: {} }),
+    /Math\.random/
+  )
+})
+
+test('runWorkflow does NOT reject Math.floor or other non-random Math methods (the widened check targets Math.random specifically, not the whole Math object)', async () => {
+  const { result } = await runWorkflow(path.join(__dirname, 'fixtures', 'uses-math-floor-legitimately.js'), { args: {}, agent: {} })
+  assert.equal(result.verdict, 'DONE')
+})
+
 
 // L3: the fake agent stub previously ignored a workflow's declared
 // `schema` entirely, so a fixture violating the schema the real runtime
