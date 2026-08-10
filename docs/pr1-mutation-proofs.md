@@ -3,11 +3,13 @@
 Per AC-QA-3 and standard §11: for the guards below, the guarded behaviour was
 actually broken (edited in the working file, not "mentally mutated"), the
 suite was run, the exact failing test and message recorded, and the file was
-then restored and the suite re-run green. Seventeen proofs were executed in
-this session (11 in the first pass, 6 more -- 5 re-verifications plus one new
-guard -- in the "Rework" section below, after a coordinator probe found
-workflow scripts cannot import anything in production); the commands and
-output are reproduced from those runs.
+then restored and the suite re-run green. Thirty-five proofs were executed
+across two passes: 17 in the initial build (11 in the first pass, 6 more --
+5 re-verifications plus one new guard -- in the "Rework" section, after a
+coordinator probe found workflow scripts cannot import anything in
+production), and 18 more (proofs 18-35) in the "Review remediation round 1"
+section, fixing every finding from a full multi-lens review (1 Critical,
+5 High, 9 Medium, 6 Low -- 21 findings, all fixed, none rejected).
 
 **Proofs 1, 6 and 7 below reference `workflows/lib/ledger.mjs`, which no
 longer exists**: that was accurate at the time each proof was first run, and
@@ -16,10 +18,11 @@ is left as the historical record of when each guard was first proven. The
 now, and re-proves the ones that moved.
 
 Restoration was verified after every mutation by re-running the affected
-test file(s) (the full suite is `node --test test/*.test.js`, 85/85 as of
-the last commit in this worktree) and by `grep -rn "MUTATION"` across
-`workflows/`, `test/`, `skills/`, `AGENT-HARNESS.md` and `README.md`
-returning nothing (no mutation marker left behind).
+test file(s) (the full suite is `node --test test/*.test.js`, 128/128 as of
+the last commit in this worktree, stable across repeated runs and a clean
+clone) and by `grep -rn "MUTATION"` across `workflows/`, `test/`, `skills/`,
+`AGENT-HARNESS.md` and `README.md` returning nothing (no mutation marker
+left behind).
 
 ## 1. `additionalProperties:false` enforcement — `workflows/lib/ledger.mjs` `validateEntry`
 
@@ -328,12 +331,135 @@ committed since -- which cannot be assumed mid-task. No data was lost in
 the final result, but it is exactly the kind of mistake that would have
 been unrecoverable without the file's content still being available.
 
+## Review remediation round 1 (proofs 18-30)
+
+The full multi-lens review (1 Critical, 5 High, 9 Medium, 6 Low) found real
+guard-vacuity holes in the eleven-plus-six proofs above, most pointedly C1
+(a validation bug that silently dropped two of four ledger record kinds,
+which shipped past all 85 tests because none of them ever piped a
+non-empty `lenses_run` into the real script) and H4 (the tdd-task
+terminal-verdict loop only ever asserted "the outcome is one of
+done/blocked/aborted", which every verdict satisfies). Every finding
+(C1; H1-H5; M1-M9; L1-L6, 21 total) was fixed, not rejected. Full detail
+and reasoning is in each fix's own commit message; this section is the
+proof ledger's continuation, not a duplicate of it.
+
+**18. C1 — `validateEntry`'s array-of-string branch.** Forced the
+object-recursion path unconditionally (`if (true)` instead of the
+items-schema type check). The two H3 seam tests for `review_cycle` and
+`plan_cycle` failed with the exact "expected an object" message from the
+finding's own evidence; `tdd_task` and `conduct_plan_event` (no
+array-of-string fields) still passed, also matching. Reverted.
+
+**19. H1 — shell-injection via unescaped payload in the ledger-write
+prompt.** Proven by direct reproduction rather than a synthetic mutation:
+the exact backtick example command from a real `review-cycle.js` prompt,
+run verbatim (substituting the shown payload the way a compliant agent
+would), created a marker file before the base64 fix and did not after.
+See `test/shell-injection.test.js`.
+
+**20. H2 — `redactPaths` not called on `spec`/`task`.** Both call sites
+disabled; the AC-SEC-3 fixture's three new H2 tests failed with the exact
+"must not contain an absolute /home/ path" message the finding's own
+evidence used. Reverted.
+
+**21. L6 — `stripRoot` not called on `write_error`.** Reverted to bare
+`e.message`; the dedicated L6 test failed, showing the real absolute
+temp-repo path in `write_error`. Reverted.
+
+**22. H4 — the two mutations named in the finding, reproduced verbatim
+against production `tdd-task.js`.** `if (green.hashes_match === false)`
+deleted (M1 in the finding) and the exhausted-implement `BLOCKED` changed
+to `ABORTED` (M2 in the finding): both now caught by the per-case
+`expect` verdict and the two new dedicated tests, both with the finding's
+own consequence (a mutant proceeds to commit, or returns the wrong
+verdict). Reverted.
+
+**23. H5 — `openFindingsRaw` computation, at both ends.**
+`review-cycle.js`'s accumulator emptied: the open_findings test failed
+(`0 !== 1`). `ledger-append.mjs`'s `computeFindings(payload.open_findings,
+'open')` stubbed to a constant empty result: the two ledger-append H5
+tests failed on entry count. Reverted both.
+
+**24. M1 — `trigger_counts['lens-product']` reverted to `specHit.length`.**
+The exact reproduction test (a UI-only diff triggering lens-product via
+`uiHit`) failed with `0 !== 1`, the finding's own shape. Reverted.
+
+**25. M4 — `round_key` hardcoded to the fixture's own SHA constant.** The
+mutant's chosen literal (`'abcdef1234567890'`) deliberately matches the
+fixture's default SHA, reproducing exactly why the ORIGINAL test survived
+this class of mutant; the NEW test (a second run at a different SHA) still
+caught it. Reverted.
+
+**26. M5 — `ts` hardcoded to `'not-a-timestamp'`.** Both new M5 tests
+(format/parse/proximity and monotonicity) failed. Reverted.
+
+**27. M6 — the `pattern` check in `validateEntry` disabled.** Both canary
+tests (a "secret sk-live-CANARY..." lens, a quoted-source-line ac_id)
+reverted to passing through unrejected. Reverted.
+
+**28. M7 — `ensureGitignored` reverted to `path.join(root, '.gitignore')`.**
+The committed-`.gitignore` fixture failed with the exact evidence from the
+finding: the tracked file gained the ledger line and `git status` was no
+longer empty. Reverted.
+
+**29. L2 — the throwing-`budget.spent()` catch branch in
+`readBudgetSpent` changed to return `0`.** The new L2 test failed with
+`0 !== null`. Reverted.
+
+**30. L3 — the schema-validation call in `makeAgentStub` disabled.** The
+"missing required field" test, driven against tdd-task.js's real
+`write-test` schema, stopped rejecting the malformed fixture. Reverted.
+Running the FULL suite after this one (not just its own test file)
+surfaced a genuine second-order effect worth recording here as much as in
+the commit: `review-cycle.js`'s own AC-QA-13 test deliberately scripts a
+synthesis response the real schema forbids (to exercise defensive
+fallback code), and the newly-strict stub correctly refused to construct
+that fixture too -- not a bug in the L3 fix, but a real design tension
+between "enforce schemas strictly" and "test defence-in-depth against a
+schema violation". Resolved with a documented, explicit opt-out
+(`__bypassSchemaValidation: true`) rather than silently loosening the
+check for everyone.
+
+**31-33. M2 — three separate mechanisms, three separate mutations.**
+Byte- vs character-based truncation: reverted `truncateBytes` to
+`truncate` at the `TRUNCATABLE_FIELDS` call site. The FIRST version of
+this test (a single multibyte field) did not catch it -- a single field
+character-truncated to 500 tops out at 1500 bytes, comfortably under the
+2048 cap regardless of which truncation function ran, so that test was
+itself a surviving mutant, found and fixed before trusting the "M2 done"
+claim: the corrected test uses TWO maxed-out fields (`task` and `spec`)
+totalling 3000 bytes under character-truncation, only then genuinely
+distinguishing the two behaviours. Findings bounding: `MAX_FINDINGS`
+slicing removed; the dedicated bounding test failed because the
+now-unbounded record had to degrade instead of fitting. Degrade-to-
+minimal: the whole `if (...) { ... }` overflow-handling block disabled;
+the degrade test failed with `entry.degraded === undefined`. All three
+reverted.
+
+**34-35. M3 — the conditional-required rule and the dedup-skip, separately.**
+`requiredWhen: []`: the missing-event_key test, which had been passing,
+failed. Dedup-skip block gated behind `if (false && ...)`: the
+duplicate-replay test failed, no longer reporting `duplicate: true`. Both
+reverted.
+
+Every mutation above was confirmed applied (via the failing test's message
+matching the intended defect, not just "some test failed"), confirmed
+reverted (via `git diff --stat` on the touched file showing only the
+intended, committed change), and the full suite re-run green after each
+revert -- 128/128 as of the last commit in this round, stable across
+repeated runs including from a fresh clean clone.
+
 ## Caveat
 
-These eleven cover the guards judged highest-risk (data integrity, injection
-safety, the single-write-path invariant, the RED/GREEN control-flow
-invariant, and null-vs-zero telemetry correctness) rather than every
-assertion in the suite. Mutation #5 is the one genuine finding: it is left in
-this document rather than quietly fixed and forgotten, because a surviving
-mutant that gets patched without a record is exactly the kind of near-miss
-this process exists to catch.
+Thirty-five proofs across two passes cover the guards judged highest-risk
+(data integrity, injection safety, the single-write-path invariant, the
+RED/GREEN control-flow invariant, null-vs-zero telemetry correctness, and
+every finding from the full multi-lens review) rather than every assertion
+in the suite. Two genuine findings are left in this document rather than
+quietly fixed and forgotten, because a surviving mutant that gets patched
+without a record is exactly the kind of near-miss this process exists to
+catch: mutation #5 (the original RED-gate two-condition gap) and the M2
+byte-truncation test's own first version (documented under proofs 31-33
+above), which was itself a surviving mutant against a single-field fixture
+before being strengthened to a genuinely discriminating two-field one.
