@@ -187,4 +187,9 @@ async function runWorkflow(filePath, options = {}) {
   return { result, calls, logs, phases }
 }
 
-module.exports = { runWorkflow, makeAgentStub }
+// L6: makeAgentStub used to be exported too, but no test file ever imports
+// it directly -- every test goes through runWorkflow, which calls it
+// internally. The export was dead code kept looking live only by its own
+// name being visible here; the function itself stays (runWorkflow needs
+// it), only the unused export path is removed.
+module.exports = { runWorkflow }

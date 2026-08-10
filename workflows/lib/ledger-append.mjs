@@ -220,21 +220,19 @@ export function findingId(lens, location, claim) {
   return hash.slice(0, 16)
 }
 
-// Bounds a free-text field to `max` characters. Passes null/undefined
+// L6: a character-based truncate() lived here until this round -- superseded
+// by truncateBytes below (M2: MAX_LINE_BYTES is a BYTE cap, and a
+// character-based bound could still push a line over it on its own with
+// multibyte input) and never called anywhere in the real write path even
+// before that, kept alive only by its own direct unit test. Deleted, along
+// with that test, rather than left as dead code that looks live.
+//
+// Bounds a free-text field to `maxBytes` UTF-8 bytes. Passes null/undefined
 // through unchanged so "field not supplied" stays distinguishable from
-// "field supplied and empty" (AC-DATA-3's truncation clause).
-export function truncate(value, max) {
-  if (value === null || value === undefined) return value
-  const s = String(value)
-  return s.length > max ? s.slice(0, max) : s
-}
-
-// M2: MAX_LINE_BYTES is a BYTE cap, but the previous truncate() bounded by
-// character count, so 500 multibyte characters (e.g. 500 * 3-byte UTF-8
-// characters = 1500 bytes) could still push a line over the limit on its
-// own. Trims one character at a time (safe against splitting a surrogate
-// pair mid-character, unlike slicing the encoded Buffer directly) until
-// the UTF-8 byte length fits.
+// "field supplied and empty" (AC-DATA-3's truncation clause). Trims one
+// character at a time (safe against splitting a surrogate pair
+// mid-character, unlike slicing the encoded Buffer directly) until the
+// UTF-8 byte length fits.
 export function truncateBytes(value, maxBytes) {
   if (value === null || value === undefined) return value
   let s = String(value)

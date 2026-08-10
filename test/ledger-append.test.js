@@ -748,14 +748,6 @@ test('ledger-append module: findingId differs across lenses for identical locati
   assert.notEqual(findingId('lens-security', 'foo.js:10', 'same'), findingId('lens-qa', 'foo.js:10', 'same'))
 })
 
-test('ledger-append module: truncate bounds long strings and passes null/undefined through unchanged', async () => {
-  const { truncate } = await import(APPEND_MODULE_URL)
-  assert.equal(truncate('short', 100), 'short')
-  assert.ok(truncate('x'.repeat(1000), 50).length <= 50)
-  assert.equal(truncate(null, 10), null)
-  assert.equal(truncate(undefined, 10), undefined)
-})
-
 test('ledger-append module: validateEntry rejects an entry with an unknown top-level property (additionalProperties:false, AC-SEC-2)', async () => {
   const { validateEntry } = await import(APPEND_MODULE_URL)
   const entry = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'tdd_task', outcome: 'done', write_ok: true, write_error: null, evidence: 'leak' }
