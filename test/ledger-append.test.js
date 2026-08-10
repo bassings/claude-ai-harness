@@ -180,6 +180,96 @@ test('ledger-append: free-text fields are truncated to MAX_LINE_BYTES before the
   assert.ok(byteLen <= 2048, `line was ${byteLen} bytes`)
 })
 
+test('ledger-append: truncation is BYTE-based, not character-based, so two multibyte fields together cannot push the line over the cap (M2)', () => {
+  const repo = makeTempRepo()
+  // Each character here is 3 bytes in UTF-8 (the maximum for a single
+  // UTF-16 code unit), so a single field character-truncated to 500 caps
+  // at 1500 bytes -- comfortably under 2048 alone, which is exactly why a
+  // single-field test does not distinguish byte- from character-based
+  // truncation. TWO such fields character-truncated to 500 each total
+  // 3000 bytes, reliably over the cap regardless of a small envelope;
+  // byte-truncated to 500 BYTES each, they total ~1000 bytes, comfortably
+  // under it.
+  const task = 'あ'.repeat(2000)
+  const spec = 'い'.repeat(2000)
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', task, spec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assert.ok(Buffer.byteLength(line, 'utf8') <= 2048, `line was ${Buffer.byteLength(line, 'utf8')} bytes`)
+  const entry = JSON.parse(line)
+  assert.ok(!entry.degraded, 'byte-based truncation of both fields must be enough to fit without degrading')
+  // the truncated fields must still be valid, well-formed text (no lone
+  // surrogate / replacement-character corruption from an unsafe byte slice)
+  assert.doesNotThrow(() => Buffer.from(entry.task, 'utf8').toString('utf8'))
+  assert.doesNotThrow(() => Buffer.from(entry.spec, 'utf8').toString('utf8'))
+})
+
+test('ledger-append: a findings array beyond the stated bound is truncated, with findings_truncated recording exactly how many were dropped (M2)', () => {
+  const repo = makeTempRepo()
+  // A minimal envelope (no verdicts/trigger_counts padding) so the bounded
+  // result reliably fits under MAX_LINE_BYTES and this test proves the
+  // bounding behaviour distinctly from the separate degrade-to-minimal path.
+  const many = Array.from({ length: 20 }, () => ({ lens: 'lens-qa', location: 'f.js:1', claim: 'x' }))
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: many })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(!entry.degraded, 'this fixture must fit within MAX_LINE_BYTES once bounded, proving the bounding path distinctly from the degrade path')
+  assert.ok(entry.findings.length < 20, 'the findings array must be bounded, not all 20 entries')
+  assert.equal(typeof entry.findings_truncated, 'number')
+  assert.equal(entry.findings.length + entry.findings_truncated, 20, 'kept + dropped must account for every finding')
+  assert.ok(entry.findings_truncated > 0)
+})
+
+test('ledger-append: findings_truncated is a real zero (not null) when findings were computed and none were dropped (M2)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'x' }] })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings_truncated, 0)
+})
+
+test('ledger-append: findings_truncated is absent/null when no finding arrays were supplied at all (tdd_task has no findings concept)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.findings_truncated === null || entry.findings_truncated === undefined)
+})
+
+test('ledger-append: when the record still cannot fit even after truncating text and bounding findings, it degrades to a minimal valid record instead of dropping the whole line (M2)', () => {
+  const repo = makeTempRepo()
+  // Even 20 bounded findings at full-length ids/lens/severity/disposition
+  // plus a large verdicts/trigger_counts object can still be built to
+  // exceed the cap; construct a payload designed to do exactly that.
+  const many = Array.from({ length: 100 }, (_, i) => ({ lens: 'lens-security', location: `f${i}.js:1`, claim: `finding number ${i} with some extra descriptive text to pad it out` }))
+  const verdicts = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`lens-fake-${i}`, 'FINDINGS']))
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: many,
+    verdicts,
+    trigger_counts: verdicts,
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected a degraded record to still be written: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'exactly one line must be written, not zero')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.degraded, true)
+  assert.equal(entry.kind, 'review_cycle')
+  assert.equal(entry.outcome, 'done')
+  assert.ok(entry.run_id && entry.ts && entry.repo)
+  assert.ok(Buffer.byteLength(lines[0], 'utf8') <= 2048)
+})
+
+test('ledger-append: an ordinary well-formed record is NOT marked degraded (M2, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'a normal task' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.degraded === undefined || entry.degraded === null)
+})
+
 test('ledger-append: a write failure (ledger path occupied by a directory) never throws; reports write_ok false with a reason (AC-QA-7)', () => {
   const repo = makeTempRepo()
   fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })

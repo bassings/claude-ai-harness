@@ -53,6 +53,14 @@ export const LEDGER_RELATIVE_PATH = '.claude/harness-ledger.jsonl'
 // free-text fields are truncated to fit before the line is ever built.
 export const MAX_LINE_BYTES = 2048
 
+// M2: a stated bound on the findings array, so a run with an unusually
+// large number of findings (a 7-lens envelope, or open_findings covering
+// every finding every lens reported, H5) degrades gracefully -- the
+// findings that DID fit are kept and findings_truncated records the rest,
+// rather than the whole line silently failing to write once the count
+// alone pushes it over MAX_LINE_BYTES.
+export const MAX_FINDINGS = 15
+
 const KINDS = ['tdd_task', 'review_cycle', 'plan_cycle', 'conduct_plan_event']
 const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
@@ -110,6 +118,11 @@ export const LEDGER_ENTRY_SCHEMA = {
     },
     spec_bug_count: { type: ['integer', 'null'] },
     rejected_finding_count: { type: ['integer', 'null'] },
+    // M2: how many findings were computed but dropped to keep `findings`
+    // within MAX_FINDINGS -- an integer (a real, measured 0 when nothing
+    // was dropped) when finding arrays were supplied at all, null when
+    // they were not (a kind with no findings concept, e.g. tdd_task).
+    findings_truncated: { type: ['integer', 'null'] },
     rounds: { type: ['object', 'null'] },
     budget_spent: { type: ['number', 'null'] },
     // conduct_plan_event only: which state transition this line records, and
@@ -117,6 +130,12 @@ export const LEDGER_ENTRY_SCHEMA = {
     // already-recorded event does not double-count it (AC-QA-9).
     event: { type: ['string', 'null'] },
     event_key: { type: ['string', 'null'] },
+    // M2: true only when the record had to be shrunk to the minimal
+    // envelope-only form because it still exceeded MAX_LINE_BYTES even
+    // after byte-truncating free text and bounding findings -- absent/null
+    // on an ordinary record, never false (unmeasured is not "definitely not
+    // degraded", it is "no degradation was needed to decide").
+    degraded: { type: ['boolean', 'null'] },
     write_ok: { type: 'boolean' },
     write_error: { type: ['string', 'null'] },
   },
@@ -144,6 +163,21 @@ export function truncate(value, max) {
   if (value === null || value === undefined) return value
   const s = String(value)
   return s.length > max ? s.slice(0, max) : s
+}
+
+// M2: MAX_LINE_BYTES is a BYTE cap, but the previous truncate() bounded by
+// character count, so 500 multibyte characters (e.g. 500 * 3-byte UTF-8
+// characters = 1500 bytes) could still push a line over the limit on its
+// own. Trims one character at a time (safe against splitting a surrogate
+// pair mid-character, unlike slicing the encoded Buffer directly) until
+// the UTF-8 byte length fits.
+export function truncateBytes(value, maxBytes) {
+  if (value === null || value === undefined) return value
+  let s = String(value)
+  while (Buffer.byteLength(s, 'utf8') > maxBytes) {
+    s = s.slice(0, -1)
+  }
+  return s
 }
 
 // A minimal, dependency-free structural validator against
@@ -351,8 +385,11 @@ export function main() {
 
   // Truncate free-text fields BEFORE validation/serialisation so an
   // oversized field cannot push the line over the single-write() bound.
+  // Byte-based (M2), not character-based: MAX_LINE_BYTES is a byte cap, and
+  // a field of multibyte characters could exceed it on its own even at a
+  // "reasonable" character count.
   for (const field of TRUNCATABLE_FIELDS) {
-    if (field in payload) payload[field] = truncate(payload[field], 500)
+    if (field in payload) payload[field] = truncateBytes(payload[field], 500)
   }
 
   // Finding computation (moved here from review-cycle.js: workflow scripts
@@ -367,9 +404,20 @@ export function main() {
   const rejected = computeFindings(payload.rejected_findings, 'rejected')
   const open = computeFindings(payload.open_findings, 'open')
   const { spec_bugs, rejected_findings, open_findings, ...restPayload } = payload
+  const allFindings = [...specBugs.entries, ...rejected.entries, ...open.entries]
+  // M2: bound the findings array at MAX_FINDINGS rather than letting an
+  // unusually finding-heavy run (a 7-lens envelope, or H5's open_findings
+  // covering every finding every lens reported) push the whole line over
+  // the byte cap by count alone; findings_truncated records exactly how
+  // many were dropped, a real measured number, never silently zero.
   const findingsFields =
     'spec_bugs' in payload || 'rejected_findings' in payload || 'open_findings' in payload
-      ? { findings: [...specBugs.entries, ...rejected.entries, ...open.entries], spec_bug_count: specBugs.count, rejected_finding_count: rejected.count }
+      ? {
+          findings: allFindings.slice(0, MAX_FINDINGS),
+          findings_truncated: Math.max(0, allFindings.length - MAX_FINDINGS),
+          spec_bug_count: specBugs.count,
+          rejected_finding_count: rejected.count,
+        }
       : {}
 
   const entry = {
@@ -388,9 +436,36 @@ export function main() {
     return result(run_id, ts, false, 'payload failed ledger schema validation: ' + errors.join('; '))
   }
 
-  const line = JSON.stringify(entry)
+  let line = JSON.stringify(entry)
   if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
-    return result(run_id, ts, false, `line exceeded MAX_LINE_BYTES (${MAX_LINE_BYTES}) even after truncation`)
+    // M2: even after byte-truncating free text and bounding findings to
+    // MAX_FINDINGS, the record can still be too large (many verdict/
+    // trigger_counts keys, for instance). Degrade to the minimal valid
+    // record -- envelope plus outcome plus a degraded flag -- rather than
+    // writing nothing: a run with an unusually large amount of data is
+    // exactly the run whose trace matters most downstream, not the one
+    // that should vanish from the ledger entirely.
+    const minimal = {
+      schema_version: entry.schema_version,
+      run_id: entry.run_id,
+      ts: entry.ts,
+      repo: entry.repo,
+      kind: entry.kind,
+      outcome: entry.outcome,
+      degraded: true,
+      write_ok: true,
+      write_error: null,
+    }
+    const minimalErrors = validateEntry(minimal)
+    if (minimalErrors.length) {
+      // Should not be reachable (the envelope fields are always small and
+      // already validated above), but never crash regardless.
+      return result(run_id, ts, false, `line exceeded MAX_LINE_BYTES (${MAX_LINE_BYTES}) even after degrading to a minimal record: ${minimalErrors.join('; ')}`)
+    }
+    line = JSON.stringify(minimal)
+    if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
+      return result(run_id, ts, false, `even the minimal degraded record exceeded MAX_LINE_BYTES (${MAX_LINE_BYTES})`)
+    }
   }
 
   try {
