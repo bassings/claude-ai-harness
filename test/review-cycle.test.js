@@ -233,6 +233,20 @@ test('review-cycle.js: lens-product\'s trigger_counts reflects only the files th
   assert.equal(result.telemetry.trigger_counts['lens-product'], 1, 'exactly one of the three changed files (foo.css) is in the ui surface')
 })
 
+// M6 (AC-QA-13 guard gap): the ONLY existing test of this path uses
+// __bypassSchemaValidation to simulate a malformed synthesis response --
+// which deliberately bypasses schema enforcement entirely, so it never
+// actually exercises whether spec_bugs/rejected_findings are genuinely
+// DECLARED REQUIRED on the schema itself (mutation: reducing required to
+// just ['report'] left 19/19 green). This reads the real schema object the
+// synthesis agent() call was made with, directly off the recorded call.
+test('review-cycle.js: the synthesis agent() call declares report, spec_bugs and rejected_findings as REQUIRED on its schema, not merely optional properties (M6, AC-QA-13)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
+  assert.ok(synthesisCall, 'expected a synthesis call')
+  assert.deepEqual(synthesisCall.opts.schema.required.slice().sort(), ['rejected_findings', 'report', 'spec_bugs'])
+})
+
 test('review-cycle.js: synthesis missing spec_bugs/rejected_findings fields is treated as a failed step, not a ledger line with silently empty arrays (AC-QA-13)', async () => {
   const { result } = await runWorkflow(WF, {
     args: {},
