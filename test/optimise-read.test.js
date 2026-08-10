@@ -317,6 +317,28 @@ test('optimise-read CLI: the ledger command\'s output includes a citationPool of
   assert.match(out.citationPool[0], /^[0-9a-f-]{36}$/, 'expected a real UUID run_id from the written ledger line')
 })
 
+// ---- escaped-defect counter-metric (AC-PROD-7): a stated, script-computed heuristic ----
+
+test('optimise-read: countEscapedDefectCandidates counts commit subjects matching the conventional "fix:" type deterministically, ignoring case and an optional scope, and states its own method/limitation', () => {
+  const commits = [
+    { sha: 'a1', subject: 'fix: repair the torn-line heal' },
+    { sha: 'a2', subject: 'Fix(ledger): handle a short write' },
+    { sha: 'a3', subject: 'feat: add the optimiser' },
+    { sha: 'a4', subject: 'fixture: not a fix, must not match on substring alone' },
+    { sha: 'a5', subject: 'docs: mention fix: in prose, must not match mid-string' },
+  ]
+  const result = mod.countEscapedDefectCandidates(commits)
+  assert.equal(result.count, 2)
+  assert.equal(result.n_commits_examined, 5)
+  assert.ok(/heuristic|proxy/i.test(result.method), 'must state this is a heuristic proxy, not a causal per-PR attribution')
+})
+
+test('optimise-read: countEscapedDefectCandidates on an empty commit list reports count:0 and n_commits_examined:0, never throwing', () => {
+  const result = mod.countEscapedDefectCandidates([])
+  assert.equal(result.count, 0)
+  assert.equal(result.n_commits_examined, 0)
+})
+
 // ---- stableProposalId (AC-DATA-10) ----
 
 test('optimise-read: stableProposalId is derived from the target descriptor, not wording -- two calls describing the same target with different prose yield the same id, and a genuinely different target yields a different id', () => {
@@ -347,6 +369,32 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <root>` reads a real led
   const statAfter = fs.statSync(ledgerPath)
   assert.ok(before.equals(after), 'the ledger file must be byte-identical after a read-only aggregation pass')
   assert.equal(statBefore.mtimeMs, statAfter.mtimeMs, 'the ledger mtime must be unchanged (no write touched it)')
+})
+
+test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal targets from stdin and returns a stable id per target, in order', () => {
+  const payload = { targets: [{ category: 'ci_demote', job_name: 'lint' }, { category: 'ci_demote', job_name: 'test' }] }
+  const res = spawnSync('node', [MODULE_PATH, 'ids'], { input: JSON.stringify(payload), encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.ids.length, 2)
+  assert.match(out.ids[0].proposal_id, /^[0-9a-f]{16}$/)
+  assert.notEqual(out.ids[0].proposal_id, out.ids[1].proposal_id)
+})
+
+test('optimise-read CLI: `node optimise-read.mjs escaped-defects` reads commits from stdin and returns the fix: count', () => {
+  const payload = { commits: [{ sha: 'a', subject: 'fix: repair a heal' }, { sha: 'b', subject: 'feat: add a thing' }] }
+  const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify(payload), encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.count, 1)
+  assert.equal(out.n_commits_examined, 2)
+})
+
+test('optimise-read CLI: an unknown command name is reported as an error, not a crash', () => {
+  const res = spawnSync('node', [MODULE_PATH, 'bogus-command'], { encoding: 'utf8' })
+  assert.equal(res.status, 0)
+  const out = JSON.parse(res.stdout.trim())
+  assert.ok(out.error)
 })
 
 test('optimise-read CLI: `node optimise-read.mjs ledger <root>` on a repo with no ledger file reports n:0 and does not create one (AC-QA-17 fixture at n=0)', () => {

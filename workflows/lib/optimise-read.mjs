@@ -369,6 +369,27 @@ export function citationPool(records, size = CITATION_POOL_SIZE) {
   return pool
 }
 
+// AC-PROD-7's escaped-defect counter-metric, derived from git history: a
+// deliberately named HEURISTIC PROXY, not a causal per-PR attribution --
+// counts commit subjects using the conventional-commit "fix:" type
+// (optionally scoped, e.g. "fix(ledger):"), which is the closest thing this
+// codebase's own commit convention (§6: "Conventional commits (feat:,
+// fix:, test:, docs:, refactor:)") gives for "a change that repaired
+// something already shipped" without requiring a real causal link back to
+// a specific merged PR, which nothing in the ledger or git history
+// captures today. Matches only at the START of the subject line (a commit
+// merely mentioning "fix:" in prose, e.g. a docs commit, must not count).
+const FIX_COMMIT_RE = /^fix(\([^)]*\))?:/i
+export function countEscapedDefectCandidates(commits) {
+  const list = Array.isArray(commits) ? commits : []
+  const count = list.filter((c) => c && typeof c.subject === 'string' && FIX_COMMIT_RE.test(c.subject.trim())).length
+  return {
+    count,
+    n_commits_examined: list.length,
+    method: 'heuristic proxy: count of commit subjects starting with the conventional-commit "fix:" type (optionally scoped) within the examined window -- NOT a verified causal attribution to a specific merged PR; a fix: commit unrelated to any recent proposal still counts, and a genuine escaped defect fixed under a different commit-message type is missed',
+  }
+}
+
 // A stable proposal id derived from the TARGET a proposal is about (never
 // its prose wording), so the same target re-proposed across cycles is
 // recognisable as the same proposal (AC-DATA-10). Real-Node sha256, same
@@ -474,7 +495,28 @@ export function main() {
     }
     return runCiCommand(payload)
   }
-  return { error: `unknown command "${command}"; expected "ledger" or "ci"` }
+  if (command === 'escaped-defects') {
+    const raw = readStdin()
+    let payload
+    try {
+      payload = raw.trim() ? JSON.parse(raw) : {}
+    } catch (e) {
+      return { error: 'stdin was not valid JSON: ' + e.message, count: null }
+    }
+    return countEscapedDefectCandidates(Array.isArray(payload && payload.commits) ? payload.commits : [])
+  }
+  if (command === 'ids') {
+    const raw = readStdin()
+    let payload
+    try {
+      payload = raw.trim() ? JSON.parse(raw) : {}
+    } catch (e) {
+      return { error: 'stdin was not valid JSON: ' + e.message, ids: [] }
+    }
+    const targets = Array.isArray(payload && payload.targets) ? payload.targets : []
+    return { ids: targets.map((target) => ({ target, proposal_id: stableProposalId(target) })) }
+  }
+  return { error: `unknown command "${command}"; expected "ledger", "ci", "escaped-defects" or "ids"` }
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
