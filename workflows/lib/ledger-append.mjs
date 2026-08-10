@@ -750,9 +750,56 @@ export function main() {
     // A single write() call, in append mode, of a line under MAX_LINE_BYTES:
     // POSIX guarantees this is atomic against other O_APPEND writers
     // (AC-DATA-3). Never read-modify-write.
-    const fd = fs.openSync(ledgerPath, 'a')
+    //
+    // HIGH round 3: a torn trailing line -- no final '\n', the state a torn
+    // write, power loss, or external truncation leaves -- previously fused
+    // with this record on append into one unparseable line, corrupting
+    // BOTH the interrupted record and this new healthy one, silently, with
+    // write_ok:true still returned. Mirrors the identical heal
+    // ensureGitignored already applies above to .git/info/exclude: read the
+    // last byte and prepend a healing '\n' first when the file is
+    // non-empty and does not already end in one. Opened 'a+' rather than
+    // 'a' so the same fd can both read that last byte (via fstat + read)
+    // and append -- 'a' alone is write-only and cannot read at all. The
+    // heal and the record are folded into ONE write() call (not two), so a
+    // crash mid-write still cannot leave a half-healed, half-appended
+    // state: either both land, or neither does.
+    const fd = fs.openSync(ledgerPath, 'a+')
     try {
-      fs.writeSync(fd, line + '\n')
+      let healPrefix = ''
+      const stats = fs.fstatSync(fd)
+      if (stats.size > 0) {
+        const lastByte = Buffer.alloc(1)
+        fs.readSync(fd, lastByte, 0, 1, stats.size - 1)
+        if (lastByte[0] !== 0x0a /* '\n' */) healPrefix = '\n'
+      }
+      // Byte length, not string length: MAX_LINE_BYTES and the short-write
+      // check below are both byte-based, and `line` may already contain
+      // multibyte UTF-8 (free text is truncated by byte length elsewhere,
+      // never by character count).
+      const buf = Buffer.from(healPrefix + line + '\n', 'utf8')
+      // Contributing cause named in the finding: fs.writeSync's return
+      // value (the actual bytes written) was previously never checked
+      // against the buffer it was asked to write. An ENOSPC short write
+      // near a full volume can succeed partially without throwing,
+      // leaving a torn trailing line yet reporting success -- exactly the
+      // corruption this whole fix exists to prevent, just from the write
+      // side instead of a pre-existing one.
+      const written = fs.writeSync(fd, buf)
+      if (written !== buf.length) {
+        // The partial bytes that DID land are themselves now a torn
+        // trailing line -- the exact corruption this whole fix exists to
+        // prevent, just self-inflicted by this failed attempt instead of a
+        // prior crash. Roll the file back to its size before this write
+        // (captured above as `stats.size`) so a short write never leaves
+        // new torn bytes behind for the next append to find.
+        try {
+          fs.ftruncateSync(fd, stats.size)
+        } catch (truncateError) {
+          // best-effort: report the original short-write failure either way
+        }
+        return result(run_id, ts, false, `short write to the ledger: wrote ${written} of ${buf.length} bytes (disk full?)`)
+      }
     } finally {
       fs.closeSync(fd)
     }

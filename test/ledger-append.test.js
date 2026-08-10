@@ -216,6 +216,112 @@ test('ledger-append: seeding 100 known lines then writing once leaves the first 
   assert.equal(lines.length, 101)
 })
 
+// HIGH round 3: a torn trailing line (no final '\n' -- the state a torn
+// write, power loss, or external truncation leaves) fuses with the NEXT
+// append into one unparseable line, silently losing BOTH the interrupted
+// record and the new healthy one, while still reporting write_ok:true. The
+// same file already heals this exact case for .git/info/exclude
+// (ensureGitignored's `const sep = contents.length && !contents.endsWith
+// ('\n') ? '\n' : ''`), so the pattern was known and simply not applied to
+// the ledger append itself.
+//
+// Sized to actually reproduce the fusion, not merely look torn: the seeded
+// final line is a real, valid, parseable JSON record with everything except
+// its trailing newline -- exactly the shape a real torn write leaves
+// (every byte up to the interrupted final byte was written).
+test('ledger-append: a torn trailing line (no final newline) is healed before appending -- every line still parses, and no record is fused into another (HIGH round 3, AC-DATA-3/AC-DATA-5)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  const tornLine = JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', run_id: 'torn-record' })
+  fs.writeFileSync(path.join(repo, LEDGER_REL), tornLine) // deliberately NO trailing '\n'
+
+  // Reproduce the fusion FIRST, against the raw bytes, before trusting the
+  // fix: this is exactly what a naive append would produce.
+  const naiveFusion = tornLine + JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', run_id: 'healthy-record' }) + '\n'
+  assert.throws(() => JSON.parse(naiveFusion.split('\n')[0]), 'sanity: the naive (unhealed) fusion must genuinely be unparseable, or this test proves nothing')
+
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', run_id: 'healthy-record' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+
+  const raw = fs.readFileSync(path.join(repo, LEDGER_REL), 'utf8')
+  const lines = raw.split('\n').filter(Boolean)
+  assert.equal(lines.length, 2, 'the torn record and the new record must both survive as two separate lines, not fuse into one')
+  const parsed = lines.map((l) => JSON.parse(l)) // throws if ANY line is unparseable
+  assert.equal(parsed[0].run_id, 'torn-record', 'the interrupted record must be recovered intact, not corrupted by the heal')
+  assert.equal(parsed[1].run_id, 'healthy-record', 'the new record must land as its own clean line')
+})
+
+test('ledger-append: a properly newline-terminated ledger is NOT healed (no spurious blank line inserted) -- the torn-line fix must not fire on the ordinary case (HIGH round 3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', run_id: 'first' })
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', run_id: 'second' })
+  const raw = fs.readFileSync(path.join(repo, LEDGER_REL), 'utf8')
+  assert.equal(raw.split('\n').filter(Boolean).length, 2)
+  assert.ok(!raw.includes('\n\n'), 'no spurious blank line from an unnecessary heal')
+})
+
+// HIGH round 3 (contributing cause): fs.writeSync's return value (the
+// actual byte count written) was never checked against the buffer it was
+// asked to write, so an ENOSPC-style SHORT write -- succeeding partially
+// without throwing -- would leave a torn trailing line yet still report
+// write_ok:true. A genuinely full disk cannot be constructed in this
+// sandbox, but `ulimit -f` (RLIMIT_FSIZE, the maximum size a process may
+// grow a file to) produces the identical OS-level behaviour on this
+// platform -- confirmed empirically before writing this test: a write()
+// past the limit returns a SHORT count rather than throwing or killing the
+// process. Calibrated rather than hardcoded, since the exact byte-to-block
+// conversion is platform-dependent.
+function runAppendWithFsizeLimit(cwd, payload, blocks) {
+  const { spawnSync } = require('node:child_process')
+  const script = `ulimit -f ${blocks}; exec node ${JSON.stringify(APPEND_SCRIPT)}`
+  return spawnSync('/bin/sh', ['-c', script], { cwd, input: JSON.stringify(payload), encoding: 'utf8' })
+}
+
+test('ledger-append: a SHORT write (fs.writeSync returns fewer bytes than requested, e.g. an ENOSPC-style near-full volume) is reported as write_ok:false, never silently as success (HIGH round 3, contributing cause)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  // A record comfortably over ~1 KB (confirmed empirically to actually
+  // exceed the smallest ulimit -f block boundaries tried below on this
+  // platform, unlike a single truncated 500-byte free-text field, which
+  // this test's first draft used and which never got truncated at any
+  // block size -- the whole record stayed under the limit's floor).
+  const payload = {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    trigger_counts: Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`lens-fake-${i}`, i])),
+  }
+
+  // Calibrate: find a block limit small enough that this exact payload's
+  // write is genuinely truncated (not merely rejected before writing
+  // anything, and not silently accepted in full).
+  let out
+  let found = false
+  for (const blocks of [1, 2, 3, 4, 6, 8, 12, 16, 24, 32]) {
+    fs.rmSync(path.join(repo, LEDGER_REL), { force: true })
+    const res = runAppendWithFsizeLimit(repo, payload, blocks)
+    const lastLine = res.stdout.trim().split('\n').pop()
+    let parsed
+    try {
+      parsed = JSON.parse(lastLine)
+    } catch (e) {
+      continue // this block size did not even let the script report cleanly; try the next
+    }
+    if (parsed.write_ok === false) {
+      out = parsed
+      found = true
+      break
+    }
+  }
+  assert.ok(found, 'calibration failed to reproduce a short write at any tried block limit -- this platform may not truncate writes past RLIMIT_FSIZE the way it was confirmed to')
+  assert.ok(out.write_error && /short write/i.test(out.write_error), `expected a short-write-specific reason: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  if (lines.length) {
+    assert.doesNotThrow(() => JSON.parse(lines[lines.length - 1]), 'a rejected short write must never leave a torn, unparseable trailing line for the NEXT append to find')
+  }
+})
+
 test('ledger-append: free-text fields are truncated to MAX_LINE_BYTES before the line is built (AC-DATA-3)', () => {
   const repo = makeTempRepo()
   const long = 'x'.repeat(10000)
