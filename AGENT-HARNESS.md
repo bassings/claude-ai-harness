@@ -26,7 +26,12 @@ and rounds to clean as structured data: that ledger is how the harness
 improves rather than merely runs. Retained indefinitely with no rotation;
 delete with `rm .claude/harness-ledger.jsonl`; export format is the file
 itself (newline-delimited JSON) -- see README.md's "Run ledger" section
-for the full field list.
+for the full field list. Each line's timestamp is an absolute wall-clock
+value, not a personal identifier on its own, and is required to compute
+the wall-clock durations (CI wait, human wait, rounds to clean) the
+ledger exists to measure. If a line is ever deliberately committed (an
+explicit opt-in; the file is untracked by default), it survives in git
+history like any other tracked change.
 
 ## Lens roster
 
