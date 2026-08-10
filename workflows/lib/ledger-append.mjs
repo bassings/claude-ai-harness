@@ -337,15 +337,20 @@ export function main() {
   }
 
   // Finding computation (moved here from review-cycle.js: workflow scripts
-  // have no node:crypto): raw spec_bugs/rejected_findings descriptors come
-  // in as data; schema-shaped {id, lens, severity, ac_id, disposition}
-  // entries go out.
+  // have no node:crypto): raw spec_bugs/rejected_findings/open_findings
+  // descriptors come in as data; schema-shaped {id, lens, severity, ac_id,
+  // disposition} entries go out. open_findings (H5) is every finding a
+  // lens actually reported, disposition 'open' -- without it, an accepted
+  // finding that later gets fixed leaves no trace on any ledger line, and
+  // "which lenses produce findings that get fixed" is uncomputable no
+  // matter how the ledger is read.
   const specBugs = computeFindings(payload.spec_bugs, 'spec_bug')
   const rejected = computeFindings(payload.rejected_findings, 'rejected')
-  const { spec_bugs, rejected_findings, ...restPayload } = payload
+  const open = computeFindings(payload.open_findings, 'open')
+  const { spec_bugs, rejected_findings, open_findings, ...restPayload } = payload
   const findingsFields =
-    'spec_bugs' in payload || 'rejected_findings' in payload
-      ? { findings: [...specBugs.entries, ...rejected.entries], spec_bug_count: specBugs.count, rejected_finding_count: rejected.count }
+    'spec_bugs' in payload || 'rejected_findings' in payload || 'open_findings' in payload
+      ? { findings: [...specBugs.entries, ...rejected.entries, ...open.entries], spec_bug_count: specBugs.count, rejected_finding_count: rejected.count }
       : {}
 
   const entry = {

@@ -48,6 +48,12 @@ let specBugsRaw = null
 let rejectedFindingsRaw = null
 let specBugCount = null
 let rejectedFindingCount = null
+// H5: every finding each lens actually reported, not just the two synthesis
+// dispositions (spec_bug/rejected) -- without this, an accepted finding
+// that gets fixed leaves no trace on any ledger line, so "which lenses
+// produce findings that get fixed" (the spec's own first stated question)
+// is uncomputable no matter how the ledger is later read.
+let openFindingsRaw = []
 
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
@@ -257,6 +263,13 @@ const reports = await parallel(lenses.map(lens => () =>
 const lensReports = reports.filter(Boolean)
 if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
 
+// H5: capture every finding each lens reported, as-is, before synthesis
+// dedupes/arbitrates them -- this is the "open" (accepted) side that was
+// previously never recorded at all.
+openFindingsRaw = lensReports.flatMap(r =>
+  (r.findings || []).map(f => ({ lens: r.lens, location: f.location, claim: f.claim, severity: f.severity, ac_id: f.ac_id || null }))
+)
+
 // AC-SIMP constraints are mechanical: checked directly against the diff, not by an agent lens (harness rule)
 let simpCheck = null
 if (specPath) {
@@ -353,7 +366,7 @@ const telemetry = {
 // spec_bugs/rejected_findings ride along as raw descriptors for
 // ledger-append.mjs to hash into finding ids; they are NOT part of the
 // workflow's own public telemetry (which only carries the counts above).
-const terminalEntry = { kind: 'review_cycle', spec_bugs: specBugsRaw, rejected_findings: rejectedFindingsRaw, ...telemetry }
+const terminalEntry = { kind: 'review_cycle', spec_bugs: specBugsRaw, rejected_findings: rejectedFindingsRaw, open_findings: openFindingsRaw, ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
 await writeLedger(terminalEntry)
 return { ...result, telemetry }

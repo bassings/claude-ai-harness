@@ -403,3 +403,36 @@ test('ledger-append module: MAX_LINE_BYTES is a small fixed bound suitable for a
   const { MAX_LINE_BYTES } = await import(APPEND_MODULE_URL)
   assert.ok(MAX_LINE_BYTES > 0 && MAX_LINE_BYTES <= 4096)
 })
+
+test('ledger-append: computes an "open" disposition for open_findings, alongside spec_bug/rejected (H5)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High' }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings.length, 1)
+  assert.equal(entry.findings[0].disposition, 'open')
+  assert.equal(entry.findings[0].lens, 'lens-security')
+  assert.equal(entry.findings[0].severity, 'High')
+  assert.ok(!('open_findings' in entry), 'the raw descriptor array must not itself reach the schema-validated entry')
+})
+
+test('ledger-append: open, spec_bug and rejected findings all coexist in the same findings array with distinct dispositions (H5)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'open one', severity: 'High' }],
+    spec_bugs: [{ lens: 'lens-qa', location: 'b.js:2', claim: 'spec bug one' }],
+    rejected_findings: [{ lens: 'lens-qa', location: 'c.js:3', claim: 'rejected one' }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  const byDisposition = Object.fromEntries(entry.findings.map((f) => [f.disposition, f]))
+  assert.equal(entry.findings.length, 3)
+  assert.equal(byDisposition.open.claim === undefined, true, 'claim text itself must never reach the ledger (AC-SEC-2), only id/lens/severity/disposition')
+  assert.ok(byDisposition.open && byDisposition.spec_bug && byDisposition.rejected)
+})

@@ -173,3 +173,31 @@ test('review-cycle.js: telemetry.budget_spent is null when no budget is supplied
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   assert.equal(result.telemetry.budget_spent, null)
 })
+
+test('review-cycle.js: every lens\'s reported findings are sent to the ledger-write step as open_findings (H5: accepted findings were previously never recorded at all, so fix-vs-reject could never be computed)', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-security': {
+        verdict: 'FINDINGS',
+        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+        findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f' }],
+      },
+    }),
+  })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.ok(Array.isArray(payload.open_findings), 'expected an open_findings array in the terminal payload')
+  assert.equal(payload.open_findings.length, 1)
+  assert.equal(payload.open_findings[0].lens, 'lens-security')
+  assert.equal(payload.open_findings[0].location, 'foo.js:10')
+  assert.equal(payload.open_findings[0].claim, 'missing auth check')
+  assert.equal(payload.open_findings[0].severity, 'High')
+})
+
+test('review-cycle.js: a CLEAN run with no findings from any lens sends an empty open_findings array, not null (a real measured zero)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.deepEqual(payload.open_findings, [])
+})
