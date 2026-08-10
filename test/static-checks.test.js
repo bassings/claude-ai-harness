@@ -62,8 +62,11 @@ test('static: no new file under workflows/, skills/ or docs/ hardcodes an absolu
   ].flat()
   for (const f of targets) {
     const contents = fs.readFileSync(f, 'utf8')
-    assert.ok(!/\/Users\//.test(contents), `${f} hardcodes an absolute /Users/ path`)
-    assert.ok(!/\/Volumes\//.test(contents), `${f} hardcodes an absolute /Volumes/ path`)
+    // A real leaked path has a segment after the prefix (e.g. /Users/scott/);
+    // documentation is allowed to mention the bare pattern /Users/ itself
+    // when describing what to reject (as this very test's name does).
+    assert.ok(!/\/Users\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Users/ path`)
+    assert.ok(!/\/Volumes\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Volumes/ path`)
     assert.ok(!/said.?of.?you|couchpotato/i.test(contents), `${f} names a private target repo`)
   }
 })
