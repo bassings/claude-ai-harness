@@ -10,37 +10,14 @@ const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
 const { pathToFileURL } = require('node:url')
-const { execFileSync, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
+const { APPEND_SCRIPT, LEDGER_REL, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
-const APPEND_SCRIPT = path.join(__dirname, '..', 'workflows', 'lib', 'ledger-append.mjs')
 const APPEND_MODULE_URL = pathToFileURL(APPEND_SCRIPT).href
-const LEDGER_REL = '.claude/harness-ledger.jsonl'
 
-function sh(cmd, cwd) {
-  return execFileSync('/bin/sh', ['-c', cmd], { cwd, encoding: 'utf8' })
-}
-
-function makeTempRepo() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ledger-append-test-'))
-  sh('git init -q -b main', dir)
-  sh('git config user.email test@example.com', dir)
-  sh('git config user.name Test', dir)
-  fs.writeFileSync(path.join(dir, 'README.md'), 'seed\n')
-  sh('git add README.md && git commit -q -m seed', dir)
-  return dir
-}
-
-function runAppend(cwd, payload) {
-  const res = spawnSync('node', [APPEND_SCRIPT], { cwd, input: JSON.stringify(payload), encoding: 'utf8' })
-  return res
-}
-
-function readLedgerLines(repoRoot) {
-  const p = path.join(repoRoot, LEDGER_REL)
-  if (!fs.existsSync(p)) return []
-  const raw = fs.readFileSync(p, 'utf8')
-  return raw.split('\n').filter(Boolean)
-}
+// L4: every makeTempRepo() call in this file is tracked by the shared
+// helper and removed here, once, after the whole file's tests finish.
+test.after(cleanupTempRepos)
 
 test('ledger-append: first write creates .claude/ and the ledger file, and reports write_ok true', () => {
   const repo = makeTempRepo()

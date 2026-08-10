@@ -164,9 +164,29 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
       errors.push(`${pathPrefix}${key}: "${value}" is not one of ${JSON.stringify(propSchema.enum)}`)
     }
     if (propSchema.type === 'array' && propSchema.items && Array.isArray(value)) {
-      value.forEach((item, i) => {
-        errors.push(...validateEntry(item, propSchema.items, `${pathPrefix}${key}[${i}].`))
-      })
+      const itemsSchema = propSchema.items
+      if (itemsSchema.type === 'object' || itemsSchema.properties) {
+        // Object-item arrays (e.g. findings): recurse fully, including the
+        // additionalProperties/required checks above.
+        value.forEach((item, i) => {
+          errors.push(...validateEntry(item, itemsSchema, `${pathPrefix}${key}[${i}].`))
+        })
+      } else {
+        // Primitive-item arrays (e.g. lenses_run: string[]): checking each
+        // element against the object-shaped validateEntry contract above
+        // would reject every element outright (a string is never "an
+        // object"), silently refusing the entire record. Check the
+        // primitive's own type/enum instead.
+        value.forEach((item, i) => {
+          const itemPath = `${pathPrefix}${key}[${i}]`
+          if (itemsSchema.type && typeof item !== itemsSchema.type) {
+            errors.push(`${itemPath}: expected ${itemsSchema.type}, got ${typeof item}`)
+          }
+          if (itemsSchema.enum && !itemsSchema.enum.includes(item)) {
+            errors.push(`${itemPath}: "${item}" is not one of ${JSON.stringify(itemsSchema.enum)}`)
+          }
+        })
+      }
     }
   }
   return errors
