@@ -160,7 +160,12 @@ test('review-cycle.js: two fixtures differing only in whether ANY lens has files
 test('review-cycle.js: synthesis missing spec_bugs/rejected_findings fields is treated as a failed step, not a ledger line with silently empty arrays (AC-QA-13)', async () => {
   const { result } = await runWorkflow(WF, {
     args: {},
-    agent: baseAgent({ synthesis: { report: 'markdown only, no structured fields' } }),
+    // The synthesis agent() call declares required: ['report', 'spec_bugs',
+    // 'rejected_findings'] (L3 now enforces declared schemas), so this
+    // fixture must opt out explicitly: it is deliberately simulating the
+    // impossible-per-the-schema case that review-cycle.js's own defensive
+    // fallback exists to guard against, not a normal successful response.
+    agent: baseAgent({ synthesis: { report: 'markdown only, no structured fields', __bypassSchemaValidation: true } }),
   })
   // The malformed synthesis response (missing the required structured
   // fields) must not silently produce spec_bug_count: 0 / rejected_finding_count: 0.

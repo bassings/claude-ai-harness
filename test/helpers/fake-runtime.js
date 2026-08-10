@@ -26,8 +26,31 @@
 // its own `agent()` calls, which is exactly what this helper stubs out.
 
 const fs = require('node:fs')
+const path = require('node:path')
+const { pathToFileURL } = require('node:url')
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+
+// L3: the fake agent stub previously ignored a workflow's declared `schema`
+// entirely, so every test that claims to exercise a schema (four non-
+// trivial ones across the three workflows) actually only exercised the JS
+// fallback path that would run after the real runtime's structured-output
+// enforcement had already rejected a malformed response -- a typo in a
+// schema shipped with the suite green. validateEntry is the same
+// dependency-free structural validator workflows/lib/ledger-append.mjs
+// uses for the ledger envelope; it is general-purpose (required fields,
+// additionalProperties, enum, pattern, array-of-object/array-of-primitive
+// items) and reused here as-is rather than duplicated. Imported lazily via
+// a cached dynamic import(): this file is CommonJS (no package.json sets
+// "type": "module") and ledger-append.mjs is an ES module.
+const LEDGER_APPEND_PATH = path.join(__dirname, '..', '..', 'workflows', 'lib', 'ledger-append.mjs')
+let validateEntryPromise = null
+function getValidateEntry() {
+  if (!validateEntryPromise) {
+    validateEntryPromise = import(pathToFileURL(LEDGER_APPEND_PATH).href).then((m) => m.validateEntry)
+  }
+  return validateEntryPromise
+}
 
 // Static rejection patterns, matched against the source with `//` line
 // comments stripped first so a script may still MENTION these patterns in
@@ -89,13 +112,49 @@ function makeAgentStub(responses, calls) {
     const record = { prompt, opts }
     calls.push(record)
     const label = opts.label || ''
-    if (!responses || !(label in responses)) return undefined
-    const resp = responses[label]
-    if (typeof resp === 'function') return resp(prompt, opts, calls.length)
-    if (Array.isArray(resp)) {
-      const i = perLabelIndex[label] || 0
-      perLabelIndex[label] = i + 1
-      return resp[i]
+    let resp
+    if (!responses || !(label in responses)) {
+      resp = undefined
+    } else {
+      const scripted = responses[label]
+      if (typeof scripted === 'function') resp = scripted(prompt, opts, calls.length)
+      else if (Array.isArray(scripted)) {
+        const i = perLabelIndex[label] || 0
+        perLabelIndex[label] = i + 1
+        resp = scripted[i]
+      } else {
+        resp = scripted
+      }
+    }
+    // undefined represents "the agent failed or was stopped" -- a real
+    // outcome the workflow must handle, not a malformed structured
+    // response, so it is never validated against the schema.
+    //
+    // A response carrying __bypassSchemaValidation: true is a deliberate,
+    // documented escape hatch: some workflows defend against a structured
+    // response that violates their OWN declared schema anyway (e.g.
+    // review-cycle.js's synthesis-missing-required-fields fallback,
+    // AC-QA-13) -- defence in depth against the runtime's structured-output
+    // enforcement somehow being bypassed. That is legitimately worth
+    // testing even though production is not expected to ever produce it,
+    // so a fixture may opt out explicitly rather than the check being
+    // silently weakened for everyone.
+    if (resp && typeof resp === 'object' && resp.__bypassSchemaValidation) {
+      const { __bypassSchemaValidation, ...rest } = resp
+      return rest
+    }
+    if (opts.schema && resp !== undefined) {
+      const validateEntry = await getValidateEntry()
+      const errors = validateEntry(resp, opts.schema)
+      if (errors.length) {
+        throw new Error(
+          `fake-runtime: the scripted response for agent() label "${label}" does not match its declared schema ` +
+          `(this is a test-fixture bug, not a workflow bug -- the real runtime would never let a non-conforming ` +
+          `structured response through). If this fixture is DELIBERATELY simulating that impossible case (e.g. ` +
+          `defensive fallback code), add __bypassSchemaValidation: true to the scripted response. ` +
+          `Schema errors: ${errors.join('; ')}`
+        )
+      }
     }
     return resp
   }

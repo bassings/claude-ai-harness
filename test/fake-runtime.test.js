@@ -100,3 +100,41 @@ test('runWorkflow does NOT reject a script that only mentions these patterns ins
   assert.equal(result.verdict, 'DONE')
 })
 
+
+// L3: the fake agent stub previously ignored a workflow's declared
+// `schema` entirely, so a fixture violating the schema the real runtime
+// would enforce shipped a test green anyway. Driven against a real
+// workflow (tdd-task.js's write-test step declares
+// required: ['test_files', 'test_command', 'expected_failure']) rather
+// than a throwaway fixture, so this proves the enforcement against an
+// actual, currently-shipping schema.
+test('runWorkflow: a scripted agent response missing a required field is rejected by the stub, not silently accepted (L3)', async () => {
+  const TDD_TASK_WF = path.join(__dirname, '..', 'workflows', 'tdd-task.js')
+  await assert.rejects(
+    () => runWorkflow(TDD_TASK_WF, {
+      args: { task: 'x' },
+      agent: {
+        // missing test_command and expected_failure, both required
+        'write-test#1': { test_files: ['a.test.js'] },
+      },
+    }),
+    /does not match its declared schema/
+  )
+})
+
+test('runWorkflow: a scripted agent response that DOES satisfy its declared schema is accepted (L3, not vacuous)', async () => {
+  const TDD_TASK_WF = path.join(__dirname, '..', 'workflows', 'tdd-task.js')
+  const { calls } = await runWorkflow(TDD_TASK_WF, {
+    args: { task: 'x' },
+    agent: {
+      'write-test#1': { test_files: ['a.test.js'], test_command: 'node a.test.js', expected_failure: 'missing fn' },
+    },
+  })
+  assert.ok(calls.some((c) => c.opts.label === 'write-test#1'))
+})
+
+test('runWorkflow: an undefined scripted response (agent failed/stopped) is never schema-validated', async () => {
+  const TDD_TASK_WF = path.join(__dirname, '..', 'workflows', 'tdd-task.js')
+  const { result } = await runWorkflow(TDD_TASK_WF, { args: { task: 'x' }, agent: {} })
+  assert.equal(result.verdict, 'ABORTED')
+})
