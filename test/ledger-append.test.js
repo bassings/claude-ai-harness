@@ -147,6 +147,16 @@ test('ledger-append: a write failure (ledger path occupied by a directory) never
   assert.ok(out.write_error && out.write_error.length > 0)
 })
 
+test('ledger-append: a write-failure error message does not echo the repo\'s absolute path (L6, the failure-path variant of H2)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.mkdirSync(path.join(repo, LEDGER_REL)) // a directory sits where the file should go, forcing an EISDIR
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false)
+  assert.ok(!out.write_error.includes(repo), `write_error echoed the repo's absolute path: ${out.write_error}`)
+})
+
 test('ledger-append: rejects a payload with a property outside the schema rather than silently writing it (AC-SEC-2)', () => {
   const repo = makeTempRepo()
   const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', evidence: 'sk-live-CANARY-0123456789 quoted line' })
@@ -172,6 +182,13 @@ test('ledger-append: git clean -xdf DOES remove the ledger, because -x explicitl
   assert.equal(readLedgerLines(repo).length, 0, 'this is the documented conflict: -x removes ignored files by design')
 })
 
+function assertNoAbsolutePaths(line, label) {
+  assert.ok(!/\/Users\//.test(line), `${label}: must not contain an absolute /Users/ path`)
+  assert.ok(!/\/home\//.test(line), `${label}: must not contain an absolute /home/ path`)
+  assert.ok(!/\/Volumes\//.test(line), `${label}: must not contain an absolute /Volumes/ path`)
+  assert.ok(!/C:\\/.test(line), `${label}: must not contain a Windows absolute path`)
+}
+
 test('ledger-append: a real ledger line contains no personal identifier -- not the operator\'s git email/name, whoami, hostname, nor any absolute path (AC-SEC-3)', () => {
   const repo = makeTempRepo()
   runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'a real task' })
@@ -184,12 +201,44 @@ test('ledger-append: a real ledger line contains no personal identifier -- not t
   assert.ok(!line.includes(gitName), 'must not contain git config user.name')
   assert.ok(!line.includes(whoami), 'must not contain the OS username')
   assert.ok(!line.includes(hostname), 'must not contain the hostname')
-  assert.ok(!/\/Users\//.test(line), 'must not contain an absolute /Users/ path')
-  assert.ok(!/\/home\//.test(line), 'must not contain an absolute /home/ path')
-  assert.ok(!/\/Volumes\//.test(line), 'must not contain an absolute /Volumes/ path')
-  assert.ok(!/C:\\/.test(line), 'must not contain a Windows absolute path')
+  assertNoAbsolutePaths(line, 'plain task')
   const entry = JSON.parse(line)
   assert.equal(entry.repo, path.basename(repo), 'repo identity is a bare dir name, not an absolute path')
+})
+
+test('ledger-append: an absolute spec path UNDER the repo root is relativised, not rejected, and never appears absolute in the line (H2, AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  const absoluteSpec = path.join(repo, 'specs', 'optimise-cycle.md')
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assertNoAbsolutePaths(line, 'relativised spec')
+  assert.ok(!line.includes(repo), 'the line must not contain the repo\'s own absolute temp-dir path either')
+  const entry = JSON.parse(line)
+  assert.equal(entry.spec, 'specs/optimise-cycle.md', 'spec must be relativised against the repo root')
+})
+
+test('ledger-append: a task string containing an embedded absolute path has that path relativised/redacted, never left absolute, in the line (H2, AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  const absolutePathInText = path.join(repo, 'src', 'foo.js')
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', task: `fix the bug in ${absolutePathInText}` })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assertNoAbsolutePaths(line, 'task with embedded absolute path')
+  assert.ok(!line.includes(repo), 'the line must not contain the repo\'s own absolute temp-dir path either')
+  const entry = JSON.parse(line)
+  assert.ok(entry.task.includes('src/foo.js'), `expected the relativised path to survive as data: ${entry.task}`)
+})
+
+test('ledger-append: an absolute spec path OUTSIDE the repo root cannot be relativised and is redacted rather than leaked verbatim (H2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: '/etc/some-other-machines-file.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assert.ok(!line.includes('/etc/some-other-machines-file.md'), 'an out-of-repo absolute path must never reach the ledger verbatim')
 })
 
 test('ledger-append: reuses a caller-supplied run_id instead of generating a fresh one, so a start record and its terminal record can share identity (AC-DATA-5)', () => {

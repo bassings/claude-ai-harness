@@ -211,6 +211,45 @@ function computeFindings(descriptors, disposition) {
 
 const TRUNCATABLE_FIELDS = ['task', 'spec', 'round_key', 'event', 'event_key']
 
+// Matches an absolute POSIX path (leading /, at least one more non-blank
+// segment) or a Windows drive-letter path, wherever it appears inside a
+// string -- not just when the whole field IS a path (a `task` description
+// is free text that may simply mention one). The leading slash must be at
+// the very start of the string or preceded by whitespace/an opening quote
+// or paren: without that anchor, a genuinely relative path that merely
+// CONTAINS a slash (e.g. "specs/foo.md") would have its "/foo.md" tail
+// misread as an absolute path and mangled.
+const ABSOLUTE_PATH_RE = /(^|[\s'"(])([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+
+// Replaces every absolute path found inside `value` with its path relative
+// to `root` when it lives under the repo (H2: the common, recoverable
+// case -- an operator's own repo path leaking into the ledger), or with a
+// fixed redaction marker when it does not (an absolute path elsewhere on
+// disk cannot be made repo-relative, and leaving it verbatim is exactly
+// the leak AC-SEC-3 forbids; relativising is preferred over rejecting the
+// whole record so a path mention never silently drops a run's telemetry).
+// Passes null/undefined/non-strings through unchanged.
+export function redactPaths(value, root) {
+  if (value === null || value === undefined) return value
+  const s = String(value)
+  return s.replace(ABSOLUTE_PATH_RE, (whole, prefix, absPath) => {
+    if (root && (absPath === root || absPath.startsWith(root + path.sep))) {
+      const rel = path.relative(root, absPath)
+      return prefix + (rel === '' ? '.' : rel)
+    }
+    return prefix + '<redacted-path>'
+  })
+}
+
+// Strips every occurrence of `root` (an absolute path) out of free text,
+// e.g. an error message, without needing the fuller redactPaths pattern
+// match -- used on paths a Node error object hands back verbatim
+// (L6: the failure-path variant of H2).
+function stripRoot(text, root) {
+  if (!root) return text
+  return String(text).split(root).join('<repo>')
+}
+
 function readStdin() {
   try {
     return fs.readFileSync(0, 'utf8')
@@ -273,19 +312,28 @@ export function main() {
   // fresh one is generated, as for any ordinary single-record write.
   const run_id = typeof payload.run_id === 'string' && payload.run_id ? payload.run_id : randomUUID()
 
-  // Truncate free-text fields BEFORE validation/serialisation so an
-  // oversized field cannot push the line over the single-write() bound.
-  for (const field of TRUNCATABLE_FIELDS) {
-    if (field in payload) payload[field] = truncate(payload[field], 500)
-  }
-
+  // Resolved BEFORE redaction/truncation below: relativising an absolute
+  // path (H2) needs to know the repo root first.
   let repo
   let root
   try {
     root = resolveMainCheckoutRoot(cwd)
     repo = resolveRepoIdentity(cwd)
   } catch (e) {
-    return result(run_id, ts, false, 'could not resolve the main checkout via git rev-parse: ' + e.message)
+    return result(run_id, ts, false, 'could not resolve the main checkout via git rev-parse: ' + stripRoot(e.message, root))
+  }
+
+  // Relativise every recorded path against the repo root BEFORE truncation
+  // (H2, AC-SEC-3): an absolute path under the root becomes repo-relative,
+  // one outside it is redacted, so a leaked path never survives to the
+  // ledger line whichever field it arrived in.
+  if ('spec' in payload) payload.spec = redactPaths(payload.spec, root)
+  if ('task' in payload) payload.task = redactPaths(payload.task, root)
+
+  // Truncate free-text fields BEFORE validation/serialisation so an
+  // oversized field cannot push the line over the single-write() bound.
+  for (const field of TRUNCATABLE_FIELDS) {
+    if (field in payload) payload[field] = truncate(payload[field], 500)
   }
 
   // Finding computation (moved here from review-cycle.js: workflow scripts
@@ -335,7 +383,7 @@ export function main() {
       fs.closeSync(fd)
     }
   } catch (e) {
-    return result(run_id, ts, false, 'append failed: ' + e.message)
+    return result(run_id, ts, false, 'append failed: ' + stripRoot(e.message, root))
   }
 
   return result(run_id, ts, true, null)
