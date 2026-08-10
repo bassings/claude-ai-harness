@@ -18,8 +18,20 @@ criteria** against the built change, and reports anything it finds outside them.
 `lens-simplicity` is the exception: it runs at **planning only** (see below).
 
 The contract between them is the AC ID. A review finding with no AC behind it is
-a **spec bug**: it means the planning lens missed something. Log those; they
-are how the harness improves rather than merely runs.
+a **spec bug**: it means the planning lens missed something. Every workflow
+run, conducted or invoked directly, appends two lines to
+`.claude/harness-ledger.jsonl` (untracked; see
+`workflows/lib/ledger-append.mjs`), recording spec bugs, rejected findings
+and rounds to clean as structured data: that ledger is how the harness
+improves rather than merely runs. Retained indefinitely with no rotation;
+delete with `rm .claude/harness-ledger.jsonl`; export format is the file
+itself (newline-delimited JSON) -- see README.md's "Run ledger" section
+for the full field list. Each line's timestamp is an absolute wall-clock
+value, not a personal identifier on its own, and is required to compute
+the wall-clock durations (CI wait, human wait, rounds to clean) the
+ledger exists to measure. If a line is ever deliberately committed (an
+explicit opt-in; the file is untracked by default), it survives in git
+history like any other tracked change.
 
 ## Lens roster
 
