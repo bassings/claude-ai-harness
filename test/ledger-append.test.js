@@ -100,6 +100,25 @@ test('ledger-append: the ledger is ignored via .git/info/exclude, which is itsel
   assert.ok(excludeContents.includes(LEDGER_REL), '.git/info/exclude must list the ledger path')
 })
 
+// L1: ensureGitignored ASSERTS the ledger is ignored (writes .git/info/exclude)
+// but never VERIFIES it actually took effect. A tracked .gitignore carrying a
+// negation pattern (`!.claude/harness-ledger.jsonl`) re-includes the path --
+// .git/info/exclude has identical mechanics to a plain .gitignore, so it
+// cannot override a later negation in a tracked file, and git resolves
+// ignore precedence by file, last match wins. Writing to the ledger and
+// reporting write_ok:true in that state risks the ledger actually being
+// committed.
+test('ledger-append: refuses to write (write_ok:false) when a tracked .gitignore re-includes the ledger path via a negation pattern, rather than reporting success on a path that is not actually ignored (L1, AC-SEC-1)', () => {
+  const repo = makeTempRepo()
+  fs.writeFileSync(path.join(repo, '.gitignore'), '!' + LEDGER_REL + '\n')
+  sh('git add .gitignore && git commit -q -m "un-ignore the ledger"', repo)
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'must refuse to write when the ledger path is not actually ignored')
+  assert.ok(out.write_error, 'must name a reason')
+  assert.equal(readLedgerLines(repo).length, 0, 'no line must be written when the ignore state could not be verified')
+})
+
 test('ledger-append: writing from inside a worktree lands the line in the MAIN checkout, not the worktree (AC-DATA-1, AC-SEC-5)', () => {
   const repo = makeTempRepo()
   const worktreeDir = path.join(os.tmpdir(), 'ledger-append-wt-' + Date.now())

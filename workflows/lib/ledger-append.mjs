@@ -679,6 +679,19 @@ export function main() {
 
   try {
     ensureGitignored(root)
+    // L1: ensureGitignored only ASSERTS the ledger is ignored (writes
+    // .git/info/exclude); it never VERIFIES the assertion took effect. A
+    // tracked .gitignore carrying a later negation pattern
+    // (`!.claude/harness-ledger.jsonl`) re-includes the path -- git
+    // resolves ignore precedence by file, last match wins, and
+    // .git/info/exclude has no special priority over a tracked .gitignore.
+    // Writing and reporting success in that state risks the ledger
+    // actually being committed, the exact outcome AC-SEC-1 forbids.
+    try {
+      execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root })
+    } catch (e) {
+      return result(run_id, ts, false, 'the ledger path is not actually gitignored (a tracked .gitignore may re-include it with a negation pattern) -- refusing to write rather than risk it being committed')
+    }
     fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
 
     // M3: a conduct_plan_event replay (the conducting agent re-ticking and
