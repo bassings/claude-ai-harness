@@ -101,8 +101,16 @@ export const LEDGER_ENTRY_SCHEMA = {
     round_key: { type: ['string', 'null'] },
     lenses_run: { type: 'array', items: { type: 'string' } },
     lenses_skipped: { type: 'array', items: { type: 'string' } },
-    trigger_counts: { type: 'object' },
-    verdicts: { type: 'object' },
+    // H2 round 2: a bare `type: 'object'` bounded nothing about what lives
+    // INSIDE the object -- a hostile payload could hide an absolute path or
+    // a secret in an extra key with an arbitrary string value, and
+    // additionalProperties:false (which only governs the OBJECT's own key
+    // set) does not reach inside a dictionary-shaped value at all.
+    // additionalProperties here is a value-schema (validateEntry's dict-value
+    // extension, not the boolean form used elsewhere): every value in the
+    // object must itself satisfy it.
+    trigger_counts: { type: 'object', additionalProperties: { type: 'integer' } },
+    verdicts: { type: 'object', additionalProperties: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] } },
     findings: {
       type: 'array',
       items: {
@@ -131,7 +139,7 @@ export const LEDGER_ENTRY_SCHEMA = {
     // was dropped) when finding arrays were supplied at all, null when
     // they were not (a kind with no findings concept, e.g. tdd_task).
     findings_truncated: { type: ['integer', 'null'] },
-    rounds: { type: ['object', 'null'] },
+    rounds: { type: ['object', 'null'], additionalProperties: { type: 'integer' } },
     budget_spent: { type: ['number', 'null'] },
     // conduct_plan_event only: which state transition this line records, and
     // an idempotency key (run_id + event) so a re-tick that replays an
@@ -188,6 +196,28 @@ export function truncateBytes(value, maxBytes) {
   return s
 }
 
+// H2 round 2: the runtime "type" of a JSON value, distinguishing integers
+// from other numbers (the schema uses 'integer' for count-shaped fields) and
+// null from 'object' (typeof null === 'object' in JS, which is not useful
+// here since the schema expresses nullability as a union member instead).
+function jsonType(value) {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  if (typeof value === 'number' && Number.isInteger(value)) return 'integer'
+  return typeof value
+}
+
+// Checks `value` against a declared `type`, which may be a single type name
+// or a union array (e.g. ['string', 'null']). 'number' accepts an integer
+// too (an integer IS a number); 'integer' does not accept a non-integer
+// number.
+function typeMatches(value, declaredType) {
+  if (!declaredType) return true
+  const types = Array.isArray(declaredType) ? declaredType : [declaredType]
+  const actual = jsonType(value)
+  return types.some((t) => (t === 'number' ? actual === 'number' || actual === 'integer' : actual === t))
+}
+
 // A minimal, dependency-free structural validator against
 // LEDGER_ENTRY_SCHEMA: required fields present, no properties outside the
 // declared set, enums honoured. Not a general JSON Schema engine -- just
@@ -222,6 +252,35 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
   for (const [key, propSchema] of Object.entries(schema.properties || {})) {
     if (!(key in entry)) continue
     const value = entry[key]
+    // H2 round 2: previously the ONLY checks below this line were enum,
+    // pattern and array-item shape -- a property's own declared `type` was
+    // never enforced, so a number, an object, or an array could sit in a
+    // field declared `type: 'string'` (or vice versa) and validate cleanly.
+    // A type mismatch makes every check below meaningless for this value
+    // (matching an enum/pattern against the wrong kind of value is not a
+    // real check), so it short-circuits the rest of this property's checks.
+    if (propSchema.type && !typeMatches(value, propSchema.type)) {
+      errors.push(`${pathPrefix}${key}: expected type ${JSON.stringify(propSchema.type)}, got ${jsonType(value)}`)
+      continue
+    }
+    // Dictionary-shaped objects (trigger_counts, verdicts, rounds): the key
+    // set is caller-defined (a lens name, a counter name), so
+    // additionalProperties:false cannot apply -- but every VALUE in the
+    // object must still satisfy a declared value-schema, or an arbitrary
+    // extra key can carry an absolute path or a secret through untyped.
+    if (value !== null && typeof value === 'object' && !Array.isArray(value) && propSchema.additionalProperties && typeof propSchema.additionalProperties === 'object') {
+      const valueSchema = propSchema.additionalProperties
+      for (const [dictKey, dictValue] of Object.entries(value)) {
+        const dictPath = `${pathPrefix}${key}.${dictKey}`
+        if (valueSchema.type && !typeMatches(dictValue, valueSchema.type)) {
+          errors.push(`${dictPath}: expected type ${JSON.stringify(valueSchema.type)}, got ${jsonType(dictValue)}`)
+          continue
+        }
+        if (valueSchema.enum && !valueSchema.enum.includes(dictValue)) {
+          errors.push(`${dictPath}: "${dictValue}" is not one of ${JSON.stringify(valueSchema.enum)}`)
+        }
+      }
+    }
     if (propSchema.enum && value !== null && value !== undefined && !propSchema.enum.includes(value)) {
       errors.push(`${pathPrefix}${key}: "${value}" is not one of ${JSON.stringify(propSchema.enum)}`)
     }
@@ -332,11 +391,24 @@ function resolveMainCheckoutRoot(cwd) {
   return path.dirname(commonDir)
 }
 
+// H2 round 2: an origin remote is not always a recognised host form -- it
+// can be a bare local filesystem path (`git remote add origin
+// <absolute-path-to-some-other-clone>`, a common local-clone workflow), and
+// the old code's regex matched that just as happily as a real host URL,
+// extracting the path's own trailing two segments (which can include a
+// username, as one operator's local layout did) as `repo`. Only a
+// recognised remote-host form -- scp-like `user@host:path` syntax, or an
+// explicit URL scheme -- is trusted for identity; anything else falls
+// through to the toplevel-basename fallback below, same as no remote at all.
+const REMOTE_HOST_RE = /^(?:[\w.-]+@[\w.-]+:|(?:https?|ssh|git):\/\/)/
+
 function resolveRepoIdentity(cwd) {
   try {
     const url = git(['remote', 'get-url', 'origin'], cwd)
-    const m = url.match(/[/:]([^/:]+\/[^/]+?)(\.git)?$/)
-    if (m) return m[1]
+    if (REMOTE_HOST_RE.test(url)) {
+      const m = url.match(/[/:]([^/:]+\/[^/]+?)(\.git)?$/)
+      if (m) return m[1]
+    }
   } catch (e) {
     // no remote; fall through
   }
@@ -401,9 +473,23 @@ export function main() {
   // Relativise every recorded path against the repo root BEFORE truncation
   // (H2, AC-SEC-3): an absolute path under the root becomes repo-relative,
   // one outside it is redacted, so a leaked path never survives to the
-  // ledger line whichever field it arrived in.
-  if ('spec' in payload) payload.spec = redactPaths(payload.spec, root)
-  if ('task' in payload) payload.task = redactPaths(payload.task, root)
+  // ledger line whichever field it arrived in. H2 round 2: this previously
+  // ran on `spec` and `task` only, by field NAME -- the conduct_plan_event
+  // route documented in SKILL.md puts an absolute plan path inside
+  // event_key, which was never covered, so it reached the ledger verbatim.
+  // Looping over every TRUNCATABLE_FIELDS entry (which already lists
+  // round_key, event and event_key alongside spec/task) closes that route
+  // and any future one that reuses the same free-text field list, rather
+  // than requiring a matching addition here every time that list grows.
+  for (const field of TRUNCATABLE_FIELDS) {
+    if (field in payload) payload[field] = redactPaths(payload[field], root)
+  }
+  // lenses_run/lenses_skipped are arrays of lens-name strings in the
+  // ordinary case, but the schema does not constrain their contents to the
+  // roster pattern (unlike `findings[].lens`), so a string element can carry
+  // an absolute path just like any other free-text field.
+  if (Array.isArray(payload.lenses_run)) payload.lenses_run = payload.lenses_run.map((v) => redactPaths(v, root))
+  if (Array.isArray(payload.lenses_skipped)) payload.lenses_skipped = payload.lenses_skipped.map((v) => redactPaths(v, root))
 
   // Truncate free-text fields BEFORE validation/serialisation so an
   // oversized field cannot push the line over the single-write() bound.

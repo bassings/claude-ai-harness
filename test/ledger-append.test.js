@@ -243,13 +243,18 @@ test('ledger-append: when the record still cannot fit even after truncating text
   // exceed the cap; construct a payload designed to do exactly that.
   const many = Array.from({ length: 100 }, (_, i) => ({ lens: 'lens-security', location: `f${i}.js:1`, claim: `finding number ${i} with some extra descriptive text to pad it out` }))
   const verdicts = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`lens-fake-${i}`, 'FINDINGS']))
+  // trigger_counts values are declared integers (H2 round 2): reusing
+  // `verdicts` here (string values) would now be rejected by validateEntry's
+  // type check rather than degraded, which is a different code path than
+  // this test means to exercise -- a same-shaped, correctly-typed object.
+  const triggerCounts = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`lens-fake-${i}`, i]))
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
     open_findings: many,
     verdicts,
-    trigger_counts: verdicts,
+    trigger_counts: triggerCounts,
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, `expected a degraded record to still be written: ${out.write_error}`)
@@ -373,6 +378,81 @@ test('ledger-append: an absolute spec path OUTSIDE the repo root cannot be relat
   assert.equal(out.write_ok, true, out.write_error)
   const line = readLedgerLines(repo)[0]
   assert.ok(!line.includes('/etc/some-other-machines-file.md'), 'an out-of-repo absolute path must never reach the ledger verbatim')
+})
+
+// Round 2 H2: redaction was applied by field NAME (spec, task only), so any
+// other field carrying an absolute path -- most concretely event_key on the
+// conduct_plan_event route SKILL.md documents -- reached the ledger
+// unredacted. These tests exercise the leak on the field it was actually
+// found on, and the "any other declared field" generalisation, rather than
+// re-testing spec/task again.
+test('ledger-append: an absolute plan path inside event_key (the conduct_plan_event route SKILL.md documents) is relativised/redacted, never left absolute, in the line (H2 round 2, AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  const absolutePlanPath = path.join(repo, 'specs', 'my-plan.md')
+  const eventKey = `${absolutePlanPath}:task-1:ci_wait_started:1`
+  const res = runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_key: eventKey })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assertNoAbsolutePaths(line, 'event_key with embedded absolute plan path')
+  assert.ok(!line.includes(repo), 'the line must not contain the repo\'s own absolute temp-dir path either')
+  const entry = JSON.parse(line)
+  assert.ok(entry.event_key.includes('specs/my-plan.md'), `expected the relativised plan path to survive as data: ${entry.event_key}`)
+})
+
+test('ledger-append: round_key carrying an embedded absolute path is redacted like any other truncatable field, not just spec/task (H2 round 2, AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  const absolutePathInText = path.join(repo, 'src', 'foo.js')
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', round_key: `sha-abc123 touching ${absolutePathInText}` })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assertNoAbsolutePaths(line, 'round_key with embedded absolute path')
+})
+
+test('ledger-append: an absolute path riding an element of lenses_run/lenses_skipped is redacted (H2 round 2, AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  const absolutePathInText = path.join(repo, 'src', 'foo.js')
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    lenses_run: ['lens-security', `lens-mentions ${absolutePathInText}`],
+    lenses_skipped: [`lens-also ${absolutePathInText}`],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assertNoAbsolutePaths(line, 'lenses_run/lenses_skipped with an embedded absolute path')
+})
+
+test('ledger-append: a hostile payload cannot smuggle a canary secret or an absolute path through trigger_counts, verdicts or rounds -- each is constrained to its declared value type/enum, so the write is rejected rather than writing the secret verbatim (H2 round 2, AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  const canary = '/etc/shadow-canary-secret-XYZZY'
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    trigger_counts: { 'lens-security': canary },
+    verdicts: { 'lens-security': canary },
+    rounds: { test_attempts: canary },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a value of the wrong declared type inside trigger_counts/verdicts/rounds must fail validation, not write the payload verbatim')
+  assert.equal(readLedgerLines(repo).length, 0, 'a rejected write must not append any line at all')
+})
+
+test('ledger-append: an origin remote that is a bare local filesystem path (not a recognised host form) is never used as repo identity -- it falls back to the toplevel basename instead (H2 round 2, AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  const otherAbsolutePath = path.join(path.dirname(repo), 'some-other-operators-project')
+  sh(`git remote add origin ${JSON.stringify(otherAbsolutePath)}`, repo)
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assertNoAbsolutePaths(line, 'repo identity derived from a local-path origin remote')
+  const entry = JSON.parse(line)
+  assert.equal(entry.repo, path.basename(repo), 'a local-path origin must fall back to the toplevel basename, not the path\'s own trailing segments')
 })
 
 test('ledger-append: reuses a caller-supplied run_id instead of generating a fresh one, so a start record and its terminal record can share identity (AC-DATA-5)', () => {
@@ -516,6 +596,37 @@ test('ledger-append module: validateEntry rejects a missing required field', asy
   const { validateEntry } = await import(APPEND_MODULE_URL)
   const errors = validateEntry({ run_id: 'r', ts: 't', repo: 'r', kind: 'tdd_task', outcome: 'done', write_ok: true, write_error: null })
   assert.ok(errors.some((e) => /schema_version/.test(e)))
+})
+
+// Round 2 H2: validateEntry checked enum/pattern/array-item shape but never
+// the base declared `type` of a scalar property at all -- a number, an
+// object, or an array could sit in a field declared `type: 'string'` and
+// validate cleanly. These pin the general type check (including the
+// ['string', 'null'] union form) plus the specific dict-value constraints
+// added to trigger_counts/verdicts/rounds.
+test('ledger-append module: validateEntry rejects a scalar property whose runtime type does not match its declared type (H2 round 2)', async () => {
+  const { validateEntry, LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
+  const base = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'tdd_task', outcome: 'done', write_ok: true, write_error: null }
+  const errors = validateEntry({ ...base, task: 42 })
+  assert.ok(errors.some((e) => /task/.test(e)), `expected a type error naming task: ${JSON.stringify(errors)}`)
+  // spec declares type: ['string', 'null'] -- both members of the union must
+  // still be accepted, so this is the non-vacuous half of the same guard.
+  assert.deepEqual(validateEntry({ ...base, spec: null }), [], 'null must still satisfy a [\'string\',\'null\'] union')
+  assert.deepEqual(validateEntry({ ...base, spec: 'specs/x.md' }), [], 'a plain string must still satisfy a [\'string\',\'null\'] union')
+  void LEDGER_ENTRY_SCHEMA
+})
+
+test('ledger-append module: validateEntry rejects a wrong-typed value hiding inside trigger_counts, verdicts or rounds, not just the top-level field (H2 round 2)', async () => {
+  const { validateEntry } = await import(APPEND_MODULE_URL)
+  const base = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null }
+  const triggerErrors = validateEntry({ ...base, trigger_counts: { 'lens-security': '/etc/shadow' } })
+  assert.ok(triggerErrors.length > 0, 'a string value inside trigger_counts (declared integer) must be rejected')
+  const verdictErrors = validateEntry({ ...base, verdicts: { 'lens-security': 'NOT-A-REAL-VERDICT' } })
+  assert.ok(verdictErrors.length > 0, 'a verdicts value outside the CLEAN/FINDINGS/BLOCKED enum must be rejected')
+  const roundsErrors = validateEntry({ ...base, rounds: { test_attempts: '/etc/shadow' } })
+  assert.ok(roundsErrors.length > 0, 'a string value inside rounds (declared integer) must be rejected')
+  // the honest-data shape for all three must still validate cleanly
+  assert.deepEqual(validateEntry({ ...base, trigger_counts: { 'lens-security': 3 }, verdicts: { 'lens-security': 'FINDINGS' }, rounds: { test_attempts: 2 } }), [])
 })
 
 test('ledger-append module: LEDGER_ENTRY_SCHEMA never declares an "evidence", "location" or "report" property (AC-SEC-2)', async () => {

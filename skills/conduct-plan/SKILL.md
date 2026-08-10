@@ -69,6 +69,10 @@ task, a Monitor, or a ScheduleWakeup.
    "conduct_plan_event", outcome: "started", event:
    "<ci_wait_started|ci_wait_ended|human_wait_started|human_wait_ended|
    pr_raised|pr_merged>", event_key: "<plan file>:<task id>:<event>:<occurrence>"}`.
+   `<plan file>` must be repo-relative (e.g. `specs/optimise-cycle.md`), never
+   an absolute path: the ledger writer redacts an absolute path it finds
+   embedded in event_key, and a redacted-away path can collide across two
+   different plans, which a repo-relative one never does.
    `event_key` is required for this kind: the script refuses a
    conduct_plan_event line without one. `<occurrence>` exists because a task
    can genuinely pass through the same event twice (a task that waits on CI,
