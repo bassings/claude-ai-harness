@@ -56,6 +56,14 @@ export const MIN_RECORDS_FOR_PROPOSALS = 5
 // than insufficient data.
 export const MIN_RUNS_FOR_NEVER_FAILED = 5
 
+// AC-QA-20 / AC-ARCH-14: the citation pool is the ONLY set of ids the
+// synthesis prompt ever sees and the ONLY set a proposal's citation is
+// checked against -- capped small and separately from the (larger, up to
+// DEFAULT_LEDGER_WINDOW_LINES) aggregation window, so a proposal's
+// citation is always both real (present in what the optimiser actually
+// processed) and cheap to embed in a prompt (never the full window).
+export const CITATION_POOL_SIZE = 50
+
 const ENVELOPE_REQUIRED = ['schema_version', 'run_id', 'ts', 'repo', 'kind']
 
 // Parses raw ledger file content into usable records and a counted,
@@ -344,6 +352,23 @@ export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAIL
   return { byJob: out }
 }
 
+// The bounded pool of real, citable ledger run_ids (AC-QA-20, AC-ARCH-14):
+// deduplicated, most-recent-first, capped at CITATION_POOL_SIZE. This is
+// the ONLY set of ids the synthesis prompt is shown and the ONLY set a
+// proposal's citation is checked against.
+export function citationPool(records, size = CITATION_POOL_SIZE) {
+  const seen = new Set()
+  const pool = []
+  for (let i = records.length - 1; i >= 0 && pool.length < size; i--) {
+    const id = records[i].run_id
+    if (typeof id === 'string' && id && !seen.has(id)) {
+      seen.add(id)
+      pool.push(id)
+    }
+  }
+  return pool
+}
+
 // A stable proposal id derived from the TARGET a proposal is about (never
 // its prose wording), so the same target re-proposed across cycles is
 // recognisable as the same proposal (AC-DATA-10). Real-Node sha256, same
@@ -410,6 +435,7 @@ function runLedgerCommand(roots, window) {
     neverFailingAcs: neverFailing,
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
     triggerAccuracy: trigger,
+    citationPool: citationPool(windowed),
   }
 }
 
@@ -418,7 +444,16 @@ function runCiCommand(payload) {
   const requestedLimit = payload && typeof payload.requestedLimit === 'number' ? payload.requestedLimit : null
   const minRunsNeverFailed = payload && typeof payload.minRunsNeverFailed === 'number' ? payload.minRunsNeverFailed : MIN_RUNS_FOR_NEVER_FAILED
   const { byJob } = aggregateCi(runs, { minRunsNeverFailed, requestedLimit })
-  return { byJob: mapToObject(byJob) }
+  const seen = new Set()
+  const ciCitationPool = []
+  for (let i = runs.length - 1; i >= 0 && ciCitationPool.length < CITATION_POOL_SIZE; i--) {
+    const id = runs[i] && runs[i].id
+    if ((typeof id === 'string' || typeof id === 'number') && !seen.has(id)) {
+      seen.add(id)
+      ciCitationPool.push(String(id))
+    }
+  }
+  return { byJob: mapToObject(byJob), citationPool: ciCitationPool }
 }
 
 export function main() {

@@ -289,6 +289,34 @@ test('optimise-read: aggregateCi sets truncated:true when the returned run count
   assert.equal(result.byJob.get('ci.yml::test').truncated, true)
 })
 
+// ---- citationPool (AC-QA-20, AC-ARCH-14) ----
+
+test('optimise-read: citationPool is deduplicated, most-recent-first, capped at the stated size, and contains only real run_ids present in the window', () => {
+  const records = []
+  for (let i = 0; i < 60; i++) records.push({ run_id: `run-${i}` })
+  records.push({ run_id: 'run-0' }) // a duplicate re-appended later must not appear twice, and its position counts as the most-recent occurrence
+  const pool = mod.citationPool(records, 50)
+  assert.equal(pool.length, 50)
+  assert.equal(new Set(pool).size, 50, 'no duplicates')
+  assert.equal(pool[0], 'run-0', 'the most recent occurrence of a run_id wins position, even if it also appeared earlier')
+  for (const id of pool) assert.ok(records.some((r) => r.run_id === id), `${id} must be a real run_id present in the window`)
+})
+
+test('optimise-read: citationPool skips records with no run_id rather than emitting undefined citations', () => {
+  const records = [{ run_id: 'a' }, {}, { run_id: null }, { run_id: 'b' }]
+  const pool = mod.citationPool(records, 50)
+  assert.deepEqual(pool.sort(), ['a', 'b'])
+})
+
+test('optimise-read CLI: the ledger command\'s output includes a citationPool of real run_ids from the window', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.citationPool.length, 1)
+  assert.match(out.citationPool[0], /^[0-9a-f-]{36}$/, 'expected a real UUID run_id from the written ledger line')
+})
+
 // ---- stableProposalId (AC-DATA-10) ----
 
 test('optimise-read: stableProposalId is derived from the target descriptor, not wording -- two calls describing the same target with different prose yield the same id, and a genuinely different target yields a different id', () => {
