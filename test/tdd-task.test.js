@@ -32,10 +32,17 @@ test('tdd-task.js: DONE path returns the pre-existing documented shape unchanged
   assert.equal(result.telemetry.outcome, 'done')
 })
 
-test('tdd-task.js: every terminating return reaches exactly one start write and one terminal write (AC-ARCH-3, AC-DATA-5)', async () => {
+test('tdd-task.js: every terminating return reaches exactly one start write and one terminal write, with the RIGHT verdict per case (AC-ARCH-3, AC-DATA-5, H4)', async () => {
+  // H4: the previous version of this loop only asserted the outcome was ANY
+  // of done/blocked/aborted, which every one of these cases satisfies no
+  // matter which verdict actually came back -- deleting the hashes_match
+  // gate (so a mutant proceeds to commit with tests_frozen:false) or turning
+  // the exhausted-implement BLOCKED into ABORTED both left the suite green.
+  // Each case now names its expected verdict, so a wrong-but-still-terminal
+  // outcome fails instead of passing.
   const cases = [
-    { name: 'test-writer agent fails', agent: {} },
-    { name: 'RED verifier agent fails', agent: { 'write-test#1': DONE_AGENT['write-test#1'] } },
+    { name: 'test-writer agent fails', agent: {}, expect: 'ABORTED' },
+    { name: 'RED verifier agent fails', agent: { 'write-test#1': DONE_AGENT['write-test#1'] }, expect: 'ABORTED' },
     {
       name: 'RED gate rejects 3 times (BLOCKED)',
       agent: {
@@ -46,10 +53,12 @@ test('tdd-task.js: every terminating return reaches exactly one start write and 
         'verify-red#2': { red: false, right_reason: false, evidence: 'passed already', test_hashes: [] },
         'verify-red#3': { red: false, right_reason: false, evidence: 'passed already', test_hashes: [] },
       },
+      expect: 'BLOCKED',
     },
     {
       name: 'implementer agent fails',
       agent: { 'write-test#1': DONE_AGENT['write-test#1'], 'verify-red#1': DONE_AGENT['verify-red#1'] },
+      expect: 'ABORTED',
     },
     {
       name: 'GREEN verifier agent fails',
@@ -58,6 +67,7 @@ test('tdd-task.js: every terminating return reaches exactly one start write and 
         'verify-red#1': DONE_AGENT['verify-red#1'],
         'implement#1': DONE_AGENT['implement#1'],
       },
+      expect: 'ABORTED',
     },
     {
       name: 'hashes changed between RED and GREEN (BLOCKED)',
@@ -67,6 +77,7 @@ test('tdd-task.js: every terminating return reaches exactly one start write and 
         'implement#1': DONE_AGENT['implement#1'],
         'verify-green#1': { green: true, suite_green: true, hashes_match: false, evidence: 'test edited' },
       },
+      expect: 'BLOCKED',
     },
     {
       name: 'GREEN gate rejects 3 times (BLOCKED)',
@@ -80,9 +91,11 @@ test('tdd-task.js: every terminating return reaches exactly one start write and 
         'verify-green#2': { green: false, suite_green: false, hashes_match: true, evidence: 'still red' },
         'verify-green#3': { green: false, suite_green: false, hashes_match: true, evidence: 'still red' },
       },
+      expect: 'BLOCKED',
     },
-    { name: 'DONE', agent: DONE_AGENT },
+    { name: 'DONE', agent: DONE_AGENT, expect: 'DONE' },
   ]
+  const OUTCOME_BY_VERDICT = { DONE: 'done', BLOCKED: 'blocked', ABORTED: 'aborted' }
   for (const c of cases) {
     const { calls, result } = await runWorkflow(WF, {
       args: { task: 'x' },
@@ -90,9 +103,44 @@ test('tdd-task.js: every terminating return reaches exactly one start write and 
     })
     const ledgerCalls = calls.filter((call) => call.opts.label === 'ledger:write')
     assert.equal(ledgerCalls.length, 2, `${c.name}: expected one start write + one terminal write, got ${ledgerCalls.length}`)
+    assert.equal(result.verdict, c.expect, `${c.name}: expected verdict ${c.expect}, got ${result.verdict}`)
     assert.ok(result.telemetry, `${c.name}: telemetry missing`)
-    assert.ok(['done', 'blocked', 'aborted'].includes(result.telemetry.outcome), `${c.name}: outcome was ${result.telemetry.outcome}`)
+    assert.equal(result.telemetry.outcome, OUTCOME_BY_VERDICT[c.expect], `${c.name}: outcome was ${result.telemetry.outcome}`)
   }
+})
+
+test('tdd-task.js: hashes_match:false BLOCKs with zero commit calls (H4, dedicated)', async () => {
+  const { calls, result } = await runWorkflow(WF, {
+    args: { task: 'x' },
+    agent: {
+      'write-test#1': DONE_AGENT['write-test#1'],
+      'verify-red#1': DONE_AGENT['verify-red#1'],
+      'implement#1': DONE_AGENT['implement#1'],
+      'verify-green#1': { green: true, suite_green: true, hashes_match: false, evidence: 'test edited to pass' },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  assert.equal(result.verdict, 'BLOCKED')
+  assert.equal(calls.filter((c) => c.opts.label === 'commit').length, 0, 'a test edited between RED and GREEN must never reach the commit step')
+})
+
+test('tdd-task.js: exhausted implement attempts (3 non-green GREEN verifications) BLOCKs with zero commit calls (H4, dedicated)', async () => {
+  const { calls, result } = await runWorkflow(WF, {
+    args: { task: 'x' },
+    agent: {
+      'write-test#1': DONE_AGENT['write-test#1'],
+      'verify-red#1': DONE_AGENT['verify-red#1'],
+      'implement#1': DONE_AGENT['implement#1'],
+      'implement#2': DONE_AGENT['implement#1'],
+      'implement#3': DONE_AGENT['implement#1'],
+      'verify-green#1': { green: false, suite_green: false, hashes_match: true, evidence: 'still red 1' },
+      'verify-green#2': { green: false, suite_green: false, hashes_match: true, evidence: 'still red 2' },
+      'verify-green#3': { green: false, suite_green: false, hashes_match: true, evidence: 'still red 3' },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  assert.equal(result.verdict, 'BLOCKED')
+  assert.equal(calls.filter((c) => c.opts.label === 'commit').length, 0, 'exhausting implement attempts without going green must never reach the commit step')
 })
 
 test('tdd-task.js: telemetry.outcome distinguishes done, blocked and aborted (AC-ARCH-3)', async () => {
