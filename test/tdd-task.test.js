@@ -2,6 +2,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
+const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
 
 const WF = path.join(__dirname, '..', 'workflows', 'tdd-task.js')
 
@@ -206,8 +207,12 @@ test('tdd-task.js: the terminal ledger write requests reuse of the start write\'
   })
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2)
-  assert.ok(!ledgerCalls[0].prompt.includes('"run_id":"start-run-id-123"'), 'the start write does not request an existing run_id (it generates one)')
-  assert.ok(ledgerCalls[1].prompt.includes('"run_id":"start-run-id-123"'), 'the terminal write must request reuse of the start write\'s run_id')
+  // The prompt embeds the payload base64-encoded (H1), so this decodes it
+  // rather than string-matching the prompt text directly.
+  const startPayload = extractLedgerPayload(ledgerCalls[0].prompt)
+  const terminalPayload = extractLedgerPayload(ledgerCalls[1].prompt)
+  assert.ok(!('run_id' in startPayload), 'the start write does not request an existing run_id (it generates one)')
+  assert.equal(terminalPayload.run_id, 'start-run-id-123', 'the terminal write must request reuse of the start write\'s run_id')
 })
 
 test('tdd-task.js: if the start write fails, the terminal write still proceeds without a run_id override (AC-QA-7 + AC-DATA-5 non-fatal interaction)', async () => {
@@ -224,7 +229,8 @@ test('tdd-task.js: if the start write fails, the terminal write still proceeds w
   assert.equal(result.verdict, 'DONE')
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2)
-  assert.ok(!ledgerCalls[1].prompt.includes('"run_id":"irrelevant"'), 'with no successful start write, the terminal write must not claim a run_id to reuse')
+  const terminalPayload = extractLedgerPayload(ledgerCalls[1].prompt)
+  assert.ok(!('run_id' in terminalPayload) || terminalPayload.run_id !== 'irrelevant', 'with no successful start write, the terminal write must not claim a run_id to reuse')
 })
 
 test('tdd-task.js: telemetry records spec identity as null when no spec was supplied, and the value when it was (AC-DATA-7)', async () => {

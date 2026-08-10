@@ -114,3 +114,20 @@ test('static: conduct-plan/SKILL.md instructs logging CI-wait, human-wait, PR-ra
   assert.ok(skill.includes('ledger-append.mjs'))
   assert.ok(/event_key/.test(skill) && /already/.test(skill), 'SKILL.md must instruct checking for an existing event_key before appending (idempotent replay)')
 })
+
+test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, ledgerWritePrompt, writeLedger) is byte-identical across all three workflow files. Workflow scripts cannot import, so this trio is necessarily duplicated three times; without a guard pinning them, a fix landed in one or two copies fails silently in the third -- the same failure class as C1.', () => {
+  function extractBlock(fileName) {
+    const contents = readAll('workflows', fileName)
+    const lines = contents.split('\n')
+    const start = lines.findIndex((l) => l.startsWith('// Reads budget.spent() defensively'))
+    const end = lines.findIndex((l, i) => i > start && l.startsWith('// The entire pre-existing workflow body'))
+    assert.ok(start >= 0 && end > start, `${fileName}: could not locate the run-ledger helper block markers`)
+    return lines.slice(start, end).join('\n')
+  }
+  const tdd = extractBlock('tdd-task.js')
+  const review = extractBlock('review-cycle.js')
+  const plan = extractBlock('plan-cycle.js')
+  assert.ok(tdd.length > 500, 'sanity: the extracted block should be substantial, not an empty match')
+  assert.equal(review, tdd, 'review-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
+  assert.equal(plan, tdd, 'plan-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
+})

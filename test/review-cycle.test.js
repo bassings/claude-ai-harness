@@ -2,6 +2,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
+const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
 
 const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
 
@@ -143,8 +144,12 @@ test('review-cycle.js: the raw spec_bugs/rejected_findings descriptors are sent 
     }),
   })
   const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  assert.ok(terminalCall.prompt.includes('"lens":"lens-qa"'))
-  assert.ok(terminalCall.prompt.includes('"claim":"no AC covers this"'))
+  // The prompt embeds the payload base64-encoded (H1: no shell-injection
+  // surface via raw quotes), so this decodes it rather than string-matching
+  // the prompt text directly.
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.spec_bugs[0].lens, 'lens-qa')
+  assert.equal(payload.spec_bugs[0].claim, 'no AC covers this')
 })
 
 test('review-cycle.js: a ledger write failure never fails the run (AC-QA-7)', async () => {

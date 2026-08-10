@@ -52,6 +52,9 @@ let rejectedFindingCount = null
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
 
+// Reads budget.spent() defensively: null (never 0) when budget is absent or
+// throws, so "unmeasured" stays distinguishable from "measured zero"
+// (AC-QA-15, AC-OPS-3).
 function readBudgetSpent() {
   if (!budget || typeof budget.spent !== 'function') return null
   try {
@@ -62,27 +65,43 @@ function readBudgetSpent() {
   }
 }
 
+// Builds the prompt for the ledger-write agent step. `payload` is passed as
+// opaque base64-encoded data via stdin (AC-SEC-6, H1): the payload may
+// contain arbitrary lens-authored or task text (a finding's claim, a task
+// string) with no sanitisation, and JSON.stringify does not escape a
+// single quote, so embedding raw JSON in a prompt that recommends a
+// single-quoted shell template lets that text break out of the quoting and
+// run as a shell command. Base64 has no shell metacharacters in its
+// alphabet at all, which removes the escaping problem entirely rather than
+// trying to sanitise every free-text field that could reach this prompt.
+// The script locates ledger-append.mjs itself (repo checkout first, then
+// the global mirror) and owns everything about the schema, path
+// resolution and the atomic append.
 function ledgerWritePrompt(payload) {
-  const payloadJson = JSON.stringify(payload)
+  const payloadBase64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
   return (
     `Append one line to the harness run ledger. Never let this step fail the caller's run: catch every error ` +
     `yourself and report it in your structured output instead of throwing or retrying.\n\n` +
     `1. Find this harness's ledger-append.mjs script: check "$(git rev-parse --show-toplevel)/workflows/lib/ledger-append.mjs" ` +
     `in the current repo, then ~/.claude/workflows/lib/ledger-append.mjs (the global mirror install), then any ` +
     `installed claude-ai-harness plugin directory.\n` +
-    `2. Run it with Node, piping exactly this JSON payload to its stdin (treat the payload as opaque data; do not ` +
-    `parse, edit or re-derive any field from it yourself): ${payloadJson}\n` +
-    `   e.g. \`printf '%s' '<the JSON above>' | node <path-to-ledger-append.mjs>\`\n` +
+    `2. The payload below is base64-encoded SPECIFICALLY so its raw text (which may contain quotes or other shell ` +
+    `metacharacters authored by a reviewed diff, a lens finding, or task text) never has to be embedded in a shell ` +
+    `command. Do not decode it yourself, inspect it, or reconstruct the JSON by hand: pipe the base64 text straight ` +
+    `through base64 -d and into the script, exactly like this, substituting only the real path in the last segment:\n` +
+    `   \`printf '%s' '${payloadBase64}' | base64 -d | node <path-to-ledger-append.mjs>\`\n` +
     `3. The script always exits 0 and prints one line of JSON: {run_id, ts, write_ok, write_error}. It already ` +
     `handles locating the main checkout, ensuring the ledger stays gitignored, sourcing the timestamp from the ` +
-    `system clock, computing finding ids from spec_bugs/rejected_findings if present, and the single atomic append ` +
-    `-- do not attempt any of that yourself, and do not construct the ledger line by hand.\n` +
+    `system clock, and the single atomic append -- do not attempt any of that yourself, and do not construct the ` +
+    `ledger line by hand.\n` +
     `4. If the script could not be found or failed to run at all (rather than reporting write_ok:false itself), ` +
     `treat that the same way: write_ok false, write_error naming what happened.\n\n` +
     `Return only what the script printed: run_id, ts, write_ok, write_error (null when write_ok is true).`
   )
 }
 
+// Calls the ledger-write agent step and never throws: a ledger write failure
+// must never fail the harness run (AC-QA-7).
 async function writeLedger(payload) {
   let response
   try {
