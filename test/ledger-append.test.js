@@ -35,6 +35,27 @@ test('ledger-append: first write creates .claude/ and the ledger file, and repor
   assert.ok(entry.ts)
 })
 
+test('ledger-append: ts is real ISO-8601 UTC with milliseconds, and is close to the test\'s own clock at write time (M5: the only prior assertion was assert.ok(entry.ts), which "not-a-timestamp" satisfies)', () => {
+  const repo = makeTempRepo()
+  const before = Date.now()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const after = Date.now()
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.match(entry.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, `ts was not ISO-8601 UTC with milliseconds: ${entry.ts}`)
+  const parsed = Date.parse(entry.ts)
+  assert.ok(!Number.isNaN(parsed), `ts did not parse as a real date: ${entry.ts}`)
+  assert.ok(parsed >= before - 1000 && parsed <= after + 1000, `ts (${entry.ts}) was not within a second of the write actually happening`)
+})
+
+test('ledger-append: two successive writes have non-decreasing timestamps (M5)', async () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const [first, second] = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.ok(Date.parse(second.ts) >= Date.parse(first.ts), `ts went backwards: ${first.ts} then ${second.ts}`)
+})
+
 test('ledger-append: a second write appends, leaving two lines with the first byte-identical (AC-QA-6)', () => {
   const repo = makeTempRepo()
   runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })

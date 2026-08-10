@@ -85,6 +85,16 @@ test('review-cycle.js: telemetry.round_key is the reviewed head SHA, identical a
   assert.equal(first.result.telemetry.round_key, second.result.telemetry.round_key)
 })
 
+test('review-cycle.js: telemetry.round_key tracks a DIFFERENT head SHA, not a constant (M4: a hardcoded string equal to the fixture\'s usual SHA previously survived, because the old test only ever varied nothing)', async () => {
+  const sameShaTwice = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const differentSha = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, head_sha: '1111111111111111111111111111111111aaaa' } }),
+  })
+  assert.equal(differentSha.result.telemetry.round_key, '1111111111111111111111111111111111aaaa')
+  assert.notEqual(sameShaTwice.result.telemetry.round_key, differentSha.result.telemetry.round_key, 'round_key must actually vary with the reviewed SHA, not be pinned to one literal value')
+})
+
 test('review-cycle.js: telemetry.trigger_counts is keyed BY LENS NAME, not by rule group, so it can be looked up directly against lenses_run (AC-QA-14, M1)', async () => {
   const { result } = await runWorkflow(WF, {
     args: {},
