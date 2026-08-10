@@ -64,13 +64,23 @@ task, a Monitor, or a ScheduleWakeup.
    `pr-open`→`awaiting-ci` transition and its resolution, and at each
    `blocked-on-human` entry/exit, PR raised and PR merged, run
    `workflows/lib/ledger-append.mjs` (found the same way as any harness file:
-   this repo, `~/.claude/workflows/lib/`, or an installed plugin) with a
-   payload of `{kind: "conduct_plan_event", outcome: "started", event:
+   this repo, `~/.claude/workflows/lib/`, or an installed plugin; pipe the
+   payload's JSON to its stdin) with a payload of `{kind:
+   "conduct_plan_event", outcome: "started", event:
    "<ci_wait_started|ci_wait_ended|human_wait_started|human_wait_ended|
-   pr_raised|pr_merged>", event_key: "<plan file>:<task id>:<event>"}`.
-   Before appending, check whether that `event_key` already appears in the
-   ledger (e.g. `grep -F` it); if it does, this tick is re-recording an
-   already-logged event and must skip the append, not double-count it.
+   pr_raised|pr_merged>", event_key: "<plan file>:<task id>:<event>:<occurrence>"}`.
+   `event_key` is required for this kind: the script refuses a
+   conduct_plan_event line without one. `<occurrence>` exists because a task
+   can genuinely pass through the same event twice (a task that waits on CI,
+   gets findings, pushes a fix, and waits on CI again produces two real
+   `ci_wait_started`/`ci_wait_ended` pairs) -- count how many existing lines
+   in the ledger already have an `event_key` starting with `<plan
+   file>:<task id>:<event>:` and use that count + 1. The script itself is
+   idempotent by construction (a re-tick appending an `event_key` that
+   already exists in the ledger is a no-op, reported back as
+   `duplicate: true`, never a second line), so this tick does not need to
+   grep the ledger first to decide whether to skip the append -- only to
+   compute the next occurrence number for a genuinely new one.
 4. **Re-arm before stopping.** Every external wait needs a live watcher.
    If nothing external is in flight but tasks remain, act on them now rather
    than stopping. Under /loop, always ScheduleWakeup: match the delay to the

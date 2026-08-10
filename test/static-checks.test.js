@@ -106,13 +106,15 @@ test('static: no workflow script directly under workflows/ (not workflows/lib/) 
   }
 })
 
-test('static: conduct-plan/SKILL.md instructs logging CI-wait, human-wait, PR-raised and PR-merged events to the ledger, and instructs a dedup check before appending (AC-QA-9; behavioural correctness of a prose skill is NOT exercised by this test, only its presence in the instructions)', () => {
+test('static: conduct-plan/SKILL.md instructs logging CI-wait, human-wait, PR-raised and PR-merged events to the ledger, names event_key as required, and documents an occurrence discriminator in the key (AC-QA-9, M3; behavioural correctness of a prose skill is NOT exercised by this test, only its presence in the instructions)', () => {
   const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
   for (const event of ['ci_wait_started', 'ci_wait_ended', 'human_wait_started', 'human_wait_ended', 'pr_raised', 'pr_merged']) {
     assert.ok(skill.includes(event), `SKILL.md must mention the ${event} event`)
   }
   assert.ok(skill.includes('ledger-append.mjs'))
-  assert.ok(/event_key/.test(skill) && /already/.test(skill), 'SKILL.md must instruct checking for an existing event_key before appending (idempotent replay)')
+  assert.ok(/event_key/.test(skill), 'SKILL.md must mention event_key')
+  assert.ok(/occurrence/i.test(skill), 'M3: the documented key format must include an occurrence discriminator, since the same event can genuinely repeat for one task')
+  assert.ok(/idempotent|no-op|duplicate/i.test(skill), 'SKILL.md must state that a replayed event_key does not double-count')
 })
 
 test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, ledgerWritePrompt, writeLedger) is byte-identical across all three workflow files. Workflow scripts cannot import, so this trio is necessarily duplicated three times; without a guard pinning them, a fix landed in one or two copies fails silently in the third -- the same failure class as C1.', () => {

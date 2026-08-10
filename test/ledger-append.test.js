@@ -612,3 +612,52 @@ test('ledger-append: a genuine lens name and a genuine AC id both pass through n
   assert.equal(entry.findings.find((f) => f.disposition === 'spec_bug').ac_id, 'AC-SEC-1')
   assert.equal(entry.findings.find((f) => f.disposition === 'rejected').lens, 'reviewer-verification')
 })
+
+test('ledger-append: a conduct_plan_event payload with no event_key is rejected -- the idempotency key AC-QA-9 depends on cannot be optional (M3)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false)
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
+test('ledger-append: a conduct_plan_event payload WITH event_key is accepted (M3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'conduct_plan_event',
+    outcome: 'started',
+    event: 'ci_wait_started',
+    event_key: 'plan.md:T1:ci_wait_started:1',
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(readLedgerLines(repo).length, 1)
+})
+
+test('ledger-append: other kinds (tdd_task, review_cycle, plan_cycle) do NOT require event_key -- the conditional-required rule is scoped to conduct_plan_event only (M3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+})
+
+test('ledger-append: appending a conduct_plan_event with an event_key that already exists in the ledger is a no-op -- it does not double-count (M3, AC-QA-9)', () => {
+  const repo = makeTempRepo()
+  const payload = { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_key: 'plan.md:T1:ci_wait_started:1' }
+  runAppend(repo, payload)
+  const res2 = runAppend(repo, payload)
+  const out2 = JSON.parse(res2.stdout.trim().split('\n').pop())
+  assert.equal(out2.write_ok, true, 'a duplicate-key replay must not be reported as a failure')
+  assert.equal(out2.duplicate, true, 'the CLI response must say this was a duplicate, not a fresh write')
+  assert.equal(readLedgerLines(repo).length, 1, 'the ledger must still contain exactly one line for this event_key')
+})
+
+test('ledger-append: two DIFFERENT event_key values (a genuine second occurrence) both get written, proving the dedup is keyed and not a blanket refusal (M3, AC-QA-9)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_key: 'plan.md:T1:ci_wait_started:1' })
+  runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', outcome: 'started', event: 'ci_wait_started', event_key: 'plan.md:T1:ci_wait_started:2' })
+  const lines = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.equal(lines.length, 2)
+  assert.notEqual(lines[0].event_key, lines[1].event_key)
+})

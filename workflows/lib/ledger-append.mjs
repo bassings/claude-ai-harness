@@ -77,6 +77,14 @@ export const LEDGER_ENTRY_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: ['schema_version', 'run_id', 'ts', 'repo', 'kind', 'outcome', 'write_ok', 'write_error'],
+  // M3: event_key is unconditionally optional above (some kinds have no
+  // concept of it) but must be present for conduct_plan_event specifically
+  // -- AC-QA-9's idempotent-replay dedup depends entirely on it, so a
+  // conduct_plan_event line with no event_key would validate and be
+  // written, defeating the whole mechanism. Declared here, in the schema
+  // (AC-ARCH-5's single definition site), rather than as an ad-hoc check
+  // in main(), so the rule stays discoverable from the schema object alone.
+  requiredWhen: [{ when: { kind: 'conduct_plan_event' }, require: ['event_key'] }],
   properties: {
     schema_version: { type: 'integer', const: SCHEMA_VERSION },
     run_id: { type: 'string', minLength: 1 },
@@ -191,6 +199,20 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
   }
   for (const key of schema.required || []) {
     if (!(key in entry)) errors.push(`${pathPrefix}${key}: required property missing`)
+  }
+  // M3: conditional-required rules, e.g. event_key is only required when
+  // kind === 'conduct_plan_event'. Generic (matches every key/value pair
+  // in `when`) so future kind-specific requirements can reuse it rather
+  // than each needing its own ad-hoc check.
+  for (const rule of schema.requiredWhen || []) {
+    const matches = Object.entries(rule.when).every(([k, v]) => entry[k] === v)
+    if (matches) {
+      for (const key of rule.require) {
+        if (!(key in entry) || entry[key] === null || entry[key] === undefined) {
+          errors.push(`${pathPrefix}${key}: required when ${JSON.stringify(rule.when)}`)
+        }
+      }
+    }
   }
   if (schema.additionalProperties === false) {
     for (const key of Object.keys(entry)) {
@@ -472,6 +494,34 @@ export function main() {
     ensureGitignored(root)
     const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
     fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
+
+    // M3: a conduct_plan_event replay (the conducting agent re-ticking and
+    // re-observing a transition it already logged) must not double-count.
+    // Rather than relying on the calling agent's own grep-before-append
+    // (prose, unenforceable), the writer itself is idempotent by
+    // construction: skip the append if this exact event_key already
+    // appears in the ledger. This is a read-then-append, not a
+    // read-modify-write of existing bytes (AC-DATA-2's append-only
+    // guarantee is about never rewriting or truncating an existing line,
+    // which this does not do); it does carry a narrow TOCTOU race under
+    // truly concurrent writers racing on the identical event_key, accepted
+    // as low-risk since conduct_plan_event lines come from one conducting
+    // agent's sequential ticks, not parallel writers of the same event.
+    if (entry.event_key && fs.existsSync(ledgerPath)) {
+      const existing = fs.readFileSync(ledgerPath, 'utf8')
+      const alreadyPresent = existing.split('\n').some((existingLine) => {
+        if (!existingLine.trim()) return false
+        try {
+          return JSON.parse(existingLine).event_key === entry.event_key
+        } catch (e) {
+          return false // a truncated/corrupt line is not a match; never let it crash the check
+        }
+      })
+      if (alreadyPresent) {
+        return { ...result(run_id, ts, true, null), duplicate: true }
+      }
+    }
+
     // A single write() call, in append mode, of a line under MAX_LINE_BYTES:
     // POSIX guarantees this is atomic against other O_APPEND writers
     // (AC-DATA-3). Never read-modify-write.

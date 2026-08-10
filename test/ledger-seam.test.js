@@ -131,7 +131,7 @@ test('seam: conduct_plan_event payload, built exactly per skills/conduct-plan/SK
     kind: 'conduct_plan_event',
     outcome: 'started',
     event: 'ci_wait_started',
-    event_key: 'specs/optimise-cycle.md:T1:ci_wait_started',
+    event_key: 'specs/optimise-cycle.md:T1:ci_wait_started:1',
   }
   const repo = makeTempRepo()
   const res = runAppend(repo, payload)
@@ -140,5 +140,5 @@ test('seam: conduct_plan_event payload, built exactly per skills/conduct-plan/SK
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.kind, 'conduct_plan_event')
   assert.equal(entry.event, 'ci_wait_started')
-  assert.equal(entry.event_key, 'specs/optimise-cycle.md:T1:ci_wait_started')
+  assert.equal(entry.event_key, 'specs/optimise-cycle.md:T1:ci_wait_started:1')
 })
