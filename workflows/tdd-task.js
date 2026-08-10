@@ -1,5 +1,3 @@
-import { writeLedgerEntry, safeBudgetSpent } from './lib/ledger.mjs'
-
 export const meta = {
   name: 'tdd-task',
   description: 'Script-enforced TDD for one scoped change: implementation is unreachable until the failing test is verified RED for the right reason, and GREEN is proven against unmodified tests',
@@ -25,6 +23,81 @@ const MAX_ATTEMPTS = 3
 // Attempt counters live outside run(): they are ledger telemetry only, never
 // part of the existing, publicly-documented return shape (AC-ARCH-10).
 const rounds = { test_attempts: 0, implement_attempts: 0 }
+
+// ---- Run-ledger helpers, inlined (workflow scripts cannot import: the
+// runtime statically rejects any import statement, so
+// workflows/lib/ledger-append.mjs -- the single definition site for the
+// envelope schema, AC-ARCH-5 -- is invoked via Bash, never imported). ----
+
+// Reads budget.spent() defensively: null (never 0) when budget is absent or
+// throws, so "unmeasured" stays distinguishable from "measured zero"
+// (AC-QA-15, AC-OPS-3).
+function readBudgetSpent() {
+  if (!budget || typeof budget.spent !== 'function') return null
+  try {
+    const v = budget.spent()
+    return typeof v === 'number' && Number.isFinite(v) ? v : null
+  } catch (e) {
+    return null
+  }
+}
+
+// Builds the prompt for the ledger-write agent step. `payload` is passed as
+// opaque JSON data via stdin (AC-SEC-6); the script locates ledger-append.mjs
+// itself (repo checkout first, then the global mirror) and owns everything
+// about the schema, path resolution and the atomic append.
+function ledgerWritePrompt(payload) {
+  const payloadJson = JSON.stringify(payload)
+  return (
+    `Append one line to the harness run ledger. Never let this step fail the caller's run: catch every error ` +
+    `yourself and report it in your structured output instead of throwing or retrying.\n\n` +
+    `1. Find this harness's ledger-append.mjs script: check "$(git rev-parse --show-toplevel)/workflows/lib/ledger-append.mjs" ` +
+    `in the current repo, then ~/.claude/workflows/lib/ledger-append.mjs (the global mirror install), then any ` +
+    `installed claude-ai-harness plugin directory.\n` +
+    `2. Run it with Node, piping exactly this JSON payload to its stdin (treat the payload as opaque data; do not ` +
+    `parse, edit or re-derive any field from it yourself): ${payloadJson}\n` +
+    `   e.g. \`printf '%s' '<the JSON above>' | node <path-to-ledger-append.mjs>\`\n` +
+    `3. The script always exits 0 and prints one line of JSON: {run_id, ts, write_ok, write_error}. It already ` +
+    `handles locating the main checkout, ensuring the ledger stays gitignored, sourcing the timestamp from the ` +
+    `system clock, and the single atomic append -- do not attempt any of that yourself, and do not construct the ` +
+    `ledger line by hand.\n` +
+    `4. If the script could not be found or failed to run at all (rather than reporting write_ok:false itself), ` +
+    `treat that the same way: write_ok false, write_error naming what happened.\n\n` +
+    `Return only what the script printed: run_id, ts, write_ok, write_error (null when write_ok is true).`
+  )
+}
+
+// Calls the ledger-write agent step and never throws: a ledger write failure
+// must never fail the harness run (AC-QA-7).
+async function writeLedger(payload) {
+  let response
+  try {
+    response = await agent(ledgerWritePrompt(payload), {
+      label: 'ledger:write',
+      phase: 'Ledger',
+      effort: 'low',
+      schema: {
+        type: 'object',
+        required: ['run_id', 'ts', 'write_ok', 'write_error'],
+        properties: {
+          run_id: { type: 'string' },
+          ts: { type: 'string' },
+          write_ok: { type: 'boolean' },
+          write_error: { type: ['string', 'null'] },
+        },
+      },
+    })
+  } catch (e) {
+    response = null
+  }
+  if (!response || response.write_ok !== true) {
+    const reason = (response && response.write_error) || 'ledger agent failed or returned no result'
+    const runId = (response && response.run_id) || 'unknown'
+    log(`Ledger write failed for run ${runId}: ${reason}`)
+    return { write_ok: false, write_error: reason, run_id: runId }
+  }
+  return { write_ok: true, write_error: null, run_id: response.run_id }
+}
 
 // The entire pre-existing workflow body, unchanged in behaviour, is wrapped
 // in run() so every one of its terminating returns funnels through exactly
@@ -186,17 +259,17 @@ const OUTCOME_BY_VERDICT = { DONE: 'done', BLOCKED: 'blocked', ABORTED: 'aborted
 // so a run killed mid-flight is recorded as incomplete rather than absent.
 // If the start write itself fails, the terminal write below simply gets its
 // own fresh run_id (AC-QA-7: a ledger write failure never blocks the run).
-const startWrite = await writeLedgerEntry({ agent, log }, { kind: 'tdd_task', outcome: 'started', task: opts.task, spec: opts.spec || null })
+const startWrite = await writeLedger({ kind: 'tdd_task', outcome: 'started', task: opts.task, spec: opts.spec || null })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
 const result = await run()
 const telemetry = {
   outcome: OUTCOME_BY_VERDICT[result.verdict] || 'aborted',
   spec: opts.spec || null,
-  budget_spent: safeBudgetSpent(budget),
+  budget_spent: readBudgetSpent(),
   rounds: { test_attempts: rounds.test_attempts, implement_attempts: rounds.implement_attempts },
 }
 const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
-await writeLedgerEntry({ agent, log }, terminalEntry)
+await writeLedger(terminalEntry)
 return { ...result, telemetry }

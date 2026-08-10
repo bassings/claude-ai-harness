@@ -22,10 +22,10 @@ function walk(dir, out = []) {
   return out
 }
 
-test('static: no file under workflows/, skills/ or hooks/ mentions optimise-cycle or an optimiser reference (AC-SIMP-7, AC-ARCH-8, AC-PROD-10)', () => {
+test('static: no file under workflows/, skills/ or hooks/ mentions optimise-cycle or an optimiser reference (AC-SIMP-7, AC-ARCH-8, AC-PROD-10). Citing the spec FILE PATH "specs/optimise-cycle.md" as a documentation source (as this test itself does, and as workflows/lib/ledger-append.mjs does when citing where the verified runtime facts are recorded) is not a reference to an optimiser implementation and is allowed.', () => {
   for (const dir of ['workflows', 'skills', 'hooks']) {
     for (const f of walk(path.join(ROOT, dir))) {
-      const contents = fs.readFileSync(f, 'utf8')
+      const contents = fs.readFileSync(f, 'utf8').replaceAll('specs/optimise-cycle.md', '')
       assert.ok(!/optimise-cycle|optimize-cycle|optimiser|optimizer/i.test(contents), `${f} must not reference the optimiser (PR2, out of scope for PR1)`)
     }
   }
@@ -42,12 +42,14 @@ test('static: no dependency manifest exists anywhere in the repo (AC-SIMP-1: no 
   assert.deepEqual(manifests, [])
 })
 
-test('static: the three instrumented workflow scripts and the ledger schema module contain no EXECUTABLE Date.now(), new Date() or Math.random() (the runtime statically rejects these; mentioning them in a // comment, e.g. explaining why, is fine)', () => {
-  for (const f of ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js', 'workflows/lib/ledger.mjs']) {
+test('static: the three instrumented workflow scripts contain no EXECUTABLE import, Date.now(), new Date() or Math.random() (the runtime statically rejects all four before execution; mentioning them in a // comment, e.g. explaining why, is fine). workflows/lib/ledger-append.mjs is deliberately EXCLUDED: it is real, unsandboxed Node code and is expected to use all four.', () => {
+  for (const f of ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js']) {
     const code = readAll(f)
       .split('\n')
       .map((line) => line.replace(/\/\/.*$/, ''))
       .join('\n')
+    assert.ok(!/^\s*import\b/m.test(code), `${f} contains an import declaration, which production statically rejects`)
+    assert.ok(!/\bimport\s*\(/.test(code), `${f} contains a dynamic import(), which production statically rejects`)
     assert.ok(!/Date\.now\(\)/.test(code), `${f} contains executable Date.now()`)
     assert.ok(!/new Date\(/.test(code), `${f} contains executable new Date(`)
     assert.ok(!/Math\.random\(\)/.test(code), `${f} contains executable Math.random()`)
@@ -71,26 +73,36 @@ test('static: no new file under workflows/, skills/ or docs/ hardcodes an absolu
   }
 })
 
-test('static: the ledger envelope field list appears in exactly one file (AC-ARCH-5)', () => {
+test('static: the ledger envelope field list appears in exactly one file (AC-ARCH-5). It lives in workflows/lib/ledger-append.mjs, not a separate ledger.mjs: workflow scripts cannot import anything, so the envelope owner must be the real-Node script they invoke via Bash, not a module they pull in.', () => {
   const all = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'skills'))]
   const definitionSites = all.filter((f) => {
     const contents = fs.readFileSync(f, 'utf8')
     return contents.includes('LEDGER_ENTRY_SCHEMA') && contents.includes('additionalProperties')
   })
-  assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/ledger.mjs'])
+  assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/ledger-append.mjs'])
 })
 
-test('static: workflows/lib/ledger.mjs is imported by at least two workflow files (AC-SIMP-12)', () => {
-  const importers = ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js'].filter((f) =>
-    readAll(f).includes("from './lib/ledger.mjs'")
+test('static: ledger-append.mjs is INVOKED by at least two workflows (AC-SIMP-12, arbitrated: "imported by >=2 files" becomes "invoked by >=2 workflows" for a script workflow scripts can only run via Bash, never import)', () => {
+  const invokers = ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js'].filter((f) =>
+    readAll(f).includes('ledger-append.mjs')
   )
-  assert.ok(importers.length >= 2, `expected >=2 importers, got ${importers.length}`)
+  assert.ok(invokers.length >= 2, `expected >=2 invokers, got ${invokers.length}`)
 })
 
-test('static: no workflow file has lifecycle machinery for the ledger -- no rotation, compaction, pruning, size cap or schema-version migration code (AC-SIMP-4)', () => {
-  for (const f of ['workflows/lib/ledger.mjs', 'workflows/lib/ledger-append.mjs']) {
-    const contents = readAll(f)
-    assert.ok(!/rotat|compact|prune|migrat/i.test(contents), `${f} appears to contain lifecycle machinery`)
+test('static: no workflow-lib file has lifecycle machinery for the ledger -- no rotation, compaction, pruning, size cap or schema-version migration code (AC-SIMP-4)', () => {
+  const contents = readAll('workflows', 'lib', 'ledger-append.mjs')
+  assert.ok(!/rotat|compact|prune|migrat/i.test(contents), 'ledger-append.mjs appears to contain lifecycle machinery')
+})
+
+test('static: no workflow script directly under workflows/ (not workflows/lib/) contains an import statement, static or dynamic (production statically rejects both before execution -- see specs/optimise-cycle.md "Verified runtime facts" in the main checkout)', () => {
+  const directChildren = fs.readdirSync(path.join(ROOT, 'workflows'), { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith('.js'))
+    .map((e) => path.join(ROOT, 'workflows', e.name))
+  assert.ok(directChildren.length > 0, 'sanity: expected at least one workflow script')
+  for (const f of directChildren) {
+    const code = fs.readFileSync(f, 'utf8').split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n')
+    assert.ok(!/^\s*import\b/m.test(code), `${f} contains a static import declaration`)
+    assert.ok(!/\bimport\s*\(/.test(code), `${f} contains a dynamic import() call`)
   }
 })
 

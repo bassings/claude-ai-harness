@@ -116,7 +116,7 @@ test('review-cycle.js: synthesis missing spec_bugs/rejected_findings fields is t
   assert.equal(result.telemetry.rejected_finding_count, null)
 })
 
-test('review-cycle.js: spec bugs and rejected findings from a well-formed synthesis are counted (AC-QA-13)', async () => {
+test('review-cycle.js: spec bugs and rejected findings from a well-formed synthesis are counted in the workflow\'s own telemetry (AC-QA-13)', async () => {
   const { result } = await runWorkflow(WF, {
     args: {},
     agent: baseAgent({
@@ -129,19 +129,22 @@ test('review-cycle.js: spec bugs and rejected findings from a well-formed synthe
   })
   assert.equal(result.telemetry.spec_bug_count, 1)
   assert.equal(result.telemetry.rejected_finding_count, 1)
-  assert.equal(result.telemetry.findings.length, 2)
-  assert.ok(result.telemetry.findings.every((f) => f.id && f.lens && f.severity && f.disposition))
 })
 
-test('review-cycle.js: finding ids computed by review-cycle are stable across two runs with identical findings (AC-QA-11)', async () => {
-  const synthesisWithBug = {
-    report: 'x',
-    spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: 'no AC covers this' }],
-    rejected_findings: [],
-  }
-  const a = await runWorkflow(WF, { args: {}, agent: baseAgent({ synthesis: synthesisWithBug }) })
-  const b = await runWorkflow(WF, { args: {}, agent: baseAgent({ synthesis: synthesisWithBug }) })
-  assert.equal(a.result.telemetry.findings[0].id, b.result.telemetry.findings[0].id)
+test('review-cycle.js: the raw spec_bugs/rejected_findings descriptors are sent to the ledger-write step as data, since workflow scripts have no node:crypto to compute finding ids themselves (AC-QA-11) -- ledger-append.mjs computes the actual ids (see its own tests)', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      synthesis: {
+        report: 'x',
+        spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: 'no AC covers this' }],
+        rejected_findings: [],
+      },
+    }),
+  })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  assert.ok(terminalCall.prompt.includes('"lens":"lens-qa"'))
+  assert.ok(terminalCall.prompt.includes('"claim":"no AC covers this"'))
 })
 
 test('review-cycle.js: a ledger write failure never fails the run (AC-QA-7)', async () => {
@@ -151,6 +154,14 @@ test('review-cycle.js: a ledger write failure never fails the run (AC-QA-7)', as
   })
   assert.equal(typeof result.report, 'string')
   assert.ok(logs.some((l) => l.includes('rX') && l.includes('boom')))
+})
+
+test('review-cycle.js: a ledger write failure via the agent call itself throwing never fails the run (AC-QA-7)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'ledger:write': () => { throw new Error('agent crashed') } }),
+  })
+  assert.equal(typeof result.report, 'string')
 })
 
 test('review-cycle.js: telemetry.budget_spent is null when no budget is supplied (AC-QA-15)', async () => {

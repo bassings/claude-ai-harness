@@ -1,5 +1,3 @@
-import { writeLedgerEntry, safeBudgetSpent } from './lib/ledger.mjs'
-
 export const meta = {
   name: 'plan-cycle',
   description: 'Multi-lens planning cycle: triggered lenses write AC-<LENS>-<n> criteria into the spec, per AGENT-HARNESS.md',
@@ -17,6 +15,70 @@ if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts
 opts = opts || {}
 if (typeof opts !== 'object' || !opts.spec) throw new Error('plan-cycle requires args.spec: the path to the spec file to plan against')
 const specPath = opts.spec
+
+// ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
+// tdd-task.js for the identical pattern and its rationale). ----
+
+function readBudgetSpent() {
+  if (!budget || typeof budget.spent !== 'function') return null
+  try {
+    const v = budget.spent()
+    return typeof v === 'number' && Number.isFinite(v) ? v : null
+  } catch (e) {
+    return null
+  }
+}
+
+function ledgerWritePrompt(payload) {
+  const payloadJson = JSON.stringify(payload)
+  return (
+    `Append one line to the harness run ledger. Never let this step fail the caller's run: catch every error ` +
+    `yourself and report it in your structured output instead of throwing or retrying.\n\n` +
+    `1. Find this harness's ledger-append.mjs script: check "$(git rev-parse --show-toplevel)/workflows/lib/ledger-append.mjs" ` +
+    `in the current repo, then ~/.claude/workflows/lib/ledger-append.mjs (the global mirror install), then any ` +
+    `installed claude-ai-harness plugin directory.\n` +
+    `2. Run it with Node, piping exactly this JSON payload to its stdin (treat the payload as opaque data; do not ` +
+    `parse, edit or re-derive any field from it yourself): ${payloadJson}\n` +
+    `   e.g. \`printf '%s' '<the JSON above>' | node <path-to-ledger-append.mjs>\`\n` +
+    `3. The script always exits 0 and prints one line of JSON: {run_id, ts, write_ok, write_error}. It already ` +
+    `handles locating the main checkout, ensuring the ledger stays gitignored, sourcing the timestamp from the ` +
+    `system clock, and the single atomic append -- do not attempt any of that yourself, and do not construct the ` +
+    `ledger line by hand.\n` +
+    `4. If the script could not be found or failed to run at all (rather than reporting write_ok:false itself), ` +
+    `treat that the same way: write_ok false, write_error naming what happened.\n\n` +
+    `Return only what the script printed: run_id, ts, write_ok, write_error (null when write_ok is true).`
+  )
+}
+
+async function writeLedger(payload) {
+  let response
+  try {
+    response = await agent(ledgerWritePrompt(payload), {
+      label: 'ledger:write',
+      phase: 'Ledger',
+      effort: 'low',
+      schema: {
+        type: 'object',
+        required: ['run_id', 'ts', 'write_ok', 'write_error'],
+        properties: {
+          run_id: { type: 'string' },
+          ts: { type: 'string' },
+          write_ok: { type: 'boolean' },
+          write_error: { type: ['string', 'null'] },
+        },
+      },
+    })
+  } catch (e) {
+    response = null
+  }
+  if (!response || response.write_ok !== true) {
+    const reason = (response && response.write_error) || 'ledger agent failed or returned no result'
+    const runId = (response && response.run_id) || 'unknown'
+    log(`Ledger write failed for run ${runId}: ${reason}`)
+    return { write_ok: false, write_error: reason, run_id: runId }
+  }
+  return { write_ok: true, write_error: null, run_id: response.run_id }
+}
 
 // The entire pre-existing workflow body, unchanged in behaviour, is wrapped
 // in run() so every one of its terminating returns funnels through exactly
@@ -138,7 +200,7 @@ return {
 
 // Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
 // pattern and its rationale.
-const startWrite = await writeLedgerEntry({ agent, log }, { kind: 'plan_cycle', outcome: 'started', spec: specPath })
+const startWrite = await writeLedger({ kind: 'plan_cycle', outcome: 'started', spec: specPath })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
 const raw = await run()
@@ -149,9 +211,9 @@ const telemetry = {
   lenses_run: result.lenses || [],
   lenses_skipped: result.skipped || [],
   verdicts: result.verdicts || {},
-  budget_spent: safeBudgetSpent(budget),
+  budget_spent: readBudgetSpent(),
 }
 const terminalEntry = { kind: 'plan_cycle', ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
-await writeLedgerEntry({ agent, log }, terminalEntry)
+await writeLedger(terminalEntry)
 return { ...result, telemetry }

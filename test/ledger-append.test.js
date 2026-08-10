@@ -9,9 +9,11 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
+const { pathToFileURL } = require('node:url')
 const { execFileSync, spawnSync } = require('node:child_process')
 
 const APPEND_SCRIPT = path.join(__dirname, '..', 'workflows', 'lib', 'ledger-append.mjs')
+const APPEND_MODULE_URL = pathToFileURL(APPEND_SCRIPT).href
 const LEDGER_REL = '.claude/harness-ledger.jsonl'
 
 function sh(cmd, cwd) {
@@ -236,4 +238,142 @@ test('ledger-append: a start record with no matching terminal record (run killed
   assert.equal(lines[0].run_id, startOut.run_id)
   const terminalOutcomes = lines.filter((l) => l.run_id === startOut.run_id && l.outcome !== 'started')
   assert.equal(terminalOutcomes.length, 0, 'a reader can tell this run_id has a start but no terminal record: aborted/unterminated')
+})
+
+// ---- Finding computation moved from review-cycle.js (workflow scripts have
+// no node:crypto, so they can no longer compute findingId themselves; they
+// send raw spec_bugs/rejected_findings descriptors and ledger-append.mjs
+// computes ids and dispositions -- AC-QA-11's "derived mechanically in
+// script code" is satisfied by this being real-Node script code). ----
+
+test('ledger-append: computes findings + counts from raw spec_bugs/rejected_findings arrays (AC-QA-13, AC-QA-11)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: 'no AC covers this' }],
+    rejected_findings: [{ lens: 'lens-security', location: 'bar.js:2', claim: 'false alarm', ac_id: 'AC-SEC-1' }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.spec_bug_count, 1)
+  assert.equal(entry.rejected_finding_count, 1)
+  assert.equal(entry.findings.length, 2)
+  assert.ok(entry.findings.every((f) => f.id && f.lens && f.severity && f.disposition))
+  assert.ok(entry.findings.some((f) => f.disposition === 'spec_bug'))
+  assert.ok(entry.findings.some((f) => f.disposition === 'rejected' && f.ac_id === 'AC-SEC-1'))
+  assert.ok(!('spec_bugs' in entry), 'the raw descriptor array must not itself reach the schema-validated entry')
+  assert.ok(!('rejected_findings' in entry))
+})
+
+test('ledger-append: spec_bugs/rejected_findings sent as null (malformed synthesis) yields null counts, not zero (AC-QA-13, AC-OPS-3)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec_bugs: null, rejected_findings: null })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.spec_bug_count, null)
+  assert.equal(entry.rejected_finding_count, null)
+  assert.deepEqual(entry.findings, [])
+})
+
+test('ledger-append: a real empty array of spec_bugs/rejected_findings yields a genuine zero count, distinguishable from null (AC-OPS-3)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec_bugs: [], rejected_findings: [] })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.spec_bug_count, 0)
+  assert.equal(entry.rejected_finding_count, 0)
+})
+
+test('ledger-append: finding ids are stable across two separate invocations with identical descriptors (AC-QA-11)', () => {
+  const repoA = makeTempRepo()
+  const repoB = makeTempRepo()
+  const descriptor = { spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: 'no AC covers this' }], rejected_findings: [] }
+  runAppend(repoA, { schema_version: 1, kind: 'review_cycle', outcome: 'done', ...descriptor })
+  runAppend(repoB, { schema_version: 1, kind: 'review_cycle', outcome: 'done', ...descriptor })
+  const entryA = JSON.parse(readLedgerLines(repoA)[0])
+  const entryB = JSON.parse(readLedgerLines(repoB)[0])
+  assert.equal(entryA.findings[0].id, entryB.findings[0].id)
+})
+
+test('ledger-append: two different defects at the same file:line yield different finding ids (AC-QA-11)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec_bugs: [
+      { lens: 'lens-qa', location: 'foo.js:10', claim: 'missing input validation' },
+      { lens: 'lens-qa', location: 'foo.js:10', claim: 'SQL injection via string concat' },
+    ],
+    rejected_findings: [],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.notEqual(entry.findings[0].id, entry.findings[1].id)
+})
+
+// ---- Unit tests for the pure functions, relocated from the now-deleted
+// workflows/lib/ledger.mjs: they live in ledger-append.mjs now, since it is
+// the sole real-Node script permitted to use node:crypto and own the
+// schema; workflow scripts cannot import them (see docs/pr1-mutation-proofs.md). ----
+
+test('ledger-append module: exposes a hard-coded relative path, not a configurable one (AC-SIMP-2)', async () => {
+  const { LEDGER_RELATIVE_PATH } = await import(APPEND_MODULE_URL)
+  assert.equal(LEDGER_RELATIVE_PATH, '.claude/harness-ledger.jsonl')
+})
+
+test('ledger-append module: importing it for its exports does not itself write a ledger line (main() is guarded)', async () => {
+  const repo = makeTempRepo()
+  const before = readLedgerLines(repo).length
+  await import(APPEND_MODULE_URL)
+  assert.equal(readLedgerLines(repo).length, before, 'import must not run main() as a side effect')
+})
+
+test('ledger-append module: findingId is stable for the same lens+location+claim', async () => {
+  const { findingId } = await import(APPEND_MODULE_URL)
+  assert.equal(findingId('lens-security', 'foo.js:10', 'x'), findingId('lens-security', 'foo.js:10', 'x'))
+})
+
+test('ledger-append module: findingId differs across lenses for identical location and claim text', async () => {
+  const { findingId } = await import(APPEND_MODULE_URL)
+  assert.notEqual(findingId('lens-security', 'foo.js:10', 'same'), findingId('lens-qa', 'foo.js:10', 'same'))
+})
+
+test('ledger-append module: truncate bounds long strings and passes null/undefined through unchanged', async () => {
+  const { truncate } = await import(APPEND_MODULE_URL)
+  assert.equal(truncate('short', 100), 'short')
+  assert.ok(truncate('x'.repeat(1000), 50).length <= 50)
+  assert.equal(truncate(null, 10), null)
+  assert.equal(truncate(undefined, 10), undefined)
+})
+
+test('ledger-append module: validateEntry rejects an entry with an unknown top-level property (additionalProperties:false, AC-SEC-2)', async () => {
+  const { validateEntry } = await import(APPEND_MODULE_URL)
+  const entry = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'tdd_task', outcome: 'done', write_ok: true, write_error: null, evidence: 'leak' }
+  const errors = validateEntry(entry)
+  assert.ok(errors.some((e) => /evidence/.test(e)))
+})
+
+test('ledger-append module: validateEntry rejects a missing required field', async () => {
+  const { validateEntry } = await import(APPEND_MODULE_URL)
+  const errors = validateEntry({ run_id: 'r', ts: 't', repo: 'r', kind: 'tdd_task', outcome: 'done', write_ok: true, write_error: null })
+  assert.ok(errors.some((e) => /schema_version/.test(e)))
+})
+
+test('ledger-append module: LEDGER_ENTRY_SCHEMA never declares an "evidence", "location" or "report" property (AC-SEC-2)', async () => {
+  const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
+  const props = Object.keys(LEDGER_ENTRY_SCHEMA.properties)
+  assert.ok(!props.includes('evidence'))
+  assert.ok(!props.includes('location'))
+  assert.ok(!props.includes('report'))
+})
+
+test('ledger-append module: findings schema entries only carry lens, severity, ac id and disposition (AC-SEC-2)', async () => {
+  const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
+  const findingProps = Object.keys(LEDGER_ENTRY_SCHEMA.properties.findings.items.properties)
+  assert.deepEqual(findingProps.sort(), ['ac_id', 'disposition', 'id', 'lens', 'severity'])
+  assert.equal(LEDGER_ENTRY_SCHEMA.properties.findings.items.additionalProperties, false)
+})
+
+test('ledger-append module: MAX_LINE_BYTES is a small fixed bound suitable for a single atomic write()', async () => {
+  const { MAX_LINE_BYTES } = await import(APPEND_MODULE_URL)
+  assert.ok(MAX_LINE_BYTES > 0 && MAX_LINE_BYTES <= 4096)
 })

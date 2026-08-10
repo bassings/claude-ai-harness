@@ -5,61 +5,73 @@
 // export, everything else is the body of an implicit async function that
 // receives `agent`, `parallel`, `pipeline`, `phase`, `log`, `args` and
 // `budget` as ambient bindings (not imports) and ends in a top-level
-// `return`. A workflow script may additionally start with plain
-// `import { a, b } from './relative.mjs'` lines pulling in a sibling module
-// under the same directory (e.g. workflows/lib/*.mjs); those are resolved
-// with a real dynamic import() and spliced in as extra bindings, mirroring
-// what the production runtime is assumed to support for local, same-repo
-// modules (untested against production; see docs/pr1-mutation-proofs.md).
+// `return`.
+//
+// Before compiling anything, the source is checked against the same static
+// pre-checks the production dynamic-workflow runtime applies before a
+// script ever executes (confirmed by probing the live runtime; see
+// specs/optimise-cycle.md's "Verified runtime facts" in the main checkout):
+// no `import ... from` declaration, no dynamic `import()` call, no
+// `Date.now()`, no `new Date(...)`, no `Math.random()`. A script violating
+// any of these is rejected here the same way production rejects it -- before
+// evaluation, not as a runtime exception -- so workflow scripts that would
+// fail to launch in production also fail to load in this helper. Workflow
+// scripts are therefore fully self-contained: no local imports are possible,
+// so any code they need (including node:crypto-dependent helpers like
+// hashing) must live in a real-Node script invoked via an agent's Bash step,
+// never imported.
 //
 // No filesystem access happens *inside* the compiled script itself (matching
-// the real runtime): all fs/git/clock work the workflow needs is delegated
-// to its own `agent()` calls, which is exactly what this helper stubs out.
+// the real runtime): all fs/git/clock work a workflow needs is delegated to
+// its own `agent()` calls, which is exactly what this helper stubs out.
 
 const fs = require('node:fs')
-const path = require('node:path')
-const { pathToFileURL } = require('node:url')
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 
-const IMPORT_LINE_RE = /^import\s*\{([^}]+)\}\s*from\s*['"](\.[^'"]+)['"];?\s*$/gm
-const META_EXPORT_RE = /^export\s+const\s+meta\s*=/m
+// Static rejection patterns, matched against the source with `//` line
+// comments stripped first so a script may still MENTION these patterns in
+// prose without being rejected (only executable code is checked).
+const REJECTIONS = [
+  { name: 'a static import declaration', re: /^\s*import\b/m },
+  { name: 'a dynamic import() call', re: /\bimport\s*\(/ },
+  { name: 'Date.now()', re: /\bDate\.now\s*\(/ },
+  { name: 'new Date(...)', re: /\bnew\s+Date\s*\(/ },
+  { name: 'Math.random()', re: /\bMath\.random\s*\(/ },
+]
 
-// Parses and strips leading `import { a, b } from './x.mjs'` lines, resolving
-// each named binding via dynamic import() against files on disk (no bundler,
-// no dependency: this is Node's built-in ESM loader).
-async function resolveLocalImports(source, baseDir) {
-  const names = []
-  const values = []
-  let stripped = source
-  let match
-  IMPORT_LINE_RE.lastIndex = 0
-  while ((match = IMPORT_LINE_RE.exec(source))) {
-    const bindingNames = match[1].split(',').map((s) => s.trim()).filter(Boolean)
-    const modPath = path.resolve(baseDir, match[2])
-    const mod = await import(pathToFileURL(modPath).href)
-    for (const name of bindingNames) {
-      names.push(name)
-      values.push(mod[name])
-    }
-    stripped = stripped.replace(match[0], '')
-  }
-  return { stripped, names, values }
+function stripLineComments(source) {
+  return source
+    .split('\n')
+    .map((line) => line.replace(/\/\/.*$/, ''))
+    .join('\n')
 }
 
+function assertProductionSafe(source, filePath) {
+  const code = stripLineComments(source)
+  for (const rule of REJECTIONS) {
+    if (rule.re.test(code)) {
+      throw new Error(
+        `${filePath}: contains ${rule.name}, which the dynamic-workflow runtime statically rejects before ` +
+        `execution ("Workflow scripts must be deterministic" / no local imports). Fix the script, not this check.`
+      )
+    }
+  }
+}
+
+const META_EXPORT_RE = /^export\s+const\s+meta\s*=/m
+
 // Compiles a workflow file's source into an AsyncFunction whose parameter
-// list is the fixed runtime binding names plus any locally-imported names,
-// in that order. Returns the function together with the import binding
-// values (already resolved) so the caller only has to supply the fixed
-// runtime stubs.
-async function compile(filePath) {
+// list is the fixed runtime binding names. Throws (does not return a
+// promise that rejects later) if the source fails the static pre-check --
+// this mirrors production rejecting at submission, before any agent call
+// could possibly happen.
+function compile(filePath) {
   const source = fs.readFileSync(filePath, 'utf8')
-  const baseDir = path.dirname(filePath)
-  const { stripped, names: importNames, values: importValues } = await resolveLocalImports(source, baseDir)
-  const body = stripped.replace(META_EXPORT_RE, 'const meta =')
-  const paramNames = ['agent', 'parallel', 'pipeline', 'phase', 'log', 'args', 'budget', ...importNames]
-  const fn = new AsyncFunction(...paramNames, body)
-  return { fn, importValues }
+  assertProductionSafe(source, filePath)
+  const body = source.replace(META_EXPORT_RE, 'const meta =')
+  const paramNames = ['agent', 'parallel', 'pipeline', 'phase', 'log', 'args', 'budget']
+  return new AsyncFunction(...paramNames, body)
 }
 
 // Builds a stub `agent(prompt, opts)` that records every call and resolves
@@ -95,9 +107,10 @@ function makeAgentStub(responses, calls) {
 //   agent   - map of label -> scripted response (see makeAgentStub)
 //   budget  - a budget stub ({spent(): number, total?: number|null}); omit
 //             to simulate a run with no budget object at all
-// Returns { result, calls, logs, phases }.
+// Returns { result, calls, logs, phases }. Throws synchronously (wrapped in
+// the returned rejected promise) if the script fails the static pre-check.
 async function runWorkflow(filePath, options = {}) {
-  const { fn, importValues } = await compile(filePath)
+  const fn = compile(filePath)
   const calls = []
   const logs = []
   const phases = []
@@ -111,16 +124,7 @@ async function runWorkflow(filePath, options = {}) {
   const phaseStub = (title) => phases.push(title)
   const logStub = (msg) => logs.push(msg)
 
-  const result = await fn(
-    agentStub,
-    parallelStub,
-    pipelineStub,
-    phaseStub,
-    logStub,
-    options.args,
-    options.budget,
-    ...importValues
-  )
+  const result = await fn(agentStub, parallelStub, pipelineStub, phaseStub, logStub, options.args, options.budget)
   return { result, calls, logs, phases }
 }
 

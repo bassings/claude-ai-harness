@@ -175,6 +175,14 @@ test('tdd-task.js: a ledger write failure via a stopped agent (undefined respons
   assert.equal(result.verdict, 'DONE')
 })
 
+test('tdd-task.js: a ledger write failure via the agent call itself throwing never fails the run (AC-QA-7)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { task: 'do the thing' },
+    agent: { ...DONE_AGENT, 'ledger:write': () => { throw new Error('agent crashed') } },
+  })
+  assert.equal(result.verdict, 'DONE')
+})
+
 test('tdd-task.js: telemetry.budget_spent is null (not 0) when no budget is supplied (AC-QA-15)', async () => {
   const { result } = await runWorkflow(WF, { args: { task: 'x' }, agent: DONE_AGENT })
   assert.equal(result.telemetry.budget_spent, null)

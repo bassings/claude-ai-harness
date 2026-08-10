@@ -1,5 +1,3 @@
-import { writeLedgerEntry, safeBudgetSpent, findingId } from './lib/ledger.mjs'
-
 export const meta = {
   name: 'review-cycle',
   description: 'Multi-lens review of the branch diff per AGENT-HARNESS.md: single-focus lenses in parallel, one synthesised report',
@@ -42,9 +40,78 @@ const specPath = opts.spec || null
 // pre-existing, publicly-documented return shape (AC-ARCH-10).
 const triggerCounts = {}
 let headSha = null
-let findingsAccumulator = []
+// Raw finding descriptors ({lens, location, claim, severity?, ac_id?}), or
+// null when the synthesis response was malformed. Passed to
+// ledger-append.mjs as opaque data: workflow scripts have no node:crypto,
+// so finding-id hashing (AC-QA-11) happens there, not here.
+let specBugsRaw = null
+let rejectedFindingsRaw = null
 let specBugCount = null
 let rejectedFindingCount = null
+
+// ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
+// tdd-task.js for the identical pattern and its rationale). ----
+
+function readBudgetSpent() {
+  if (!budget || typeof budget.spent !== 'function') return null
+  try {
+    const v = budget.spent()
+    return typeof v === 'number' && Number.isFinite(v) ? v : null
+  } catch (e) {
+    return null
+  }
+}
+
+function ledgerWritePrompt(payload) {
+  const payloadJson = JSON.stringify(payload)
+  return (
+    `Append one line to the harness run ledger. Never let this step fail the caller's run: catch every error ` +
+    `yourself and report it in your structured output instead of throwing or retrying.\n\n` +
+    `1. Find this harness's ledger-append.mjs script: check "$(git rev-parse --show-toplevel)/workflows/lib/ledger-append.mjs" ` +
+    `in the current repo, then ~/.claude/workflows/lib/ledger-append.mjs (the global mirror install), then any ` +
+    `installed claude-ai-harness plugin directory.\n` +
+    `2. Run it with Node, piping exactly this JSON payload to its stdin (treat the payload as opaque data; do not ` +
+    `parse, edit or re-derive any field from it yourself): ${payloadJson}\n` +
+    `   e.g. \`printf '%s' '<the JSON above>' | node <path-to-ledger-append.mjs>\`\n` +
+    `3. The script always exits 0 and prints one line of JSON: {run_id, ts, write_ok, write_error}. It already ` +
+    `handles locating the main checkout, ensuring the ledger stays gitignored, sourcing the timestamp from the ` +
+    `system clock, computing finding ids from spec_bugs/rejected_findings if present, and the single atomic append ` +
+    `-- do not attempt any of that yourself, and do not construct the ledger line by hand.\n` +
+    `4. If the script could not be found or failed to run at all (rather than reporting write_ok:false itself), ` +
+    `treat that the same way: write_ok false, write_error naming what happened.\n\n` +
+    `Return only what the script printed: run_id, ts, write_ok, write_error (null when write_ok is true).`
+  )
+}
+
+async function writeLedger(payload) {
+  let response
+  try {
+    response = await agent(ledgerWritePrompt(payload), {
+      label: 'ledger:write',
+      phase: 'Ledger',
+      effort: 'low',
+      schema: {
+        type: 'object',
+        required: ['run_id', 'ts', 'write_ok', 'write_error'],
+        properties: {
+          run_id: { type: 'string' },
+          ts: { type: 'string' },
+          write_ok: { type: 'boolean' },
+          write_error: { type: ['string', 'null'] },
+        },
+      },
+    })
+  } catch (e) {
+    response = null
+  }
+  if (!response || response.write_ok !== true) {
+    const reason = (response && response.write_error) || 'ledger agent failed or returned no result'
+    const runId = (response && response.run_id) || 'unknown'
+    log(`Ledger write failed for run ${runId}: ${reason}`)
+    return { write_ok: false, write_error: reason, run_id: runId }
+  }
+  return { write_ok: true, write_error: null, run_id: response.run_id }
+}
 
 // The entire pre-existing workflow body, unchanged in behaviour, is wrapped
 // in run() so every one of its terminating returns funnels through exactly
@@ -222,14 +289,14 @@ const synthesis = await agent(
 // older or misbehaving agent that only returned prose) must not silently
 // masquerade as "zero spec bugs, zero rejected findings": null means
 // unmeasured, distinguishable from a genuine zero (AC-QA-13, AC-OPS-3).
-const specBugs = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_bugs : null
-const rejectedFindings = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
-specBugCount = specBugs ? specBugs.length : null
-rejectedFindingCount = rejectedFindings ? rejectedFindings.length : null
-findingsAccumulator = [
-  ...(specBugs || []).map(f => ({ id: findingId(f.lens, f.location, f.claim), lens: f.lens, severity: f.severity || 'Low', ac_id: f.ac_id || null, disposition: 'spec_bug' })),
-  ...(rejectedFindings || []).map(f => ({ id: findingId(f.lens, f.location, f.claim), lens: f.lens, severity: f.severity || 'Low', ac_id: f.ac_id || null, disposition: 'rejected' })),
-]
+// The raw descriptor arrays (not finding ids: no node:crypto here) are
+// carried through to the ledger payload, where ledger-append.mjs computes
+// ids and dispositions (AC-QA-11 -- mechanical, just in real-Node script
+// code instead of a sandboxed one).
+specBugsRaw = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_bugs : null
+rejectedFindingsRaw = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
+specBugCount = specBugsRaw ? specBugsRaw.length : null
+rejectedFindingCount = rejectedFindingsRaw ? rejectedFindingsRaw.length : null
 
 const outcome = lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
 
@@ -247,7 +314,7 @@ return {
 
 // Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
 // pattern and its rationale.
-const startWrite = await writeLedgerEntry({ agent, log }, { kind: 'review_cycle', outcome: 'started', spec: specPath })
+const startWrite = await writeLedger({ kind: 'review_cycle', outcome: 'started', spec: specPath })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
 const raw = await run()
@@ -260,12 +327,14 @@ const telemetry = {
   lenses_skipped: result.skipped || [],
   trigger_counts: triggerCounts,
   verdicts: result.verdicts || {},
-  findings: findingsAccumulator,
   spec_bug_count: specBugCount,
   rejected_finding_count: rejectedFindingCount,
-  budget_spent: safeBudgetSpent(budget),
+  budget_spent: readBudgetSpent(),
 }
-const terminalEntry = { kind: 'review_cycle', ...telemetry }
+// spec_bugs/rejected_findings ride along as raw descriptors for
+// ledger-append.mjs to hash into finding ids; they are NOT part of the
+// workflow's own public telemetry (which only carries the counts above).
+const terminalEntry = { kind: 'review_cycle', spec_bugs: specBugsRaw, rejected_findings: rejectedFindingsRaw, ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
-await writeLedgerEntry({ agent, log }, terminalEntry)
+await writeLedger(terminalEntry)
 return { ...result, telemetry }

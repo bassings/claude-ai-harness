@@ -79,6 +79,14 @@ test('plan-cycle.js: a ledger write failure never fails the run (AC-QA-7)', asyn
   assert.ok(logs.some((l) => l.includes('rZ') && l.includes('nope')))
 })
 
+test('plan-cycle.js: a ledger write failure via the agent call itself throwing never fails the run (AC-QA-7)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { spec: 'specs/foo.md' },
+    agent: baseAgent({ 'ledger:write': () => { throw new Error('agent crashed') } }),
+  })
+  assert.equal(typeof result.report, 'string')
+})
+
 test('plan-cycle.js: telemetry.budget_spent is null when no budget is supplied, and reflects budget.spent() when supplied (AC-QA-15)', async () => {
   const noBudget = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
   assert.equal(noBudget.result.telemetry.budget_spent, null)
