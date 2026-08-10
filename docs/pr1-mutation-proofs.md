@@ -180,9 +180,29 @@ the first write, `.gitignore` is created or extended to cover it.
 
 **Reverted**: restored from backup; `ledger-append.test.js` back to 13/13 green.
 
+## 10. No personal identifier reaches a real ledger line — `workflows/lib/ledger-append.mjs` `resolveRepoIdentity`
+
+**Guarded behaviour**: AC-SEC-3 — `repo` is a repo-relative identity (an
+`owner/repo` slug or a bare directory basename), never an absolute path, and
+a real ledger line never contains the operator's git email/name, OS
+username, hostname, or an absolute `/Users/`, `/home/`, `/Volumes/` or `C:\`
+path.
+
+**Mutation**: `resolveRepoIdentity` short-circuited to `return cwd` (the
+absolute working directory) before its real body.
+
+**Result**: 1 test failed for the right reason —
+
+- `ledger-append: a real ledger line contains no personal identifier -- not the operator's git email/name, whoami, hostname, nor any absolute path (AC-SEC-3)`
+  — `AssertionError: must not contain the OS username` (the mutant's absolute
+  cwd path contains the scratch temp directory, which on this machine embeds
+  the OS username)
+
+**Reverted**: restored from backup; `ledger-append.test.js` back to 14/14 green.
+
 ## Caveat
 
-These nine cover the guards judged highest-risk (data integrity, injection
+These ten cover the guards judged highest-risk (data integrity, injection
 safety, the single-write-path invariant, the RED/GREEN control-flow
 invariant, and null-vs-zero telemetry correctness) rather than every
 assertion in the suite. Mutation #5 is the one genuine finding: it is left in

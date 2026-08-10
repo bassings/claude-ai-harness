@@ -192,3 +192,23 @@ test('ledger-append: git clean -xdf DOES remove the ledger, because -x explicitl
   sh('git clean -xdf', repo)
   assert.equal(readLedgerLines(repo).length, 0, 'this is the documented conflict: -x removes ignored files by design')
 })
+
+test('ledger-append: a real ledger line contains no personal identifier -- not the operator\'s git email/name, whoami, hostname, nor any absolute path (AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'a real task' })
+  const line = readLedgerLines(repo)[0]
+  const gitEmail = sh('git config user.email', repo).trim()
+  const gitName = sh('git config user.name', repo).trim()
+  const whoami = sh('whoami', repo).trim()
+  const hostname = sh('hostname', repo).trim()
+  assert.ok(!line.includes(gitEmail), 'must not contain git config user.email')
+  assert.ok(!line.includes(gitName), 'must not contain git config user.name')
+  assert.ok(!line.includes(whoami), 'must not contain the OS username')
+  assert.ok(!line.includes(hostname), 'must not contain the hostname')
+  assert.ok(!/\/Users\//.test(line), 'must not contain an absolute /Users/ path')
+  assert.ok(!/\/home\//.test(line), 'must not contain an absolute /home/ path')
+  assert.ok(!/\/Volumes\//.test(line), 'must not contain an absolute /Volumes/ path')
+  assert.ok(!/C:\\/.test(line), 'must not contain a Windows absolute path')
+  const entry = JSON.parse(line)
+  assert.equal(entry.repo, path.basename(repo), 'repo identity is a bare dir name, not an absolute path')
+})
