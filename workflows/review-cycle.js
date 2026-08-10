@@ -245,6 +245,11 @@ return {
 
 } // end run()
 
+// Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
+// pattern and its rationale.
+const startWrite = await writeLedgerEntry({ agent, log }, { kind: 'review_cycle', outcome: 'started', spec: specPath })
+const startRunId = startWrite.write_ok ? startWrite.run_id : null
+
 const raw = await run()
 const { __outcome, ...result } = raw
 const telemetry = {
@@ -260,5 +265,7 @@ const telemetry = {
   rejected_finding_count: rejectedFindingCount,
   budget_spent: safeBudgetSpent(budget),
 }
-await writeLedgerEntry({ agent, log }, { kind: 'review_cycle', ...telemetry })
+const terminalEntry = { kind: 'review_cycle', ...telemetry }
+if (startRunId) terminalEntry.run_id = startRunId
+await writeLedgerEntry({ agent, log }, terminalEntry)
 return { ...result, telemetry }

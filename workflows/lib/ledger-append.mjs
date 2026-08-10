@@ -72,15 +72,18 @@ function result(run_id, ts, write_ok, write_error) {
 
 function main() {
   const cwd = process.cwd()
-  const run_id = randomUUID()
   const ts = new Date().toISOString()
   let payload
   try {
     const raw = readStdin()
     payload = raw.trim() ? JSON.parse(raw) : {}
   } catch (e) {
-    return result(run_id, ts, false, 'payload was not valid JSON: ' + e.message)
+    return result(randomUUID(), ts, false, 'payload was not valid JSON: ' + e.message)
   }
+  // A caller may supply run_id to pair a terminal record with an earlier
+  // start record (the start/terminal protocol, AC-DATA-5); otherwise a
+  // fresh one is generated, as for any ordinary single-record write.
+  const run_id = typeof payload.run_id === 'string' && payload.run_id ? payload.run_id : randomUUID()
 
   // Truncate free-text fields BEFORE validation/serialisation so an
   // oversized field cannot push the line over the single-write() bound.

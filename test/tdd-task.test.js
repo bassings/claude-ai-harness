@@ -31,7 +31,7 @@ test('tdd-task.js: DONE path returns the pre-existing documented shape unchanged
   assert.equal(result.telemetry.outcome, 'done')
 })
 
-test('tdd-task.js: every terminating return reaches exactly one ledger write (AC-ARCH-3)', async () => {
+test('tdd-task.js: every terminating return reaches exactly one start write and one terminal write (AC-ARCH-3, AC-DATA-5)', async () => {
   const cases = [
     { name: 'test-writer agent fails', agent: {} },
     { name: 'RED verifier agent fails', agent: { 'write-test#1': DONE_AGENT['write-test#1'] } },
@@ -88,7 +88,7 @@ test('tdd-task.js: every terminating return reaches exactly one ledger write (AC
       agent: { ...c.agent, 'ledger:write': LEDGER_OK },
     })
     const ledgerCalls = calls.filter((call) => call.opts.label === 'ledger:write')
-    assert.equal(ledgerCalls.length, 1, `${c.name}: expected exactly one ledger write, got ${ledgerCalls.length}`)
+    assert.equal(ledgerCalls.length, 2, `${c.name}: expected one start write + one terminal write, got ${ledgerCalls.length}`)
     assert.ok(result.telemetry, `${c.name}: telemetry missing`)
     assert.ok(['done', 'blocked', 'aborted'].includes(result.telemetry.outcome), `${c.name}: outcome was ${result.telemetry.outcome}`)
   }
@@ -183,6 +183,40 @@ test('tdd-task.js: telemetry.budget_spent is null (not 0) when no budget is supp
 test('tdd-task.js: telemetry.budget_spent reflects budget.spent() when supplied', async () => {
   const { result } = await runWorkflow(WF, { args: { task: 'x' }, agent: DONE_AGENT, budget: { spent: () => 5000 } })
   assert.equal(result.telemetry.budget_spent, 5000)
+})
+
+test('tdd-task.js: the terminal ledger write requests reuse of the start write\'s run_id (AC-DATA-5 pairing)', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: { task: 'x' },
+    agent: {
+      ...DONE_AGENT,
+      'ledger:write': [
+        { run_id: 'start-run-id-123', ts: 't1', write_ok: true, write_error: null },
+        { run_id: 'terminal-run-id-456', ts: 't2', write_ok: true, write_error: null },
+      ],
+    },
+  })
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  assert.equal(ledgerCalls.length, 2)
+  assert.ok(!ledgerCalls[0].prompt.includes('"run_id":"start-run-id-123"'), 'the start write does not request an existing run_id (it generates one)')
+  assert.ok(ledgerCalls[1].prompt.includes('"run_id":"start-run-id-123"'), 'the terminal write must request reuse of the start write\'s run_id')
+})
+
+test('tdd-task.js: if the start write fails, the terminal write still proceeds without a run_id override (AC-QA-7 + AC-DATA-5 non-fatal interaction)', async () => {
+  const { calls, result } = await runWorkflow(WF, {
+    args: { task: 'x' },
+    agent: {
+      ...DONE_AGENT,
+      'ledger:write': [
+        { run_id: 'irrelevant', ts: 't1', write_ok: false, write_error: 'disk full' },
+        { run_id: 'terminal-only', ts: 't2', write_ok: true, write_error: null },
+      ],
+    },
+  })
+  assert.equal(result.verdict, 'DONE')
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  assert.equal(ledgerCalls.length, 2)
+  assert.ok(!ledgerCalls[1].prompt.includes('"run_id":"irrelevant"'), 'with no successful start write, the terminal write must not claim a run_id to reuse')
 })
 
 test('tdd-task.js: telemetry records spec identity as null when no spec was supplied, and the value when it was (AC-DATA-7)', async () => {

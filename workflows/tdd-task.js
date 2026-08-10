@@ -181,6 +181,14 @@ return {
 
 const OUTCOME_BY_VERDICT = { DONE: 'done', BLOCKED: 'blocked', ABORTED: 'aborted' }
 
+// Start/terminal record protocol (AC-DATA-5): an append-only start record
+// before any work happens, and a terminal record after, sharing a run_id,
+// so a run killed mid-flight is recorded as incomplete rather than absent.
+// If the start write itself fails, the terminal write below simply gets its
+// own fresh run_id (AC-QA-7: a ledger write failure never blocks the run).
+const startWrite = await writeLedgerEntry({ agent, log }, { kind: 'tdd_task', outcome: 'started', task: opts.task, spec: opts.spec || null })
+const startRunId = startWrite.write_ok ? startWrite.run_id : null
+
 const result = await run()
 const telemetry = {
   outcome: OUTCOME_BY_VERDICT[result.verdict] || 'aborted',
@@ -188,5 +196,7 @@ const telemetry = {
   budget_spent: safeBudgetSpent(budget),
   rounds: { test_attempts: rounds.test_attempts, implement_attempts: rounds.implement_attempts },
 }
-await writeLedgerEntry({ agent, log }, { kind: 'tdd_task', task: opts.task, ...telemetry })
+const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
+if (startRunId) terminalEntry.run_id = startRunId
+await writeLedgerEntry({ agent, log }, terminalEntry)
 return { ...result, telemetry }

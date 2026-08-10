@@ -56,7 +56,7 @@ test('review-cycle.js: the "no changes found" early return (line 65 historically
   })
   assert.equal(result.report, 'No changes found between the base ref and HEAD. Nothing to review.')
   assert.equal(result.telemetry.outcome, 'no-op')
-  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 1)
+  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
 })
 
 test('review-cycle.js: "every lens agent failed" early return (line 149 historically) still reaches the ledger write, with outcome aborted (AC-ARCH-3)', async () => {
@@ -66,7 +66,7 @@ test('review-cycle.js: "every lens agent failed" early return (line 149 historic
   })
   assert.equal(result.report, 'Every lens agent failed or was stopped; no review produced.')
   assert.equal(result.telemetry.outcome, 'aborted')
-  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 1)
+  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
 })
 
 test('review-cycle.js: outcome is blocked when any lens returns BLOCKED', async () => {

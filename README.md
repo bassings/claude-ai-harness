@@ -173,13 +173,15 @@ copy the hook and add to `~/.claude/settings.json`:
 
 ## Run ledger
 
-Every conducted `tdd-task`, `review-cycle` and `plan-cycle` run, plus
-`conduct-plan`'s task-level wait/PR events, appends one JSON line to
-`.claude/harness-ledger.jsonl` **inside the repo the workflow ran against**
-(the main checkout root, never a worktree). It is created and gitignored
-automatically on first write; it is never staged, committed or pushed by any
-code in this repo, and if you want it committed as a deliberate opt-in,
-remove that `.gitignore` line yourself.
+Every conducted `tdd-task`, `review-cycle` and `plan-cycle` run appends two
+JSON lines to `.claude/harness-ledger.jsonl` **inside the repo the workflow
+ran against** (the main checkout root, never a worktree): a `started` record
+before any work begins and a terminal record after, sharing a `run_id`, so a
+run killed mid-flight is recorded as incomplete rather than simply absent.
+`conduct-plan`'s task-level wait/PR events add one line each. The file is
+created and gitignored automatically on first write; it is never staged,
+committed or pushed by any code in this repo, and if you want it committed
+as a deliberate opt-in, remove that `.gitignore` line yourself.
 
 Each line records: which workflow ran and its outcome, which lenses ran/were
 skipped and their verdicts, findings as `{id, lens, severity, ac_id,

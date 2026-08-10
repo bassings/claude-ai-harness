@@ -212,3 +212,28 @@ test('ledger-append: a real ledger line contains no personal identifier -- not t
   const entry = JSON.parse(line)
   assert.equal(entry.repo, path.basename(repo), 'repo identity is a bare dir name, not an absolute path')
 })
+
+test('ledger-append: reuses a caller-supplied run_id instead of generating a fresh one, so a start record and its terminal record can share identity (AC-DATA-5)', () => {
+  const repo = makeTempRepo()
+  const startRes = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'started' })
+  const startOut = JSON.parse(startRes.stdout.trim().split('\n').pop())
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', run_id: startOut.run_id })
+  const lines = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.equal(lines.length, 2)
+  assert.equal(lines[0].outcome, 'started')
+  assert.equal(lines[1].outcome, 'done')
+  assert.equal(lines[0].run_id, lines[1].run_id, 'the start and terminal records must share one run_id')
+})
+
+test('ledger-append: a start record with no matching terminal record (run killed mid-flight) leaves the start line intact and parseable, distinguishable by its run_id having no "done"/"blocked"/"aborted" companion (AC-DATA-5)', () => {
+  const repo = makeTempRepo()
+  const startRes = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'started' })
+  const startOut = JSON.parse(startRes.stdout.trim().split('\n').pop())
+  // simulate the process being killed before the terminal write ever runs
+  const lines = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.equal(lines.length, 1)
+  assert.equal(lines[0].outcome, 'started')
+  assert.equal(lines[0].run_id, startOut.run_id)
+  const terminalOutcomes = lines.filter((l) => l.run_id === startOut.run_id && l.outcome !== 'started')
+  assert.equal(terminalOutcomes.length, 0, 'a reader can tell this run_id has a start but no terminal record: aborted/unterminated')
+})

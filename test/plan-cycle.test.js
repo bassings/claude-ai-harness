@@ -49,7 +49,7 @@ test('plan-cycle.js: the "scope agent failed" early return (line 48 historically
   const { result, calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'scope:spec': undefined }) })
   assert.equal(result.report, 'Scope agent failed; no plan produced.')
   assert.equal(result.telemetry.outcome, 'aborted')
-  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 1)
+  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
 })
 
 test('plan-cycle.js: the "every lens agent failed" early return (line 98 historically) still reaches the ledger write, with outcome aborted (AC-ARCH-3)', async () => {
@@ -59,7 +59,7 @@ test('plan-cycle.js: the "every lens agent failed" early return (line 98 histori
   })
   assert.equal(result.report, 'Every lens agent failed or was stopped; no plan produced.')
   assert.equal(result.telemetry.outcome, 'aborted')
-  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 1)
+  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
 })
 
 test('plan-cycle.js: outcome is blocked when any lens returns BLOCKED', async () => {

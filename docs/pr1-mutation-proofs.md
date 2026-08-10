@@ -200,9 +200,41 @@ absolute working directory) before its real body.
 
 **Reverted**: restored from backup; `ledger-append.test.js` back to 14/14 green.
 
+## 11. `ledger-append.mjs` reuses a caller-supplied `run_id` — start/terminal pairing
+
+**Guarded behaviour**: AC-DATA-5's start/terminal record protocol only works
+if the terminal write's `run_id` can be forced to match the start write's;
+otherwise a killed run's start record is an orphan nobody can pair back up.
+
+**Mutation**: `const run_id = typeof payload.run_id === 'string' && ... ?
+payload.run_id : randomUUID()` reverted to always `randomUUID()`.
+
+**Result**: 1 test failed for the right reason —
+
+- `ledger-append: reuses a caller-supplied run_id instead of generating a fresh one, so a start record and its terminal record can share identity (AC-DATA-5)`
+  — two different UUIDs printed where the same one was expected.
+
+**Reverted**: restored from backup; `ledger-append.test.js` back to 16/16 green.
+
+## A note on this document's own history
+
+Ten proofs were originally written up as "PR1 done" before a late pass
+noticed the spec's explicit start/terminal record protocol (AC-DATA-5) had
+been understood but never actually wired into the three instrumented
+workflows -- only a single terminal write existed, meaning a run killed
+mid-flight left no ledger trace at all, exactly the risk the spec's own
+"Risks" section names as the reason the protocol exists. That gap is now
+closed (workflows/tdd-task.js, review-cycle.js and plan-cycle.js each write
+a `started` record before any work begins, and their terminal write requests
+reuse of that record's `run_id`), proof #11 above, and every earlier
+AC-ARCH-3 test updated from "expects one ledger write" to "expects one start
+write plus one terminal write." Recorded here rather than quietly folded in,
+because a task list that silently grows after "done" was said is exactly
+the kind of thing this file exists to make visible.
+
 ## Caveat
 
-These ten cover the guards judged highest-risk (data integrity, injection
+These eleven cover the guards judged highest-risk (data integrity, injection
 safety, the single-write-path invariant, the RED/GREEN control-flow
 invariant, and null-vs-zero telemetry correctness) rather than every
 assertion in the suite. Mutation #5 is the one genuine finding: it is left in
