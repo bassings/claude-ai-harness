@@ -3,17 +3,20 @@
 Per AC-QA-3 and standard §11: for the guards below, the guarded behaviour was
 actually broken (edited in the working file, not "mentally mutated"), the
 suite was run, the exact failing test and message recorded, and the file was
-then restored and the suite re-run green. Sixty-seven proofs have been
-executed across three passes: 17 in the initial build (11 in the first pass,
+then restored and the suite re-run green. Seventy-three proofs have been
+executed across four passes: 17 in the initial build (11 in the first pass,
 6 more -- 5 re-verifications plus one new guard -- in the "Rework" section,
 after a coordinator probe found workflow scripts cannot import anything in
 production), 18 more (proofs 18-35) in the "Review remediation round 1"
 section (1 Critical, 5 High, 9 Medium, 6 Low -- 21 findings, all fixed, none
-rejected), and 32 more (proofs 36-67) in the "Review remediation round 2"
+rejected), 32 more (proofs 36-67) in the "Review remediation round 2"
 section (0 Critical, 4 High, 6 Medium, 12 Low -- 22 findings; 20 fixed, one
 deferred to PR 2 with reasoning recorded (L11), one triaged as a docs-only
 addition with a mechanical guard rather than a mutation-proved code guard
-(L9, this section itself)).
+(L9, this section itself)), and 6 more (proofs 68-73) in the "Review
+remediation round 3" section (1 High, 2 Low, plus one self-flagged
+test-hygiene item carried over from round 2's own final report -- all
+fixed, none rejected).
 
 **Proofs 1, 6 and 7 below reference `workflows/lib/ledger.mjs`, which no
 longer exists**: that was accurate at the time each proof was first run, and
@@ -693,12 +696,101 @@ coverage gap. Rows marked "no test, PR 2" name real, currently-absent
 coverage for criteria this PR does not implement, not a hidden gap in what
 it does implement.
 
+## Review remediation round 3 (proofs 68-73)
+
+A third full multi-lens review (0 Critical, 1 High, 2 Low; two arbitrations
+recorded) found lens-data's first real finding of the whole PR: appending
+after a torn trailing line fuses two records into one unparseable line.
+Every mutation below was applied to the working file, backed up first via
+`cp` to a scratch path -- never `git checkout --` -- restored the same way,
+and the affected test file(s) re-run green after every revert.
+
+**68. HIGH -- the torn-line heal.** The last-byte read and healing '\n'
+prefix in `ledger-append.mjs`'s append block replaced with `let healPrefix
+= ''` unconditionally. Caught by exactly the torn-trailing-line test
+(seeded a real, valid JSON record missing only its trailing newline,
+confirmed by a sanity assertion that the naive unhealed concatenation is
+genuinely unparseable before trusting the test proves anything). The
+regression test (an ordinary two-write sequence, asserting no spurious
+blank line) stayed green throughout, confirming the heal only fires when
+actually needed.
+
+**69. HIGH -- the short-write check.** `if (written !== buf.length)`
+disabled (`if (false && ...)`). Caught by exactly the calibrated
+`ulimit -f` test. A genuinely full disk cannot be constructed in this
+sandbox; confirmed empirically first that RLIMIT_FSIZE produces a real
+short `fs.writeSync` return (not an exception, not a killed process) on
+this platform, then calibrated the payload size after a first draft
+(a 500-byte truncated `task` field) never exceeded the smallest tried
+block limit's ~1024-byte floor and so never actually reproduced a short
+write at any size tried -- caught before trusting the "short write
+reproduced" claim, the same vacuous-fixture class as earlier rounds.
+
+**70. HIGH -- the short-write rollback.** The `fs.ftruncateSync(fd,
+stats.size)` call on a detected short write removed. Caught by the same
+calibrated test: without the rollback, the partial bytes already written
+by the failed attempt are themselves a fresh torn trailing line, and
+`readLedgerLines` correctly surfaces it as one unparseable "line" (no
+trailing newline to split on), which the test's `JSON.parse` throws on --
+confirmed by reading the actual failure message ("Unterminated string in
+JSON at position 1024") to be certain the assertion fired for that reason,
+rather than assuming its (conditional on `lines.length`) guard clause
+would have been skipped.
+
+**71. LOW -- README's git-clean documentation and arbitration.** Both the
+git-clean-deletes-the-ledger sentence and the AC-DATA-4/AC-SEC-1
+arbitration paragraph reverted together. Caught by exactly the new static
+test (asserting "git clean -xdf" is named with a deletion statement and a
+keep-it instruction nearby, and that "arbitration" plus both AC IDs appear
+in the document). The keep-it instruction
+(`git clean -xdf -e .claude/harness-ledger.jsonl`) was verified by hand
+against a real repo before being documented as the fix, not assumed correct.
+
+**72. LOW (speculative) -- fake-runtime's widened Date/Math.random
+patterns.** Both new regex entries (bare `Date` token, `Math.random`
+without requiring an immediate call) removed from REJECTIONS. Caught by
+exactly the three new obfuscation fixtures (bracket access, Date aliased
+through a variable, Math.random aliased through a variable); the
+Math.floor non-vacuity fixture stayed green throughout, confirming the
+widening targets Math.random specifically, not the whole Math object.
+Confirmed by grep before adding either pattern that neither "Date" nor
+"Math" appears anywhere in the three real workflow scripts, so the
+widening introduces no false positive against production code.
+"Import used as a bare identifier" (the finding's third obfuscation) was
+investigated and rejected with evidence, not silently skipped: `import`
+is a reserved word in JS syntax, so aliasing it is a SyntaxError -- no
+valid code path could reach this check via that route.
+
+**73. Test hygiene (self-flagged carryover, not one of the three review
+findings) -- shell-injection.test.js's marker isolation.** Rather than
+mutating the fix itself, this was proven by reproducing the underlying
+vulnerability for real: `review-cycle.js`'s `ledgerWritePrompt` reverted
+from the base64 transport back to raw JSON embedding (the exact pre-H1
+form, the same technique as proof #19). Running `shell-injection.test.js`
+in isolation against that reverted code caused both tests to fail for the
+right reason (the marker WAS created under the isolated SUITE_TMPDIR,
+proving the injection re-triggered exactly as the file exists to detect),
+leaving the marker uncleaned mid-process since the assertion threw before
+reaching its own `fs.rmSync` line -- exactly the leak shape the old bare-
+`os.tmpdir()` code would have left permanently. After the process exited,
+TMPDIR was checked and found to hold zero leftover directories, proving
+the exit-hook mechanism (shared with M4 via the now-exported
+`SUITE_TMPDIR`) closes the leak even under this exact failure path, not
+merely on the happy path a simpler test might have exercised.
+
+Every mutation above was confirmed applied (via the failing test's message
+matching the intended defect), confirmed reverted (via `git diff --stat`
+on the touched file showing only the intended, committed change, and via
+snapshot `cp` rather than `git checkout --` throughout), and the full
+suite re-run green after each revert -- 195/195 as of the last commit in
+this round.
+
 ## Caveat
 
-Sixty-seven proofs across three passes cover the guards judged
+Seventy-three proofs across four passes cover the guards judged
 highest-risk (data integrity, injection safety, the single-write-path
 invariant, the RED/GREEN control-flow invariant, null-vs-zero telemetry
-correctness, and every finding from two full multi-lens reviews) rather
+correctness, and every finding from three full multi-lens reviews) rather
 than every assertion in the suite. Genuine findings are left in this
 document rather than quietly fixed and forgotten, because a surviving
 mutant that gets patched without a record is exactly the kind of
@@ -706,9 +798,23 @@ near-miss this process exists to catch: mutation #5 (the original RED-gate
 two-condition gap), the M2 byte-truncation test's own first version
 (documented under proofs 31-33), which was itself a surviving mutant
 against a single-field fixture before being strengthened to a genuinely
-discriminating two-field one, and -- from round 2 -- the L2 submodule test
-and L3 static-doc test near-misses documented under proofs 58 and 59
-above, both caught and fixed before being trusted, both by the same
-mechanism: reading the actual evidence (a real bogus directory tree on
-disk; the raw file with its line wrap intact) rather than assuming the
-fixture or the regex was correct.
+discriminating two-field one; from round 2, the L2 submodule test and L3
+static-doc test near-misses documented under proofs 58 and 59, both caught
+and fixed before being trusted by reading the actual evidence (a real
+bogus directory tree on disk; the raw file with its line wrap intact)
+rather than assuming the fixture or the regex was correct; and from round
+3, proof 69's short-write test, whose first draft (a 500-byte truncated
+`task` field under `ulimit -f`) never actually exceeded the smallest tried
+block limit's floor and so never reproduced a short write at any size
+tried at all -- caught by checking the calibration actually found a
+value, not by assuming a small `ulimit` number would obviously be small
+enough.
+
+One genuine limitation, stated rather than worked around: proof 69/70's
+short-write path could not be tested via a real full disk (not
+constructible in this sandbox), so `ulimit -f` (RLIMIT_FSIZE) was used
+instead, confirmed empirically first to produce the same observable
+behaviour (a real short `fs.writeSync` return, not an exception) on this
+platform before being trusted as a stand-in for ENOSPC. This is close to
+the real failure mode but is not literally the same kernel code path, and
+was not verified on any platform other than the one this session ran on.
