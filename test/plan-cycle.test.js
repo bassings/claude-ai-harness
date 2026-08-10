@@ -45,6 +45,15 @@ test('plan-cycle.js: normal completion preserves the existing return shape and a
   assert.ok(calls.find((c) => c.opts.label === 'ledger:write'))
 })
 
+// M3: see tdd-task.js for the identical guard gap and rationale -- nothing
+// previously pinned the start record to before the work.
+test('plan-cycle.js: the start-record ledger write is the very first agent() call, strictly before any work-agent step (M3)', async () => {
+  const { calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
+  assert.ok(calls.length > 1, 'expected more than just the start write')
+  assert.equal(calls[0].opts.label, 'ledger:write', 'the start-record ledger write must be the FIRST agent() call in the unfiltered order')
+  assert.equal(calls[1].opts.label, 'scope:spec', 'the second call must be the first real work step, not another ledger write')
+})
+
 test('plan-cycle.js: the "scope agent failed" early return (line 48 historically) still reaches the ledger write, with outcome aborted (AC-ARCH-3)', async () => {
   const { result, calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'scope:spec': undefined }) })
   assert.equal(result.report, 'Scope agent failed; no plan produced.')

@@ -69,6 +69,15 @@ test('review-cycle.js: outcome is aborted (not done) when synthesis returns a st
   assert.equal(result.telemetry.outcome, 'aborted')
 })
 
+// M3: see tdd-task.js for the identical guard gap and rationale -- nothing
+// previously pinned the start record to before the work.
+test('review-cycle.js: the start-record ledger write is the very first agent() call, strictly before any work-agent step (M3)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.ok(calls.length > 1, 'expected more than just the start write')
+  assert.equal(calls[0].opts.label, 'ledger:write', 'the start-record ledger write must be the FIRST agent() call in the unfiltered order')
+  assert.equal(calls[1].opts.label, 'scope:diff', 'the second call must be the first real work step, not another ledger write')
+})
+
 test('review-cycle.js: the "no changes found" early return (line 65 historically) still reaches the ledger write, with outcome no-op (AC-ARCH-3)', async () => {
   const { result, calls } = await runWorkflow(WF, {
     args: {},

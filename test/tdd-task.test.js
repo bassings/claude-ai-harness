@@ -32,6 +32,20 @@ test('tdd-task.js: DONE path returns the pre-existing documented shape unchanged
   assert.equal(result.telemetry.outcome, 'done')
 })
 
+// M3: every existing ledger assertion filters to ledger:write calls first,
+// or distinguishes writes by payload -- none of them compares a ledger
+// call's position against a work-agent call's in the UNFILTERED list, so
+// nothing actually pins the start record to before the work, which is the
+// entire reason the start record exists (a killed run must still leave a
+// "started" line behind). Moving the start write after the first work call
+// would leave every ledger:write-filtered assertion green.
+test('tdd-task.js: the start-record ledger write is the very first agent() call, strictly before any work-agent step (M3)', async () => {
+  const { calls } = await runWorkflow(WF, { args: { task: 'do the thing' }, agent: DONE_AGENT })
+  assert.ok(calls.length > 1, 'expected more than just the start write')
+  assert.equal(calls[0].opts.label, 'ledger:write', 'the start-record ledger write must be the FIRST agent() call in the unfiltered order')
+  assert.equal(calls[1].opts.label, 'write-test#1', 'the second call must be the first real work step, not another ledger write')
+})
+
 test('tdd-task.js: every terminating return reaches exactly one start write and one terminal write, with the RIGHT verdict per case (AC-ARCH-3, AC-DATA-5, H4)', async () => {
   // H4: the previous version of this loop only asserted the outcome was ANY
   // of done/blocked/aborted, which every one of these cases satisfies no
