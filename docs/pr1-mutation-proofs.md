@@ -3,8 +3,8 @@
 Per AC-QA-3 and standard §11: for the guards below, the guarded behaviour was
 actually broken (edited in the working file, not "mentally mutated"), the
 suite was run, the exact failing test and message recorded, and the file was
-then restored and the suite re-run green. Seventy-three proofs have been
-executed across four passes: 17 in the initial build (11 in the first pass,
+then restored and the suite re-run green. Seventy-four proofs have been
+executed across five passes: 17 in the initial build (11 in the first pass,
 6 more -- 5 re-verifications plus one new guard -- in the "Rework" section,
 after a coordinator probe found workflow scripts cannot import anything in
 production), 18 more (proofs 18-35) in the "Review remediation round 1"
@@ -13,10 +13,14 @@ rejected), 32 more (proofs 36-67) in the "Review remediation round 2"
 section (0 Critical, 4 High, 6 Medium, 12 Low -- 22 findings; 20 fixed, one
 deferred to PR 2 with reasoning recorded (L11), one triaged as a docs-only
 addition with a mechanical guard rather than a mutation-proved code guard
-(L9, this section itself)), and 6 more (proofs 68-73) in the "Review
+(L9, this section itself)), 6 more (proofs 68-73) in the "Review
 remediation round 3" section (1 High, 2 Low, plus one self-flagged
 test-hygiene item carried over from round 2's own final report -- all
-fixed, none rejected).
+fixed, none rejected), and 1 more (proof 74) in "Review remediation round
+3b", which RETRACTS part of round 3: proof 70's own rollback guard was
+itself found unsafe under concurrency and removed outright rather than
+re-fixed in place (§12 -- a change reverted for being worse keeps the
+simpler original).
 
 **Proofs 1, 6 and 7 below reference `workflows/lib/ledger.mjs`, which no
 longer exists**: that was accurate at the time each proof was first run, and
@@ -678,7 +682,7 @@ for (const k of Object.keys(acToTests).sort()) console.log(k, [...acToTests[k]].
 | AC-ARCH-13, 14 | **no test, PR 2** | |
 | AC-DATA-1 | ledger-append.test.js | Worktree resolution |
 | AC-DATA-2 | ledger-append.test.js | Append-only, no rewrite |
-| AC-DATA-3 | ledger-append.test.js | Concurrent writers, atomic write |
+| AC-DATA-3 | ledger-append.test.js | Concurrent writers, atomic write; proof 74's concurrency test additionally guards that a short write on one writer never destroys another concurrent writer's already-committed record |
 | AC-DATA-4 | ledger-append.test.js | Checkout survival (checkout half only) |
 | AC-DATA-5 | ledger-append.test.js, tdd-task.test.js | Proof 11, 16; start/terminal pairing |
 | AC-DATA-7 | tdd-task.test.js | **Also proven, untagged, by H4's new ac_verdicts/ac_id tests in review-cycle.test.js and ledger-append.test.js** (proof 43-45) -- the round-2 effective FAIL this round's H4 closed |
@@ -784,6 +788,80 @@ on the touched file showing only the intended, committed change, and via
 snapshot `cp` rather than `git checkout --` throughout), and the full
 suite re-run green after each revert -- 195/195 as of the last commit in
 this round.
+
+## Review remediation round 3b (proof 74) -- proof 70's rollback retracted
+
+A confirming re-review (lens-data; security, qa and reviewer-verification
+all CLEAN) found that proof 70's own rollback -- `fs.ftruncateSync(fd,
+stats.size)` on a detected short write, added in round 3 to prevent a
+short write from leaving a torn trailing line -- introduced a NEW, worse
+defect: `stats.size` is captured by `fstat` BEFORE this writer's own
+write attempt, and under the concurrent-writer design AC-DATA-3 requires
+(direct invocations, no locking, many processes appending to the same
+file), another writer can complete a full `O_APPEND` write in the window
+between this writer's `fstat` and its `ftruncate`. The rollback then
+truncates the file back to that stale, pre-race size -- deleting the
+OTHER writer's already-committed record, a record whose write already
+returned `write_ok:true` to its own caller. This is worse than the
+torn-line problem the rollback was added to solve: instead of losing only
+the interrupted writer's own record, it can silently destroy a third
+party's successful one.
+
+**Disposition (§12: a change reverted for being worse keeps the simpler
+original): proof 70's rollback is retracted, not merely mutated again --
+the `ftruncateSync` call is deleted outright.** The short write is still
+detected and reported as `write_ok:false` to the caller (so the run is
+correctly recorded as failed, not falsely successful), but the file is no
+longer touched to "repair" it. Any partial bytes the failed write did
+leave behind are a self-inflicted torn trailing line -- exactly the
+pre-existing, already-tolerated case (AC-DATA-5) the heal from proof 68
+already fixes on the next append. No locking was added: the fix removes
+the unsafe mutation rather than making it safe, per the coordinator's own
+instruction, because adding a lock around fstat-through-ftruncate would
+undermine the entire lock-free, concurrent-writers-by-design point of the
+plain `O_APPEND` approach.
+
+**74. Concurrency: a short write must never destroy a concurrent writer's
+already-committed record.** New test drives two real, separately spawned
+processes against the same ledger: writer A, constrained via a calibrated
+`ulimit -f` (confirmed, as in proof 69, to produce a genuine short
+`fs.writeSync` return on this platform rather than an exception); writer
+B, an ordinary unconstrained writer, fired 100ms after A starts. Because a
+microsecond-scale OS race cannot be relied on to land reliably in a fast,
+portable test, `LEDGER_APPEND_TEST_RACE_WINDOW_MS` (a no-op unless this
+exact env var is set; never set outside this test) widens the window
+between writer A's `fstat` and its write/short-write handling to 300ms,
+giving writer B a generous, reliable interval to land its own committed
+write inside it.
+
+- **Against the round-3 code (rollback present, confirmed BEFORE removing
+  it):** ran 3 times, failed all 3 times for the identical reason --
+  writer B's record (`run_id: "writer-b-committed-record"`), already
+  reported `write_ok:true` to its own caller, was absent from the ledger
+  after writer A's rollback truncated it away. Reproduces the finding's
+  own evidence exactly (writer A's stale `fstat` size wins over writer
+  B's real, later-landed record).
+- **Fix applied (the `ftruncateSync` call deleted).**
+- **After the fix:** ran 4 times, passed all 4 times. Writer A still
+  correctly reports `write_ok:false` (the short write is still detected
+  and surfaced to its caller); writer B's committed record survives
+  intact every time.
+- **Mutation-proof (formal round-trip, in addition to the natural
+  before/after above):** reintroduced the `ftruncateSync` call as an
+  explicit mutation into the already-fixed file. The concurrency test
+  failed for the identical reason. Reverted from a snapshot copy (never
+  `git checkout --`) and confirmed restored via `git diff --stat`.
+
+The single-writer short-write test from proof 69 was updated in the same
+change: its old assertion ("a rejected short write must never leave a
+torn, unparseable trailing line") encoded the ROLLBACK's behaviour and is
+no longer true by design -- a short write may now leave a torn trailing
+fragment, which is accepted and left to the next append's heal (proof 68)
+to fix, not repaired at write time. The assertion was removed, not
+weakened silently: the reasoning is recorded in the test's own comment.
+
+Full suite re-run green after the fix (196/196: 195 from round 3 plus this
+one new concurrency test), and again after the mutation-proof revert.
 
 ## Caveat
 

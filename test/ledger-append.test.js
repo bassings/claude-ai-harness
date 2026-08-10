@@ -316,10 +316,105 @@ test('ledger-append: a SHORT write (fs.writeSync returns fewer bytes than reques
   }
   assert.ok(found, 'calibration failed to reproduce a short write at any tried block limit -- this platform may not truncate writes past RLIMIT_FSIZE the way it was confirmed to')
   assert.ok(out.write_error && /short write/i.test(out.write_error), `expected a short-write-specific reason: ${out.write_error}`)
-  const lines = readLedgerLines(repo)
-  if (lines.length) {
-    assert.doesNotThrow(() => JSON.parse(lines[lines.length - 1]), 'a rejected short write must never leave a torn, unparseable trailing line for the NEXT append to find')
+  // Round 3b: the file is NO LONGER rolled back on a short write (see the
+  // concurrency test below for why -- an absolute-offset rollback is unsafe
+  // under the concurrent-writer design AC-DATA-3 requires). A short write
+  // may therefore leave a torn trailing fragment on disk; that is accepted
+  // and left to the next append's own heal to fix (proven by the
+  // torn-trailing-line test above), not repaired here.
+})
+
+// Round 3b HIGH: the short-write rollback added in round 3 (ftruncateSync
+// to the size captured by fstat BEFORE this write) is unsafe under
+// concurrency. Another writer can complete a full O_APPEND write in the
+// window between THIS writer's fstat and its ftruncate; the rollback then
+// truncates the file back to the stale pre-race size, destroying that
+// other writer's already-committed record -- a record whose write already
+// returned write_ok:true to ITS caller. This is worse than the torn-line
+// bug the rollback was added to prevent: instead of losing only the
+// writer's own interrupted record, it can silently delete a THIRD PARTY's
+// successful one.
+//
+// A microsecond-scale OS race cannot be relied on to land reliably in a
+// fast, portable test, so LEDGER_APPEND_TEST_RACE_WINDOW_MS (a no-op
+// unless this exact env var is set, see ledger-append.mjs) widens the
+// window deterministically: writer A pauses right after its fstat, giving
+// writer B a generous, reliable interval to land its own committed write
+// before writer A ever reaches its write/rollback.
+function spawnAppendAsync(cwd, payload, { blocks, env } = {}) {
+  const { spawn } = require('node:child_process')
+  return new Promise((resolve, reject) => {
+    const spawnEnv = { ...process.env, ...(env || {}) }
+    const child = blocks
+      ? spawn('/bin/sh', ['-c', `ulimit -f ${blocks}; exec node ${JSON.stringify(APPEND_SCRIPT)}`], { cwd, env: spawnEnv })
+      : spawn('node', [APPEND_SCRIPT], { cwd, env: spawnEnv })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (d) => (stdout += d))
+    child.stderr.on('data', (d) => (stderr += d))
+    child.on('close', () => resolve({ stdout, stderr }))
+    child.on('error', reject)
+    child.stdin.end(JSON.stringify(payload))
+  })
+}
+
+test('ledger-append: a concurrent writer\'s already-committed record survives another writer\'s short write -- it must never be silently deleted by a rollback (round 3b HIGH, AC-DATA-3)', async () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+
+  const shortPayload = {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    trigger_counts: Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`lens-fake-${i}`, i])),
   }
+
+  // Calibrate exactly as the single-writer short-write test does.
+  let blocks = null
+  for (const b of [1, 2, 3, 4, 6, 8, 12, 16, 24, 32]) {
+    fs.rmSync(path.join(repo, LEDGER_REL), { force: true })
+    const res = runAppendWithFsizeLimit(repo, shortPayload, b)
+    const lastLine = res.stdout.trim().split('\n').pop()
+    let parsed
+    try {
+      parsed = JSON.parse(lastLine)
+    } catch (e) {
+      continue
+    }
+    if (parsed.write_ok === false) {
+      blocks = b
+      break
+    }
+  }
+  assert.ok(blocks, 'calibration failed to find a block limit that produces a short write for this payload')
+  fs.rmSync(path.join(repo, LEDGER_REL), { force: true })
+
+  // Writer A: the short-write victim, its fstat-to-write window widened so
+  // writer B has a reliable interval to land inside it.
+  const writerA = spawnAppendAsync(repo, shortPayload, { blocks, env: { LEDGER_APPEND_TEST_RACE_WINDOW_MS: '300' } })
+
+  // Writer B: an ordinary, unconstrained writer, fired shortly after A has
+  // started (giving A time to open the file and reach its fstat) but well
+  // inside A's widened window.
+  await new Promise((r) => setTimeout(r, 100))
+  const writerB = spawnAppendAsync(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', run_id: 'writer-b-committed-record' })
+
+  const [outA, outB] = await Promise.all([writerA, writerB])
+  const parsedA = JSON.parse(outA.stdout.trim().split('\n').pop())
+  const parsedB = JSON.parse(outB.stdout.trim().split('\n').pop())
+
+  assert.equal(parsedA.write_ok, false, 'writer A must still detect and report its own short write as a failure to its caller')
+  assert.equal(parsedB.write_ok, true, `writer B's own write must have succeeded: ${outB.stderr}`)
+
+  const lines = readLedgerLines(repo)
+  const survived = lines.some((l) => {
+    try {
+      return JSON.parse(l).run_id === 'writer-b-committed-record'
+    } catch (e) {
+      return false
+    }
+  })
+  assert.ok(survived, 'writer B\'s already-committed record (already reported write_ok:true to its own caller) must never be silently deleted by writer A\'s short-write handling')
 })
 
 test('ledger-append: free-text fields are truncated to MAX_LINE_BYTES before the line is built (AC-DATA-3)', () => {

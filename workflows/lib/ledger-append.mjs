@@ -773,6 +773,17 @@ export function main() {
         fs.readSync(fd, lastByte, 0, 1, stats.size - 1)
         if (lastByte[0] !== 0x0a /* '\n' */) healPrefix = '\n'
       }
+      // TEST-ONLY, a no-op unless a test sets this exact env var: widens the
+      // window between the fstat above and the write below so a concurrency
+      // test can reliably land a concurrent writer's append inside it,
+      // rather than depending on unpredictable OS scheduling to win a
+      // microsecond-scale race. Never set outside this repo's own test
+      // suite (round-3b concurrency finding, see
+      // test/ledger-append.test.js).
+      const testRaceWindowMs = Number(process.env.LEDGER_APPEND_TEST_RACE_WINDOW_MS || 0)
+      if (testRaceWindowMs > 0) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, testRaceWindowMs)
+      }
       // Byte length, not string length: MAX_LINE_BYTES and the short-write
       // check below are both byte-based, and `line` may already contain
       // multibyte UTF-8 (free text is truncated by byte length elsewhere,
@@ -787,17 +798,25 @@ export function main() {
       // side instead of a pre-existing one.
       const written = fs.writeSync(fd, buf)
       if (written !== buf.length) {
-        // The partial bytes that DID land are themselves now a torn
-        // trailing line -- the exact corruption this whole fix exists to
-        // prevent, just self-inflicted by this failed attempt instead of a
-        // prior crash. Roll the file back to its size before this write
-        // (captured above as `stats.size`) so a short write never leaves
-        // new torn bytes behind for the next append to find.
-        try {
-          fs.ftruncateSync(fd, stats.size)
-        } catch (truncateError) {
-          // best-effort: report the original short-write failure either way
-        }
+        // Round 3b: this used to roll the file back to `stats.size`
+        // (captured by fstat above, BEFORE this write) via ftruncateSync.
+        // That is unsafe under the concurrent-writer design AC-DATA-3
+        // requires: another writer can complete a full O_APPEND write in
+        // the window between THIS writer's fstat and its ftruncate, and an
+        // absolute-offset truncate back to the stale pre-race size deletes
+        // that other writer's already-committed record too -- a record
+        // whose write already returned write_ok:true to ITS caller. Fixing
+        // this correctly would require an exclusive lock around fstat
+        // through ftruncate, which the design deliberately avoids (that is
+        // exactly what makes the plain O_APPEND single-write() approach
+        // simple and lock-free in the first place). §12: a change reverted
+        // for being worse keeps the simpler original -- the fix is to
+        // report the failure and leave the file alone, not to "repair" it.
+        // The partial bytes this failed attempt DID write (if any) are
+        // left in place: a self-inflicted torn trailing line, exactly the
+        // pre-existing case the heal above already exists to fix on the
+        // NEXT append (this is not new risk -- a torn trailing line is
+        // already a supported, tolerated state per AC-DATA-5).
         return result(run_id, ts, false, `short write to the ledger: wrote ${written} of ${buf.length} bytes (disk full?)`)
       }
     } finally {
