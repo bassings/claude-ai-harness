@@ -747,6 +747,25 @@ test('ledger-append: two different defects at the same file:line yield different
   assert.notEqual(entry.findings[0].id, entry.findings[1].id)
 })
 
+// L10: findingId's location component was never independently exercised --
+// every existing test either held location fixed while varying claim, or
+// varied claim alongside location together, so removing the location
+// argument entirely (or its trim/lowercase normalisation) changed no
+// existing test's outcome.
+test('ledger-append module: findingId varies with location alone, holding lens and claim fixed (L10, AC-QA-11)', async () => {
+  const { findingId } = await import(APPEND_MODULE_URL)
+  const a = findingId('lens-qa', 'foo.js:10', 'same claim text')
+  const b = findingId('lens-qa', 'bar.js:20', 'same claim text')
+  assert.notEqual(a, b, 'two different locations for the identical lens+claim must yield different ids')
+})
+
+test('ledger-append module: findingId normalises location (trim + lowercase) so cosmetic variants of the SAME location yield the SAME id (L10, AC-QA-11)', async () => {
+  const { findingId } = await import(APPEND_MODULE_URL)
+  const base = findingId('lens-qa', 'foo.js:10', 'same claim text')
+  assert.equal(findingId('lens-qa', '  foo.js:10  ', 'same claim text'), base, 'leading/trailing whitespace must not change the id')
+  assert.equal(findingId('lens-qa', 'FOO.JS:10', 'same claim text'), base, 'case must not change the id')
+})
+
 // ---- Unit tests for the pure functions, relocated from the now-deleted
 // workflows/lib/ledger.mjs: they live in ledger-append.mjs now, since it is
 // the sole real-Node script permitted to use node:crypto and own the
