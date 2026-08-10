@@ -55,7 +55,9 @@ Then run the workflows namespaced:
 ```bash
 git clone https://github.com/bassings/claude-ai-harness
 cp claude-ai-harness/agents/*.md ~/.claude/agents/
-cp claude-ai-harness/workflows/*.js ~/.claude/workflows/
+cp -r claude-ai-harness/workflows/. ~/.claude/workflows/
+cp -r claude-ai-harness/skills/. ~/.claude/skills/
+cp -r claude-ai-harness/hooks/. ~/.claude/hooks/
 cp claude-ai-harness/AGENT-HARNESS.md ~/.claude/
 ```
 
@@ -169,6 +171,48 @@ copy the hook and add to `~/.claude/settings.json`:
 }
 ```
 
+## Run ledger
+
+Every conducted `tdd-task`, `review-cycle` and `plan-cycle` run, plus
+`conduct-plan`'s task-level wait/PR events, appends one JSON line to
+`.claude/harness-ledger.jsonl` **inside the repo the workflow ran against**
+(the main checkout root, never a worktree). It is created and gitignored
+automatically on first write; it is never staged, committed or pushed by any
+code in this repo, and if you want it committed as a deliberate opt-in,
+remove that `.gitignore` line yourself.
+
+Each line records: which workflow ran and its outcome, which lenses ran/were
+skipped and their verdicts, findings as `{id, lens, severity, ac_id,
+disposition}` only (never the lens's evidence text or the markdown report),
+round/spec identity, attempt counts, and `budget.spent()` if available. See
+`workflows/lib/ledger.mjs`'s `LEDGER_ENTRY_SCHEMA` for the exact, exhaustive
+field list.
+
+**Retention**: kept indefinitely as an ordinary untracked file; nothing in
+this repo prunes or rotates it. **Delete it** with `rm .claude/harness-ledger.jsonl`.
+**Export**: it already is one — the file itself is newline-delimited JSON,
+readable with any JSONL tool. If a line is ever deliberately committed (the
+opt-in above), it survives in git history like any other tracked change.
+
+## Tests
+
+This repo's own tests need only Node (no `npm install`, no dependency
+manifest):
+
+```bash
+node --test test/*.test.js
+```
+
+(`node --test` with no args also picks up `test/helpers/` and `test/fixtures/`
+as if they were test files, since Node's default discovery matches every
+`.js` file under a directory named `test`; the explicit glob avoids that.)
+
+`test/helpers/fake-runtime.js` loads a workflow script from disk and runs it
+against stubbed `agent`, `parallel`, `pipeline`, `phase`, `log`, `args` and
+`budget`, recording every agent call, so the three instrumented workflows are
+tested by driving them to completion with scripted responses rather than by
+invoking real subagents.
+
 ## What's in the box
 
 | Path | What |
@@ -180,8 +224,11 @@ copy the hook and add to `~/.claude/settings.json`:
 | `workflows/plan-cycle.js` | Planning orchestration: scope, parallel lenses, simplicity veto, AC write-back |
 | `workflows/review-cycle.js` | Review orchestration: scope + SHA pin, deterministic triggering, parallel worktree-isolated lenses, synthesis |
 | `workflows/tdd-task.js` | Script-enforced TDD for one scoped change: implement is unreachable until RED is verified for the right reason; commit refused if tests changed between RED and GREEN |
-| `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling |
+| `workflows/lib/ledger.mjs` | The one definition of the run-ledger envelope/schema, shared by the three workflows above |
+| `workflows/lib/ledger-append.mjs` | Standalone script performing the actual path resolution, gitignore-ensure and atomic single-line append |
+| `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
+| `test/` | This repo's own test suite (`node --test test/`); see "Tests" above |
 
 ## Cost and proportionality
 
