@@ -18,7 +18,6 @@ import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 import { LEDGER_RELATIVE_PATH, LEDGER_ENTRY_SCHEMA, MAX_LINE_BYTES, validateEntry, truncate } from './ledger.mjs'
 
