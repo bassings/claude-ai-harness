@@ -279,6 +279,50 @@ test('tdd-task.js: telemetry.budget_spent is null (not 0) when budget.spent() th
   assert.equal(result.verdict, 'DONE')
 })
 
+// L7: telemetry.rounds is new behaviour this PR added, with no test at all
+// -- swapping the two counters, or zeroing either, would keep the suite
+// green. Three cases, each with a different real value for at least one
+// counter, so a swap or a hardcoded value is distinguishable from the
+// correct count.
+test('tdd-task.js: telemetry.rounds records the real attempt counts on the DONE path -- one of each when everything succeeds first try (L7)', async () => {
+  const { result } = await runWorkflow(WF, { args: { task: 'x' }, agent: DONE_AGENT })
+  assert.deepEqual(result.telemetry.rounds, { test_attempts: 1, implement_attempts: 1 })
+})
+
+test('tdd-task.js: telemetry.rounds.test_attempts reflects every RED attempt, even when RED is never confirmed and implement is never reached (L7)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { task: 'x' },
+    agent: {
+      'write-test#1': DONE_AGENT['write-test#1'],
+      'write-test#2': DONE_AGENT['write-test#1'],
+      'write-test#3': DONE_AGENT['write-test#1'],
+      'verify-red#1': { red: false, right_reason: false, evidence: 'nope', test_hashes: [] },
+      'verify-red#2': { red: false, right_reason: false, evidence: 'nope', test_hashes: [] },
+      'verify-red#3': { red: false, right_reason: false, evidence: 'nope', test_hashes: [] },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  assert.deepEqual(result.telemetry.rounds, { test_attempts: 3, implement_attempts: 0 }, 'implement_attempts must stay 0 -- implement was never reached')
+})
+
+test('tdd-task.js: telemetry.rounds.implement_attempts reflects every GREEN attempt, distinct from test_attempts (L7)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { task: 'x' },
+    agent: {
+      'write-test#1': DONE_AGENT['write-test#1'],
+      'verify-red#1': DONE_AGENT['verify-red#1'],
+      'implement#1': DONE_AGENT['implement#1'],
+      'implement#2': DONE_AGENT['implement#1'],
+      'implement#3': DONE_AGENT['implement#1'],
+      'verify-green#1': { green: false, suite_green: false, hashes_match: true, evidence: 'still red 1' },
+      'verify-green#2': { green: false, suite_green: false, hashes_match: true, evidence: 'still red 2' },
+      'verify-green#3': { green: false, suite_green: false, hashes_match: true, evidence: 'still red 3' },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  assert.deepEqual(result.telemetry.rounds, { test_attempts: 1, implement_attempts: 3 }, 'test_attempts must stay 1 -- RED was confirmed first try, only implement retried')
+})
+
 test('tdd-task.js: the terminal ledger write requests reuse of the start write\'s run_id (AC-DATA-5 pairing)', async () => {
   const { calls } = await runWorkflow(WF, {
     args: { task: 'x' },
