@@ -3,13 +3,23 @@
 Per AC-QA-3 and standard §11: for the guards below, the guarded behaviour was
 actually broken (edited in the working file, not "mentally mutated"), the
 suite was run, the exact failing test and message recorded, and the file was
-then restored and the suite re-run green. All nine were executed in this
-session; the commands and output are reproduced from that run.
+then restored and the suite re-run green. Seventeen proofs were executed in
+this session (11 in the first pass, 6 more -- 5 re-verifications plus one new
+guard -- in the "Rework" section below, after a coordinator probe found
+workflow scripts cannot import anything in production); the commands and
+output are reproduced from those runs.
 
-Restoration was verified after every mutation by re-running the full suite
-(`node --test test/*.test.js`) and confirming 77/77 pass, and by `grep -rn
-"MUTATION"` across `workflows/`, `test/`, `skills/`, `AGENT-HARNESS.md` and
-`README.md` returning nothing (no mutation marker left behind).
+**Proofs 1, 6 and 7 below reference `workflows/lib/ledger.mjs`, which no
+longer exists**: that was accurate at the time each proof was first run, and
+is left as the historical record of when each guard was first proven. The
+"Rework" section documents where the code (and each guard) actually lives
+now, and re-proves the ones that moved.
+
+Restoration was verified after every mutation by re-running the affected
+test file(s) (the full suite is `node --test test/*.test.js`, 85/85 as of
+the last commit in this worktree) and by `grep -rn "MUTATION"` across
+`workflows/`, `test/`, `skills/`, `AGENT-HARNESS.md` and `README.md`
+returning nothing (no mutation marker left behind).
 
 ## 1. `additionalProperties:false` enforcement — `workflows/lib/ledger.mjs` `validateEntry`
 
@@ -231,6 +241,92 @@ AC-ARCH-3 test updated from "expects one ledger write" to "expects one start
 write plus one terminal write." Recorded here rather than quietly folded in,
 because a task list that silently grows after "done" was said is exactly
 the kind of thing this file exists to make visible.
+
+## Rework: workflow scripts made fully self-contained (no imports)
+
+A coordinator probe against the live dynamic-workflow runtime found that
+both static `import ... from` and dynamic `import()` are rejected at
+submission, before execution -- the same static pre-check that already
+rejects `Date.now()`/`new Date()`/`Math.random()`. `workflows/tdd-task.js`,
+`review-cycle.js` and `plan-cycle.js` each opened with `import { ... } from
+'./lib/ledger.mjs'`, so all three would have failed to launch in
+production; the fake-runtime test helper had never enforced this because it
+ran under real Node, which accepts imports the production loader forbids.
+
+Fixed by: tightening `test/helpers/fake-runtime.js` to statically reject the
+same four patterns before compiling anything (proven with new fixtures under
+`test/fixtures/rejects-*.js`, one per pattern, plus
+`mentions-in-comment-only.js` proving a `//` mention does not trip it);
+deleting `workflows/lib/ledger.mjs` and moving everything it held (the
+envelope schema -- AC-ARCH-5's single definition site, validation,
+`findingId` hashing, truncation) into `workflows/lib/ledger-append.mjs`,
+the one real-Node script every workflow was already invoking via Bash;
+making each workflow file self-contained (no imports, small inlined
+`readBudgetSpent`/`ledgerWritePrompt`/`writeLedger` helpers, duplicated
+three times, which AC-SIMP-12 now permits since importing them is
+impossible); and moving finding-id computation for `review-cycle.js`'s
+spec-bugs/rejected-findings into `ledger-append.mjs`, since workflow
+scripts have no `node:crypto` (review-cycle.js now sends the raw
+descriptors as payload data instead).
+
+Every guard proof above whose code moved was re-run against its new
+location, by the same break/watch-fail/revert method, before being trusted
+again:
+
+**Proof 12 (was #1, additionalProperties:false).** Disabled the same check,
+now in `ledger-append.mjs`'s `validateEntry`. 2 tests failed for the right
+reason (`ledger-append: rejects a payload with a property outside the
+schema...` and the relocated `ledger-append module: validateEntry rejects
+an entry with an unknown top-level property...`). Reverted; 31/31 green.
+
+**Proof 13 (was #8, spec_bug_count/rejected_finding_count null-not-zero).**
+`computeFindings`'s `null` fallback (now in `ledger-append.mjs`, since it
+sits next to the relocated finding computation) changed to `0`. 1 test
+failed for the right reason (`spec_bugs/rejected_findings sent as null...
+yields null counts, not zero`). Reverted; 31/31 green.
+
+**Proof 14 (was #6, `budget.spent()` null-not-zero).** The three `null`
+returns in `tdd-task.js`'s now-inlined `readBudgetSpent` changed to `0`. 1
+test failed for the right reason (`telemetry.budget_spent is null (not 0)
+when no budget is supplied`). Reverted; 13/13 green. (Not re-run for
+review-cycle.js/plan-cycle.js: identical duplicated code, same fixture
+shape, diminishing return on repeating it a third time.)
+
+**Proof 15 (was #7, ledger write never throws).** The `try`/`catch` around
+`agent(...)` in `tdd-task.js`'s now-inlined `writeLedger` removed. 1 test
+failed for the right reason: the test's own `Error: agent crashed`
+propagated up through `writeLedger` uncaught. Reverted; 13/13 green.
+
+**Proof 16 (was #11, run_id reuse for start/terminal pairing).** `payload.run_id`
+reuse in `ledger-append.mjs` reverted to always `randomUUID()`. 1 test
+failed for the right reason (two different UUIDs printed where the same one
+was expected). Reverted; 31/31 green.
+
+**Proof 17 (new): no-import static check.** Added `import { findingId }
+from './lib/ledger-append.mjs'` to the top of `tdd-task.js` (exactly the
+regression this whole rework fixes). Three independent layers caught it:
+`static-checks.test.js`'s dedicated no-import test failed
+(`workflows/tdd-task.js contains a static import declaration`); its
+Date/Math/import combined check also failed; and every one of
+`tdd-task.test.js`'s 13 tests failed via the fake-runtime helper's own
+pre-check, since `runWorkflow` now rejects before compiling. Reverted;
+85/85 green across the full suite.
+
+One near-miss during this rework, recorded because it is a genuine
+process lesson rather than a code defect: partway through mutation
+re-verification, `git checkout -- workflows/lib/ledger-append.mjs` was run
+to "revert" a mutation on a file that, at that moment, had substantial
+uncommitted rework beyond the mutation itself -- the command silently
+discarded all of it back to the last commit. Caught immediately by the
+next test run's file-content check, and recovered by rewriting the file
+from the version held in this session's own context. From that point on,
+every mutation in this rework was backed up with `cp` to a scratch path
+before editing and restored the same way, never with `git checkout --`,
+specifically because that command reverts to the last COMMIT, not to
+"a moment ago," and the two are only the same thing if nothing has been
+committed since -- which cannot be assumed mid-task. No data was lost in
+the final result, but it is exactly the kind of mistake that would have
+been unrecoverable without the file's content still being available.
 
 ## Caveat
 
