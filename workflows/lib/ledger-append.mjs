@@ -419,7 +419,20 @@ function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 }
 
+// L2: inside a git submodule, --git-common-dir resolves to the
+// SUPERPROJECT's .git/modules/<name> (a submodule's gitdir lives there, not
+// inside its own working tree), so path.dirname(commonDir) computes
+// .git/modules -- not a usable checkout root, and ensureGitignored would
+// then write a bogus .git/info tree there (confirmed against a real
+// submodule fixture: <super>/.git/modules/.git/info/exclude gets created).
+// --show-superproject-working-tree prints the superproject's path when run
+// from inside a submodule, and nothing (with exit 0) otherwise, so it is a
+// direct, purpose-built detection rather than pattern-matching the path.
 function resolveMainCheckoutRoot(cwd) {
+  const superprojectRoot = git(['rev-parse', '--show-superproject-working-tree'], cwd)
+  if (superprojectRoot) {
+    throw new Error('refusing to write from inside a git submodule (superproject at ' + superprojectRoot + '): --git-common-dir resolves to the superproject\'s .git/modules/<name>, not a usable checkout root -- run this from the submodule\'s own repo directly, or from the superproject')
+  }
   const commonDir = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd)
   return path.dirname(commonDir)
 }

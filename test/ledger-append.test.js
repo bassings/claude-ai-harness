@@ -134,6 +134,32 @@ test('ledger-append: writing from inside a worktree lands the line in the MAIN c
   assert.equal(readLedgerLines(repo).length, 1, 'the line survives worktree removal')
 })
 
+// L2: inside a git submodule, `git rev-parse --git-common-dir` resolves to
+// the SUPERPROJECT's .git/modules/<name> (a submodule's gitdir lives there,
+// not inside its own working tree), so path.dirname(commonDir) computes
+// .git/modules -- not a usable checkout root at all. Confirmed manually
+// before writing this test: on a real submodule fixture, --git-common-dir
+// returned <super>/.git/modules/subrepo, and a naive dirname would have
+// misfiled the ledger and a bogus .git/info tree into <super>/.git/modules/.
+test('ledger-append: refuses to write (write_ok:false, no misfiled ledger) when run from inside a git submodule, rather than writing into the superproject\'s .git/modules tree (L2, AC-SEC-5)', () => {
+  const superRepo = makeTempRepo()
+  const subRepo = makeTempRepo()
+  sh(`git -c protocol.file.allow=always submodule add -q ${JSON.stringify(subRepo)} subrepo`, superRepo)
+  sh('git commit -q -m "add submodule"', superRepo)
+  const submodulePath = path.join(superRepo, 'subrepo')
+  const res = runAppend(submodulePath, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'must refuse rather than misfile into the superproject\'s .git/modules tree')
+  assert.match(out.write_error, /submodule/i, 'the refusal must specifically name the submodule case, not an incidental failure from a later step (e.g. check-ignore failing because .git/modules is not a work tree)')
+  // The actual bug this test guards: root was computed as
+  // path.dirname(commonDir) = <super>/.git/modules (dirname of
+  // .git/modules/subrepo), so ensureGitignored(root) created a bogus
+  // .git/info tree AT .git/modules/.git/info/exclude -- confirmed by hand
+  // against a real submodule fixture before writing this assertion.
+  const bogusInfoExclude = path.join(superRepo, '.git', 'modules', '.git', 'info', 'exclude')
+  assert.ok(!fs.existsSync(bogusInfoExclude), 'no bogus .git/info tree must be created under .git/modules at all')
+})
+
 test('ledger-append: a task string carrying a literal newline plus a forged JSON object does not split or forge a record (AC-SEC-6)', () => {
   const repo = makeTempRepo()
   const hostile = 'legit task\n{"outcome":"merged","rounds":0}'
