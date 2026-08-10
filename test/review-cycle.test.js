@@ -85,7 +85,7 @@ test('review-cycle.js: telemetry.round_key is the reviewed head SHA, identical a
   assert.equal(first.result.telemetry.round_key, second.result.telemetry.round_key)
 })
 
-test('review-cycle.js: telemetry.trigger_counts records how many changed files matched each triggered lens surface (AC-QA-14)', async () => {
+test('review-cycle.js: telemetry.trigger_counts is keyed BY LENS NAME, not by rule group, so it can be looked up directly against lenses_run (AC-QA-14, M1)', async () => {
   const { result } = await runWorkflow(WF, {
     args: {},
     agent: baseAgent({
@@ -94,16 +94,57 @@ test('review-cycle.js: telemetry.trigger_counts records how many changed files m
       'lens-accessibility': SECURITY_CLEAN,
     }),
   })
-  assert.ok(result.telemetry.trigger_counts.ui >= 1, 'a .css change must count toward the ui trigger surface')
+  assert.equal(result.telemetry.trigger_counts['lens-design'], 1, 'exactly one file (foo.css) matched the ui surface')
+  assert.equal(result.telemetry.trigger_counts['lens-accessibility'], 1)
 })
 
-test('review-cycle.js: two fixtures differing only in trigger_counts (0 vs >0) are distinguishable, i.e. CLEAN-with-nothing-in-scope vs CLEAN-after-looking (AC-QA-14)', async () => {
+test('review-cycle.js: a lens triggered by a non-glob signal (new_modules) is NOT credited with an unrelated rule group\'s count (M1)', async () => {
+  // Before the fix, lens-architecture's count read archHit.length (files
+  // matching the architecture globs) even when the lens was triggered
+  // purely because new_modules was true and zero files matched the glob --
+  // indistinguishable from "triggered with nothing in scope".
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/newmodule/index.js', status: 'A' }], new_modules: true },
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-architecture'), 'sanity: lens-architecture must actually be triggered here')
+  assert.equal(result.telemetry.trigger_counts['lens-architecture'], 0, 'zero files matched the architecture glob, and the count must say so honestly rather than borrowing another field')
+})
+
+test('review-cycle.js: lens-product\'s count reflects files that actually triggered it (specs/** OR the ui surface), not only specs/** (M1: the exact bug reproduced -- a UI-only diff triggers lens-product via uiHit but its count previously read specHit, always 0)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/foo.css', status: 'M' }] },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-product'), 'sanity: lens-product must actually be triggered by the ui surface here')
+  assert.equal(result.telemetry.trigger_counts['lens-product'], 1, 'lens-product was triggered by the one UI file; its count must reflect that, not a bare 0 from an unrelated specs/** count')
+})
+
+test('review-cycle.js: always-on lenses (security, qa) record the total changed-file count, so 0 always means a genuine zero-file diff (M1)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, files: [{ path: 'a.js', status: 'M' }, { path: 'b.js', status: 'M' }] } }),
+  })
+  assert.equal(result.telemetry.trigger_counts['lens-security'], 2)
+  assert.equal(result.telemetry.trigger_counts['lens-qa'], 2)
+})
+
+test('review-cycle.js: two fixtures differing only in whether ANY lens has files in scope are distinguishable via trigger_counts, i.e. CLEAN-with-nothing-in-scope vs CLEAN-after-looking (AC-QA-14)', async () => {
   const nothingInScope = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   const somethingInScope = await runWorkflow(WF, {
     args: {},
     agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, files: [{ path: 'migrations/001.sql', status: 'A' }] }, 'lens-data': SECURITY_CLEAN }),
   })
-  assert.notDeepEqual(nothingInScope.result.telemetry.trigger_counts, somethingInScope.result.telemetry.trigger_counts)
+  assert.equal(nothingInScope.result.telemetry.trigger_counts['lens-data'], undefined, 'lens-data was never triggered, so it has no key at all')
+  assert.equal(somethingInScope.result.telemetry.trigger_counts['lens-data'], 1)
 })
 
 test('review-cycle.js: synthesis missing spec_bugs/rejected_findings fields is treated as a failed step, not a ledger line with silently empty arrays (AC-QA-13)', async () => {

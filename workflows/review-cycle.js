@@ -187,19 +187,45 @@ const dataHit = matches(paths, rules.data)
 const archHit = matches(paths, rules.architecture)
 const opsHit = matches(paths, rules.operability)
 const specHit = matches(paths, ['specs/**'])
-triggerCounts.ui = uiHit.length
-triggerCounts.data = dataHit.length
-triggerCounts.architecture = archHit.length
-triggerCounts.operability = opsHit.length
-triggerCounts.product = specHit.length
 
-if (uiHit.length) lenses.push('lens-design', 'lens-accessibility')
-if (dataHit.length) lenses.push('lens-data')
-if (archHit.length || scope.new_modules || scope.new_dependency_entries) lenses.push('lens-architecture')
-if (opsHit.length) lenses.push('lens-operability')
+// M1: keyed BY LENS NAME (matching entries in `lenses` below), not by rule
+// group -- a lens's count must reflect the files that actually triggered
+// IT, so it can be looked up directly rather than requiring the reader to
+// know the rule-group mapping. Always-on lenses get the total changed-file
+// count (they are never "triggered by" a subset), so an absent key always
+// means "not triggered", never "triggered with 0 files".
+triggerCounts['lens-security'] = paths.length
+triggerCounts['lens-qa'] = paths.length
+
+if (uiHit.length) {
+  lenses.push('lens-design', 'lens-accessibility')
+  triggerCounts['lens-design'] = uiHit.length
+  triggerCounts['lens-accessibility'] = uiHit.length
+}
+if (dataHit.length) {
+  lenses.push('lens-data')
+  triggerCounts['lens-data'] = dataHit.length
+}
+if (archHit.length || scope.new_modules || scope.new_dependency_entries) {
+  lenses.push('lens-architecture')
+  // Honestly 0 when triggered purely by new_modules/new_dependency_entries
+  // with no file matching the architecture globs: a real, measured zero,
+  // not a stand-in borrowed from an unrelated rule group.
+  triggerCounts['lens-architecture'] = archHit.length
+}
+if (opsHit.length) {
+  lenses.push('lens-operability')
+  triggerCounts['lens-operability'] = opsHit.length
+}
 // specPath too: a caller can supply an existing, unchanged spec for a
 // user-facing backend change that touches neither a spec file nor a UI glob.
-if (specHit.length || uiHit.length || specPath) lenses.push('lens-product')
+if (specHit.length || uiHit.length || specPath) {
+  lenses.push('lens-product')
+  // Credits whichever files actually caused the trigger (specs/** and/or
+  // the ui surface), deduplicated -- not just specHit.length, which was
+  // always 0 for the common case of a UI-only diff triggering this lens.
+  triggerCounts['lens-product'] = new Set([...specHit, ...uiHit]).size
+}
 
 // An override ADDS to the mandatory roster, it does not replace it: the
 // always-on lenses cannot be silently dropped by {lenses: [...]}.
