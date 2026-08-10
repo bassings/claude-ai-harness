@@ -32,6 +32,19 @@ test('tdd-task.js: DONE path returns the pre-existing documented shape unchanged
   assert.equal(result.telemetry.outcome, 'done')
 })
 
+// L5: AC-ARCH-10's "exactly one new top-level key" clause was unguarded --
+// nothing asserted the FULL key set, only that specific keys existed and had
+// the right value, so leaking the internal __outcome sentinel into the
+// public result (instead of destructuring it out) would pass every existing
+// assertion above unnoticed.
+test('tdd-task.js: the DONE-path result carries EXACTLY its documented keys plus telemetry -- no internal sentinel (__outcome or otherwise) leaks through (L5, AC-ARCH-10)', async () => {
+  const { result } = await runWorkflow(WF, { args: { task: 'do the thing' }, agent: DONE_AGENT })
+  assert.deepEqual(
+    Object.keys(result).sort(),
+    ['commit', 'green_evidence', 'implementation', 'red_evidence', 'task', 'telemetry', 'test_files', 'tests_frozen', 'verdict']
+  )
+})
+
 // M3: every existing ledger assertion filters to ledger:write calls first,
 // or distinguishes writes by payload -- none of them compares a ledger
 // call's position against a work-agent call's in the UNFILTERED list, so

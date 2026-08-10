@@ -50,6 +50,16 @@ test('review-cycle.js: normal completion preserves the existing return shape and
   assert.ok(calls.find((c) => c.opts.label === 'ledger:write'))
 })
 
+// L5: AC-ARCH-10's "exactly one new top-level key" clause was unguarded --
+// nothing asserted the FULL key set, so leaking the internal __outcome
+// sentinel (destructured out via `const { __outcome, ...result } = raw`
+// before telemetry is added) into the public result would pass every
+// existing assertion above unnoticed.
+test('review-cycle.js: the result carries EXACTLY its documented keys plus telemetry -- the internal __outcome sentinel does not leak through (L5, AC-ARCH-10)', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.deepEqual(Object.keys(result).sort(), ['base', 'head', 'lenses', 'report', 'skipped', 'telemetry', 'verdicts'])
+})
+
 // M1: a run whose synthesis agent fails (undefined response) or returns a
 // structurally-valid-but-empty report was previously recorded as outcome
 // "done" -- inflating the denominator of "rounds to clean", the spec's

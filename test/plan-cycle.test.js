@@ -45,6 +45,14 @@ test('plan-cycle.js: normal completion preserves the existing return shape and a
   assert.ok(calls.find((c) => c.opts.label === 'ledger:write'))
 })
 
+// L5: see review-cycle.js's identical test for the rationale -- nothing
+// previously asserted the FULL key set, so the internal __outcome sentinel
+// could leak into the public result unnoticed.
+test('plan-cycle.js: the result carries EXACTLY its documented keys plus telemetry -- the internal __outcome sentinel does not leak through (L5, AC-ARCH-10)', async () => {
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
+  assert.deepEqual(Object.keys(result).sort(), ['lenses', 'report', 'skipped', 'spec', 'telemetry', 'verdicts'])
+})
+
 // M3: see tdd-task.js for the identical guard gap and rationale -- nothing
 // previously pinned the start record to before the work.
 test('plan-cycle.js: the start-record ledger write is the very first agent() call, strictly before any work-agent step (M3)', async () => {
