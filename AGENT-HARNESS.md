@@ -20,9 +20,9 @@ criteria** against the built change, and reports anything it finds outside them.
 The contract between them is the AC ID. A review finding with no AC behind it is
 a **spec bug**: it means the planning lens missed something. Every conducted
 workflow run appends one line to `.claude/harness-ledger.jsonl` (untracked;
-see `workflows/lib/ledger.mjs`), recording spec bugs, rejected findings and
-rounds to clean as structured data: that ledger is how the harness improves
-rather than merely runs.
+see `workflows/lib/ledger-append.mjs`), recording spec bugs, rejected
+findings and rounds to clean as structured data: that ledger is how the
+harness improves rather than merely runs.
 
 ## Lens roster
 
