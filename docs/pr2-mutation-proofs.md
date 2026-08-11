@@ -17,7 +17,11 @@ mutation on the first fixture; one (proof 7, `citationPool`'s dedup check)
 investigated and fixed before being trusted, recorded in full below rather
 than quietly patched. A further thirteen proofs were executed after review
 round-1 (see "Review round-1 fixes" below), covering each of the eight
-findings. The full suite was `node --test test/*.test.js`, 292/292 as of
+findings. A further fifteen proofs were executed after review round-2 (see
+"Review round-2 fixes" below); two of them (the L2 totals-line/Filtering-
+line proofs) surfaced a SECOND genuine vacuous-mutant pair, also
+investigated and fixed before being trusted. The full suite was
+`node --test test/*.test.js`, 307/307 as of
 the last commit in this worktree, re-run clean after every proof.
 
 ## 1. `parseLedgerContent` skips a line missing a required envelope field — `workflows/lib/optimise-read.mjs`
@@ -517,6 +521,146 @@ Every mutation above was confirmed applied via `git diff`/`git diff --stat`
 before running tests, confirmed reverted via `git status --porcelain`
 returning nothing before the next mutation, and the full suite re-run
 clean after the batch -- 292/292 as of the last commit in this round.
+
+## Review round-2 fixes (proofs 32-46)
+
+A follow-up multi-lens review found no AC failures, but 3 Mediums and 6
+Lows, all real. The coordinator's framing for M1 mattered: it was the
+THIRD wall-clock pairing symptom across two rounds (round 1: null-
+timestamp fabrication, cross-repo merge; round 2: sorted-index mispairing
+of an orphan ended event) -- a §12 signal to reframe rather than patch
+again, so that proof documents the REWRITE, not one more instance-fix.
+
+**32. M1 -- `occurrenceKeyFromEventKey` disabled entirely (returns null
+unconditionally).** Every event falls back to the "malformed/unpaired"
+branch. Caught 7 tests -- every wall-clock pairing test in the suite,
+including all three round-1 regression tests (null-ts, negative-interval,
+cross-repo) and the two new round-2 fixtures -- confirming the function is
+the SINGLE point every pairing path now depends on, exactly the "make the
+whole class unrepresentable" goal. Reverted; `optimise-read.test.js` back
+to 48/48.
+
+**33. M1 -- the orphan-ended branch (`else if (!s && e)`) silently
+dropped, uncounted -- the OLD bug's exact shape, reproduced as a
+mutation.** Caught exactly the two dedicated round-2 M1 tests (the
+reviewer's PROBE1 reproduction, and the "orphan never mispairs with an
+unrelated event" test); every other wall-clock test, including the
+established round-1 regressions, stayed green -- confirming this specific
+branch is what the two new tests exist to guard, independent of the rest
+of the pairing rewrite. Reverted; `optimise-read.test.js` back to 48/48.
+
+**34. M2 -- `canonicalJson` reverted to the original top-level-only
+replacer array (the reviewer's exact reproduced bug).** Caught exactly the
+dedicated nested-collision test (`AssertionError`: two distinct targets
+collided again); the key-order-stability and same-target-twice tests
+stayed green (they don't exercise nesting). Reverted;
+`optimise-read.test.js` back to 48/48.
+
+**35. M3 -- `wrapAsData`'s tag reverted to the bare, un-nonced
+`UNTRUSTED-DATA` form.** Caught 7 tests -- every test that parses a
+nonce-tagged block, including the round-1 canary, the new round-2 breakout
+canary, both L5 wrap tests, and (as expected collateral) the two M7
+annotation tests whose `synthesis:ids` responder locates its payload via
+the same nonce-tagged pattern. This breadth confirms the nonce is now the
+single mechanism every containment boundary in the file depends on, not
+just the two tests specifically named for M3. Reverted;
+`optimise-cycle.test.js` back to 38/38.
+
+**36. M3 -- the missing-nonce abort guard (`if (!scope.nonce ...)`)
+disabled.** Caught exactly the dedicated defensive-path test (a
+schema-bypassed scope response with no nonce field); every other test
+supplies a real nonce via `scopeFixture()` and was unaffected. Reverted;
+`optimise-cycle.test.js` back to 38/38.
+
+**37-38. L5 -- the ledger-lane and ci-lane wrapping, each reverted to a
+bare `JSON.stringify` interpolation separately.** Each mutation caught
+exactly its own dedicated wrap-test (the ledger-lane roots test for the
+first, the ci-lane {root,label} test for the second) and nothing else,
+confirming the two wraps are independent, not one incidentally covering
+the other. Both reverted; `optimise-cycle.test.js` back to 38/38 after each.
+
+**39-40. L2 -- the wall-clock totals line and the Filtering line's
+segment-detail rendering, a self-caught vacuous-mutant PAIR.** First
+attempt: removing the totals line's per-segment counts left the existing
+M4 test (`/agent_compute[^\n]*\b4\b/i`) green, because the Filtering
+line's own detail incidentally satisfied the same loose regex --
+investigated per §11, not trusted on a single green run. Fixed in both
+directions: (a) a NEW dedicated test, using a fixture where no proposal
+drop occurs at all (so the Filtering line carries no detail to
+incidentally satisfy anything), proves the totals line's own
+`unmeasured n=N` phrasing; (b) the original M4 test's assertion was
+tightened to the Filtering line's OWN distinct phrasing
+(`agent_compute (4 unmeasured runs)`), textually impossible to satisfy
+from the totals line's different wording. Re-mutated both independently
+afterward: disabling the totals-line rendering now fails ONLY the new
+dedicated test; disabling the Filtering-line detail now fails ONLY the
+original M4 test -- confirmed genuinely separate, independently
+load-bearing guards. Both reverted; `optimise-cycle.test.js` back to
+44/44 after each.
+
+**41-42. L3 -- the `reportWriteError` derivation, and the case where the
+report:write agent call itself returns nothing.** (a) The three-line
+derivation (`let reportWriteError = null; if (!reportWrite) ...`) removed
+entirely, replaced with the bare declaration. Caught exactly the two
+dedicated L3 tests (the named-error-reason test and the undefined-response
+test); the "succeeds" test (asserting `null`) stayed green, since the
+mutated code ALSO always yields `null` -- confirming the two failing tests
+are what actually prove the derivation exists, not the trivially-true
+success case. Reverted; `optimise-cycle.test.js` back to 43/43.
+
+**43. L4 -- `ledgerLaneFailed` hardcoded to `false`.** Caught exactly the
+dedicated lane-failure test; the "genuinely empty ledger does NOT trigger
+the wording" test (asserting the ABSENCE of the phrase) stayed green,
+since a hardcoded `false` trivially satisfies "must not say lane failed"
+too -- confirming, symmetrically to proof 41-42, that only the
+failure-case test actually proves this field is computed from `ledgerAgg`
+rather than a constant. Reverted; `optimise-cycle.test.js` back to 44/44.
+
+**L1, L6**: not separately mutation-proved as new guards. L1's fix was
+entirely test-side (the underlying citation filter it now also exercises
+was already proven load-bearing in round-1 proof 9); the strengthened
+assertion in the "all four gh failure modes" test was confirmed to
+exercise a real proposal (added a CI-cited proposal to the fixture) rather
+than an empty one, which is itself the proof that it is no longer vacuous
+-- there is no separate PRODUCTION guard to mutate. L6 is a regex
+tightening on the TEST side of the M3 canary, not a change to any guarded
+production behaviour; its own non-vacuity is demonstrated structurally
+(anchored, non-greedy, backreferenced to the actual nonce) rather than by
+a further mutation.
+
+Every mutation above was confirmed applied via `git diff`/`git diff --stat`
+before running tests, confirmed reverted via `git status --porcelain`
+returning nothing before the next mutation, and the full suite re-run
+clean after the batch -- 307/307 as of the last commit in this round.
+
+### Spec bugs found at review round-2 (no AC behind them)
+
+Per the harness's own convention (a review finding with no AC behind it is
+a spec bug, logged because that list is how the harness improves): three
+of round-2's findings traced to no acceptance criterion in
+`specs/optimise-cycle.md` at all, meaning the planning lenses never
+required these behaviours in the first place.
+
+- **M1 (wall-clock pairing correctness under a lost event)** -- no AC
+  required started/ended events to be paired by anything other than "the
+  matching ones", which happened to hold for every planning-time fixture
+  (always exactly one occurrence per plan). A future AC should require:
+  "an orphan event on either side of a wait pair is never mispaired with
+  an unrelated event, proven against a fixture with more ends than
+  starts (or vice versa) within the SAME plan/repo bucket."
+- **L3 (report-persistence failure surfacing)** -- AC-PROD-5 requires the
+  report to be persisted, but no AC required a WRITE FAILURE's reason to
+  reach the operator, the same gap AC-QA-7 already closed for the ledger
+  write. A future AC should require: "a report:write failure surfaces its
+  reason in the workflow return and is logged visibly in the same turn,
+  mirroring AC-QA-7's ledger-write discipline."
+- **L4 (lane-crash vs. empty-ledger distinction)** -- AC-OPS-11 requires
+  distinguishing an uninstrumented REPO from no activity, but no AC
+  required distinguishing a lane CRASH (the agent step itself failing)
+  from a successfully-read, genuinely empty ledger -- a third state
+  AC-OPS-11's own text does not name. A future AC should require: "a
+  ledger-lane agent failure is reported distinctly from n=0, both in the
+  report and in a machine-readable field."
 
 ## Guards NOT proven by an executed mutation, stated plainly rather than implied
 
