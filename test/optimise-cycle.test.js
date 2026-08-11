@@ -179,6 +179,22 @@ test('optimise-cycle: a scope response missing its containment nonce (schema-imp
   assert.match(result.report, /nonce/i)
 })
 
+// ---- Review round-3 F3 (spec bug): a resolved repo root must never carry a shell metacharacter into the ledger-lane's literal command string ----
+
+test('optimise-cycle: a resolved repo root containing a shell metacharacter aborts the run BEFORE any lane runs, rather than being embedded literally in the ledger-lane command string (round-3 F3, PR1-H1 class)', async () => {
+  const { result, calls } = await runWorkflow(WORKFLOW, {
+    args: {},
+    agent: { 'scope:repos': { resolved: [{ requested: '.', root: '/repo/$(whoami)', label: 'demo' }], unresolved: [], plan_labels: [], nonce: TEST_NONCE } },
+  })
+  assert.ok(!calls.some((c) => c.opts.phase === 'Lanes'), 'no lane may run while an unsafe root would be embedded in a shell command')
+  assert.match(result.report, /shell metacharacter/i)
+})
+
+test('optimise-cycle: an ordinary repo root (no metacharacters) proceeds normally -- the F3 guard does not over-block realistic paths', async () => {
+  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  assert.ok(calls.some((c) => c.opts.phase === 'Lanes'), 'a normal root must not be blocked')
+})
+
 // ---- AC-QA-17: insufficient ledger data, three fixture points + CI section still produced ----
 
 for (const n of [0, 1, 4]) {
@@ -296,6 +312,77 @@ test('optimise-cycle: "Retire the never-failing gitleaks job" with NO reinstatem
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 0)
+})
+
+// ---- Review round-3 F1 (AC-SEC-10, spec bug): the free-text fallback must be verb-independent and synonym-aware ----
+
+test('optimise-cycle: a proposal with target.touches_always_on_lens:true is dropped unconditionally, even with no removal verb and no literal lens name anywhere (round-3 F1, structured path)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'lens_tune', touches_always_on_lens: true }, statement: 'The always-on lens only needs to look at half the diff', citations: ['run-1'], reinstatement_evidence: 'evidence' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+})
+
+test('optimise-cycle: "the security lens only on triggered reviews" (no listed removal verb, no literal "lens-security" substring) is still dropped by the free-text fallback (round-3 F1, fallback path -- reproduces the reviewer\'s exact evasion)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'lens_tune' }, statement: 'Run the security lens only on triggered reviews', citations: ['run-1'], reinstatement_evidence: 'evidence' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+})
+
+test('optimise-cycle: "security lens" phrasing (no literal "lens-security" substring, no verb) is dropped by the free-text fallback (round-3 F1, fallback path)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'lens_tune' }, statement: 'The qa lens catches nothing the security lens does not already catch', citations: ['run-1'], reinstatement_evidence: 'evidence' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+})
+
+test('optimise-cycle: a proposal that never mentions a security lens at all (by name, phrase, or structured field) is NOT dropped by this gate (round-3 F1 does not over-block unrelated proposals)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'trigger_tune', lens: 'lens-operability' }, statement: 'Narrow the lens-operability trigger glob', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+})
+
+// ---- Review round-3 F2 (AC-SEC-10, spec bug): the security-check keyword list omits real tools ----
+
+test('optimise-cycle: "Demote the pip-audit check to nightly" lands in the flagged security-removal category (round-3 F2)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_demote', job: 'pip-audit' }, statement: 'Demote the pip-audit check to nightly: never failed in 40 runs', citations: ['run-1'], reinstatement_evidence: 'reinstate if a dependency vulnerability is ever missed' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+  assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
+})
+
+test('optimise-cycle: "Remove the Dependabot security job" lands in the flagged security-removal category (round-3 F2)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', job: 'dependabot' }, statement: 'Remove the Dependabot security job: never found anything actionable', citations: ['run-1'], reinstatement_evidence: 'reinstate on any CVE affecting a direct dependency' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+  assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
+})
+
+test('optimise-cycle: a proposal with target.security_purposed:true is flagged even if the keyword regex would not otherwise match (round-3 F2, structured path)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', job: 'our-custom-vuln-scanner', security_purposed: true }, statement: 'Remove our-custom-vuln-scanner: never failed in 40 runs', citations: ['run-1'], reinstatement_evidence: 'reinstate on any new CVE class' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+  assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
+})
+
+test('optimise-cycle: a proposal with target.security_purposed:true but NO removal verb anywhere is still required to carry reinstatement evidence (self-caught coherence gap: security_purposed must not bypass the AC-PROD-7 gate just because it evades the verb-based isRemovalShaped check)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_note', job: 'our-custom-vuln-scanner', security_purposed: true }, statement: 'our-custom-vuln-scanner is noisy lately', citations: ['run-1'], reinstatement_evidence: null })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0, 'a security_purposed proposal with no removal verb and no reinstatement evidence must still be dropped, not silently flagged and shipped')
 })
 
 test('optimise-cycle: a security-purposed check removal with NO reinstatement evidence is dropped (AC-PROD-7)', async () => {
@@ -510,6 +597,66 @@ test('optimise-cycle: a proposal whose target.segment is fully measured (0 unmea
       },
     }),
     'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'ci_wait' }, statement: 'CI wait dominates wall-clock', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+})
+
+// ---- Review round-3 F4 (AC-OPS-3, spec bug): the unmeasured-segment gate must not depend on the agent having set target.segment ----
+
+test('optimise-cycle: an UNTAGGED proposal (no target.segment at all) whose motivating_measurement mentions "agent_compute" is still dropped when that segment has unmeasured runs -- the gate reads the free text, not just the typed tag (round-3 F4)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: null, agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 4, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': {
+      proposals: [
+        proposal({
+          target: { category: 'concurrency' }, // deliberately NO segment field
+          statement: 'Add more concurrent agents to shorten delivery',
+          motivating_measurement: 'agent_compute is a small share of total wall-clock time this cycle',
+          citations: ['run-1'],
+        }),
+      ],
+    },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0, 'an untagged proposal must still be caught if its own text names an unmeasured segment')
+})
+
+test('optimise-cycle: an untagged proposal mentioning a segment name in its STATEMENT (not motivating_measurement) is also caught (round-3 F4)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 3, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 0, agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': {
+      proposals: [proposal({ target: { category: 'concurrency' }, statement: 'ci_wait is negligible so parallelism will not help much', citations: ['run-1'] })],
+    },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+})
+
+test('optimise-cycle: an untagged proposal that mentions a segment name while that segment is FULLY measured (0 unmeasured runs) survives (round-3 F4 does not over-block)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 100, ciWaitMeasuredRuns: 5, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 50, agentComputeMeasuredRuns: 5, agentComputeUnmeasuredRuns: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': {
+      proposals: [proposal({ target: { category: 'concurrency' }, statement: 'ci_wait dominates the cycle', citations: ['run-1'] })],
+    },
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 1)

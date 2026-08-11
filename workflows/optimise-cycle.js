@@ -80,7 +80,17 @@ function wrapAsData(nonce, label, value) {
 // merge path" is literally that section's own phrasing for a demotion).
 const REMOVAL_VERBS_RE = /\b(remove|removing|demote|demoting|skip|skipping|disable|disabling|drop|dropping|delete|deleting|move|moving|retire|retiring|exclude|excluding|omit|omitting|eliminate|eliminating|stop|stopping|cut|cutting|prune|pruning)\b/i
 const SECURITY_LENS_NAMES = ['lens-security', 'lens-qa']
-const SECURITY_CHECK_KEYWORDS_RE = /\b(sast|secret[\s-]?scan|gitleaks|dependency[\s-]?audit|npm audit|trivy|codeql|semgrep)\b/i
+// Review round-3 F2: the original list named only what the spec's own text
+// happened to mention (gitleaks, CodeQL, SAST); it omitted tools this
+// standards set and the delivery repos actually run (§3/§3a: dependency
+// updates, secret scanning) -- pip-audit, safety, Dependabot, Snyk,
+// osv-scanner and bandit all evaded the flag entirely.
+const SECURITY_CHECK_KEYWORDS_RE = /\b(sast|secret[\s-]?scan|gitleaks|dependency[\s-]?audit|npm audit|trivy|codeql|semgrep|pip-?audit|safety|dependabot|snyk|osv-scanner|bandit)\b/i
+// Round-3 F1: free-text phrasings that refer to a security lens WITHOUT
+// using its literal name -- "the security lens", "the qa lens" -- which
+// the original substring check (`text.includes('lens-security')`) missed
+// entirely.
+const SECURITY_LENS_PHRASE_RE = /\b(lens-security|lens-qa|security lens|qa lens)\b/i
 
 function proposalText(p) {
   return `${p && p.statement ? p.statement : ''} ${p && p.target ? JSON.stringify(p.target) : ''}`
@@ -101,20 +111,45 @@ function proposalText(p) {
 // status. A false positive here (a hypothetical benign proposal that
 // happens to set target.lens to a security lens for some other reason)
 // costs a human manually re-raising it; a false negative costs the
-// containment this gate exists for. The free-text verb+name check remains
-// as a second, independent layer for proposals that omit target.lens.
+// containment this gate exists for.
+//
+// Round-3 F1: `target.lens` only catches a proposal that names the LENS
+// itself as its target; a proposal about, say, a trigger-glob change that
+// happens to narrow when the security lens runs might reasonably set
+// target.category='lens_tune' without target.lens naming it structurally.
+// `target.touches_always_on_lens` is a second, explicit typed field for
+// exactly that case -- evasion now requires lying in a typed field, not
+// picking a synonym or omitting a verb. The free-text fallback (for a
+// proposal setting NEITHER typed field) is now verb-INDEPENDENT and
+// synonym-aware (SECURITY_LENS_PHRASE_RE also matches "security lens"/
+// "qa lens", not just the literal lens-security/lens-qa substring) --
+// deliberately the most conservative of the three layers, since a false
+// positive here just costs a human re-raising a benign proposal, while a
+// false negative defeats the containment AC-SEC-10 exists for.
 function isAlwaysOnSecurityRemoval(p) {
   const target = p && p.target
   if (target && SECURITY_LENS_NAMES.includes(target.lens)) return true
-  const text = proposalText(p)
-  return REMOVAL_VERBS_RE.test(text) && SECURITY_LENS_NAMES.some((name) => text.includes(name))
+  if (target && target.touches_always_on_lens === true) return true
+  return SECURITY_LENS_PHRASE_RE.test(proposalText(p))
 }
 
 // A proposal that removes/demotes/skips ANYTHING is required to carry
 // reinstatement_evidence (AC-PROD-7, AC-SEC-10 second clause); this is
 // deliberately broader than security-only, since AC-PROD-7 states the
 // requirement for every delete/demote/skip proposal.
+//
+// Round-3 F2 coherence fix (self-caught, not separately named by the
+// review): `isSecurityPurposedRemoval` below can now be satisfied purely
+// by `target.security_purposed === true`, with no removal verb required --
+// without this, a proposal setting that field but using no listed verb
+// would be reclassified into the flagged security-removal category WHILE
+// SKIPPING the reinstatement-evidence gate entirely, since that gate is
+// keyed on `isRemovalShaped`. A proposal is removal-shaped if it declares
+// itself security-purposed or always-on-lens-touching by EITHER typed
+// field, independent of wording, closing that gap.
 function isRemovalShaped(p) {
+  const target = p && p.target
+  if (target && (target.touches_always_on_lens === true || target.security_purposed === true)) return true
   return REMOVAL_VERBS_RE.test(proposalText(p))
 }
 
@@ -123,7 +158,15 @@ function isRemovalShaped(p) {
 // security lens triggering) is placed in a distinct flagged category
 // regardless of what the drafting agent set, carrying the reinstatement
 // evidence AC-PROD-7 also requires.
+//
+// Round-3 F2: mirrors F1's structure -- `target.security_purposed` is a
+// typed field the drafting prompt can set for a check this keyword list
+// does not yet name (evasion requires lying in the typed field), with the
+// keyword-plus-removal-verb match as the fallback for a proposal that
+// omits it.
 function isSecurityPurposedRemoval(p) {
+  const target = p && p.target
+  if (target && target.security_purposed === true) return true
   return REMOVAL_VERBS_RE.test(proposalText(p)) && SECURITY_CHECK_KEYWORDS_RE.test(proposalText(p))
 }
 
@@ -202,6 +245,23 @@ if (!scope.nonce || typeof scope.nonce !== 'string') {
 }
 const dataNonce = scope.nonce
 const roots = scope.resolved.map((r) => r.root)
+// Round-3 F3 (spec bug, PR1-H1 class): the ledger lane's own command
+// string below embeds each root literally inside double quotes for the
+// agent to run verbatim; a root containing a shell metacharacter could
+// break that quoting when the agent actually executes it. Roots are ALSO
+// passed through wrapAsData as data (AC-SEC-8, round-2 L5), but this
+// second embedding builds a REAL command line, so it gets its own,
+// independent check rather than relying on the data-framing alone.
+const SHELL_METACHAR_RE = /[`$"'\\;&|<>(){}!\n]/
+const unsafeRoots = roots.filter((r) => SHELL_METACHAR_RE.test(r))
+if (unsafeRoots.length) {
+  return {
+    resolved: scope.resolved,
+    unresolved: scope.unresolved,
+    report: `Refusing to proceed: resolved repo root(s) contain a shell metacharacter and cannot be safely embedded in a command: ${unsafeRoots.join(', ')}.`,
+    __outcome: 'aborted',
+  }
+}
 log(`Optimising over ${roots.length} repo(s): ${scope.resolved.map((r) => r.label).join(', ')}. Window: ${requestedWindow} lines per repo.`)
 
 // ---- Phase 2: lanes, in parallel -- this is the fan-out AC-SIMP-11 requires ----
@@ -334,7 +394,13 @@ const synthesisPrompt =
   `exactly matching the CI-aggregate's own "workflow"/"job" fields if the proposal is about a specific CI job; ` +
   `target.segment set to exactly "ci_wait", "human_wait" or "agent_compute" if the proposal is MOTIVATED BY that ` +
   `wall-clock segment -- the orchestrator will drop such a proposal if that segment has any unmeasured runs in ` +
-  `the window, so only set it when the segment genuinely motivates the proposal), statement (the proposal ` +
+  `the window, so only set it when the segment genuinely motivates the proposal; target.touches_always_on_lens ` +
+  `set to true if the proposal in any way changes whether, when, or how often lens-security or lens-qa runs -- ` +
+  `even if it does not name them by their literal id (e.g. "run the security lens only sometimes"), even if it ` +
+  `uses no word like "remove"; target.security_purposed set to true if the proposal deletes, demotes, skips, or ` +
+  `otherwise reduces a check whose PURPOSE is security (SAST, secret scanning, dependency/vulnerability auditing, ` +
+  `a security lens trigger) -- these two fields are mechanically checked by the orchestrator regardless of your ` +
+  `wording, so set them honestly rather than omitting them to phrase around the gate), statement (the proposal ` +
   `itself), motivating_measurement (cite the specific numbers above that motivate it), confirming_measurement ` +
   `(what would confirm or refute it after adoption), n (the sample size backing it -- the record/run count from ` +
   `the aggregate above, never invented), citations (array of real ids copied VERBATIM from a citationPool above ` +
@@ -417,9 +483,22 @@ function segmentUnmeasuredRuns(segment) {
   const v = wallClockTotals[`${prefix}UnmeasuredRuns`]
   return typeof v === 'number' ? v : 0
 }
+// Round-3 F4: the typed `target.segment` tag alone made this gate
+// agent-tag-dependent -- a proposal genuinely motivated by a null segment
+// but drafted without setting the tag (the prompt only asks for it "if
+// the proposal is MOTIVATED BY that segment", a judgement call) survived
+// on the citation filter alone. Independent of the tag, ANY mention of a
+// segment's name in the proposal's own statement or motivating_measurement
+// text is now also checked against that segment's unmeasured-run count --
+// mechanical, not reliant on the agent having tagged itself correctly.
+function motivatingSegments(p) {
+  const tagged = p && p.target && WALL_CLOCK_SEGMENTS.includes(p.target.segment) ? [p.target.segment] : []
+  const text = `${(p && p.statement) || ''} ${(p && p.motivating_measurement) || ''}`
+  const mentioned = WALL_CLOCK_SEGMENTS.filter((seg) => text.includes(seg))
+  return [...new Set([...tagged, ...mentioned])]
+}
 function isUnmeasuredSegmentMotivated(p) {
-  const segment = p && p.target && p.target.segment
-  return WALL_CLOCK_SEGMENTS.includes(segment) && segmentUnmeasuredRuns(segment) >= 1
+  return motivatingSegments(p).some((seg) => segmentUnmeasuredRuns(seg) >= 1)
 }
 const droppedUnmeasuredSegment = proposals.filter(isUnmeasuredSegmentMotivated)
 proposals = proposals.filter((p) => !isUnmeasuredSegmentMotivated(p))
@@ -516,7 +595,15 @@ const reportMarkdown = buildReport({
   // Round-2 L2: which segment(s) caused a drop, and their exact
   // unmeasured-run count, so the Filtering line names both rather than
   // just a bare drop count.
-  droppedUnmeasuredSegmentDetails: droppedUnmeasuredSegment.map((p) => ({ segment: p.target.segment, unmeasuredRuns: segmentUnmeasuredRuns(p.target.segment) })),
+  // Round-3 F4: a dropped proposal may name its segment via the typed tag,
+  // free text, or both -- report every segment that actually motivated the
+  // drop (has >=1 unmeasured run), not just whatever target.segment says
+  // (which may be unset for a free-text-caught proposal).
+  droppedUnmeasuredSegmentDetails: droppedUnmeasuredSegment.flatMap((p) =>
+    motivatingSegments(p)
+      .filter((seg) => segmentUnmeasuredRuns(seg) >= 1)
+      .map((seg) => ({ segment: seg, unmeasuredRuns: segmentUnmeasuredRuns(seg) }))
+  ),
   droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
   ranked,
   insufficientDataProposals,
