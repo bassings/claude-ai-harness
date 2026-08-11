@@ -68,6 +68,35 @@ Then in any project:
 /review-cycle
 ```
 
+### Keeping the installed mirror in sync (AC-OPS-4)
+
+The manual-copy install above puts a **copy** of `workflows/lib/` (and any
+plugin install does the same, at its own plugin-managed path) at
+`~/.claude/workflows/lib/`. That installed copy, not this repo, is what
+actually executes for a delivery repo -- a fix landed here can be green in
+this repo's own test suite while the installed mirror keeps running the old
+code, silently. Every change to `workflows/lib/ledger-append.mjs` or
+`workflows/lib/optimise-read.mjs` must be re-synced after merging:
+
+```bash
+cp -r claude-ai-harness/workflows/lib/. ~/.claude/workflows/lib/
+```
+
+Confirm the installed copy actually matches this repo (exits 0, no output,
+when they agree; lists the differing files otherwise):
+
+```bash
+diff -rq claude-ai-harness/workflows/lib ~/.claude/workflows/lib
+```
+
+A stale mirror is also detectable from the optimiser's own report without
+running either command by hand: `workflows/lib/ledger-append.mjs`'s
+`SCHEMA_VERSION` was bumped (1 to 2) by the plan-identity canonicalisation
+change, and `optimise-read.mjs ledger`'s `perRepo[].schemaVersionsSeen`
+reports the schema-version mix actually seen per repo -- a stale installed
+writer still emitting `schema_version: 1` shows up there in the next report
+instead of continuing silently.
+
 ## Usage
 
 **Planning** (once per spec, before implementation):
