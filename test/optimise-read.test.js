@@ -270,6 +270,16 @@ test('optimise-read: aggregateWallClock treats an unparseable ts on the ENDED ev
   assert.equal(plan.humanWaitN, 0)
   assert.equal(plan.humanWaitSeconds, 0)
   assert.equal(plan.unusableIntervals.length, 1)
+  // Round-3 F6 (§11 incidentally-passing guard): without this assertion,
+  // deleting the `|| e.ms === null` half of the null-guard (M8) still
+  // passed every assertion above -- a null e.ms coerces to 0 in
+  // `e.ms - s.ms`, producing a NEGATIVE duration that the pre-existing
+  // "negative or out of order" fallback also excludes, so ciWaitN/Seconds
+  // and the unusableIntervals COUNT all still came out identical. Only the
+  // REASON text differs between the two code paths, and only pinning it
+  // here (as the STARTED test above already does) proves the end-side
+  // null guard specifically, not its negative-duration neighbour.
+  assert.match(plan.unusableIntervals[0].reason, /unparseable|invalid|timestamp/i, 'the reason must name an unparseable timestamp, not merely "negative or out of order" (which a null e.ms would ALSO incidentally satisfy)')
 })
 
 // ---- Review round-1 M4 (AC-OPS-3): null-vs-zero for wall-clock segments ----
