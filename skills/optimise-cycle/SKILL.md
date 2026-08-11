@@ -92,6 +92,21 @@ wrote:
 4. **Sample-size labelling (AC-SIMP-10)**: a surviving proposal below the
    stated minimum `n` is excluded from the ranked list and reported
    separately as insufficient data, never hidden.
+5. **Unmeasured wall-clock segment (AC-OPS-3)**: a proposal motivated by a
+   wall-clock segment (`target.segment`) that has at least one unmeasured
+   run in the window is dropped -- a small-looking total can be small
+   because it genuinely was, or because most of it could not be measured;
+   the gate does not let the latter pass as evidence.
+6. **Weak CI evidence (AC-DATA-8)**: a removal-shaped proposal citing a
+   specific CI job (`target.workflow` + `target.job`) whose aggregate is
+   insufficient-data, window-truncated, or a suspected rename is dropped --
+   a "never failed" claim resting on incomplete history must not motivate
+   a removal.
+7. **Proposal-outcome lookup (AC-DATA-10)**: a proposal whose stable id
+   matches a prior `proposal_rejected` event is annotated with that
+   rejection's date rather than re-raised silently; one matching two or
+   more `proposal_reverted` events is flagged (§12: a change reverted
+   twice for being worse keeps the original).
 
 ## The escaped-defect counter-metric
 
@@ -127,15 +142,19 @@ Record the deciding measurement (why it was adopted, rejected, or reverted)
 in the commit or PR body that makes the decision, per this codebase's
 existing convention for arbitrations -- the ledger line is the durable,
 structured marker; the reasoning lives in git history next to the change.
-A future optimiser cycle reads these events the same way it reads any other
-`conduct_plan_event` line: a proposal adopted and reverted twice is a
-pattern worth flagging in a later report; a rejected proposal's next
-citation should reference the prior rejection and its date rather than
-re-raising it silently, once a cycle has enough of these events accumulated
-to check against (the current cycle does not re-implement this lookup --
-recorded here as a stated direction for a future cycle to build against,
-since it needs several proposal_adopted/rejected cycles of real data to be
-meaningful, which does not exist yet).
+
+**Implemented, not deferred** (review round-1 finding M7: an earlier draft
+of this skill deferred the lookup; the optimiser flagging its own bad
+proposals is thematically the point of the whole cycle, so it is not the
+one guarantee left unbuilt). Every cycle reads these events via
+`workflows/lib/optimise-read.mjs`'s `aggregateProposalOutcomes`, keyed by
+`proposal_id` (the first colon-delimited segment of `event_key`): a
+proposal whose id has a recorded `proposal_rejected` is annotated with
+that rejection's date in the report rather than re-raised silently, and
+one with two or more `proposal_reverted` events is flagged (§12: a change
+reverted twice for being worse keeps the original). This needs no new
+ledger kind or schema change -- it reads exactly the `conduct_plan_event`
+shape documented above.
 
 ## Install verification (both paths work)
 
@@ -148,11 +167,39 @@ plugin, run it namespaced: `/claude-ai-harness:optimise-cycle`.
 
 ## Reading the report
 
-`.claude/optimise-cycle-report.md` (untracked; same convention as the
-ledger) states, every run: sample completeness per repo (record count,
-window truncation), the CI section (with any `gh` failure named
-distinctly and non-fatally, never silently dropped), the escaped-defect
-count and its heuristic caveat, the ranked proposals with their citations
-and confirming measurements, and the proposals excluded for insufficient
-data. It is the durable artefact (AC-PROD-5): read it after the run, do not
+`.claude/optimise-cycle-report.md` is untracked -- gitignored via
+`.git/info/exclude`, verified with `git check-ignore -q` before every
+write, and the write is refused entirely if that check fails, mirroring
+`ledger-append.mjs`'s own discipline exactly (`workflows/lib/
+optimise-report-ignore.mjs`; review round-1 finding M1 closed the gap
+where this claim was made but not actually true). It states, every run, in
+this order:
+
+1. **Sample completeness**: ledger record count against the minimum,
+   window truncation, and per-repo detail -- an **uninstrumented** repo is
+   named distinctly, never folded into the combined count as if it were a
+   quiet week.
+2. **Wall-clock decomposition** (source: ledger): per-plan ci-wait/
+   human-wait/agent-compute seconds and counts, `unterminated_waits` when
+   present, and totals -- a segment with zero measured runs but at least
+   one unmeasured attempt reports `null`, not a misleadingly measured-
+   looking zero (AC-OPS-3).
+3. **Rework attribution** and **never-failing acceptance criteria**
+   (source: ledger).
+4. **Trigger accuracy** (source: ledger), with an unmeasured `trigger_count`
+   bucketed separately from both "nothing in scope" and "examined and
+   found nothing".
+5. **CI section** (source: `gh`), with any `gh` failure named distinctly
+   and non-fatally (never silently dropped), and a job named
+   insufficient-data/truncated/rename-suspect where applicable.
+6. **Escaped-defect counter-metric** and its heuristic caveat.
+7. **Ranked proposals**, each with citations, confirming measurement, any
+   security-removal flag, and any prior-rejection or reverted-twice
+   annotation (AC-DATA-10).
+8. **Proposals excluded for insufficient data**, and a **filtering
+   summary** naming how many were dropped and why (uncited, always-on
+   security removal, missing reinstatement evidence, unmeasured wall-clock
+   segment, or weak CI evidence).
+
+It is the durable artefact (AC-PROD-5): read it after the run, do not
 rely on the conversation transcript.

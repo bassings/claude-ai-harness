@@ -52,7 +52,14 @@ function wrapAsData(label, value) {
   )
 }
 
-const REMOVAL_VERBS_RE = /\b(remove|removing|demote|demoting|skip|skipping|disable|disabling|drop|dropping|delete|deleting)\b/i
+// Review round-1 M2: the original list covered only remove/demote/skip/
+// disable/drop/delete, so a proposal worded with a synonym AC-SEC-10 itself
+// names -- "move ... to post-merge", "retire" -- evaded every gate built on
+// this regex, and every existing test used the word "Remove", so the gap
+// shipped green. Widened to the verbs AC-SEC-10's own text and the spec's
+// "Licence to delete" section actually use ("moving a slow check out of the
+// merge path" is literally that section's own phrasing for a demotion).
+const REMOVAL_VERBS_RE = /\b(remove|removing|demote|demoting|skip|skipping|disable|disabling|drop|dropping|delete|deleting|move|moving|retire|retiring|exclude|excluding|omit|omitting|eliminate|eliminating|stop|stopping|cut|cutting|prune|pruning)\b/i
 const SECURITY_LENS_NAMES = ['lens-security', 'lens-qa']
 const SECURITY_CHECK_KEYWORDS_RE = /\b(sast|secret[\s-]?scan|gitleaks|dependency[\s-]?audit|npm audit|trivy|codeql|semgrep)\b/i
 
@@ -64,7 +71,22 @@ function proposalText(p) {
 // lens-security or lens-qa from the always-on roster -- checked in script
 // code, not left to the drafting agent's judgement, so a fooled or
 // compromised synthesis step cannot ship this regardless of what it wrote.
+//
+// Review round-1 M2: keyed PRIMARILY on the proposal's own structured
+// `target.lens` field, verb-independent -- the drafting prompt already
+// instructs proposals to name their target structurally (never by
+// wording, so a stable id can be derived from it), and lens-security/
+// lens-qa are never gated by a trigger at all (they are unconditionally
+// always-on), so a proposal whose target genuinely names one of them has
+// no legitimate reason to exist that ISN'T about touching that always-on
+// status. A false positive here (a hypothetical benign proposal that
+// happens to set target.lens to a security lens for some other reason)
+// costs a human manually re-raising it; a false negative costs the
+// containment this gate exists for. The free-text verb+name check remains
+// as a second, independent layer for proposals that omit target.lens.
 function isAlwaysOnSecurityRemoval(p) {
+  const target = p && p.target
+  if (target && SECURITY_LENS_NAMES.includes(target.lens)) return true
   const text = proposalText(p)
   return REMOVAL_VERBS_RE.test(text) && SECURITY_LENS_NAMES.some((name) => text.includes(name))
 }
@@ -149,7 +171,7 @@ phase('Lanes')
 
 const LEDGER_LANE_SCHEMA = {
   type: 'object',
-  required: ['n', 'windowTruncated', 'windowDroppedCount', 'perRepo', 'skipped', 'rework', 'neverFailingAcs', 'wallClock', 'triggerAccuracy', 'citationPool'],
+  required: ['n', 'windowTruncated', 'windowDroppedCount', 'perRepo', 'skipped', 'rework', 'neverFailingAcs', 'wallClock', 'triggerAccuracy', 'proposalOutcomes', 'citationPool'],
   properties: {
     n: { type: 'integer' },
     windowTruncated: { type: 'boolean' },
@@ -160,6 +182,7 @@ const LEDGER_LANE_SCHEMA = {
     neverFailingAcs: { type: 'array', items: { type: 'object' } },
     wallClock: { type: 'object' },
     triggerAccuracy: { type: 'object' },
+    proposalOutcomes: { type: 'object' },
     citationPool: { type: 'array', items: { type: 'string' } },
   },
 }
@@ -258,13 +281,18 @@ const synthesisPrompt =
   wrapAsData('plan-labels', scope.plan_labels) +
   `\n\n` +
   `Draft a ranked list of proposed changes to the harness, the pipelines, or the process (never apply anything -- ` +
-  `you only propose). For EACH proposal, return: target (an object identifying WHAT it is about: e.g. {category, ` +
-  `workflow_file, job_name} or {category, lens, trigger_glob} -- used to derive a stable id, never wording), ` +
-  `statement (the proposal itself), motivating_measurement (cite the specific numbers above that motivate it), ` +
-  `confirming_measurement (what would confirm or refute it after adoption), n (the sample size backing it -- the ` +
-  `record/run count from the aggregate above, never invented), citations (array of real ids copied VERBATIM from ` +
-  `a citationPool above -- never invented), and reinstatement_evidence (required, non-empty, if the proposal ` +
-  `deletes, demotes, or skips anything; null otherwise).\n` +
+  `you only propose). For EACH proposal, return: target (an object identifying WHAT it is about, used to derive a ` +
+  `stable id, never wording -- and mechanically checked by the orchestrator, so set these fields precisely: ` +
+  `target.lens exactly matching a lens name if the proposal is about a lens; target.workflow and target.job ` +
+  `exactly matching the CI-aggregate's own "workflow"/"job" fields if the proposal is about a specific CI job; ` +
+  `target.segment set to exactly "ci_wait", "human_wait" or "agent_compute" if the proposal is MOTIVATED BY that ` +
+  `wall-clock segment -- the orchestrator will drop such a proposal if that segment has any unmeasured runs in ` +
+  `the window, so only set it when the segment genuinely motivates the proposal), statement (the proposal ` +
+  `itself), motivating_measurement (cite the specific numbers above that motivate it), confirming_measurement ` +
+  `(what would confirm or refute it after adoption), n (the sample size backing it -- the record/run count from ` +
+  `the aggregate above, never invented), citations (array of real ids copied VERBATIM from a citationPool above ` +
+  `-- never invented), and reinstatement_evidence (required, non-empty, if the proposal deletes, demotes, skips, ` +
+  `moves, retires, or otherwise reduces anything; null otherwise).\n` +
   `Return proposals: [].`
 const synthesis = await agent(synthesisPrompt, {
   label: 'synthesis:proposals',
@@ -321,6 +349,54 @@ proposals = proposals.map((p) => (isSecurityPurposedRemoval(p) ? { ...p, categor
 const droppedNoCitation = proposals.filter((p) => !(Array.isArray(p.citations) && p.citations.some((c) => allCitations.has(c))))
 proposals = proposals.filter((p) => Array.isArray(p.citations) && p.citations.some((c) => allCitations.has(c)))
 
+// Review round-1 M4 (AC-OPS-3): a proposal drafted to be MOTIVATED BY a
+// specific wall-clock segment (the drafting prompt asks for target.segment
+// on any such proposal) is dropped if that segment has >=1 unmeasured run
+// in the window -- a small-looking total can be small because it was
+// genuinely small, or small because most of it could not be measured at
+// all, and a proposal built on the latter must not ship silently.
+// `target.segment` uses the snake_case names AC-ARCH-13's own source map
+// already uses (ci_wait/human_wait/agent_compute); the aggregate's own
+// field names are camelCase (ciWaitUnmeasuredRuns etc, matching the rest
+// of workflows/lib/optimise-read.mjs's JS-object convention) -- this map
+// is the single translation point between the two, so a future segment
+// addition only needs one new entry, not a naming convention to remember.
+const WALL_CLOCK_SEGMENT_FIELD_PREFIX = { ci_wait: 'ciWait', human_wait: 'humanWait', agent_compute: 'agentCompute' }
+const WALL_CLOCK_SEGMENTS = Object.keys(WALL_CLOCK_SEGMENT_FIELD_PREFIX)
+const wallClockTotals = (ledgerAgg && ledgerAgg.wallClock && ledgerAgg.wallClock.totals) || {}
+function segmentUnmeasuredRuns(segment) {
+  const prefix = WALL_CLOCK_SEGMENT_FIELD_PREFIX[segment]
+  if (!prefix) return 0
+  const v = wallClockTotals[`${prefix}UnmeasuredRuns`]
+  return typeof v === 'number' ? v : 0
+}
+function isUnmeasuredSegmentMotivated(p) {
+  const segment = p && p.target && p.target.segment
+  return WALL_CLOCK_SEGMENTS.includes(segment) && segmentUnmeasuredRuns(segment) >= 1
+}
+const droppedUnmeasuredSegment = proposals.filter(isUnmeasuredSegmentMotivated)
+proposals = proposals.filter((p) => !isUnmeasuredSegmentMotivated(p))
+
+// Review round-1 M6 (AC-DATA-8): a removal-shaped proposal whose target
+// names a specific CI job (workflow + job, matching aggregateCi's own
+// `${workflow}::${job}` key) is dropped if that job's aggregate is
+// insufficientData, truncated, or renameSuspect -- a "never failed"
+// removal case built on a window that could not have seen a failure, or a
+// job that may be a renamed continuation of one with its own unexamined
+// history, is exactly the unbraked-removal risk AC-DATA-8 exists to catch.
+function ciJobEntryFor(target) {
+  if (!target || !target.workflow || !target.job) return null
+  const key = `${target.workflow}::${target.job}`
+  return (ciAgg && ciAgg.byJob && ciAgg.byJob[key]) || null
+}
+function isWeakCiEvidenceRemoval(p) {
+  if (!isRemovalShaped(p)) return false
+  const entry = ciJobEntryFor(p.target)
+  return !!(entry && (entry.insufficientData || entry.truncated || entry.renameSuspect))
+}
+const droppedWeakCiEvidence = proposals.filter(isWeakCiEvidenceRemoval)
+proposals = proposals.filter((p) => !isWeakCiEvidenceRemoval(p))
+
 // AC-SIMP-10: every surviving proposal carries n; below the minimum, it is
 // labelled insufficient_data and excluded from the ranked list (but still
 // reported, not hidden).
@@ -349,12 +425,34 @@ const idByIndex = idTargets.map((t, i) => (idResults[i] && idResults[i].proposal
 ranked.forEach((p, i) => { p.proposal_id = idByIndex[i] })
 insufficientDataProposals.forEach((p, i) => { p.proposal_id = idByIndex[ranked.length + i] })
 
+// Review round-1 M7 (AC-DATA-10): once a proposal has its stable id, look
+// up any recorded outcome for it (a human or the conductor's own
+// proposal_adopted/rejected/reverted ledger lines -- see
+// skills/optimise-cycle/SKILL.md). A prior rejection is ANNOTATED with its
+// date rather than omitted outright (keeping it visible with context beats
+// silence, and the finding's fix explicitly allows either); a proposal
+// adopted-then-reverted at least twice is flagged, the §12 signal that a
+// reverted-for-being-worse change should keep the simpler original rather
+// than being re-tried.
+function annotateProposalOutcome(p) {
+  const outcome = p.proposal_id && ledgerAgg && ledgerAgg.proposalOutcomes ? ledgerAgg.proposalOutcomes[p.proposal_id] : null
+  if (!outcome) return p
+  if (outcome.rejectedCount > 0) p.prior_rejection_ts = outcome.lastRejectionTs
+  if (outcome.revertedTwiceOrMore) p.reverted_twice = true
+  return p
+}
+ranked.forEach(annotateProposalOutcome)
+insufficientDataProposals.forEach(annotateProposalOutcome)
+
+const repoLabels = Object.fromEntries(scope.resolved.map((r) => [r.root, r.label]))
 const reportMarkdown = buildReport({
   reposLabel: scope.resolved.map((r) => r.label).join(', '),
   unresolved: scope.unresolved,
   ledgerN, minRecords: MIN_RECORDS_FOR_PROPOSALS, ledgerSufficient,
   windowTruncated: ledgerAgg ? ledgerAgg.windowTruncated : null,
   skipped: ledgerAgg ? ledgerAgg.skipped : [],
+  perRepo: ledgerAgg ? ledgerAgg.perRepo : [],
+  repoLabels,
   rework: ledgerAgg ? ledgerAgg.rework : null,
   neverFailingAcs: ledgerAgg ? ledgerAgg.neverFailingAcs : [],
   wallClock: ledgerAgg ? ledgerAgg.wallClock : null,
@@ -366,15 +464,27 @@ const reportMarkdown = buildReport({
   droppedAlwaysOnSecurityCount: droppedAlwaysOnSecurity.length,
   droppedNoReinstatementCount: droppedNoReinstatement.length,
   droppedNoCitationCount: droppedNoCitation.length,
+  droppedUnmeasuredSegmentCount: droppedUnmeasuredSegment.length,
+  droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
   ranked,
   insufficientDataProposals,
 })
 
 const reportWrite = await agent(
-  `Write EXACTLY the content below, verbatim, to the file "${REPORT_RELATIVE_PATH}" at the CURRENT repo's root ` +
-  `(create the .claude/ directory first if it does not exist; overwrite the file if it already exists). This is ` +
-  `the ONLY file you may create or modify in this step. Do NOT run \`git add\`, \`git commit\`, \`git push\`, any ` +
-  `\`gh\` command with \`-X POST/PATCH/PUT/DELETE\`, or any other command that changes repo or remote state.\n\n` +
+  `Before writing anything, ensure the report path is gitignored -- mirroring ledger-append.mjs's own discipline ` +
+  `(the SAME protection the ledger already has, which the report previously lacked despite documentation claiming ` +
+  `parity, review round-1 finding M1). Find this harness's optimise-report-ignore.mjs script the same way the ` +
+  `lanes above found optimise-read.mjs (global mirror, then any installed plugin, then this repo's own copy ONLY ` +
+  `if this repo is claude-ai-harness itself). Run exactly: \`node <path-to-optimise-report-ignore.mjs> ` +
+  `"$(git rev-parse --show-toplevel)" "${REPORT_RELATIVE_PATH}"\` from the CURRENT repo. It appends the path to ` +
+  `.git/info/exclude if not already present, then verifies with \`git check-ignore -q\`, printing {ignored, error}.\n` +
+  `If ignored is NOT true: do NOT write the report at all -- return written:false and error naming this reason ` +
+  `(e.g. "the report path is not gitignored: <the script's own error>"), and stop here.\n` +
+  `Only once ignored is true, write EXACTLY the content below, verbatim, to the file "${REPORT_RELATIVE_PATH}" at ` +
+  `the CURRENT repo's root (create the .claude/ directory first if it does not exist; overwrite the file if it ` +
+  `already exists). This is the ONLY file you may create or modify in this step. Do NOT run \`git add\`, ` +
+  `\`git commit\`, \`git push\`, any \`gh\` command with \`-X POST/PATCH/PUT/DELETE\`, or any other command that ` +
+  `changes repo or remote state.\n\n` +
   wrapAsData('report-content-to-write-verbatim', reportMarkdown) +
   `\n\nReturn written (boolean), path, and error (null on success).`,
   {
@@ -390,6 +500,11 @@ return {
   unresolved: scope.unresolved,
   ledger_sufficient: ledgerSufficient,
   ledger_n: ledgerN,
+  // H1: the headline aggregates were computed and rendered into the report
+  // but never reached the return value, so a caller reading the RETURN
+  // (rather than parsing the markdown) saw none of it.
+  wall_clock: ledgerAgg ? ledgerAgg.wallClock : null,
+  per_repo: ledgerAgg ? ledgerAgg.perRepo : [],
   report_path: REPORT_RELATIVE_PATH,
   report_written: !!(reportWrite && reportWrite.written),
   proposals_ranked: ranked,
@@ -404,6 +519,10 @@ function fmtPct(n, d) {
   return d > 0 ? `${Math.round((n / d) * 100)}%` : 'n/a'
 }
 
+function fmtSeconds(v) {
+  return v === null ? 'unmeasured (null)' : `${v}s`
+}
+
 function buildReport(d) {
   const lines = []
   lines.push('# Delivery optimiser report')
@@ -411,18 +530,101 @@ function buildReport(d) {
   lines.push(`Repos: ${d.reposLabel || 'none resolved'}`)
   if (d.unresolved && d.unresolved.length) lines.push(`Unresolved: ${d.unresolved.map((u) => `${u.requested} (${u.reason})`).join('; ')}`)
   lines.push('')
+
+  // H1 / AC-OPS-11: sample completeness, per repo, with an uninstrumented
+  // repo flagged DISTINCTLY -- it contributed 0 to the totals not because
+  // of a quiet week but because the ledger was never written there at all,
+  // and that difference must never disappear into a summed count.
   lines.push('## Sample completeness')
   lines.push(`Ledger records in window: ${d.ledgerN} (minimum for harness-side proposals: ${d.minRecords}).`)
   if (!d.ledgerSufficient) lines.push(`**Insufficient data**: harness-side (rework/wall-clock/trigger) proposals are suppressed until the ledger holds at least ${d.minRecords} records.`)
   if (d.windowTruncated) lines.push('Ledger window was truncated to the most recent records; older history was not read (AC-ARCH-14 bound).')
   if (d.skipped && d.skipped.length) lines.push(`${d.skipped.length} ledger line(s) were skipped as unparseable or missing a required field; see raw skip reasons in the agent transcript.`)
+  for (const entry of d.perRepo || []) {
+    const label = (d.repoLabels && d.repoLabels[entry.root]) || entry.root
+    if (entry.uninstrumented) {
+      lines.push(`- ${label}: **uninstrumented** (no ledger file found -- not "no activity"; the harness has never written a ledger here)`)
+    } else {
+      lines.push(`- ${label}: ${entry.recordCount} record(s) in window${entry.skippedCount ? `, ${entry.skippedCount} skipped` : ''}`)
+    }
+  }
+  lines.push('Instrumented invocation routes: conducted runs and every direct invocation of the harness\'s other workflows write the ledger identically (AC-ARCH-4); conduct-plan wait/PR events are conductor-only.')
   lines.push('')
+
+  // H1 / AC-OPS-11, AC-OPS-12, AC-ARCH-13: the headline deliverable --
+  // wall-clock decomposition, per plan, sourced only from the ledger.
+  lines.push('## Wall-clock decomposition (source: ledger)')
+  if (d.wallClock) {
+    const byPlan = d.wallClock.byPlan || {}
+    const planKeys = Object.keys(byPlan)
+    if (!planKeys.length) lines.push('No wall-clock data in window.')
+    for (const key of planKeys) {
+      const b = byPlan[key]
+      lines.push(
+        `- ${key}: ci_wait=${b.ciWaitSeconds}s (n=${b.ciWaitN}), human_wait=${b.humanWaitSeconds}s (n=${b.humanWaitN}), ` +
+        `agent_compute=${b.agentComputeSeconds}s (n=${b.agentComputeN})` +
+        (b.unterminatedWaits ? `, unterminated_waits: ${b.unterminatedWaits}` : '')
+      )
+    }
+    const t = d.wallClock.totals || {}
+    lines.push(`Totals: ci_wait=${fmtSeconds(t.ciWaitSeconds)}, human_wait=${fmtSeconds(t.humanWaitSeconds)}, agent_compute=${fmtSeconds(t.agentComputeSeconds)}.`)
+    if (t.unterminatedWaits) lines.push(`unterminated_waits: ${t.unterminatedWaits}`)
+    if (d.wallClock.source) lines.push(`Sources: ci_wait=${d.wallClock.source.ci_wait}, human_wait=${d.wallClock.source.human_wait}, agent_compute=${d.wallClock.source.agent_compute}.`)
+  } else {
+    lines.push('No wall-clock data (ledger unavailable).')
+  }
+  lines.push('')
+
+  // Rework attribution (spec item 1).
+  lines.push('## Rework attribution (source: ledger)')
+  if (d.rework && d.rework.lensDispositionCounts) {
+    const lensNames = Object.keys(d.rework.lensDispositionCounts)
+    if (!lensNames.length) lines.push('No lens findings recorded in window.')
+    for (const lens of lensNames) {
+      const c = d.rework.lensDispositionCounts[lens]
+      lines.push(`- ${lens}: fixed=${c.fixed}, rejected=${c.rejected}, spec_bug=${c.spec_bug}, open=${c.open}`)
+    }
+  } else {
+    lines.push('No rework data (ledger unavailable).')
+  }
+  lines.push('')
+
+  // "Which ACs never fail" (spec item 1).
+  lines.push('## Never-failing acceptance criteria (source: ledger)')
+  if (d.neverFailingAcs && d.neverFailingAcs.length) {
+    for (const a of d.neverFailingAcs) {
+      lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${a.insufficient_data ? ' (insufficient data)' : `, never_failed=${a.never_failed}`}`)
+    }
+  } else {
+    lines.push('None recorded.')
+  }
+  lines.push('')
+
+  // Trigger accuracy (spec item 4).
+  lines.push('## Trigger accuracy (source: ledger)')
+  if (d.triggerAccuracy && d.triggerAccuracy.byLens) {
+    const lensNames = Object.keys(d.triggerAccuracy.byLens)
+    if (!lensNames.length) lines.push('No trigger data in window.')
+    for (const lens of lensNames) {
+      const b = d.triggerAccuracy.byLens[lens]
+      lines.push(`- ${lens}: clean_zero_trigger=${b.cleanWithZeroTrigger}, clean_with_matches=${b.cleanWithMatches}, findings=${b.findingsWithMatches}, clean_trigger_unmeasured=${b.cleanTriggerUnmeasured || 0}, total=${b.total}`)
+    }
+  } else {
+    lines.push('No trigger data (ledger unavailable).')
+  }
+  lines.push('')
+
   lines.push('## CI section (source: gh)')
   const jobKeys = Object.keys(d.ciByJob || {})
   if (!jobKeys.length && (!d.ciFailures || !d.ciFailures.length)) lines.push('No CI data available.')
   for (const key of jobKeys) {
     const j = d.ciByJob[key]
-    lines.push(`- ${key}: n=${j.n}${j.insufficientData ? ' (insufficient data)' : j.neverFailed ? ', never failed in this window' : ''}`)
+    const qualifiers = []
+    if (j.insufficientData) qualifiers.push('insufficient data')
+    if (j.truncated) qualifiers.push('window truncated')
+    if (j.renameSuspect) qualifiers.push('rename suspect')
+    if (!qualifiers.length && j.neverFailed) qualifiers.push('never failed in this window')
+    lines.push(`- ${key}: n=${j.n}${qualifiers.length ? ` (${qualifiers.join(', ')})` : ''}`)
   }
   for (const f of d.ciFailures || []) lines.push(`- gh unavailable for ${f.repo}: ${f.mode} (${f.command}): ${f.error || 'n/a'}`)
   lines.push('')
@@ -440,6 +642,8 @@ function buildReport(d) {
     lines.push(`n=${p.n}. Motivating: ${p.motivating_measurement}. Confirming: ${p.confirming_measurement}. Citations: ${(p.citations || []).join(', ')}.`)
     if (p.reinstatement_evidence) lines.push(`Reinstatement evidence: ${p.reinstatement_evidence}`)
     if (p.category === 'security_removal_flagged') lines.push('**Flagged: security-purposed check removal/demotion.**')
+    if (p.prior_rejection_ts) lines.push(`**Previously rejected on ${p.prior_rejection_ts}.**`)
+    if (p.reverted_twice) lines.push('**Flagged: adopted and reverted at least twice previously (§12: keep the original).**')
   }
   lines.push('')
   lines.push('## Proposals (insufficient data, excluded from ranking)')
@@ -447,7 +651,13 @@ function buildReport(d) {
   for (const p of d.insufficientDataProposals) lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
   lines.push('')
   lines.push('## Filtering')
-  lines.push(`Drafted: ${d.draftedCount}. Dropped (no resolvable citation): ${d.droppedNoCitationCount}. Dropped (always-on security lens removal, never permitted): ${d.droppedAlwaysOnSecurityCount}. Dropped (removal without reinstatement evidence): ${d.droppedNoReinstatementCount}.`)
+  lines.push(
+    `Drafted: ${d.draftedCount}. Dropped (no resolvable citation): ${d.droppedNoCitationCount}. ` +
+    `Dropped (always-on security lens removal, never permitted): ${d.droppedAlwaysOnSecurityCount}. ` +
+    `Dropped (removal without reinstatement evidence): ${d.droppedNoReinstatementCount}. ` +
+    `Dropped (motivating wall-clock segment has unmeasured runs): ${d.droppedUnmeasuredSegmentCount || 0}. ` +
+    `Dropped (cited CI job is insufficient-data/truncated/rename-suspect): ${d.droppedWeakCiEvidenceCount || 0}.`
+  )
   return lines.join('\n')
 }
 

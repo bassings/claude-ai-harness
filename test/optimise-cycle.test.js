@@ -20,6 +20,7 @@ function ledgerFixture(overrides = {}) {
     neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false }],
     wallClock: { byPlan: {}, totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 }, source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' } },
     triggerAccuracy: { byLens: {} },
+    proposalOutcomes: {},
     citationPool: ['run-1', 'run-2', 'run-3', 'run-4', 'run-5', 'run-6'],
     ...overrides,
   }
@@ -82,6 +83,66 @@ test('optimise-cycle: happy path returns ranked proposals, writes the report, an
   assert.equal(result.proposals_ranked.length, 1)
   assert.equal(result.proposals_ranked[0].proposal_id, 'id-0')
   assert.ok(result.report.includes('Delivery optimiser report'))
+})
+
+// ---- Review round-1 H1 (AC-OPS-11, AC-OPS-12, AC-OPS-3): buildReport must actually RENDER what it is given, and the return must include it ----
+
+test('optimise-cycle: a two-repo fixture with unterminatedWaits>0 and one uninstrumented repo surfaces EVERY headline wall-clock/completeness/rework/trigger signal in both the report AND the workflow return (H1)', async () => {
+  const twoRepoScope = scopeFixture({
+    resolved: [{ requested: '.', root: '/repoA', label: 'repoA' }, { requested: '../other', root: '/repoB', label: 'repoB' }],
+  })
+  const wallClockFixture = {
+    byPlan: {
+      'repoA|specs/a.md': {
+        repo: 'repoA', plan: 'specs/a.md',
+        ciWaitSeconds: 300, ciWaitN: 1, ciWaitUnmeasuredN: 0,
+        humanWaitSeconds: 1200, humanWaitN: 1, humanWaitUnmeasuredN: 0,
+        agentComputeSeconds: 90, agentComputeN: 1, agentComputeUnmeasuredN: 0,
+        unterminatedWaits: 3,
+        unusableIntervals: [],
+      },
+    },
+    totals: {
+      ciWaitSeconds: 300, ciWaitMeasuredRuns: 1, ciWaitUnmeasuredRuns: 0,
+      humanWaitSeconds: 1200, humanWaitMeasuredRuns: 1, humanWaitUnmeasuredRuns: 0,
+      agentComputeSeconds: 90, agentComputeMeasuredRuns: 1, agentComputeUnmeasuredRuns: 0,
+      unterminatedWaits: 3,
+    },
+    source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+  }
+  const responses = baseResponses({
+    'scope:repos': twoRepoScope,
+    'lane:ledger': ledgerFixture({
+      perRepo: [
+        { root: '/repoA', uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false },
+        { root: '/repoB', uninstrumented: true, recordCount: 0, skippedCount: 0, schemaVersionsSeen: {}, truncatedFinalLine: false },
+      ],
+      wallClock: wallClockFixture,
+      triggerAccuracy: { byLens: { 'lens-operability': { cleanWithZeroTrigger: 2, cleanWithMatches: 1, findingsWithMatches: 0, cleanTriggerUnmeasured: 0, total: 3 } } },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: { repos: ['.', '../other'] }, agent: responses })
+
+  for (const needle of [
+    'unterminated', // AC-OPS-12: unterminated_waits signal
+    'human_wait', // wall-clock section names the segment
+    'uninstrumented', // AC-OPS-11: distinctly flagged, not folded into the sum
+    'Trigger', // trigger-accuracy table
+    'Rework', // rework attribution table
+    'never_failed', // never-failing-AC table (from the base ledgerFixture's neverFailingAcs)
+    'repoB', // the uninstrumented repo must be named, not silently dropped from the count
+  ]) {
+    assert.ok(result.report.includes(needle), `report must include "${needle}"`)
+  }
+
+  // The return object, not just the rendered string, must carry the raw
+  // aggregates (H1's evidence: "the workflow return omits wallClock and
+  // perRepo").
+  assert.ok(result.wall_clock, 'return must include wall_clock')
+  assert.equal(result.wall_clock.totals.unterminatedWaits, 3)
+  assert.ok(Array.isArray(result.per_repo), 'return must include per_repo')
+  assert.equal(result.per_repo.length, 2)
+  assert.equal(result.per_repo.find((r) => r.root === '/repoB').uninstrumented, true)
 })
 
 test('optimise-cycle: no repo resolves -> returns early with the unresolved reasons and makes no lane calls', async () => {
@@ -157,6 +218,32 @@ test('optimise-cycle: a proposal to remove lens-qa is likewise dropped unconditi
   assert.equal(result.proposals_ranked.length, 0)
 })
 
+// ---- Review round-1 M2 (AC-SEC-10): "move"/"retire" phrasing must not bypass the gate ----
+
+test('optimise-cycle: "Move lens-security out of the always-on set" is dropped unconditionally -- the verb "move" is not "remove", and AC-SEC-10 itself names "move post-merge" as a covered action (AC-SEC-10, M2)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'lens_removal', lens: 'lens-security' }, statement: 'Move lens-security out of the always-on set and into a triggered lens instead', citations: ['run-1'], reinstatement_evidence: 'evidence' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+})
+
+test('optimise-cycle: "Retire lens-qa" is dropped unconditionally -- "retire" is not "remove" either (AC-SEC-10, M2)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'lens_removal', lens: 'lens-qa' }, statement: 'Retire lens-qa from the always-on roster', citations: ['run-1'], reinstatement_evidence: 'evidence' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+})
+
+test('optimise-cycle: a structured target naming lens-security is dropped even with NO removal verb at all in the statement -- the target keying is verb-independent (AC-SEC-10, M2)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'lens_removal', lens: 'lens-security' }, statement: 'lens-security should not run on every review', citations: ['run-1'], reinstatement_evidence: 'evidence' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+})
+
 test('optimise-cycle: a security-purposed check removal WITH reinstatement evidence survives but is reclassified into the flagged category (AC-SEC-10 second clause, AC-PROD-7)', async () => {
   const responses = baseResponses({
     'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', job: 'gitleaks' }, statement: 'Remove the gitleaks secret-scanning job: never failed in 40 runs', citations: ['run-1'], reinstatement_evidence: 'reinstate if any secret ever leaks, or on any dependency bump touching auth code' })] },
@@ -165,6 +252,23 @@ test('optimise-cycle: a security-purposed check removal WITH reinstatement evide
   assert.equal(result.proposals_ranked.length, 1)
   assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
   assert.ok(result.report.includes('Flagged: security-purposed check removal'))
+})
+
+test('optimise-cycle: "Move the gitleaks scan to post-merge" WITH reinstatement evidence is flagged as security_removal_flagged, not shipped as a plain "general" proposal (AC-SEC-10, M2)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_demote', job: 'gitleaks' }, statement: 'Move the gitleaks scan to post-merge: never failed in 40 runs', citations: ['run-1'], reinstatement_evidence: 'reinstate to the merge path if it ever fails' })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+  assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
+})
+
+test('optimise-cycle: "Retire the never-failing gitleaks job" with NO reinstatement evidence is dropped, same as "Remove" would be (AC-PROD-7, M2)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', job: 'gitleaks' }, statement: 'Retire the never-failing gitleaks job', citations: ['run-1'], reinstatement_evidence: null })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
 })
 
 test('optimise-cycle: a security-purposed check removal with NO reinstatement evidence is dropped (AC-PROD-7)', async () => {
@@ -232,6 +336,91 @@ test('optimise-cycle: a proposal with n below the minimum is excluded from the r
   assert.equal(result.proposals_insufficient_data[0].insufficient_data, true)
 })
 
+// ---- Review round-1 M4 (AC-OPS-3): a proposal motivated by an unmeasured wall-clock segment is dropped ----
+
+test('optimise-cycle: a proposal whose target.segment is agent_compute is dropped when that segment has >=1 unmeasured run in the window, naming the field and count in the report (M4)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: null, agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 4, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a small share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+  assert.match(result.report, /agentComputeUnmeasuredRuns|unmeasured runs/i)
+})
+
+test('optimise-cycle: a proposal whose target.segment is fully measured (0 unmeasured runs) survives (M4 does not over-block)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 100, ciWaitMeasuredRuns: 5, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 50, agentComputeMeasuredRuns: 5, agentComputeUnmeasuredRuns: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'ci_wait' }, statement: 'CI wait dominates wall-clock', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+})
+
+// ---- Review round-1 M6 (AC-DATA-8): a removal proposal citing a weakly-grounded CI job claim is dropped ----
+
+test('optimise-cycle: a removal-shaped proposal whose target names a CI job that is insufficientData/truncated/renameSuspect is dropped, naming the reason in the report (M6)', async () => {
+  const responses = baseResponses({
+    'lane:ci': ciFixture({
+      byJob: { 'ci.yml::gitleaks': { workflow: 'ci.yml', job: 'gitleaks', n: 100, windowStart: 'x', windowEnd: 'y', truncated: true, insufficientData: false, renameSuspect: false, neverFailed: null, meanDurationS: 1 } },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'ci.yml', job: 'gitleaks' }, statement: 'Remove the gitleaks job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 100 })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+  assert.match(result.report, /insufficient-data\/truncated\/rename-suspect/i)
+})
+
+test('optimise-cycle: a removal-shaped proposal citing a CI job with a solid (not truncated/insufficient/rename-suspect) never-failed claim survives (M6 does not over-block)', async () => {
+  const responses = baseResponses({
+    'lane:ci': ciFixture({
+      byJob: { 'ci.yml::lint': { workflow: 'ci.yml', job: 'lint', n: 20, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: true, meanDurationS: 1 } },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'ci.yml', job: 'lint' }, statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 20 })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+})
+
+// ---- Review round-1 M7 (AC-DATA-10): a prior rejection is annotated (not silently re-raised); reverted-twice is flagged ----
+
+test('optimise-cycle: a proposal whose target matches a prior proposal_rejected event is annotated with the rejection date, not silently re-raised (M7)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({ proposalOutcomes: { 'id-0': { adoptedCount: 0, rejectedCount: 1, revertedCount: 0, lastRejectionTs: '2026-07-01T00:00:00.000Z', revertedTwiceOrMore: false } } }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+  assert.equal(result.proposals_ranked[0].prior_rejection_ts, '2026-07-01T00:00:00.000Z')
+  assert.match(result.report, /previously rejected on 2026-07-01/i)
+})
+
+test('optimise-cycle: a proposal whose target matches a proposal_reverted at least twice is flagged reverted_twice (M7, §12)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({ proposalOutcomes: { 'id-0': { adoptedCount: 1, rejectedCount: 0, revertedCount: 2, lastRejectionTs: null, revertedTwiceOrMore: true } } }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked[0].reverted_twice, true)
+  assert.match(result.report, /reverted at least twice/i)
+})
+
+test('optimise-cycle: a proposal with no recorded outcome events is not annotated at all (the common case must stay clean)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  assert.equal(result.proposals_ranked[0].prior_rejection_ts, undefined)
+  assert.equal(result.proposals_ranked[0].reverted_twice, undefined)
+})
+
 // ---- Report persistence (AC-PROD-5) and no-mutation instruction (AC-SEC-9) ----
 
 test('optimise-cycle: the report:write step is instructed to write only the documented report path, and never to run a mutating git/gh command', async () => {
@@ -247,6 +436,17 @@ test('optimise-cycle: if the report:write step fails, the run still completes an
   const responses = baseResponses({ 'report:write': { written: false, path: '.claude/optimise-cycle-report.md', error: 'disk full' } })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.report_written, false)
+})
+
+// ---- Review round-1 M1 (AC-SEC-9): the report must be gitignored before writing, mirroring ledger-append.mjs ----
+
+test('optimise-cycle: the report:write step is instructed to ensure the report path is gitignored (via optimise-report-ignore.mjs, mirroring ledger-append.mjs\'s ensureGitignored + check-ignore discipline) BEFORE writing, and to skip the write entirely if it is not (M1)', async () => {
+  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const writeCall = calls.find((c) => c.opts.label === 'report:write')
+  assert.ok(writeCall, 'expected a report:write agent step')
+  assert.ok(/optimise-report-ignore\.mjs/.test(writeCall.prompt), 'must instruct locating and running the ignore-ensure helper')
+  assert.ok(/check-ignore/.test(writeCall.prompt), 'must instruct verifying with git check-ignore, not just appending to .git/info/exclude and trusting it')
+  assert.ok(/do not write|skip the write|not.*ignored/i.test(writeCall.prompt), 'must instruct refusing to write when the ignore check fails')
 })
 
 // ---- AC-ARCH-14: bounded prompt even with a large aggregate ----

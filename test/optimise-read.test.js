@@ -201,8 +201,10 @@ test('optimise-read: neverFailingAcs does not mark never_failed for a pair with 
 })
 
 // ---- aggregateWallClock: conduct_plan_event pairing (AC-ARCH-13, AC-OPS-12, AC-QA-10) ----
+// Bucket keys are `${repo}|${plan}` (AC-DATA-7, review round-1 M5): the
+// same plan/spec path in two different repos must never merge.
 
-test('optimise-read: aggregateWallClock pairs ci_wait_started/ended by plan, sums real durations, sourced only from the ledger', () => {
+test('optimise-read: aggregateWallClock pairs ci_wait_started/ended by (repo, plan), sums real durations, sourced only from the ledger', () => {
   const records = [
     { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
     { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:05:00.000Z' },
@@ -211,7 +213,7 @@ test('optimise-read: aggregateWallClock pairs ci_wait_started/ended by plan, sum
     { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'run-start-1', ts: '2026-08-01T03:00:00.000Z' },
   ]
   const result = mod.aggregateWallClock(records)
-  const plan = result.byPlan.get('specs/a.md')
+  const plan = result.byPlan.get('demo|specs/a.md')
   assert.equal(plan.ciWaitSeconds, 300)
   assert.equal(plan.ciWaitN, 1)
   assert.equal(plan.humanWaitSeconds, 3600)
@@ -226,7 +228,7 @@ test('optimise-read: aggregateWallClock reports an unmatched trailing start as u
     { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
   ]
   const result = mod.aggregateWallClock(records)
-  const plan = result.byPlan.get('specs/a.md')
+  const plan = result.byPlan.get('demo|specs/a.md')
   assert.equal(plan.ciWaitN, 0)
   assert.equal(plan.unterminatedWaits, 1)
 })
@@ -237,10 +239,122 @@ test('optimise-read: aggregateWallClock reports a negative/out-of-order interval
     { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:00:00.000Z' }, // ends BEFORE it starts
   ]
   const result = mod.aggregateWallClock(records)
-  const plan = result.byPlan.get('specs/a.md')
+  const plan = result.byPlan.get('demo|specs/a.md')
   assert.equal(plan.ciWaitN, 0, 'a negative interval must not be counted toward the valid-duration total')
   assert.equal(plan.unusableIntervals.length, 1)
   assert.ok(plan.unusableIntervals[0].reason.includes('negative') || plan.unusableIntervals[0].reason.includes('order'))
+})
+
+// ---- Review round-1 M3 (AC-QA-10 / AC-QA-16): an unparseable timestamp must never produce a fabricated duration ----
+
+test('optimise-read: aggregateWallClock treats an unparseable ts on the STARTED event as unusable, not a ~56-year garbage duration (AC-QA-10, M3)', () => {
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:1', ts: 'not-a-real-timestamp' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:05:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  const plan = result.byPlan.get('demo|specs/a.md')
+  assert.equal(plan.ciWaitN, 0, 'must not count a pair with an unparseable timestamp as a valid duration')
+  assert.equal(plan.ciWaitSeconds, 0)
+  assert.equal(plan.unusableIntervals.length, 1)
+  assert.match(plan.unusableIntervals[0].reason, /unparseable|invalid|timestamp/i)
+})
+
+test('optimise-read: aggregateWallClock treats an unparseable ts on the ENDED event the same way (both sides guarded, not just started) (AC-QA-10, M3)', () => {
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'human_wait_started', event_key: 'specs/a.md:T1:human_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'human_wait_ended', event_key: 'specs/a.md:T1:human_wait_ended:1', ts: 'garbage' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  const plan = result.byPlan.get('demo|specs/a.md')
+  assert.equal(plan.humanWaitN, 0)
+  assert.equal(plan.humanWaitSeconds, 0)
+  assert.equal(plan.unusableIntervals.length, 1)
+})
+
+// ---- Review round-1 M4 (AC-OPS-3): null-vs-zero for wall-clock segments ----
+
+test('optimise-read: aggregateWallClock tracks a per-segment unmeasured-run count, and totals report a segment as null (not 0) when it has zero measured runs but at least one unmeasured attempt (AC-OPS-3, M4)', () => {
+  // A ci_wait pair with an unparseable timestamp: one unmeasured attempt,
+  // zero measured ci_wait runs anywhere in this fixture.
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:1', ts: 'bad-ts' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:05:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.ciWaitMeasuredRuns, 0)
+  assert.equal(result.totals.ciWaitUnmeasuredRuns, 1)
+  assert.equal(result.totals.ciWaitSeconds, null, 'zero measured + >=1 unmeasured must report null, distinguishable from a genuine zero')
+})
+
+test('optimise-read: aggregateWallClock totals report a genuine 0 (not null) when a segment has zero measured AND zero unmeasured runs -- nothing of that kind happened at all', () => {
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'human_wait_started', event_key: 'specs/a.md:T1:human_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'human_wait_ended', event_key: 'specs/a.md:T1:human_wait_ended:1', ts: '2026-08-01T00:10:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  // ci_wait never appears anywhere in this fixture: genuinely nothing happened -- 0, not null.
+  assert.equal(result.totals.ciWaitMeasuredRuns, 0)
+  assert.equal(result.totals.ciWaitUnmeasuredRuns, 0)
+  assert.equal(result.totals.ciWaitSeconds, 0)
+})
+
+test('optimise-read: aggregateWallClock totals keep the real measured sum even when the SAME segment also has unmeasured runs elsewhere (partial measurement is reported, not nulled out entirely)', () => {
+  const records = [
+    // Plan A: a genuinely measured 100s ci_wait.
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:01:40.000Z' },
+    // Plan B: an unmeasured (bad timestamp) ci_wait attempt.
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/b.md:T1:ci_wait_started:1', ts: 'bad-ts' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/b.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:05:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.ciWaitMeasuredRuns, 1)
+  assert.equal(result.totals.ciWaitUnmeasuredRuns, 1)
+  assert.equal(result.totals.ciWaitSeconds, 100, 'a real measured value must survive, not be nulled just because another plan had an unmeasured attempt')
+})
+
+test('optimise-read: aggregateWallClock counts an orphan start (no terminal pair at all) toward agentComputeUnmeasuredRuns and reports the segment as null, not a silent zero (M4)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'orphan-1', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1, 'the orphan start must count as an unmeasured attempt, not be silently skipped uncounted')
+  assert.equal(result.totals.agentComputeSeconds, null)
+})
+
+test('optimise-read: aggregateWallClock counts a pair with an unparseable timestamp on either side toward agentComputeUnmeasuredRuns (not just the wait-event pairing)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'bad-ts-1', ts: 'not-a-timestamp' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'bad-ts-1', ts: '2026-08-01T00:05:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, null)
+})
+
+// ---- Review round-1 M5 (AC-DATA-7): wall-clock must key by (repo, plan), never plan alone ----
+
+test('optimise-read: aggregateWallClock keeps two repos with the IDENTICAL spec path in separate buckets, never merged (AC-DATA-7, M5)', () => {
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'repoA', event: 'ci_wait_started', event_key: 'specs/x.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'repoA', event: 'ci_wait_ended', event_key: 'specs/x.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:01:00.000Z' }, // 60s
+    { kind: 'conduct_plan_event', repo: 'repoB', event: 'ci_wait_started', event_key: 'specs/x.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'repoB', event: 'ci_wait_ended', event_key: 'specs/x.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:10:00.000Z' }, // 600s
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.byPlan.size, 2, 'must produce TWO buckets, not one merged bucket')
+  const a = result.byPlan.get('repoA|specs/x.md')
+  const b = result.byPlan.get('repoB|specs/x.md')
+  assert.ok(a && b, 'both repo-scoped keys must exist')
+  assert.equal(a.ciWaitSeconds, 60)
+  assert.equal(b.ciWaitSeconds, 600)
+  assert.equal(a.repo, 'repoA')
+  assert.equal(b.repo, 'repoB')
+  assert.equal(a.plan, 'specs/x.md')
+  assert.equal(b.plan, 'specs/x.md')
 })
 
 // ---- aggregateTriggerAccuracy (spec item 4) ----
@@ -257,6 +371,24 @@ test('optimise-read: aggregateTriggerAccuracy distinguishes CLEAN-with-nothing-i
   assert.equal(ops.cleanWithMatches, 1)
   assert.equal(ops.findingsWithMatches, 1)
   assert.equal(ops.total, 3)
+})
+
+// Review round-1 L1 (AC-OPS-3): a null (unmeasured) trigger_count on a
+// CLEAN run must not be folded into cleanWithMatches -- it is neither
+// "looked and found nothing" nor "nothing in scope", it is unmeasured.
+test('optimise-read: aggregateTriggerAccuracy buckets a CLEAN run with a null trigger_count separately as cleanTriggerUnmeasured, not folded into cleanWithMatches (AC-OPS-3, L1)', () => {
+  const records = [
+    // lens-operability ran and is CLEAN but never reported a trigger_count at all (absent from trigger_counts).
+    { kind: 'review_cycle', repo: 'demo', lenses_run: ['lens-operability'], trigger_counts: {}, verdicts: { 'lens-operability': 'CLEAN' } },
+    // A genuinely-measured CLEAN-with-matches run, for contrast -- must still land in cleanWithMatches.
+    { kind: 'review_cycle', repo: 'demo', lenses_run: ['lens-operability'], trigger_counts: { 'lens-operability': 4 }, verdicts: { 'lens-operability': 'CLEAN' } },
+  ]
+  const result = mod.aggregateTriggerAccuracy(records)
+  const ops = result.byLens['lens-operability']
+  assert.equal(ops.cleanTriggerUnmeasured, 1)
+  assert.equal(ops.cleanWithMatches, 1, 'the unmeasured run must not inflate cleanWithMatches')
+  assert.equal(ops.cleanWithZeroTrigger, 0)
+  assert.equal(ops.total, 2)
 })
 
 // ---- aggregateCi (AC-DATA-8, AC-QA-19 shape) ----
@@ -289,6 +421,39 @@ test('optimise-read: aggregateCi sets truncated:true when the returned run count
   assert.equal(result.byJob.get('ci.yml::test').truncated, true)
 })
 
+// ---- Review round-1 M6 (AC-DATA-8): a truncated window or a suspected rename must never back a "never failed" claim ----
+
+test('optimise-read: aggregateCi reports neverFailed:null (not true) when the window is truncated, even though every fetched run succeeded -- PROBE2 from the review, reproduced as a fixture', () => {
+  const runs = []
+  for (let i = 0; i < 100; i++) runs.push({ workflow: 'ci.yml', job: 'test', conclusion: 'success', started_at: `2026-01-${String((i % 28) + 1).padStart(2, '0')}T00:00:00Z`, duration_s: 10 })
+  const result = mod.aggregateCi(runs, { minRunsNeverFailed: 5, requestedLimit: 100 })
+  const job = result.byJob.get('ci.yml::test')
+  assert.equal(job.truncated, true, 'sanity: 100 runs at requestedLimit=100 must be flagged truncated')
+  assert.equal(job.insufficientData, false, 'sanity: n=100 is well above the minimum, so this is NOT the insufficient-data path')
+  assert.equal(job.neverFailed, null, 'a truncated window must never back a never-failed claim, regardless of sample size')
+})
+
+test('optimise-read: aggregateCi flags a job whose first observed run starts AFTER the window\'s true earliest run as renameSuspect, and does not emit a never-failed claim for it -- PROBE3 from the review, reproduced as a fixture', () => {
+  const runs = []
+  // "unit" ran across the whole window (the true earliest history).
+  for (let i = 0; i < 8; i++) runs.push({ workflow: 'ci.yml', job: 'unit', conclusion: 'success', started_at: `2026-01-0${i + 1}T00:00:00Z`, duration_s: 10 })
+  // "unit-tests" is the renamed job: its own history starts well AFTER "unit"'s earliest run.
+  for (let i = 0; i < 8; i++) runs.push({ workflow: 'ci.yml', job: 'unit-tests', conclusion: 'success', started_at: `2026-02-0${i + 1}T00:00:00Z`, duration_s: 10 })
+  const result = mod.aggregateCi(runs, { minRunsNeverFailed: 5, requestedLimit: 100 })
+  const renamed = result.byJob.get('ci.yml::unit-tests')
+  const original = result.byJob.get('ci.yml::unit')
+  assert.equal(renamed.renameSuspect, true)
+  assert.equal(renamed.neverFailed, null, 'a rename-suspect job must not carry a never-failed claim, even with a clean run history under its own name')
+  assert.equal(original.renameSuspect, false, 'the job whose history reaches back to the window\'s true earliest run is not itself a rename suspect')
+})
+
+test('optimise-read: aggregateCi does NOT flag renameSuspect for the only job in the dataset (nothing to compare its start against)', () => {
+  const runs = []
+  for (let i = 0; i < 6; i++) runs.push({ workflow: 'ci.yml', job: 'solo', conclusion: 'success', started_at: `2026-01-0${i + 1}T00:00:00Z`, duration_s: 10 })
+  const result = mod.aggregateCi(runs, { minRunsNeverFailed: 5, requestedLimit: 100 })
+  assert.equal(result.byJob.get('ci.yml::solo').renameSuspect, false)
+})
+
 // ---- citationPool (AC-QA-20, AC-ARCH-14) ----
 
 test('optimise-read: citationPool is deduplicated, most-recent-first, capped at the stated size, and contains only real run_ids present in the window', () => {
@@ -314,6 +479,15 @@ test('optimise-read: citationPool skips records with no run_id rather than emitt
   const records = [{ run_id: 'a' }, {}, { run_id: null }, { run_id: 'b' }]
   const pool = mod.citationPool(records, 50)
   assert.deepEqual(pool.sort(), ['a', 'b'])
+})
+
+test('optimise-read CLI: the ledger command\'s output includes proposalOutcomes, computed for a real proposal_rejected line (AC-DATA-10, M7)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'proposal_rejected', event_scope: 'abc123:proposal_rejected' })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.proposalOutcomes['abc123'].rejectedCount, 1)
 })
 
 test('optimise-read CLI: the ledger command\'s output includes a citationPool of real run_ids from the window', () => {
@@ -345,6 +519,45 @@ test('optimise-read: countEscapedDefectCandidates on an empty commit list report
   const result = mod.countEscapedDefectCandidates([])
   assert.equal(result.count, 0)
   assert.equal(result.n_commits_examined, 0)
+})
+
+// ---- Review round-1 M7 (AC-DATA-10): reading proposal_adopted/rejected/reverted events, keyed by proposal_id ----
+
+test('optimise-read: aggregateProposalOutcomes keys conduct_plan_event proposal_* lines by proposal_id (the first segment of event_key), counting each outcome kind separately', () => {
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_rejected', event_key: 'abc123:proposal_rejected:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_adopted', event_key: 'def456:proposal_adopted:1', ts: '2026-08-02T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_reverted', event_key: 'def456:proposal_reverted:1', ts: '2026-08-03T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateProposalOutcomes(records)
+  assert.equal(result.get('abc123').rejectedCount, 1)
+  assert.equal(result.get('abc123').adoptedCount, 0)
+  assert.equal(result.get('def456').adoptedCount, 1)
+  assert.equal(result.get('def456').revertedCount, 1)
+})
+
+test('optimise-read: aggregateProposalOutcomes reports the most recent rejection timestamp, and flags revertedTwiceOrMore only at >=2 reverts (AC-DATA-10)', () => {
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_rejected', event_key: 'abc123:proposal_rejected:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_rejected', event_key: 'abc123:proposal_rejected:2', ts: '2026-09-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_reverted', event_key: 'def456:proposal_reverted:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_reverted', event_key: 'def456:proposal_reverted:2', ts: '2026-09-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_reverted', event_key: 'ghi789:proposal_reverted:1', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateProposalOutcomes(records)
+  assert.equal(result.get('abc123').lastRejectionTs, '2026-09-01T00:00:00.000Z', 'must report the LATEST rejection, not the first')
+  assert.equal(result.get('def456').revertedTwiceOrMore, true)
+  assert.equal(result.get('ghi789').revertedTwiceOrMore, false, 'a single revert must not trip the >=2 flag')
+})
+
+test('optimise-read: aggregateProposalOutcomes ignores conduct_plan_event lines whose event is not one of the three proposal-outcome kinds (e.g. ci_wait_started), and never throws on a malformed event_key', () => {
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'proposal_adopted', event_key: 'onlyoneseg', ts: '2026-08-01T00:00:00.000Z' }, // malformed: no ":event:occurrence"
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done' },
+  ]
+  const result = mod.aggregateProposalOutcomes(records)
+  assert.equal(result.size, 0, 'the ci_wait line and the malformed proposal line must not produce a bogus entry')
 })
 
 // ---- stableProposalId (AC-DATA-10) ----

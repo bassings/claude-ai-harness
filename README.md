@@ -248,8 +248,11 @@ the routine. See `skills/optimise-cycle/SKILL.md` for the full rollout and
 decay rule.
 
 **Report**: written to `.claude/optimise-cycle-report.md` in the repo the
-cycle was invoked in — untracked, same convention as the ledger, and the
-**only** file any of its steps may create or modify. Every proposal carries
+cycle was invoked in — gitignored via `.git/info/exclude` and verified with
+`git check-ignore -q` before every write (the write is refused if that
+check fails), mirroring `ledger-append.mjs`'s own discipline exactly via
+`workflows/lib/optimise-report-ignore.mjs`, and the **only** file any of
+its steps may create or modify. Every proposal carries
 the measurement that motivated it and the measurement that would confirm or
 refute it after adoption, and cites a real ledger `run_id` or `gh` run id
 present in what it actually read; an uncited proposal is dropped
@@ -296,6 +299,7 @@ invoking real subagents.
 | `workflows/lib/ledger-append.mjs` | Real-Node script (invoked via Bash, never imported: workflow scripts cannot import) owning the ledger envelope schema, path resolution, `.git/info/exclude` ignore-ensure and the atomic single-line append; invoked by all three workflows above |
 | `workflows/optimise-cycle.js` | Delivery optimiser orchestration: three parallel lanes (ledger, gh, git), mechanical proposal gates (citation, insufficient-data, security-removal, sample-size), report persistence |
 | `workflows/lib/optimise-read.mjs` | Real-Node script owning ledger parsing/aggregation, gh/CI aggregation, the escaped-defect heuristic and stable proposal ids; invoked by `optimise-cycle.js`, read-only |
+| `workflows/lib/optimise-report-ignore.mjs` | Real-Node script ensuring the optimiser's report path is gitignored before every write, mirroring `ledger-append.mjs`'s own discipline; the one narrowly-scoped exception to `optimise-read.mjs`'s read-only contract, kept in a separate file on purpose |
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `skills/optimise-cycle/` | Usage, cadence, report format and the proposal-decision recording protocol for the delivery optimiser |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |

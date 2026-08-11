@@ -196,17 +196,27 @@ function tsMs(ts) {
   return Number.isFinite(ms) ? ms : null
 }
 
-function ensurePlan(byPlan, plan) {
-  if (!byPlan.has(plan)) {
-    byPlan.set(plan, {
-      ciWaitSeconds: 0, ciWaitN: 0,
-      humanWaitSeconds: 0, humanWaitN: 0,
-      agentComputeSeconds: 0, agentComputeN: 0,
+// Review round-1 M5 (AC-DATA-7): the wall-clock bucket key, mirroring
+// aggregateRework's `${repo}|${spec}` scheme exactly -- the same plan/spec
+// path recurring in two different repos (a realistic case once this
+// harness's own specs/ layout is mirrored into other repos) must never
+// merge their waits into one bucket.
+function planBucketKey(repo, plan) {
+  return `${repo}|${plan}`
+}
+
+function ensurePlan(byPlan, key, repo, plan) {
+  if (!byPlan.has(key)) {
+    byPlan.set(key, {
+      repo, plan,
+      ciWaitSeconds: 0, ciWaitN: 0, ciWaitUnmeasuredN: 0,
+      humanWaitSeconds: 0, humanWaitN: 0, humanWaitUnmeasuredN: 0,
+      agentComputeSeconds: 0, agentComputeN: 0, agentComputeUnmeasuredN: 0,
       unterminatedWaits: 0,
       unusableIntervals: [],
     })
   }
-  return byPlan.get(plan)
+  return byPlan.get(key)
 }
 
 // Wall-clock decomposition (spec item 2). AC-ARCH-13: every segment here
@@ -216,6 +226,14 @@ function ensurePlan(byPlan, plan) {
 // function; CI duration/queue time (a distinct measure from ci_wait, which
 // tracks how long the CONDUCTOR was in the waiting state, not how long the
 // CI run itself took) is aggregated separately by aggregateCi, from gh only.
+//
+// Review round-1 M3/M4 (AC-QA-10, AC-OPS-3): every pair with an unparseable
+// timestamp on EITHER side, or an orphan start/terminal with no partner at
+// all, is counted as an UNMEASURED attempt (never silently dropped, never
+// turned into a fabricated duration by doing arithmetic on a null) --
+// tracked per segment so totals can report null (unmeasured) rather than a
+// misleadingly measured-looking 0 when a segment has zero measured runs but
+// at least one unmeasured attempt.
 export function aggregateWallClock(records) {
   const byPlan = new Map()
 
@@ -227,34 +245,49 @@ export function aggregateWallClock(records) {
       if (r.kind !== 'conduct_plan_event') continue
       const plan = planKeyFromEventKey(r.event_key)
       if (!plan) continue
+      const repo = r.repo || 'unknown'
       const ms = tsMs(r.ts)
-      if (r.event === `${eventName}_started`) started.push({ plan, ms })
-      else if (r.event === `${eventName}_ended`) ended.push({ plan, ms })
+      if (r.event === `${eventName}_started`) started.push({ repo, plan, ms })
+      else if (r.event === `${eventName}_ended`) ended.push({ repo, plan, ms })
     }
-    const byPlanStarts = new Map()
-    const byPlanEnds = new Map()
+    const byKeyStarts = new Map()
+    const byKeyEnds = new Map()
     const pushInto = (map, key, value) => {
       if (!map.has(key)) map.set(key, [])
       map.get(key).push(value)
     }
-    for (const s of started) pushInto(byPlanStarts, s.plan, s.ms)
-    for (const e of ended) pushInto(byPlanEnds, e.plan, e.ms)
-    const plans = new Set([...byPlanStarts.keys(), ...byPlanEnds.keys()])
-    for (const plan of plans) {
-      const starts = (byPlanStarts.get(plan) || []).slice().sort((a, b) => a - b)
-      const ends = (byPlanEnds.get(plan) || []).slice().sort((a, b) => a - b)
-      const bucket = ensurePlan(byPlan, plan)
+    for (const s of started) pushInto(byKeyStarts, planBucketKey(s.repo, s.plan), { ms: s.ms, repo: s.repo, plan: s.plan })
+    for (const e of ended) pushInto(byKeyEnds, planBucketKey(e.repo, e.plan), { ms: e.ms, repo: e.repo, plan: e.plan })
+    const keys = new Set([...byKeyStarts.keys(), ...byKeyEnds.keys()])
+    for (const key of keys) {
+      const starts = (byKeyStarts.get(key) || []).slice().sort((a, b) => (a.ms ?? 0) - (b.ms ?? 0))
+      const ends = (byKeyEnds.get(key) || []).slice().sort((a, b) => (a.ms ?? 0) - (b.ms ?? 0))
+      const repo = (starts[0] || ends[0]).repo
+      const plan = (starts[0] || ends[0]).plan
+      const bucket = ensurePlan(byPlan, key, repo, plan)
       const pairCount = Math.min(starts.length, ends.length)
       for (let i = 0; i < pairCount; i++) {
-        const durationS = (ends[i] - starts[i]) / 1000
+        const startMs = starts[i].ms
+        const endMs = ends[i].ms
+        if (startMs === null || endMs === null) {
+          bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} interval has an unparseable timestamp on the ${startMs === null ? 'started' : 'ended'} event` })
+          bucket[`${eventName === 'ci_wait' ? 'ciWait' : 'humanWait'}UnmeasuredN`] += 1
+          continue
+        }
+        const durationS = (endMs - startMs) / 1000
         if (!(durationS >= 0)) {
           bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} interval is negative or out of order (end before start)` })
+          bucket[`${eventName === 'ci_wait' ? 'ciWait' : 'humanWait'}UnmeasuredN`] += 1
           continue
         }
         if (eventName === 'ci_wait') { bucket.ciWaitSeconds += durationS; bucket.ciWaitN += 1 }
         else { bucket.humanWaitSeconds += durationS; bucket.humanWaitN += 1 }
       }
-      if (starts.length > ends.length) bucket.unterminatedWaits += starts.length - ends.length
+      if (starts.length > ends.length) {
+        const unterminated = starts.length - ends.length
+        bucket.unterminatedWaits += unterminated
+        bucket[`${eventName === 'ci_wait' ? 'ciWait' : 'humanWait'}UnmeasuredN`] += unterminated
+      }
     }
   }
 
@@ -267,23 +300,62 @@ export function aggregateWallClock(records) {
     byRunId.get(r.run_id).push(r)
   }
   for (const [, pair] of byRunId.entries()) {
-    if (pair.length < 2) continue // an orphan start or terminal with no partner: not enough to compute a duration
+    const repo = pair[0]?.repo || 'unknown'
     const spec = pair.find((p) => p.spec)?.spec || null
     const plan = spec || 'unspecified'
+    const key = planBucketKey(repo, plan)
+    if (pair.length < 2) {
+      // An orphan start or terminal with no partner: an attempt we know
+      // happened but cannot measure a duration for -- unmeasured, never
+      // simply skipped uncounted.
+      ensurePlan(byPlan, key, repo, plan).agentComputeUnmeasuredN += 1
+      continue
+    }
     const times = pair.map((p) => tsMs(p.ts)).filter((t) => t !== null)
-    if (times.length < 2) continue
+    const bucket = ensurePlan(byPlan, key, repo, plan)
+    if (times.length < 2) {
+      bucket.agentComputeUnmeasuredN += 1
+      continue
+    }
+    // Math.max(...times) - Math.min(...times) is the SPAN between the two
+    // parseable timestamps regardless of which record carried which value,
+    // so unlike the ci_wait/human_wait pairing above (which subtracts a
+    // specific end from a specific start, and so CAN go negative on a
+    // corrupted or reordered pair) this can never be negative -- there is
+    // no unreachable branch to guard here.
     const durationS = (Math.max(...times) - Math.min(...times)) / 1000
-    const bucket = ensurePlan(byPlan, plan)
-    if (durationS >= 0) { bucket.agentComputeSeconds += durationS; bucket.agentComputeN += 1 }
+    bucket.agentComputeSeconds += durationS
+    bucket.agentComputeN += 1
   }
 
-  const totals = { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 }
+  const totals = {
+    ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0,
+    humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0,
+    agentComputeSeconds: 0, agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 0,
+    unterminatedWaits: 0,
+  }
   for (const bucket of byPlan.values()) {
     totals.ciWaitSeconds += bucket.ciWaitSeconds
+    totals.ciWaitMeasuredRuns += bucket.ciWaitN
+    totals.ciWaitUnmeasuredRuns += bucket.ciWaitUnmeasuredN
     totals.humanWaitSeconds += bucket.humanWaitSeconds
+    totals.humanWaitMeasuredRuns += bucket.humanWaitN
+    totals.humanWaitUnmeasuredRuns += bucket.humanWaitUnmeasuredN
     totals.agentComputeSeconds += bucket.agentComputeSeconds
+    totals.agentComputeMeasuredRuns += bucket.agentComputeN
+    totals.agentComputeUnmeasuredRuns += bucket.agentComputeUnmeasuredN
     totals.unterminatedWaits += bucket.unterminatedWaits
   }
+  // AC-OPS-3: unmeasured is never silently reported as a measured zero. A
+  // segment with ZERO measured runs but AT LEAST ONE unmeasured attempt
+  // reports null (genuinely unknown), distinguishable from a segment with
+  // zero measured AND zero unmeasured runs (nothing of that kind happened
+  // in the window at all -- a real, measured zero). A segment with at
+  // least one MEASURED run keeps its real sum regardless of unmeasured
+  // attempts elsewhere: partial measurement is reported, not nulled out.
+  if (totals.ciWaitMeasuredRuns === 0 && totals.ciWaitUnmeasuredRuns > 0) totals.ciWaitSeconds = null
+  if (totals.humanWaitMeasuredRuns === 0 && totals.humanWaitUnmeasuredRuns > 0) totals.humanWaitSeconds = null
+  if (totals.agentComputeMeasuredRuns === 0 && totals.agentComputeUnmeasuredRuns > 0) totals.agentComputeSeconds = null
 
   return {
     byPlan,
@@ -300,17 +372,25 @@ export function aggregateWallClock(records) {
 // CLEAN with nothing in its own trigger surface (a candidate for narrowing
 // harness-triggers.json) versus CLEAN after genuinely examining matched
 // files, versus returning FINDINGS.
+//
+// Review round-1 L1 (AC-OPS-3): a CLEAN run with a null (unmeasured)
+// trigger_count -- the lens ran but never reported one -- is neither
+// "nothing in scope" (triggerCount===0) nor "examined matched files and
+// found nothing" (a real positive count); it is unmeasured, and folding it
+// into cleanWithMatches would erase that distinction and quietly treat
+// missing instrumentation as evidence for a narrow-this-trigger proposal.
 export function aggregateTriggerAccuracy(records) {
   const byLens = {}
   for (const r of records) {
     if (r.kind !== 'review_cycle') continue
     for (const lens of r.lenses_run || []) {
-      if (!byLens[lens]) byLens[lens] = { cleanWithZeroTrigger: 0, cleanWithMatches: 0, findingsWithMatches: 0, total: 0 }
+      if (!byLens[lens]) byLens[lens] = { cleanWithZeroTrigger: 0, cleanWithMatches: 0, findingsWithMatches: 0, cleanTriggerUnmeasured: 0, total: 0 }
       const bucket = byLens[lens]
       bucket.total += 1
       const triggerCount = r.trigger_counts && lens in r.trigger_counts ? r.trigger_counts[lens] : null
       const verdict = r.verdicts && r.verdicts[lens]
       if (verdict === 'CLEAN' && triggerCount === 0) bucket.cleanWithZeroTrigger += 1
+      else if (verdict === 'CLEAN' && triggerCount === null) bucket.cleanTriggerUnmeasured += 1
       else if (verdict === 'CLEAN') bucket.cleanWithMatches += 1
       else if (verdict === 'FINDINGS') bucket.findingsWithMatches += 1
     }
@@ -323,6 +403,16 @@ export function aggregateTriggerAccuracy(records) {
 // output (this script never calls gh itself -- agents do I/O, per the
 // runtime facts). Tolerant of missing fields on an individual run (skips
 // that run from the aggregate rather than throwing).
+//
+// Review round-1 M6 (AC-DATA-8): a "never failed" claim is gated on THREE
+// conditions, not just the sample-size floor -- insufficientData (too few
+// runs), truncated (the window boundary was hit, so history older than
+// what was fetched is invisible: a failure at run 101 of a 100-run fetch
+// cannot be seen), and renameSuspect (this job's own first observed run
+// starts strictly after the dataset's true earliest run, suggesting either
+// a genuinely new job or one renamed from something with its own,
+// unexamined failure history -- either way, "never failed" oversells what
+// is actually known). Any one of the three nulls the claim.
 export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAILED, requestedLimit = null } = {}) {
   const byJob = new Map()
   for (const run of runs || []) {
@@ -336,7 +426,8 @@ export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAIL
     const jobRuns = group.runs.slice().sort((a, b) => (a.started_at || '').localeCompare(b.started_at || ''))
     const n = jobRuns.length
     const insufficientData = n < minRunsNeverFailed
-    const neverFailed = insufficientData ? null : jobRuns.every((r) => r.conclusion === 'success')
+    const truncated = requestedLimit !== null && n >= requestedLimit
+    const rawNeverFailed = insufficientData ? null : jobRuns.every((r) => r.conclusion === 'success')
     const durations = jobRuns.map((r) => r.duration_s).filter((d) => typeof d === 'number' && Number.isFinite(d))
     const meanDurationS = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null
     out.set(key, {
@@ -345,13 +436,71 @@ export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAIL
       n,
       windowStart: jobRuns.length ? jobRuns[0].started_at : null,
       windowEnd: jobRuns.length ? jobRuns[jobRuns.length - 1].started_at : null,
-      truncated: requestedLimit !== null && n >= requestedLimit,
+      truncated,
       insufficientData,
-      neverFailed,
+      renameSuspect: false, // filled in below, once every job's windowStart is known
+      neverFailed: truncated ? null : rawNeverFailed,
       meanDurationS,
     })
   }
+  // renameSuspect needs every job's windowStart computed first, to find the
+  // dataset's true earliest run to compare each job's own start against.
+  let overallEarliestMs = null
+  for (const entry of out.values()) {
+    const ms = tsMs(entry.windowStart)
+    if (ms !== null && (overallEarliestMs === null || ms < overallEarliestMs)) overallEarliestMs = ms
+  }
+  for (const entry of out.values()) {
+    const ms = tsMs(entry.windowStart)
+    entry.renameSuspect = overallEarliestMs !== null && ms !== null && ms > overallEarliestMs
+    if (entry.renameSuspect) entry.neverFailed = null
+  }
   return { byJob: out }
+}
+
+// Review round-1 M7 (AC-DATA-10): reads a proposal's recorded outcome
+// events, so a rejected proposal is not silently re-raised and a proposal
+// adopted-then-reverted twice is flagged. Per skills/optimise-cycle/
+// SKILL.md, a human (or the conductor, at the moment of the decision)
+// appends a `conduct_plan_event` line shaped
+// {event: "proposal_adopted"|"proposal_rejected"|"proposal_reverted",
+// event_scope: "<proposal_id>:<event>"}; ledger-append.mjs mints
+// event_key as "<event_scope>:<occurrence>" = "<proposal_id>:<event>:<n>".
+// proposal_id is a 16-hex-char sha256 slice (stableProposalId) and so
+// never itself contains a colon, making the first colon-delimited segment
+// an unambiguous key.
+const PROPOSAL_OUTCOME_EVENTS = ['proposal_adopted', 'proposal_rejected', 'proposal_reverted']
+export function aggregateProposalOutcomes(records) {
+  const byProposalId = new Map()
+  for (const r of records) {
+    if (r.kind !== 'conduct_plan_event') continue
+    if (!PROPOSAL_OUTCOME_EVENTS.includes(r.event)) continue
+    if (typeof r.event_key !== 'string') continue
+    const parts = r.event_key.split(':')
+    if (parts.length < 2 || parts[1] !== r.event) continue // malformed or inconsistent event_key: not trusted
+    const proposalId = parts[0]
+    if (!byProposalId.has(proposalId)) byProposalId.set(proposalId, { adopted: [], rejected: [], reverted: [] })
+    const bucket = byProposalId.get(proposalId)
+    if (r.event === 'proposal_adopted') bucket.adopted.push(r.ts)
+    else if (r.event === 'proposal_rejected') bucket.rejected.push(r.ts)
+    else if (r.event === 'proposal_reverted') bucket.reverted.push(r.ts)
+  }
+  const out = new Map()
+  for (const [id, bucket] of byProposalId.entries()) {
+    // Records are processed in ledger (append) order, so the LAST pushed
+    // rejection is the most recent one, not necessarily the max by string
+    // comparison (which would be wrong across a DST boundary or a mixed
+    // timestamp format) -- ledger append order is the correct ordering.
+    const lastRejectionTs = bucket.rejected.length ? bucket.rejected[bucket.rejected.length - 1] : null
+    out.set(id, {
+      adoptedCount: bucket.adopted.length,
+      rejectedCount: bucket.rejected.length,
+      revertedCount: bucket.reverted.length,
+      lastRejectionTs,
+      revertedTwiceOrMore: bucket.reverted.length >= 2,
+    })
+  }
+  return out
 }
 
 // The bounded pool of real, citable ledger run_ids (AC-QA-20, AC-ARCH-14):
@@ -448,6 +597,7 @@ function runLedgerCommand(roots, window) {
   const neverFailing = neverFailingAcs(rework.acVerdicts, {})
   const wallClock = aggregateWallClock(windowed)
   const trigger = aggregateTriggerAccuracy(windowed)
+  const proposalOutcomes = aggregateProposalOutcomes(windowed)
   return {
     n: windowed.length,
     windowTruncated: truncated,
@@ -456,6 +606,7 @@ function runLedgerCommand(roots, window) {
     skipped: combinedSkipped,
     rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()] },
     neverFailingAcs: neverFailing,
+    proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
     triggerAccuracy: trigger,
     citationPool: citationPool(windowed),
