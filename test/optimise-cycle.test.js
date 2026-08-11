@@ -190,16 +190,28 @@ test('optimise-cycle: the report\'s Sample completeness section renders all thre
     }),
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  assert.match(result.report, /unattributable/i, 'the report must name the unattributable-runs signal at all')
-  assert.ok(/\b2\b/.test(result.report.match(/unattributable[^\n]*/gi)?.join(' ') || ''), `expected the unattributableRuns count (2) to render somewhere near "unattributable", got: ${result.report}`)
-  assert.match(result.report, /degraded/i, 'the report must name the degraded-unattributed signal')
-  assert.match(result.report, /\b4\b/, 'the unattributableWaits count (4) must render')
-  assert.match(result.report, /\b5\b/, 'the rework unattributableCount (5) must render')
+  // Review round-2 M3: matching against the WHOLE report let three of the
+  // four counters pass vacuously -- `/\b4\b/` matched "AC-ARCH-4" in an
+  // unrelated pre-existing line, `/\b5\b/` matched "n=5"/"minimum ... 5" in
+  // the CI section, and `/degraded/i` matched the hard-coded label text
+  // regardless of the actual value. Extracting the SPECIFIC rendered line
+  // and asserting the exact substrings on IT closes all three.
+  const line = result.report.split('\n').find((l) => l.startsWith('Excluded from attribution'))
+  assert.ok(line, `expected a line starting with "Excluded from attribution", report was: ${result.report}`)
+  assert.ok(line.includes('unattributable runs=2'), `got: ${line}`)
+  assert.ok(line.includes('degraded-unattributed runs=1'), `got: ${line}`)
+  assert.ok(line.includes('unattributable ci_wait/human_wait observations=4'), `got: ${line}`)
+  assert.ok(line.includes('unattributable rework records=5'), `got: ${line}`)
 })
 
 test('optimise-cycle: the report renders real ZEROS for the three exclusion counters on a clean fixture, never omitting the line entirely (M2, "a missing line means the check stopped running")', async () => {
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  assert.match(result.report, /unattributable/i, 'the exclusion-counter line must always render, even when every count is zero')
+  const line = result.report.split('\n').find((l) => l.startsWith('Excluded from attribution'))
+  assert.ok(line, `expected a line starting with "Excluded from attribution" even when every count is zero, report was: ${result.report}`)
+  assert.ok(line.includes('unattributable runs=0'), `got: ${line}`)
+  assert.ok(line.includes('degraded-unattributed runs=0'), `got: ${line}`)
+  assert.ok(line.includes('unattributable ci_wait/human_wait observations=0'), `got: ${line}`)
+  assert.ok(line.includes('unattributable rework records=0'), `got: ${line}`)
 })
 
 // ---- Review round-1 M5 (SPEC BUG SB-1): perRepo[].root silently changed
@@ -234,8 +246,20 @@ test('optimise-cycle: perRepo[].rootIndex lets the report show the scope-resolve
 })
 
 test('optimise-cycle: with no rootIndex on a perRepo entry (e.g. an older reader), the report falls back to the reader\'s own (already-safe, post-round-2) derived label rather than crashing or showing "undefined" (M5, not vacuous, defensive fallback)', async () => {
-  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  // Review round-2 L6: the default ledgerFixture() sets rootIndex:0, so the
+  // `typeof entry.rootIndex === 'number'` branch was always taken and the
+  // fallback (`|| entry.root`) was never reached at all -- the deletion
+  // mutation the review applied (`d.repoLabels[entry.rootIndex]`, no
+  // fallback) still passed. Explicitly omitting rootIndex here is what
+  // actually exercises the fallback branch.
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      perRepo: [{ root: 'demo-derived-label', uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.ok(!/undefined/i.test(result.report), 'the report must never render the literal string "undefined" for a repo label')
+  assert.ok(result.report.includes('demo-derived-label'), `expected the fallback to render the reader's own derived label, report was: ${result.report}`)
 })
 
 test('optimise-cycle: no repo resolves -> returns early with the unresolved reasons and makes no lane calls', async () => {
