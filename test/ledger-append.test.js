@@ -12,7 +12,13 @@ const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
 const { APPEND_SCRIPT, LEDGER_REL, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos } = require('./helpers/temp-repo.js')
-const { makeHostileTempRepo, makeHomeLikeHostileTempRepo, makeSpacyTempRepo } = require('./helpers/hostile-repo.js')
+const {
+  makeHostileTempRepo,
+  makeHomeLikeHostileTempRepo,
+  makeSpacyTempRepo,
+  makeSymlinkAncestorTempRepo,
+  makeInRepoSymlinkSpec,
+} = require('./helpers/hostile-repo.js')
 
 const APPEND_MODULE_URL = pathToFileURL(APPEND_SCRIPT).href
 
@@ -1412,6 +1418,60 @@ test('ledger-append (round-2 H3): an absolute spec path reached THROUGH the same
   assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.plan_key, 'specs/a.md', `got ${JSON.stringify(entry.plan_key)}`)
+})
+
+// Round 4: the test above passed even before the dirname-realpath fix,
+// because its cwd IS the repo root itself -- the PWD candidate, set to the
+// same symlinked string as the spec's own prefix, matched by simple prefix
+// comparison. That accidentally covered the narrower case, and is exactly
+// why the coordinator's own, more thorough probe (cwd one level further
+// down, inside a real "sub" directory) still found `spec: '<redacted-path>'`
+// -- PWD (repo/sub) is not a prefix of a spec rooted at repo/specs/a.md, no
+// matter how many ancestor-realpath candidates exist for root/cwdRoot
+// themselves (both already real; trying their own realpath forms, round
+// 3's now-removed realpathOrNull, never helped this case either). This is
+// the fixture that actually forces the fix: an absolute spec built from the
+// SYMLINKED repo path, submitted from a REAL SUBDIRECTORY of that same repo
+// -- a file genuinely inside the working tree, not a hypothetical.
+test('ledger-append (round-4 H3): an absolute spec through a symlinked ancestor, submitted from a SUBDIRECTORY (not the repo root) of that same symlinked repo, still resolves to the true repo-relative key', () => {
+  const { repo, sub } = makeSymlinkAncestorTempRepo()
+  fs.mkdirSync(path.join(repo, 'specs'))
+  fs.writeFileSync(path.join(repo, 'specs', 'a.md'), '# a\n')
+  const absoluteSpecViaSymlink = path.join(repo, 'specs', 'a.md')
+  const res = spawnSync('node', [APPEND_SCRIPT], {
+    cwd: sub,
+    input: JSON.stringify({ schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpecViaSymlink }),
+    encoding: 'utf8',
+    env: { ...process.env, PWD: sub },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.plan_key, 'specs/a.md', `got ${JSON.stringify(entry.plan_key)}, expected the true repo-relative key, not the marker`)
+  assert.notEqual(entry.spec, '<redacted-path>')
+})
+
+// AC-DATA-3 case e, re-proven against the round-4 fix specifically: the
+// dirname-realpath fix must realpath ONLY the spec's directory, never the
+// spec path itself -- otherwise an in-repo spec that is ITSELF a symlink
+// would resolve to (and leak) wherever it points, exactly the collapse
+// AC-DATA-3 case e forbids. The symlink's target lives OUTSIDE the repo
+// entirely, so a wrongly-resolved key could not even look like a real
+// in-repo value if this regressed.
+test('ledger-append (round-4 H3 case e): an in-repo spec that is ITSELF a symlink to a file OUTSIDE the repo stays lexical -- its OWN repo-relative path, never resolved to (or leaking) its target', () => {
+  const repo = makeHostileTempRepo()
+  const linkPath = makeInRepoSymlinkSpec(repo, path.join('specs', 'link.md'))
+  const res = spawnSync('node', [APPEND_SCRIPT], {
+    cwd: repo,
+    input: JSON.stringify({ schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: linkPath }),
+    encoding: 'utf8',
+    env: { ...process.env, PWD: repo },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.plan_key, 'specs/link.md', `got ${JSON.stringify(entry.plan_key)}, the symlink's OWN path, never its target`)
+  assert.ok(!JSON.stringify(entry).includes('outside.md'), `the symlink's target must never leak into the record: ${JSON.stringify(entry)}`)
 })
 
 test('ledger-append (round-2 H3): the two existing worktree-identity assertions, re-run with the worktree created under a deliberately SYMLINKED parent, still pass -- environment-proof, not merely environment-lucky', () => {

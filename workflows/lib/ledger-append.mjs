@@ -492,12 +492,14 @@ const WINDOWS_DRIVE_ABS_RE = /^[A-Za-z]:[\\/]/
 //
 // Review round-2, Decision 1: no regex is used to find a path's boundary
 // here, ever. `root` is a plain STRING prefix (or an ARRAY of candidate
-// string prefixes, tried in order -- H3: the writer may need to try both
-// `cwdRoot` and `root` and their realpath forms, since `process.cwd()`
-// resolves symlinks but a caller-supplied absolute spec may not) to
+// string prefixes, tried in order -- the writer may need to try both
+// `cwdRoot` and `root`, plus PWD when it names the writer's own cwd) to
 // lexically strip from an absolute `spec` -- never touched by any fs call
 // here. The caller (main(), below) resolves which real root string(s) to
-// pass; this function only ever does string/array arithmetic with them.
+// pass, and (round 4, H3) resolves `spec`'s own realpath'd DIRECTORY before
+// calling this function when `spec` reaches a real root through a
+// symlinked ancestor; this function itself only ever does string/array
+// arithmetic with whatever it is handed.
 // There is no longer a "final shape" regex check on the derived key
 // either (round-1's UNSAFE_EMBEDDED_SLASH_RE): it fired on legitimate
 // already-relative segments containing ordinary punctuation ("specs/plan
@@ -793,25 +795,29 @@ export function main() {
   // (lexical only: path.resolve does no fs I/O, no existence check, so this
   // stays consistent with AC-DATA-3's "no realpath on the spec itself").
   // The result is then relativised against every candidate root this
-  // writer knows about: cwdRoot and root, PLUS their fs.realpathSync.native
-  // forms (H3 -- process.cwd() resolves symlinks, so a caller-supplied
-  // absolute spec built from the SAME symlinked path string as argv/PWD
-  // would otherwise never match cwdRoot's resolved form), plus PWD itself
-  // when it names the same directory as cwd (compared by inode, not
-  // string). All of this fs work happens HERE, in main(), never inside
-  // canonicalPlanKey, which stays pure per AC-ARCH-2/AC-SEC-2. Redaction
-  // fires only when relativisation against every candidate genuinely fails
-  // (AC-SEC-1 cases c/d) -- never as a guess based on which characters
-  // happen to surround a path.
-  function realpathOrNull(p) {
-    if (!p) return null
-    try {
-      return fs.realpathSync.native(p)
-    } catch (e) {
-      return null
-    }
-  }
-  const specRootCandidates = [cwdRoot, root, realpathOrNull(cwdRoot), realpathOrNull(root)]
+  // writer knows about: cwdRoot and root, plus PWD itself when it names the
+  // same directory as cwd (compared by inode, not string). All of this fs
+  // work happens HERE, in main(), never inside canonicalPlanKey, which
+  // stays pure per AC-ARCH-2/AC-SEC-2. Redaction fires only when
+  // relativisation against every candidate genuinely fails (AC-SEC-1 cases
+  // c/d) -- never as a guess based on which characters happen to surround a
+  // path.
+  //
+  // Round 4 (H3, still half-fixed after round 3): `root` and `cwdRoot` are
+  // both already real (git rev-parse and process.cwd() both resolve
+  // symlinks), so trying THEIR realpath forms as extra candidates (round 3's
+  // realpathOrNull, removed here as confirmed dead by mutation-proof -- see
+  // docs/harn-opt-2-mutation-proofs.md) never mattered. What actually
+  // mattered was the SPEC side: an absolute spec built from a symlinked
+  // ANCESTOR directory (e.g. a checkout reached via a symlinked clone path)
+  // never lexically matched any real candidate root, however many of those
+  // candidates existed, and fell through to REDACTED_PATH_MARKER --
+  // destroying a legitimate in-repo file's identity, the same class of harm
+  // as H1/H2. Fixed by resolving the real form of the spec's own DIRECTORY
+  // only, never the spec path itself, before matching: AC-DATA-3 case e (a
+  // spec that is ITSELF a symlink) stays untouched, because
+  // fs.realpathSync never sees the final path segment.
+  const specRootCandidates = [cwdRoot, root]
   if (process.env.PWD) {
     try {
       if (fs.statSync(process.env.PWD).ino === fs.statSync(cwd).ino) specRootCandidates.push(process.env.PWD)
@@ -822,7 +828,19 @@ export function main() {
   if (typeof payload.spec === 'string' && payload.spec && !(payload.spec.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(payload.spec))) {
     payload.spec = path.resolve(cwd, payload.spec)
   }
-  const planKey = canonicalPlanKey(payload.spec, specRootCandidates)
+  let specForMatching = payload.spec
+  if (typeof payload.spec === 'string' && (payload.spec.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(payload.spec))) {
+    try {
+      const realDir = fs.realpathSync.native(path.dirname(payload.spec))
+      specForMatching = path.join(realDir, path.basename(payload.spec))
+    } catch (e) {
+      // The spec's directory does not exist, or cannot be resolved: fall
+      // back to lexical matching against the un-realpathed candidates, the
+      // pre-existing behaviour for a spec naming a path not actually on
+      // disk.
+    }
+  }
+  const planKey = canonicalPlanKey(specForMatching, specRootCandidates)
   // AC-DATA-4: the retained `spec` field tracks the SAME resolution as
   // plan_key -- never left as a raw, unresolved caller string (which could
   // still be an absolute path or a "../" traversal) and never blindly

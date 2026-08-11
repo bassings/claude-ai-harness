@@ -68,4 +68,44 @@ function makeSpacyTempRepo() {
   return initGitRepo(path.join(parent, 'My Repos', 'mainrepo'))
 }
 
-module.exports = { makeHostileTempRepo, makeHomeLikeHostileTempRepo, makeSpacyTempRepo }
+// Round 4 (H3, still half-fixed after round 3): a symlinked-ancestor repo
+// where the write's CWD is a real SUBDIRECTORY of the repo, not the repo
+// root itself -- the shape the round-3 H3 fixture did not reach (its own
+// absolute-spec test used cwd === repo root, which let the PWD-inode
+// candidate accidentally cover it by prefix-matching the whole repo path).
+// A caller building an absolute spec from `repo` while running with `sub`
+// as cwd reproduces the coordinator's own repro exactly: an absolute spec
+// reached through the SAME symlinked parent as cwd, but from one directory
+// further down, where PWD-prefix-matching cannot help.
+function makeSymlinkAncestorTempRepo() {
+  const repo = makeHostileTempRepo()
+  const sub = path.join(repo, 'sub')
+  fs.mkdirSync(sub)
+  return { repo, sub }
+}
+
+// AC-DATA-3 case e: an in-repo spec file that is ITSELF a symlink, pointing
+// to a target OUTSIDE the repo entirely. The canonical key must stay the
+// symlink's OWN repo-relative path -- never resolve to (or leak) the
+// target it points at. `relPath` is the symlink's repo-relative path, e.g.
+// "specs/link.md". Exists as a fixture in its own right (not folded into
+// the ancestor-symlink helper above) so a directory-realpath fix cannot be
+// verified by a test that also happens to touch this case.
+function makeInRepoSymlinkSpec(repo, relPath) {
+  const targetParent = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'hostile-symlink-target-'))
+  trackTempDir(targetParent)
+  const target = path.join(targetParent, 'outside.md')
+  fs.writeFileSync(target, '# outside\n')
+  const linkPath = path.join(repo, relPath)
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true })
+  fs.symlinkSync(target, linkPath, 'file')
+  return linkPath
+}
+
+module.exports = {
+  makeHostileTempRepo,
+  makeHomeLikeHostileTempRepo,
+  makeSpacyTempRepo,
+  makeSymlinkAncestorTempRepo,
+  makeInRepoSymlinkSpec,
+}
