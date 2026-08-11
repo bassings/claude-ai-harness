@@ -367,6 +367,48 @@ test('optimise-read: aggregateWallClock keeps two repos with the IDENTICAL spec 
   assert.equal(b.plan, 'specs/x.md')
 })
 
+// ---- Review round-2 M4: planBucketKey's `${repo}|${plan}` delimiter join
+// is not injective -- a "|" inside a repo identity or spec path merges two
+// distinct (repo, plan) pairs into one bucket, summing durations. Fixed by
+// backslash-escaping any literal "|" (and "\") within each component before
+// joining, which is IDENTICAL to the plain join for the overwhelmingly
+// common case (neither component contains "|"), so every existing
+// `byPlan.get('repo|plan')` lookup in this file keeps working unchanged. ----
+
+test('optimise-read: aggregateWallClock keeps two DIFFERENT (repo, plan) pairs distinct even when a "|" in one component could otherwise make their naive joins collide (M4)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'a|weird.md', run_id: 'x1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'a|weird.md', run_id: 'x1', ts: '2026-08-01T00:01:00.000Z' }, // 60s
+    { kind: 'tdd_task', repo: 'demo|a', outcome: 'started', spec: 'weird.md', run_id: 'x2', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo|a', outcome: 'done', spec: 'weird.md', run_id: 'x2', ts: '2026-08-01T00:02:00.000Z' }, // 120s
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.byPlan.size, 2, `naively-colliding (repo, plan) pairs must land in TWO buckets, not one merged bucket -- got ${JSON.stringify([...result.byPlan.values()].map((b) => ({ repo: b.repo, plan: b.plan, agentComputeSeconds: b.agentComputeSeconds, agentComputeN: b.agentComputeN })))}`)
+  const buckets = [...result.byPlan.values()]
+  const first = buckets.find((b) => b.repo === 'demo' && b.plan === 'a|weird.md')
+  const second = buckets.find((b) => b.repo === 'demo|a' && b.plan === 'weird.md')
+  assert.ok(first && second, `both distinct (repo, plan) pairs must have their own bucket, got ${JSON.stringify(buckets)}`)
+  assert.equal(first.agentComputeSeconds, 60, 'durations must never be summed across the two distinct pairs')
+  assert.equal(second.agentComputeSeconds, 120)
+})
+
+test('optimise-read: aggregateRework keeps two DIFFERENT (repo, plan, ac_id) triples distinct even when a "|" could otherwise make their naive joins collide (M4)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'a|weird.md', round_key: 's1', outcome: 'done', findings: [], ac_verdicts: [{ ac_id: 'AC-X-1', verdict: 'PASS' }] },
+    { kind: 'review_cycle', repo: 'demo|a', spec: 'weird.md', round_key: 's2', outcome: 'done', findings: [], ac_verdicts: [{ ac_id: 'AC-X-1', verdict: 'FAIL' }] },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.acVerdicts.size, 2, `must produce two distinct acVerdicts entries, not one merged entry -- got ${JSON.stringify([...result.acVerdicts.values()])}`)
+  const entries = [...result.acVerdicts.values()]
+  const first = entries.find((e) => e.repo === 'demo' && e.spec === 'a|weird.md')
+  const second = entries.find((e) => e.repo === 'demo|a' && e.spec === 'weird.md')
+  assert.ok(first && second, `both distinct triples must have their own entry, got ${JSON.stringify(entries)}`)
+  assert.equal(first.pass, 1)
+  assert.equal(first.fail, 0)
+  assert.equal(second.pass, 0)
+  assert.equal(second.fail, 1, 'verdicts must never be merged across the two distinct (repo, plan, ac_id) triples')
+})
+
 // ---- Review round-2 M1 (reframe, no AC -- spec bug): pairing by sorted-timestamp INDEX is unrepresentable ----
 //
 // Round 1 fixed two symptoms of the same underlying defect (a null
@@ -783,6 +825,26 @@ test('optimise-read CLI: an unknown command name is reported as an error, not a 
   assert.ok(out.error)
 })
 
+// ---- Review round-2 L2: `ci`, `escaped-defects` and `ids` all echoed
+// JSON.parse's own SyntaxError message on malformed stdin -- V8 embeds a
+// snippet of the actual input it failed on in that message, matching L1's
+// already-fixed ledger-line-parser leak (line 99), which was fixed there
+// but not here. These commands are fed agent-assembled gh output and
+// commit subjects, which optimise-cycle.js then carries into the
+// synthesis prompt and the report. ----
+
+for (const [command, malformedInput] of [['ci', '/Users/some-user/private not json'], ['escaped-defects', '/Users/some-user/private not json'], ['ids', '/Users/some-user/private not json']]) {
+  test(`optimise-read CLI: \`${command}\` on malformed stdin beginning with an absolute path does not echo that path into the returned error (L2, AC-SEC-3)`, () => {
+    const res = spawnSync('node', [MODULE_PATH, command], { input: malformedInput, encoding: 'utf8' })
+    assert.equal(res.status, 0, res.stderr)
+    const out = JSON.parse(res.stdout.trim())
+    assert.ok(out.error, `expected an error field, got ${JSON.stringify(out)}`)
+    assert.ok(!out.error.includes('/Users/'), `error must not echo the raw stdin content: ${out.error}`)
+    assert.ok(!out.error.includes('private'), `error must not echo the raw stdin content: ${out.error}`)
+    assert.match(out.error, /valid JSON|pars|JSON/i, 'the error must still say WHY it failed, just not echo the raw content')
+  })
+}
+
 test('optimise-read CLI: `node optimise-read.mjs ledger <root>` on a repo with no ledger file reports n:0 and does not create one (AC-QA-17 fixture at n=0)', () => {
   const repo = makeTempRepo()
   const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
@@ -866,7 +928,11 @@ test('optimise-read CLI: `ledger <root>` over a fixture reproducing the real 9-r
   const rawLines = fs.readFileSync(path.join(homeLikeRoot, LEDGER_REL), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
   const rawSpecIdentities = new Set(rawLines.filter((l) => l.kind !== 'conduct_plan_event').map((l) => l.spec ?? '<no-spec-raw>'))
   assert.equal(rawSpecIdentities.size, 4, `sanity: expected 4 distinct RAW (un-normalised) spec forms in the fixture, got ${JSON.stringify([...rawSpecIdentities])} -- the fixture must genuinely contain the historical absolute form or this test cannot prove anything about the fix`)
-  assert.ok(!JSON.stringify(rawLines[0]).startsWith('specs/'), 'sanity: rec0\'s raw spec must genuinely be absolute, not already relative')
+  // Review round-2 L3: JSON.stringify(rawLines[0]) is always an object
+  // stringified to "{...}", so the negated startsWith('specs/') check could
+  // never fail regardless of rec0's actual spec value -- checked directly
+  // on the parsed field instead.
+  assert.ok(path.isAbsolute(rawLines[0].spec), `sanity: rec0's raw spec must genuinely be absolute, not already relative -- got ${JSON.stringify(rawLines[0].spec)}`)
 
   const res = spawnSync('node', [MODULE_PATH, 'ledger', homeLikeRoot], { encoding: 'utf8' })
   assert.equal(res.status, 0, res.stderr)
@@ -1092,21 +1158,60 @@ test('optimise-read: three records sharing one run_id (forward, reversed, and sh
   assert.ok(!results[0].includes('<no-spec>'), 'sanity: the no-spec sentinel must never win when a real spec is present anywhere in the pair')
 })
 
-// ---- Review round-1 M1 (read-side half): a stored plan_key is
-// re-canonicalised on read, not trusted verbatim -- defence in depth
-// against a hand-edited or foreign ledger line whose plan_key itself
-// carries an M1-shaped leak. ----
+// ---- Review round-1 M1 (read-side half), reproduction updated in round 2:
+// round-1's canonicalPlanKey had a second "final shape" regex check
+// (UNSAFE_EMBEDDED_SLASH_RE) that caught an embedded-but-not-leading
+// absolute path like "plan=/Users/<user>/x.md". Round 2 removed that check
+// entirely (Decision 1: it fired on legitimate already-relative segments
+// containing ordinary punctuation indistinguishably from a genuine leak --
+// see H1). The read-side re-canonicalisation itself is UNCHANGED and still
+// load-bearing: a stored plan_key that is genuinely ABSOLUTE (starts with
+// "/") and matches no known root is still redacted on read, exactly like a
+// hostile `spec` would be -- defence in depth against a hand-edited or
+// foreign ledger line. ----
 
-test('optimise-read: aggregateWallClock re-canonicalises a STORED plan_key on read rather than trusting it verbatim -- a hand-edited line whose plan_key itself carries an embedded absolute path is still redacted (M1, read-side defence in depth)', () => {
+test('optimise-read: aggregateWallClock re-canonicalises a STORED plan_key on read rather than trusting it verbatim -- a hand-edited line whose plan_key is a genuine absolute path outside every known root is still redacted (M1, read-side defence in depth)', () => {
   const records = [
-    { kind: 'tdd_task', repo: 'demo', outcome: 'started', plan_key: 'plan=/Users/some-user/private/plan.md', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
-    { kind: 'tdd_task', repo: 'demo', outcome: 'done', plan_key: 'plan=/Users/some-user/private/plan.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', plan_key: '/Users/some-user/private/plan.md', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', plan_key: '/Users/some-user/private/plan.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
   ]
   const result = mod.aggregateWallClock(records)
   const stdout = JSON.stringify([...result.byPlan.entries()])
   assert.ok(!stdout.includes('/Users/'), 'a hostile stored plan_key must not reach byPlan verbatim')
   assert.equal(result.byPlan.size, 0, 'the re-canonicalised key must resolve to the out-of-repo marker and be excluded, exactly like a hostile spec would be')
   assert.equal(result.totals.unattributableRuns, 1)
+})
+
+test('optimise-read: a stored plan_key that is a genuine absolute path UNDER the analysis root re-canonicalises to the correct relative key on read (not vacuous: proves re-canonicalisation actually runs canonicalPlanKey\'s real logic, not just a blanket redact-if-absolute rule)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', plan_key: '/repo/specs/a.md', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', plan_key: '/repo/specs/a.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  assert.ok(result.byPlan.has('demo|specs/a.md'), `expected the absolute stored plan_key to re-canonicalise to the relative key under the analysis root, got ${JSON.stringify([...result.byPlan.keys()])}`)
+})
+
+// ---- Review round-2 M1 (the guard's REAL consumer): a pre-PR1 line's
+// `spec` can be a verbatim "../" traversal -- main's own ABSOLUTE_PATH_RE
+// matched only leading-slash/drive forms, so a relative traversal reached
+// the ledger unredacted. This is exactly what planKeyForRecord's fallback
+// (re-deriving from `spec` when no `plan_key` is stored) exists to catch
+// on READ. Hand-seeded, not written through runAppend, since the fixed
+// writer can no longer PRODUCE this shape at write time (the same fixture
+// technique AC-DATA-6/AC-QA-5's fixtures already use). ----
+
+test('optimise-read: a hand-seeded pre-PR1 line whose spec is a verbatim "../" traversal (no plan_key stored) is redacted on read via the spec fallback, counted as unattributable, and leaks nothing into the output (M1, end-to-end)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '../../../home/scott.b/.ssh/config', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: '../../../home/scott.b/.ssh/config', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  assert.equal(result.byPlan.size, 0, 'the traversal must never create (or share) a byPlan bucket')
+  assert.equal(result.totals.unattributableRuns, 1)
+  const stdout = JSON.stringify([...result.byPlan.entries()]) + JSON.stringify(result.totals)
+  assert.ok(!stdout.includes('/home/'), 'must not leak /home/')
+  assert.ok(!stdout.includes('scott.b'), 'must not leak the account name')
+  assert.ok(!stdout.includes('.ssh'), 'must not leak the traversal\'s target file name')
 })
 
 test('optimise-read: a genuinely clean stored plan_key is unaffected by re-canonicalisation (not vacuous)', () => {

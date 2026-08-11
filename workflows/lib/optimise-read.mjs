@@ -194,7 +194,8 @@ export function aggregateRework(records, { root = '' } = {}) {
       continue
     }
     for (const v of verdicts) {
-      const key = `${r.repo}|${planKey}|${v.ac_id}`
+      // Review round-2 M4: same injective-escaping fix as planBucketKey.
+      const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(v.ac_id)}`
       if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
       const entry = acVerdicts.get(key)
       entry.n += 1
@@ -262,13 +263,26 @@ function occurrenceKeyFromEventKey(eventKey, eventName) {
   return eventKey.slice(0, idx) + ':' + eventKey.slice(idx + marker.length)
 }
 
+// Review round-2 M4: a bare `|`-join is not injective -- a literal "|"
+// inside a repo identity (a remoteless repo's basename fallback, or a
+// deliberately named checkout) or a spec path merges two DISTINCT (repo,
+// plan) pairs into one bucket, summing durations and merging AC verdicts.
+// Backslash-escaping "\" and "|" within each component before joining
+// fixes this while staying IDENTICAL to the plain join whenever neither
+// component actually contains "|" (the overwhelming common case) -- every
+// `${repo}|${plan}`-shaped key elsewhere in this codebase and its tests
+// keeps working unchanged.
+function escapeKeyComponent(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/\|/g, '\\|')
+}
+
 // Review round-1 M5 (AC-DATA-7): the wall-clock bucket key, mirroring
 // aggregateRework's `${repo}|${spec}` scheme exactly -- the same plan/spec
 // path recurring in two different repos (a realistic case once this
 // harness's own specs/ layout is mirrored into other repos) must never
 // merge their waits into one bucket.
 function planBucketKey(repo, plan) {
-  return `${repo}|${plan}`
+  return `${escapeKeyComponent(repo)}|${escapeKeyComponent(plan)}`
 }
 
 function ensurePlan(byPlan, key, repo, plan) {
@@ -872,7 +886,12 @@ export function main() {
     try {
       payload = raw.trim() ? JSON.parse(raw) : {}
     } catch (e) {
-      return { error: 'stdin was not valid JSON: ' + e.message, byJob: {} }
+      // Review round-2 L2: JSON.parse's own SyntaxError message embeds a
+      // snippet of the RAW input it failed on -- matching L1's already-
+      // fixed ledger-line-parser leak, applied here too. This command is
+      // fed agent-assembled `gh` output, which optimise-cycle.js carries
+      // into the synthesis prompt and the report.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', byJob: {} }
     }
     return runCiCommand(payload)
   }
@@ -882,7 +901,8 @@ export function main() {
     try {
       payload = raw.trim() ? JSON.parse(raw) : {}
     } catch (e) {
-      return { error: 'stdin was not valid JSON: ' + e.message, count: null }
+      // Review round-2 L2: same fix as the `ci` command above.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', count: null }
     }
     return countEscapedDefectCandidates(Array.isArray(payload && payload.commits) ? payload.commits : [])
   }
@@ -892,7 +912,8 @@ export function main() {
     try {
       payload = raw.trim() ? JSON.parse(raw) : {}
     } catch (e) {
-      return { error: 'stdin was not valid JSON: ' + e.message, ids: [] }
+      // Review round-2 L2: same fix as the `ci` command above.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', ids: [] }
     }
     const targets = Array.isArray(payload && payload.targets) ? payload.targets : []
     return { ids: targets.map((target) => ({ target, proposal_id: stableProposalId(target) })) }
