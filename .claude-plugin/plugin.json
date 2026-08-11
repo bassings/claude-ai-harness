@@ -2,7 +2,7 @@
   "name": "claude-ai-harness",
   "displayName": "Claude AI Harness",
   "description": "Multi-lens planning and review harness for Claude Code: single-focus specialist lenses run in parallel via dynamic workflows, with acceptance criteria as the contract between planning and review.",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "author": { "name": "Scott Bassingthwaighte-Hatch" },
   "repository": "https://github.com/bassings/claude-ai-harness",
   "license": "MIT",
