@@ -590,12 +590,32 @@ export function countEscapedDefectCandidates(commits) {
   }
 }
 
+// Review round-2 M2: `JSON.stringify(value, Object.keys(target).sort())`
+// looked like it canonicalised the whole object, but a replacer ARRAY is
+// applied identically at EVERY nesting level of JSON.stringify's own
+// traversal, not just the top level -- so a key present only inside a
+// nested object (never in the top-level target's own key list) is
+// filtered OUT at that inner level, and every nested object serialises to
+// "{}" regardless of its content. Two targets differing only in a nested
+// field (e.g. {trigger:{glob:'*.js'}} vs {trigger:{glob:'*.py'}}) hashed
+// identically as a result. Recurses and sorts keys at EVERY level instead,
+// so nested content is never silently dropped and key order never matters
+// at any depth.
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
 // A stable proposal id derived from the TARGET a proposal is about (never
 // its prose wording), so the same target re-proposed across cycles is
 // recognisable as the same proposal (AC-DATA-10). Real-Node sha256, same
 // pattern as ledger-append.mjs's findingId.
 export function stableProposalId(target) {
-  const canonical = JSON.stringify(target, Object.keys(target).sort())
+  const canonical = canonicalJson(target)
   return createHash('sha256').update(canonical).digest('hex').slice(0, 16)
 }
 

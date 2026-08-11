@@ -623,6 +623,27 @@ test('optimise-read: stableProposalId is derived from the target descriptor, not
   assert.match(idA1, /^[0-9a-f]{16}$/)
 })
 
+// ---- Review round-2 M2 (AC-DATA-10): a bare Object.keys(target).sort() replacer only sorts the TOP level; JSON.stringify's replacer array is re-applied at every nesting level, so a nested key not present at top level is dropped entirely, and every nested object serialises to "{}" regardless of its content ----
+
+test('optimise-read: stableProposalId does NOT collide two distinct targets that differ only in a NESTED field -- reproduces the reviewer\'s exact collision ({trigger:{glob:"*.js"}} vs {trigger:{glob:"*.py"}}) (AC-DATA-10, M2)', () => {
+  const idJs = mod.stableProposalId({ category: 'trigger_tune', trigger: { glob: '*.js' } })
+  const idPy = mod.stableProposalId({ category: 'trigger_tune', trigger: { glob: '*.py' } })
+  assert.notEqual(idJs, idPy, 'two targets differing only in a nested field must not collide')
+})
+
+test('optimise-read: stableProposalId is stable regardless of KEY ORDER at any nesting depth, not just the top level', () => {
+  const idOrderA = mod.stableProposalId({ category: 'trigger_tune', trigger: { glob: '*.js', mode: 'narrow' } })
+  const idOrderB = mod.stableProposalId({ trigger: { mode: 'narrow', glob: '*.js' }, category: 'trigger_tune' })
+  assert.equal(idOrderA, idOrderB, 'the same target, with keys reordered at both the top level and inside the nested object, must hash identically')
+})
+
+test('optimise-read: stableProposalId still yields the SAME id for the identical target across two calls after the fix (regression: the fix must not make a previously-stable id unstable)', () => {
+  const target = { category: 'ci_demote', workflow_file: '.github/workflows/ci.yml', job_name: 'lint' }
+  const id1 = mod.stableProposalId(target)
+  const id2 = mod.stableProposalId({ category: 'ci_demote', workflow_file: '.github/workflows/ci.yml', job_name: 'lint' })
+  assert.equal(id1, id2)
+})
+
 // ---- CLI integration: real fs, real repo, no mutation of anything but the read (AC-SEC-9 partial proof) ----
 
 test('optimise-read CLI: `node optimise-read.mjs ledger <root>` reads a real ledger written by ledger-append.mjs and prints an aggregate JSON to stdout, without modifying the ledger file (byte-identical before/after, mtime unchanged)', () => {
