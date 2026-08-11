@@ -598,11 +598,26 @@ function resolveRepoIdentity(cwd, mainRoot) {
 // above) before the general redaction pass -- which knows only the main
 // checkout root -- ever runs. This is the fs/git-touching half of that
 // resolution; canonicalPlanKey itself stays pure and never calls this.
+// AC-QA-20: fs-only (walking up for the nearest `.git` entry, file or
+// directory -- a linked worktree's own root has a `.git` FILE containing
+// `gitdir: <path>`; an ordinary checkout has a `.git` DIRECTORY; either
+// marks `dir` as a working tree's own toplevel), never a git subprocess.
+// This mirrors `git rev-parse --show-toplevel`'s own resolution closely
+// enough for this purpose without adding a 4th git call to every write --
+// today's count (with an origin remote configured: --show-superproject-
+// working-tree, --git-common-dir, remote get-url origin, check-ignore) must
+// not grow by one just to resolve the CURRENT working tree's root, which an
+// ordinary fs stat walk already answers just as well for this narrow use
+// (never resolving GIT_DIR/GIT_WORK_TREE overrides or core.worktree, which
+// only a real `git rev-parse` call could -- accepted, since those are rare
+// enough that AC-QA-20's subprocess-count guarantee outweighs them here).
 function resolveWorkingTreeRoot(cwd) {
-  try {
-    return git(['rev-parse', '--show-toplevel'], cwd)
-  } catch (e) {
-    return null
+  let dir = path.resolve(cwd)
+  while (true) {
+    if (fs.existsSync(path.join(dir, '.git'))) return dir
+    const parent = path.dirname(dir)
+    if (parent === dir) return null
+    dir = parent
   }
 }
 

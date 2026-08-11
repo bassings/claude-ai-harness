@@ -8,13 +8,18 @@ snapshot taken before any mutation began (`git checkout --` reverts to the
 last commit, destroying uncommitted work sitting on top of it), and every
 restore was confirmed with `diff <working-file> <snapshot>` returning
 nothing before the next mutation. Full suite: `node --test test/*.test.js`,
-350/350 (this count already includes proofs 7 and 8's own new tests),
+353/353 (this count already includes proofs 7, 8 and 9's own new tests),
 re-run three consecutive times clean after the final restore. AC-SIMP-10
 caps this file at 200 lines (Section 11 evidence otherwise belongs in the
 PR body); kept concise accordingly.
 
-Eight proofs executed, one per load-bearing guard. All eight caught the
+Nine proofs executed, one per load-bearing guard. All nine caught the
 mutation on the first fixture — no vacuous or incidentally-passing guard.
+Proof 9 records a real near-miss: the first implementation of AC-ARCH-3's
+worktree-root resolution used a `git rev-parse --show-toplevel` subprocess,
+which regressed AC-QA-20 (no additional git subprocess per write) by one
+call on every write, not just worktree writes. Caught by writing AC-QA-20's
+own guard before trusting the implementation, not by a review round.
 
 ## 1. `canonicalPlanKey`'s `..`-escape detection (AC-SEC-1 case d) — `ledger-append.mjs`
 
@@ -119,6 +124,22 @@ split PR1 exists to close). **Result**: the new static test failed —
 `definitionSites` listed both files instead of one. **Reverted**: `cp` from
 snapshot, confirmed byte-identical, suite back to 350/350 (this proof's own
 static test is what raised the count from 349 to 350).
+
+## 9. Worktree-root resolution costs zero additional git subprocesses (AC-QA-20) — `ledger-append.mjs`
+
+**Guards**: resolving the current working tree's own root (needed for
+AC-ARCH-3's worktree relativisation) never adds a git subprocess call beyond
+the pre-PR1 baseline (measured directly: 4 calls for an ordinary write with
+an origin remote configured -- show-superproject-working-tree,
+git-common-dir, remote get-url origin, check-ignore). **Mutation**:
+`resolveWorkingTreeRoot`'s fs-only stat walk replaced with the original
+implementation attempt, `git(['rev-parse', '--show-toplevel'], cwd)`.
+**Result**: both new PATH-shim-counting tests failed — 5 invocations instead
+of 4 for an ordinary write, confirming a real regression this proof exists
+to prevent, not a hypothetical one. **Reverted**: `cp` from a snapshot taken
+immediately before this specific mutation, confirmed byte-identical, suite
+back to 353/353 (this proof's own two new tests raised the count from 351
+to 353).
 
 ## Not separately mutation-proven
 

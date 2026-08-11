@@ -1539,6 +1539,56 @@ test('ledger-append module: SCHEMA_VERSION is bumped past 1 -- the plan_key fiel
   assert.notEqual(SCHEMA_VERSION, 1)
 })
 
+// AC-QA-20: plan-identity canonicalisation must add no per-write git
+// subprocess beyond what the writer already invoked -- resolving the
+// current working tree's own root (needed to relativise a worktree-
+// authored absolute spec, AC-ARCH-3) is done by an fs stat walk, never a
+// `git rev-parse --show-toplevel` call, so it costs nothing here. Counted
+// through a PATH shim (a fake `git` that logs its own argv then execs the
+// real one), per the AC's own stated method, never by wall-clock timing.
+function countGitInvocations(repo, payload) {
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-shim-'))
+  const logPath = path.join(shimDir, 'calls.log')
+  const realGit = spawnSync('/usr/bin/env', ['which', 'git'], { encoding: 'utf8' }).stdout.trim() || '/usr/bin/git'
+  fs.writeFileSync(
+    path.join(shimDir, 'git'),
+    `#!/bin/sh\necho "$@" >> ${JSON.stringify(logPath)}\nexec ${JSON.stringify(realGit)} "$@"\n`,
+    { mode: 0o755 }
+  )
+  const res = spawnSync('node', [APPEND_SCRIPT], {
+    cwd: repo,
+    input: JSON.stringify(payload),
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}` },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  const calls = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean) : []
+  fs.rmSync(shimDir, { recursive: true, force: true })
+  return { out, calls }
+}
+
+test('ledger-append: an ordinary write with an origin remote configured invokes git exactly 4 times (show-superproject-working-tree, git-common-dir, remote get-url origin, check-ignore) -- resolving the current working tree\'s own root for AC-ARCH-3 adds an fs stat walk, never a 5th git subprocess (AC-QA-20)', () => {
+  const repo = makeTempRepo()
+  sh('git remote add origin git@github.com:example/example.git', repo)
+  const { out, calls } = countGitInvocations(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(calls.length, 4, `expected exactly 4 git invocations, got ${calls.length}: ${JSON.stringify(calls)}`)
+})
+
+test('ledger-append: a worktree-authored write (which needs BOTH the main-checkout root and the worktree\'s own root) still invokes git no more than the main-checkout case -- resolving the worktree\'s own root costs zero additional git subprocesses (AC-QA-20, the actual worktree code path)', () => {
+  const repo = makeTempRepo()
+  sh('git remote add origin git@github.com:example/example.git', repo)
+  const worktreeDir = path.join(os.tmpdir(), 'ledger-append-gitcount-wt-' + Math.random().toString(36).slice(2))
+  sh(`git worktree add -q -b gitcount-wt-branch "${worktreeDir}"`, repo)
+  try {
+    const { out, calls } = countGitInvocations(worktreeDir, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: path.join(worktreeDir, 'specs', 'a.md') })
+    assert.equal(out.write_ok, true, out.write_error)
+    assert.ok(calls.length <= 4, `expected no more than 4 git invocations from a worktree write, got ${calls.length}: ${JSON.stringify(calls)}`)
+  } finally {
+    sh(`git worktree remove --force "${worktreeDir}"`, repo)
+  }
+})
+
 test('ledger-append module: LEDGER_ENTRY_SCHEMA declares plan_key as optional (not unconditionally required), so a hand-built entry that predates this field still validates -- read-side normalisation, not a schema migration, is what makes historical lines usable (AC-ARCH-5)', async () => {
   const { LEDGER_ENTRY_SCHEMA, validateEntry } = await import(APPEND_MODULE_URL)
   assert.ok('plan_key' in LEDGER_ENTRY_SCHEMA.properties, 'expected a plan_key property on the schema')
