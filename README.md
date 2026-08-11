@@ -118,6 +118,18 @@ test edited into passing voids the run instead of shipping. Three failed
 attempts at either gate stops the workflow with "the frame is wrong" rather
 than trying a fourth.
 
+**Optimising the delivery cycle** (scheduled, weekly per repo by default —
+see "Delivery optimiser" below; never per-PR):
+
+```
+/optimise-cycle
+/optimise-cycle {"repos": ["../delivery-repo-a", "../delivery-repo-b"]}
+```
+
+Read-only: fans out to three parallel lanes (ledger, GitHub Actions via
+`gh`, git history) and writes a ranked, cited report of proposed changes —
+it never applies one itself.
+
 ## Per-repo trigger customisation
 
 The review cycle ships generic path globs for deciding which lenses a diff
@@ -220,6 +232,40 @@ telemetry-only, and fully preventable by the exclusion above. This is a
 deliberate, accepted trade-off, not an oversight: AC-DATA-4's git-clean-
 survival clause is an accepted FAIL for this path.
 
+## Delivery optimiser
+
+`/optimise-cycle` (`workflows/optimise-cycle.js` + `skills/optimise-cycle/`)
+reads the run ledger, conducted plan files, git history and GitHub Actions
+history (via `gh`, run/job metadata only — never a job's log output) to
+propose measured, cited changes to the harness, pipelines or process. It
+**never applies a change itself**: every proposal goes through the normal
+gate like any other change to this repo.
+
+**Cadence**: weekly, per delivery repo, run as a scheduled routine — never
+per-PR. Two consecutive dry cycles (no adopted-and-confirmed proposal) halve
+it (weekly → fortnightly → monthly); a third dry cycle at monthly retires
+the routine. See `skills/optimise-cycle/SKILL.md` for the full rollout and
+decay rule.
+
+**Report**: written to `.claude/optimise-cycle-report.md` in the repo the
+cycle was invoked in — gitignored via `.git/info/exclude` and verified with
+`git check-ignore -q` before every write (the write is refused if that
+check fails), mirroring `ledger-append.mjs`'s own discipline exactly via
+`workflows/lib/optimise-report-ignore.mjs`, and the **only** file any of
+its steps may create or modify. Every proposal carries
+the measurement that motivated it and the measurement that would confirm or
+refute it after adoption, and cites a real ledger `run_id` or `gh` run id
+present in what it actually read; an uncited proposal is dropped
+mechanically, in script code, not by agent judgement. A proposal to remove
+`lens-security` or `lens-qa` from the always-on roster is never emitted; any
+other removal, demotion or skip proposal must state the evidence that would
+reinstate it, alongside the escaped-defect counter-metric (a stated
+heuristic derived from git history, not a verified per-PR attribution).
+
+**Args**: `{repos?: string[] (default: the current repo), window?: number
+(ledger lines per repo; default 2000)}` — never a hardcoded path or repo
+name; the repos it reads always come from `args` or its documented default.
+
 ## Tests
 
 This repo's own tests need only Node (no `npm install`, no dependency
@@ -251,7 +297,11 @@ invoking real subagents.
 | `workflows/review-cycle.js` | Review orchestration: scope + SHA pin, deterministic triggering, parallel worktree-isolated lenses, synthesis |
 | `workflows/tdd-task.js` | Script-enforced TDD for one scoped change: implement is unreachable until RED is verified for the right reason; commit refused if tests changed between RED and GREEN |
 | `workflows/lib/ledger-append.mjs` | Real-Node script (invoked via Bash, never imported: workflow scripts cannot import) owning the ledger envelope schema, path resolution, `.git/info/exclude` ignore-ensure and the atomic single-line append; invoked by all three workflows above |
+| `workflows/optimise-cycle.js` | Delivery optimiser orchestration: three parallel lanes (ledger, gh, git), mechanical proposal gates (citation, insufficient-data, security-removal, sample-size), report persistence |
+| `workflows/lib/optimise-read.mjs` | Real-Node script owning ledger parsing/aggregation, gh/CI aggregation, the escaped-defect heuristic and stable proposal ids; invoked by `optimise-cycle.js`, read-only |
+| `workflows/lib/optimise-report-ignore.mjs` | Real-Node script ensuring the optimiser's report path is gitignored before every write, mirroring `ledger-append.mjs`'s own discipline; the one narrowly-scoped exception to `optimise-read.mjs`'s read-only contract, kept in a separate file on purpose |
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
+| `skills/optimise-cycle/` | Usage, cadence, report format and the proposal-decision recording protocol for the delivery optimiser |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
 | `test/` | This repo's own test suite (`node --test test/*.test.js`); see "Tests" above |
 
