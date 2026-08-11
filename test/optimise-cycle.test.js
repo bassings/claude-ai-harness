@@ -465,9 +465,39 @@ test('optimise-cycle: a proposal whose target.segment is agent_compute is droppe
   // "unmeasured runs" (which the report never actually contained -- the
   // original assertion passed incidentally on the word "unmeasured"
   // appearing in the totals line's "unmeasured (null)" rendering, not on
-  // any real count) to requiring BOTH the segment name and its exact
-  // affected-run count (4, from this fixture) to appear together.
-  assert.match(result.report, /agent_compute[^\n]*\b4\b/i, 'the report must name the segment AND its exact unmeasured-run count, not just contain the word "unmeasured" somewhere')
+  // any real count) to the EXACT Filtering-line phrasing, distinct from
+  // the totals line's own "unmeasured n=N" wording (proven separately
+  // below) -- proven itself vacuous by mutation once: an earlier draft of
+  // this assertion (`/agent_compute[^\n]*\b4\b/i`) still passed with the
+  // Filtering-line detail computation completely blanked out, because the
+  // totals line ALSO satisfied it. This exact phrase can only come from
+  // the Filtering line.
+  assert.match(result.report, /agent_compute \(4 unmeasured runs\)/, 'the Filtering line must name the segment AND its exact unmeasured-run count in its own distinct phrasing')
+})
+
+// Round-2 L2, self-caught vacuous-mutant fix: the assertion above can pass
+// purely from the FILTERING line's drop-reason detail even if the wall-
+// clock TOTALS line itself never renders any count at all (proven by
+// mutation: removing just the totals-line counts left the test above
+// green). This fixture triggers NO M4 drop at all (the drafted proposal's
+// target does not name a wall-clock segment), so the Filtering line can
+// contain no such detail -- the ONLY place ci_wait's unmeasured count can
+// come from is the totals line itself.
+test('optimise-cycle: the wall-clock TOTALS line itself names a segment\'s exact unmeasured-run count, independent of whether any proposal drop also mentions it (round-2 L2, closes a self-caught vacuous-test gap)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 50, ciWaitMeasuredRuns: 2, ciWaitUnmeasuredRuns: 7, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 0, agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    // No proposal targets ci_wait, so M4's gate never fires and the
+    // Filtering line carries no unmeasured-segment detail at all.
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.report.includes('Dropped (motivating wall-clock segment has unmeasured runs -- '), false, 'sanity: no drop-reason detail should exist in this fixture')
+  assert.match(result.report, /ci_wait[^\n]*unmeasured n=7/i, 'the totals line itself must name ci_wait\'s exact unmeasured-run count')
 })
 
 test('optimise-cycle: a proposal whose target.segment is fully measured (0 unmeasured runs) survives (M4 does not over-block)', async () => {
