@@ -404,10 +404,36 @@ test('optimise-cycle: all four gh failure modes are surfaced in the report witho
     { repo: 'third', mode: 'rate_limited', command: 'gh run list', error: 'API rate limit exceeded' },
     { repo: 'fourth', mode: 'no_history', command: 'gh run list', error: '' },
   ]
-  const responses = baseResponses({ 'lane:ci': ciFixture({ byJob: {}, citationPool: [], failures }) })
+  // Round-2 L1: also script one CI-cited proposal so this fixture can prove
+  // AC-QA-19's own "emits no proposal derived from gh" sub-clause, which
+  // the original fixture (empty byJob, no proposal at all) never actually
+  // exercised -- it was mechanically enforced by AC-QA-20's citation filter
+  // and independently proven there, but THIS test's title claimed more
+  // than its assertions checked.
+  const responses = baseResponses({
+    'lane:ci': ciFixture({ byJob: {}, citationPool: [], failures }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_demote', job: 'flaky' }, citations: ['nonexistent-gh-id'], reinstatement_evidence: 'n/a' })] },
+  })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.report_written, true, 'a run must complete and still write a report despite every gh failure mode')
   for (const f of failures) assert.ok(result.report.includes(f.mode), `report must mention gh failure mode "${f.mode}"`)
+  assert.equal(result.proposals_ranked.length, 0, 'no proposal whose only citation is a gh id may survive when gh itself failed for every repo')
+})
+
+// ---- Review round-2 L4 (spec bug, no AC): a ledger-lane CRASH must be distinguishable from an empty-but-read ledger ----
+
+test('optimise-cycle: when the ledger lane fails entirely (e.g. optimise-read.mjs not yet resolvable before rollout), the report names this distinctly from "insufficient data" -- a crash is not the same state as a genuinely empty ledger (round-2 L4)', async () => {
+  const responses = baseResponses()
+  delete responses['lane:ledger'] // undefined response: the lane agent failed/was stopped, same as fake-runtime's convention elsewhere
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.match(result.report, /ledger analysis unavailable|ledger lane (failed|unavailable)/i, 'the report must name a lane FAILURE distinctly, not just print "0 records" as if the ledger were genuinely empty')
+  assert.equal(result.ledger_sufficient, false)
+})
+
+test('optimise-cycle: a genuinely empty (successfully read, zero-record) ledger does NOT trigger the lane-failure wording -- the two states must stay distinguishable in both directions', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ n: 0, perRepo: [{ root: '/repo', uninstrumented: false, recordCount: 0, skippedCount: 0, schemaVersionsSeen: {}, truncatedFinalLine: false }], citationPool: [] }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.ok(!/ledger analysis unavailable|ledger lane (failed|unavailable)/i.test(result.report), 'a genuinely empty ledger must not be misreported as a lane failure')
 })
 
 // ---- AC-SIMP-10: below-minimum-n proposals are labelled and excluded from ranking, not hidden ----
@@ -435,7 +461,13 @@ test('optimise-cycle: a proposal whose target.segment is agent_compute is droppe
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 0)
-  assert.match(result.report, /agentComputeUnmeasuredRuns|unmeasured runs/i)
+  // Round-2 L2: tightened from a bare substring match on the phrase
+  // "unmeasured runs" (which the report never actually contained -- the
+  // original assertion passed incidentally on the word "unmeasured"
+  // appearing in the totals line's "unmeasured (null)" rendering, not on
+  // any real count) to requiring BOTH the segment name and its exact
+  // affected-run count (4, from this fixture) to appear together.
+  assert.match(result.report, /agent_compute[^\n]*\b4\b/i, 'the report must name the segment AND its exact unmeasured-run count, not just contain the word "unmeasured" somewhere')
 })
 
 test('optimise-cycle: a proposal whose target.segment is fully measured (0 unmeasured runs) survives (M4 does not over-block)', async () => {
@@ -520,6 +552,28 @@ test('optimise-cycle: if the report:write step fails, the run still completes an
   const responses = baseResponses({ 'report:write': { written: false, path: '.claude/optimise-cycle-report.md', error: 'disk full' } })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.report_written, false)
+})
+
+// ---- Review round-2 L3 (spec bug, no AC): the report-write refusal reason must not be swallowed ----
+
+test('optimise-cycle: when report:write fails, its error reason reaches the return (report_write_error) and is logged visibly in the same turn -- matching PR1\'s AC-QA-7 ledger-write-failure discipline (round-2 L3)', async () => {
+  const responses = baseResponses({ 'report:write': { written: false, path: '.claude/optimise-cycle-report.md', error: 'the report path is not gitignored: a tracked .gitignore re-includes it with a negation pattern' } })
+  const { result, logs } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.report_write_error, 'the report path is not gitignored: a tracked .gitignore re-includes it with a negation pattern')
+  assert.ok(logs.some((l) => l.includes('negation pattern')), 'the failure reason must be logged visibly in the same turn, never swallowed')
+})
+
+test('optimise-cycle: report_write_error is null (not merely falsy/absent) when the write succeeds', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  assert.equal(result.report_write_error, null)
+})
+
+test('optimise-cycle: report_write_error names the failure even when the report:write agent call itself returns nothing (a stopped/undefined response, not just a written:false result)', async () => {
+  const responses = baseResponses()
+  delete responses['report:write'] // undefined response, same as a stopped agent
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.report_written, false)
+  assert.match(result.report_write_error, /failed|no result/i)
 })
 
 // ---- Review round-1 M1 (AC-SEC-9): the report must be gitignored before writing, mirroring ledger-append.mjs ----

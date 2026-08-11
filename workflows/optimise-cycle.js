@@ -497,6 +497,7 @@ const reportMarkdown = buildReport({
   unresolved: scope.unresolved,
   ledgerN, minRecords: MIN_RECORDS_FOR_PROPOSALS, ledgerSufficient,
   windowTruncated: ledgerAgg ? ledgerAgg.windowTruncated : null,
+  ledgerLaneFailed: !ledgerAgg,
   skipped: ledgerAgg ? ledgerAgg.skipped : [],
   perRepo: ledgerAgg ? ledgerAgg.perRepo : [],
   repoLabels,
@@ -512,6 +513,10 @@ const reportMarkdown = buildReport({
   droppedNoReinstatementCount: droppedNoReinstatement.length,
   droppedNoCitationCount: droppedNoCitation.length,
   droppedUnmeasuredSegmentCount: droppedUnmeasuredSegment.length,
+  // Round-2 L2: which segment(s) caused a drop, and their exact
+  // unmeasured-run count, so the Filtering line names both rather than
+  // just a bare drop count.
+  droppedUnmeasuredSegmentDetails: droppedUnmeasuredSegment.map((p) => ({ segment: p.target.segment, unmeasuredRuns: segmentUnmeasuredRuns(p.target.segment) })),
   droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
   ranked,
   insufficientDataProposals,
@@ -541,6 +546,15 @@ const reportWrite = await agent(
     schema: { type: 'object', required: ['written', 'path', 'error'], properties: { written: { type: 'boolean' }, path: { type: 'string' }, error: { type: ['string', 'null'] } } },
   }
 )
+// Round-2 L3 (spec bug, no AC): the report:write agent already returns a
+// reason on failure, but the workflow used to keep only the boolean and
+// silently drop it -- the exact swallowed-failure shape PR1's AC-QA-7
+// exists to forbid for the ledger write. Surfaced in the return AND
+// logged visibly in the same turn, never only one or the other.
+let reportWriteError = null
+if (!reportWrite) reportWriteError = 'report:write agent failed or returned no result'
+else if (!reportWrite.written) reportWriteError = reportWrite.error || 'report:write reported written:false with no reason given'
+if (reportWriteError) log(`Report write failed: ${reportWriteError}`)
 
 return {
   resolved: scope.resolved,
@@ -554,6 +568,7 @@ return {
   per_repo: ledgerAgg ? ledgerAgg.perRepo : [],
   report_path: REPORT_RELATIVE_PATH,
   report_written: !!(reportWrite && reportWrite.written),
+  report_write_error: reportWriteError,
   proposals_ranked: ranked,
   proposals_insufficient_data: insufficientDataProposals,
   report: reportMarkdown,
@@ -583,6 +598,17 @@ function buildReport(d) {
   // of a quiet week but because the ledger was never written there at all,
   // and that difference must never disappear into a summed count.
   lines.push('## Sample completeness')
+  // Round-2 L4 (spec bug, no AC): a ledger-lane CRASH (the agent step
+  // itself failed, e.g. optimise-read.mjs not yet resolvable before the
+  // T3 global-mirror rollout) previously degraded through the exact same
+  // `ledgerAgg ? ... : 0/[]` defaults as a genuinely empty, successfully-
+  // read ledger -- both rendered as "0 records ... insufficient data",
+  // indistinguishable to the operator. AC-OPS-11 already separates
+  // uninstrumented from no-activity for a per-repo read; a lane crash is a
+  // THIRD state, distinct from both, and must say so.
+  if (d.ledgerLaneFailed) {
+    lines.push('**Ledger analysis unavailable**: the ledger lane failed to run (e.g. optimise-read.mjs may not be resolvable yet -- see the rollout\'s global-mirror step). This is NOT the same as an empty ledger: a fixed install may already show real data.')
+  }
   lines.push(`Ledger records in window: ${d.ledgerN} (minimum for harness-side proposals: ${d.minRecords}).`)
   if (!d.ledgerSufficient) lines.push(`**Insufficient data**: harness-side (rework/wall-clock/trigger) proposals are suppressed until the ledger holds at least ${d.minRecords} records.`)
   if (d.windowTruncated) lines.push('Ledger window was truncated to the most recent records; older history was not read (AC-ARCH-14 bound).')
@@ -614,7 +640,15 @@ function buildReport(d) {
       )
     }
     const t = d.wallClock.totals || {}
-    lines.push(`Totals: ci_wait=${fmtSeconds(t.ciWaitSeconds)}, human_wait=${fmtSeconds(t.humanWaitSeconds)}, agent_compute=${fmtSeconds(t.agentComputeSeconds)}.`)
+    // Round-2 L2: the per-segment measured/unmeasured RUN COUNTS now
+    // render here, not just whether the total is null -- an operator
+    // reading the persisted report (not the raw JSON return) previously
+    // had no way to see how many runs were unmeasured for a segment.
+    lines.push(
+      `Totals: ci_wait=${fmtSeconds(t.ciWaitSeconds)} (measured n=${t.ciWaitMeasuredRuns ?? 0}, unmeasured n=${t.ciWaitUnmeasuredRuns ?? 0}), ` +
+      `human_wait=${fmtSeconds(t.humanWaitSeconds)} (measured n=${t.humanWaitMeasuredRuns ?? 0}, unmeasured n=${t.humanWaitUnmeasuredRuns ?? 0}), ` +
+      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}).`
+    )
     if (t.unterminatedWaits) lines.push(`unterminated_waits: ${t.unterminatedWaits}`)
     if (d.wallClock.source) lines.push(`Sources: ci_wait=${d.wallClock.source.ci_wait}, human_wait=${d.wallClock.source.human_wait}, agent_compute=${d.wallClock.source.agent_compute}.`)
   } else {
@@ -698,11 +732,19 @@ function buildReport(d) {
   for (const p of d.insufficientDataProposals) lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
   lines.push('')
   lines.push('## Filtering')
+  // Round-2 L2: name the specific segment(s) and their exact unmeasured-run
+  // count that caused a drop, not just a bare count of dropped proposals --
+  // an operator reading this line could not previously tell WHICH segment
+  // blocked a proposal, or how badly unmeasured it was, without parsing
+  // the raw JSON return.
+  const unmeasuredSegmentBySegment = {}
+  for (const entry of d.droppedUnmeasuredSegmentDetails || []) unmeasuredSegmentBySegment[entry.segment] = entry.unmeasuredRuns
+  const unmeasuredSegmentDetail = Object.entries(unmeasuredSegmentBySegment).map(([seg, n]) => `${seg} (${n} unmeasured runs)`).join(', ')
   lines.push(
     `Drafted: ${d.draftedCount}. Dropped (no resolvable citation): ${d.droppedNoCitationCount}. ` +
     `Dropped (always-on security lens removal, never permitted): ${d.droppedAlwaysOnSecurityCount}. ` +
     `Dropped (removal without reinstatement evidence): ${d.droppedNoReinstatementCount}. ` +
-    `Dropped (motivating wall-clock segment has unmeasured runs): ${d.droppedUnmeasuredSegmentCount || 0}. ` +
+    `Dropped (motivating wall-clock segment has unmeasured runs${unmeasuredSegmentDetail ? ` -- ${unmeasuredSegmentDetail}` : ''}): ${d.droppedUnmeasuredSegmentCount || 0}. ` +
     `Dropped (cited CI job is insufficient-data/truncated/rename-suspect): ${d.droppedWeakCiEvidenceCount || 0}.`
   )
   return lines.join('\n')
