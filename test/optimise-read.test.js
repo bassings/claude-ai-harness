@@ -675,6 +675,77 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <root>` reads a real led
   assert.equal(statBefore.mtimeMs, statAfter.mtimeMs, 'the ledger mtime must be unchanged (no write touched it)')
 })
 
+// ---- Review round-3 F5 (AC-QA-17, the untested PRIMARY production path): the two-repo ledger CLI invocation ----
+//
+// Every prior CLI test used exactly one root; the two-repo path is exactly
+// what T4 runs against the real delivery repos, and it was never exercised
+// with two REAL reads (only via a fixture, in the workflow-level tests).
+// Untested specifically: cross-root record concatenation, the perRepo
+// array from two real reads, and windowRecords' behaviour once the
+// COMBINED total exceeds a small --window -- the first-listed repo's
+// records sit at the HEAD of the concatenated array, so a window keeping
+// only the TAIL drops them first regardless of true recency, while
+// perRepo's own recordCount (computed BEFORE windowing, per-repo) can
+// still show the repo's full count. This test proves that mismatch is
+// VISIBLE in the existing output (n, windowTruncated, windowDroppedCount,
+// perRepo), not merely a silent internal detail.
+
+test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combines two REAL repos\' ledgers -- correct combined n, both perRepo entries with their own full counts, and the window-starvation mismatch (repoA listed first loses ALL its records to a small --window) is visible via windowTruncated/windowDroppedCount/perRepo, not silent (round-3 F5)', () => {
+  const repoA = makeTempRepo()
+  const repoB = makeTempRepo()
+  for (let i = 0; i < 3; i++) runAppend(repoA, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  for (let i = 0; i < 5; i++) runAppend(repoB, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repoA, repoB, '--window=4'], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+
+  // Combined n is windowed (8 total records, window=4), not the raw sum.
+  assert.equal(out.n, 4, 'the windowed combined n must be exactly the --window value, not the raw 8-record total')
+  assert.equal(out.windowTruncated, true)
+  assert.equal(out.windowDroppedCount, 4, '8 combined records minus the 4-record window')
+
+  // Both real repos must have their own perRepo entry with their OWN full
+  // (pre-window) record count -- never merged, never dropped from perRepo
+  // just because the window truncated the combined aggregate.
+  assert.equal(out.perRepo.length, 2)
+  const entryA = out.perRepo.find((e) => e.root === repoA)
+  const entryB = out.perRepo.find((e) => e.root === repoB)
+  assert.ok(entryA && entryB, 'both repos must have their own perRepo entry')
+  assert.equal(entryA.recordCount, 3, "repoA's own full record count, computed before windowing")
+  assert.equal(entryB.recordCount, 5, "repoB's own full record count, computed before windowing")
+
+  // THE STARVATION, made visible: repoA is listed FIRST, so its 3 records
+  // sit at the head of the concatenated [A,A,A,B,B,B,B,B] array; a window
+  // keeping the last 4 keeps ONLY repoB's records (B2..B5) and drops every
+  // one of repoA's, even though repoA's own perRepo entry still reports
+  // recordCount:3. The sum of perRepo counts (8) diverging from the
+  // windowed n (4) IS the visible reconciliation signal -- a caller
+  // comparing them can detect exactly this starvation without any
+  // additional field.
+  const perRepoSum = out.perRepo.reduce((acc, e) => acc + e.recordCount, 0)
+  assert.equal(perRepoSum, 8)
+  assert.notEqual(perRepoSum, out.n, 'perRepo\'s summed full counts must diverge from the windowed n whenever starvation occurred -- this divergence is the detectable signal')
+  assert.equal(out.citationPool.length, 4, 'the citation pool must be drawn from the WINDOWED set only (4), never the raw 8')
+})
+
+test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combines two real repos\' ledgers correctly when the window is large enough that NO starvation occurs (sanity: the mismatch above is a real window effect, not a bug in every multi-repo run)', () => {
+  const repoA = makeTempRepo()
+  const repoB = makeTempRepo()
+  runAppend(repoA, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  runAppend(repoA, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  runAppend(repoB, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repoA, repoB], { encoding: 'utf8' }) // default window (2000), no starvation
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.n, 3)
+  assert.equal(out.windowTruncated, false)
+  assert.equal(out.windowDroppedCount, 0)
+  const perRepoSum = out.perRepo.reduce((acc, e) => acc + e.recordCount, 0)
+  assert.equal(perRepoSum, out.n, 'with no window truncation, perRepo\'s summed counts must equal n exactly -- no starvation, no divergence')
+})
+
 test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal targets from stdin and returns a stable id per target, in order', () => {
   const payload = { targets: [{ category: 'ci_demote', job_name: 'lint' }, { category: 'ci_demote', job_name: 'test' }] }
   const res = spawnSync('node', [MODULE_PATH, 'ids'], { input: JSON.stringify(payload), encoding: 'utf8' })
