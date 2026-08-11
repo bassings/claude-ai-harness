@@ -11,12 +11,14 @@ before moving to the next mutation, following PR1's own recorded near-miss:
 working tree was kept clean (mutation, test, revert, confirm clean) between
 each proof rather than stacking uncommitted mutations.
 
-Sixteen proofs were executed. Fourteen caught the mutation on the first
-fixture; one (proof 7, `citationPool`'s dedup check) **survived** its
-original fixture -- a genuine vacuous-mutant find, investigated and fixed
-before being trusted, recorded in full below rather than quietly patched.
-The full suite was `node --test test/*.test.js`, 257/257 as of the last
-commit in this worktree, re-run clean after every proof.
+Eighteen proofs were executed in the initial build. Sixteen caught the
+mutation on the first fixture; one (proof 7, `citationPool`'s dedup check)
+**survived** its original fixture -- a genuine vacuous-mutant find,
+investigated and fixed before being trusted, recorded in full below rather
+than quietly patched. A further thirteen proofs were executed after review
+round-1 (see "Review round-1 fixes" below), covering each of the eight
+findings. The full suite was `node --test test/*.test.js`, 292/292 as of
+the last commit in this worktree, re-run clean after every proof.
 
 ## 1. `parseLedgerContent` skips a line missing a required envelope field — `workflows/lib/optimise-read.mjs`
 
@@ -394,6 +396,128 @@ with `JSON.stringify({})` (the target argument ignored entirely).
 
 **Reverted**: `git checkout --`; confirmed clean; 27/27 green.
 
+## Review round-1 fixes (proofs 19-31)
+
+A full multi-lens review (1 High, 6 Medium, 1 Low; 7 failing ACs, 8
+findings) found that five of the eight failures traced to the wall-clock
+decomposition -- the spec's headline deliverable. Every finding below was
+fixed, not rejected; every mutation was applied to the working file,
+confirmed with `git diff`/`git diff --stat`, and reverted with
+`git checkout --`, confirmed clean via `git status --porcelain` before the
+next mutation. Full detail and reasoning is in the fix commit's own
+message (`f246420`); this section is the proof ledger's continuation.
+
+**19-20. H1 -- `buildReport` renders nothing, and the return omits the
+aggregates, two separate mutations.** (a) `wall_clock:
+ledgerAgg ? ledgerAgg.wallClock : null` in the return statement replaced
+with a comment (field dropped entirely). The H1 fixture test failed with
+`AssertionError: return must include wall_clock` (`actual: undefined`).
+(b) The wall-clock section's `if (d.wallClock)` guard changed to
+`if (false && d.wallClock)`, so the section header printed but its body
+never did. The same test failed with `AssertionError: report must include
+"unterminated"`. Both reverted; `optimise-cycle.test.js` back to 34/34
+(H1's own test exercises seven separate needles across four rendered
+sections plus two return-shape assertions in one fixture, so either
+mutation alone was sufficient to fail it -- confirming the test is not
+narrowly coupled to one specific line).
+
+**21. M1 -- the check-ignore verification in `optimise-report-ignore.mjs`.**
+The `execFileSync('git', ['check-ignore', ...])` call and its `catch`
+branch deleted outright, so `ensureIgnored` always reported `ignored:true`
+regardless of whether the path was actually ignored. Caught by exactly the
+negation-pattern test (`optimise-report-ignore.test.js`): `AssertionError:
+a negation pattern in a tracked .gitignore must be detected, not silently
+reported as success: true !== false`. The other four tests in the file
+stayed green (they never construct a negation-pattern fixture), confirming
+this is the one guard that specific mutation removes. Reverted; 5/5 green.
+
+**22-23. M2 -- the widened verb regex and the structured-target keying,
+proven as two INDEPENDENT layers.** (a) `REMOVAL_VERBS_RE` reverted to the
+pre-fix narrow list (no move/retire/etc). Caught 2 of 5 M2 tests --
+specifically the two whose target carries no `lens` field (the
+"Move the gitleaks scan..." and "Retire the never-failing gitleaks
+job..." CI-job cases) -- while the three lens-targeted tests stayed green,
+because `isAlwaysOnSecurityRemoval`'s structured `target.lens` check
+(unaffected by this mutation) caught those independently. This is the
+intended defence-in-depth shape, not a partial proof: it demonstrates the
+two layers are genuinely independent, not that one is redundant. (b) The
+structured `target.lens` check itself (`if (target && SECURITY_LENS_NAMES
+.includes(target.lens)) return true`) disabled via `if (false && ...)`.
+Caught exactly 1 test -- the one deliberately written with NO removal verb
+anywhere in the statement (`"lens-security should not run on every
+review"`) -- while the two "Move"/"Retire" tests stayed green, because
+their STATEMENT text also happens to satisfy the widened verb-regex
+fallback path. Both reverted; `optimise-cycle.test.js` back to 34/34.
+
+**24. M3 -- the null-timestamp guard in `aggregateWallClock`'s wait-pairing
+loop.** `if (startMs === null || endMs === null) { ... }` disabled via
+`if (false && (...))`. Caught the STARTED-side test only (`ciWaitN`
+became 1 instead of 0, reproducing the review's exact "~56-year garbage
+duration" scenario: `null` coerces to `0` in `endMs - startMs`, i.e. epoch
+1970, so the resulting duration is enormous and positive, evading the
+pre-existing negative-duration check entirely). The ENDED-side test
+stayed green, because a null `endMs` makes the subtraction NEGATIVE
+(`0 - startMs`), which the pre-existing negative-duration guard already
+catches -- confirming the null-guard is uniquely load-bearing specifically
+for the STARTED-null case, the exact asymmetry the review's evidence
+described. Reverted; `optimise-read.test.js` back to 43/43.
+
+**25. M4 -- the unmeasured-segment mechanical gate in `optimise-cycle.js`.**
+`isUnmeasuredSegmentMotivated`'s body replaced with `return false`. Caught
+exactly the dedicated M4 test (`AssertionError: 1 !== 0` -- the
+agent-compute-motivated proposal, whose segment has 4 unmeasured runs,
+shipped anyway); the "does not over-block" sibling test stayed green.
+Reverted; 34/34.
+
+**26. M5 -- `planBucketKey` dropping the repo component.** ``return
+`${repo}|${plan}` `` replaced with `return plan`. Caught the dedicated M5
+test (`AssertionError: 1 !== 2` -- two repos' distinct 60s/600s ci_waits
+merged into one bucket) AND five other wall-clock tests that assert
+against the `demo|specs/a.md` composite key specifically -- expected,
+pervasive collateral (this function computes the map key for literally
+every wall-clock bucket in every test), not a vacuous result: it confirms
+the composite key is exercised everywhere, not just in the one fixture
+built to probe it. Reverted; `optimise-read.test.js` back to 43/43.
+
+**27-28. M6 -- the truncated-nulls-the-claim rule and the renameSuspect
+flag, separately.** (a) `neverFailed: truncated ? null : rawNeverFailed`
+reverted to `neverFailed: rawNeverFailed` (dropping the truncated check).
+Caught exactly the PROBE2 fixture test (100/100 successful runs at the
+fetch limit wrongly claimed `neverFailed:true`). (b) `if
+(entry.renameSuspect) entry.neverFailed = null` replaced with a comment.
+Caught exactly the PROBE3 fixture test (the renamed job's clean-looking
+own history wrongly claimed `neverFailed:true`). Both reverted;
+`optimise-read.test.js` back to 43/43 after each.
+
+**29. M6 -- the workflow-level weak-CI-evidence gate.**
+`isWeakCiEvidenceRemoval`'s body replaced with `return false`. Caught
+exactly the dedicated M6 workflow test (a removal proposal citing a
+`truncated:true` CI job shipped instead of being dropped); the
+"does not over-block" sibling test (a solid, non-truncated never-failed
+claim) stayed green. Reverted; `optimise-cycle.test.js` back to 34/34.
+
+**30. M7 -- `revertedTwiceOrMore`'s threshold in `aggregateProposalOutcomes`.**
+`bucket.reverted.length >= 2` replaced with the constant `false`. Caught
+exactly the dedicated aggregator test (`AssertionError`: the two-revert
+fixture's flag came back `false` instead of `true`); the adjacent
+last-rejection-timestamp assertion in the same test file was unaffected,
+confirming the mutation is scoped to the one field it changed. Reverted;
+`optimise-read.test.js` back to 43/43.
+
+**31. M7 -- the workflow-level annotation step, `annotateProposalOutcome`.**
+Body replaced with `return p` (a no-op pass-through). Caught exactly the
+two dedicated M7 workflow tests (the prior-rejection annotation and the
+reverted-twice flag both silently disappeared); the "no recorded outcome
+events -> stays clean" sibling test was unaffected (it asserts absence,
+which a no-op trivially still satisfies -- confirming that test alone
+would NOT have caught this mutation, which is why the other two exist).
+Reverted; `optimise-cycle.test.js` back to 34/34.
+
+Every mutation above was confirmed applied via `git diff`/`git diff --stat`
+before running tests, confirmed reverted via `git status --porcelain`
+returning nothing before the next mutation, and the full suite re-run
+clean after the batch -- 292/292 as of the last commit in this round.
+
 ## Guards NOT proven by an executed mutation, stated plainly rather than implied
 
 - **AC-SEC-9's overall "never mutates" claim** was proven by REAL EXECUTION
@@ -427,11 +551,22 @@ with `JSON.stringify({})` (the target argument ignored entirely).
   to already-proven code in the same function). Listed here rather than
   silently omitted, per the standard's own instruction to say plainly what
   was not verified.
-- **The report markdown's exact rendering** (`buildReport`'s string
-  assembly) is exercised indirectly by tests asserting specific substrings
-  appear (gh failure modes, the flagged-category marker, cadence wording in
-  the skill) but was not mutation-tested as a unit in its own right — it is
-  pure string formatting with no guard-shaped behaviour to invert.
+- **The report markdown's rendering** was mutation-tested for its wall-clock
+  section (proofs 19-20, since round-1's H1 finding was precisely that this
+  section existed but never rendered) and is exercised indirectly elsewhere
+  by tests asserting specific substrings appear (gh failure modes, the
+  flagged-category marker, cadence wording in the skill), but the Rework /
+  Never-failing-AC / Trigger-accuracy sections' own rendering was not
+  separately mutation-broken — they are pure string formatting with no
+  guard-shaped behaviour to invert beyond "is this section present at all",
+  which H1's own fix already had to prove for the wall-clock case.
+- **`workflows/lib/optimise-report-ignore.mjs`'s existence as a narrowly-
+  scoped, deliberate exception to `optimise-read.mjs`'s absolute read-only
+  guarantee** is a design decision stated in that file's own header comment
+  and in this PR's final report, not itself a "guard" with a proof of its
+  own beyond proofs 21 (its check-ignore verification, mutation-tested) and
+  its five real-git integration tests (`optimise-report-ignore.test.js`,
+  the same real-repo style AC-SEC-1 uses for the ledger).
 - **The real, end-to-end `/optimise-cycle` invocation through an actual
   Claude Code agent runtime** was not performed in this session: this
   worktree has no access to the live dynamic-workflow runtime, only
