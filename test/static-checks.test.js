@@ -117,6 +117,12 @@ test('static: the ledger envelope field list appears in exactly one file (AC-ARC
   assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/ledger-append.mjs'])
 })
 
+test('static: plan-identity canonicalisation (canonicalPlanKey) has exactly one definition site (AC-ARCH-1), mirroring the LEDGER_ENTRY_SCHEMA single-definition-site test above -- only workflows/lib/ledger-append.mjs defines it; every other caller (workflows/lib/optimise-read.mjs) imports it rather than re-declaring a second normalisation implementation of its own.', () => {
+  const all = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'skills'))]
+  const definitionSites = all.filter((f) => /\bfunction\s+canonicalPlanKey\s*\(/.test(fs.readFileSync(f, 'utf8')))
+  assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/ledger-append.mjs'])
+})
+
 test('static: ledger-append.mjs is INVOKED by at least two workflows (AC-SIMP-12, arbitrated: "imported by >=2 files" becomes "invoked by >=2 workflows" for a script workflow scripts can only run via Bash, never import)', () => {
   const invokers = ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js'].filter((f) =>
     readAll(f).includes('ledger-append.mjs')
@@ -176,6 +182,14 @@ test('static: README.md\'s Retention note states that git clean -xdf deletes the
   assert.ok(/-e |exclude|move it outside/i.test(nearby), 'must state how to keep the ledger through a git clean -xdf')
   assert.ok(/arbitration/i.test(readme), 'README.md must record the AC-DATA-4/AC-SEC-1 conflict as an explicit arbitration, not just in a test comment')
   assert.ok(/AC-DATA-4/.test(readme) && /AC-SEC-1/.test(readme), 'the arbitration must name both conflicting ACs')
+})
+
+test('static: README.md names the step that refreshes the installed ~/.claude/workflows/lib mirror after a workflows/lib change, and gives an exact command that confirms the installed copy matches the repo (AC-OPS-4)', () => {
+  const readme = readAll('README.md')
+  assert.ok(/AC-OPS-4/.test(readme), 'README.md must record this under its AC-OPS-4 heading')
+  assert.ok(/cp -r claude-ai-harness\/workflows\/lib\/\. ~\/\.claude\/workflows\/lib\//.test(readme), 'README.md must give the exact re-sync command for workflows/lib specifically')
+  assert.ok(/diff -rq claude-ai-harness\/workflows\/lib ~\/\.claude\/workflows\/lib/.test(readme), 'README.md must give an exact command that confirms the installed copy matches the repo')
+  assert.ok(/schemaVersionsSeen/.test(readme), 'README.md must state that a stale mirror is also detectable from the report\'s per-repo schema_version mix')
 })
 
 test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, ledgerWritePrompt, writeLedger) is byte-identical across all three workflow files. Workflow scripts cannot import, so this trio is necessarily duplicated three times; without a guard pinning them, a fix landed in one or two copies fails silently in the third -- the same failure class as C1.', () => {

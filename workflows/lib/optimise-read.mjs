@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY } from './ledger-append.mjs'
 
 // AC-ARCH-14: the default bound on how much ledger history a single
 // aggregation pass reads -- proven against a >=2000-line synthetic ledger
@@ -130,21 +130,59 @@ function bumpDisposition(counts, lens, disposition) {
   if (disposition in counts[lens]) counts[lens][disposition] += 1
 }
 
+// HARN-OPT-2 PR1 (AC-ARCH-1, AC-ARCH-4): the ONE place every plan-keyed
+// aggregation below derives its bucket key from -- routes through the
+// single shared canonicalPlanKey (imported from ledger-append.mjs, never
+// redeclared here). Prefers a post-PR1 record's own `plan_key` (computed
+// writer-side, so it already accounts for the ACTUAL working tree the
+// record was authored from -- see ledger-append.mjs's AC-ARCH-3 worktree
+// handling, which this reader cannot reproduce after the fact); falls back
+// to re-deriving it from the retained `spec` field for a historical
+// (pre-PR1) line that has no plan_key at all (AC-ARCH-5: one code path, no
+// branch on schema_version).
+//
+// Returns null for a record with no attributable identity left at all
+// (AC-QA-7): a `degraded:true` line drops spec/plan_key entirely to fit
+// the minimal envelope, so there is nothing to canonicalise -- the caller
+// must count this separately, never fold it into the no-spec bucket.
+function planKeyForRecord(record, root = '') {
+  if (!record || record.degraded) return null
+  if (typeof record.plan_key === 'string' && record.plan_key) return record.plan_key
+  return canonicalPlanKey(record.spec, root)
+}
+
 // Rework attribution (spec item 1) + AC-verdict aggregation keyed by
 // (repo, spec, ac_id) -- AC-DATA-7: never by AC id alone, so the same AC id
 // in two different specs (or the same spec name reused across two repos)
-// reports as two distinct criteria, not one merged one.
-export function aggregateRework(records) {
+// reports as two distinct criteria, not one merged one. HARN-OPT-2 PR1: the
+// key's `spec` segment (and the entry's reported `spec` field) is now the
+// CANONICAL plan key, not the raw ledger value, so an absolute and a
+// relative form of the same plan collapse into one entry (AC-ARCH-4) and a
+// path that cannot be attributed to any single spec (out-of-repo, or the
+// pre-existing redaction placeholder) is excluded entirely and counted
+// under the returned `unattributableCount` instead of a plan-shaped bucket
+// (AC-DATA-7, AC-OPS-5) -- `root`, optional, is the caller's already-
+// resolved analysis root, used only for lexically relativising an absolute
+// historical `spec` value; it is never touched by any fs call here.
+export function aggregateRework(records, { root = '' } = {}) {
   const reviewRecords = records.filter((r) => r.kind === 'review_cycle')
   const lensDispositionCounts = {}
   const acVerdicts = new Map()
+  let unattributableCount = 0
   for (const r of reviewRecords) {
     for (const f of r.findings || []) {
       bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
     }
-    for (const v of r.ac_verdicts || []) {
-      const key = `${r.repo}|${r.spec}|${v.ac_id}`
-      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: r.spec, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
+    const verdicts = r.ac_verdicts || []
+    if (!verdicts.length) continue
+    const planKey = planKeyForRecord(r, root)
+    if (planKey === null || planKey === REDACTED_PATH_MARKER) {
+      unattributableCount += verdicts.length
+      continue
+    }
+    for (const v of verdicts) {
+      const key = `${r.repo}|${planKey}|${v.ac_id}`
+      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
       const entry = acVerdicts.get(key)
       entry.n += 1
       if (v.verdict === 'PASS') entry.pass += 1
@@ -152,7 +190,7 @@ export function aggregateRework(records) {
       else if (v.verdict === 'UNVERIFIABLE') entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -249,7 +287,11 @@ function ensurePlan(byPlan, key, repo, plan) {
 // tracked per segment so totals can report null (unmeasured) rather than a
 // misleadingly measured-looking 0 when a segment has zero measured runs but
 // at least one unmeasured attempt.
-export function aggregateWallClock(records) {
+// HARN-OPT-2 PR1 (AC-ARCH-4): `root`, optional, is the caller's already-
+// resolved analysis root, used only to lexically relativise an absolute
+// historical spec/event_key plan segment via the shared canonicalPlanKey --
+// never touched by any fs call here.
+export function aggregateWallClock(records, { root = '' } = {}) {
   const byPlan = new Map()
 
   // ---- ci_wait / human_wait, from conduct_plan_event pairs ----
@@ -268,8 +310,13 @@ export function aggregateWallClock(records) {
     const nullOccByBucket = new Map() // bucketKey -> {starts: [...], ends: [...]}
     for (const r of records) {
       if (r.kind !== 'conduct_plan_event') continue
-      const plan = planKeyFromEventKey(r.event_key)
-      if (!plan) continue
+      const rawPlan = planKeyFromEventKey(r.event_key)
+      if (!rawPlan) continue
+      // AC-ARCH-4: the ci_wait/human_wait bucket key routes through the
+      // SAME shared canonicalisation as agent_compute and aggregateRework,
+      // so an absolute and a relative form of the same plan file's
+      // event_key segment collapse into one bucket here too.
+      const plan = canonicalPlanKey(rawPlan, root)
       const repo = r.repo || 'unknown'
       const bucketKey = planBucketKey(repo, plan)
       const ms = tsMs(r.ts)
@@ -348,10 +395,36 @@ export function aggregateWallClock(records) {
     if (!byRunId.has(r.run_id)) byRunId.set(r.run_id, [])
     byRunId.get(r.run_id).push(r)
   }
+  // HARN-OPT-2 PR1 (AC-ARCH-4, AC-DATA-7, AC-OPS-5, AC-QA-7): plan identity
+  // for the pair routes through the single shared planKeyForRecord helper,
+  // preferring whichever record in the pair carries a real identity. Three
+  // outcomes, counted and named distinctly, never conflated:
+  //   - every record in the pair is degraded (no spec/plan_key survives at
+  //     all): counted under degradedUnattributedRuns, never folded into
+  //     the no-spec bucket (AC-QA-7);
+  //   - the canonical key is the out-of-repo/redaction marker: counted
+  //     under unattributableRuns, never rendered as a plan-shaped bucket,
+  //     and never merged with a DIFFERENT out-of-repo plan (AC-DATA-7,
+  //     AC-OPS-5);
+  //   - otherwise, a real (possibly no-spec-sentinel) plan key: bucketed
+  //     as before.
+  let degradedUnattributedRuns = 0
+  let unattributableRuns = 0
   for (const [, pair] of byRunId.entries()) {
     const repo = pair[0]?.repo || 'unknown'
-    const spec = pair.find((p) => p.spec)?.spec || null
-    const plan = spec || 'unspecified'
+    let plan = null
+    for (const p of pair) {
+      const k = planKeyForRecord(p, root)
+      if (k !== null) { plan = k; break }
+    }
+    if (plan === null) {
+      degradedUnattributedRuns += 1
+      continue
+    }
+    if (plan === REDACTED_PATH_MARKER) {
+      unattributableRuns += 1
+      continue
+    }
     const key = planBucketKey(repo, plan)
     if (pair.length < 2) {
       // An orphan start or terminal with no partner: an attempt we know
@@ -382,6 +455,8 @@ export function aggregateWallClock(records) {
     humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0,
     agentComputeSeconds: 0, agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 0,
     unterminatedWaits: 0,
+    degradedUnattributedRuns,
+    unattributableRuns,
   }
   for (const bucket of byPlan.values()) {
     totals.ciWaitSeconds += bucket.ciWaitSeconds
@@ -662,9 +737,19 @@ function runLedgerCommand(roots, window) {
     combinedSkipped = combinedSkipped.concat(skipped)
   }
   const { windowed, truncated, droppedCount } = windowRecords(combinedRecords, window)
-  const rework = aggregateRework(windowed)
+  // HARN-OPT-2 PR1: plan-identity canonicalisation of an absolute historical
+  // spec value needs the actual analysis root as a lexical string to strip.
+  // Simplification, stated here rather than hidden: when MULTIPLE roots are
+  // analysed in one invocation, only the FIRST one is used for this -- an
+  // absolute historical spec belonging to a DIFFERENT listed root falls
+  // through to the safe out-of-repo marker (never merged, never leaked)
+  // rather than being relativised against the wrong root. The common case
+  // (one root per invocation, per AC-SEC-3's own documented usage) is
+  // unaffected.
+  const canonicalRoot = roots[0] || ''
+  const rework = aggregateRework(windowed, { root: canonicalRoot })
   const neverFailing = neverFailingAcs(rework.acVerdicts, {})
-  const wallClock = aggregateWallClock(windowed)
+  const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
   const trigger = aggregateTriggerAccuracy(windowed)
   const proposalOutcomes = aggregateProposalOutcomes(windowed)
   return {
@@ -673,7 +758,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()] },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
