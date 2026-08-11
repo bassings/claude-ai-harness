@@ -22,9 +22,13 @@ findings. A further fifteen proofs were executed after review round-2 (see
 line proofs) surfaced a SECOND genuine vacuous-mutant pair, also
 investigated and fixed before being trusted. A further nine proofs were
 executed after review round-3 (see "Review round-3 fixes" below), covering
-all six findings (all Low severity; no AC failed). The full suite was
-`node --test test/*.test.js`, 322/322 as of the last commit in this
-worktree, re-run clean after every proof.
+all six findings (all Low severity; no AC failed). A final two proofs were
+executed after review round-4 (see "Review round-4 fixes" below), covering
+the two findings fixed in code (Low-1, Low-2); the review's remaining three
+findings (Low-3, Low-4, Low-5) were recorded rather than fixed, per the
+coordinator's explicit instruction that this was the final review round.
+The full suite was `node --test test/*.test.js`, 324/324 as of the last
+commit in this worktree, re-run clean after every proof.
 
 ## 1. `parseLedgerContent` skips a line missing a required envelope field — `workflows/lib/optimise-read.mjs`
 
@@ -803,6 +807,122 @@ workflow scripts can only run via Bash, never import) holds comfortably:
 this is not a borderline case argued down to exactly two, it is four
 independent production call sites in the one file that invokes it at all.
 No code change was made or needed to confirm this.
+
+## Review round-4 fixes (proofs 56-57)
+
+A fourth multi-lens review converged: four lenses, all FINDINGS, all Low,
+zero overlap between findings (no two lenses reported the same defect), no
+AC failed. The coordinator named this the final round before merge. Five
+findings; two fixed in code (Low-1, Low-2), three recorded rather than
+fixed (Low-3, Low-4, Low-5, all explicitly deferrable per the review's own
+closing section).
+
+One near-miss during this round is worth recording plainly rather than
+glossing over: the Low-1 and Low-2 fixes were made and tested GREEN, but
+not yet committed, before the first mutation proof began. Following the
+established discipline of reverting a mutation with `git checkout --`
+without first committing the real fix reverted BOTH the mutation AND the
+uncommitted Low-1 fix itself -- exactly the near-miss this document's own
+intro paragraph already warns against (`git checkout --` reverts to the
+last COMMIT, not "a moment ago"). Caught immediately by grepping for the
+fix's own symbol (`proposalIdsComputed`) in the file after the revert and
+finding nothing; the fix was reapplied, the full suite re-confirmed green,
+and ONLY THEN committed (commit `e84b9a7`) before either mutation proof was
+attempted a second time, so the reverts below are safe (they return to a
+commit that still contains the fix). Recorded here because a mutation
+discipline that requires "commit first" is stronger advice than remembering
+it, and this is the second time in this PR's history the same trap has
+been walked into (see the intro paragraph's own note, added after PR1's
+own recorded near-miss) -- a candidate for a future harness improvement:
+`/tdd-task`-style tooling that refuses to let a mutation proof begin against
+an uncommitted change.
+
+**56. Low-1 -- the ids-step-failure suppression signal.** The
+`if (idResults.length < idTargets.length) { proposalIdsComputed = false; log(...) }`
+block in `workflows/optimise-cycle.js` removed entirely (leaving
+`proposalIdsComputed` permanently `true`, the exact pre-fix silent-failure
+shape Low-1 describes). Caught exactly the two dedicated round-4 Low-1
+tests: the fully-failed ids-step test (`true !== false`) and the
+partial-response test (fewer ids than targets; `true !== false`); the
+happy-path test (asserting `proposal_ids_computed === true`) stayed green,
+confirming the guard does not simply invert the field unconditionally.
+Reverted; `optimise-cycle.test.js` back to 59/59.
+
+**57. Low-2 -- the security-drop audit-count render assertion.**
+`const droppedAlwaysOnSecurity = proposals.filter(isAlwaysOnSecurityRemoval)`
+replaced with `const droppedAlwaysOnSecurity = []` -- reproducing the
+review's own named mutation M8 exactly. Caught exactly the dedicated
+assertion added to the existing AC-SEC-10 first-clause test (`result.report`
+no longer contained `Dropped (always-on security lens removal, never
+permitted): 1`, rendering `: 0` instead), confirming the audit count is now
+pinned and M8 no longer survives. Reverted; `optimise-cycle.test.js` back
+to 59/59.
+
+Both mutations were confirmed applied via `git diff` before running tests,
+confirmed reverted via `git status --porcelain` returning nothing after
+the `git checkout --`, and the full suite re-run clean after both --
+324/324 as of commit `e84b9a7`.
+
+### Spec bugs found at review round-4 (no AC behind them)
+
+- **Low-1 (ids-step-failure observability)** -- no AC required an ids
+  computation failure to be surfaced at all; AC-DATA-10 requires stable ids
+  to be computed but says nothing about what happens when the computation
+  step itself fails partway through a batch. A future AC should require:
+  "a failure or partial failure of the proposal-id computation step is
+  reported in both the workflow's return value and a same-turn log entry,
+  the same discipline AC-QA-7 requires for the ledger write, so that any
+  outcome-annotation lookup keyed by that id is known to have been skipped
+  rather than silently empty."
+- **Low-2 (security-drop audit-count render)** -- AC-SEC-10 requires the
+  always-on-lens removal to never ship, but does not require the COUNT of
+  how many were dropped to be accurately rendered in the persisted report.
+  A future AC should require: "every mechanical drop category the report
+  names (always-on-security, no-reinstatement, no-citation, unmeasured-
+  segment, weak-CI-evidence) renders a count that is itself covered by a
+  test asserting the rendered line, not only the resulting proposal list."
+
+### Recorded, not fixed in code (Low-3, Low-4, Low-5)
+
+Per the coordinator's explicit instruction for this final round: these
+three findings are accepted as residual limitations or backlog items
+rather than fixed now.
+
+- **Low-3 (AC-SEC-10 free-text keyword dependence)** -- `isSecurityPurposedRemoval`'s
+  free-text path still depends on `SECURITY_CHECK_KEYWORDS_RE` naming the
+  specific tool; an unrecognised, unflagged security check evades the
+  `security_removal_flagged` category (though never the unconditional
+  always-on-lens gate, which is a separate and unaffected guarantee). The
+  reviewer's own assessment: no code change warranted, since the typed
+  `target.security_purposed` field is the intended, documented mitigation
+  and the keyword list already covers the tools the delivery repos run.
+  Accepted as a residual limitation of free-text security-check detection;
+  not re-litigated here.
+- **Low-4 (AC-OPS-3 per-plan wall-clock renders unmeasurable segments as
+  `0s`)** -- display-layer only: the per-plan row in `buildReport` renders
+  `ci_wait=${b.ciWaitSeconds}s (n=${b.ciWaitN})` without the
+  `ciWaitUnmeasuredN`/`humanWaitUnmeasuredN`/`agentComputeUnmeasuredN`
+  fields already present on the bucket (`optimise-read.mjs:227-229`), so an
+  operator scanning a single plan's row cannot see that segment was
+  unmeasurable FOR THAT PLAN specifically (the totals line nulls correctly
+  and the drop-gate reads totals, so no wrong proposal ships; this is
+  containment, not computation). Backlog fix noted for a future pass:
+  append the per-plan unmeasured counts to the row (e.g.
+  `ci_wait=0s (n=0, unmeasured=2)`), or render `unmeasured` instead of
+  `0s` when `...N===0 && ...UnmeasuredN>0`, mirroring `fmtSeconds`' own
+  null handling at the per-plan level.
+- **Low-5 (AC-QA-17 incidentally-passing sub-assertion)** -- the below-min
+  record-count test at `test/optimise-cycle.test.js:213` (pre-round-4 line
+  numbering) asserts `result.report.includes(String(n))` for n=0/1/4,
+  which cannot fail regardless of whether the record count is actually
+  rendered, since the digit appears throughout the report incidentally
+  (e.g. "minimum for harness-side proposals: 5"). The test's PRIMARY
+  assertions (`ledger_sufficient=false`, ranked-proposal citations) are
+  strong and mutation-killed, so the test stays load-bearing overall; this
+  is one weak sub-assertion, not a vacuous test. Backlog tightening noted:
+  `assert.ok(result.report.includes(\`Ledger records in window: ${n}\`))`
+  (the exact line `buildReport` renders at the equivalent of
+  `optimise-cycle.js:699`, pre-round-4 line numbering).
 
 ## Guards NOT proven by an executed mutation, stated plainly rather than implied
 
