@@ -20,9 +20,11 @@ round-1 (see "Review round-1 fixes" below), covering each of the eight
 findings. A further fifteen proofs were executed after review round-2 (see
 "Review round-2 fixes" below); two of them (the L2 totals-line/Filtering-
 line proofs) surfaced a SECOND genuine vacuous-mutant pair, also
-investigated and fixed before being trusted. The full suite was
-`node --test test/*.test.js`, 307/307 as of
-the last commit in this worktree, re-run clean after every proof.
+investigated and fixed before being trusted. A further nine proofs were
+executed after review round-3 (see "Review round-3 fixes" below), covering
+all six findings (all Low severity; no AC failed). The full suite was
+`node --test test/*.test.js`, 322/322 as of the last commit in this
+worktree, re-run clean after every proof.
 
 ## 1. `parseLedgerContent` skips a line missing a required envelope field — `workflows/lib/optimise-read.mjs`
 
@@ -661,6 +663,146 @@ required these behaviours in the first place.
   AC-OPS-11's own text does not name. A future AC should require: "a
   ledger-lane agent failure is reported distinctly from n=0, both in the
   report and in a machine-readable field."
+
+## Review round-3 fixes (proofs 47-55)
+
+A final multi-lens review converged: lens-data CLEAN, every other lens Low
+only, no Critical/High/Medium, no AC failed. Six findings, all cheap and
+all on the two surfaces T4 (pointing the optimiser at the real delivery
+repos) depends on most: the security-removal gates (F1, F2) and the
+multi-repo/root-safety path (F3, F5). Every mutation below was applied to
+the working file, confirmed with `git diff`/`git diff --stat`, and reverted
+with `git checkout --`, confirmed clean via `git status --porcelain`
+before the next mutation.
+
+**47. F1 -- the `target.touches_always_on_lens` structured check.** The
+`if (target && target.touches_always_on_lens === true) return true` line
+removed. Caught exactly the dedicated structured-path test (a proposal
+with the typed field set, but a statement containing NEITHER a removal
+verb NOR any "security lens"/"lens-security" phrasing -- so it could only
+be caught via the typed field). Reverted; `optimise-cycle.test.js` back to
+57/57.
+
+**48. F1 -- the free-text phrase fallback (`SECURITY_LENS_PHRASE_RE`).**
+Replaced with a hardcoded `return false`. Caught 4 tests: the two new F1
+fallback tests ("security lens only on triggered reviews", "security
+lens"/"qa lens" phrasing), the ORIGINAL round-1 "Remove lens-security"
+test (which sets no `target.lens` at all, relying on the fallback alone),
+and the AC-SEC-8 canary (whose simulated "fooled agent" proposal also
+carries no structured `target.lens`) -- confirming the fallback is
+load-bearing across every proposal shape that omits the typed field, not
+just the two fixtures purpose-built for F1. Reverted; 57/57.
+
+**49. F2 -- the extended `SECURITY_CHECK_KEYWORDS_RE` keyword list.**
+Reverted to the pre-fix narrow list (sast/secret-scan/gitleaks/dependency-
+audit/npm audit/trivy/codeql/semgrep only). Caught exactly the two
+dedicated F2 tests (pip-audit, Dependabot). Reverted; 57/57.
+
+**50. F2 -- the `target.security_purposed` structured check inside
+`isSecurityPurposedRemoval`.** Removed. Caught exactly the dedicated
+structured-path test; the self-caught coherence-gap test (security_purposed
+with no removal verb, no reinstatement evidence) stayed green -- because
+THAT test is independently protected by `isRemovalShaped`'s own separate
+structured-field check (proof 51), confirming the two functions' checks
+are genuinely separate guards, not one silently covering for the other.
+Reverted; 57/57.
+
+**51. F2 coherence fix -- `isRemovalShaped`'s structured-field check.**
+`if (target && (target.touches_always_on_lens === true || target.security_purposed === true)) return true`
+replaced with `if (false) return true`. Caught exactly the dedicated
+coherence-gap test (a `security_purposed:true` proposal with no removal
+verb and no reinstatement evidence, which must still be dropped for
+missing evidence -- without this check it would bypass AC-PROD-7 entirely
+by evading the verb-based half of `isRemovalShaped`). Reverted; 57/57.
+
+**52. F3 -- the shell-metacharacter abort guard.** `if (unsafeRoots.length) { ... }`
+replaced with `if (false) { ... }`. Caught exactly the dedicated F3 test (a
+root containing `$(whoami)` no longer aborted the run before the ledger
+lane fired). Reverted; 57/57.
+
+**53-54. F4 -- `motivatingSegments`' free-text scan, and the `droppedUnmeasuredSegmentDetails`
+reporting it feeds.** The free-text half of `motivatingSegments` (scanning
+`statement`/`motivating_measurement` for a segment name) removed, leaving
+only the `target.segment` tag lookup -- the exact pre-fix behaviour F4
+describes. Caught exactly the two dedicated F4 tests (an untagged proposal
+mentioning "agent_compute" in its motivating_measurement; an untagged
+proposal mentioning "ci_wait" in its statement); the "does not over-block"
+sibling test (a fully-measured segment) stayed green, confirming the gate
+still requires an actual unmeasured count, not just a name match. Reverted;
+`optimise-cycle.test.js` back to 57/57.
+
+**55. F5 -- `runLedgerCommand`'s multi-root loop, real-repo proof.**
+`for (const root of roots)` narrowed to `for (const root of roots.slice(0, 1))`
+(silently ignoring every root after the first) in `workflows/lib/optimise-read.mjs`.
+Caught both new F5 tests against REAL temp repos: the starvation test
+(`AssertionError: 3 !== 4` -- the combined `n` came from repoA's 3 records
+alone, since repoB was never read at all) and the no-starvation sanity
+test (`AssertionError: 2 !== 3`). Reverted; `optimise-read.test.js` back to
+50/50.
+
+**F6** is documented separately above (in-line with its own fix, not
+renumbered here): reproducing mutation M8 exactly (deleting the
+`|| e.ms === null` half of the wait-pairing null guard) now fails the
+tightened ENDED-side test with the reviewer's own predicted message
+("...interval is negative or out of order..." instead of an unparseable-
+timestamp reason), confirmed and reverted before the fix was committed.
+
+Every mutation above was confirmed applied via `git diff`/`git diff --stat`
+before running tests, confirmed reverted via `git status --porcelain`
+returning nothing before the next mutation, and the full suite re-run
+clean after the batch -- 322/322 as of the last commit in this round.
+
+### Spec bugs found at review round-3 (no AC behind them)
+
+Per the harness's own convention: four of round-3's findings (F1-F4) traced
+to no acceptance criterion at all, adjacent to AC-SEC-10 (F1, F2) and
+AC-OPS-3 (F4), or entirely outside any AC's stated threat surface (F3). F5
+and F6 are test-quality gaps under EXISTING ACs (AC-QA-17, AC-QA-10
+respectively) and are not spec bugs by the harness's own definition.
+
+- **F1 (the always-on-lens gate's free-text fallback)** -- no AC required
+  the fallback to be verb-independent or to recognise "security lens"/
+  "qa lens" phrasings, only the literal lens ids. A future AC should
+  require: "a proposal that in any way changes whether, when, or how often
+  an always-on lens runs is caught by the gate, independent of the verb
+  used or whether the lens is named by its literal id or a synonym
+  phrase."
+- **F2 (the security-purposed-check keyword list)** -- no AC named the
+  specific tools (pip-audit, safety, Dependabot, Snyk, osv-scanner,
+  bandit) this project's own standards (§3/§3a) require triaging. A future
+  AC should require: "the security-purposed-check keyword list is derived
+  from (or at minimum kept in sync with) the dependency/secret/SAST
+  scanners CLAUDE.md §3/§3a names, not hand-curated against just the
+  examples in this spec's own text."
+- **F3 (repo roots embedded in the ledger-lane's literal command string)**
+  -- outside AC-SEC-8's declared threat surface (which enumerates
+  commit/PR/job/ledger text, not operator-supplied repo paths); no AC
+  covers root sanitisation before command embedding at all. A future AC
+  should require: "any value embedded literally into a command string an
+  agent is instructed to execute is checked for shell metacharacters
+  first, regardless of whether its origin is considered untrusted under
+  AC-SEC-8."
+- **F4 (the unmeasured-segment gate's tag dependence)** -- AC-OPS-3
+  requires the null-vs-zero distinction to be rendered, but no AC required
+  the PROPOSAL-DROP gate itself to be mechanical independent of the
+  drafting agent's own tagging judgement. A future AC should require: "a
+  proposal whose own text (not only its structured target) references a
+  measured quantity that is null/unmeasured in the aggregate is dropped or
+  flagged, regardless of whether the drafting agent tagged it structurally."
+
+### AC-SIMP-12 arbitration re-confirmed (no code change)
+
+`workflows/lib/optimise-read.mjs` is invoked from four distinct call sites
+in `workflows/optimise-cycle.js` -- the `ledger` subcommand (ledger lane),
+the `ci` subcommand (ci lane), the `escaped-defects` subcommand (git lane),
+and the `ids` subcommand (the proposal-id batch step) -- plus a fifth,
+non-production call site: `test/optimise-read.test.js` imports its
+exported functions directly for unit testing. The spec's own arbitration
+("imported by ≥2 files" reads as "invoked by ≥2 call sites" for a script
+workflow scripts can only run via Bash, never import) holds comfortably:
+this is not a borderline case argued down to exactly two, it is four
+independent production call sites in the one file that invokes it at all.
+No code change was made or needed to confirm this.
 
 ## Guards NOT proven by an executed mutation, stated plainly rather than implied
 
