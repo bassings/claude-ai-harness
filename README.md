@@ -250,6 +250,18 @@ opt a single run out (see above), and no setting to turn ledger writes off.
 readable with any JSONL tool. If a line is ever deliberately committed (the
 opt-in above), it survives in git history like any other tracked change.
 
+**Durability (AC-DATA-17)**: the ledger is a single local copy — nothing
+backs it up or replicates it anywhere, so it is lost along with the main
+checkout (a lost disk, a reformatted machine, an accidental `rm -rf`) with
+no way to recover it. It always resolves to the MAIN checkout root, via
+`git rev-parse --git-common-dir` (`workflows/lib/ledger-append.mjs`), never
+a linked worktree's own directory — so it survives a linked worktree
+removal; worktree removal never removes it, only removing the main
+checkout itself loses it. This is a deliberate, accepted trade-off (see the
+AC-DATA-4/AC-SEC-1 arbitration above: making it cloud-reachable would
+reopen that privacy decision), not an oversight, and would be revisited
+only if the ledger were made cloud-reachable.
+
 **Arbitration (AC-DATA-4 vs. AC-SEC-1)**: AC-DATA-4 (the ledger survives a
 routine `git clean -xdf`) and AC-SEC-1 (the ledger is gitignored) are
 mutually unsatisfiable for a single in-tree, ignored path -- `-x` removes

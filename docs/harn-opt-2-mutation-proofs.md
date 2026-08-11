@@ -7,193 +7,194 @@ file was restored and the suite re-run green. Restoration used `cp` from a
 snapshot taken before any mutation began (`git checkout --` reverts to the
 last commit, destroying uncommitted work sitting on top of it), and every
 restore was confirmed with `diff <working-file> <snapshot>` returning
-nothing before the next mutation. Full suite: `node --test test/*.test.js`,
-355/355 as of round 2 below, re-run three consecutive times clean after the
-final restore. AC-SIMP-10 caps this file at 200 lines (Section 11 evidence
-otherwise belongs in the PR body); kept concise accordingly.
+nothing before the next mutation. Full suite: `node --test test/*.test.js`.
+AC-SIMP-10 caps this file at 200 lines; kept concise accordingly, so round 3
+below compresses round 1/2's proofs rather than dropping them.
 
-**Round 2** (coordinator finding against the real live ledger): `perRepo[].root`
-was still the raw caller-supplied path verbatim -- 1 match each for
-`/Volumes/` and `whoami`, unchanged by round 1, whose own AC-SEC-3 fixture
-used each test's own temp-repo path as root (never reliably home-like).
-Also rendered downstream: `optimise-cycle.js:717`'s `entry.root` fallback in
-the persisted report/synthesis prompt. Fixed by deriving a non-identifying
-label (the root's own recorded repo identity, else a bare basename).
+**Round 2**: `perRepo[].root` was still the raw caller-supplied path
+verbatim. Fixed by deriving a non-identifying label (proof 10 below).
 
-Eleven proofs executed, one per load-bearing guard. All eleven caught the
-mutation on the first fixture — no vacuous or incidentally-passing guard.
-Proof 9 records a real near-miss: the first implementation of AC-ARCH-3's
-worktree-root resolution used a `git rev-parse --show-toplevel` subprocess,
-which regressed AC-QA-20 (no additional git subprocess per write) by one
-call on every write, not just worktree writes. Caught by writing AC-QA-20's
-own guard before trusting the implementation, not by a review round.
+**Round 3** (current tip; BLOCKED verdict on CRITICAL C1: four distinct
+conductor events collapsed to one ledger line). Root cause: write-time
+regex redaction applied to a STRUCTURED path value (`spec`/`event_key`),
+not free text. Decision: strip write-time redaction of `spec` entirely (the
+ledger is gitignored, local-only -- AC-SEC-1 -- so there is no privacy
+requirement to redact data INSIDE it; AC-SEC-3 governs the report/prompt
+OUTPUT boundary only), replaced with pure lexical root-matching in
+`canonicalPlanKey`. **Supersedes proofs 2 and 4 below**, corrected in place
+rather than deleted. Suite at this tip: 398/398 (ledger-append.test.js 121,
+optimise-read.test.js 76, optimise-cycle.test.js 63, optimise-static.test.js
+15, static-checks.test.js 18, 105 elsewhere untouched by this PR).
 
-## 1. `canonicalPlanKey`'s `..`-escape detection (AC-SEC-1 case d) — `ledger-append.mjs`
+## Round 1/2 proofs (1-11), condensed
 
-**Guards**: a relative spec whose `..` segments lexically resolve outside
-the repo root (e.g. `../../../home/<user>/.ssh/config`) canonicalises to the
-fixed marker — the leak ABSOLUTE_PATH_RE cannot catch (no leading slash).
-**Mutation**: `if (segments.length === 0) return REDACTED_PATH_MARKER`
-(inside the `..` branch) → `if (false) return REDACTED_PATH_MARKER`.
-**Result**: `ledger-append: a relative spec containing ".." that resolves
-OUTSIDE the repo root is redacted...` failed — `the traversal path must
-never reach the ledger verbatim` (the hostile string appeared in the line).
-96/97 other tests stayed green. **Reverted**, confirmed byte-identical,
-97/97 green.
+1. **`canonicalPlanKey`'s `..`-escape detection** (AC-SEC-1 case d):
+   `if (segments.length === 0) return REDACTED_PATH_MARKER` -> `if (false)
+   ...`. Still the live mechanism at ledger-append.mjs:539. Failed the
+   traversal-redaction test (hostile string reached the line verbatim).
+   Re-verified round 3 as an M1 direct unit test
+   (`canonicalPlanKey('../../../home/some-user/.ssh/config', '/repo')`,
+   see round-3 probe list). **Reverted, current.**
 
-## 2. Worktree-root pre-pass gate (AC-DATA-1, AC-ARCH-3) — `ledger-append.mjs`
+2. **CORRECTED (was stale)**. Originally described `spec` being relativised
+   against a worktree's root via a pre-pass gate before general redaction --
+   that pipeline no longer applies to `spec` (round 3 struck all regex-based
+   redaction of it). The mutated line, `if (cwdRoot && cwdRoot !== root) {`
+   at ledger-append.mjs:764, still exists but now guards only
+   `task`/`round_key`/`event`/`event_key` via `relativiseAgainstRoot` --
+   `spec` is handled by `specRootCandidates` inside `canonicalPlanKey`
+   instead (round-3 probes 2-3). Not re-mutated separately: structurally
+   identical to round-3 probe 9, same gate, same fields.
 
-**Guards**: an absolute spec authored inside a linked worktree is
-relativised against the WORKTREE's own root before the main-checkout-only
-redaction pass runs, landing as a real repo-relative value, not the marker.
-**Mutation**: `if (cwdRoot && cwdRoot !== root) {` → `if (false && cwdRoot
-&& cwdRoot !== root) {`. **Result**: `an absolute spec path authored INSIDE
-a worktree is recorded repo-relative...` failed — `spec` was
-`<redacted-path>` instead of `specs/a.md`. **Reverted**, confirmed
-byte-identical, 97/97 green.
+3. **Repo-identity fallback uses the main-checkout basename** (AC-DATA-2):
+   `if (mainRoot) return path.basename(mainRoot)` -> `if (false) ...` at
+   ledger-append.mjs:619. Unchanged this round. Failed the worktree/main
+   identity-agreement test. **Reverted, current.**
 
-## 3. Repo-identity fallback uses the main-checkout basename (AC-DATA-2) — `ledger-append.mjs`
+4. **CORRECTED (was stale)**. Original mutation targeted a standalone
+   `payload.spec = REDACTED_PATH_MARKER` override block that no longer
+   exists. Current mechanism: `specWasOverwritten`
+   (ledger-append.mjs:832-833) overwrites `payload.spec` with `planKey`
+   (real key or marker) whenever `planKey !== NO_SPEC_PLAN_KEY`. Not
+   independently re-mutated this round (a `specWasOverwritten` mutation is a
+   different, less interesting failure mode than proof 4's original); flagged
+   as needing its own round-4 proof if revisited, not marked passing.
 
-**Guards**: a remoteless repo's identity fallback uses the basename of the
-already-resolved MAIN checkout root, so a worktree write agrees with the
-main checkout — closing the split where a fresh `git rev-parse
---show-toplevel` from a worktree returned its own throwaway directory name.
-**Mutation**: `if (mainRoot) return path.basename(mainRoot)` → `if (false)
-return path.basename(mainRoot)`. **Result**: `writing from inside a REAL
-worktree with no origin remote records the SAME repo identity...` failed —
-the main checkout recorded `repo-<hash>`, the worktree recorded
-`ledger-append-identity-wt-<random>`, two identities for one repo.
-**Reverted**, confirmed byte-identical, 97/97 green.
+5. **Unattributable-run exclusion in `aggregateWallClock`** (AC-DATA-7):
+   `if (plan === REDACTED_PATH_MARKER) { unattributableRuns += 1; continue }`
+   at optimise-read.mjs:475-478. Unchanged. **Reverted, current.**
 
-## 4. Raw `spec` field override for a relative escape (AC-SEC-1 case d, field half) — `ledger-append.mjs`
+6. **Degraded-record exclusion in `planKeyForRecord`** (AC-QA-7):
+   `if (!record || record.degraded) return null` at optimise-read.mjs:155.
+   Unchanged. **Reverted, current.**
 
-**Guards**: independent of proof 1 (which guards the *canonical key*), the
-raw retained `spec` field is ALSO overwritten with the marker on a relative
-escape — otherwise the hostile string still reaches the ledger verbatim in
-`spec` even with a correct `plan_key`, since `plan_key` is additive, not a
-replacement. **Mutation**: the override block (`if (typeof payload.spec ===
-'string' && planKey === REDACTED_PATH_MARKER && payload.spec !==
-REDACTED_PATH_MARKER) { payload.spec = REDACTED_PATH_MARKER }`) deleted,
-leaving only `payload.plan_key = planKey`. **Result**: the same case-d test
-as proof 1 failed again, this time because `entry.spec` (not `plan_key`)
-retained the raw traversal string — confirming the two guards are
-independently load-bearing; deleting either alone breaks the test.
-**Reverted**, confirmed byte-identical, 97/97 green.
+7. **`ci_wait`/`human_wait` bucket key routes through `canonicalPlanKey`**
+   (AC-ARCH-4): `const plan = canonicalPlanKey(rawPlan, root)` at
+   optimise-read.mjs:357. Unchanged. **Reverted, current.**
 
-## 5. Unattributable-run exclusion in `aggregateWallClock` (AC-DATA-7, AC-OPS-5) — `optimise-read.mjs`
+8. **Single-definition-site static guard for `canonicalPlanKey`** (AC-ARCH-1):
+   a second throwaway definition appended to optimise-read.mjs was caught
+   by the static single-definition test. Unchanged. **Reverted, current.**
 
-**Guards**: a run whose canonical plan key is the out-of-repo marker is
-excluded from `byPlan` and counted under `unattributableRuns` instead — two
-DIFFERENT out-of-repo specs must never merge into one fake shared bucket.
-**Mutation**: `if (plan === REDACTED_PATH_MARKER) { unattributableRuns +=
-1; continue }` → `if (false) { ... }`. **Result**: `aggregateWallClock
-never presents two DIFFERENT out-of-repo specs as one merged plan...`
-failed — `byPlan.size` was 1 (merged under the marker) instead of 0, and
-`unattributableRuns` was 0 instead of 2. 58/59 other tests stayed green.
-**Reverted**, confirmed byte-identical, 59/59 green.
+9. **Worktree-root resolution costs zero additional git subprocesses**
+   (AC-QA-20): reverting `resolveWorkingTreeRoot`'s fs-only walk to a
+   `git rev-parse --show-toplevel` call failed the PATH-shim call-count
+   tests. Unchanged. **Reverted, current.**
 
-## 6. Degraded-record exclusion in `planKeyForRecord` (AC-QA-7) — `optimise-read.mjs`
+10. **`perRepo[].root` derives a non-identifying label** (AC-SEC-3 round 2):
+    `derivePerRepoLabel` left unused, raw `root` pushed instead, at
+    optimise-read.mjs:789-823. Unchanged. **Reverted, current.**
 
-**Guards**: a `degraded: true` record (collapsed to the minimal envelope,
-per `ledger-append.mjs`'s MAX_LINE_BYTES last resort) carries no
-spec/plan_key and must never be silently folded into the no-spec bucket —
-counted separately under `degradedUnattributedRuns`. **Mutation**: `if
-(!record || record.degraded) return null` → `if (!record) return null`.
-**Result**: `aggregateWallClock excludes a fully-degraded pair...` failed —
-`byPlan.size` was 1 (landed in the no-spec bucket) instead of 0.
-**Reverted**, confirmed byte-identical, 59/59 green.
+11. **AC-DATA-6: a pre-PR1-shaped line still attributes via `spec`**:
+    `planKeyForRecord`'s fallback replaced with `return NO_SPEC_PLAN_KEY` at
+    optimise-read.mjs:164. Unchanged. **Reverted, current.**
 
-## 7. `ci_wait`/`human_wait` bucket key also routes through `canonicalPlanKey` (AC-ARCH-4) — `optimise-read.mjs`
+## Round 3 probes (this round's rebuild, nine total)
 
-Added after noticing AC-ARCH-4's claim ("its `ci_wait`/`human_wait` bucket
-key... route through it") had no test proving the `ci_wait` half — only
-`agent_compute`'s collapsing was tested. A guard nobody has watched fail is
-not done: a fixture was written first (absolute-form and relative-form
-`event_key` for the same plan, asserted to collapse into one bucket),
-confirmed green against the already-implemented code, then proven
-load-bearing. **Guards**: `planKeyFromEventKey`'s raw plan-file segment is
-canonicalised before use, so absolute and relative `event_key` forms for the
-same plan collapse into one bucket, matching `agent_compute`'s treatment of
-`spec`. **Mutation**: `const plan = canonicalPlanKey(rawPlan, root)` →
-`const plan = rawPlan`. **Result**: `aggregateWallClock canonicalises the
-ci_wait event_key plan segment too...` failed — `byPlan.size` was 2 (forms
-stayed separate) instead of 1. **Reverted**, confirmed byte-identical, 60/60
-green (this proof's own test raised the file's count from 59 to 60).
+Each probe: mutate -> run the named suite -> record exact pass/fail counts
+and which named test(s) failed -> `diff` against the pre-mutation `/tmp`
+snapshot after `cp`-restoring, confirming zero lines -> full suite green
+again before the next probe. Two probes (6, 9) are differential: run twice,
+once per candidate mechanism, to isolate which one actually carries the fix.
 
-## 8. Single-definition-site static guard for `canonicalPlanKey` (AC-ARCH-1) — `test/static-checks.test.js`
+1. **C1** (`ledger-append.mjs`): reintroduced the destructive event_key
+   regex (`payload.event_key.replace(/\.\.[\\/].*$/, '<redacted-path>')`,
+   C1's exact shape -- a "../" match swallowing the whole remainder).
+   121 -> 119 pass, 2 fail: the C1 four-distinct-events reproduction, and
+   the L2-reversion test (a literal "../" inside `event_scope` must survive
+   verbatim in the minted `event_key`). No collateral failures. **Reverted,
+   zero-line diff, 121/121.**
 
-Mirrors the pre-existing `LEDGER_ENTRY_SCHEMA` single-definition-site test.
-**Guards**: no second `canonicalPlanKey` implementation is ever added
-alongside the shared one in `ledger-append.mjs`. **Mutation**: appended a
-second, throwaway `function canonicalPlanKey(x) { return x }` to the end of
-`optimise-read.mjs` (a plausible way a future drift could re-introduce the
-split PR1 exists to close). **Result**: the new static test failed —
-`definitionSites` listed both files instead of one. **Reverted**: `cp` from
-snapshot, confirmed byte-identical, suite back to 350/350 (this proof's own
-static test is what raised the count from 349 to 350).
+2. **Realpath root candidates** (`ledger-append.mjs`): reduced
+   `specRootCandidates` from `[cwdRoot, root, realpathOrNull(cwdRoot),
+   realpathOrNull(root)]` to `[cwdRoot, root]`. **0 failures** -- the H3
+   symlinked-worktree test passed regardless. Genuine coverage gap, not a
+   false pass: see probe 3.
 
-## 9. Worktree-root resolution costs zero additional git subprocesses (AC-QA-20) — `ledger-append.mjs`
+3. **PWD root candidate** (`ledger-append.mjs`), differential counterpart
+   to probe 2: `if (fs.statSync(process.env.PWD).ino === fs.statSync(cwd).ino)
+   specRootCandidates.push(process.env.PWD)` short-circuited to
+   `if (false) ...`. 121 -> 120 pass, 1 fail: exactly the H3 PWD symlink
+   test. **Conclusion: `process.env.PWD`, inode-matched against `cwd`, is
+   the load-bearing mechanism for the symlinked-absolute-spec case; the two
+   `realpathOrNull` entries in `specRootCandidates` are currently
+   unexercised by any test in this suite** -- kept per the coordinator's
+   explicit instruction to try them as candidates, but their coverage claim
+   is honestly downgraded here rather than implied by proof 2 above.
+   **Reverted, zero-line diff, 121/121.**
 
-**Guards**: resolving the current working tree's own root (needed for
-AC-ARCH-3's worktree relativisation) never adds a git subprocess call beyond
-the pre-PR1 baseline (measured directly: 4 calls for an ordinary write with
-an origin remote configured -- show-superproject-working-tree,
-git-common-dir, remote get-url origin, check-ignore). **Mutation**:
-`resolveWorkingTreeRoot`'s fs-only stat walk replaced with the original
-implementation attempt, `git(['rev-parse', '--show-toplevel'], cwd)`.
-**Result**: both new PATH-shim-counting tests failed — 5 invocations instead
-of 4 for an ordinary write, confirming a real regression this proof exists
-to prevent, not a hypothetical one. **Reverted**: `cp` from a snapshot taken
-immediately before this specific mutation, confirmed byte-identical, suite
-back to 353/353 (this proof's own two new tests raised the count from 351
-to 353).
+4. **Bucket-key escaping** (`optimise-read.mjs`): `escapeKeyComponent`
+   reduced to `return String(s)` (the pre-M4 bare join). 76 -> 74 pass,
+   2 fail: the `aggregateWallClock` and `aggregateRework` colliding-pair
+   tests (`('demo','a|weird.md')` vs `('demo|a','weird.md')`). Two other
+   tests sharing the "M4" label in their names (unmeasured-run and
+   orphan-start counters) stayed green, confirming the mutation is scoped
+   to escaping only. **Reverted, zero-line diff, 76/76.**
 
-## 10. `perRepo[].root` derives a non-identifying label, never the raw path (AC-SEC-3 round 2) — `optimise-read.mjs`
+5. **Exclusion-counter report line** (`optimise-cycle.js`): the
+   `unattributableWaits` render hardcoded from
+   `` `observations=${wallTotalsForExclusions.unattributableWaits ?? 0}` ``
+   to a literal `observations=0`. 63 -> 62 pass, 1 fail: the repaired M3
+   test asserting the "Excluded from attribution" line's exact substring.
+   The PRE-repair version of this test (a bare `/\b4\b/` scan over the
+   whole report) would have passed under this exact mutation, since
+   "AC-ARCH-4" appears elsewhere in the output -- confirming the repair is a
+   real detection-power improvement, not cosmetic. **Reverted, zero-line
+   diff, 63/63.**
 
-**Guards**: `perRepo[].root` carries the analysed root's own repo identity
-(from its own ledger records) or a bare basename, never the raw absolute
-path -- proven against a fixture root deliberately nested under a path
-containing both a literal `home` segment and the real `whoami` output (a
-bare temp-repo path cannot exercise this: on most machines it contains
-neither). **Mutation**: `const label = derivePerRepoLabel(records, root)`
-left in place but unused (`void label`); `perRepo.push({ root, ... })`
-reverted to pushing the raw `root` verbatim. **Result**: 3 tests failed for
-the right reason — the recursive whole-JSON walk (`$.perRepo[0].root` named
-explicitly, all three of `/Volumes/`, `/home/` and `whoami` matched), the
-broadened AC-SEC-3 CLI test, and round-3 F5's basename-lookup assertion.
-**Reverted**, confirmed byte-identical, 354/354 green.
+6. **Raw stdin parse-error leaks, all three CLI commands**
+   (`optimise-read.mjs`): `ci`/`escaped-defects`/`ids` reverted to
+   `'stdin was not valid JSON: ' + e.message` (V8's raw SyntaxError, which
+   embeds a snippet of the failing input). 76 -> 73 pass, 3 fail: exactly
+   the three parameterised L2 leak tests, one per command, no collateral.
+   **Reverted, zero-line diff, 76/76.**
 
-## 11. AC-DATA-6: a pre-PR1-shaped line (no `plan_key`) still attributes via `spec` — `optimise-read.mjs`
+7. **L4 static O(1)-per-record guard** (`optimise-static.test.js` against
+   `optimise-read.mjs`): inserted an inert `void fs.existsSync` inside
+   `parseLedgerContent`. 15 -> 14 pass, 1 fail: the L4 check, which extracts
+   each named function's body between column-0 boundaries and greps for
+   `fs.`. Confirms the extraction correctly scopes to the three target
+   functions without false-positiving on the file's legitimate CLI-layer
+   `fs` usage. **Reverted, zero-line diff, 15/15.**
 
-**Guards**: a ledger mixing hand-seeded pre-PR1-shaped lines (no `plan_key`,
-`schema_version: 1`) with genuine post-PR1 writer output for the IDENTICAL
-plan collapses to ONE bucket, with every record counted. **Mutation**:
-`planKeyForRecord`'s fallback, `return canonicalPlanKey(record.spec, root)`,
-replaced with `return NO_SPEC_PLAN_KEY` (pretending a plan_key-less record
-can never be attributed via its retained `spec`). **Result**: 7 tests
-failed, including the new AC-DATA-6 test (`byPlan` held 2 buckets, not 1)
-and five pre-existing AC-ARCH-4/AC-DATA-7/AC-QA-7 tests — confirming the
-fallback path is broadly load-bearing, not just for this one fixture.
-**Reverted**, confirmed byte-identical, 355/355 green.
+8. **L6 rootIndex label fallback** (`optimise-cycle.js`): the label
+   expression `(d.repoLabels && typeof entry.rootIndex === 'number' &&
+   d.repoLabels[entry.rootIndex]) || entry.root` reduced to a bare
+   `d.repoLabels[entry.rootIndex]`. 63 -> 62 pass, 1 fail: the repaired
+   defensive-fallback test (fixture now omits `rootIndex`, where the
+   pre-repair fixture always supplied `rootIndex:0` and so never exercised
+   the `||` branch at all -- a vacuous test converted into a real one,
+   verified by the mutation that originally exposed it). **Reverted,
+   zero-line diff, 63/63.**
 
-This proof also caught a genuine fixture bug of my own first: the initial
-draft hand-seeded pre-PR1 lines with `repo: 'demo'` while the real writer
-resolved a DIFFERENT repo identity (the temp repo's own basename) for the
-post-PR1 lines in the same file -- two `repo` values meant two bucket keys
-regardless of `plan_key`, failing for the wrong reason. Fixed by deriving
-`repoIdentity` from `path.basename(repo)`, matching the real writer.
+9. **`spec` re-exposed to free-text redaction** (`ledger-append.mjs`,
+   central round-3 structural fix): `FREE_TEXT_FIELDS =
+   TRUNCATABLE_FIELDS.filter((f) => f !== 'spec')` mutated to
+   `TRUNCATABLE_FIELDS` (spec no longer excluded), reinstating C1/H1/H2's
+   root architectural mistake. 121 -> 120 pass, 1 fail: **only** the H3 PWD
+   symlink test. Both H1 tests (paren segment, non-ASCII segment) and both
+   H2 tests (space in checkout path) stayed GREEN under this mutation.
+   **Explanation, confirmed by re-tracing, not assumed:** `ABSOLUTE_PATH_RE`
+   was independently narrowed back to main's whitespace/quote/paren-prefix
+   form in this same round, so running it over a relative spec containing a
+   paren, space or non-ASCII segment is now harmless -- H1/H2 are satisfied
+   by that narrowing alone, defence in depth rather than redundant coverage.
+   Only an absolute spec (H3's case, which the narrow regex still matches
+   and would mis-relativise against `root` alone, bypassing the
+   multi-candidate/PWD logic) distinguishes the two fixes. **The
+   FREE_TEXT_FIELDS split has thinner coverage than its design prominence
+   suggests: one H3 test stands behind it.** Flagged, not silently trusted.
+   **Reverted, zero-line diff, 121/121. Full suite re-confirmed 398/398
+   after all nine probes.**
 
 ## Not separately mutation-proven
 
-- **AC-SEC-3's whole-output zero-leak CLI test** (real 9-record ledger
-  reproduction): an end-to-end assertion over the combined effect of proofs
-  1–6, not a single guard with one clean on/off edit — any one of those six
-  mutations breaks it too. Not re-proven separately to avoid duplicating the
-  same six results under an eighth heading.
-- **`aggregateRework`'s unattributable-exclusion** (proof 5's counterpart
-  for `acVerdicts`): structurally identical to proof 5 (same
-  `planKey === REDACTED_PATH_MARKER` branch, same `unattributableCount`
-  pattern, sibling function) and covered by its own dedicated test
-  (`aggregateRework excludes an out-of-repo spec from acVerdicts...`), but
-  not independently mutated given the structural identity to proof 5 and
-  this round's time budget. Flagged here, not silently omitted.
+- **AC-SEC-3's whole-output zero-leak CLI test** and **`aggregateRework`'s
+  unattributable-exclusion**: unchanged from round 1/2 (see original
+  reasoning, condensed above under proofs 5/10 and their neighbours).
+- **AC-DATA-17 (durability doc)**: a static-checks test, not a mutation
+  guard in the behavioural sense -- proven RED (missing prose) before
+  GREEN (README updated), per §1, not independently mutated.
+- **`realpathOrNull(cwdRoot)`/`realpathOrNull(root)`** (round-3 probe 2):
+  explicitly left as an open, honestly-reported gap, not a false pass --
+  see probe 3's conclusion.

@@ -184,6 +184,20 @@ test('static: README.md\'s Retention note states that git clean -xdf deletes the
   assert.ok(/AC-DATA-4/.test(readme) && /AC-SEC-1/.test(readme), 'the arbitration must name both conflicting ACs')
 })
 
+test('static: README.md\'s Retention paragraph states the ledger is a single local copy, that nothing backs it up or replicates it, that it is lost with the main checkout, and names the condition under which that would be revisited (round-2 M5, AC-DATA-17)', () => {
+  const readme = readAll('README.md')
+  assert.ok(/single local copy|only copy/i.test(readme), 'README.md must state the ledger is the single/only local copy')
+  assert.ok(/not backed up|no backup|nothing\s+backs it up/i.test(readme), 'README.md must state nothing backs up the ledger')
+  assert.ok(/lost\s+(along with|with|if)\s+the\s+main\s+checkout/i.test(readme), 'README.md must state the ledger is lost if the main checkout is lost')
+  assert.ok(/cloud-reachable|revisit/i.test(readme), 'README.md must name the condition under which the no-backup decision would be revisited')
+})
+
+test('static: README.md does NOT claim the ledger is removed by worktree deletion -- it resolves to the MAIN checkout root via git-common-dir, so removing a linked worktree never removes it (round-2 M5, AC-DATA-17 worktree-deletion clause was factually wrong)', () => {
+  const readme = readAll('README.md')
+  assert.ok(!/removed by worktree deletion|worktree deletion removes|deleting a worktree removes/i.test(readme), 'README.md must not claim the ledger is removed by worktree deletion -- it lives at the main checkout root and survives it')
+  assert.ok(/survives (a |linked )?worktree|worktree removal (does not|never)/i.test(readme), 'README.md must state the ledger SURVIVES worktree removal, since it resolves to the main checkout root')
+})
+
 test('static: README.md names the step that refreshes the installed ~/.claude/workflows/lib mirror after a workflows/lib change, and gives an exact command that confirms the installed copy matches the repo (AC-OPS-4)', () => {
   const readme = readAll('README.md')
   assert.ok(/AC-OPS-4/.test(readme), 'README.md must record this under its AC-OPS-4 heading')
