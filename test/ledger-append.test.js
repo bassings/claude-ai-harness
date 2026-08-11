@@ -1387,6 +1387,159 @@ test('ledger-append: a relative spec containing ".." that resolves OUTSIDE the r
   assert.equal(entry.plan_key, '<redacted-path>', 'the derived canonical plan_key must record the same fixed marker')
 })
 
+// ---- Review round-1 H1 (rank-1, irrecoverable): a relative spec naming a
+// REAL in-repo file, reached via ".." from a subdirectory, must record its
+// true repo-relative key -- not the out-of-repo marker. canonicalPlanKey
+// treated every relative spec as already relative to the REPO ROOT,
+// regardless of the writer's actual cwd, so "../specs/a.md" run from
+// "<repo>/sub" (naming the real file "<repo>/specs/a.md") popped straight
+// out of the root's own frame and was destroyed -- in an append-only,
+// unbacked-up file, permanently. The genuinely hostile case (enough ".."
+// segments to escape the writer's OWN cwd, not just the root) must stay
+// redacted: security's win does not depend on destroying this case. ----
+
+test('ledger-append: a relative spec reached via ".." from a SUBDIRECTORY, naming a REAL in-repo file, records its true repo-relative key -- never the out-of-repo marker (H1, rank-1 AC-DATA-4)', () => {
+  const repo = makeTempRepo()
+  const subDir = path.join(repo, 'sub')
+  fs.mkdirSync(subDir)
+  const res = runAppend(subDir, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: '../specs/a.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.plan_key, 'specs/a.md', 'must resolve against the writer\'s ACTUAL cwd ("<repo>/sub"), recovering the real in-repo file, not the marker')
+  assert.notEqual(entry.spec, '<redacted-path>', 'the retained spec field must not be destroyed either -- AC-DATA-4\'s whole point is recoverability')
+  assert.notEqual(entry.plan_key, '<redacted-path>')
+})
+
+test('ledger-append: two DIFFERENT real in-repo files, both reached via ".." from a subdirectory, record DISTINCT plan_keys -- proving the fix recovers real identity, not just avoids the marker for one lucky case (H1, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const subDir = path.join(repo, 'sub')
+  fs.mkdirSync(subDir)
+  runAppend(subDir, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: '../specs/a.md', run_id: 'a' })
+  runAppend(subDir, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: '../specs/b.md', run_id: 'b' })
+  const [entryA, entryB] = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.equal(entryA.plan_key, 'specs/a.md')
+  assert.equal(entryB.plan_key, 'specs/b.md')
+  assert.notEqual(entryA.plan_key, entryB.plan_key, 'main recorded these as two distinct plans; the writer must too')
+})
+
+test('ledger-append: a relative spec whose ".." segments escape the writer\'s OWN cwd (not just the repo root) is still redacted -- the H1 fix must not weaken the genuinely hostile case (e.g. from a subdirectory, enough ".." to reach outside the repo entirely)', () => {
+  const repo = makeTempRepo()
+  const subDir = path.join(repo, 'sub')
+  fs.mkdirSync(subDir)
+  // From "<repo>/sub", four levels of ".." exits the repo entirely (sub ->
+  // repo -> repo's own parent -> further up), landing outside any root this
+  // writer knows about.
+  const res = runAppend(subDir, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: '../../../../etc/hostile.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.plan_key, '<redacted-path>', 'a path that escapes the writer\'s own cwd must still be redacted')
+  assert.equal(entry.spec, '<redacted-path>')
+})
+
+// ---- Review round-1 M1: redaction must fail closed on the SHAPE of the
+// derived key, not on a first-character prefix class. An absolute path
+// preceded by any character outside ABSOLUTE_PATH_RE's old prefix class
+// (whitespace/quote/paren/start) reached the ledger, and the plan_key,
+// verbatim. ----
+
+test('ledger-append: an absolute path embedded with NO recognised prefix character (e.g. "plan=/Users/<user>/private/plan.md") is still redacted in both spec and plan_key -- redaction must fail closed on path SHAPE, not a first-character prefix class (M1, AC-SEC-3)', () => {
+  const repo = makeTempRepo()
+  const hostileSpec = 'plan=/Users/some-user/private/plan.md'
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: hostileSpec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assert.ok(!line.includes('/Users/'), 'must not leak /Users/ just because it is not preceded by whitespace/quote/paren')
+  assert.ok(!line.includes('private'), 'must not leak the path\'s own segments')
+  const entry = JSON.parse(line)
+  assert.equal(entry.spec, '<redacted-path>')
+  assert.equal(entry.plan_key, '<redacted-path>')
+})
+
+test('ledger-append: an absolute path embedded after a plain "x=" prefix (round-1 M1\'s second reproduction) is redacted the same way, proving the fix is not specific to the word "plan"', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'x=/Users/victim/secret-plan.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.spec, '<redacted-path>')
+  assert.equal(entry.plan_key, '<redacted-path>')
+})
+
+test('ledger-append: an ordinary in-repo relative spec is unaffected by the widened M1 fix (not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/ordinary-widened-check.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.spec, 'specs/ordinary-widened-check.md')
+  assert.equal(entry.plan_key, 'specs/ordinary-widened-check.md')
+})
+
+// ---- Review round-1 L2: the same ".."-escape redaction protecting `spec`
+// must cover the other free-text fields that can carry a plan-shaped path:
+// event_key (minted from event_scope) and task. ----
+
+test('ledger-append: a relative ".."-escape embedded in a conduct_plan_event\'s event_scope is redacted in the minted event_key, not written verbatim (L2, AC-SEC-1)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'ci_wait_started', event_scope: '../../../home/some-user/secret-plan.md:T1:ci_wait_started' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assert.ok(!line.includes('/home/'), 'must not leak the traversal\'s /home/ segment')
+  assert.ok(!line.includes('secret-plan'), 'must not leak the traversal\'s target file name')
+  const entry = JSON.parse(line)
+  assert.ok(entry.event_key.includes('<redacted-path>'), `expected the redaction marker inside event_key, got ${entry.event_key}`)
+  assert.ok(!out.event_key.includes('/home/'), 'the value RETURNED to the caller must also be redacted, not just the written line')
+})
+
+test('ledger-append: a relative ".."-escape embedded in a task description is redacted, leaving the surrounding prose intact (L2, AC-SEC-1)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', spec: 'specs/a.md', task: 'fix ../../../home/some-user/.ssh/config handling' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(!entry.task.includes('/home/'), 'must not leak the traversal\'s /home/ segment')
+  assert.ok(!entry.task.includes('.ssh'), 'must not leak the traversal\'s target file name')
+  assert.ok(entry.task.includes('<redacted-path>'), `expected the marker to replace just the traversal, got ${entry.task}`)
+  assert.ok(entry.task.startsWith('fix ') && entry.task.endsWith(' handling'), `expected the surrounding prose to survive intact, got ${JSON.stringify(entry.task)}`)
+})
+
+test('ledger-append: a task description with no ".." mention at all is unaffected by the L2 fix (not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'fix the torn-line heal' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.task, 'fix the torn-line heal')
+})
+
+// ---- Review round-1 L5: the no-spec sentinel must be structurally
+// unproducible from a real spec path, not merely an implausible one.
+// canonicalPlanKey never emits a trailing "/" (a trailing-slash segment is
+// always dropped as empty), so '<no-spec>/' can never be the canonicalised
+// form of any real path, unlike the plain '<no-spec>' string (a legal
+// single path segment). ----
+
+test('ledger-append module: NO_SPEC_PLAN_KEY is structurally unproducible from any real spec path -- a spec LITERALLY named "<no-spec>" (or "./<no-spec>") canonicalises to its own real key, never colliding with the missing-spec sentinel (L5, AC-QA-2)', async () => {
+  const { canonicalPlanKey, NO_SPEC_PLAN_KEY } = await import(APPEND_MODULE_URL)
+  assert.ok(NO_SPEC_PLAN_KEY.endsWith('/'), 'the sentinel must end in a character canonicalPlanKey never emits at the end of a real key')
+  assert.notEqual(canonicalPlanKey('<no-spec>', '/repo'), NO_SPEC_PLAN_KEY, 'a real spec file literally named "<no-spec>" must not collide with the missing-spec sentinel')
+  assert.notEqual(canonicalPlanKey('./<no-spec>', '/repo'), NO_SPEC_PLAN_KEY)
+  assert.equal(canonicalPlanKey(null, '/repo'), NO_SPEC_PLAN_KEY, 'a genuinely missing spec must still canonicalise to the sentinel (not vacuous)')
+})
+
+test('ledger-append: a record with a spec literally named "<no-spec>" is NOT merged into the missing-spec bucket (L5, end-to-end)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: '<no-spec>' })
+  const [noSpecEntry, literalEntry] = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.notEqual(noSpecEntry.plan_key, literalEntry.plan_key)
+  assert.equal(literalEntry.plan_key, '<no-spec>')
+})
+
 test('ledger-append: an absolute spec path OUTSIDE the repo root also records the out-of-repo marker as its plan_key, not just in the redacted spec field (AC-SEC-1 case c, plan_key half)', () => {
   const repo = makeTempRepo()
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: '/etc/some-other-machines-file.md' })

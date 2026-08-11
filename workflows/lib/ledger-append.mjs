@@ -398,11 +398,19 @@ const TRUNCATABLE_FIELDS = ['task', 'spec', 'round_key', 'event', 'event_key']
 // segment) or a Windows drive-letter path, wherever it appears inside a
 // string -- not just when the whole field IS a path (a `task` description
 // is free text that may simply mention one). The leading slash must be at
-// the very start of the string or preceded by whitespace/an opening quote
-// or paren: without that anchor, a genuinely relative path that merely
-// CONTAINS a slash (e.g. "specs/foo.md") would have its "/foo.md" tail
-// misread as an absolute path and mangled.
-const ABSOLUTE_PATH_RE = /(^|[\s'"(])([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+// the very start of the string or preceded by a character that could never
+// be part of an ordinary relative path segment: without that anchor, a
+// genuinely relative path that merely CONTAINS a slash (e.g. "specs/foo.md")
+// would have its "/foo.md" tail misread as an absolute path and mangled.
+//
+// Review round-1 M1: this used to anchor on a NARROW prefix class
+// (whitespace, an opening quote or paren, or start-of-string only), so an
+// absolute path preceded by any OTHER character -- e.g. "plan=/Users/<user>/x.md"
+// -- matched nothing and reached the ledger verbatim. Widened to exclude
+// only characters that ARE legal inside an
+// ordinary path segment (letters, digits, underscore, dot, hyphen): fail
+// closed on path SHAPE, not on which punctuation happens to precede it.
+const ABSOLUTE_PATH_RE = /(^|[^A-Za-z0-9_.-])([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
 
 // The fixed marker for a path that cannot be safely recorded: an absolute
 // path outside the repo root, or (HARN-OPT-2 PR1, AC-SEC-1 case d) a
@@ -454,13 +462,49 @@ function relativiseAgainstRoot(value, root) {
   })
 }
 
+// Review round-1 L2: the same ".."-escape a hostile `spec` can carry
+// (AC-SEC-1 case d) can also be embedded in OTHER free-text fields --
+// event_key (minted from event_scope) and task -- where it cannot be
+// safely resolved: there is no single unambiguous base to resolve an
+// EMBEDDED mention against, unlike `spec`, which the writer now resolves
+// against its own cwd before canonicalPlanKey ever sees it. Any "../" or
+// "..\" -prefixed substring is therefore redacted UNCONDITIONALLY here,
+// never relativised -- the conservative, fail-closed choice, matching M1's
+// "fail closed on shape" principle. Applied to every TRUNCATABLE_FIELDS
+// entry EXCEPT spec, which has its own more precise (cwd-aware) handling
+// via canonicalPlanKey further below.
+const RELATIVE_ESCAPE_RE = /(^|[^A-Za-z0-9_.-])(\.\.[\\/][^\s'")]*)/g
+export function redactRelativeEscapes(value) {
+  if (value === null || value === undefined) return value
+  const s = String(value)
+  return s.replace(RELATIVE_ESCAPE_RE, (whole, prefix) => prefix + REDACTED_PATH_MARKER)
+}
+
 // HARN-OPT-2 PR1: the no-spec sentinel (AC-QA-2) -- distinguishable from
 // every real spec value, including one literally named "unspecified" (the
-// literal string a real, if confusingly-named, spec file could use). Never
-// producible by canonicalPlanKey from a real string input.
-export const NO_SPEC_PLAN_KEY = '<no-spec>'
+// literal string a real, if confusingly-named, spec file could use).
+// Review round-1 L5: the plain string '<no-spec>' was itself a LEGAL single
+// path segment, so a spec file literally named "<no-spec>" collided with
+// it. canonicalPlanKey never emits a TRAILING "/" in a real key (a
+// trailing-slash segment is always dropped as empty by the segment loop
+// below), so appending one makes the sentinel structurally unproducible
+// from any real spec path, not merely implausible -- while the trailing
+// "/" still starts with a safe character, so it does not itself trip the
+// M1 shape check below.
+export const NO_SPEC_PLAN_KEY = '<no-spec>/'
 
 const WINDOWS_DRIVE_ABS_RE = /^[A-Za-z]:[\\/]/
+
+// Review round-1 M1: the FINAL safety net, checked on the derived key's own
+// SHAPE rather than trusting that every unsafe input was already caught by
+// name-anchored passes upstream. A "/" at the very start, or preceded by a
+// character that could never legally appear inside an ordinary path
+// segment, means an absolute-path-shaped (or Windows-drive-shaped, once
+// backslashes are normalised to "/" above) substring survived segment
+// processing untouched -- it was never split apart because none of its
+// own segments were literally "..", so the escape-detection loop below
+// never had a reason to reject it on its own.
+const UNSAFE_EMBEDDED_SLASH_RE = /(^|[^A-Za-z0-9_.-])\//
 
 // HARN-OPT-2 PR1: plan-identity canonicalisation, the single definition
 // site (AC-ARCH-1) the writer and the reader both call. PURE (AC-ARCH-2,
@@ -510,7 +554,15 @@ export function canonicalPlanKey(spec, root) {
     }
   }
   if (segments.length === 0) return REDACTED_PATH_MARKER
-  return segments.join('/')
+  const finalKey = segments.join('/')
+  // M1's final check: an absolute-path-shaped substring embedded anywhere
+  // in what was otherwise treated as "relative" (e.g.
+  // "plan=/Users/<user>/private/plan.md" -- none of its segments were
+  // "..", so the loop above never rejected it) is caught here, on the
+  // joined result, rather than trusting the name-anchored passes upstream
+  // to have already caught every shape.
+  if (UNSAFE_EMBEDDED_SLASH_RE.test(finalKey)) return REDACTED_PATH_MARKER
+  return finalKey
 }
 
 // Strips every occurrence of `root` (an absolute path) out of free text,
@@ -731,6 +783,26 @@ export function main() {
   // an absolute path authored inside the worktree does not start with the
   // main root at all, so the pass below could only ever mark it redacted,
   // never relativise it (AC-DATA-1's bug).
+  // Review round-1 H1 (rank-1, irrecoverable, AC-DATA-4): resolve a
+  // RELATIVE spec against the writer's own cwd BEFORE anything else
+  // touches it -- lexical only (path.resolve does no fs I/O, no
+  // existence check), never blindly against the repo root. Without this,
+  // canonicalPlanKey (further below) had no way to know a relative spec
+  // like "../specs/a.md" was authored from "<repo>/sub" and named a REAL
+  // in-repo file: it assumed every relative spec was already relative to
+  // the repo ROOT itself, so the same ".." immediately popped out of that
+  // assumed frame and destroyed a legitimate plan's identity in an
+  // append-only, unbacked-up file. Resolving against cwd first recovers
+  // the file it actually names; the existing worktree-relativise +
+  // redactPaths pipeline below then correctly turns that back into a safe
+  // repo-relative key, or redacts it if it genuinely falls outside every
+  // root this writer knows about (the hostile case stays covered: enough
+  // ".." to exit the writer's own cwd entirely still resolves outside
+  // `root`, and is redacted exactly as before).
+  if (typeof payload.spec === 'string' && payload.spec && !(payload.spec.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(payload.spec))) {
+    payload.spec = path.resolve(cwd, payload.spec)
+  }
+
   if (cwdRoot && cwdRoot !== root) {
     for (const field of TRUNCATABLE_FIELDS) {
       if (field in payload) payload[field] = relativiseAgainstRoot(payload[field], cwdRoot)
@@ -748,6 +820,17 @@ export function main() {
   // an absolute path just like any other free-text field.
   if (Array.isArray(payload.lenses_run)) payload.lenses_run = payload.lenses_run.map((v) => redactPaths(v, root))
   if (Array.isArray(payload.lenses_skipped)) payload.lenses_skipped = payload.lenses_skipped.map((v) => redactPaths(v, root))
+
+  // Review round-1 L2: the ".."-escape redaction above only ever covered
+  // `spec` (via canonicalPlanKey, below). event_key (minted from
+  // event_scope, just above) and task can carry the identical relative
+  // escape and reached the ledger verbatim. Applied to every
+  // TRUNCATABLE_FIELDS entry except `spec`, which gets the more precise
+  // cwd-aware handling via canonicalPlanKey instead of blanket redaction.
+  for (const field of TRUNCATABLE_FIELDS) {
+    if (field === 'spec') continue
+    if (field in payload) payload[field] = redactRelativeEscapes(payload[field])
+  }
 
   // Truncate free-text fields BEFORE validation/serialisation so an
   // oversized field cannot push the line over the single-write() bound.
