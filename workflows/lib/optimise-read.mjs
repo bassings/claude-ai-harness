@@ -719,6 +719,28 @@ function mapToObject(m) {
   return Object.fromEntries([...m.entries()])
 }
 
+// AC-SEC-3 (round 2): perRepo[].root used to be the raw, caller-supplied
+// analysis path verbatim -- a real leak, not merely "the caller's own
+// already-known argument": workflows/optimise-cycle.js renders it directly
+// into the persisted report and the synthesis prompt whenever no friendlier
+// label has been resolved elsewhere (`d.repoLabels[entry.root] ||
+// entry.root`), so an operator's home-directory-bearing checkout path
+// reached both. Derives a non-identifying handle instead, from data this
+// file already has no fs-privileged reason to withhold: the `repo` identity
+// the WRITER already resolved and redacted for its own records (the same
+// value every other part of this output already keys on -- byPlan, rework),
+// falling back to a bare basename (never the full path) when no record
+// exists to derive one from (an uninstrumented repo, or one whose every
+// line was skipped). No git/gh call is made here (this file stays read-only
+// and shells out to nothing, per AC-SEC-9/AC-ARCH-8) -- purely a string/
+// array read over records already parsed.
+function derivePerRepoLabel(records, root) {
+  const withRepo = records.find((r) => typeof r.repo === 'string' && r.repo)
+  if (withRepo) return withRepo.repo
+  const base = path.basename(root)
+  return base || REDACTED_PATH_MARKER
+}
+
 function runLedgerCommand(roots, window) {
   const perRepo = []
   let combinedRecords = []
@@ -732,7 +754,8 @@ function runLedgerCommand(roots, window) {
       raw = fs.readFileSync(ledgerPath, 'utf8')
     }
     const { records, skipped, schemaVersionsSeen, truncatedFinalLine } = parseLedgerContent(raw)
-    perRepo.push({ root, uninstrumented: !exists, recordCount: records.length, skippedCount: skipped.length, schemaVersionsSeen: mapToObject(schemaVersionsSeen), truncatedFinalLine })
+    const label = derivePerRepoLabel(records, root)
+    perRepo.push({ root: label, uninstrumented: !exists, recordCount: records.length, skippedCount: skipped.length, schemaVersionsSeen: mapToObject(schemaVersionsSeen), truncatedFinalLine })
     combinedRecords = combinedRecords.concat(records)
     combinedSkipped = combinedSkipped.concat(skipped)
   }

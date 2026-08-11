@@ -8,12 +8,19 @@ snapshot taken before any mutation began (`git checkout --` reverts to the
 last commit, destroying uncommitted work sitting on top of it), and every
 restore was confirmed with `diff <working-file> <snapshot>` returning
 nothing before the next mutation. Full suite: `node --test test/*.test.js`,
-353/353 (this count already includes proofs 7, 8 and 9's own new tests),
-re-run three consecutive times clean after the final restore. AC-SIMP-10
-caps this file at 200 lines (Section 11 evidence otherwise belongs in the
-PR body); kept concise accordingly.
+355/355 as of round 2 below, re-run three consecutive times clean after the
+final restore. AC-SIMP-10 caps this file at 200 lines (Section 11 evidence
+otherwise belongs in the PR body); kept concise accordingly.
 
-Nine proofs executed, one per load-bearing guard. All nine caught the
+**Round 2** (coordinator finding against the real live ledger): `perRepo[].root`
+was still the raw caller-supplied path verbatim -- 1 match each for
+`/Volumes/` and `whoami`, unchanged by round 1, whose own AC-SEC-3 fixture
+used each test's own temp-repo path as root (never reliably home-like).
+Also rendered downstream: `optimise-cycle.js:717`'s `entry.root` fallback in
+the persisted report/synthesis prompt. Fixed by deriving a non-identifying
+label (the root's own recorded repo identity, else a bare basename).
+
+Eleven proofs executed, one per load-bearing guard. All eleven caught the
 mutation on the first fixture — no vacuous or incidentally-passing guard.
 Proof 9 records a real near-miss: the first implementation of AC-ARCH-3's
 worktree-root resolution used a `git rev-parse --show-toplevel` subprocess,
@@ -140,6 +147,41 @@ to prevent, not a hypothetical one. **Reverted**: `cp` from a snapshot taken
 immediately before this specific mutation, confirmed byte-identical, suite
 back to 353/353 (this proof's own two new tests raised the count from 351
 to 353).
+
+## 10. `perRepo[].root` derives a non-identifying label, never the raw path (AC-SEC-3 round 2) — `optimise-read.mjs`
+
+**Guards**: `perRepo[].root` carries the analysed root's own repo identity
+(from its own ledger records) or a bare basename, never the raw absolute
+path -- proven against a fixture root deliberately nested under a path
+containing both a literal `home` segment and the real `whoami` output (a
+bare temp-repo path cannot exercise this: on most machines it contains
+neither). **Mutation**: `const label = derivePerRepoLabel(records, root)`
+left in place but unused (`void label`); `perRepo.push({ root, ... })`
+reverted to pushing the raw `root` verbatim. **Result**: 3 tests failed for
+the right reason — the recursive whole-JSON walk (`$.perRepo[0].root` named
+explicitly, all three of `/Volumes/`, `/home/` and `whoami` matched), the
+broadened AC-SEC-3 CLI test, and round-3 F5's basename-lookup assertion.
+**Reverted**, confirmed byte-identical, 354/354 green.
+
+## 11. AC-DATA-6: a pre-PR1-shaped line (no `plan_key`) still attributes via `spec` — `optimise-read.mjs`
+
+**Guards**: a ledger mixing hand-seeded pre-PR1-shaped lines (no `plan_key`,
+`schema_version: 1`) with genuine post-PR1 writer output for the IDENTICAL
+plan collapses to ONE bucket, with every record counted. **Mutation**:
+`planKeyForRecord`'s fallback, `return canonicalPlanKey(record.spec, root)`,
+replaced with `return NO_SPEC_PLAN_KEY` (pretending a plan_key-less record
+can never be attributed via its retained `spec`). **Result**: 7 tests
+failed, including the new AC-DATA-6 test (`byPlan` held 2 buckets, not 1)
+and five pre-existing AC-ARCH-4/AC-DATA-7/AC-QA-7 tests — confirming the
+fallback path is broadly load-bearing, not just for this one fixture.
+**Reverted**, confirmed byte-identical, 355/355 green.
+
+This proof also caught a genuine fixture bug of my own first: the initial
+draft hand-seeded pre-PR1 lines with `repo: 'demo'` while the real writer
+resolved a DIFFERENT repo identity (the temp repo's own basename) for the
+post-PR1 lines in the same file -- two `repo` values meant two bucket keys
+regardless of `plan_key`, failing for the wrong reason. Fixed by deriving
+`repoIdentity` from `path.basename(repo)`, matching the real writer.
 
 ## Not separately mutation-proven
 

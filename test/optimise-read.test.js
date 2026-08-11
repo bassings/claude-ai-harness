@@ -14,7 +14,7 @@ const assert = require('node:assert/strict')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
-const { makeTempRepo, runAppend, trackTempDir, cleanupTempRepos, SUITE_TMPDIR, sh } = require('./helpers/temp-repo.js')
+const { makeTempRepo, runAppend, trackTempDir, cleanupTempRepos, SUITE_TMPDIR, sh, LEDGER_REL } = require('./helpers/temp-repo.js')
 const fs = require('node:fs')
 
 const MODULE_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
@@ -707,11 +707,16 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combine
 
   // Both real repos must have their own perRepo entry with their OWN full
   // (pre-window) record count -- never merged, never dropped from perRepo
-  // just because the window truncated the combined aggregate.
+  // just because the window truncated the combined aggregate. perRepo[].root
+  // is looked up by the derived, non-identifying label (AC-SEC-3 round 2:
+  // the raw absolute root path must never reach this field) -- neither repo
+  // has an origin remote, so the writer's own repo-identity fallback is the
+  // main checkout's basename, which is exactly what the label derives too.
   assert.equal(out.perRepo.length, 2)
-  const entryA = out.perRepo.find((e) => e.root === repoA)
-  const entryB = out.perRepo.find((e) => e.root === repoB)
+  const entryA = out.perRepo.find((e) => e.root === path.basename(repoA))
+  const entryB = out.perRepo.find((e) => e.root === path.basename(repoB))
   assert.ok(entryA && entryB, 'both repos must have their own perRepo entry')
+  assert.ok(!entryA.root.includes(repoA) && !entryB.root.includes(repoB), 'perRepo[].root must never be (or contain) the raw absolute analysis path')
   assert.equal(entryA.recordCount, 3, "repoA's own full record count, computed before windowing")
   assert.equal(entryB.recordCount, 5, "repoB's own full record count, computed before windowing")
 
@@ -806,21 +811,72 @@ function seedNineRecordFixture(repo) {
   runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/optimise-cycle.md', run_id: 'rec7' })
 }
 
-test('optimise-read CLI: `ledger <root>` over a fixture reproducing the real 9-record ledger (absolute + relative forms of the same plan) produces ZERO matches for /Users/, /Volumes/, /home/, C:\\\\ and the current whoami anywhere in the LEDGER-DERIVED output -- byPlan keys, each bucket\'s plan field, rework\'s acVerdicts spec field and the skipped-line reasons (AC-SEC-3: this command returns leaked matches today). perRepo[].root is deliberately excluded from this check: it is the CALLER\'s own supplied CLI argument (round-3 F5\'s test already locks in exact-match lookup against it, `perRepo.find(e => e.root === repoA)`), not data derived from a ledger LINE -- an operator already knows the path they typed, so echoing it back is not the leak this AC guards against; on a machine whose own TMPDIR happens to live under /Volumes (as this one does), asserting against it would fail for a reason that has nothing to do with plan-identity redaction.', () => {
+test('optimise-read CLI: `ledger <root>` over a fixture reproducing the real 9-record ledger (absolute + relative forms of the same plan) produces ZERO matches for /Users/, /Volumes/, /home/, C:\\\\ and the current whoami anywhere in the output, INCLUDING perRepo (AC-SEC-3: this command returns leaked matches today). Round 2: perRepo[].root was found to leak too -- it is not merely "the caller\'s own already-known argument", it is what the persisted report and the synthesis prompt actually render (workflows/optimise-cycle.js:717, `d.repoLabels[entry.root] || entry.root`), so a raw home-directory-bearing path reaches both. See the dedicated recursive-walk test below for the fixture that actually exercises this (a plain temp-repo path here does not reliably contain a home-like segment on every machine).', () => {
   const repo = makeTempRepo()
   seedNineRecordFixture(repo)
   const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
   assert.equal(res.status, 0, res.stderr)
-  const out = JSON.parse(res.stdout.trim())
-  delete out.perRepo // the caller's own supplied root path -- see test name for why this is excluded
-  const ledgerDerived = JSON.stringify(out)
+  const stdout = res.stdout
   const whoami = sh('whoami', repo).trim()
-  assert.ok(!/\/Users\//.test(ledgerDerived), 'must not leak /Users/')
-  assert.ok(!/\/Volumes\//.test(ledgerDerived), 'must not leak /Volumes/')
-  assert.ok(!/\/home\//.test(ledgerDerived), 'must not leak /home/')
-  assert.ok(!/C:\\/.test(ledgerDerived), 'must not leak a Windows absolute path')
-  assert.ok(!ledgerDerived.includes(whoami), 'must not leak the OS username')
-  assert.ok(!ledgerDerived.includes(repo), 'must not leak the analysed repo\'s own absolute temp-dir path either, outside the excluded perRepo[].root field')
+  assert.ok(!/\/Users\//.test(stdout), 'must not leak /Users/')
+  assert.ok(!/\/Volumes\//.test(stdout), 'must not leak /Volumes/')
+  assert.ok(!/\/home\//.test(stdout), 'must not leak /home/')
+  assert.ok(!/C:\\/.test(stdout), 'must not leak a Windows absolute path')
+  assert.ok(!stdout.includes(whoami), 'must not leak the OS username')
+  assert.ok(!stdout.includes(repo), 'must not leak the analysed repo\'s own absolute temp-dir path, perRepo[].root included')
+})
+
+// Round 2 (coordinator finding): the test above uses makeTempRepo()'s own
+// temp-dir path as root, which on MOST machines is not a home-like path at
+// all (a bare mktemp path, e.g. /tmp/xyz or /var/folders/...) -- so the
+// assertion above could never actually fail on those machines even with the
+// old, leaking code, and on the one machine where TMPDIR happens to live
+// under /Volumes/.../home/..., that was a coincidence, not a deliberately
+// sized fixture. This test deliberately nests the analysed repo under a
+// path containing BOTH a literal "home" segment AND the real `whoami`
+// output, so the assertion can actually fail regardless of the machine's
+// own TMPDIR -- and walks the WHOLE emitted JSON recursively (every key,
+// every string value, at every depth), not a spot-check of named fields,
+// so a leak in any field -- not just the ones already known about -- is
+// caught.
+test('optimise-read CLI: `ledger <root>` -- recursively walking the ENTIRE emitted JSON (every key, every value, any depth) finds zero matches for /Users/, /Volumes/, /home/, C:\\\\ and the real whoami, when the analysed repo itself lives under a path containing a home-like segment and the real username (AC-SEC-3, perRepo[].root)', () => {
+  const whoami = sh('whoami', SUITE_TMPDIR).trim()
+  const homeLikeRoot = path.join(SUITE_TMPDIR, 'home', whoami, 'repo-' + Math.random().toString(36).slice(2))
+  fs.mkdirSync(homeLikeRoot, { recursive: true })
+  trackTempDir(path.join(SUITE_TMPDIR, 'home'))
+  sh('git init -q -b main', homeLikeRoot)
+  sh('git config user.email test@example.com', homeLikeRoot)
+  sh('git config user.name Test', homeLikeRoot)
+  fs.writeFileSync(path.join(homeLikeRoot, 'README.md'), 'seed\n')
+  sh('git add README.md && git commit -q -m seed', homeLikeRoot)
+  assert.ok(/\/home\//.test(homeLikeRoot) && homeLikeRoot.includes(whoami), 'sanity: the fixture root itself must genuinely contain both a home-like segment and the real username, or this test proves nothing')
+
+  runAppend(homeLikeRoot, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', homeLikeRoot], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+
+  const violations = []
+  function walk(value, at) {
+    if (value === null || value === undefined) return
+    if (typeof value === 'string') {
+      if (/\/Users\//.test(value)) violations.push(`${at}: /Users/ in ${JSON.stringify(value)}`)
+      if (/\/Volumes\//.test(value)) violations.push(`${at}: /Volumes/ in ${JSON.stringify(value)}`)
+      if (/\/home\//.test(value)) violations.push(`${at}: /home/ in ${JSON.stringify(value)}`)
+      if (/C:\\/.test(value)) violations.push(`${at}: Windows path in ${JSON.stringify(value)}`)
+      if (whoami && value.includes(whoami)) violations.push(`${at}: whoami ("${whoami}") in ${JSON.stringify(value)}`)
+      return
+    }
+    if (Array.isArray(value)) {
+      value.forEach((v, i) => walk(v, `${at}[${i}]`))
+      return
+    }
+    if (typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) walk(v, `${at}.${k}`)
+    }
+  }
+  walk(out, '$')
+  assert.deepEqual(violations, [], `leaked path/username found in the emitted JSON:\n${violations.join('\n')}`)
 })
 
 test('optimise-read CLI: `ledger <root>` over the 9-record fixture collapses the absolute and relative forms of "specs/optimise-cycle.md" into ONE wallClock.byPlan bucket -- exactly 3 buckets total (optimise-cycle.md, x.md, no-spec), where today it yields 4 (AC-QA-5)', () => {
@@ -869,6 +925,61 @@ test('optimise-read: aggregateRework collapses an absolute spec and a relative s
   const entry = [...result.acVerdicts.values()][0]
   assert.equal(entry.n, 2, 'both records must contribute to the ONE collapsed entry')
   assert.equal(entry.spec, 'specs/a.md', 'the reported spec must be the canonical, repo-relative form -- never the absolute one')
+})
+
+// ---- AC-DATA-6: a ledger mixing genuine pre-PR1-shaped lines (no plan_key
+// at all, schema_version 1 -- exactly what the writer produced before this
+// change) with post-PR1 lines (plan_key present, schema_version 2) for the
+// SAME plan must aggregate to ONE bucket per plan, with every record
+// counted -- none dropped uncounted just because it predates plan_key. ----
+
+test('optimise-read CLI: a real ledger mixing hand-seeded pre-PR1-shaped lines (no plan_key, schema_version 1) with genuine post-PR1 writer output (plan_key present, schema_version 2) for the IDENTICAL plan collapses to ONE wallClock.byPlan bucket, and every record is counted -- none dropped uncounted for lacking plan_key (AC-DATA-6)', () => {
+  const repo = makeTempRepo()
+  const ledgerPath = path.join(repo, LEDGER_REL)
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
+
+  // Hand-seeded, byte-for-byte the shape the PRE-PR1 writer actually
+  // produced: no plan_key field at all, schema_version 1. A genuine
+  // started/done pair for "specs/shared.md", written directly (not via
+  // runAppend, which would always add plan_key -- the whole point is to
+  // reproduce lines that predate this change). repo is the SAME identity
+  // the real writer resolves for this repo (its basename, no origin remote
+  // configured) -- a fixture using a different, made-up repo string here
+  // would land in a DIFFERENT bucket key (`${repo}|${plan}`) regardless of
+  // plan_key, proving nothing about plan-identity collapsing specifically.
+  const repoIdentity = path.basename(repo)
+  const preChangeLines = [
+    { schema_version: 1, run_id: 'pre-1', ts: '2026-01-01T00:00:00.000Z', repo: repoIdentity, kind: 'tdd_task', outcome: 'started', spec: 'specs/shared.md' },
+    { schema_version: 1, run_id: 'pre-1', ts: '2026-01-01T00:01:00.000Z', repo: repoIdentity, kind: 'tdd_task', outcome: 'done', spec: 'specs/shared.md' },
+  ]
+  fs.writeFileSync(ledgerPath, preChangeLines.map((l) => JSON.stringify(l)).join('\n') + '\n')
+  const preLinesRaw = fs.readFileSync(ledgerPath, 'utf8')
+
+  // A genuine POST-PR1 write, through the real (fixed) writer, for the
+  // IDENTICAL plan ("specs/shared.md") -- this line DOES carry plan_key
+  // and schema_version 2.
+  const postRes = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'started', spec: 'specs/shared.md', run_id: 'post-1' })
+  const postOut = JSON.parse(postRes.stdout.trim().split('\n').pop())
+  assert.equal(postOut.write_ok, true, postOut.write_error)
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', spec: 'specs/shared.md', run_id: 'post-1' })
+
+  const rawAfter = fs.readFileSync(ledgerPath, 'utf8')
+  assert.ok(rawAfter.startsWith(preLinesRaw), 'the hand-seeded pre-PR1 lines must survive byte for byte, unmoved, at the head of the append-only file (AC-DATA-6)')
+  const allLines = rawAfter.split('\n').filter(Boolean)
+  assert.equal(allLines.length, 4, 'all 4 lines (2 pre-PR1 + 2 post-PR1) must be present -- append-only, nothing rewritten')
+  const postLine = JSON.parse(allLines[2])
+  assert.ok('plan_key' in postLine && postLine.plan_key === 'specs/shared.md', 'sanity: the genuine post-PR1 line really does carry plan_key')
+  assert.ok(!('plan_key' in JSON.parse(allLines[0])), 'sanity: the hand-seeded pre-PR1 line really does lack plan_key, or this test proves nothing about the mixed-version case')
+
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.n, 4, 'all 4 records must be read and counted, none dropped uncounted for lacking plan_key')
+  assert.equal(out.skipped.length, 0, 'a missing plan_key must never cause a line to be skipped -- plan_key is optional, per AC-ARCH-5')
+
+  const sharedBuckets = Object.values(out.wallClock.byPlan).filter((b) => b.plan === 'specs/shared.md')
+  assert.equal(sharedBuckets.length, 1, `expected the pre-PR1 pair and the post-PR1 pair to collapse into ONE bucket, got ${JSON.stringify(sharedBuckets)}`)
+  assert.equal(sharedBuckets[0].agentComputeN, 2, 'BOTH the pre-PR1 pair and the post-PR1 pair must be measured inside the one collapsed bucket -- neither silently dropped')
 })
 
 test('optimise-read: aggregateWallClock never presents two DIFFERENT out-of-repo specs as one merged plan -- both are excluded from byPlan and counted under a named unattributable total instead (AC-DATA-7, AC-OPS-5)', () => {
