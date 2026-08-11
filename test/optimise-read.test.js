@@ -798,9 +798,26 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <root>` on a repo with n
 // a hardcoded machine-specific string) so the fixture is portable and the
 // relativisation genuinely exercises the writer/reader's real root-matching
 // logic, not a coincidence of a hardcoded prefix.
+// Review round-1 M4: seeding the "historical absolute-form" line THROUGH
+// runAppend (the real, FIXED writer) meant it could never actually be
+// absolute by the time it reached the ledger -- the writer relativises it
+// at write time, so the AC-QA-5 guard this fixture exists to prove had
+// nothing left to fail on (355/355 stayed green even with read-side
+// normalisation deleted entirely). rec0 is now hand-seeded directly, byte
+// for byte the shape the PRE-PR1 writer actually produced: schema_version
+// 1, a genuinely absolute spec, no plan_key at all -- the same technique
+// already used for the AC-DATA-6 fixture above. repo identity matches what
+// the REAL writer resolves for the other 8 records (this repo's own
+// basename, no origin remote configured), or the two groups would land in
+// different buckets for a reason unrelated to plan-identity collapsing.
 function seedNineRecordFixture(repo) {
+  const ledgerPath = path.join(repo, LEDGER_REL)
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
+  const repoIdentity = path.basename(repo)
   const absSpec = path.join(repo, 'specs', 'optimise-cycle.md')
-  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: absSpec, run_id: 'rec0' })
+  const record0 = { schema_version: 1, run_id: 'rec0', ts: '2026-08-01T00:00:00.000Z', repo: repoIdentity, kind: 'review_cycle', outcome: 'started', spec: absSpec }
+  fs.writeFileSync(ledgerPath, JSON.stringify(record0) + '\n')
+
   runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', run_id: 'rec1' })
   runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', spec: 'specs/x.md', run_id: 'r1' })
   runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'ci_wait_started', event_scope: 'specs/optimise-cycle.md:T1:ci_wait_started' })
@@ -811,19 +828,74 @@ function seedNineRecordFixture(repo) {
   runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/optimise-cycle.md', run_id: 'rec7' })
 }
 
-test('optimise-read CLI: `ledger <root>` over a fixture reproducing the real 9-record ledger (absolute + relative forms of the same plan) produces ZERO matches for /Users/, /Volumes/, /home/, C:\\\\ and the current whoami anywhere in the output, INCLUDING perRepo (AC-SEC-3: this command returns leaked matches today). Round 2: perRepo[].root was found to leak too -- it is not merely "the caller\'s own already-known argument", it is what the persisted report and the synthesis prompt actually render (workflows/optimise-cycle.js:717, `d.repoLabels[entry.root] || entry.root`), so a raw home-directory-bearing path reaches both. See the dedicated recursive-walk test below for the fixture that actually exercises this (a plain temp-repo path here does not reliably contain a home-like segment on every machine).', () => {
-  const repo = makeTempRepo()
-  seedNineRecordFixture(repo)
-  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+// Review round-1 M4: nested under a home-like path (a literal "home"
+// segment plus the real `whoami` output, matching the recursive-walk
+// fixture's own technique) so leak-freedom AND the 4-to-3 bucket collapse
+// are proven together, over the SAME fixture, in one test.
+test('optimise-read CLI: `ledger <root>` over a fixture reproducing the real 9-record ledger, hand-seeded so the historical absolute-form line genuinely reaches the ledger, nested under a home-like path -- ZERO leaked matches for /Users/, /Volumes/, /home/, C:\\\\ and whoami anywhere in the output (including perRepo), AND the absolute + relative forms of "specs/optimise-cycle.md" collapse into ONE wallClock.byPlan bucket, proven against a sanity check that the RAW fixture genuinely contains 4 distinct un-normalised spec forms (AC-SEC-3, AC-QA-5)', () => {
+  const whoami = sh('whoami', SUITE_TMPDIR).trim()
+  // whoami sits as an INTERMEDIATE path segment (a realistic
+  // "/home/<user>/projects/<repo>" shape) -- NOT the checkout's own
+  // basename. This repo has no origin remote, so the writer's repo-identity
+  // fallback is that basename; if it were literally "whoami" too, the
+  // record's own (legitimate) repo field would coincidentally equal the
+  // account name for a reason unrelated to what this test guards, and the
+  // recursive walk below would flag a false positive.
+  const homeLikeRoot = path.join(SUITE_TMPDIR, 'home', whoami, 'repo-' + Math.random().toString(36).slice(2))
+  fs.mkdirSync(homeLikeRoot, { recursive: true })
+  trackTempDir(path.join(SUITE_TMPDIR, 'home'))
+  sh('git init -q -b main', homeLikeRoot)
+  sh('git config user.email test@example.com', homeLikeRoot)
+  sh('git config user.name Test', homeLikeRoot)
+  fs.writeFileSync(path.join(homeLikeRoot, 'README.md'), 'seed\n')
+  sh('git add README.md && git commit -q -m seed', homeLikeRoot)
+  assert.ok(/\/home\//.test(homeLikeRoot) && homeLikeRoot.includes(whoami), 'sanity: the fixture root must genuinely be home-shaped')
+
+  seedNineRecordFixture(homeLikeRoot)
+
+  // Sanity ("4 before"): the RAW ledger content genuinely contains 4
+  // distinct, un-normalised spec-identity forms. Without this, a fixture
+  // that happened to already be normalised (M4's exact finding) would pass
+  // "3 buckets" vacuously.
+  const rawLines = fs.readFileSync(path.join(homeLikeRoot, LEDGER_REL), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const rawSpecIdentities = new Set(rawLines.filter((l) => l.kind !== 'conduct_plan_event').map((l) => l.spec ?? '<no-spec-raw>'))
+  assert.equal(rawSpecIdentities.size, 4, `sanity: expected 4 distinct RAW (un-normalised) spec forms in the fixture, got ${JSON.stringify([...rawSpecIdentities])} -- the fixture must genuinely contain the historical absolute form or this test cannot prove anything about the fix`)
+  assert.ok(!JSON.stringify(rawLines[0]).startsWith('specs/'), 'sanity: rec0\'s raw spec must genuinely be absolute, not already relative')
+
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', homeLikeRoot], { encoding: 'utf8' })
   assert.equal(res.status, 0, res.stderr)
   const stdout = res.stdout
-  const whoami = sh('whoami', repo).trim()
-  assert.ok(!/\/Users\//.test(stdout), 'must not leak /Users/')
-  assert.ok(!/\/Volumes\//.test(stdout), 'must not leak /Volumes/')
-  assert.ok(!/\/home\//.test(stdout), 'must not leak /home/')
-  assert.ok(!/C:\\/.test(stdout), 'must not leak a Windows absolute path')
-  assert.ok(!stdout.includes(whoami), 'must not leak the OS username')
-  assert.ok(!stdout.includes(repo), 'must not leak the analysed repo\'s own absolute temp-dir path, perRepo[].root included')
+
+  const violations = []
+  function walk(value, at) {
+    if (value === null || value === undefined) return
+    if (typeof value === 'string') {
+      if (/\/Users\//.test(value)) violations.push(`${at}: /Users/`)
+      if (/\/Volumes\//.test(value)) violations.push(`${at}: /Volumes/`)
+      if (/\/home\//.test(value)) violations.push(`${at}: /home/`)
+      if (/C:\\/.test(value)) violations.push(`${at}: Windows path`)
+      if (whoami && value.includes(whoami)) violations.push(`${at}: whoami in ${JSON.stringify(value)}`)
+      return
+    }
+    if (Array.isArray(value)) { value.forEach((v, i) => walk(v, `${at}[${i}]`)); return }
+    if (typeof value === 'object') { for (const [k, v] of Object.entries(value)) walk(v, `${at}.${k}`) }
+  }
+  const out = JSON.parse(stdout)
+  walk(out, '$')
+  assert.deepEqual(violations, [], `leaked path/username found in the emitted JSON:\n${violations.join('\n')}`)
+
+  // AC-QA-5, "3 after": the absolute and relative forms of
+  // "specs/optimise-cycle.md" must collapse into ONE bucket.
+  const planKeys = Object.values(out.wallClock.byPlan).map((b) => b.plan)
+  assert.equal(planKeys.length, 3, `expected exactly 3 buckets, got ${JSON.stringify(planKeys)}`)
+  assert.ok(planKeys.includes('specs/optimise-cycle.md'))
+  assert.ok(planKeys.includes('specs/x.md'))
+  const optimiseCycleBucket = Object.values(out.wallClock.byPlan).find((b) => b.plan === 'specs/optimise-cycle.md')
+  // rec0 (absolute, started) has no terminal pair; rec4-rec6 (started, no
+  // terminal) are also orphans; rec7's started/done pair is the one real
+  // measured pair -- 4 unmeasured attempts total once collapsed into one bucket.
+  assert.equal(optimiseCycleBucket.agentComputeN, 1, 'the one real started/done pair must be measured')
+  assert.equal(optimiseCycleBucket.agentComputeUnmeasuredN, 4, 'every orphan (including the absolute-form one) must land in the SAME bucket\'s unmeasured count, not a separate one')
 })
 
 // Round 2 (coordinator finding): the test above uses makeTempRepo()'s own
@@ -877,24 +949,6 @@ test('optimise-read CLI: `ledger <root>` -- recursively walking the ENTIRE emitt
   }
   walk(out, '$')
   assert.deepEqual(violations, [], `leaked path/username found in the emitted JSON:\n${violations.join('\n')}`)
-})
-
-test('optimise-read CLI: `ledger <root>` over the 9-record fixture collapses the absolute and relative forms of "specs/optimise-cycle.md" into ONE wallClock.byPlan bucket -- exactly 3 buckets total (optimise-cycle.md, x.md, no-spec), where today it yields 4 (AC-QA-5)', () => {
-  const repo = makeTempRepo()
-  seedNineRecordFixture(repo)
-  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
-  assert.equal(res.status, 0, res.stderr)
-  const out = JSON.parse(res.stdout.trim())
-  const planKeys = Object.values(out.wallClock.byPlan).map((b) => b.plan)
-  assert.equal(planKeys.length, 3, `expected exactly 3 buckets, got ${JSON.stringify(planKeys)}`)
-  assert.ok(planKeys.includes('specs/optimise-cycle.md'))
-  assert.ok(planKeys.includes('specs/x.md'))
-  const optimiseCycleBucket = Object.values(out.wallClock.byPlan).find((b) => b.plan === 'specs/optimise-cycle.md')
-  // rec0 (absolute, started) has no terminal pair; rec4-rec6 (started, no
-  // terminal) are also orphans; rec7's started/done pair is the one real
-  // measured pair -- 4 unmeasured attempts total once collapsed into one bucket.
-  assert.equal(optimiseCycleBucket.agentComputeN, 1, 'the one real started/done pair must be measured')
-  assert.equal(optimiseCycleBucket.agentComputeUnmeasuredN, 4, 'every orphan (including the absolute-form one) must land in the SAME bucket\'s unmeasured count, not a separate one')
 })
 
 test('optimise-read: aggregateWallClock collapses an absolute spec, a relative spec, and a ".."-containing spec for the SAME plan into one bucket, in both directions (agent_compute and, via the event_key plan segment, ci_wait) -- proven with an explicit root so the absolute form resolves (AC-ARCH-4)', () => {
