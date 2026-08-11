@@ -94,7 +94,13 @@ export function parseLedgerContent(raw) {
     try {
       parsed = JSON.parse(line)
     } catch (e) {
-      skipped.push({ line: lineNo, reason: `line ${lineNo} failed JSON parse: ${e.message}` })
+      // Review round-1 L1: JSON.parse's own SyntaxError message embeds a
+      // snippet of the RAW (corrupt) input it failed on -- for a torn or
+      // hand-edited line beginning with an absolute path, that snippet is
+      // the leak itself, reaching this reader's JSON output and, from
+      // there, a model prompt. A fixed reason naming only the line number,
+      // never the parser's own message text, closes it.
+      skipped.push({ line: lineNo, reason: `line ${lineNo} failed JSON parse (invalid JSON syntax)` })
       if (i === lines.length - 1) truncatedFinalLine = true
       continue
     }
@@ -147,7 +153,14 @@ function bumpDisposition(counts, lens, disposition) {
 // must count this separately, never fold it into the no-spec bucket.
 function planKeyForRecord(record, root = '') {
   if (!record || record.degraded) return null
-  if (typeof record.plan_key === 'string' && record.plan_key) return record.plan_key
+  // Review round-1 M1 (read-side defence in depth): a STORED plan_key is
+  // re-canonicalised, never trusted verbatim. A hand-edited or foreign
+  // ledger line (the spec itself documents hand-injected records) can carry
+  // a plan_key that itself leaks -- re-running it through the same shared
+  // function costs nothing for an already-clean value (canonicalPlanKey is
+  // idempotent) and closes that route the same way a hostile `spec` is
+  // closed.
+  if (typeof record.plan_key === 'string' && record.plan_key) return canonicalPlanKey(record.plan_key, root)
   return canonicalPlanKey(record.spec, root)
 }
 
@@ -304,6 +317,10 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   // shared occurrence key (see occurrenceKeyFromEventKey) makes that whole
   // class of bug unrepresentable: two events pair if and only if they
   // share a key, independent of sort order or how many of each exist.
+  // Review round-1 H2: two DIFFERENT out-of-repo plans must never merge
+  // into one ci_wait/human_wait bucket -- shared across both event names
+  // below, mirroring agentComputeUnattributed's own counter in shape.
+  let unattributableWaits = 0
   for (const eventName of ['ci_wait', 'human_wait']) {
     const startedByBucket = new Map() // bucketKey -> Map(occKey -> {ms, repo, plan}); a null-occKey event can never be matched, kept in its own list
     const endedByBucket = new Map()
@@ -312,17 +329,30 @@ export function aggregateWallClock(records, { root = '' } = {}) {
       if (r.kind !== 'conduct_plan_event') continue
       const rawPlan = planKeyFromEventKey(r.event_key)
       if (!rawPlan) continue
+      // Only a record actually relevant to THIS pass (this loop runs once
+      // per eventName, and `records` is the same full array each time) --
+      // checked BEFORE the marker/count logic below so an unattributable
+      // record is never counted once per eventName it is irrelevant to.
+      const isStarted = r.event === `${eventName}_started`
+      const isEnded = r.event === `${eventName}_ended`
+      if (!isStarted && !isEnded) continue
       // AC-ARCH-4: the ci_wait/human_wait bucket key routes through the
       // SAME shared canonicalisation as agent_compute and aggregateRework,
       // so an absolute and a relative form of the same plan file's
       // event_key segment collapse into one bucket here too.
       const plan = canonicalPlanKey(rawPlan, root)
+      // Review round-1 H2: an out-of-repo (or otherwise unattributable)
+      // plan is never bucketed -- agent_compute already had this guard;
+      // ci_wait/human_wait did not, so two DIFFERENT out-of-repo plans
+      // collapsed into one bucket literally named "<redacted-path>" and had
+      // their durations SUMMED. Counted here instead, never merged.
+      if (plan === REDACTED_PATH_MARKER) {
+        unattributableWaits += 1
+        continue
+      }
       const repo = r.repo || 'unknown'
       const bucketKey = planBucketKey(repo, plan)
       const ms = tsMs(r.ts)
-      const isStarted = r.event === `${eventName}_started`
-      const isEnded = r.event === `${eventName}_ended`
-      if (!isStarted && !isEnded) continue
       const occKey = occurrenceKeyFromEventKey(r.event_key, r.event)
       const target = isStarted ? startedByBucket : endedByBucket
       if (occKey === null) {
@@ -412,15 +442,22 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   let unattributableRuns = 0
   for (const [, pair] of byRunId.entries()) {
     const repo = pair[0]?.repo || 'unknown'
-    let plan = null
-    for (const p of pair) {
-      const k = planKeyForRecord(p, root)
-      if (k !== null) { plan = k; break }
-    }
-    if (plan === null) {
+    // Review round-1 M3: order-independent, main's own semantics restored
+    // (`pair.find(p => p.spec)?.spec`). The PREVIOUS "first non-null wins"
+    // rule treated NO_SPEC_PLAN_KEY as "non-null" too, so a no-spec record
+    // sitting first in file/array order won over a partner that DID carry a
+    // real spec -- order-DEPENDENT, and the no-spec sentinel won by default
+    // rather than by any real evidence. Collect every key in the pair, then
+    // prefer the first one that is neither null (degraded) NOR the no-spec
+    // sentinel; fall back to the sentinel only when nothing in the pair has
+    // a real one, and to "fully degraded" only when EVERY record in the
+    // pair is degraded (nothing at all survives to attribute).
+    const keys = pair.map((p) => planKeyForRecord(p, root))
+    if (keys.every((k) => k === null)) {
       degradedUnattributedRuns += 1
       continue
     }
+    const plan = keys.find((k) => k !== null && k !== NO_SPEC_PLAN_KEY) ?? NO_SPEC_PLAN_KEY
     if (plan === REDACTED_PATH_MARKER) {
       unattributableRuns += 1
       continue
@@ -457,6 +494,7 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     unterminatedWaits: 0,
     degradedUnattributedRuns,
     unattributableRuns,
+    unattributableWaits,
   }
   for (const bucket of byPlan.values()) {
     totals.ciWaitSeconds += bucket.ciWaitSeconds
@@ -737,8 +775,15 @@ function mapToObject(m) {
 function derivePerRepoLabel(records, root) {
   const withRepo = records.find((r) => typeof r.repo === 'string' && r.repo)
   if (withRepo) return withRepo.repo
-  const base = path.basename(root)
-  return base || REDACTED_PATH_MARKER
+  // Review round-1 M7: the fallback used to be the root's own basename --
+  // but for a home-shaped analysis root (e.g. `<scratch>/Users/<user>`,
+  // the operator's own home directory or one directly beneath it), the
+  // basename CAN BE the account name itself, leaking exactly what AC-SEC-3
+  // exists to redact. This branch fires for precisely the common
+  // "uninstrumented" case (no ledger file at all, so no record to derive a
+  // real identity from), so it must never fall back to any part of the raw
+  // path -- a fixed, non-identifying constant instead.
+  return REDACTED_PATH_MARKER
 }
 
 function runLedgerCommand(roots, window) {
