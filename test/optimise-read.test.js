@@ -717,6 +717,12 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combine
   const entryB = out.perRepo.find((e) => e.root === path.basename(repoB))
   assert.ok(entryA && entryB, 'both repos must have their own perRepo entry')
   assert.ok(!entryA.root.includes(repoA) && !entryB.root.includes(repoB), 'perRepo[].root must never be (or contain) the raw absolute analysis path')
+  // Review round-1 M5: rootIndex is the stable, positional key
+  // optimise-cycle.js uses to look up its OWN scope-resolved label,
+  // matching the position `roots` (and therefore `scope.resolved`) listed
+  // this repo at -- repoA was passed first, repoB second.
+  assert.equal(entryA.rootIndex, 0, 'repoA was the first positional root argument')
+  assert.equal(entryB.rootIndex, 1, 'repoB was the second positional root argument')
   assert.equal(entryA.recordCount, 3, "repoA's own full record count, computed before windowing")
   assert.equal(entryB.recordCount, 5, "repoB's own full record count, computed before windowing")
 

@@ -790,7 +790,8 @@ function runLedgerCommand(roots, window) {
   const perRepo = []
   let combinedRecords = []
   let combinedSkipped = []
-  for (const root of roots) {
+  for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
+    const root = roots[rootIndex]
     const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
     let raw = ''
     let exists = false
@@ -800,7 +801,12 @@ function runLedgerCommand(roots, window) {
     }
     const { records, skipped, schemaVersionsSeen, truncatedFinalLine } = parseLedgerContent(raw)
     const label = derivePerRepoLabel(records, root)
-    perRepo.push({ root: label, uninstrumented: !exists, recordCount: records.length, skippedCount: skipped.length, schemaVersionsSeen: mapToObject(schemaVersionsSeen), truncatedFinalLine })
+    // Review round-1 M5: rootIndex is the stable, positional, non-
+    // identifying key a caller (optimise-cycle.js) can use to look up its
+    // OWN friendlier label for this same root -- `root` here is a derived
+    // identity/basename (AC-SEC-3), not the raw path, so a caller cannot
+    // key its own lookup by it any more.
+    perRepo.push({ root: label, rootIndex, uninstrumented: !exists, recordCount: records.length, skippedCount: skipped.length, schemaVersionsSeen: mapToObject(schemaVersionsSeen), truncatedFinalLine })
     combinedRecords = combinedRecords.concat(records)
     combinedSkipped = combinedSkipped.concat(skipped)
   }
