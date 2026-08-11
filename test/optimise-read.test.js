@@ -357,6 +357,58 @@ test('optimise-read: aggregateWallClock keeps two repos with the IDENTICAL spec 
   assert.equal(b.plan, 'specs/x.md')
 })
 
+// ---- Review round-2 M1 (reframe, no AC -- spec bug): pairing by sorted-timestamp INDEX is unrepresentable ----
+//
+// Round 1 fixed two symptoms of the same underlying defect (a null
+// timestamp fabricating a duration; a plan/repo merge); round 2 found a
+// THIRD: pairing started/ended by SORTED INDEX WITHIN A BUCKET, rather than
+// by the occurrence discriminator already present in event_key, mispairs
+// an orphan ended event with an unrelated started event and silently drops
+// the real ended event it belonged with. The fix pairs by the full
+// event_key occurrence key (plan:task:occurrence, event-name-independent)
+// so an orphan on EITHER side can never be mispaired with an unrelated
+// event on the other side -- making the whole class of bug unrepresentable
+// rather than patching this one instance.
+
+test('optimise-read: aggregateWallClock pairs started/ended by event_key OCCURRENCE, not sorted-timestamp index -- an orphan ci_wait_ended (occurrence :1, no matching started) does not mispair with a later real pair (occurrence :2), and the real pair is measured correctly (review round-2 M1, reproduces the reviewer\'s exact fixture)', () => {
+  const records = [
+    // Orphan ended at occurrence 1 -- its own started event was lost (e.g. a crash/resume or a torn ledger line).
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:00:10.000Z' },
+    // A genuine, complete pair at occurrence 2: a real 20s wait.
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:2', ts: '2026-08-01T01:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:2', ts: '2026-08-01T01:00:20.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  const plan = result.byPlan.get('demo|specs/a.md')
+  // The real pair (occurrence :2) must be measured as exactly 20s, not
+  // mispaired with the orphan (which would produce a wrong duration).
+  assert.equal(plan.ciWaitN, 1, 'exactly one valid measured pair')
+  assert.equal(plan.ciWaitSeconds, 20, 'the real pair\'s true 20s duration, not a value computed from the orphan')
+  // The orphan ended event must be counted, with a reason, never silently
+  // dropped and never treated as a second valid measurement.
+  assert.equal(plan.ciWaitUnmeasuredN, 1, 'the orphan ended event counts as one unmeasured attempt')
+  const orphanEntries = plan.unusableIntervals.filter((u) => /no matching started|orphan/i.test(u.reason))
+  assert.equal(orphanEntries.length, 1, 'the orphan must be recorded with a reason, not silently dropped')
+})
+
+test('optimise-read: aggregateWallClock -- an orphan ended event is never paired with an UNRELATED started event even when there is exactly one of each (the mispairing shape the old sorted-index code produced)', () => {
+  const records = [
+    // Occurrence :1 ended only (orphan); occurrence :2 started only
+    // (unterminated) -- with the OLD sorted-index pairing, these two single-
+    // element arrays would pair as one "valid" 10-minute interval. They
+    // must NOT: they belong to different occurrences and must both be
+    // reported as their own distinct unmeasured/unterminated attempt.
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:10:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:2', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  const plan = result.byPlan.get('demo|specs/a.md')
+  assert.equal(plan.ciWaitN, 0, 'must not fabricate a measured pair from two unrelated orphans')
+  assert.equal(plan.ciWaitSeconds, 0)
+  assert.equal(plan.unterminatedWaits, 1, 'the lone started (occurrence :2) is unterminated')
+  assert.equal(plan.ciWaitUnmeasuredN, 2, 'both orphans count toward unmeasured -- the started AND the ended')
+})
+
 // ---- aggregateTriggerAccuracy (spec item 4) ----
 
 test('optimise-read: aggregateTriggerAccuracy distinguishes CLEAN-with-nothing-in-scope from CLEAN-after-looking, per lens', () => {

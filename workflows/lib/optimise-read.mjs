@@ -196,6 +196,21 @@ function tsMs(ts) {
   return Number.isFinite(ms) ? ms : null
 }
 
+// Review round-2 M1 (reframe, not a third patch): the shared key a
+// started/ended PAIR carries -- "<plan>:<task>:<occurrence>", with the
+// event-name segment removed, so a ci_wait_started and its matching
+// ci_wait_ended (same occurrence) produce the IDENTICAL key even though
+// their own event_key strings differ only in that segment. This is what
+// makes correct pairing possible without ever touching sort order: two
+// events pair if and only if they share this key, never by adjacency.
+function occurrenceKeyFromEventKey(eventKey, eventName) {
+  if (typeof eventKey !== 'string') return null
+  const marker = `:${eventName}:`
+  const idx = eventKey.indexOf(marker)
+  if (idx === -1) return null
+  return eventKey.slice(0, idx) + ':' + eventKey.slice(idx + marker.length)
+}
+
 // Review round-1 M5 (AC-DATA-7): the wall-clock bucket key, mirroring
 // aggregateRework's `${repo}|${spec}` scheme exactly -- the same plan/spec
 // path recurring in two different repos (a realistic case once this
@@ -238,55 +253,89 @@ export function aggregateWallClock(records) {
   const byPlan = new Map()
 
   // ---- ci_wait / human_wait, from conduct_plan_event pairs ----
+  //
+  // Review round-2 M1: pairing used to sort each bucket's starts and ends
+  // by timestamp and zip them by INDEX -- so an orphan (a started with no
+  // ended, or vice versa, e.g. a crash/resume or a torn ledger line) could
+  // mispair with an unrelated event and both fabricate a wrong duration
+  // AND silently drop the real event it belonged with. Pairing by the
+  // shared occurrence key (see occurrenceKeyFromEventKey) makes that whole
+  // class of bug unrepresentable: two events pair if and only if they
+  // share a key, independent of sort order or how many of each exist.
   for (const eventName of ['ci_wait', 'human_wait']) {
-    const started = []
-    const ended = []
+    const startedByBucket = new Map() // bucketKey -> Map(occKey -> {ms, repo, plan}); a null-occKey event can never be matched, kept in its own list
+    const endedByBucket = new Map()
+    const nullOccByBucket = new Map() // bucketKey -> {starts: [...], ends: [...]}
     for (const r of records) {
       if (r.kind !== 'conduct_plan_event') continue
       const plan = planKeyFromEventKey(r.event_key)
       if (!plan) continue
       const repo = r.repo || 'unknown'
+      const bucketKey = planBucketKey(repo, plan)
       const ms = tsMs(r.ts)
-      if (r.event === `${eventName}_started`) started.push({ repo, plan, ms })
-      else if (r.event === `${eventName}_ended`) ended.push({ repo, plan, ms })
-    }
-    const byKeyStarts = new Map()
-    const byKeyEnds = new Map()
-    const pushInto = (map, key, value) => {
-      if (!map.has(key)) map.set(key, [])
-      map.get(key).push(value)
-    }
-    for (const s of started) pushInto(byKeyStarts, planBucketKey(s.repo, s.plan), { ms: s.ms, repo: s.repo, plan: s.plan })
-    for (const e of ended) pushInto(byKeyEnds, planBucketKey(e.repo, e.plan), { ms: e.ms, repo: e.repo, plan: e.plan })
-    const keys = new Set([...byKeyStarts.keys(), ...byKeyEnds.keys()])
-    for (const key of keys) {
-      const starts = (byKeyStarts.get(key) || []).slice().sort((a, b) => (a.ms ?? 0) - (b.ms ?? 0))
-      const ends = (byKeyEnds.get(key) || []).slice().sort((a, b) => (a.ms ?? 0) - (b.ms ?? 0))
-      const repo = (starts[0] || ends[0]).repo
-      const plan = (starts[0] || ends[0]).plan
-      const bucket = ensurePlan(byPlan, key, repo, plan)
-      const pairCount = Math.min(starts.length, ends.length)
-      for (let i = 0; i < pairCount; i++) {
-        const startMs = starts[i].ms
-        const endMs = ends[i].ms
-        if (startMs === null || endMs === null) {
-          bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} interval has an unparseable timestamp on the ${startMs === null ? 'started' : 'ended'} event` })
-          bucket[`${eventName === 'ci_wait' ? 'ciWait' : 'humanWait'}UnmeasuredN`] += 1
-          continue
-        }
-        const durationS = (endMs - startMs) / 1000
-        if (!(durationS >= 0)) {
-          bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} interval is negative or out of order (end before start)` })
-          bucket[`${eventName === 'ci_wait' ? 'ciWait' : 'humanWait'}UnmeasuredN`] += 1
-          continue
-        }
-        if (eventName === 'ci_wait') { bucket.ciWaitSeconds += durationS; bucket.ciWaitN += 1 }
-        else { bucket.humanWaitSeconds += durationS; bucket.humanWaitN += 1 }
+      const isStarted = r.event === `${eventName}_started`
+      const isEnded = r.event === `${eventName}_ended`
+      if (!isStarted && !isEnded) continue
+      const occKey = occurrenceKeyFromEventKey(r.event_key, r.event)
+      const target = isStarted ? startedByBucket : endedByBucket
+      if (occKey === null) {
+        if (!nullOccByBucket.has(bucketKey)) nullOccByBucket.set(bucketKey, { starts: [], ends: [], repo, plan })
+        nullOccByBucket.get(bucketKey)[isStarted ? 'starts' : 'ends'].push({ ms })
+        continue
       }
-      if (starts.length > ends.length) {
-        const unterminated = starts.length - ends.length
-        bucket.unterminatedWaits += unterminated
-        bucket[`${eventName === 'ci_wait' ? 'ciWait' : 'humanWait'}UnmeasuredN`] += unterminated
+      if (!target.has(bucketKey)) target.set(bucketKey, new Map())
+      target.get(bucketKey).set(occKey, { ms, repo, plan })
+    }
+
+    const bucketKeys = new Set([...startedByBucket.keys(), ...endedByBucket.keys(), ...nullOccByBucket.keys()])
+    for (const bucketKey of bucketKeys) {
+      const starts = startedByBucket.get(bucketKey) || new Map()
+      const ends = endedByBucket.get(bucketKey) || new Map()
+      const nullOcc = nullOccByBucket.get(bucketKey) || { starts: [], ends: [] }
+      // repo/plan are identical for every event sharing a bucketKey (both
+      // are inputs to the key itself), so any one entry's values suffice.
+      const anyEntry = [...starts.values()][0] || [...ends.values()][0] || nullOcc
+      const bucket = ensurePlan(byPlan, bucketKey, anyEntry.repo, anyEntry.plan)
+      const unmeasuredField = `${eventName === 'ci_wait' ? 'ciWait' : 'humanWait'}UnmeasuredN`
+
+      const occKeys = new Set([...starts.keys(), ...ends.keys()])
+      for (const occKey of occKeys) {
+        const s = starts.get(occKey)
+        const e = ends.get(occKey)
+        if (s && e) {
+          if (s.ms === null || e.ms === null) {
+            bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} interval has an unparseable timestamp on the ${s.ms === null ? 'started' : 'ended'} event` })
+            bucket[unmeasuredField] += 1
+            continue
+          }
+          const durationS = (e.ms - s.ms) / 1000
+          if (!(durationS >= 0)) {
+            bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} interval is negative or out of order (end before start)` })
+            bucket[unmeasuredField] += 1
+            continue
+          }
+          if (eventName === 'ci_wait') { bucket.ciWaitSeconds += durationS; bucket.ciWaitN += 1 }
+          else { bucket.humanWaitSeconds += durationS; bucket.humanWaitN += 1 }
+        } else if (s && !e) {
+          // A started with no matching ended at this occurrence: unterminated.
+          bucket.unterminatedWaits += 1
+          bucket[unmeasuredField] += 1
+        } else if (!s && e) {
+          // Round-2 M1: an ended with no matching started at this
+          // occurrence -- NEVER paired with an unrelated started event.
+          // Recorded with a reason, counted as unmeasured, not silently
+          // dropped and not treated as a valid measurement.
+          bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} ended event has no matching started event (occurrence key: ${occKey})` })
+          bucket[unmeasuredField] += 1
+        }
+      }
+      // A malformed event_key (no parseable occurrence) can never be
+      // trusted to pair with anything -- each one is its own unmeasured
+      // attempt, never guessed at by adjacency.
+      for (const s of nullOcc.starts) { bucket.unterminatedWaits += 1; bucket[unmeasuredField] += 1 }
+      for (const e of nullOcc.ends) {
+        bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} ended event has a malformed event_key and cannot be paired` })
+        bucket[unmeasuredField] += 1
       }
     }
   }
