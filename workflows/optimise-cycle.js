@@ -539,6 +539,15 @@ ranked.sort((a, b) => (b.n || 0) - (a.n || 0))
 // helper, since this sandboxed script has no node:crypto).
 const idTargets = [...ranked, ...insufficientDataProposals].map((p) => p.target)
 let idResults = []
+// Round-4 Low-1 (spec bug): on an ids-step failure, idResults used to fall
+// back to [] with no signal beyond every proposal_id ending up null -- the
+// same silent-swallow shape AC-QA-7 forbids for the ledger write, and the
+// same discipline round-2 L3 already applied to report_write_error just
+// below this step. proposalIdsComputed surfaces it in the return AND the
+// log the same turn, so a §12 outcome annotation (prior_rejection_ts /
+// reverted_twice) that could not be looked up this run is distinguishable
+// from one that was looked up and found nothing.
+let proposalIdsComputed = true
 if (idTargets.length) {
   const idResponse = await agent(
     `Find optimise-read.mjs the same way the lanes above did. Pipe ${wrapAsData(dataNonce, 'proposal-targets', { targets: idTargets })} ` +
@@ -546,6 +555,10 @@ if (idTargets.length) {
     { label: 'synthesis:ids', phase: 'Synthesis', effort: 'low', schema: { type: 'object', required: ['ids'], properties: { ids: { type: 'array', items: { type: 'object', required: ['target', 'proposal_id'], properties: { target: { type: 'object' }, proposal_id: { type: 'string' } } } } } } }
   )
   idResults = (idResponse && Array.isArray(idResponse.ids)) ? idResponse.ids : []
+  if (idResults.length < idTargets.length) {
+    proposalIdsComputed = false
+    log('proposal id computation failed: outcome annotations suppressed this run')
+  }
 }
 const idByIndex = idTargets.map((t, i) => (idResults[i] && idResults[i].proposal_id) || null)
 ranked.forEach((p, i) => { p.proposal_id = idByIndex[i] })
@@ -656,6 +669,7 @@ return {
   report_path: REPORT_RELATIVE_PATH,
   report_written: !!(reportWrite && reportWrite.written),
   report_write_error: reportWriteError,
+  proposal_ids_computed: proposalIdsComputed,
   proposals_ranked: ranked,
   proposals_insufficient_data: insufficientDataProposals,
   report: reportMarkdown,

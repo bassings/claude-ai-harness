@@ -97,6 +97,10 @@ test('optimise-cycle: happy path returns ranked proposals, writes the report, an
   assert.equal(result.proposals_ranked.length, 1)
   assert.equal(result.proposals_ranked[0].proposal_id, 'id-0')
   assert.ok(result.report.includes('Delivery optimiser report'))
+  // Round-4 Low-1: the happy path must NOT report suppression -- proven
+  // alongside the failure-path tests below so the guard cannot be
+  // satisfied by simply always returning false.
+  assert.equal(result.proposal_ids_computed, true)
 })
 
 // ---- Review round-1 H1 (AC-OPS-11, AC-OPS-12, AC-OPS-3): buildReport must actually RENDER what it is given, and the return must include it ----
@@ -251,6 +255,14 @@ test('optimise-cycle: a proposal to remove lens-security from the always-on rost
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 0)
   assert.equal(result.proposals_insufficient_data.length, 0)
+  // Round-4 Low-2: the containment filter (line above) drops the proposal
+  // silently as far as this assertion is concerned -- pin the AUDIT COUNT
+  // the report renders too, so a regression that empties the drop-count
+  // computation while the separate containment filter still works (review
+  // round-4 mutation M8: droppedAlwaysOnSecurity -> []) is caught. Without
+  // this, an operator reading the persisted report could see "Dropped
+  // ...: 0" even when a removal was in fact dropped.
+  assert.ok(result.report.includes('Dropped (always-on security lens removal, never permitted): 1'))
 })
 
 test('optimise-cycle: a proposal to remove lens-qa is likewise dropped unconditionally', async () => {
@@ -712,6 +724,32 @@ test('optimise-cycle: a proposal with no recorded outcome events is not annotate
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
   assert.equal(result.proposals_ranked[0].prior_rejection_ts, undefined)
   assert.equal(result.proposals_ranked[0].reverted_twice, undefined)
+})
+
+// ---- Review round-4 Low-1 (spec bug): a synthesis:ids step failure must not silently disable §12 outcome annotation ----
+
+test('optimise-cycle: when the synthesis:ids agent call fails entirely (stopped/undefined response), proposal_ids_computed is reported false and the suppression is logged, not just silently absent from the annotation (round-4 Low-1)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({ proposalOutcomes: { 'id-0': { adoptedCount: 1, rejectedCount: 0, revertedCount: 2, lastRejectionTs: null, revertedTwiceOrMore: true } } }),
+  })
+  delete responses['synthesis:ids'] // undefined response: the ids agent failed/was stopped, same convention as the ledger-lane and report:write failure tests above
+  const { result, logs } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposal_ids_computed, false)
+  assert.equal(result.proposals_ranked[0].proposal_id, null)
+  // The reverted-twice flag is exactly what silently fails to attach on an
+  // ids-step failure -- proposalOutcomes is keyed by proposal_id, and every
+  // id is null here, so the lookup can never hit.
+  assert.equal(result.proposals_ranked[0].reverted_twice, undefined)
+  assert.ok(logs.some((l) => l.includes('outcome annotations suppressed')), 'the suppression must be logged visibly in the same turn, never swallowed')
+})
+
+test('optimise-cycle: when the synthesis:ids agent returns fewer ids than targets (a partial/malformed response), proposal_ids_computed is still reported false (round-4 Low-1)', async () => {
+  const responses = baseResponses({
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'trigger_tune', lens: 'lens-operability' }, statement: 'Narrow the lens-operability trigger glob (proposal A)', citations: ['run-1'] }), proposal({ target: { category: 'trigger_tune', lens: 'lens-design' }, statement: 'Narrow the lens-design trigger glob (proposal B)', citations: ['run-2'] })] },
+    'synthesis:ids': (prompt) => { const targets = extractTargets(prompt); return { ids: targets.slice(0, 1).map((t, i) => ({ target: t, proposal_id: `id-${i}` })) } },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposal_ids_computed, false)
 })
 
 // ---- Report persistence (AC-PROD-5) and no-mutation instruction (AC-SEC-9) ----
