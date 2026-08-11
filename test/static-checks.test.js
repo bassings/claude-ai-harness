@@ -22,18 +22,53 @@ function walk(dir, out = []) {
   return out
 }
 
-test('static: no file under workflows/, skills/ or hooks/ mentions optimise-cycle or an optimiser reference (AC-SIMP-7, AC-ARCH-8, AC-PROD-10). Citing the spec FILE PATH "specs/optimise-cycle.md" as a documentation source (as this test itself does, and as workflows/lib/ledger-append.mjs does when citing where the verified runtime facts are recorded) is not a reference to an optimiser implementation and is allowed.', () => {
-  for (const dir of ['workflows', 'skills', 'hooks']) {
-    for (const f of walk(path.join(ROOT, dir))) {
-      const contents = fs.readFileSync(f, 'utf8').replaceAll('specs/optimise-cycle.md', '')
-      assert.ok(!/optimise-cycle|optimize-cycle|optimiser|optimizer/i.test(contents), `${f} must not reference the optimiser (PR2, out of scope for PR1)`)
-    }
-  }
+// PR2 note: these two checks originally enforced AC-SIMP-7 ("PR 1's diff
+// contains no file whose path matches optimise-cycle") by scanning the LIVE
+// tree, which was correct only while PR 2 did not exist yet. Now that
+// workflows/optimise-cycle.js and skills/optimise-cycle/ are real,
+// permanent, in-scope deliverables, a live-tree scan of this kind can never
+// pass again -- it would forever fail as written, for a reason with no
+// bearing on either PR's correctness. AC-SIMP-7 is a claim about the PR 1
+// DIFF specifically, which is now historical and immutable (PR 1
+// squash-merged as d7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9): checking it
+// against that commit's own file list, rather than the live tree, keeps the
+// guard meaningful and lets it stay true forever, exactly like checking any
+// other already-merged commit's shape. This also incidentally fixes a
+// latent path-based bug in the original form: it matched the FULL absolute
+// path, so running the suite from a checkout whose own directory name
+// happens to contain "optimise-cycle" (e.g. a worktree named
+// t2-optimise-cycle, as PR 2's own build happened in) made it fail
+// regardless of repo contents -- git's own file list is always
+// repo-relative, so that failure mode cannot recur here.
+test('static: PR1\'s merge commit (d7eb2cc) introduced no file whose path matches "optimise-cycle" (AC-SIMP-7, checked against the immutable historical commit rather than the live tree, which now legitimately contains PR 2\'s optimiser files)', () => {
+  const out = require('node:child_process').execFileSync(
+    'git',
+    ['show', '--stat', '--format=', 'd7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9'],
+    { cwd: ROOT, encoding: 'utf8' }
+  )
+  const files = out
+    .split('\n')
+    .map((l) => l.split('|')[0].trim())
+    .filter(Boolean)
+  assert.ok(files.length > 10, 'sanity: expected PR1\'s merge commit to list many changed files')
+  assert.ok(!files.some((f) => /optimise-cycle/.test(f)), `PR1's merge commit must not have introduced an optimise-cycle path; found: ${files.filter((f) => /optimise-cycle/.test(f))}`)
 })
 
-test('static: PR1 introduces no file whose path matches "optimise-cycle" (AC-SIMP-7)', () => {
-  const all = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'skills')), ...walk(path.join(ROOT, 'test')), ...walk(path.join(ROOT, 'docs'))]
-  assert.ok(!all.some((f) => /optimise-cycle/.test(f)))
+test('static: none of the three ORIGINAL instrumented workflows (tdd-task.js, review-cycle.js, plan-cycle.js), hooks/, or conduct-plan/SKILL.md reference the optimiser -- the dependency edge points one way (AC-ARCH-8) and no per-PR path invokes it (AC-PROD-10). The optimiser\'s OWN files (workflows/optimise-cycle.js, skills/optimise-cycle/) necessarily mention their own name and are excluded from this scan, same as this test file and workflows/lib/ledger-append.mjs are excluded for citing the spec path as a documentation source.', () => {
+  const targets = [
+    'workflows/tdd-task.js',
+    'workflows/review-cycle.js',
+    'workflows/plan-cycle.js',
+    'workflows/lib/ledger-append.mjs',
+    'skills/conduct-plan/SKILL.md',
+    ...(fs.existsSync(path.join(ROOT, 'hooks')) ? walk(path.join(ROOT, 'hooks')).map((f) => path.relative(ROOT, f)) : []),
+  ]
+  for (const rel of targets) {
+    const full = path.join(ROOT, rel)
+    if (!fs.existsSync(full)) continue
+    const contents = fs.readFileSync(full, 'utf8').replaceAll('specs/optimise-cycle.md', '')
+    assert.ok(!/optimise-cycle|optimize-cycle|optimiser|optimizer/i.test(contents), `${rel} must not reference the optimiser: the dependency edge points one way (AC-ARCH-8) and nothing per-PR may invoke it (AC-PROD-10)`)
+  }
 })
 
 test('static: no dependency manifest exists anywhere in the repo (AC-SIMP-1: no new runtime dependency)', () => {
