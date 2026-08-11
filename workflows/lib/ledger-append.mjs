@@ -40,7 +40,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const SCHEMA_VERSION = 1
+// HARN-OPT-2 PR1: bumped from 1 -- plan_key (below) is a genuine shape
+// change to every written line, and AC-OPS-4 needs a stale installed
+// mirror (~/.claude/workflows/lib/ledger-append.mjs, still writing the old
+// shape) to be detectable from the report rather than failing silently.
+export const SCHEMA_VERSION = 2
 
 // Hard-coded and not configurable (AC-SIMP-2): resolved against the MAIN
 // checkout root (never a worktree's own .claude/) via `git rev-parse
@@ -200,6 +204,15 @@ export const LEDGER_ENTRY_SCHEMA = {
     // on an ordinary record, never false (unmeasured is not "definitely not
     // degraded", it is "no degradation was needed to decide").
     degraded: { type: ['boolean', 'null'] },
+    // HARN-OPT-2 PR1 (AC-DATA-4): the plan-identity canonicalisation
+    // function's own output for this record's `spec` (or the no-spec/
+    // out-of-repo sentinel), computed and written alongside the retained
+    // `spec` field itself -- never in place of it, so a canonicaliser
+    // defect is correctable on READ from the retained field alone, without
+    // rewriting the append-only ledger. Optional (not in `required`): a
+    // pre-PR1 line has no plan_key at all, and read-side normalisation
+    // (not a rewrite of the stored line) is what makes it usable (AC-ARCH-5).
+    plan_key: { type: ['string', 'null'] },
     write_ok: { type: 'boolean' },
     write_error: { type: ['string', 'null'] },
   },
@@ -391,6 +404,14 @@ const TRUNCATABLE_FIELDS = ['task', 'spec', 'round_key', 'event', 'event_key']
 // misread as an absolute path and mangled.
 const ABSOLUTE_PATH_RE = /(^|[\s'"(])([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
 
+// The fixed marker for a path that cannot be safely recorded: an absolute
+// path outside the repo root, or (HARN-OPT-2 PR1, AC-SEC-1 case d) a
+// relative path whose "../" segments lexically resolve outside it. Named
+// and exported once (AC-ARCH-1) so the writer's own `spec`/`plan_key`
+// fields and the reader's unattributable-bucket handling (AC-DATA-7,
+// AC-OPS-5) agree on one literal value, rather than each hand-rolling it.
+export const REDACTED_PATH_MARKER = '<redacted-path>'
+
 // Replaces every absolute path found inside `value` with its path relative
 // to `root` when it lives under the repo (H2: the common, recoverable
 // case -- an operator's own repo path leaking into the ledger), or with a
@@ -407,8 +428,89 @@ export function redactPaths(value, root) {
       const rel = path.relative(root, absPath)
       return prefix + (rel === '' ? '.' : rel)
     }
-    return prefix + '<redacted-path>'
+    return prefix + REDACTED_PATH_MARKER
   })
+}
+
+// HARN-OPT-2 PR1 (AC-ARCH-3): a narrowing PRE-PASS, run before redactPaths,
+// that makes an absolute path repo-relative when it lives under `root` and
+// leaves it COMPLETELY UNCHANGED otherwise -- unlike redactPaths, it never
+// redacts. This is what lets a path authored inside a linked WORKTREE
+// (whose own absolute root differs from the main checkout's) get relativised
+// against the worktree's own root first, before the general pass (which
+// only knows the main checkout root) ever sees it: a path still absolute
+// after this pre-pass either belongs to the main root (the next pass
+// handles it) or is genuinely outside every root this writer knows about
+// (the next pass correctly marks it).
+function relativiseAgainstRoot(value, root) {
+  if (value === null || value === undefined || !root) return value
+  const s = String(value)
+  return s.replace(ABSOLUTE_PATH_RE, (whole, prefix, absPath) => {
+    if (absPath === root || absPath.startsWith(root + path.sep)) {
+      const rel = path.relative(root, absPath)
+      return prefix + (rel === '' ? '.' : rel)
+    }
+    return whole
+  })
+}
+
+// HARN-OPT-2 PR1: the no-spec sentinel (AC-QA-2) -- distinguishable from
+// every real spec value, including one literally named "unspecified" (the
+// literal string a real, if confusingly-named, spec file could use). Never
+// producible by canonicalPlanKey from a real string input.
+export const NO_SPEC_PLAN_KEY = '<no-spec>'
+
+const WINDOWS_DRIVE_ABS_RE = /^[A-Za-z]:[\\/]/
+
+// HARN-OPT-2 PR1: plan-identity canonicalisation, the single definition
+// site (AC-ARCH-1) the writer and the reader both call. PURE (AC-ARCH-2,
+// AC-SEC-2): string arguments in, a string out, no fs/child_process/
+// process.cwd()/realpath anywhere in this function -- the canonical value
+// for a given `spec` is byte-identical whether the target exists, does
+// not, or is a symlink to somewhere hostile (AC-DATA-3 case e: a symlinked
+// spec keeps its OWN lexical path, since this function never resolves a
+// symlink's target -- collapsing that route would require realpath, which
+// was explicitly struck from scope at planning).
+//
+// `root`, when supplied, is a plain STRING prefix to lexically strip from
+// an absolute `spec` -- never touched by any fs call here. The caller
+// (main(), below) is responsible for resolving which real root string to
+// pass; this function only ever does string arithmetic with it.
+export function canonicalPlanKey(spec, root) {
+  if (spec === NO_SPEC_PLAN_KEY || spec === REDACTED_PATH_MARKER) return spec
+  if (typeof spec !== 'string' || spec === '') return NO_SPEC_PLAN_KEY
+  const normalizedRoot = typeof root === 'string' && root ? root.replace(/[\\/]+$/, '') : ''
+  let rel = spec
+  const isAbsolute = spec.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(spec)
+  if (isAbsolute) {
+    if (normalizedRoot && (spec === normalizedRoot || spec.startsWith(normalizedRoot + '/') || spec.startsWith(normalizedRoot + '\\'))) {
+      rel = spec.slice(normalizedRoot.length).replace(/^[\\/]+/, '')
+    } else {
+      // An absolute path with no known root to relativise against: cannot
+      // be safely made repo-relative (AC-SEC-1 case c).
+      return REDACTED_PATH_MARKER
+    }
+  }
+  // Lexical normalisation only (AC-DATA-3): forward-slash-join, then
+  // collapse "." and ".." segments by plain array arithmetic -- no
+  // fs.realpath, no existence check of any kind. A ".." with nothing left
+  // to pop lexically escapes the root (AC-SEC-1 case d): a relative spec
+  // like "../../../home/<user>/.ssh/config" has no leading slash at all,
+  // so the absolute-only ABSOLUTE_PATH_RE above never touches it, and
+  // without this check it would reach the ledger verbatim.
+  const posixRel = rel.split(/[\\/]+/).join('/')
+  const segments = []
+  for (const seg of posixRel.split('/')) {
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') {
+      if (segments.length === 0) return REDACTED_PATH_MARKER
+      segments.pop()
+    } else {
+      segments.push(seg)
+    }
+  }
+  if (segments.length === 0) return REDACTED_PATH_MARKER
+  return segments.join('/')
 }
 
 // Strips every occurrence of `root` (an absolute path) out of free text,
@@ -461,7 +563,17 @@ function resolveMainCheckoutRoot(cwd) {
 // through to the toplevel-basename fallback below, same as no remote at all.
 const REMOTE_HOST_RE = /^(?:[\w.-]+@[\w.-]+:|(?:https?|ssh|git):\/\/)/
 
-function resolveRepoIdentity(cwd) {
+// HARN-OPT-2 PR1 (AC-DATA-2): `mainRoot` is the already-resolved MAIN
+// checkout root (resolveMainCheckoutRoot, shared for a repo and every one
+// of its linked worktrees via --git-common-dir). The remoteless fallback
+// used to re-derive its own toplevel via a SECOND `git rev-parse
+// --show-toplevel` call from `cwd` -- which, run from inside a linked
+// worktree, returns the WORKTREE's own directory, not the main checkout,
+// so a remoteless worktree recorded its own throwaway directory name as
+// repo identity and split every bucket. Using the basename of the
+// already-resolved main root instead makes a write from any worktree of a
+// repo agree with a write from its main checkout, by construction.
+function resolveRepoIdentity(cwd, mainRoot) {
   try {
     const url = git(['remote', 'get-url', 'origin'], cwd)
     if (REMOTE_HOST_RE.test(url)) {
@@ -471,10 +583,26 @@ function resolveRepoIdentity(cwd) {
   } catch (e) {
     // no remote; fall through
   }
+  if (mainRoot) return path.basename(mainRoot)
   try {
     return path.basename(git(['rev-parse', '--show-toplevel'], cwd))
   } catch (e) {
     return 'unknown'
+  }
+}
+
+// HARN-OPT-2 PR1 (AC-ARCH-3): the CURRENT working tree's own root -- a
+// linked worktree's own directory when writing from inside one, identical
+// to the main checkout root otherwise. Used ONLY to make an absolute path
+// authored inside a worktree repo-relative (via relativiseAgainstRoot,
+// above) before the general redaction pass -- which knows only the main
+// checkout root -- ever runs. This is the fs/git-touching half of that
+// resolution; canonicalPlanKey itself stays pure and never calls this.
+function resolveWorkingTreeRoot(cwd) {
+  try {
+    return git(['rev-parse', '--show-toplevel'], cwd)
+  } catch (e) {
+    return null
   }
 }
 
@@ -519,12 +647,20 @@ export function main() {
   const run_id = typeof payload.run_id === 'string' && payload.run_id ? payload.run_id : randomUUID()
 
   // Resolved BEFORE redaction/truncation below: relativising an absolute
-  // path (H2) needs to know the repo root first.
+  // path (H2) needs to know the repo root first. HARN-OPT-2 PR1: cwdRoot
+  // (the CURRENT working tree's own root -- a linked worktree's own
+  // directory, when applicable) is resolved alongside root (the MAIN
+  // checkout's root) so a worktree-authored absolute spec can be
+  // relativised against the root it was actually authored under
+  // (AC-ARCH-3), and so repo identity's remoteless fallback uses the main
+  // checkout's basename rather than the worktree's own (AC-DATA-2).
   let repo
   let root
+  let cwdRoot
   try {
     root = resolveMainCheckoutRoot(cwd)
-    repo = resolveRepoIdentity(cwd)
+    cwdRoot = resolveWorkingTreeRoot(cwd)
+    repo = resolveRepoIdentity(cwd, root)
   } catch (e) {
     return result(run_id, ts, false, 'could not resolve the main checkout via git rev-parse: ' + stripRoot(e.message, root))
   }
@@ -572,6 +708,22 @@ export function main() {
   // round_key, event and event_key alongside spec/task) closes that route
   // and any future one that reuses the same free-text field list, rather
   // than requiring a matching addition here every time that list grows.
+  // HARN-OPT-2 PR1 (AC-ARCH-3): when writing from inside a linked worktree
+  // (cwdRoot differs from the main checkout root), first relativise every
+  // field against the WORKTREE's own root -- a plain lexical string
+  // substitution using the fs-resolved cwdRoot from above, not a second
+  // filesystem-touching step inside canonicalPlanKey itself. Without this,
+  // an absolute path authored inside the worktree does not start with the
+  // main root at all, so the pass below could only ever mark it redacted,
+  // never relativise it (AC-DATA-1's bug).
+  if (cwdRoot && cwdRoot !== root) {
+    for (const field of TRUNCATABLE_FIELDS) {
+      if (field in payload) payload[field] = relativiseAgainstRoot(payload[field], cwdRoot)
+    }
+    if (Array.isArray(payload.lenses_run)) payload.lenses_run = payload.lenses_run.map((v) => relativiseAgainstRoot(v, cwdRoot))
+    if (Array.isArray(payload.lenses_skipped)) payload.lenses_skipped = payload.lenses_skipped.map((v) => relativiseAgainstRoot(v, cwdRoot))
+  }
+
   for (const field of TRUNCATABLE_FIELDS) {
     if (field in payload) payload[field] = redactPaths(payload[field], root)
   }
@@ -586,10 +738,32 @@ export function main() {
   // oversized field cannot push the line over the single-write() bound.
   // Byte-based (M2), not character-based: MAX_LINE_BYTES is a byte cap, and
   // a field of multibyte characters could exceed it on its own even at a
-  // "reasonable" character count.
+  // "reasonable" character count. Plan-identity canonicalisation (below)
+  // runs AFTER this, from the already-truncated `spec` -- computing it
+  // BEFORE truncation would let an oversized spec value (free text with no
+  // real path segments) reach `plan_key` completely untruncated, since
+  // `plan_key` is not itself one of TRUNCATABLE_FIELDS.
   for (const field of TRUNCATABLE_FIELDS) {
     if (field in payload) payload[field] = truncateBytes(payload[field], 500)
   }
+
+  // HARN-OPT-2 PR1 (AC-ARCH-1, AC-SEC-1): plan-identity canonicalisation,
+  // derived from the now-redacted, now-truncated `spec` via the single
+  // shared function. This also catches the one leak the ABSOLUTE_PATH_RE-
+  // based passes above cannot: a RELATIVE path containing ".." that
+  // lexically escapes the repo root has no leading slash, so it is
+  // untouched by either pass and would otherwise reach the ledger verbatim
+  // in the raw `spec` field (case d). When canonicalisation reports an
+  // escape for a value that was not ALREADY the marker (i.e. it was a
+  // relative escape, not the absolute-outside-root case the redaction pass
+  // above already handled), the raw field is overwritten with the same
+  // fixed marker too -- kept consistent with case (c), which already
+  // redacts the raw field, not just a derived key.
+  const planKey = canonicalPlanKey(payload.spec, root)
+  if (typeof payload.spec === 'string' && planKey === REDACTED_PATH_MARKER && payload.spec !== REDACTED_PATH_MARKER) {
+    payload.spec = REDACTED_PATH_MARKER
+  }
+  payload.plan_key = planKey
 
   // Finding computation (moved here from review-cycle.js: workflow scripts
   // have no node:crypto): raw spec_bugs/rejected_findings/open_findings

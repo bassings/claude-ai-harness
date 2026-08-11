@@ -30,7 +30,9 @@ test('ledger-append: first write creates .claude/ and the ledger file, and repor
   const entry = JSON.parse(lines[0])
   assert.equal(entry.kind, 'tdd_task')
   assert.equal(entry.outcome, 'done')
-  assert.equal(entry.schema_version, 1)
+  // HARN-OPT-2 PR1: bumped from 1 -- plan_key is a genuine shape change,
+  // and AC-OPS-4 needs a stale installed writer to be detectable from it.
+  assert.equal(entry.schema_version, 2)
   assert.ok(entry.run_id)
   assert.ok(entry.ts)
 })
@@ -1313,4 +1315,234 @@ test('ledger-append: a tdd_task/review_cycle/plan_cycle payload with NO outcome 
     assert.equal(out.write_ok, false, `${kind}: outcome must still be required`)
     assert.equal(readLedgerLines(repo).length, 0)
   }
+})
+
+// ---- HARN-OPT-2 PR1: plan-identity canonicalisation (AC-ARCH-1, AC-SEC-1,
+// AC-SEC-2, AC-DATA-1..4, AC-ARCH-2/3, AC-QA-1..3) ----
+//
+// The pervasive worktree-identity split: a worktree-authored absolute spec
+// used to write BOTH a redacted `spec` (the absolute path did not start
+// with the MAIN checkout root, so redactPaths could only mark it, never
+// relativise it) AND a `repo` identity taken from the worktree's own
+// `git rev-parse --show-toplevel` (its own throwaway directory name, not
+// the main checkout's), splitting one plan into two buckets and one repo
+// into two identities simultaneously.
+
+test('ledger-append: writing from inside a REAL worktree with no origin remote records the SAME repo identity as the main checkout, not the worktree\'s own directory basename (AC-DATA-2, real git worktree add fixture)', () => {
+  const repo = makeTempRepo()
+  const worktreeDir = path.join(os.tmpdir(), 'ledger-append-identity-wt-' + Math.random().toString(36).slice(2))
+  sh(`git worktree add -q -b identity-wt-branch "${worktreeDir}"`, repo)
+  try {
+    runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+    runAppend(worktreeDir, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+    const lines = readLedgerLines(repo).map((l) => JSON.parse(l))
+    assert.equal(lines.length, 2, 'both writes must land in the main checkout\'s ledger')
+    assert.equal(lines[0].repo, lines[1].repo, 'a write from the main checkout and a write from its own worktree must record the SAME repo identity')
+    assert.equal(lines[1].repo, path.basename(repo), 'must be the MAIN checkout\'s basename, never the worktree\'s own throwaway directory name')
+    assert.notEqual(lines[1].repo, path.basename(worktreeDir), 'sanity: the worktree\'s own basename must NOT be what gets recorded')
+  } finally {
+    sh(`git worktree remove --force "${worktreeDir}"`, repo)
+  }
+})
+
+test('ledger-append: an absolute spec path authored INSIDE a worktree is recorded repo-relative, never as the redaction placeholder -- identical plan_key to the same plan run from the main checkout (AC-DATA-1, AC-ARCH-3, real git worktree add fixture)', () => {
+  const repo = makeTempRepo()
+  const worktreeDir = path.join(os.tmpdir(), 'ledger-append-spec-wt-' + Math.random().toString(36).slice(2))
+  sh(`git worktree add -q -b spec-wt-branch "${worktreeDir}"`, repo)
+  try {
+    const absoluteSpecInWorktree = path.join(worktreeDir, 'specs', 'a.md')
+    const res = runAppend(worktreeDir, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpecInWorktree })
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, true, out.write_error)
+    const line = readLedgerLines(repo)[0]
+    assertNoAbsolutePaths(line, 'absolute spec authored inside a worktree')
+    const entry = JSON.parse(line)
+    assert.equal(entry.spec, 'specs/a.md', 'must relativise against the WORKTREE\'s own root, not fall back to the redaction placeholder just because it is not under the main checkout root')
+    assert.notEqual(entry.spec, '<redacted-path>', 'must never be the redaction placeholder for a path genuinely inside the current working tree')
+    assert.equal(entry.plan_key, 'specs/a.md')
+
+    // The SAME plan, run from the main checkout with an equivalent relative
+    // spec, must land under the identical plan_key -- proving the split is
+    // actually closed, not just that this one write avoided the placeholder.
+    runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md' })
+    const lines = readLedgerLines(repo).map((l) => JSON.parse(l))
+    assert.equal(lines[0].plan_key, lines[1].plan_key, 'the worktree-authored and main-checkout-authored writes for the same plan must canonicalise to one identical key')
+  } finally {
+    sh(`git worktree remove --force "${worktreeDir}"`, repo)
+  }
+})
+
+test('ledger-append: a relative spec containing ".." that resolves OUTSIDE the repo root is redacted, never written verbatim (AC-SEC-1 case d: ledger-append.mjs:392\'s ABSOLUTE_PATH_RE matched only leading-slash/drive forms, so a relative traversal like "../../../home/<user>/.ssh/config" passed straight through)', () => {
+  const repo = makeTempRepo()
+  const hostileSpec = '../../../home/some-user/.ssh/config'
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: hostileSpec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(repo)[0]
+  assert.ok(!line.includes(hostileSpec), 'the traversal path must never reach the ledger verbatim')
+  assert.ok(!line.includes('/home/'), 'must not leak the /home/ segment the traversal resolves through')
+  assert.ok(!line.includes('.ssh'), 'must not leak the traversal\'s target file name')
+  const entry = JSON.parse(line)
+  assert.equal(entry.spec, '<redacted-path>', 'the raw spec field must record the fixed out-of-repo marker, exactly like an absolute-outside-root spec already does')
+  assert.equal(entry.plan_key, '<redacted-path>', 'the derived canonical plan_key must record the same fixed marker')
+})
+
+test('ledger-append: an absolute spec path OUTSIDE the repo root also records the out-of-repo marker as its plan_key, not just in the redacted spec field (AC-SEC-1 case c, plan_key half)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: '/etc/some-other-machines-file.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.plan_key, '<redacted-path>')
+})
+
+test('ledger-append: a spec path that is a SYMLINK inside the repo keeps its own lexical key, never resolved to the symlink\'s target -- canonicalisation is lexical, not realpath-based (AC-DATA-3 case e, AC-ARCH-2)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, 'specs'))
+  fs.symlinkSync('/etc/passwd', path.join(repo, 'specs', 'link.md'))
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/link.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.spec, 'specs/link.md', 'the symlink\'s own repo-relative path is kept as data')
+  assert.equal(entry.plan_key, 'specs/link.md', 'the canonical key is the symlink\'s own lexical path, never /etc/passwd')
+})
+
+test('ledger-append: plan_key is retained alongside the redacted, repo-relative spec string -- re-deriving canonicalPlanKey from the retained spec field alone reproduces the stored plan_key (AC-DATA-4)', async () => {
+  const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/../specs/awkward.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.plan_key, 'specs/awkward.md', 'the canonical key must collapse the ../ segment')
+  assert.equal(canonicalPlanKey(entry.spec, ''), entry.plan_key, 'a canonicaliser defect must be correctable on READ from the retained spec field alone, without rewriting the append-only ledger')
+})
+
+test('ledger-append: a genuinely well-formed repo-relative spec is unaffected -- plan_key equals the spec as-is, and it is not the out-of-repo marker (not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/ordinary.md' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.spec, 'specs/ordinary.md')
+  assert.equal(entry.plan_key, 'specs/ordinary.md')
+  assert.notEqual(entry.plan_key, '<redacted-path>')
+})
+
+test('ledger-append: a record with no spec at all gets the no-spec sentinel as plan_key, distinguishable from a real spec literally named "unspecified" (AC-QA-2)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'unspecified' })
+  const [noSpecEntry, literalEntry] = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.notEqual(noSpecEntry.plan_key, literalEntry.plan_key, 'a genuinely missing spec must never canonicalise to the same key as a real spec literally named "unspecified"')
+  assert.equal(literalEntry.plan_key, 'unspecified', 'the literal spec value is a legitimate (if confusing) real plan key')
+})
+
+test('ledger-append module: canonicalPlanKey is pure -- returns byte-identical output for a path that exists on disk and one that does not, and its own source touches no fs/child_process/cwd/realpath (AC-ARCH-2, AC-SEC-2)', async () => {
+  const mod = await import(APPEND_MODULE_URL)
+  const { canonicalPlanKey } = mod
+  assert.equal(canonicalPlanKey('specs/does-not-exist-anywhere-xyz.md', '/some/root'), canonicalPlanKey('specs/does-not-exist-anywhere-xyz.md', '/some/root'))
+  const existingFile = __filename
+  assert.equal(
+    canonicalPlanKey('this-file-does-not-exist.md', '/nonexistent/root'),
+    'this-file-does-not-exist.md',
+    'sanity: a non-existent target resolves fine, proving no fs check gates the result'
+  )
+  void existingFile
+  const source = fs.readFileSync(APPEND_SCRIPT, 'utf8')
+  const fnStart = source.indexOf('export function canonicalPlanKey')
+  assert.ok(fnStart !== -1, 'expected to find the canonicalPlanKey function definition')
+  const fnEnd = source.indexOf('\n}', fnStart) + 2
+  // Strip `//` comments before scanning: the function's own prose explains
+  // WHY it never calls realpath, which would otherwise self-trigger this
+  // exact guard on the comment text rather than on executable code.
+  const fnBody = source.slice(fnStart, fnEnd).split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
+  assert.ok(!/\bfs\./.test(fnBody), 'canonicalPlanKey must not touch fs')
+  assert.ok(!/child_process|execFileSync|spawnSync/.test(fnBody), 'canonicalPlanKey must not touch child_process')
+  assert.ok(!/process\.cwd\(\)/.test(fnBody), 'canonicalPlanKey must not read process.cwd()')
+  assert.ok(!/realpath/i.test(fnBody), 'canonicalPlanKey must never call realpath -- collapsing a symlink route is explicitly out of scope (AC-DATA-3)')
+})
+
+test('ledger-append module: canonicalPlanKey maps a repo-relative path, its absolute form under root, a "../" traversal that stays in-repo, and a "./"-prefixed form all to ONE identical key for the same plan, and is idempotent on its own output (AC-QA-1)', async () => {
+  const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
+  const root = '/repo'
+  const forms = [
+    'specs/a.md',
+    '/repo/specs/a.md',
+    'specs/sub/../a.md',
+    './specs/a.md',
+  ]
+  const keys = forms.map((f) => canonicalPlanKey(f, root))
+  assert.ok(keys.every((k) => k === 'specs/a.md'), `expected every form to canonicalise to "specs/a.md", got ${JSON.stringify(keys)}`)
+  for (const k of keys) assert.equal(canonicalPlanKey(k, root), k, 'canonicalPlanKey must be idempotent on its own output')
+})
+
+test('ledger-append module: canonicalPlanKey never throws on hostile input -- non-string (number/object/array), empty string, a 4096-char path, a path with an embedded newline, emoji/combining characters, and a Windows drive form (AC-QA-3)', async () => {
+  const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
+  const hostileInputs = [42, { a: 1 }, ['x'], '', 'x'.repeat(4096), 'specs/a\nb.md', 'specs/🎉combining-é.md', 'C:\\x\\y.md', null, undefined]
+  for (const input of hostileInputs) {
+    assert.doesNotThrow(() => canonicalPlanKey(input, '/repo'), `canonicalPlanKey must never throw on ${JSON.stringify(input)}`)
+    const out = canonicalPlanKey(input, '/repo')
+    assert.equal(typeof out, 'string', `canonicalPlanKey must always return a string, got ${typeof out} for ${JSON.stringify(input)}`)
+  }
+})
+
+test('ledger-append module: canonicalPlanKey keeps distinct inputs distinct -- two specs sharing a basename under different directories, and a spec containing the bucket-key delimiter "|" (AC-QA-2)', async () => {
+  const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
+  const a = canonicalPlanKey('specs/a/plan.md', '/repo')
+  const b = canonicalPlanKey('specs/b/plan.md', '/repo')
+  assert.notEqual(a, b)
+  const withDelimiter = canonicalPlanKey('specs/a|weird.md', '/repo')
+  assert.equal(withDelimiter, 'specs/a|weird.md', 'a delimiter-containing path is kept as data, not stripped or rejected')
+  assert.notEqual(withDelimiter, canonicalPlanKey('specs/a.md', '/repo'))
+})
+
+test('ledger-append: writing a hostile spec ("../../../etc/x", a newline, and a shell metacharacter) creates or modifies exactly one file -- the main checkout\'s ledger -- proven by a sha256 manifest of the whole repo tree before and after (AC-SEC-2)', () => {
+  const repo = makeTempRepo()
+  function manifest() {
+    const crypto = require('node:crypto')
+    const out = {}
+    for (const f of walkAll(repo)) {
+      if (f.includes(`${path.sep}.git${path.sep}`) || f.endsWith(`${path.sep}.git`)) continue
+      const rel = path.relative(repo, f)
+      const stat = fs.statSync(f)
+      if (stat.isDirectory()) continue
+      out[rel] = crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex')
+    }
+    return out
+  }
+  function walkAll(dir, acc = []) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) walkAll(full, acc)
+      acc.push(full)
+    }
+    return acc
+  }
+  const before = manifest()
+  for (const hostileSpec of ['../../../etc/x', 'legit\nspec.md', 'specs/a.md; rm -rf /']) {
+    runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: hostileSpec })
+  }
+  const after = manifest()
+  const beforeFiles = new Set(Object.keys(before))
+  const afterFiles = new Set(Object.keys(after))
+  const added = [...afterFiles].filter((f) => !beforeFiles.has(f))
+  const changed = [...afterFiles].filter((f) => beforeFiles.has(f) && before[f] !== after[f])
+  assert.deepEqual(added, ['.claude/harness-ledger.jsonl'], `expected only the ledger file to be created, got ${JSON.stringify(added)}`)
+  assert.deepEqual(changed, [], `expected no other file modified, got ${JSON.stringify(changed)}`)
+  assert.equal(fs.existsSync('/etc/x'), false)
+})
+
+test('ledger-append module: SCHEMA_VERSION is bumped past 1 -- the plan_key field is a genuine shape change, and a stale installed writer (still on the old shape) must be detectable from its output (AC-OPS-4)', async () => {
+  const { SCHEMA_VERSION } = await import(APPEND_MODULE_URL)
+  assert.notEqual(SCHEMA_VERSION, 1)
+})
+
+test('ledger-append module: LEDGER_ENTRY_SCHEMA declares plan_key as optional (not unconditionally required), so a hand-built entry that predates this field still validates -- read-side normalisation, not a schema migration, is what makes historical lines usable (AC-ARCH-5)', async () => {
+  const { LEDGER_ENTRY_SCHEMA, validateEntry } = await import(APPEND_MODULE_URL)
+  assert.ok('plan_key' in LEDGER_ENTRY_SCHEMA.properties, 'expected a plan_key property on the schema')
+  assert.ok(!LEDGER_ENTRY_SCHEMA.required.includes('plan_key'), 'plan_key must not be unconditionally required')
+  const preExisting = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'tdd_task', outcome: 'done', write_ok: true, write_error: null }
+  assert.deepEqual(validateEntry(preExisting), [], 'an entry with no plan_key at all must still validate cleanly')
 })
