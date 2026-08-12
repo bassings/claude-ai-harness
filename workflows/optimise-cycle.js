@@ -764,10 +764,22 @@ function buildReport(d) {
     const entries = Object.entries(byKind || {})
     return entries.length ? entries.map(([k, n]) => `${k}: ${n}`).join(', ') : 'none'
   }
+  // Review round-2 H-1 (High): `?? 0` cannot tell "the reader computed a
+  // real zero" apart from "this field does not exist on the object at
+  // all" -- the latter is the NORMAL post-merge state whenever the
+  // installed mirror at ~/.claude/workflows/lib/optimise-read.mjs (which
+  // the ledger lane prefers, see the scope prompt below) is stale or a
+  // field gets renamed, and it is worse than the pre-PR2 state, where the
+  // operator at least saw a single combined `unmeasured=6`. `undefined` now
+  // renders an explicit, unmissable marker instead of a confident 0.
+  const UNAVAILABLE_STALE_READER = 'unavailable (installed optimise-read.mjs predates this field)'
+  function fmtCountOrUnavailable(value) {
+    return value === undefined ? UNAVAILABLE_STALE_READER : String(value)
+  }
   lines.push(
-    `Orphaned agent-compute runs (never silently collapsed into one number): start-only=${wallTotalsForExclusions.agentComputeStartOnlyRuns ?? 0} ` +
+    `Orphaned agent-compute runs (never silently collapsed into one number): start-only=${fmtCountOrUnavailable(wallTotalsForExclusions.agentComputeStartOnlyRuns)} ` +
     `(by kind: ${formatByKind(wallTotalsForExclusions.agentComputeStartOnlyByKind)}), ` +
-    `terminal-only=${wallTotalsForExclusions.agentComputeTerminalOnlyRuns ?? 0} ` +
+    `terminal-only=${fmtCountOrUnavailable(wallTotalsForExclusions.agentComputeTerminalOnlyRuns)} ` +
     `(by kind: ${formatByKind(wallTotalsForExclusions.agentComputeTerminalOnlyByKind)}).`
   )
   lines.push('')
@@ -802,7 +814,7 @@ function buildReport(d) {
     lines.push(
       `Totals: ci_wait=${fmtSeconds(t.ciWaitSeconds)} (measured n=${t.ciWaitMeasuredRuns ?? 0}, unmeasured n=${t.ciWaitUnmeasuredRuns ?? 0}), ` +
       `human_wait=${fmtSeconds(t.humanWaitSeconds)} (measured n=${t.humanWaitMeasuredRuns ?? 0}, unmeasured n=${t.humanWaitUnmeasuredRuns ?? 0}), ` +
-      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}, aborted n=${t.agentComputeAbortedPairs ?? 0}).`
+      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}, aborted n=${fmtCountOrUnavailable(t.agentComputeAbortedPairs)}).`
     )
     if (t.unterminatedWaits) lines.push(`unterminated_waits: ${t.unterminatedWaits}`)
     if (d.wallClock.source) lines.push(`Sources: ci_wait=${d.wallClock.source.ci_wait}, human_wait=${d.wallClock.source.human_wait}, agent_compute=${d.wallClock.source.agent_compute}.`)

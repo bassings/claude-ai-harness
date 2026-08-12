@@ -4,9 +4,14 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
+const { spawnSync } = require('node:child_process')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
+const { makeTempRepo, runAppend, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
 const WORKFLOW = path.join(__dirname, '..', 'workflows', 'optimise-cycle.js')
+const OPTIMISE_READ_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
+
+test.after(cleanupTempRepos)
 
 // Round-2 M3: a fixed, known nonce for fixtures. In production this comes
 // from a Bash-generated random token (openssl rand -hex 16 or equivalent)
@@ -32,7 +37,23 @@ function ledgerFixture(overrides = {}) {
     skipped: [],
     rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }] },
     neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false }],
-    wallClock: { byPlan: {}, totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 }, source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' } },
+    // Review round-2 H-1: the orphan/aborted fields are included here as
+    // explicit real zeros -- representing an UP-TO-DATE reader that
+    // genuinely computed "nothing to report" -- so this default fixture
+    // (used by most tests as "the clean case") is distinguishable from a
+    // STALE reader that never computed these fields at all (undefined).
+    // Tests that specifically want the stale-reader case build their own
+    // totals object omitting these fields.
+    wallClock: {
+      byPlan: {},
+      totals: {
+        ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0,
+        agentComputeStartOnlyRuns: 0, agentComputeTerminalOnlyRuns: 0,
+        agentComputeStartOnlyByKind: {}, agentComputeTerminalOnlyByKind: {},
+        agentComputeAbortedPairs: 0,
+      },
+      source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+    },
     triggerAccuracy: { byLens: {} },
     proposalOutcomes: {},
     citationPool: ['run-1', 'run-2', 'run-3', 'run-4', 'run-5', 'run-6'],
@@ -288,6 +309,79 @@ test('optimise-cycle: the wall-clock Totals line renders a real ZERO for aborted
   const line = result.report.split('\n').find((l) => l.startsWith('Totals:'))
   assert.ok(line, `expected a line starting with "Totals:", report was: ${result.report}`)
   assert.ok(line.includes('aborted n=0'), `got: ${line}`)
+})
+
+// ---- Review round-2 H-1 (High): the renderers `?? 0`'d a MISSING field,
+// so a STALE installed reader (one that predates these fields -- the
+// NORMAL state post-merge, since the ledger lane prefers the installed
+// mirror at ~/.claude/workflows/lib/optimise-read.mjs) or a renamed field
+// prints `start-only=0, terminal-only=0, aborted n=0` when the truth is
+// 4/2/N -- worse than pre-PR2, where the operator at least saw
+// `unmeasured=6`. Confirmed by execution: renaming the reader's own
+// exported field names left the FULL SUITE 460/460 green, because every
+// report test built its totals fixture by hand and none omitted these
+// fields to prove the undefined case. Fixed: `undefined` (field genuinely
+// absent) now renders an explicit "unavailable" marker, distinguishable
+// from a real, computed `0`. ----
+
+test('optimise-cycle: when the installed reader is STALE (predates the orphan-count fields entirely -- totals lacks them, not merely zero), the report renders an explicit "unavailable" marker, never a confident 0 (H-1)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        // Deliberately the SHAPE a pre-round-1 optimise-read.mjs would
+        // return: no orphan/aborted fields exist on totals at all.
+        totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const orphanLine = result.report.split('\n').find((l) => l.startsWith('Orphaned agent-compute runs'))
+  assert.ok(orphanLine, `expected the line to still render, report was: ${result.report}`)
+  assert.ok(!orphanLine.includes('start-only=0'), `must NOT render a confident 0 when the field is genuinely absent, got: ${orphanLine}`)
+  assert.ok(!orphanLine.includes('terminal-only=0'), `must NOT render a confident 0 when the field is genuinely absent, got: ${orphanLine}`)
+  assert.ok(/unavailable/i.test(orphanLine), `must state the value is unavailable, got: ${orphanLine}`)
+
+  const totalsLine = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(!totalsLine.includes('aborted n=0'), `must NOT render a confident 0 for aborted n when the field is genuinely absent, got: ${totalsLine}`)
+  assert.ok(/unavailable/i.test(totalsLine), `must state the value is unavailable, got: ${totalsLine}`)
+})
+
+// AC-QA-10-style reader-to-report SEAM test (H-1's own required second
+// part): builds the totals from the REAL optimise-read.mjs output over a
+// real temp ledger with known non-zero counts, not a hand-built fixture --
+// so a rename of the reader's exported field names (which left the whole
+// suite green in round-2's own reproduction) is caught HERE, because this
+// is the one test whose fixture is not hand-typed to match whatever the
+// reader currently calls its fields.
+test('optimise-cycle: the orphan-count and aborted-pairs lines render REAL numbers computed by the REAL optimise-read.mjs over a real temp ledger -- not a hand-built fixture, so a field rename in the reader cannot leave this test green (H-1 seam test)', async () => {
+  const repo = makeTempRepo()
+  // Reproduces the spec's own worked example: 4 start-only, 2 terminal-only,
+  // 1 genuinely paired/measured run, all attributed to one repo-relative plan.
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/a.md', run_id: 'so-1' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/a.md', run_id: 'so-2' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/a.md', run_id: 'so-3' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/a.md', run_id: 'so-4' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', run_id: 'to-1' })
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', spec: 'specs/a.md', run_id: 'to-2' })
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'started', spec: 'specs/a.md', run_id: 'paired-1' })
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'aborted', spec: 'specs/a.md', run_id: 'paired-1' })
+
+  const res = spawnSync('node', [OPTIMISE_READ_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const realLedgerOutput = JSON.parse(res.stdout.trim())
+  assert.equal(realLedgerOutput.wallClock.totals.agentComputeStartOnlyRuns, 4, 'sanity: the real fixture must genuinely produce 4 start-only orphans')
+  assert.equal(realLedgerOutput.wallClock.totals.agentComputeTerminalOnlyRuns, 2, 'sanity: the real fixture must genuinely produce 2 terminal-only orphans')
+  assert.equal(realLedgerOutput.wallClock.totals.agentComputeAbortedPairs, 1, 'sanity: the real fixture must genuinely produce 1 aborted pair')
+
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ wallClock: realLedgerOutput.wallClock }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const orphanLine = result.report.split('\n').find((l) => l.startsWith('Orphaned agent-compute runs'))
+  assert.ok(orphanLine.includes('start-only=4'), `got: ${orphanLine}`)
+  assert.ok(orphanLine.includes('terminal-only=2'), `got: ${orphanLine}`)
+  const totalsLine = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(totalsLine.includes('aborted n=1'), `got: ${totalsLine}`)
 })
 
 // ---- Review round-1 M5 (SPEC BUG SB-1): perRepo[].root silently changed
