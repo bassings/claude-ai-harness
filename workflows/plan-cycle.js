@@ -222,7 +222,11 @@ const lensPrompt = (lens) =>
   `shown true or false against the built change. Do not write criteria for another lens's concern.\n` +
   `Do NOT modify any file, including the spec: the synthesis step writes the criteria in. Return them via the structured ` +
   `output schema, with your coverage statement (could_not_check is mandatory and must be honest). Findings here are ` +
-  `problems with the SPEC itself (missing decisions, untestable asks, scope risks).`
+  `problems with the SPEC itself (missing decisions, untestable asks, scope risks).\n\n` +
+  `Before you run or invoke workflows/lib/ledger-append.mjs for ANY reason (a mutation experiment, a manual probe, ` +
+  `reading its behaviour): export HARNESS_LEDGER_READONLY=1 in that shell first. That script resolves the operator's ` +
+  `real, main-checkout ledger regardless of which worktree invokes it (AC-DATA-1), so without this it is not a test ` +
+  `double, it is the live ledger. You are read-only: never write to the harness's own ledger.`
 
 const reports = await parallel(lenses.map(lens => () =>
   agent(lensPrompt(lens), { agentType: lens, label: lens, phase: 'Lenses', schema: PLAN_SCHEMA })

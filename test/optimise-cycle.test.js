@@ -1049,6 +1049,105 @@ test('optimise-cycle: an untagged proposal that mentions a segment name while th
   assert.equal(result.proposals_ranked.length, 1)
 })
 
+// ---- Owner decision, round-3 coordinator triage: the suppression gate
+// moves from PRESENCE (>=1 unmeasured run anywhere in the segment) to
+// PROPORTION (the unmeasured/aborted share of the window exceeds a stated
+// threshold, UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD = 20%). Scott's own
+// design error, corrected: presence-based gating meant one ROUTINE aborted
+// run (a handled crash, not a data problem) permanently suppressed the
+// entire wall-clock proposal lane -- the analysis this whole programme
+// exists to produce. Both directions proven here, plus the exact boundary,
+// so this cannot be the vacuous one-directional guard the project keeps
+// finding: a low-share window must survive, a high-share window must still
+// be dropped, and the threshold's own inclusivity (>=, chosen to match the
+// old gate's own >=1 inclusivity and to err toward caution: a false
+// suppression only delays analysis, a false pass could ship a proposal
+// built on a badly corrupted window) must be pinned exactly, not just
+// approximately. ----
+
+test('optimise-cycle: a proposal motivated by a segment at a LOW unmeasured share (1/10 = 10%, below the 20% threshold) SURVIVES -- one routine aborted run must never blind the whole wall-clock lane (owner decision)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 900, agentComputeMeasuredRuns: 9, agentComputeUnmeasuredRuns: 1, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a large share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1, 'a 10% unmeasured share must not suppress a proposal citing that segment')
+  assert.match(result.report, /agent_compute:\s*1\/10 runs unmeasured \(10%\)/, 'the ratio line must print the exact fraction and percentage')
+  assert.match(result.report, /agent_compute:\s*1\/10[^\n]*below[^\n]*20%/i, 'the ratio line must state it is below the 20% suppression threshold')
+})
+
+test('optimise-cycle: a proposal motivated by a segment at a HIGH unmeasured share (3/10 = 30%, above the 20% threshold) is DROPPED -- the brake must still fire (owner decision)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 700, agentComputeMeasuredRuns: 7, agentComputeUnmeasuredRuns: 3, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a large share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0, 'a 30% unmeasured share must still suppress a proposal citing that segment -- the brake is not disabled by the fix')
+  assert.match(result.report, /agent_compute:\s*3\/10 runs unmeasured \(30%\)/, 'the ratio line must print the exact fraction and percentage even when the gate fires')
+  assert.match(result.report, /agent_compute:\s*3\/10[^\n]*(at.?\/?.?above|exceeds|>=)[^\n]*20%/i, 'the ratio line must state the threshold was crossed')
+})
+
+test('optimise-cycle: EXACTLY at the 20% boundary (2/10), the gate is INCLUSIVE (>=) and the proposal is DROPPED (owner decision: boundary is >=, pinned exactly, not approximately)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 800, agentComputeMeasuredRuns: 8, agentComputeUnmeasuredRuns: 2, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a large share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0, 'exactly 20% must be treated as AT the threshold, not below it -- the gate is >=')
+})
+
+test('optimise-cycle: JUST below the 20% boundary (19/100), the proposal SURVIVES -- the boundary is precise, not off by one (owner decision)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 8100, agentComputeMeasuredRuns: 81, agentComputeUnmeasuredRuns: 19, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a large share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1, '19% must survive -- one percentage point below the 20% threshold must not be treated as at it')
+})
+
+test('optimise-cycle: the segment ratio line renders for EVERY wall-clock segment unconditionally, even when no proposal cites or is dropped for any of them (owner decision: "always print the ratio, whether or not the gate fires")', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 500, ciWaitMeasuredRuns: 4, ciWaitUnmeasuredRuns: 1, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 900, agentComputeMeasuredRuns: 9, agentComputeUnmeasuredRuns: 1, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    // Deliberately the DEFAULT proposal (mentions no wall-clock segment at
+    // all, by name or tag) -- the gate never fires, no proposal is dropped,
+    // yet the ratio must still print for every segment.
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.match(result.report, /ci_wait:\s*1\/5 runs unmeasured \(20%\)/, 'ci_wait ratio must render even though nothing was dropped')
+  assert.match(result.report, /agent_compute:\s*1\/10 runs unmeasured \(10%\)/, 'agent_compute ratio must render even though nothing was dropped')
+  assert.match(result.report, /human_wait:\s*0\/0 runs unmeasured/, 'human_wait (zero activity) must still render its own line, a real zero, not silently omitted')
+})
+
 // ---- Review round-1 M6 (AC-DATA-8): a removal proposal citing a weakly-grounded CI job claim is dropped ----
 
 test('optimise-cycle: a removal-shaped proposal whose target names a CI job that is insufficientData/truncated/renameSuspect is dropped, naming the reason in the report (M6)', async () => {

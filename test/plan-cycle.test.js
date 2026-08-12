@@ -46,6 +46,20 @@ test('plan-cycle.js: normal completion preserves the existing return shape and a
   assert.ok(calls.find((c) => c.opts.label === 'ledger:write'))
 })
 
+// Coordinator, round-3 triage item 2 (lens-security's L-1): plan-cycle
+// also fans out to lenses, so the same live-ledger risk review-cycle's own
+// lens prompt already guards against (a lens probing ledger-append.mjs
+// from its own process, which resolves the MAIN checkout via
+// --git-common-dir regardless of who invokes it -- AC-DATA-1) applies here
+// too. Same mechanism, same wording.
+test('plan-cycle.js: every lens\'s prompt instructs it to export HARNESS_LEDGER_READONLY (a truthy value) before it probes ledger-append.mjs, so a lens\'s own mutation experiments never reach the operator\'s real ledger', async () => {
+  const { calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
+  const lensCall = calls.find((c) => c.opts.label === 'lens-security')
+  assert.ok(lensCall, 'expected a lens-security call')
+  assert.match(lensCall.prompt, /HARNESS_LEDGER_READONLY/, 'the lens prompt must name the env var')
+  assert.match(lensCall.prompt, /export HARNESS_LEDGER_READONLY=1/i, 'the lens prompt must give a concrete, truthy export the lens can copy verbatim')
+})
+
 // L5: see review-cycle.js's identical test for the rationale -- nothing
 // previously asserted the FULL key set, so the internal __outcome sentinel
 // could leak into the public result unnoticed.

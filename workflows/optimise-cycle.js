@@ -24,6 +24,27 @@ const requestedWindow = typeof opts.window === 'number' && opts.window > 0 ? opt
 // helper trio is duplicated across the three PR1 workflows).
 const MIN_RECORDS_FOR_PROPOSALS = 5
 
+// Owner decision, round-3 coordinator triage (Scott's own design correction,
+// not a review finding): the wall-clock suppression gate below (see
+// isUnmeasuredSegmentMotivated) previously fired on PRESENCE -- >=1
+// unmeasured run anywhere in a segment's window suppressed EVERY proposal
+// motivated by that segment. Since a routine, correctly-handled aborted run
+// is exactly what produces an unmeasured run (AC-QA-8's exception guard),
+// one ordinary crash in an otherwise healthy window (measured: 9 healthy
+// runs + 1 routine abort => unmeasuredRuns=1) permanently disabled the
+// entire wall-clock proposal lane -- the analysis this whole programme
+// exists to produce (whether more concurrent agents would help). Gating on
+// PROPORTION instead: only suppress when the unmeasured/aborted share of
+// the segment's window meets or exceeds this threshold. The boundary is
+// INCLUSIVE (>=), not exclusive (>): chosen to match the old gate's own
+// inclusive count (>=1) and to err toward caution, since a false
+// suppression only delays an analysis a future cycle can still produce,
+// while a false pass could ship a proposal built on a window that turns
+// out to be mostly unmeasured. Not configurable (AC-SIMP-2, amended by the
+// owner to forbid new USER-FACING settings): a single named internal
+// constant, the same discipline as MIN_RECORDS_FOR_PROPOSALS above.
+const UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD = 0.2
+
 // The optimiser's own report artefact: the ONE file any of its agent steps
 // may create or modify (AC-SEC-9), written into the CURRENT repo (the one
 // /optimise-cycle was invoked in), documented in README.md. Not
@@ -483,6 +504,27 @@ function segmentUnmeasuredRuns(segment) {
   const v = wallClockTotals[`${prefix}UnmeasuredRuns`]
   return typeof v === 'number' ? v : 0
 }
+function segmentMeasuredRuns(segment) {
+  const prefix = WALL_CLOCK_SEGMENT_FIELD_PREFIX[segment]
+  if (!prefix) return 0
+  const v = wallClockTotals[`${prefix}MeasuredRuns`]
+  return typeof v === 'number' ? v : 0
+}
+// The window's total attempts for a segment: measured + unmeasured (the
+// latter already counts an aborted pair a second time, see H1's own
+// comment further up this file -- deliberate, so this total is "every
+// attempt the window saw", not merely "every attempt with a usable
+// duration".
+function segmentTotalRuns(segment) {
+  return segmentMeasuredRuns(segment) + segmentUnmeasuredRuns(segment)
+}
+// A segment with zero total attempts has nothing to be uncertain ABOUT --
+// share is 0, not NaN/undefined, so the gate below never suppresses on a
+// segment nobody has touched yet.
+function segmentUnmeasuredShare(segment) {
+  const total = segmentTotalRuns(segment)
+  return total > 0 ? segmentUnmeasuredRuns(segment) / total : 0
+}
 // Round-3 F4: the typed `target.segment` tag alone made this gate
 // agent-tag-dependent -- a proposal genuinely motivated by a null segment
 // but drafted without setting the tag (the prompt only asks for it "if
@@ -498,7 +540,7 @@ function motivatingSegments(p) {
   return [...new Set([...tagged, ...mentioned])]
 }
 function isUnmeasuredSegmentMotivated(p) {
-  return motivatingSegments(p).some((seg) => segmentUnmeasuredRuns(seg) >= 1)
+  return motivatingSegments(p).some((seg) => segmentUnmeasuredShare(seg) >= UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD)
 }
 const droppedUnmeasuredSegment = proposals.filter(isUnmeasuredSegmentMotivated)
 proposals = proposals.filter((p) => !isUnmeasuredSegmentMotivated(p))
@@ -619,9 +661,24 @@ const reportMarkdown = buildReport({
   // (which may be unset for a free-text-caught proposal).
   droppedUnmeasuredSegmentDetails: droppedUnmeasuredSegment.flatMap((p) =>
     motivatingSegments(p)
-      .filter((seg) => segmentUnmeasuredRuns(seg) >= 1)
+      .filter((seg) => segmentUnmeasuredShare(seg) >= UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD)
       .map((seg) => ({ segment: seg, unmeasuredRuns: segmentUnmeasuredRuns(seg) }))
   ),
+  // Owner decision: the ratio must always print, whether or not the gate
+  // fires for anything this cycle -- an operator must be able to see how
+  // close to the brake every segment is, not only the segment(s) that
+  // happened to suppress a proposal.
+  segmentUnmeasuredRatios: WALL_CLOCK_SEGMENTS.map((seg) => ({
+    segment: seg,
+    unmeasuredRuns: segmentUnmeasuredRuns(seg),
+    totalRuns: segmentTotalRuns(seg),
+    // undefined when the reader's totals object never carried this
+    // segment's fields at all (a stale installed optimise-read.mjs) --
+    // distinguishable from a genuine 0/0, matching H-1's own convention.
+    measuredFieldPresent: wallClockTotals[`${WALL_CLOCK_SEGMENT_FIELD_PREFIX[seg]}MeasuredRuns`] !== undefined,
+    unmeasuredFieldPresent: wallClockTotals[`${WALL_CLOCK_SEGMENT_FIELD_PREFIX[seg]}UnmeasuredRuns`] !== undefined,
+    suppressed: segmentUnmeasuredShare(seg) >= UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD,
+  })),
   droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
   ranked,
   insufficientDataProposals,
@@ -934,6 +991,24 @@ function buildReport(d) {
   for (const p of d.insufficientDataProposals) lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
   lines.push('')
   lines.push('## Filtering')
+  // Owner decision, round-3 coordinator triage: the suppression gate now
+  // fires on the unmeasured/aborted SHARE of a segment's window, not mere
+  // presence -- an operator must be able to see how close to the brake
+  // every segment is, whether or not the gate actually dropped anything
+  // this cycle, so this renders unconditionally for all three wall-clock
+  // segments (never only the ones that caused a drop).
+  const thresholdPct = Math.round(UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD * 100)
+  for (const entry of d.segmentUnmeasuredRatios || []) {
+    if (!entry.measuredFieldPresent || !entry.unmeasuredFieldPresent) {
+      lines.push(`${entry.segment}: ${UNAVAILABLE_STALE_READER}`)
+      continue
+    }
+    const pct = entry.totalRuns > 0 ? Math.round((entry.unmeasuredRuns / entry.totalRuns) * 100) : 0
+    const verdict = entry.suppressed
+      ? `at/above the ${thresholdPct}% suppression threshold: wall-clock proposals citing this segment are suppressed`
+      : `below the ${thresholdPct}% suppression threshold`
+    lines.push(`${entry.segment}: ${entry.unmeasuredRuns}/${entry.totalRuns} runs unmeasured (${pct}%) -- ${verdict}`)
+  }
   // Round-2 L2: name the specific segment(s) and their exact unmeasured-run
   // count that caused a drop, not just a bare count of dropped proposals --
   // an operator reading this line could not previously tell WHICH segment
