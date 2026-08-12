@@ -461,6 +461,24 @@ test('review-cycle.js: a finding\'s ac_id survives into open_findings when a len
   assert.equal(payload.open_findings[0].ac_id, 'AC-SEC-3', 'a lens-supplied ac_id must survive, not be discarded to null')
 })
 
+// Review round-2, new harness-level finding: during review round 2, a lens
+// wrote two TEST-FIXTURE records into the live ledger while probing
+// ledger-append.mjs -- lenses are specified read-only, but the writer
+// resolves the MAIN checkout via --git-common-dir (AC-DATA-1) regardless of
+// which worktree invoked it, so a lens's own probe from its isolated
+// worktree still lands in the operator's real ledger. ledger-append.mjs now
+// honours HARNESS_LEDGER_READONLY (see its own tests); this is the other
+// half -- every lens must be TOLD to export it before it probes the writer.
+// This is prompt-enforced at the lens boundary, not fully mechanical: a
+// lens that ignores its own instructions is not stopped by this alone.
+test('review-cycle.js: every lens\'s prompt instructs it to export HARNESS_LEDGER_READONLY (a truthy value) before it probes ledger-append.mjs, so a lens\'s own mutation experiments never reach the operator\'s real ledger', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const lensCall = calls.find((c) => c.opts.label === 'lens-security')
+  assert.ok(lensCall, 'expected a lens-security call')
+  assert.match(lensCall.prompt, /HARNESS_LEDGER_READONLY/, 'the lens prompt must name the env var')
+  assert.match(lensCall.prompt, /export HARNESS_LEDGER_READONLY=1/i, 'the lens prompt must give a concrete, truthy export the lens can copy verbatim')
+})
+
 // HARN-OPT-2 PR2 (AC-QA-8, AC-OPS-1, AC-ARCH-9): the measured defect. See
 // tdd-task.test.js for the identical pattern and its rationale -- an
 // exception thrown by an agent() call inside run() previously escaped past

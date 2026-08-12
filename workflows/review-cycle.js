@@ -332,6 +332,10 @@ const lensPrompt = (lens) =>
   `The worktree will not contain uncommitted tooling from the main checkout (virtualenvs, node_modules); if you need the ` +
   `project's interpreter or test runner, invoke the main checkout's copy by absolute path (locate the main checkout ` +
   `with \`cd "$(git rev-parse --git-common-dir)/.." && pwd\`), and never modify anything under the main checkout.\n\n` +
+  `Before you run or invoke workflows/lib/ledger-append.mjs for ANY reason (a mutation experiment, a manual probe, ` +
+  `reading its behaviour): export HARNESS_LEDGER_READONLY=1 in that shell first. That script resolves the operator's ` +
+  `real, main-checkout ledger regardless of which worktree invokes it (AC-DATA-1), so without this it is not a test ` +
+  `double, it is the live ledger. You are read-only: never write to the harness's own ledger.\n\n` +
   `Your final structured output maps the AGENT-HARNESS.md output contract onto the schema fields: verdict, coverage ` +
   `(could_not_check is mandatory and must be honest, not "nothing"), ac_verdicts, findings (each with file:line in location). ` +
   `You are licensed to return CLEAN with empty findings.`
