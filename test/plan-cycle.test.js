@@ -2,6 +2,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
+const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
 
 const WF = path.join(__dirname, '..', 'workflows', 'plan-cycle.js')
 
@@ -62,21 +63,33 @@ test('plan-cycle.js: the start-record ledger write is the very first agent() cal
   assert.equal(calls[1].opts.label, 'scope:spec', 'the second call must be the first real work step, not another ledger write')
 })
 
-test('plan-cycle.js: the "scope agent failed" early return (line 48 historically) still reaches the ledger write, with outcome aborted (AC-ARCH-3)', async () => {
-  const { result, calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'scope:spec': undefined }) })
+// AC-QA-9: distinct run_ids per call, and the terminal request checked
+// against the START write's run_id, not just a call count -- see
+// tdd-task.test.js's parametrized version for the identical rationale.
+const PAIRED_LEDGER = [
+  { run_id: 'return-path-start', ts: 't1', write_ok: true, write_error: null },
+  { run_id: 'return-path-terminal', ts: 't2', write_ok: true, write_error: null },
+]
+
+test('plan-cycle.js: the "scope agent failed" early return (line 48 historically) still reaches the ledger write, with outcome aborted, and the terminal write reuses the start run_id (AC-ARCH-3, AC-QA-9)', async () => {
+  const { result, calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'scope:spec': undefined, 'ledger:write': PAIRED_LEDGER }) })
   assert.equal(result.report, 'Scope agent failed; no plan produced.')
   assert.equal(result.telemetry.outcome, 'aborted')
-  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
+  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
 })
 
-test('plan-cycle.js: the "every lens agent failed" early return (line 98 historically) still reaches the ledger write, with outcome aborted (AC-ARCH-3)', async () => {
+test('plan-cycle.js: the "every lens agent failed" early return (line 98 historically) still reaches the ledger write, with outcome aborted, and the terminal write reuses the start run_id (AC-ARCH-3, AC-QA-9)', async () => {
   const { result, calls } = await runWorkflow(WF, {
     args: { spec: 'specs/foo.md' },
-    agent: baseAgent({ 'lens-security': undefined, 'lens-qa': undefined, 'lens-simplicity': undefined, 'lens-product': undefined }),
+    agent: baseAgent({ 'lens-security': undefined, 'lens-qa': undefined, 'lens-simplicity': undefined, 'lens-product': undefined, 'ledger:write': PAIRED_LEDGER }),
   })
   assert.equal(result.report, 'Every lens agent failed or was stopped; no plan produced.')
   assert.equal(result.telemetry.outcome, 'aborted')
-  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
+  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
 })
 
 // M1: a run whose synthesis:write-back agent fails (undefined response) or
@@ -123,4 +136,61 @@ test('plan-cycle.js: telemetry.budget_spent is null when no budget is supplied, 
   assert.equal(noBudget.result.telemetry.budget_spent, null)
   const withBudget = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent(), budget: { spent: () => 999 } })
   assert.equal(withBudget.result.telemetry.budget_spent, 999)
+})
+
+// HARN-OPT-2 PR2 (AC-QA-8, AC-OPS-1, AC-ARCH-9): the measured defect. See
+// tdd-task.test.js for the identical pattern and its rationale -- an
+// exception thrown by an agent() call inside run() previously escaped past
+// the single start/terminal ledger write entirely.
+test('plan-cycle.js: an exception thrown by an agent() call inside run() still produces exactly one terminal ledger write, carrying the start run_id and outcome aborted, AND the original error still reaches the caller (AC-QA-8, AC-OPS-1)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: { spec: 'specs/foo.md' },
+        agent: baseAgent({
+          'scope:spec': () => { throw new Error('agent step crashed mid-run') },
+          'ledger:write': [
+            { run_id: 'start-abc', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'terminal-abc', ts: 't2', write_ok: true, write_error: null },
+          ],
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /agent step crashed mid-run/, 'the ORIGINAL error must reach the caller unchanged')
+      const ledgerCalls = err.calls.filter((c) => c.opts.label === 'ledger:write')
+      assert.equal(ledgerCalls.length, 2, `expected one start write + one terminal write even though run() threw, got ${ledgerCalls.length}`)
+      const startPayload = extractLedgerPayload(ledgerCalls[0].prompt)
+      const terminalPayload = extractLedgerPayload(ledgerCalls[1].prompt)
+      assert.ok(!('run_id' in startPayload), 'the start write does not request an existing run_id')
+      assert.equal(terminalPayload.run_id, 'start-abc', 'the terminal write must reuse the start run_id')
+      assert.equal(terminalPayload.outcome, 'aborted', 'a thrown run() must never be recorded as done or blocked (AC-QA-12)')
+      assert.ok(
+        err.logs.some((l) => l.includes('start-abc') && l.includes('agent step crashed mid-run')),
+        `expected one log line naming the run_id and the failure, got ${JSON.stringify(err.logs)}`
+      )
+      return true
+    }
+  )
+})
+
+test('plan-cycle.js: the original error still reaches the caller even when the terminal ledger write ALSO fails (AC-OPS-1: never swallowed by a failure of the terminal write itself)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: { spec: 'specs/foo.md' },
+        agent: baseAgent({
+          'scope:spec': () => { throw new Error('body boom') },
+          'ledger:write': [
+            { run_id: 'start-xyz', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'irrelevant', ts: 't2', write_ok: false, write_error: 'disk full' },
+          ],
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /body boom/, 'the run() error must win, not a ledger-write-failure error')
+      const ledgerCalls = err.calls.filter((c) => c.opts.label === 'ledger:write')
+      assert.equal(ledgerCalls.length, 2, 'a failing terminal write must still be ATTEMPTED before the original error is re-thrown')
+      return true
+    }
+  )
 })

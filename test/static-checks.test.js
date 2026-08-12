@@ -222,3 +222,69 @@ test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, le
   assert.equal(review, tdd, 'review-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
   assert.equal(plan, tdd, 'plan-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
 })
+
+// HARN-OPT-2 PR2 (AC-ARCH-9): the start/terminal exception-guard block PR 2
+// added (an exception escaping run() must still reach the single terminal
+// writeLedger( call, then re-throw) is a SECOND necessarily-triplicated
+// block, mirroring L5 above -- without a guard pinning it, a fix landed in
+// one or two copies fails silently in the third, exactly the C1 failure
+// class this file already guards against for the run-ledger helper trio.
+test('static: PR2 -- the exception-guard block wrapping `await run()` (the try/catch that produces a terminal write even when run() throws, then re-throws the original error) is byte-identical across all three workflow files (AC-ARCH-9)', () => {
+  function extractGuardBlock(fileName) {
+    const contents = readAll('workflows', fileName)
+    const lines = contents.split('\n')
+    const start = lines.findIndex((l) => l.startsWith('// PR 2 (AC-QA-8, AC-ARCH-9): an exception escaping run() must still'))
+    const end = lines.findIndex((l, i) => i > start && l.trim() === '} // end PR 2 exception guard')
+    assert.ok(start >= 0 && end > start, `${fileName}: could not locate the PR2 exception-guard block markers`)
+    return lines.slice(start, end + 1).join('\n')
+  }
+  const tdd = extractGuardBlock('tdd-task.js')
+  const review = extractGuardBlock('review-cycle.js')
+  const plan = extractGuardBlock('plan-cycle.js')
+  assert.ok(tdd.length > 300, 'sanity: the extracted block should be substantial, not an empty match')
+  assert.equal(review, tdd, 'review-cycle.js\'s PR2 exception-guard block has drifted from tdd-task.js\'s')
+  assert.equal(plan, tdd, 'plan-cycle.js\'s PR2 exception-guard block has drifted from tdd-task.js\'s')
+})
+
+// The re-throw itself sits after the (per-file-diverging) telemetry-build
+// and terminal writeLedger( call, so it cannot live inside the block above
+// -- pinned separately, as its own one-line-plus-return byte-identical pair.
+test('static: PR2 -- the re-throw line (`if (runError) throw runError`) immediately preceding the final `return { ...result, telemetry }` is byte-identical across all three workflow files (AC-ARCH-9)', () => {
+  const REQUIRED = 'if (runError) throw runError\nreturn { ...result, telemetry }'
+  for (const f of ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js']) {
+    const contents = readAll(...f.split('/'))
+    assert.ok(contents.includes(REQUIRED), `${f} must contain the exact re-throw-then-return pair:\n${REQUIRED}`)
+  }
+})
+
+// AC-QA-9: "a static test that fails when a new return is added inside
+// run() without a matching pairing test, so the enumeration cannot go
+// stale". Every terminating `return` inside each workflow's run() is
+// written as `return {` (an object literal), consistently, everywhere in
+// this codebase -- confirmed by grep. Pinning the COUNT of that pattern
+// inside run()'s own body means adding a new terminating return silently
+// changes the count and fails this test, forcing whoever adds it to also
+// come here and to tdd-task.test.js/review-cycle.test.js/plan-cycle.test.js
+// (each of which has one test per return path, named by case) rather than
+// leaving the new path unpaired with a ledger-write assertion.
+test('static: AC-QA-9 -- the number of terminating `return {` statements inside each workflow\'s run() function is pinned, so a new return path added without a matching pairing test fails this check instead of silently going unpaired', () => {
+  function countReturnsInRun(fileName) {
+    const contents = readAll('workflows', fileName)
+    const lines = contents.split('\n')
+    const start = lines.findIndex((l) => l.trim() === 'async function run() {')
+    const end = lines.findIndex((l, i) => i > start && l.trim() === '} // end run()')
+    assert.ok(start >= 0 && end > start, `${fileName}: could not locate the run() function markers`)
+    const body = lines.slice(start, end + 1).join('\n')
+    return (body.match(/return\s*\{/g) || []).length
+  }
+  // tdd-task.js: 4 ABORTED, 3 BLOCKED (2 max-attempts exhaustions + the
+  // hashes-changed short-circuit), 1 DONE -- see the 8-case table in
+  // tdd-task.test.js's "every terminating return" test.
+  assert.equal(countReturnsInRun('tdd-task.js'), 8, 'tdd-task.js run() must have exactly 8 terminating returns; if you added one, add its pairing test too')
+  // review-cycle.js: the no-op (no changes found), the every-lens-failed
+  // abort, and the main synthesis return.
+  assert.equal(countReturnsInRun('review-cycle.js'), 3, 'review-cycle.js run() must have exactly 3 terminating returns; if you added one, add its pairing test too')
+  // plan-cycle.js: the scope-agent-failed abort, the every-lens-failed
+  // abort, and the main synthesis return.
+  assert.equal(countReturnsInRun('plan-cycle.js'), 3, 'plan-cycle.js run() must have exactly 3 terminating returns; if you added one, add its pairing test too')
+})

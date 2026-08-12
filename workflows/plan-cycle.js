@@ -237,7 +237,22 @@ return {
 const startWrite = await writeLedger({ kind: 'plan_cycle', outcome: 'started', spec: specPath })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
-const raw = await run()
+// PR 2 (AC-QA-8, AC-ARCH-9): an exception escaping run() must still
+// produce exactly one terminal ledger write, carrying the existing
+// aborted outcome via the SAME mapping site below -- never a second
+// writeLedger( call site (AC-SIMP-7) and never a fabricated 'done'
+// (AC-QA-12). The original error is re-thrown after the write so it still
+// reaches the caller (AC-OPS-1), never swallowed by a failing terminal
+// write (writeLedger itself never throws, see above).
+let runError = null
+let raw
+try {
+  raw = await run()
+} catch (e) {
+  runError = e
+  raw = {}
+  log(`Run ${startRunId || 'unknown'} threw before producing a result: ${e && e.message ? e.message : String(e)}`)
+} // end PR 2 exception guard
 const { __outcome, ...result } = raw
 const telemetry = {
   outcome: __outcome || 'aborted',
@@ -250,4 +265,5 @@ const telemetry = {
 const terminalEntry = { kind: 'plan_cycle', ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
 await writeLedger(terminalEntry)
+if (runError) throw runError
 return { ...result, telemetry }
