@@ -435,29 +435,35 @@ test('ledger-append: free-text fields are truncated to MAX_LINE_BYTES before the
   assert.ok(byteLen <= 2048, `line was ${byteLen} bytes`)
 })
 
-test('ledger-append: truncation is BYTE-based, not character-based, so two multibyte fields together cannot push the line over the cap (M2)', () => {
+test('ledger-append: truncation is BYTE-based, not character-based, so three multibyte fields together cannot push the line over the cap (M2)', () => {
   const repo = makeTempRepo()
   // Each character here is 3 bytes in UTF-8 (the maximum for a single
   // UTF-16 code unit), so a single field character-truncated to 500 caps
-  // at 1500 bytes -- comfortably under 2048 alone, which is exactly why a
-  // single-field test does not distinguish byte- from character-based
-  // truncation. TWO such fields character-truncated to 500 each total
-  // 3000 bytes, reliably over the cap regardless of a small envelope;
-  // byte-truncated to 500 BYTES each, they total ~1000 bytes, comfortably
-  // under it.
+  // at 1500 bytes -- comfortably under the threshold alone, which is
+  // exactly why a single-field test does not distinguish byte- from
+  // character-based truncation. THREE such fields (task, spec and --
+  // round 5, H-B -- spec_raw, which retains the caller's un-truncated
+  // string until this same byte-based pass runs) character-truncated to
+  // 500 each would total 4500 bytes, reliably over a 2048 threshold
+  // regardless of a small envelope; byte-truncated to 500 BYTES each, they
+  // total ~1500 bytes, comfortably under the wider threshold below (a real
+  // measured line here is ~2.2 KB -- the threshold is set with headroom
+  // above that, not tuned to the exact number, and stays far under
+  // MAX_LINE_BYTES=16384).
   const task = 'あ'.repeat(2000)
   const spec = 'い'.repeat(2000)
   const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', task, spec })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const line = readLedgerLines(repo)[0]
-  assert.ok(Buffer.byteLength(line, 'utf8') <= 2048, `line was ${Buffer.byteLength(line, 'utf8')} bytes`)
+  assert.ok(Buffer.byteLength(line, 'utf8') <= 3000, `line was ${Buffer.byteLength(line, 'utf8')} bytes`)
   const entry = JSON.parse(line)
-  assert.ok(!entry.degraded, 'byte-based truncation of both fields must be enough to fit without degrading')
+  assert.ok(!entry.degraded, 'byte-based truncation of all three fields must be enough to fit without degrading')
   // the truncated fields must still be valid, well-formed text (no lone
   // surrogate / replacement-character corruption from an unsafe byte slice)
   assert.doesNotThrow(() => Buffer.from(entry.task, 'utf8').toString('utf8'))
   assert.doesNotThrow(() => Buffer.from(entry.spec, 'utf8').toString('utf8'))
+  assert.doesNotThrow(() => Buffer.from(entry.spec_raw, 'utf8').toString('utf8'))
 })
 
 test('ledger-append: a findings array beyond the stated bound is truncated, with findings_truncated recording exactly how many were dropped (M2)', () => {
@@ -752,17 +758,20 @@ test('ledger-append: a real ledger line contains no personal identifier -- not t
   assert.equal(entry.repo, path.basename(repo), 'repo identity is a bare dir name, not an absolute path')
 })
 
-test('ledger-append: an absolute spec path UNDER the repo root is relativised, not rejected, and never appears absolute in the line (H2, AC-SEC-3)', () => {
+test('ledger-append: an absolute spec path UNDER the repo root is relativised (spec/plan_key), never rejected -- the RAW absolute form is retained separately, in spec_raw only (H2, AC-SEC-3, round 5 H-B)', () => {
   const repo = makeTempRepo()
   const absoluteSpec = path.join(repo, 'specs', 'optimise-cycle.md')
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
-  const line = readLedgerLines(repo)[0]
-  assertNoAbsolutePaths(line, 'relativised spec')
-  assert.ok(!line.includes(repo), 'the line must not contain the repo\'s own absolute temp-dir path either')
-  const entry = JSON.parse(line)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.spec, 'specs/optimise-cycle.md', 'spec must be relativised against the repo root')
+  assert.equal(entry.plan_key, 'specs/optimise-cycle.md', 'plan_key must never be the absolute form either')
+  // Round 5 (H-B): spec_raw is the ONE field allowed to carry the caller's
+  // absolute form verbatim -- this is deliberate (AC-DATA-4 recoverability),
+  // not a regression of H2/AC-SEC-3, which govern spec/plan_key and the
+  // OUTPUT boundary (the reader never emits spec_raw -- see optimise-read.mjs).
+  assert.equal(entry.spec_raw, absoluteSpec, 'spec_raw must retain the caller\'s original absolute string verbatim')
 })
 
 test('ledger-append: a task string containing an embedded absolute path has that path relativised/redacted, never left absolute, in the line (H2, AC-SEC-3)', () => {
@@ -1420,20 +1429,18 @@ test('ledger-append (round-2 H3): an absolute spec path reached THROUGH the same
   assert.equal(entry.plan_key, 'specs/a.md', `got ${JSON.stringify(entry.plan_key)}`)
 })
 
-// Round 4: the test above passed even before the dirname-realpath fix,
-// because its cwd IS the repo root itself -- the PWD candidate, set to the
-// same symlinked string as the spec's own prefix, matched by simple prefix
-// comparison. That accidentally covered the narrower case, and is exactly
-// why the coordinator's own, more thorough probe (cwd one level further
-// down, inside a real "sub" directory) still found `spec: '<redacted-path>'`
-// -- PWD (repo/sub) is not a prefix of a spec rooted at repo/specs/a.md, no
-// matter how many ancestor-realpath candidates exist for root/cwdRoot
-// themselves (both already real; trying their own realpath forms, round
-// 3's now-removed realpathOrNull, never helped this case either). This is
-// the fixture that actually forces the fix: an absolute spec built from the
-// SYMLINKED repo path, submitted from a REAL SUBDIRECTORY of that same repo
-// -- a file genuinely inside the working tree, not a hypothetical.
-test('ledger-append (round-4 H3): an absolute spec through a symlinked ancestor, submitted from a SUBDIRECTORY (not the repo root) of that same symlinked repo, still resolves to the true repo-relative key', () => {
+// Round 5 (H-A, REVERTED): round 4 added an fs.realpathSync.native call on
+// the spec's own directory in main() to resolve exactly this case. The
+// coordinator's own probe proved that made plan identity FILESYSTEM-STATE-
+// dependent (the IDENTICAL spec string recorded the marker before a
+// symlink existed on disk and the real key after one was created at the
+// same path) -- reverted entirely (see main()'s own comment at the H-A
+// call site). This case now records the out-of-repo marker, deterministically,
+// regardless of the symlink's cwd depth or existence on disk -- a known,
+// documented limitation (README), not a defect. Pinned here so a future
+// change cannot silently reintroduce the round-4 shape without this test
+// noticing.
+test('ledger-append (round 5, H-A pinned): an absolute spec through a symlinked ancestor, submitted from a SUBDIRECTORY of that same symlinked repo, records the out-of-repo marker -- a known, deterministic limitation, not the real key', () => {
   const { repo, sub } = makeSymlinkAncestorTempRepo()
   fs.mkdirSync(path.join(repo, 'specs'))
   fs.writeFileSync(path.join(repo, 'specs', 'a.md'), '# a\n')
@@ -1447,8 +1454,64 @@ test('ledger-append (round-4 H3): an absolute spec through a symlinked ancestor,
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.plan_key, 'specs/a.md', `got ${JSON.stringify(entry.plan_key)}, expected the true repo-relative key, not the marker`)
-  assert.notEqual(entry.spec, '<redacted-path>')
+  assert.equal(entry.plan_key, '<redacted-path>', `got ${JSON.stringify(entry.plan_key)} -- the accepted degradation is the marker, deterministically, not a filesystem-dependent guess`)
+  assert.equal(entry.spec, '<redacted-path>')
+})
+
+// Round 5 (H-A): the purity/byte-identity requirement (AC-ARCH-2, AC-SEC-2,
+// AC-DATA-3) is about the WRITE-TIME PIPELINE'S OWN BEHAVIOUR, not merely
+// about canonicalPlanKey's own function body staying free of fs calls --
+// round 4's violation lived entirely in main(), a DIFFERENT function, so a
+// static grep scoped to canonicalPlanKey's body (see the "canonicalPlanKey
+// is pure" test above) could never have caught it. These two tests run the
+// REAL writer end-to-end, twice, against genuinely different filesystem
+// states for the identical input, and assert byte-identical plan_key.
+test('ledger-append (round 5, H-A behavioural purity guard): the SAME absolute spec string yields the SAME plan_key through the real writer whether or not its TARGET FILE exists on disk', () => {
+  const repo = makeTempRepo()
+  const absoluteSpec = path.join(repo, 'specs', 'not-yet-created.md')
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec, run_id: 'before' })
+  fs.mkdirSync(path.join(repo, 'specs'), { recursive: true })
+  fs.writeFileSync(absoluteSpec, '# now it exists\n')
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec, run_id: 'after' })
+  const [before, after] = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.equal(before.plan_key, after.plan_key, `plan_key must not depend on whether the target file exists: before=${JSON.stringify(before.plan_key)}, after=${JSON.stringify(after.plan_key)}`)
+  assert.equal(before.plan_key, 'specs/not-yet-created.md')
+})
+
+test('ledger-append (round 5, H-A behavioural purity guard): the SAME absolute spec string, reached through an ANCESTOR SYMLINK path, yields the SAME plan_key through the real writer whether or not that symlink exists on disk yet -- the exact defect round 4 shipped and round 5 reverts', () => {
+  const realParent = fs.mkdtempSync(path.join(os.tmpdir(), 'h-a-purity-real-'))
+  const linkParent = fs.mkdtempSync(path.join(os.tmpdir(), 'h-a-purity-link-'))
+  trackTempDir(realParent)
+  trackTempDir(linkParent)
+  const realRepo = path.join(realParent, 'repo')
+  fs.mkdirSync(realRepo)
+  sh('git init -q -b main', realRepo)
+  sh('git config user.email test@example.com', realRepo)
+  sh('git config user.name Test', realRepo)
+  fs.writeFileSync(path.join(realRepo, 'README.md'), 'seed\n')
+  sh('git add README.md && git commit -q -m seed', realRepo)
+  fs.mkdirSync(path.join(realRepo, 'specs'))
+  fs.writeFileSync(path.join(realRepo, 'specs', 'a.md'), '# a\n')
+
+  const symlinkPath = path.join(linkParent, 'via-symlink')
+  const specViaSymlink = path.join(symlinkPath, 'specs', 'a.md')
+
+  // Run 1: the symlink does NOT exist yet. cwd is the REAL repo path (the
+  // symlink cannot be cd-ed into before it exists), so the writer's own
+  // root/cwdRoot are the real path -- the spec string, built from the
+  // not-yet-real symlinked path, cannot lexically match either.
+  runAppend(realRepo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: specViaSymlink, run_id: 'before-symlink' })
+
+  fs.symlinkSync(realRepo, symlinkPath, 'dir')
+
+  // Run 2: the IDENTICAL spec string, the symlink now genuinely resolves
+  // to the real repo -- but canonicalPlanKey does purely lexical matching,
+  // so this must produce the exact same result as run 1, not the real key.
+  runAppend(realRepo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: specViaSymlink, run_id: 'after-symlink' })
+
+  const [before, after] = readLedgerLines(realRepo).map((l) => JSON.parse(l))
+  assert.equal(before.plan_key, after.plan_key, `plan_key must not depend on whether the ancestor symlink exists: before=${JSON.stringify(before.plan_key)}, after=${JSON.stringify(after.plan_key)}`)
+  assert.equal(before.plan_key, '<redacted-path>', 'both runs must record the deterministic out-of-repo marker, never a filesystem-state-dependent real key')
 })
 
 // AC-DATA-3 case e, re-proven against the round-4 fix specifically: the
@@ -1567,12 +1630,14 @@ test('ledger-append: an absolute spec path authored INSIDE a worktree is recorde
     const res = runAppend(worktreeDir, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpecInWorktree })
     const out = JSON.parse(res.stdout.trim().split('\n').pop())
     assert.equal(out.write_ok, true, out.write_error)
-    const line = readLedgerLines(repo)[0]
-    assertNoAbsolutePaths(line, 'absolute spec authored inside a worktree')
-    const entry = JSON.parse(line)
+    const entry = JSON.parse(readLedgerLines(repo)[0])
     assert.equal(entry.spec, 'specs/a.md', 'must relativise against the WORKTREE\'s own root, not fall back to the redaction placeholder just because it is not under the main checkout root')
     assert.notEqual(entry.spec, '<redacted-path>', 'must never be the redaction placeholder for a path genuinely inside the current working tree')
     assert.equal(entry.plan_key, 'specs/a.md')
+    // Round 5 (H-B): spec_raw retains the worktree-absolute form verbatim,
+    // deliberately (AC-DATA-4) -- spec/plan_key staying relative is what
+    // H2/AC-SEC-3 actually require.
+    assert.equal(entry.spec_raw, absoluteSpecInWorktree)
 
     // The SAME plan, run from the main checkout with an equivalent relative
     // spec, must land under the identical plan_key -- proving the split is
@@ -1690,21 +1755,72 @@ test('ledger-append (round-2): an ordinary in-repo relative spec is unaffected (
 })
 
 // ---- Review round-2, reverting round-1 L2: event_key/task are no longer
-// scanned for a "../" escape at all -- redactRelativeEscapes is deleted.
-// This is C1's root cause fix: minting the occurrence suffix from a value
-// that then gets mangled by a SEPARATE destructive pass is what collapsed
-// four distinct conductor events onto one literal key. See the round-2 C1
-// reproduction test above for the end-to-end proof (4 events in, 4 lines
-// out). ----
+// scanned by a blind free-text REGEX for a "../" escape -- redactRelativeEscapes
+// is deleted. This is C1's root cause fix: minting the occurrence suffix
+// from a value that then gets mangled by a SEPARATE destructive regex pass
+// is what collapsed four distinct conductor events onto one literal key.
+// See the round-2 C1 reproduction test above for the end-to-end proof (4
+// events in, 4 lines out). ----
+//
+// Round 5 (H-C, AC-ARCH-6) supersedes this test's original expectation for
+// event_scope's PLAN-FILE segment specifically: that ONE segment is now
+// canonicalised through the same shared, structured, lexical
+// canonicalPlanKey `spec` itself uses (never a free-text regex) -- so a
+// "../" mention that genuinely ESCAPES every known root is deliberately
+// redacted, exactly matching spec's own AC-SEC-1 case-d protection, not a
+// reversion to round-1's regex-based destruction. task/round_key/event
+// (genuine free text) are UNCHANGED by this and stay verbatim -- see the
+// task-description test immediately below.
 
-test('ledger-append (round-2, reverting round-1 L2): a "../" mention inside a conduct_plan_event\'s event_scope is preserved verbatim in the minted event_key -- redactRelativeEscapes is gone', () => {
+test('ledger-append (round 5, H-C): an event_scope plan segment whose "../" segments escape every known root is redacted to the fixed marker -- matching spec\'s own AC-SEC-1 case-d protection, not a reversion to round-1\'s regex destruction', () => {
   const repo = makeTempRepo()
   const res = runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'ci_wait_started', event_scope: '../../../home/some-user/secret-plan.md:T1:ci_wait_started' })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.event_key, '../../../home/some-user/secret-plan.md:T1:ci_wait_started:1')
+  assert.equal(entry.event_key, '<redacted-path>:T1:ci_wait_started:1', `got ${JSON.stringify(entry.event_key)}`)
+  assert.ok(!JSON.stringify(entry).includes('secret-plan'), 'the hostile filename must never reach the ledger')
+  assert.ok(!JSON.stringify(entry).includes('/home/'), 'the hostile path segment must never reach the ledger')
   assert.equal(out.event_key, entry.event_key, 'the value returned to the caller matches what was actually stored')
+})
+
+test('ledger-append (round 5, H-C): a LEGITIMATE relative event_scope plan segment reached via ".." from a SUBDIRECTORY, naming a real in-repo file, resolves to its true repo-relative form -- the ancestor-escape protection above must not also catch this ordinary case (not vacuous, mirrors spec\'s own H1 fix)', () => {
+  const repo = makeTempRepo()
+  const subDir = path.join(repo, 'sub')
+  fs.mkdirSync(subDir)
+  const res = runAppend(subDir, { schema_version: 1, kind: 'conduct_plan_event', event: 'ci_wait_started', event_scope: '../specs/a.md:T1:ci_wait_started' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.event_key, 'specs/a.md:T1:ci_wait_started:1', `got ${JSON.stringify(entry.event_key)}`)
+})
+
+// The coordinator's own C1-remnant reproduction (AC-ARCH-6): before this
+// fix, occurrence was minted from the RAW event_scope prefix, so two
+// DISTINCT events sharing an absolute plan path but spelled identically
+// still counted correctly ONLY because their raw prefixes matched exactly
+// -- but the REST of the pipeline (the free-text redaction pass over
+// event_key, which knows nothing about the writer's candidate roots) could
+// still corrupt the stored key afterwards. Measured directly: two events
+// with an absolute event_scope used to produce ONE line (the second
+// silently read as a duplicate, write_ok: true), while the same two events
+// with a relative event_scope correctly produced two lines, :1 and :2.
+test('ledger-append (round 5, H-C, AC-ARCH-6): two DISTINCT conduct_plan_event payloads sharing the SAME absolute, in-repo event_scope plan path produce TWO lines with occurrence suffixes :1 and :2 -- never a silent duplicate', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, 'specs'))
+  fs.writeFileSync(path.join(repo, 'specs', 'a.md'), '# a\n')
+  const absoluteScope = path.join(repo, 'specs', 'a.md') + ':T1:ci_wait_started'
+  const out1 = JSON.parse(runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'ci_wait_started', event_scope: absoluteScope }).stdout.trim().split('\n').pop())
+  const out2 = JSON.parse(runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'ci_wait_started', event_scope: absoluteScope }).stdout.trim().split('\n').pop())
+  assert.equal(out1.write_ok, true, out1.write_error)
+  assert.equal(out2.write_ok, true, out2.write_error)
+  assert.ok(!out1.duplicate, `the first write must never be reported as a duplicate: ${JSON.stringify(out1)}`)
+  assert.ok(!out2.duplicate, `the second, genuinely distinct write must never be silently dropped as a duplicate: ${JSON.stringify(out2)}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 2, `expected 2 distinct lines on disk, got ${lines.length}`)
+  const eventKeys = lines.map((l) => JSON.parse(l).event_key)
+  assert.equal(eventKeys[0], 'specs/a.md:T1:ci_wait_started:1', `got ${JSON.stringify(eventKeys)}`)
+  assert.equal(eventKeys[1], 'specs/a.md:T1:ci_wait_started:2', `got ${JSON.stringify(eventKeys)}`)
 })
 
 test('ledger-append (round-2, reverting round-1 L2): a "../" mention inside a task description is preserved verbatim, prose and all', () => {
@@ -1775,15 +1891,35 @@ test('ledger-append: a spec path that is a SYMLINK inside the repo keeps its own
   assert.equal(entry.plan_key, 'specs/link.md', 'the canonical key is the symlink\'s own lexical path, never /etc/passwd')
 })
 
-test('ledger-append: plan_key is retained alongside the redacted, repo-relative spec string -- re-deriving canonicalPlanKey from the retained spec field alone reproduces the stored plan_key (AC-DATA-4)', async () => {
-  const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
+// Round 5 (H-B): the original version of this test re-derived
+// canonicalPlanKey from `entry.spec` -- but `entry.spec` is ALREADY the
+// canonical key (it is overwritten with plan_key at write time), so
+// "re-deriving" from it was really just checking canonicalPlanKey is
+// idempotent on its own output, which any function satisfies trivially,
+// including a broken one. Proven vacuous by mutation: appending
+// `.toLowerCase()` to canonicalPlanKey's return (a canonicaliser that
+// silently merges two plans differing only in case into one) left this
+// test green, because BOTH sides of the comparison called the SAME
+// (mutated) function and therefore agreed with each other regardless of
+// whether the shared answer was correct. Fixed two ways: (1) the fixture
+// input's canonical form must actually DIFFER from its raw retained form,
+// or the test proves nothing about recoverability; (2) both sides assert
+// against a HAND-DERIVED, HARDCODED expected value -- not against each
+// other -- so a mutation that corrupts canonicalPlanKey uniformly (as
+// .toLowerCase() does) still trips a literal-string mismatch.
+test('ledger-append (round 5, H-B, AC-DATA-4): plan_key is independently re-derivable from the RETAINED RAW spec (spec_raw), for an input whose canonical form actually differs from the raw string -- not vacuous', async () => {
   const repo = makeTempRepo()
-  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/../specs/awkward.md' })
+  const rawSpec = 'specs/../Specs/Awkward.md'
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: rawSpec })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.plan_key, 'specs/awkward.md', 'the canonical key must collapse the ../ segment')
-  assert.equal(canonicalPlanKey(entry.spec, ''), entry.plan_key, 'a canonicaliser defect must be correctable on READ from the retained spec field alone, without rewriting the append-only ledger')
+  assert.equal(entry.spec_raw, rawSpec, `the caller's raw string must be retained verbatim, got ${JSON.stringify(entry.spec_raw)}`)
+  assert.notEqual(entry.spec_raw, entry.plan_key, 'the fixture must exercise a case where the canonical form DIFFERS from the raw retained value, or recoverability cannot be distinguished from mere idempotence')
+  const expectedCanonical = 'Specs/Awkward.md'
+  assert.equal(entry.plan_key, expectedCanonical, 'the writer\'s own canonicalisation must collapse "specs/../" and nothing else -- case preserved, a literal expectation, not a recomputation')
+  const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
+  assert.equal(canonicalPlanKey(entry.spec_raw, repo), expectedCanonical, 'a canonicaliser defect must be correctable by re-running canonicalPlanKey against the RETAINED RAW field alone -- checked against the SAME hardcoded literal, not against entry.plan_key')
 })
 
 test('ledger-append: a genuinely well-formed repo-relative spec is unaffected -- plan_key equals the spec as-is, and it is not the out-of-repo marker (not vacuous)', () => {

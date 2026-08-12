@@ -273,6 +273,33 @@ telemetry-only, and fully preventable by the exclusion above. This is a
 deliberate, accepted trade-off, not an oversight: AC-DATA-4's git-clean-
 survival clause is an accepted FAIL for this path.
 
+**Known limitations**: an absolute `spec` path reached through a
+**symlinked ANCESTOR directory** (e.g. a checkout cloned at, or accessed
+via, a symlink somewhere above the repo root) records the out-of-repo
+marker (`<redacted-path>`) rather than its true repo-relative key, even
+though the file is genuinely inside the working tree. `plan_key` derivation
+is deliberately **lexical only** — it compares the literal spec string
+against known root strings, never resolving a symlink to check where it
+actually points (AC-DATA-3, AC-SEC-2) — because the alternative (resolving
+the spec's real path before matching) makes plan identity depend on
+filesystem STATE at the moment of the write: the identical spec string
+would record differently depending on whether a symlink happened to exist
+on disk yet, which is worse than a narrow, deterministic degradation. Two
+mitigations already avoid the common cases: a *relative* spec (or one
+reached via `..` from a subdirectory) resolves correctly regardless of
+symlinks, since it is matched against the writer's own already-resolved
+`cwd`; and an absolute spec reached through a symlinked `cwd` **itself**
+(not merely an ancestor) resolves correctly via the `PWD`-inode-match
+candidate. Only the specific combination — an absolute spec, built from a
+symlinked path, submitted from somewhere other than that exact symlinked
+directory — hits the marker. The ledger's `spec_raw` field (AC-DATA-4: the
+caller's original spec string, retained verbatim alongside the derived
+`plan_key`, so a canonicaliser defect is correctable without replaying the
+original caller) keeps the original string recoverable regardless, though
+retained only when a canonical key was actually derived — a genuinely
+out-of-repo or `..`-escaping spec is never retained raw, matching
+`spec`/`plan_key`'s own redaction (AC-SEC-1).
+
 ## Delivery optimiser
 
 `/optimise-cycle` (`workflows/optimise-cycle.js` + `skills/optimise-cycle/`)
