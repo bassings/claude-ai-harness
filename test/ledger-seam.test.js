@@ -180,6 +180,88 @@ test('seam: a real tdd_task run\'s start AND terminal payloads, BOTH piped throu
   assert.equal(result.totals.agentComputeUnmeasuredRuns, 0, 'a genuine, real-generated-run_id pair must never be counted as unmeasured')
 })
 
+// Review round-1 L5: the three AC-QA-8 tests in tdd-task.test.js/
+// review-cycle.test.js/plan-cycle.test.js script the ledger:write response,
+// so the payload the exception-guard's THROW path builds was never
+// actually validated by the real ledger-append.mjs -- only checked by
+// hand, off-suite. If a future field were added to the terminal telemetry
+// that the schema rejects on the abort path only, every test would stay
+// green and the terminal record would be silently lost in production: the
+// same class of gap this PR exists to close. Extends the AC-QA-10 seam
+// pattern to the throw path specifically, for all three workflows.
+function throwPathPayloads(err) {
+  const ledgerCalls = err.calls.filter((c) => c.opts.label === 'ledger:write')
+  assert.equal(ledgerCalls.length, 2, `expected a start write and a terminal write on the throw path, got ${ledgerCalls.length}`)
+  const start = extractLedgerPayload(ledgerCalls[0].prompt)
+  const terminal = extractLedgerPayload(ledgerCalls[1].prompt)
+  assert.ok(!('run_id' in start))
+  return { start, terminal }
+}
+
+function pipeThrowPathAndAssert(err, label) {
+  const { start, terminal } = throwPathPayloads(err)
+  const repo = makeTempRepo()
+  const startRes = runAppend(repo, start)
+  const startOut = JSON.parse(startRes.stdout.trim().split('\n').pop())
+  assert.equal(startOut.write_ok, true, `${label}: real writer refused the throw path's START payload: ${startOut.write_error}`)
+  // The terminal payload requests reuse of the run_id the REAL writer just
+  // generated for the start write, exactly as production would feed it back.
+  const terminalWithRealRunId = { ...terminal, run_id: startOut.run_id }
+  const terminalRes = runAppend(repo, terminalWithRealRunId)
+  const terminalOut = JSON.parse(terminalRes.stdout.trim().split('\n').pop())
+  assert.equal(terminalOut.write_ok, true, `${label}: real writer refused the throw path's TERMINAL payload: ${terminalOut.write_error}`)
+  const lines = readLedgerLines(repo).map((l) => JSON.parse(l))
+  assert.equal(lines.length, 2)
+  assert.equal(lines[0].run_id, lines[1].run_id, 'both lines must share the real generated run_id')
+  assert.equal(lines[0].outcome, 'started')
+  assert.equal(lines[1].outcome, 'aborted', 'the throw path\'s terminal outcome must be aborted, real writer agreeing (AC-QA-12)')
+}
+
+test('seam: tdd_task\'s THROW-path start AND terminal payloads (built by the try/catch exception guard, never by a normal return) are BOTH accepted by the real ledger-append.mjs, producing two lines sharing one run_id with terminal outcome aborted (L5, AC-QA-10/AC-QA-8)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'tdd-task.js')
+  let caught
+  try {
+    await runWorkflow(WF, {
+      args: { task: 'seam throw proof', spec: 'specs/seam-throw.md' },
+      agent: { 'write-test#1': () => { throw new Error('seam throw proof') }, 'ledger:write': LEDGER_OK },
+    })
+  } catch (e) {
+    caught = e
+  }
+  assert.ok(caught, 'expected the workflow to throw')
+  pipeThrowPathAndAssert(caught, 'tdd_task')
+})
+
+test('seam: review_cycle\'s THROW-path start AND terminal payloads are BOTH accepted by the real ledger-append.mjs, producing two lines sharing one run_id with terminal outcome aborted (L5, AC-QA-10/AC-QA-8)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
+  let caught
+  try {
+    await runWorkflow(WF, {
+      args: {},
+      agent: { 'scope:diff': () => { throw new Error('seam throw proof') }, 'ledger:write': LEDGER_OK },
+    })
+  } catch (e) {
+    caught = e
+  }
+  assert.ok(caught, 'expected the workflow to throw')
+  pipeThrowPathAndAssert(caught, 'review_cycle')
+})
+
+test('seam: plan_cycle\'s THROW-path start AND terminal payloads are BOTH accepted by the real ledger-append.mjs, producing two lines sharing one run_id with terminal outcome aborted (L5, AC-QA-10/AC-QA-8)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'plan-cycle.js')
+  let caught
+  try {
+    await runWorkflow(WF, {
+      args: { spec: 'specs/seam-throw.md' },
+      agent: { 'scope:spec': () => { throw new Error('seam throw proof') }, 'ledger:write': LEDGER_OK },
+    })
+  } catch (e) {
+    caught = e
+  }
+  assert.ok(caught, 'expected the workflow to throw')
+  pipeThrowPathAndAssert(caught, 'plan_cycle')
+})
+
 test('seam: conduct_plan_event payload, built exactly per skills/conduct-plan/SKILL.md\'s documented shape, is accepted by ledger-append.mjs', () => {
   // conduct-plan is a prose skill with no fake-runtime harness to drive it
   // (nothing sandboxes a live conducting agent); this hand-builds the
