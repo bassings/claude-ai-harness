@@ -70,32 +70,60 @@ Then in any project:
 
 ### Keeping the installed mirror in sync (AC-OPS-4)
 
-The manual-copy install above puts a **copy** of `workflows/lib/` (and any
-plugin install does the same, at its own plugin-managed path) at
-`~/.claude/workflows/lib/`. That installed copy, not this repo, is what
+The manual-copy install above puts a **copy** of the whole `workflows/`
+tree -- both the top-level workflow scripts (`tdd-task.js`, `review-cycle.js`,
+`plan-cycle.js`, `optimise-cycle.js`) and `workflows/lib/` (and any plugin
+install does the same, at its own plugin-managed path) -- at
+`~/.claude/workflows/`. That installed copy, not this repo, is what
 actually executes for a delivery repo -- a fix landed here can be green in
 this repo's own test suite while the installed mirror keeps running the old
-code, silently. Every change to `workflows/lib/ledger-append.mjs` or
-`workflows/lib/optimise-read.mjs` must be re-synced after merging:
+code, silently. Review round 1 of PR 2 (HARN-OPT-2) found this section had
+only ever documented re-syncing `workflows/lib/`, while PR 2's entire fix
+(the start/terminal exception guard) lives in the three TOP-LEVEL workflow
+scripts -- an operator following only the `workflows/lib/` steps below would
+get a clean exit 0 while the live top-level copies kept crashing without
+terminal records.
+
+**Re-sync the whole tree** after merging any change under `workflows/`,
+whether it touched a top-level script or `workflows/lib/`:
 
 ```bash
-cp -r claude-ai-harness/workflows/lib/. ~/.claude/workflows/lib/
+cp -r claude-ai-harness/workflows/. ~/.claude/workflows/
 ```
 
 Confirm the installed copy actually matches this repo (exits 0, no output,
 when they agree; lists the differing files otherwise):
 
 ```bash
+diff -rq claude-ai-harness/workflows ~/.claude/workflows
+```
+
+If you only touched `workflows/lib/` (e.g. `ledger-append.mjs` or
+`optimise-read.mjs`) and want a narrower command, the equivalent pair
+scoped to that directory still works:
+
+```bash
+cp -r claude-ai-harness/workflows/lib/. ~/.claude/workflows/lib/
 diff -rq claude-ai-harness/workflows/lib ~/.claude/workflows/lib
 ```
 
-A stale mirror is also detectable from the optimiser's own report without
-running either command by hand: `workflows/lib/ledger-append.mjs`'s
+**This PR's definition of done re-syncs all four files it touched**:
+`workflows/tdd-task.js`, `workflows/review-cycle.js`, `workflows/plan-cycle.js`
+and `workflows/lib/optimise-read.mjs`.
+
+A stale `workflows/lib/` mirror is also detectable from the optimiser's own
+report without running either command by hand: `workflows/lib/ledger-append.mjs`'s
 `SCHEMA_VERSION` was bumped (1 to 2) by the plan-identity canonicalisation
 change, and `optimise-read.mjs ledger`'s `perRepo[].schemaVersionsSeen`
 reports the schema-version mix actually seen per repo -- a stale installed
 writer still emitting `schema_version: 1` shows up there in the next report
-instead of continuing silently.
+instead of continuing silently. **This signal does NOT cover a stale
+top-level workflow script**: PR 2 (the exception-guard fix) bumped no
+`SCHEMA_VERSION` and added no ledger field, so a stale
+`tdd-task.js`/`review-cycle.js`/`plan-cycle.js` produces no artefact
+difference `schemaVersionsSeen` (or anything else in the report) can detect
+-- the `diff -rq` command above is the only check that actually proves the
+top-level scripts are in sync.
 
 ## Usage
 

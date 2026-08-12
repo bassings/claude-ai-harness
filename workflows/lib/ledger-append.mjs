@@ -83,6 +83,12 @@ export const MAX_AC_VERDICTS = 200
 
 const KINDS = ['tdd_task', 'review_cycle', 'plan_cycle', 'conduct_plan_event']
 const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
+// Review round-1 M3: the single definition site for the ac_id shape,
+// shared by the schema declarations below AND by sanitizeAcIds (which
+// removes/nulls a non-conforming value BEFORE validateEntry runs, so one
+// free-text ac_id from a lens no longer fails the WHOLE record).
+const AC_ID_PATTERN_STR = '^AC-[A-Z]+-[0-9]+$'
+const AC_ID_RE = new RegExp(AC_ID_PATTERN_STR)
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // 'fixed' is never written by the workflows in this PR: no single run can
 // know a finding from an earlier round was fixed. It is reserved for a
@@ -166,7 +172,7 @@ export const LEDGER_ENTRY_SCHEMA = {
           // cannot catch this: it is a different route into the same line.
           lens: { type: 'string', pattern: '^(lens|reviewer)-[a-z]+$' },
           severity: { type: 'string', enum: SEVERITIES },
-          ac_id: { type: ['string', 'null'], pattern: '^AC-[A-Z]+-[0-9]+$' },
+          ac_id: { type: ['string', 'null'], pattern: AC_ID_PATTERN_STR },
           disposition: { type: 'string', enum: DISPOSITIONS },
         },
       },
@@ -183,13 +189,23 @@ export const LEDGER_ENTRY_SCHEMA = {
         additionalProperties: false,
         required: ['ac_id', 'verdict'],
         properties: {
-          ac_id: { type: 'string', pattern: '^AC-[A-Z]+-[0-9]+$' },
+          ac_id: { type: 'string', pattern: AC_ID_PATTERN_STR },
           verdict: { type: 'string', enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] },
         },
       },
     },
     spec_bug_count: { type: ['integer', 'null'] },
     rejected_finding_count: { type: ['integer', 'null'] },
+    // Review round-1 M3: how many ac_id values (across ac_verdicts entries
+    // dropped entirely, and findings[].ac_id values nulled) failed the
+    // AC-<LENS>-<n> pattern and were sanitized before validateEntry ran --
+    // a real, measured integer when either array was supplied at all
+    // (including a real 0 when every value was well-formed), null when
+    // neither was supplied (mirrors findings_truncated's own semantics).
+    // Named distinctly from AC-OPS-2's start-only/terminal-only orphan
+    // counters so this cause is never mistaken for "an exception escaped
+    // run() or the process was killed".
+    invalid_ac_ids_dropped: { type: ['integer', 'null'] },
     // M2: how many findings were computed but dropped to keep `findings`
     // within MAX_FINDINGS -- an integer (a real, measured 0 when nothing
     // was dropped) when finding arrays were supplied at all, null when
@@ -1001,6 +1017,37 @@ export function main() {
   // for the same reason AC-SIMP-4 favours the simplest guard that closes
   // the real risk).
   if (Array.isArray(entry.ac_verdicts)) entry.ac_verdicts = entry.ac_verdicts.slice(0, MAX_AC_VERDICTS)
+
+  // Review round-1 M3: a single non-conforming ac_id (free text like
+  // "none", a comma-joined list, a cross-spec-prefixed id) used to fail
+  // validateEntry for the WHOLE entry -- write_ok:false, the entire line
+  // (outcome, verdicts, budget_spent, every OTHER finding and AC verdict)
+  // refused, recreating exactly the start-only orphan class AC-OPS-2
+  // exists to count and name correctly, with the wrong cause. Sanitized
+  // here, granularly, before validateEntry ever runs: findings[].ac_id is
+  // NULLABLE in the schema, so a bad value is nulled and the finding
+  // itself survives; ac_verdicts entries require ac_id as a non-null
+  // string, so a bad value there makes the {ac_id, verdict} PAIR
+  // meaningless and the entry is dropped -- never the whole array, never
+  // the whole record. Every drop is counted in one place so an operator
+  // can tell this apart from a real orphan.
+  let invalidAcIdsDropped = 0
+  if (Array.isArray(entry.findings)) {
+    for (const f of entry.findings) {
+      if (typeof f.ac_id === 'string' && !AC_ID_RE.test(f.ac_id)) {
+        f.ac_id = null
+        invalidAcIdsDropped += 1
+      }
+    }
+  }
+  if (Array.isArray(entry.ac_verdicts)) {
+    const before = entry.ac_verdicts.length
+    entry.ac_verdicts = entry.ac_verdicts.filter((v) => typeof v.ac_id === 'string' && AC_ID_RE.test(v.ac_id))
+    invalidAcIdsDropped += before - entry.ac_verdicts.length
+  }
+  if (Array.isArray(entry.findings) || Array.isArray(entry.ac_verdicts)) {
+    entry.invalid_ac_ids_dropped = invalidAcIdsDropped
+  }
 
   const errors = validateEntry(entry)
   if (errors.length) {

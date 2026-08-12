@@ -206,6 +206,31 @@ test('static: README.md names the step that refreshes the installed ~/.claude/wo
   assert.ok(/schemaVersionsSeen/.test(readme), 'README.md must state that a stale mirror is also detectable from the report\'s per-repo schema_version mix')
 })
 
+// Review round-1 H3: PR2's entire fix lives in three TOP-LEVEL workflow
+// scripts (tdd-task.js, review-cycle.js, plan-cycle.js), which the
+// installed mirror ALSO copies (`~/.claude/workflows/*.js`, not just
+// `workflows/lib/`) -- but the AC-OPS-4 section above only ever documented
+// re-syncing workflows/lib/. An operator following it exactly would get a
+// clean exit 0 while the live top-level copies kept crashing without
+// terminal records. Also: PR2 bumps no SCHEMA_VERSION and adds no ledger
+// field, so the schemaVersionsSeen-based staleness signal above does NOT
+// detect a stale top-level workflow script -- that must be stated
+// honestly, not implied to be covered.
+test('static: README.md\'s AC-OPS-4 section ALSO covers the whole workflows/ tree (not just workflows/lib/), names the three top-level workflow scripts explicitly, and states that the schema_version staleness signal does not detect a stale top-level script (H3)', () => {
+  const readme = readAll('README.md')
+  assert.ok(/cp -r claude-ai-harness\/workflows\/\. ~\/\.claude\/workflows\//.test(readme), 'README.md must give a whole-tree re-sync command covering the top-level workflow scripts too')
+  assert.ok(/diff -rq claude-ai-harness\/workflows ~\/\.claude\/workflows\b/.test(readme), 'README.md must give a whole-tree verification command')
+  for (const f of ['tdd-task.js', 'review-cycle.js', 'plan-cycle.js']) {
+    assert.ok(readme.includes(f), `README.md must name ${f} explicitly in the AC-OPS-4 section`)
+  }
+  const opsIdx = readme.indexOf('AC-OPS-4')
+  const section = readme.slice(opsIdx, opsIdx + 3000)
+  assert.ok(
+    /does not|never|not detect|no signal/i.test(section) && /schema_version|SCHEMA_VERSION/.test(section),
+    'README.md must state honestly that the schema_version-based staleness signal does not cover a stale TOP-LEVEL workflow script (PR2 bumped no schema version)'
+  )
+})
+
 test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, ledgerWritePrompt, writeLedger) is byte-identical across all three workflow files. Workflow scripts cannot import, so this trio is necessarily duplicated three times; without a guard pinning them, a fix landed in one or two copies fails silently in the third -- the same failure class as C1.', () => {
   function extractBlock(fileName) {
     const contents = readAll('workflows', fileName)

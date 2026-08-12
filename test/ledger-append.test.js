@@ -497,6 +497,92 @@ test('ledger-append: findings_truncated is absent/null when no finding arrays we
   assert.ok(entry.findings_truncated === null || entry.findings_truncated === undefined)
 })
 
+// ---- Review round-1 M3: a single non-conforming ac_id anywhere in
+// ac_verdicts/findings used to fail schema validation for the WHOLE entry
+// (write_ok:false, the whole line refused), recreating exactly the
+// start-only orphan class this PR exists to count and name correctly --
+// and mislabelling its cause (the code comment for that counter says "an
+// exception escaped run() or the process was killed", not "a lens emitted
+// a free-text ac_id"). Reachable from untrusted input: /review-cycle runs
+// lenses over an attacker-authored diff, and a prompt-injected ac_id value
+// deletes that run's entire audit record while every lens still reports
+// normally. Fixed by sanitizing non-conforming ac_id values BEFORE
+// validateEntry runs: findings[].ac_id (nullable in the schema) is nulled;
+// ac_verdicts entries (ac_id is NOT nullable there -- the pair is
+// meaningless without it) are dropped entirely. Both counted in one named
+// field so the loss is visible and distinguishable from a real
+// start-only/terminal-only orphan. ----
+
+test('ledger-append: an ac_verdicts entry with a free-text (non-conforming) ac_id no longer fails the WHOLE write -- it is dropped and counted, the rest of the entry (including well-formed ac_verdicts) survives (M3, reproduces the review\'s exact "none" repro)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [
+      { ac_id: 'AC-SEC-1', verdict: 'PASS' },
+      { ac_id: 'none', verdict: 'FAIL' },
+    ],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to still succeed with the bad entry dropped, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must still be written -- not silently discarded into a start-only orphan')
+  const entry = JSON.parse(lines[0])
+  assert.deepEqual(entry.ac_verdicts, [{ ac_id: 'AC-SEC-1', verdict: 'PASS' }], 'the well-formed entry must survive; the malformed one must be dropped, not corrupt the whole array')
+  assert.equal(entry.invalid_ac_ids_dropped, 1, 'the drop must be counted under its own named field, distinguishable from a real orphan')
+})
+
+test('ledger-append: a findings[].ac_id that fails the pattern is NULLED (not the whole finding dropped) -- the finding\'s other fields (lens, severity, location via id) survive (M3)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: 'optimise-cycle:AC-SEC-1' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings.length, 1, 'the finding itself must survive')
+  assert.equal(entry.findings[0].ac_id, null, 'the non-conforming ac_id must be nulled, not left in a shape that would fail validation')
+  assert.equal(entry.findings[0].lens, 'lens-security', 'the rest of the finding must be intact')
+  assert.equal(entry.invalid_ac_ids_dropped, 1)
+})
+
+test('ledger-append: invalid_ac_ids_dropped is a real zero (not null) when ac_verdicts/findings were supplied and every ac_id was well-formed (M3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: 'AC-SEC-1', verdict: 'PASS' }],
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: 'AC-SEC-2' }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.invalid_ac_ids_dropped, 0)
+})
+
+test('ledger-append: invalid_ac_ids_dropped is absent/null when neither ac_verdicts nor a findings array was supplied at all (tdd_task has no ac-id concept)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.invalid_ac_ids_dropped === null || entry.invalid_ac_ids_dropped === undefined)
+})
+
+test('ledger-append: a null ac_id in findings (the ordinary "no AC" case) is left completely alone -- never counted as a drop, never touched (M3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x' }], // no ac_id at all
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].ac_id, null)
+  assert.equal(entry.invalid_ac_ids_dropped, 0, 'a genuinely absent ac_id is not an invalid one -- must not be counted as a drop')
+})
+
 // H3 round 2: at the OLD 2048-byte cap, a realistic review round (roughly
 // 10-12 findings across a full lens roster) degraded to a ~221-byte
 // envelope-only record -- the ledger kept LEAST data for the BUSIEST
@@ -1182,17 +1268,35 @@ test('ledger-append: a finding\'s "lens" field is constrained to the roster patt
   assert.equal(readLedgerLines(repo).length, 0)
 })
 
-test('ledger-append: a finding\'s "ac_id" field is constrained to the AC-<LENS>-<n> pattern, so a quoted source line routed through it is rejected rather than written verbatim (M6)', () => {
+// Review round-1 M3: this test's ORIGINAL assertion (write_ok:false, zero
+// lines written) is exactly the defect M3 identifies -- a single
+// non-conforming ac_id anywhere in the payload destroyed the WHOLE
+// record's telemetry, mislabelling the run as a start-only orphan. The
+// M3 fix text is explicit that the SECRET-ROUTING CONTROL M6 exists for is
+// preserved a different way: "the offending value is still refused...
+// but the line is not [refused]" -- the hostile text must still never
+// reach the ledger verbatim (sanitizeAcIds nulls it before validateEntry
+// ever runs), but the record around it now survives. Updated to assert
+// the preserved security property directly: the write succeeds, the
+// finding survives, and the hostile text is nowhere in the written line.
+test('ledger-append: a finding\'s "ac_id" field is constrained to the AC-<LENS>-<n> pattern -- a quoted source line routed through it is NULLED (never written verbatim), the finding and the rest of the record still survive, and the drop is counted (M3, supersedes the original M6 whole-write-rejection expectation)', () => {
   const repo = makeTempRepo()
+  const hostileAcId = 'AC-X-1 quoted source: const key = 0xdeadbeef'
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: 'lens-qa', location: 'x', claim: 'y', ac_id: 'AC-X-1 quoted source: const key = 0xdeadbeef' }],
+    spec_bugs: [{ lens: 'lens-qa', location: 'x', claim: 'y', ac_id: hostileAcId }],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.equal(out.write_ok, false, 'an ac_id field that is not a real AC-<LENS>-<n> identifier must be rejected, not written')
-  assert.equal(readLedgerLines(repo).length, 0)
+  assert.equal(out.write_ok, true, `expected the write to succeed with the hostile ac_id sanitized, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1)
+  assert.ok(!lines[0].includes('0xdeadbeef') && !lines[0].includes('quoted source'), 'the hostile ac_id text must never reach the ledger verbatim -- M6\'s actual security property, preserved by nulling rather than by refusing the whole write')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.findings[0].ac_id, null)
+  assert.equal(entry.findings[0].claim, undefined, 'sanity: claim was never a declared field to begin with (AC-SEC-2 evidence exclusion, unrelated to this fix)')
+  assert.equal(entry.invalid_ac_ids_dropped, 1)
 })
 
 test('ledger-append: a genuine lens name and a genuine AC id both pass through normally (M6, not vacuous)', () => {
