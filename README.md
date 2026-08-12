@@ -107,23 +107,84 @@ cp -r claude-ai-harness/workflows/lib/. ~/.claude/workflows/lib/
 diff -rq claude-ai-harness/workflows/lib ~/.claude/workflows/lib
 ```
 
-**This PR's definition of done re-syncs all four files it touched**:
-`workflows/tdd-task.js`, `workflows/review-cycle.js`, `workflows/plan-cycle.js`
-and `workflows/lib/optimise-read.mjs`.
+**Always re-sync the whole tree, never an enumerated subset.** Review
+round 2 of PR 2 found the previous revision of this section named "the four
+files this PR touched" -- a list that was already stale by the time review
+round 2 alone landed a further six commits touching all six files under
+`workflows/` (the three top-level scripts, `ledger-append.mjs`,
+`optimise-read.mjs`, `optimise-cycle.js`). Any hand-maintained per-PR
+enumeration goes stale the moment a later round adds one more touched file;
+the whole-tree `cp -r`/`diff -rq` pair above is the one command pair that is
+correct regardless of which files a given PR touched, so it is the only
+form documented here.
 
-A stale `workflows/lib/` mirror is also detectable from the optimiser's own
-report without running either command by hand: `workflows/lib/ledger-append.mjs`'s
-`SCHEMA_VERSION` was bumped (1 to 2) by the plan-identity canonicalisation
-change, and `optimise-read.mjs ledger`'s `perRepo[].schemaVersionsSeen`
-reports the schema-version mix actually seen per repo -- a stale installed
-writer still emitting `schema_version: 1` shows up there in the next report
-instead of continuing silently. **This signal does NOT cover a stale
-top-level workflow script**: PR 2 (the exception-guard fix) bumped no
-`SCHEMA_VERSION` and added no ledger field, so a stale
-`tdd-task.js`/`review-cycle.js`/`plan-cycle.js` produces no artefact
-difference `schemaVersionsSeen` (or anything else in the report) can detect
--- the `diff -rq` command above is the only check that actually proves the
-top-level scripts are in sync.
+A stale `workflows/lib/` mirror is *sometimes* detectable from the
+optimiser's own report without running either command by hand:
+`workflows/lib/ledger-append.mjs`'s `SCHEMA_VERSION` was bumped (1 to 2) by
+PR 1's plan-identity canonicalisation change, and `optimise-read.mjs
+ledger`'s `perRepo[].schemaVersionsSeen` reports the schema-version mix
+actually seen per repo -- a stale installed writer still emitting
+`schema_version: 1` shows up there in the next report instead of continuing
+silently. **This signal does not cover every staleness class.** PR 2's
+exception-guard fix, and review round 2's `invalid_ac_ids_dropped`/
+`ac_id_raw` fields, both bumped no `SCHEMA_VERSION` (they are additive and
+optional, by design, so an older writer or reader omitting them is not
+itself an error) -- a stale `tdd-task.js`/`review-cycle.js`/`plan-cycle.js`,
+or a stale `optimise-read.mjs` reading a newer ledger, produces no
+`schemaVersionsSeen` difference at all. What covers THAT gap is the
+report's own rendering, not the schema version: a genuinely stale or absent
+reader field renders as an explicit "unavailable (installed
+optimise-read.mjs predates this field)" marker rather than a confident
+zero (review round 2, H-1) -- so the report tells you when it cannot see a
+signal, even though `schemaVersionsSeen` cannot. **The `diff -rq` command
+above is still the only check that proves the installed tree is byte-for-byte
+current** -- the report's markers are a second line of defence for when that
+check was skipped, not a replacement for it.
+
+### Sync ordering matters: never let the reader lag behind the writer (AC-OPS-11)
+
+If `workflows/lib/` and the three top-level scripts are ever synced
+separately rather than as one `cp -r`, sync them in this order: **the
+reader (`optimise-read.mjs`) first, the writer (the top-level scripts) last**
+-- never the other way round, and never leave them split for longer than the
+one command it takes to finish the sync.
+
+Verified directly against this repo: an installed reader from before this
+PR (`git show main:workflows/lib/optimise-read.mjs`) has no concept of a
+crashed run at all, because on `main` the top-level scripts have no
+exception guard -- a crash there can only ever leave an *unpaired* start
+record (correctly counted as unmeasured). This PR's exception guard makes a
+crash produce a real, *paired* terminal record (`outcome: 'aborted'`) for
+the first time. Fed that same pair, the OLD reader has no `outcome`-aware
+branch at all: it counts any complete pair as a plain measured run,
+indistinguishable from a real success --
+
+```
+OLD reader:  agentComputeSeconds: 5, agentComputeMeasuredRuns: 1   (the crash reads as a healthy 5-second run)
+NEW reader:  agentComputeSeconds: null, agentComputeMeasuredRuns: 0, agentComputeAbortedPairs: 1, agentComputeAbortedSeconds: 5
+```
+
+That is the failure this section warns against: **a NEWER writer paired
+with an OLDER reader silently converts a crashed run into an
+apparently-healthy one**, because the writer's new capability (a guaranteed
+terminal record even on crash) reaches a reader that has no idea that
+capability, or the `aborted` outcome it produces, exists yet. A newer
+reader paired with an older writer is comparatively safe: the older writer
+simply never produces the fields the newer reader looks for, and those
+fields render as the explicit "unavailable" marker above rather than a
+wrong number.
+
+**Rollback drill, executed against this repo's own tree** (not merely
+described): populating a scratch "installed mirror" from `main`, then
+applying only `workflows/lib/optimise-read.mjs` forward (the exact partial
+sync this section warns against) still leaves `diff -rq` reporting five
+further differing files -- the three top-level scripts and the other two
+`workflows/lib/` files. `diff -rq` cannot see the outcome-classification
+regression above directly (it compares files, not aggregation behaviour),
+but it reliably flags that *some* file in the tree is out of sync whenever
+a partial sync is attempted, which is why the "always re-sync/verify the
+whole tree" rule above is the actual mitigation: a partial sync is only
+possible by skipping the verification step, never by passing it.
 
 ## Usage
 
