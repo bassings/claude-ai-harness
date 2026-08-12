@@ -14,7 +14,7 @@ const assert = require('node:assert/strict')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
-const { makeTempRepo, runAppend, trackTempDir, cleanupTempRepos, SUITE_TMPDIR } = require('./helpers/temp-repo.js')
+const { makeTempRepo, runAppend, trackTempDir, cleanupTempRepos, SUITE_TMPDIR, sh, LEDGER_REL } = require('./helpers/temp-repo.js')
 const fs = require('node:fs')
 
 const MODULE_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
@@ -367,6 +367,48 @@ test('optimise-read: aggregateWallClock keeps two repos with the IDENTICAL spec 
   assert.equal(b.plan, 'specs/x.md')
 })
 
+// ---- Review round-2 M4: planBucketKey's `${repo}|${plan}` delimiter join
+// is not injective -- a "|" inside a repo identity or spec path merges two
+// distinct (repo, plan) pairs into one bucket, summing durations. Fixed by
+// backslash-escaping any literal "|" (and "\") within each component before
+// joining, which is IDENTICAL to the plain join for the overwhelmingly
+// common case (neither component contains "|"), so every existing
+// `byPlan.get('repo|plan')` lookup in this file keeps working unchanged. ----
+
+test('optimise-read: aggregateWallClock keeps two DIFFERENT (repo, plan) pairs distinct even when a "|" in one component could otherwise make their naive joins collide (M4)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'a|weird.md', run_id: 'x1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'a|weird.md', run_id: 'x1', ts: '2026-08-01T00:01:00.000Z' }, // 60s
+    { kind: 'tdd_task', repo: 'demo|a', outcome: 'started', spec: 'weird.md', run_id: 'x2', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo|a', outcome: 'done', spec: 'weird.md', run_id: 'x2', ts: '2026-08-01T00:02:00.000Z' }, // 120s
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.byPlan.size, 2, `naively-colliding (repo, plan) pairs must land in TWO buckets, not one merged bucket -- got ${JSON.stringify([...result.byPlan.values()].map((b) => ({ repo: b.repo, plan: b.plan, agentComputeSeconds: b.agentComputeSeconds, agentComputeN: b.agentComputeN })))}`)
+  const buckets = [...result.byPlan.values()]
+  const first = buckets.find((b) => b.repo === 'demo' && b.plan === 'a|weird.md')
+  const second = buckets.find((b) => b.repo === 'demo|a' && b.plan === 'weird.md')
+  assert.ok(first && second, `both distinct (repo, plan) pairs must have their own bucket, got ${JSON.stringify(buckets)}`)
+  assert.equal(first.agentComputeSeconds, 60, 'durations must never be summed across the two distinct pairs')
+  assert.equal(second.agentComputeSeconds, 120)
+})
+
+test('optimise-read: aggregateRework keeps two DIFFERENT (repo, plan, ac_id) triples distinct even when a "|" could otherwise make their naive joins collide (M4)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'a|weird.md', round_key: 's1', outcome: 'done', findings: [], ac_verdicts: [{ ac_id: 'AC-X-1', verdict: 'PASS' }] },
+    { kind: 'review_cycle', repo: 'demo|a', spec: 'weird.md', round_key: 's2', outcome: 'done', findings: [], ac_verdicts: [{ ac_id: 'AC-X-1', verdict: 'FAIL' }] },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.acVerdicts.size, 2, `must produce two distinct acVerdicts entries, not one merged entry -- got ${JSON.stringify([...result.acVerdicts.values()])}`)
+  const entries = [...result.acVerdicts.values()]
+  const first = entries.find((e) => e.repo === 'demo' && e.spec === 'a|weird.md')
+  const second = entries.find((e) => e.repo === 'demo|a' && e.spec === 'weird.md')
+  assert.ok(first && second, `both distinct triples must have their own entry, got ${JSON.stringify(entries)}`)
+  assert.equal(first.pass, 1)
+  assert.equal(first.fail, 0)
+  assert.equal(second.pass, 0)
+  assert.equal(second.fail, 1, 'verdicts must never be merged across the two distinct (repo, plan, ac_id) triples')
+})
+
 // ---- Review round-2 M1 (reframe, no AC -- spec bug): pairing by sorted-timestamp INDEX is unrepresentable ----
 //
 // Round 1 fixed two symptoms of the same underlying defect (a null
@@ -707,11 +749,22 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combine
 
   // Both real repos must have their own perRepo entry with their OWN full
   // (pre-window) record count -- never merged, never dropped from perRepo
-  // just because the window truncated the combined aggregate.
+  // just because the window truncated the combined aggregate. perRepo[].root
+  // is looked up by the derived, non-identifying label (AC-SEC-3 round 2:
+  // the raw absolute root path must never reach this field) -- neither repo
+  // has an origin remote, so the writer's own repo-identity fallback is the
+  // main checkout's basename, which is exactly what the label derives too.
   assert.equal(out.perRepo.length, 2)
-  const entryA = out.perRepo.find((e) => e.root === repoA)
-  const entryB = out.perRepo.find((e) => e.root === repoB)
+  const entryA = out.perRepo.find((e) => e.root === path.basename(repoA))
+  const entryB = out.perRepo.find((e) => e.root === path.basename(repoB))
   assert.ok(entryA && entryB, 'both repos must have their own perRepo entry')
+  assert.ok(!entryA.root.includes(repoA) && !entryB.root.includes(repoB), 'perRepo[].root must never be (or contain) the raw absolute analysis path')
+  // Review round-1 M5: rootIndex is the stable, positional key
+  // optimise-cycle.js uses to look up its OWN scope-resolved label,
+  // matching the position `roots` (and therefore `scope.resolved`) listed
+  // this repo at -- repoA was passed first, repoB second.
+  assert.equal(entryA.rootIndex, 0, 'repoA was the first positional root argument')
+  assert.equal(entryB.rootIndex, 1, 'repoB was the second positional root argument')
   assert.equal(entryA.recordCount, 3, "repoA's own full record count, computed before windowing")
   assert.equal(entryB.recordCount, 5, "repoB's own full record count, computed before windowing")
 
@@ -772,6 +825,26 @@ test('optimise-read CLI: an unknown command name is reported as an error, not a 
   assert.ok(out.error)
 })
 
+// ---- Review round-2 L2: `ci`, `escaped-defects` and `ids` all echoed
+// JSON.parse's own SyntaxError message on malformed stdin -- V8 embeds a
+// snippet of the actual input it failed on in that message, matching L1's
+// already-fixed ledger-line-parser leak (line 99), which was fixed there
+// but not here. These commands are fed agent-assembled gh output and
+// commit subjects, which optimise-cycle.js then carries into the
+// synthesis prompt and the report. ----
+
+for (const [command, malformedInput] of [['ci', '/Users/some-user/private not json'], ['escaped-defects', '/Users/some-user/private not json'], ['ids', '/Users/some-user/private not json']]) {
+  test(`optimise-read CLI: \`${command}\` on malformed stdin beginning with an absolute path does not echo that path into the returned error (L2, AC-SEC-3)`, () => {
+    const res = spawnSync('node', [MODULE_PATH, command], { input: malformedInput, encoding: 'utf8' })
+    assert.equal(res.status, 0, res.stderr)
+    const out = JSON.parse(res.stdout.trim())
+    assert.ok(out.error, `expected an error field, got ${JSON.stringify(out)}`)
+    assert.ok(!out.error.includes('/Users/'), `error must not echo the raw stdin content: ${out.error}`)
+    assert.ok(!out.error.includes('private'), `error must not echo the raw stdin content: ${out.error}`)
+    assert.match(out.error, /valid JSON|pars|JSON/i, 'the error must still say WHY it failed, just not echo the raw content')
+  })
+}
+
 test('optimise-read CLI: `node optimise-read.mjs ledger <root>` on a repo with no ledger file reports n:0 and does not create one (AC-QA-17 fixture at n=0)', () => {
   const repo = makeTempRepo()
   const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
@@ -779,4 +852,531 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <root>` on a repo with n
   const out = JSON.parse(res.stdout.trim())
   assert.equal(out.n, 0)
   assert.equal(fs.existsSync(path.join(repo, '.claude', 'harness-ledger.jsonl')), false, 'reading must never create the ledger file')
+})
+
+// ---- HARN-OPT-2 PR1: read-side plan-identity normalisation is a
+// REDACTION, not merely a regrouping (AC-SEC-3, AC-QA-5, AC-ARCH-4/5,
+// AC-DATA-7, AC-OPS-5, AC-QA-7) ----
+
+// Reproduces the real 9-record ledger (see the spec's own worked example):
+// one absolute-form spec, one no-spec record, one stray "specs/x.md" record
+// (the hand-injected test record, kept as ordinary data, never specially
+// excluded), and five records for "specs/optimise-cycle.md" in its relative
+// form. The absolute-form line uses THIS repo's own real absolute path (not
+// a hardcoded machine-specific string) so the fixture is portable and the
+// relativisation genuinely exercises the writer/reader's real root-matching
+// logic, not a coincidence of a hardcoded prefix.
+// Review round-1 M4: seeding the "historical absolute-form" line THROUGH
+// runAppend (the real, FIXED writer) meant it could never actually be
+// absolute by the time it reached the ledger -- the writer relativises it
+// at write time, so the AC-QA-5 guard this fixture exists to prove had
+// nothing left to fail on (355/355 stayed green even with read-side
+// normalisation deleted entirely). rec0 is now hand-seeded directly, byte
+// for byte the shape the PRE-PR1 writer actually produced: schema_version
+// 1, a genuinely absolute spec, no plan_key at all -- the same technique
+// already used for the AC-DATA-6 fixture above. repo identity matches what
+// the REAL writer resolves for the other 8 records (this repo's own
+// basename, no origin remote configured), or the two groups would land in
+// different buckets for a reason unrelated to plan-identity collapsing.
+function seedNineRecordFixture(repo) {
+  const ledgerPath = path.join(repo, LEDGER_REL)
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
+  const repoIdentity = path.basename(repo)
+  const absSpec = path.join(repo, 'specs', 'optimise-cycle.md')
+  const record0 = { schema_version: 1, run_id: 'rec0', ts: '2026-08-01T00:00:00.000Z', repo: repoIdentity, kind: 'review_cycle', outcome: 'started', spec: absSpec }
+  fs.writeFileSync(ledgerPath, JSON.stringify(record0) + '\n')
+
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', run_id: 'rec1' })
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', spec: 'specs/x.md', run_id: 'r1' })
+  runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'ci_wait_started', event_scope: 'specs/optimise-cycle.md:T1:ci_wait_started' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/optimise-cycle.md', run_id: 'rec4' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/optimise-cycle.md', run_id: 'rec5' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/optimise-cycle.md', run_id: 'rec6' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/optimise-cycle.md', run_id: 'rec7' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/optimise-cycle.md', run_id: 'rec7' })
+}
+
+// Review round-1 M4: nested under a home-like path (a literal "home"
+// segment plus the real `whoami` output, matching the recursive-walk
+// fixture's own technique) so leak-freedom AND the 4-to-3 bucket collapse
+// are proven together, over the SAME fixture, in one test.
+test('optimise-read CLI: `ledger <root>` over a fixture reproducing the real 9-record ledger, hand-seeded so the historical absolute-form line genuinely reaches the ledger, nested under a home-like path -- ZERO leaked matches for /Users/, /Volumes/, /home/, C:\\\\ and whoami anywhere in the output (including perRepo), AND the absolute + relative forms of "specs/optimise-cycle.md" collapse into ONE wallClock.byPlan bucket, proven against a sanity check that the RAW fixture genuinely contains 4 distinct un-normalised spec forms (AC-SEC-3, AC-QA-5)', () => {
+  const whoami = sh('whoami', SUITE_TMPDIR).trim()
+  // whoami sits as an INTERMEDIATE path segment (a realistic
+  // "/home/<user>/projects/<repo>" shape) -- NOT the checkout's own
+  // basename. This repo has no origin remote, so the writer's repo-identity
+  // fallback is that basename; if it were literally "whoami" too, the
+  // record's own (legitimate) repo field would coincidentally equal the
+  // account name for a reason unrelated to what this test guards, and the
+  // recursive walk below would flag a false positive.
+  const homeLikeRoot = path.join(SUITE_TMPDIR, 'home', whoami, 'repo-' + Math.random().toString(36).slice(2))
+  fs.mkdirSync(homeLikeRoot, { recursive: true })
+  trackTempDir(path.join(SUITE_TMPDIR, 'home'))
+  sh('git init -q -b main', homeLikeRoot)
+  sh('git config user.email test@example.com', homeLikeRoot)
+  sh('git config user.name Test', homeLikeRoot)
+  fs.writeFileSync(path.join(homeLikeRoot, 'README.md'), 'seed\n')
+  sh('git add README.md && git commit -q -m seed', homeLikeRoot)
+  assert.ok(/\/home\//.test(homeLikeRoot) && homeLikeRoot.includes(whoami), 'sanity: the fixture root must genuinely be home-shaped')
+
+  seedNineRecordFixture(homeLikeRoot)
+
+  // Sanity ("4 before"): the RAW ledger content genuinely contains 4
+  // distinct, un-normalised spec-identity forms. Without this, a fixture
+  // that happened to already be normalised (M4's exact finding) would pass
+  // "3 buckets" vacuously.
+  const rawLines = fs.readFileSync(path.join(homeLikeRoot, LEDGER_REL), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const rawSpecIdentities = new Set(rawLines.filter((l) => l.kind !== 'conduct_plan_event').map((l) => l.spec ?? '<no-spec-raw>'))
+  assert.equal(rawSpecIdentities.size, 4, `sanity: expected 4 distinct RAW (un-normalised) spec forms in the fixture, got ${JSON.stringify([...rawSpecIdentities])} -- the fixture must genuinely contain the historical absolute form or this test cannot prove anything about the fix`)
+  // Review round-2 L3: JSON.stringify(rawLines[0]) is always an object
+  // stringified to "{...}", so the negated startsWith('specs/') check could
+  // never fail regardless of rec0's actual spec value -- checked directly
+  // on the parsed field instead.
+  assert.ok(path.isAbsolute(rawLines[0].spec), `sanity: rec0's raw spec must genuinely be absolute, not already relative -- got ${JSON.stringify(rawLines[0].spec)}`)
+
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', homeLikeRoot], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const stdout = res.stdout
+
+  const violations = []
+  function walk(value, at) {
+    if (value === null || value === undefined) return
+    if (typeof value === 'string') {
+      if (/\/Users\//.test(value)) violations.push(`${at}: /Users/`)
+      if (/\/Volumes\//.test(value)) violations.push(`${at}: /Volumes/`)
+      if (/\/home\//.test(value)) violations.push(`${at}: /home/`)
+      if (/C:\\/.test(value)) violations.push(`${at}: Windows path`)
+      if (whoami && value.includes(whoami)) violations.push(`${at}: whoami in ${JSON.stringify(value)}`)
+      return
+    }
+    if (Array.isArray(value)) { value.forEach((v, i) => walk(v, `${at}[${i}]`)); return }
+    if (typeof value === 'object') { for (const [k, v] of Object.entries(value)) walk(v, `${at}.${k}`) }
+  }
+  const out = JSON.parse(stdout)
+  walk(out, '$')
+  assert.deepEqual(violations, [], `leaked path/username found in the emitted JSON:\n${violations.join('\n')}`)
+
+  // AC-QA-5, "3 after": the absolute and relative forms of
+  // "specs/optimise-cycle.md" must collapse into ONE bucket.
+  const planKeys = Object.values(out.wallClock.byPlan).map((b) => b.plan)
+  assert.equal(planKeys.length, 3, `expected exactly 3 buckets, got ${JSON.stringify(planKeys)}`)
+  assert.ok(planKeys.includes('specs/optimise-cycle.md'))
+  assert.ok(planKeys.includes('specs/x.md'))
+  const optimiseCycleBucket = Object.values(out.wallClock.byPlan).find((b) => b.plan === 'specs/optimise-cycle.md')
+  // rec0 (absolute, started) has no terminal pair; rec4-rec6 (started, no
+  // terminal) are also orphans; rec7's started/done pair is the one real
+  // measured pair -- 4 unmeasured attempts total once collapsed into one bucket.
+  assert.equal(optimiseCycleBucket.agentComputeN, 1, 'the one real started/done pair must be measured')
+  assert.equal(optimiseCycleBucket.agentComputeUnmeasuredN, 4, 'every orphan (including the absolute-form one) must land in the SAME bucket\'s unmeasured count, not a separate one')
+})
+
+// Round 2 (coordinator finding): the test above uses makeTempRepo()'s own
+// temp-dir path as root, which on MOST machines is not a home-like path at
+// all (a bare mktemp path, e.g. /tmp/xyz or /var/folders/...) -- so the
+// assertion above could never actually fail on those machines even with the
+// old, leaking code, and on the one machine where TMPDIR happens to live
+// under /Volumes/.../home/..., that was a coincidence, not a deliberately
+// sized fixture. This test deliberately nests the analysed repo under a
+// path containing BOTH a literal "home" segment AND the real `whoami`
+// output, so the assertion can actually fail regardless of the machine's
+// own TMPDIR -- and walks the WHOLE emitted JSON recursively (every key,
+// every string value, at every depth), not a spot-check of named fields,
+// so a leak in any field -- not just the ones already known about -- is
+// caught.
+test('optimise-read CLI: `ledger <root>` -- recursively walking the ENTIRE emitted JSON (every key, every value, any depth) finds zero matches for /Users/, /Volumes/, /home/, C:\\\\ and the real whoami, when the analysed repo itself lives under a path containing a home-like segment and the real username (AC-SEC-3, perRepo[].root)', () => {
+  const whoami = sh('whoami', SUITE_TMPDIR).trim()
+  const homeLikeRoot = path.join(SUITE_TMPDIR, 'home', whoami, 'repo-' + Math.random().toString(36).slice(2))
+  fs.mkdirSync(homeLikeRoot, { recursive: true })
+  trackTempDir(path.join(SUITE_TMPDIR, 'home'))
+  sh('git init -q -b main', homeLikeRoot)
+  sh('git config user.email test@example.com', homeLikeRoot)
+  sh('git config user.name Test', homeLikeRoot)
+  fs.writeFileSync(path.join(homeLikeRoot, 'README.md'), 'seed\n')
+  sh('git add README.md && git commit -q -m seed', homeLikeRoot)
+  assert.ok(/\/home\//.test(homeLikeRoot) && homeLikeRoot.includes(whoami), 'sanity: the fixture root itself must genuinely contain both a home-like segment and the real username, or this test proves nothing')
+
+  runAppend(homeLikeRoot, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', homeLikeRoot], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+
+  const violations = []
+  function walk(value, at) {
+    if (value === null || value === undefined) return
+    if (typeof value === 'string') {
+      if (/\/Users\//.test(value)) violations.push(`${at}: /Users/ in ${JSON.stringify(value)}`)
+      if (/\/Volumes\//.test(value)) violations.push(`${at}: /Volumes/ in ${JSON.stringify(value)}`)
+      if (/\/home\//.test(value)) violations.push(`${at}: /home/ in ${JSON.stringify(value)}`)
+      if (/C:\\/.test(value)) violations.push(`${at}: Windows path in ${JSON.stringify(value)}`)
+      if (whoami && value.includes(whoami)) violations.push(`${at}: whoami ("${whoami}") in ${JSON.stringify(value)}`)
+      return
+    }
+    if (Array.isArray(value)) {
+      value.forEach((v, i) => walk(v, `${at}[${i}]`))
+      return
+    }
+    if (typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) walk(v, `${at}.${k}`)
+    }
+  }
+  walk(out, '$')
+  assert.deepEqual(violations, [], `leaked path/username found in the emitted JSON:\n${violations.join('\n')}`)
+})
+
+test('optimise-read: aggregateWallClock collapses an absolute spec, a relative spec, and a ".."-containing spec for the SAME plan into one bucket, in both directions (agent_compute and, via the event_key plan segment, ci_wait) -- proven with an explicit root so the absolute form resolves (AC-ARCH-4)', () => {
+  const root = '/repo'
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '/repo/specs/a.md', run_id: 'abs-1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: '/repo/specs/a.md', run_id: 'abs-1', ts: '2026-08-01T00:01:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'rel-1', ts: '2026-08-01T01:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'rel-1', ts: '2026-08-01T01:02:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/sub/../a.md', run_id: 'dotdot-1', ts: '2026-08-01T02:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/sub/../a.md', run_id: 'dotdot-1', ts: '2026-08-01T02:03:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root })
+  assert.equal(result.byPlan.size, 1, `expected exactly one bucket, got ${JSON.stringify([...result.byPlan.keys()])}`)
+  const bucket = result.byPlan.get('demo|specs/a.md')
+  assert.ok(bucket, 'expected the canonical "demo|specs/a.md" bucket to exist')
+  assert.equal(bucket.agentComputeN, 3, 'all three forms must be measured runs inside the ONE bucket')
+})
+
+test('optimise-read: aggregateRework collapses an absolute spec and a relative spec for the same plan into one acVerdicts entry (AC-ARCH-4)', () => {
+  const root = '/repo'
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: '/repo/specs/a.md', round_key: 's1', outcome: 'done', findings: [], ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PASS' }] },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 's2', outcome: 'done', findings: [], ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PASS' }] },
+  ]
+  const result = mod.aggregateRework(records, { root })
+  assert.equal(result.acVerdicts.size, 1, `expected one collapsed entry, got ${JSON.stringify([...result.acVerdicts.keys()])}`)
+  const entry = [...result.acVerdicts.values()][0]
+  assert.equal(entry.n, 2, 'both records must contribute to the ONE collapsed entry')
+  assert.equal(entry.spec, 'specs/a.md', 'the reported spec must be the canonical, repo-relative form -- never the absolute one')
+})
+
+// ---- AC-DATA-6: a ledger mixing genuine pre-PR1-shaped lines (no plan_key
+// at all, schema_version 1 -- exactly what the writer produced before this
+// change) with post-PR1 lines (plan_key present, schema_version 2) for the
+// SAME plan must aggregate to ONE bucket per plan, with every record
+// counted -- none dropped uncounted just because it predates plan_key. ----
+
+test('optimise-read CLI: a real ledger mixing hand-seeded pre-PR1-shaped lines (no plan_key, schema_version 1) with genuine post-PR1 writer output (plan_key present, schema_version 2) for the IDENTICAL plan collapses to ONE wallClock.byPlan bucket, and every record is counted -- none dropped uncounted for lacking plan_key (AC-DATA-6)', () => {
+  const repo = makeTempRepo()
+  const ledgerPath = path.join(repo, LEDGER_REL)
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
+
+  // Hand-seeded, byte-for-byte the shape the PRE-PR1 writer actually
+  // produced: no plan_key field at all, schema_version 1. A genuine
+  // started/done pair for "specs/shared.md", written directly (not via
+  // runAppend, which would always add plan_key -- the whole point is to
+  // reproduce lines that predate this change). repo is the SAME identity
+  // the real writer resolves for this repo (its basename, no origin remote
+  // configured) -- a fixture using a different, made-up repo string here
+  // would land in a DIFFERENT bucket key (`${repo}|${plan}`) regardless of
+  // plan_key, proving nothing about plan-identity collapsing specifically.
+  const repoIdentity = path.basename(repo)
+  const preChangeLines = [
+    { schema_version: 1, run_id: 'pre-1', ts: '2026-01-01T00:00:00.000Z', repo: repoIdentity, kind: 'tdd_task', outcome: 'started', spec: 'specs/shared.md' },
+    { schema_version: 1, run_id: 'pre-1', ts: '2026-01-01T00:01:00.000Z', repo: repoIdentity, kind: 'tdd_task', outcome: 'done', spec: 'specs/shared.md' },
+  ]
+  fs.writeFileSync(ledgerPath, preChangeLines.map((l) => JSON.stringify(l)).join('\n') + '\n')
+  const preLinesRaw = fs.readFileSync(ledgerPath, 'utf8')
+
+  // A genuine POST-PR1 write, through the real (fixed) writer, for the
+  // IDENTICAL plan ("specs/shared.md") -- this line DOES carry plan_key
+  // and schema_version 2.
+  const postRes = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'started', spec: 'specs/shared.md', run_id: 'post-1' })
+  const postOut = JSON.parse(postRes.stdout.trim().split('\n').pop())
+  assert.equal(postOut.write_ok, true, postOut.write_error)
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', spec: 'specs/shared.md', run_id: 'post-1' })
+
+  const rawAfter = fs.readFileSync(ledgerPath, 'utf8')
+  assert.ok(rawAfter.startsWith(preLinesRaw), 'the hand-seeded pre-PR1 lines must survive byte for byte, unmoved, at the head of the append-only file (AC-DATA-6)')
+  const allLines = rawAfter.split('\n').filter(Boolean)
+  assert.equal(allLines.length, 4, 'all 4 lines (2 pre-PR1 + 2 post-PR1) must be present -- append-only, nothing rewritten')
+  const postLine = JSON.parse(allLines[2])
+  assert.ok('plan_key' in postLine && postLine.plan_key === 'specs/shared.md', 'sanity: the genuine post-PR1 line really does carry plan_key')
+  assert.ok(!('plan_key' in JSON.parse(allLines[0])), 'sanity: the hand-seeded pre-PR1 line really does lack plan_key, or this test proves nothing about the mixed-version case')
+
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.n, 4, 'all 4 records must be read and counted, none dropped uncounted for lacking plan_key')
+  assert.equal(out.skipped.length, 0, 'a missing plan_key must never cause a line to be skipped -- plan_key is optional, per AC-ARCH-5')
+
+  const sharedBuckets = Object.values(out.wallClock.byPlan).filter((b) => b.plan === 'specs/shared.md')
+  assert.equal(sharedBuckets.length, 1, `expected the pre-PR1 pair and the post-PR1 pair to collapse into ONE bucket, got ${JSON.stringify(sharedBuckets)}`)
+  assert.equal(sharedBuckets[0].agentComputeN, 2, 'BOTH the pre-PR1 pair and the post-PR1 pair must be measured inside the one collapsed bucket -- neither silently dropped')
+})
+
+// ---- Review round-1 H2: the ci_wait/human_wait path lacked the
+// REDACTED_PATH_MARKER guard the agent_compute path already had, so two
+// DIFFERENT out-of-repo plans merged into one bucket literally named
+// "<redacted-path>" and their durations SUMMED -- a regression against
+// main, which kept them distinct. ----
+
+test('optimise-read: aggregateWallClock never merges two DIFFERENT out-of-repo ci_wait plans into one bucket -- both excluded from byPlan, counted under a named unattributable-waits total, durations never summed (H2, regression against main)', () => {
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: '/elsewhereA/specs/plan-one.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: '/elsewhereA/specs/plan-one.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:00:10.000Z' }, // 10s
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: '/elsewhereB/specs/plan-two.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: '/elsewhereB/specs/plan-two.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:05:00.000Z' }, // 300s
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  for (const bucket of result.byPlan.values()) {
+    assert.notEqual(bucket.plan, '<redacted-path>', 'the redaction marker must never be rendered as if it were a real plan name')
+  }
+  assert.equal(result.byPlan.size, 0, 'neither out-of-repo ci_wait plan may create (or share) a byPlan bucket')
+  assert.equal(result.totals.unattributableWaits, 4, 'all 4 unattributable wait records must be counted, distinctly -- never silently merged as if they were one plan\'s measurement')
+})
+
+// ---- Review round-1 M3: pair plan-identity selection must be
+// order-independent and must prefer a REAL spec over the no-spec sentinel,
+// restoring main's `pair.find(p => p.spec)?.spec` semantics. AC-QA-13. ----
+
+test('optimise-read: a pair where one record has no spec and the other carries a real spec attributes to the REAL spec, regardless of which record comes first in file order (M3, AC-QA-13)', () => {
+  const noSpecRecord = { kind: 'tdd_task', repo: 'demo', outcome: 'started', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' }
+  const realSpecRecord = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' }
+  const forward = mod.aggregateWallClock([noSpecRecord, realSpecRecord])
+  const reversed = mod.aggregateWallClock([realSpecRecord, noSpecRecord])
+  assert.deepEqual([...forward.byPlan.keys()], ['demo|specs/a.md'], 'forward order must attribute to the real spec, not the no-spec sentinel')
+  assert.deepEqual([...reversed.byPlan.keys()], ['demo|specs/a.md'], 'reversed order must attribute identically')
+  assert.equal(
+    JSON.stringify([...forward.byPlan.entries()]),
+    JSON.stringify([...reversed.byPlan.entries()]),
+    'forward and reversed order must produce byte-identical aggregate output (AC-QA-13)'
+  )
+})
+
+test('optimise-read: three records sharing one run_id (forward, reversed, and shuffled), only one of which carries a real spec, all attribute to the real spec and produce byte-identical aggregates (M3, AC-QA-13, shuffled)', () => {
+  const a = { kind: 'tdd_task', repo: 'demo', outcome: 'started', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' } // no spec
+  const b = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/real.md', run_id: 'r1', ts: '2026-08-01T00:00:30.000Z' }
+  const c = { kind: 'tdd_task', repo: 'demo', outcome: 'done', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' } // no spec
+  const orderings = [[a, b, c], [c, b, a], [b, c, a], [c, a, b]]
+  const results = orderings.map((records) => JSON.stringify([...mod.aggregateWallClock(records).byPlan.entries()]))
+  for (const r of results) assert.equal(r, results[0], 'every ordering must produce byte-identical aggregate output')
+  assert.ok(results[0].includes('specs/real.md'), 'sanity: the real spec must actually win in every ordering, or this test proves nothing')
+  assert.ok(!results[0].includes('<no-spec>'), 'sanity: the no-spec sentinel must never win when a real spec is present anywhere in the pair')
+})
+
+// ---- Review round-1 M1 (read-side half), reproduction updated in round 2:
+// round-1's canonicalPlanKey had a second "final shape" regex check
+// (UNSAFE_EMBEDDED_SLASH_RE) that caught an embedded-but-not-leading
+// absolute path like "plan=/Users/<user>/x.md". Round 2 removed that check
+// entirely (Decision 1: it fired on legitimate already-relative segments
+// containing ordinary punctuation indistinguishably from a genuine leak --
+// see H1). The read-side re-canonicalisation itself is UNCHANGED and still
+// load-bearing: a stored plan_key that is genuinely ABSOLUTE (starts with
+// "/") and matches no known root is still redacted on read, exactly like a
+// hostile `spec` would be -- defence in depth against a hand-edited or
+// foreign ledger line. ----
+
+test('optimise-read: aggregateWallClock re-canonicalises a STORED plan_key on read rather than trusting it verbatim -- a hand-edited line whose plan_key is a genuine absolute path outside every known root is still redacted (M1, read-side defence in depth)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', plan_key: '/Users/some-user/private/plan.md', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', plan_key: '/Users/some-user/private/plan.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  const stdout = JSON.stringify([...result.byPlan.entries()])
+  assert.ok(!stdout.includes('/Users/'), 'a hostile stored plan_key must not reach byPlan verbatim')
+  assert.equal(result.byPlan.size, 0, 'the re-canonicalised key must resolve to the out-of-repo marker and be excluded, exactly like a hostile spec would be')
+  assert.equal(result.totals.unattributableRuns, 1)
+})
+
+test('optimise-read: a stored plan_key that is a genuine absolute path UNDER the analysis root re-canonicalises to the correct relative key on read (not vacuous: proves re-canonicalisation actually runs canonicalPlanKey\'s real logic, not just a blanket redact-if-absolute rule)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', plan_key: '/repo/specs/a.md', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', plan_key: '/repo/specs/a.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  assert.ok(result.byPlan.has('demo|specs/a.md'), `expected the absolute stored plan_key to re-canonicalise to the relative key under the analysis root, got ${JSON.stringify([...result.byPlan.keys()])}`)
+})
+
+// ---- Review round-2 M1 (the guard's REAL consumer): a pre-PR1 line's
+// `spec` can be a verbatim "../" traversal -- main's own ABSOLUTE_PATH_RE
+// matched only leading-slash/drive forms, so a relative traversal reached
+// the ledger unredacted. This is exactly what planKeyForRecord's fallback
+// (re-deriving from `spec` when no `plan_key` is stored) exists to catch
+// on READ. Hand-seeded, not written through runAppend, since the fixed
+// writer can no longer PRODUCE this shape at write time (the same fixture
+// technique AC-DATA-6/AC-QA-5's fixtures already use). ----
+
+test('optimise-read: a hand-seeded pre-PR1 line whose spec is a verbatim "../" traversal (no plan_key stored) is redacted on read via the spec fallback, counted as unattributable, and leaks nothing into the output (M1, end-to-end)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '../../../home/scott.b/.ssh/config', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: '../../../home/scott.b/.ssh/config', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  assert.equal(result.byPlan.size, 0, 'the traversal must never create (or share) a byPlan bucket')
+  assert.equal(result.totals.unattributableRuns, 1)
+  const stdout = JSON.stringify([...result.byPlan.entries()]) + JSON.stringify(result.totals)
+  assert.ok(!stdout.includes('/home/'), 'must not leak /home/')
+  assert.ok(!stdout.includes('scott.b'), 'must not leak the account name')
+  assert.ok(!stdout.includes('.ssh'), 'must not leak the traversal\'s target file name')
+})
+
+test('optimise-read: a genuinely clean stored plan_key is unaffected by re-canonicalisation (not vacuous)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', plan_key: 'specs/a.md', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', plan_key: 'specs/a.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.ok(result.byPlan.has('demo|specs/a.md'))
+})
+
+// Round 5 medium (AC-SEC-3): planKeyForRecord's line 163 branch
+// (`record.plan_key` present, re-canonicalised regardless) had a real
+// pre-PR1-shaped-line sibling test (M1, above) covering line 164's spec
+// fallback with a HOSTILE value, but no equivalent for a hostile STORED
+// plan_key -- a hand-edited or foreign ledger line (the spec itself
+// documents this can happen) that carries plan_key already set to an
+// absolute, out-of-repo path. Re-canonicalisation must catch it exactly
+// like a hostile spec would.
+test('optimise-read (round 5 medium, AC-SEC-3): a hand-seeded line whose STORED plan_key is itself an absolute, out-of-repo path is redacted on re-canonicalisation, counted as unattributable, and leaks nothing (line 163\'s branch, not just line 164\'s)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', plan_key: '/etc/hostile-secret.md', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', plan_key: '/etc/hostile-secret.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  assert.equal(result.byPlan.size, 0, 'a hostile stored plan_key must never create (or share) a byPlan bucket')
+  assert.equal(result.totals.unattributableRuns, 1)
+  const stdout = JSON.stringify([...result.byPlan.entries()]) + JSON.stringify(result.totals)
+  assert.ok(!stdout.includes('/etc/'), 'must not leak the hostile path')
+  assert.ok(!stdout.includes('hostile-secret'), 'must not leak the hostile filename')
+})
+
+// ---- Review round-1 M7: derivePerRepoLabel's no-records (uninstrumented)
+// branch was covered by no test, and its old fallback (path.basename(root))
+// could itself be the operator's account name for a home-shaped root. ----
+
+test('optimise-read CLI: `ledger <root>` on an UNINSTRUMENTED root (no ledger file, no records) whose own BASENAME is the account name never emits the account name as perRepo[].root -- recursive walk for the same five patterns (M7, AC-SEC-3, reproducing the review\'s exact `<scratch>/Users/<user>` shape)', () => {
+  const whoami = sh('whoami', SUITE_TMPDIR).trim()
+  // The analysed root's own LAST path segment (its basename) is literally
+  // the account name -- exactly `node optimise-read.mjs ledger <scratch>/Users/<user>`,
+  // the review's own reproduction. A random segment sits BEFORE it only for
+  // per-run uniqueness; it must never be the trailing (basename) segment.
+  const homeLikeRoot = path.join(SUITE_TMPDIR, 'home', Math.random().toString(36).slice(2), whoami)
+  fs.mkdirSync(homeLikeRoot, { recursive: true })
+  trackTempDir(path.join(SUITE_TMPDIR, 'home'))
+  sh('git init -q -b main', homeLikeRoot)
+  sh('git config user.email test@example.com', homeLikeRoot)
+  sh('git config user.name Test', homeLikeRoot)
+  fs.writeFileSync(path.join(homeLikeRoot, 'README.md'), 'seed\n')
+  sh('git add README.md && git commit -q -m seed', homeLikeRoot)
+  assert.ok(/\/home\//.test(homeLikeRoot) && homeLikeRoot.includes(whoami), 'sanity: the fixture root must genuinely be home-shaped')
+  // No runAppend call: this repo is deliberately UNINSTRUMENTED (no ledger
+  // file at all), which is exactly the branch derivePerRepoLabel's fallback
+  // governs -- withRepo is never found, so the fallback fires for real.
+
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', homeLikeRoot], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.perRepo.length, 1)
+  assert.equal(out.perRepo[0].uninstrumented, true, 'sanity: this must genuinely exercise the no-records branch')
+  assert.notEqual(out.perRepo[0].root, whoami, 'the fallback must never emit the bare account name')
+
+  const violations = []
+  function walk(value, at) {
+    if (value === null || value === undefined) return
+    if (typeof value === 'string') {
+      if (/\/Users\//.test(value)) violations.push(`${at}: /Users/`)
+      if (/\/Volumes\//.test(value)) violations.push(`${at}: /Volumes/`)
+      if (/\/home\//.test(value)) violations.push(`${at}: /home/`)
+      if (/C:\\/.test(value)) violations.push(`${at}: Windows path`)
+      if (whoami && value.includes(whoami)) violations.push(`${at}: whoami in ${JSON.stringify(value)}`)
+      return
+    }
+    if (Array.isArray(value)) { value.forEach((v, i) => walk(v, `${at}[${i}]`)); return }
+    if (typeof value === 'object') { for (const [k, v] of Object.entries(value)) walk(v, `${at}.${k}`) }
+  }
+  walk(out, '$')
+  assert.deepEqual(violations, [])
+})
+
+// ---- Review round-1 L1: skipped-line reasons echoed the parser's own
+// error message verbatim, which can itself embed the first characters of
+// the raw (corrupt) line -- including a leaked absolute path. ----
+
+test('optimise-read: a skipped line beginning with an absolute path does not leak that path into the skip reason (L1, AC-SEC-3)', () => {
+  const raw = '/Users/some-user/private/secret-plan.md was here\n'
+  const { skipped } = mod.parseLedgerContent(raw)
+  assert.equal(skipped.length, 1)
+  assert.ok(!skipped[0].reason.includes('/Users/'), `skip reason must not echo the raw line's own content: ${JSON.stringify(skipped[0].reason)}`)
+  assert.ok(!skipped[0].reason.includes('secret-plan'), `skip reason must not echo the raw line's target file name: ${JSON.stringify(skipped[0].reason)}`)
+  assert.match(skipped[0].reason, /pars|JSON|invalid/i, 'the reason must still say WHY it was skipped, just not echo the raw content')
+})
+
+test('optimise-read: a skipped line with an ordinary (non-leaking) parse error still names the reason clearly (not vacuous)', () => {
+  const raw = 'not json at all\n'
+  const { skipped } = mod.parseLedgerContent(raw)
+  assert.equal(skipped.length, 1)
+  assert.match(skipped[0].reason, /pars|JSON|invalid/i)
+})
+
+test('optimise-read: aggregateWallClock never presents two DIFFERENT out-of-repo specs as one merged plan -- both are excluded from byPlan and counted under a named unattributable total instead (AC-DATA-7, AC-OPS-5)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '/etc/plan-one.md', run_id: 'oor-1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: '/etc/plan-one.md', run_id: 'oor-1', ts: '2026-08-01T00:01:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '/var/plan-two.md', run_id: 'oor-2', ts: '2026-08-01T01:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: '/var/plan-two.md', run_id: 'oor-2', ts: '2026-08-01T01:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  for (const bucket of result.byPlan.values()) {
+    assert.notEqual(bucket.plan, '<redacted-path>', 'the redaction marker must never be rendered as if it were a real plan name')
+  }
+  assert.equal(result.byPlan.size, 0, 'neither out-of-repo record may create (or share) a byPlan bucket')
+  assert.equal(result.totals.unattributableRuns, 2, 'both records must be counted, distinctly, under the named unattributable total -- never silently merged as if they were the same plan')
+})
+
+test('optimise-read: aggregateRework excludes an out-of-repo spec from acVerdicts and counts it under unattributableCount instead of a plan-shaped bucket (AC-DATA-7, AC-OPS-5)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: '/etc/plan-one.md', round_key: 's1', outcome: 'done', findings: [], ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PASS' }] },
+  ]
+  const result = mod.aggregateRework(records, { root: '/repo' })
+  assert.equal(result.acVerdicts.size, 0)
+  assert.equal(result.unattributableCount, 1)
+})
+
+test('optimise-read: aggregateWallClock excludes a fully-degraded pair (both records marked degraded:true, no spec survives) from byPlan -- counted under a named degraded-run total, never silently folded into the no-spec bucket (AC-QA-7)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', run_id: 'deg-1', ts: '2026-08-01T00:00:00.000Z', degraded: true },
+    { kind: 'tdd_task', repo: 'demo', run_id: 'deg-1', ts: '2026-08-01T00:01:00.000Z', outcome: 'done', degraded: true },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.byPlan.size, 0, 'a fully-degraded pair must not create (or fall into) a no-spec byPlan bucket')
+  assert.equal(result.totals.degradedUnattributedRuns, 1)
+})
+
+test('optimise-read: aggregateWallClock still attributes a pair where only ONE side degraded -- the surviving side\'s plan identity is real and must not be discarded just because its partner degraded (AC-QA-7, not vacuous)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', run_id: 'partial-1', spec: 'specs/a.md', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', run_id: 'partial-1', ts: '2026-08-01T00:01:00.000Z', outcome: 'done', degraded: true },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.degradedUnattributedRuns, 0, 'a pair with a real spec on one side must not count as unattributed-degraded')
+  const bucket = result.byPlan.get('demo|specs/a.md')
+  assert.ok(bucket, 'the real plan identity must survive even though its terminal partner degraded')
+  assert.equal(bucket.agentComputeN, 1)
+})
+
+test('optimise-read: aggregateWallClock canonicalises the ci_wait event_key plan segment too, not just agent_compute\'s spec -- an absolute-form event_key and a relative-form event_key for the same plan collapse into ONE bucket (AC-ARCH-4, the ci_wait/human_wait half)', () => {
+  const root = '/repo'
+  const records = [
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: '/repo/specs/a.md:T1:ci_wait_started:1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: '/repo/specs/a.md:T1:ci_wait_ended:1', ts: '2026-08-01T00:00:10.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_started', event_key: 'specs/a.md:T1:ci_wait_started:2', ts: '2026-08-01T01:00:00.000Z' },
+    { kind: 'conduct_plan_event', repo: 'demo', event: 'ci_wait_ended', event_key: 'specs/a.md:T1:ci_wait_ended:2', ts: '2026-08-01T01:00:20.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root })
+  assert.equal(result.byPlan.size, 1, `expected the absolute and relative event_key forms to collapse into one bucket, got ${JSON.stringify([...result.byPlan.keys()])}`)
+  const bucket = result.byPlan.get('demo|specs/a.md')
+  assert.ok(bucket, 'expected the canonical "demo|specs/a.md" bucket')
+  assert.equal(bucket.ciWaitN, 2, 'both the absolute-form and relative-form pairs must be measured inside the ONE bucket')
+  assert.equal(bucket.ciWaitSeconds, 30)
+})
+
+test('optimise-read module: canonicalPlanKey and the marker/sentinel constants are imported from ledger-append.mjs, not redeclared -- no second normalisation implementation (no path-stripping regex, no path.normalize on a spec value) anywhere in optimise-read.mjs (AC-ARCH-1)', () => {
+  const contents = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs'), 'utf8')
+  assert.ok(/import\s*\{[^}]*canonicalPlanKey[^}]*\}\s*from\s*['"]\.\/ledger-append\.mjs['"]/.test(contents), 'expected optimise-read.mjs to import canonicalPlanKey from ledger-append.mjs')
+  assert.ok(!/path\.normalize/.test(contents), 'optimise-read.mjs must not run its own path.normalize on a spec value -- canonicalPlanKey is the single definition site')
+  assert.ok(!/function\s+canonicalPlanKey/.test(contents.replace(/import[^\n]*canonicalPlanKey[^\n]*/, '')), 'optimise-read.mjs must not declare a second canonicalPlanKey of its own')
 })

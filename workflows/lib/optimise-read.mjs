@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY } from './ledger-append.mjs'
 
 // AC-ARCH-14: the default bound on how much ledger history a single
 // aggregation pass reads -- proven against a >=2000-line synthetic ledger
@@ -94,7 +94,13 @@ export function parseLedgerContent(raw) {
     try {
       parsed = JSON.parse(line)
     } catch (e) {
-      skipped.push({ line: lineNo, reason: `line ${lineNo} failed JSON parse: ${e.message}` })
+      // Review round-1 L1: JSON.parse's own SyntaxError message embeds a
+      // snippet of the RAW (corrupt) input it failed on -- for a torn or
+      // hand-edited line beginning with an absolute path, that snippet is
+      // the leak itself, reaching this reader's JSON output and, from
+      // there, a model prompt. A fixed reason naming only the line number,
+      // never the parser's own message text, closes it.
+      skipped.push({ line: lineNo, reason: `line ${lineNo} failed JSON parse (invalid JSON syntax)` })
       if (i === lines.length - 1) truncatedFinalLine = true
       continue
     }
@@ -130,21 +136,67 @@ function bumpDisposition(counts, lens, disposition) {
   if (disposition in counts[lens]) counts[lens][disposition] += 1
 }
 
+// HARN-OPT-2 PR1 (AC-ARCH-1, AC-ARCH-4): the ONE place every plan-keyed
+// aggregation below derives its bucket key from -- routes through the
+// single shared canonicalPlanKey (imported from ledger-append.mjs, never
+// redeclared here). Prefers a post-PR1 record's own `plan_key` (computed
+// writer-side, so it already accounts for the ACTUAL working tree the
+// record was authored from -- see ledger-append.mjs's AC-ARCH-3 worktree
+// handling, which this reader cannot reproduce after the fact); falls back
+// to re-deriving it from the retained `spec` field for a historical
+// (pre-PR1) line that has no plan_key at all (AC-ARCH-5: one code path, no
+// branch on schema_version).
+//
+// Returns null for a record with no attributable identity left at all
+// (AC-QA-7): a `degraded:true` line drops spec/plan_key entirely to fit
+// the minimal envelope, so there is nothing to canonicalise -- the caller
+// must count this separately, never fold it into the no-spec bucket.
+function planKeyForRecord(record, root = '') {
+  if (!record || record.degraded) return null
+  // Review round-1 M1 (read-side defence in depth): a STORED plan_key is
+  // re-canonicalised, never trusted verbatim. A hand-edited or foreign
+  // ledger line (the spec itself documents hand-injected records) can carry
+  // a plan_key that itself leaks -- re-running it through the same shared
+  // function costs nothing for an already-clean value (canonicalPlanKey is
+  // idempotent) and closes that route the same way a hostile `spec` is
+  // closed.
+  if (typeof record.plan_key === 'string' && record.plan_key) return canonicalPlanKey(record.plan_key, root)
+  return canonicalPlanKey(record.spec, root)
+}
+
 // Rework attribution (spec item 1) + AC-verdict aggregation keyed by
 // (repo, spec, ac_id) -- AC-DATA-7: never by AC id alone, so the same AC id
 // in two different specs (or the same spec name reused across two repos)
-// reports as two distinct criteria, not one merged one.
-export function aggregateRework(records) {
+// reports as two distinct criteria, not one merged one. HARN-OPT-2 PR1: the
+// key's `spec` segment (and the entry's reported `spec` field) is now the
+// CANONICAL plan key, not the raw ledger value, so an absolute and a
+// relative form of the same plan collapse into one entry (AC-ARCH-4) and a
+// path that cannot be attributed to any single spec (out-of-repo, or the
+// pre-existing redaction placeholder) is excluded entirely and counted
+// under the returned `unattributableCount` instead of a plan-shaped bucket
+// (AC-DATA-7, AC-OPS-5) -- `root`, optional, is the caller's already-
+// resolved analysis root, used only for lexically relativising an absolute
+// historical `spec` value; it is never touched by any fs call here.
+export function aggregateRework(records, { root = '' } = {}) {
   const reviewRecords = records.filter((r) => r.kind === 'review_cycle')
   const lensDispositionCounts = {}
   const acVerdicts = new Map()
+  let unattributableCount = 0
   for (const r of reviewRecords) {
     for (const f of r.findings || []) {
       bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
     }
-    for (const v of r.ac_verdicts || []) {
-      const key = `${r.repo}|${r.spec}|${v.ac_id}`
-      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: r.spec, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
+    const verdicts = r.ac_verdicts || []
+    if (!verdicts.length) continue
+    const planKey = planKeyForRecord(r, root)
+    if (planKey === null || planKey === REDACTED_PATH_MARKER) {
+      unattributableCount += verdicts.length
+      continue
+    }
+    for (const v of verdicts) {
+      // Review round-2 M4: same injective-escaping fix as planBucketKey.
+      const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(v.ac_id)}`
+      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
       const entry = acVerdicts.get(key)
       entry.n += 1
       if (v.verdict === 'PASS') entry.pass += 1
@@ -152,7 +204,7 @@ export function aggregateRework(records) {
       else if (v.verdict === 'UNVERIFIABLE') entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -211,13 +263,26 @@ function occurrenceKeyFromEventKey(eventKey, eventName) {
   return eventKey.slice(0, idx) + ':' + eventKey.slice(idx + marker.length)
 }
 
+// Review round-2 M4: a bare `|`-join is not injective -- a literal "|"
+// inside a repo identity (a remoteless repo's basename fallback, or a
+// deliberately named checkout) or a spec path merges two DISTINCT (repo,
+// plan) pairs into one bucket, summing durations and merging AC verdicts.
+// Backslash-escaping "\" and "|" within each component before joining
+// fixes this while staying IDENTICAL to the plain join whenever neither
+// component actually contains "|" (the overwhelming common case) -- every
+// `${repo}|${plan}`-shaped key elsewhere in this codebase and its tests
+// keeps working unchanged.
+function escapeKeyComponent(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/\|/g, '\\|')
+}
+
 // Review round-1 M5 (AC-DATA-7): the wall-clock bucket key, mirroring
 // aggregateRework's `${repo}|${spec}` scheme exactly -- the same plan/spec
 // path recurring in two different repos (a realistic case once this
 // harness's own specs/ layout is mirrored into other repos) must never
 // merge their waits into one bucket.
 function planBucketKey(repo, plan) {
-  return `${repo}|${plan}`
+  return `${escapeKeyComponent(repo)}|${escapeKeyComponent(plan)}`
 }
 
 function ensurePlan(byPlan, key, repo, plan) {
@@ -249,7 +314,11 @@ function ensurePlan(byPlan, key, repo, plan) {
 // tracked per segment so totals can report null (unmeasured) rather than a
 // misleadingly measured-looking 0 when a segment has zero measured runs but
 // at least one unmeasured attempt.
-export function aggregateWallClock(records) {
+// HARN-OPT-2 PR1 (AC-ARCH-4): `root`, optional, is the caller's already-
+// resolved analysis root, used only to lexically relativise an absolute
+// historical spec/event_key plan segment via the shared canonicalPlanKey --
+// never touched by any fs call here.
+export function aggregateWallClock(records, { root = '' } = {}) {
   const byPlan = new Map()
 
   // ---- ci_wait / human_wait, from conduct_plan_event pairs ----
@@ -262,20 +331,42 @@ export function aggregateWallClock(records) {
   // shared occurrence key (see occurrenceKeyFromEventKey) makes that whole
   // class of bug unrepresentable: two events pair if and only if they
   // share a key, independent of sort order or how many of each exist.
+  // Review round-1 H2: two DIFFERENT out-of-repo plans must never merge
+  // into one ci_wait/human_wait bucket -- shared across both event names
+  // below, mirroring agentComputeUnattributed's own counter in shape.
+  let unattributableWaits = 0
   for (const eventName of ['ci_wait', 'human_wait']) {
     const startedByBucket = new Map() // bucketKey -> Map(occKey -> {ms, repo, plan}); a null-occKey event can never be matched, kept in its own list
     const endedByBucket = new Map()
     const nullOccByBucket = new Map() // bucketKey -> {starts: [...], ends: [...]}
     for (const r of records) {
       if (r.kind !== 'conduct_plan_event') continue
-      const plan = planKeyFromEventKey(r.event_key)
-      if (!plan) continue
-      const repo = r.repo || 'unknown'
-      const bucketKey = planBucketKey(repo, plan)
-      const ms = tsMs(r.ts)
+      const rawPlan = planKeyFromEventKey(r.event_key)
+      if (!rawPlan) continue
+      // Only a record actually relevant to THIS pass (this loop runs once
+      // per eventName, and `records` is the same full array each time) --
+      // checked BEFORE the marker/count logic below so an unattributable
+      // record is never counted once per eventName it is irrelevant to.
       const isStarted = r.event === `${eventName}_started`
       const isEnded = r.event === `${eventName}_ended`
       if (!isStarted && !isEnded) continue
+      // AC-ARCH-4: the ci_wait/human_wait bucket key routes through the
+      // SAME shared canonicalisation as agent_compute and aggregateRework,
+      // so an absolute and a relative form of the same plan file's
+      // event_key segment collapse into one bucket here too.
+      const plan = canonicalPlanKey(rawPlan, root)
+      // Review round-1 H2: an out-of-repo (or otherwise unattributable)
+      // plan is never bucketed -- agent_compute already had this guard;
+      // ci_wait/human_wait did not, so two DIFFERENT out-of-repo plans
+      // collapsed into one bucket literally named "<redacted-path>" and had
+      // their durations SUMMED. Counted here instead, never merged.
+      if (plan === REDACTED_PATH_MARKER) {
+        unattributableWaits += 1
+        continue
+      }
+      const repo = r.repo || 'unknown'
+      const bucketKey = planBucketKey(repo, plan)
+      const ms = tsMs(r.ts)
       const occKey = occurrenceKeyFromEventKey(r.event_key, r.event)
       const target = isStarted ? startedByBucket : endedByBucket
       if (occKey === null) {
@@ -348,10 +439,43 @@ export function aggregateWallClock(records) {
     if (!byRunId.has(r.run_id)) byRunId.set(r.run_id, [])
     byRunId.get(r.run_id).push(r)
   }
+  // HARN-OPT-2 PR1 (AC-ARCH-4, AC-DATA-7, AC-OPS-5, AC-QA-7): plan identity
+  // for the pair routes through the single shared planKeyForRecord helper,
+  // preferring whichever record in the pair carries a real identity. Three
+  // outcomes, counted and named distinctly, never conflated:
+  //   - every record in the pair is degraded (no spec/plan_key survives at
+  //     all): counted under degradedUnattributedRuns, never folded into
+  //     the no-spec bucket (AC-QA-7);
+  //   - the canonical key is the out-of-repo/redaction marker: counted
+  //     under unattributableRuns, never rendered as a plan-shaped bucket,
+  //     and never merged with a DIFFERENT out-of-repo plan (AC-DATA-7,
+  //     AC-OPS-5);
+  //   - otherwise, a real (possibly no-spec-sentinel) plan key: bucketed
+  //     as before.
+  let degradedUnattributedRuns = 0
+  let unattributableRuns = 0
   for (const [, pair] of byRunId.entries()) {
     const repo = pair[0]?.repo || 'unknown'
-    const spec = pair.find((p) => p.spec)?.spec || null
-    const plan = spec || 'unspecified'
+    // Review round-1 M3: order-independent, main's own semantics restored
+    // (`pair.find(p => p.spec)?.spec`). The PREVIOUS "first non-null wins"
+    // rule treated NO_SPEC_PLAN_KEY as "non-null" too, so a no-spec record
+    // sitting first in file/array order won over a partner that DID carry a
+    // real spec -- order-DEPENDENT, and the no-spec sentinel won by default
+    // rather than by any real evidence. Collect every key in the pair, then
+    // prefer the first one that is neither null (degraded) NOR the no-spec
+    // sentinel; fall back to the sentinel only when nothing in the pair has
+    // a real one, and to "fully degraded" only when EVERY record in the
+    // pair is degraded (nothing at all survives to attribute).
+    const keys = pair.map((p) => planKeyForRecord(p, root))
+    if (keys.every((k) => k === null)) {
+      degradedUnattributedRuns += 1
+      continue
+    }
+    const plan = keys.find((k) => k !== null && k !== NO_SPEC_PLAN_KEY) ?? NO_SPEC_PLAN_KEY
+    if (plan === REDACTED_PATH_MARKER) {
+      unattributableRuns += 1
+      continue
+    }
     const key = planBucketKey(repo, plan)
     if (pair.length < 2) {
       // An orphan start or terminal with no partner: an attempt we know
@@ -382,6 +506,9 @@ export function aggregateWallClock(records) {
     humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0,
     agentComputeSeconds: 0, agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 0,
     unterminatedWaits: 0,
+    degradedUnattributedRuns,
+    unattributableRuns,
+    unattributableWaits,
   }
   for (const bucket of byPlan.values()) {
     totals.ciWaitSeconds += bucket.ciWaitSeconds
@@ -644,11 +771,41 @@ function mapToObject(m) {
   return Object.fromEntries([...m.entries()])
 }
 
+// AC-SEC-3 (round 2): perRepo[].root used to be the raw, caller-supplied
+// analysis path verbatim -- a real leak, not merely "the caller's own
+// already-known argument": workflows/optimise-cycle.js renders it directly
+// into the persisted report and the synthesis prompt whenever no friendlier
+// label has been resolved elsewhere (`d.repoLabels[entry.root] ||
+// entry.root`), so an operator's home-directory-bearing checkout path
+// reached both. Derives a non-identifying handle instead, from data this
+// file already has no fs-privileged reason to withhold: the `repo` identity
+// the WRITER already resolved and redacted for its own records (the same
+// value every other part of this output already keys on -- byPlan, rework),
+// falling back to a bare basename (never the full path) when no record
+// exists to derive one from (an uninstrumented repo, or one whose every
+// line was skipped). No git/gh call is made here (this file stays read-only
+// and shells out to nothing, per AC-SEC-9/AC-ARCH-8) -- purely a string/
+// array read over records already parsed.
+function derivePerRepoLabel(records, root) {
+  const withRepo = records.find((r) => typeof r.repo === 'string' && r.repo)
+  if (withRepo) return withRepo.repo
+  // Review round-1 M7: the fallback used to be the root's own basename --
+  // but for a home-shaped analysis root (e.g. `<scratch>/Users/<user>`,
+  // the operator's own home directory or one directly beneath it), the
+  // basename CAN BE the account name itself, leaking exactly what AC-SEC-3
+  // exists to redact. This branch fires for precisely the common
+  // "uninstrumented" case (no ledger file at all, so no record to derive a
+  // real identity from), so it must never fall back to any part of the raw
+  // path -- a fixed, non-identifying constant instead.
+  return REDACTED_PATH_MARKER
+}
+
 function runLedgerCommand(roots, window) {
   const perRepo = []
   let combinedRecords = []
   let combinedSkipped = []
-  for (const root of roots) {
+  for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
+    const root = roots[rootIndex]
     const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
     let raw = ''
     let exists = false
@@ -657,14 +814,30 @@ function runLedgerCommand(roots, window) {
       raw = fs.readFileSync(ledgerPath, 'utf8')
     }
     const { records, skipped, schemaVersionsSeen, truncatedFinalLine } = parseLedgerContent(raw)
-    perRepo.push({ root, uninstrumented: !exists, recordCount: records.length, skippedCount: skipped.length, schemaVersionsSeen: mapToObject(schemaVersionsSeen), truncatedFinalLine })
+    const label = derivePerRepoLabel(records, root)
+    // Review round-1 M5: rootIndex is the stable, positional, non-
+    // identifying key a caller (optimise-cycle.js) can use to look up its
+    // OWN friendlier label for this same root -- `root` here is a derived
+    // identity/basename (AC-SEC-3), not the raw path, so a caller cannot
+    // key its own lookup by it any more.
+    perRepo.push({ root: label, rootIndex, uninstrumented: !exists, recordCount: records.length, skippedCount: skipped.length, schemaVersionsSeen: mapToObject(schemaVersionsSeen), truncatedFinalLine })
     combinedRecords = combinedRecords.concat(records)
     combinedSkipped = combinedSkipped.concat(skipped)
   }
   const { windowed, truncated, droppedCount } = windowRecords(combinedRecords, window)
-  const rework = aggregateRework(windowed)
+  // HARN-OPT-2 PR1: plan-identity canonicalisation of an absolute historical
+  // spec value needs the actual analysis root as a lexical string to strip.
+  // Simplification, stated here rather than hidden: when MULTIPLE roots are
+  // analysed in one invocation, only the FIRST one is used for this -- an
+  // absolute historical spec belonging to a DIFFERENT listed root falls
+  // through to the safe out-of-repo marker (never merged, never leaked)
+  // rather than being relativised against the wrong root. The common case
+  // (one root per invocation, per AC-SEC-3's own documented usage) is
+  // unaffected.
+  const canonicalRoot = roots[0] || ''
+  const rework = aggregateRework(windowed, { root: canonicalRoot })
   const neverFailing = neverFailingAcs(rework.acVerdicts, {})
-  const wallClock = aggregateWallClock(windowed)
+  const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
   const trigger = aggregateTriggerAccuracy(windowed)
   const proposalOutcomes = aggregateProposalOutcomes(windowed)
   return {
@@ -673,7 +846,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()] },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
@@ -713,7 +886,12 @@ export function main() {
     try {
       payload = raw.trim() ? JSON.parse(raw) : {}
     } catch (e) {
-      return { error: 'stdin was not valid JSON: ' + e.message, byJob: {} }
+      // Review round-2 L2: JSON.parse's own SyntaxError message embeds a
+      // snippet of the RAW input it failed on -- matching L1's already-
+      // fixed ledger-line-parser leak, applied here too. This command is
+      // fed agent-assembled `gh` output, which optimise-cycle.js carries
+      // into the synthesis prompt and the report.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', byJob: {} }
     }
     return runCiCommand(payload)
   }
@@ -723,7 +901,8 @@ export function main() {
     try {
       payload = raw.trim() ? JSON.parse(raw) : {}
     } catch (e) {
-      return { error: 'stdin was not valid JSON: ' + e.message, count: null }
+      // Review round-2 L2: same fix as the `ci` command above.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', count: null }
     }
     return countEscapedDefectCandidates(Array.isArray(payload && payload.commits) ? payload.commits : [])
   }
@@ -733,7 +912,8 @@ export function main() {
     try {
       payload = raw.trim() ? JSON.parse(raw) : {}
     } catch (e) {
-      return { error: 'stdin was not valid JSON: ' + e.message, ids: [] }
+      // Review round-2 L2: same fix as the `ci` command above.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', ids: [] }
     }
     const targets = Array.isArray(payload && payload.targets) ? payload.targets : []
     return { ids: targets.map((target) => ({ target, proposal_id: stableProposalId(target) })) }

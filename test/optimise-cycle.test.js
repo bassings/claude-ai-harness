@@ -23,7 +23,12 @@ function scopeFixture(overrides = {}) {
 function ledgerFixture(overrides = {}) {
   return {
     n: 6, windowTruncated: false, windowDroppedCount: 0,
-    perRepo: [{ root: '/repo', uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
+    // root is a DERIVED, non-identifying label (the reader's own repo
+    // identity or a basename, per round-2's AC-SEC-3 fix -- never the raw
+    // path any more), and rootIndex is the position into `roots` the
+    // scope step resolved (M5): both match the shape optimise-read.mjs's
+    // real CLI now actually emits, not the pre-round-2 raw-path shape.
+    perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
     skipped: [],
     rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }] },
     neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false }],
@@ -161,6 +166,100 @@ test('optimise-cycle: a two-repo fixture with unterminatedWaits>0 and one uninst
   assert.ok(Array.isArray(result.per_repo), 'return must include per_repo')
   assert.equal(result.per_repo.length, 2)
   assert.equal(result.per_repo.find((r) => r.root === '/repoB').uninstrumented, true)
+})
+
+// ---- Review round-1 M2: runs excluded from byPlan (unattributable and
+// degraded) disappeared from every rendered figure -- the report's totals
+// sum over byPlan only, and the three counters the reader already computes
+// (wallClock.totals.unattributableRuns, .degradedUnattributedRuns,
+// .unattributableWaits, rework.unattributableCount) reached the JSON and
+// stopped there. ----
+
+test('optimise-cycle: the report\'s Sample completeness section renders all three exclusion counters (wallClock unattributable runs, degraded-unattributed runs, unattributable waits, and rework unattributable count), with real non-zero numbers when a marker-bearing fixture is fed in (M2, AC-DATA-7/AC-QA-7)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0,
+          unattributableRuns: 2, degradedUnattributedRuns: 1, unattributableWaits: 4,
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+      rework: { n: 3, lensDispositionCounts: {}, acVerdicts: [], unattributableCount: 5 },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  // Review round-2 M3: matching against the WHOLE report let three of the
+  // four counters pass vacuously -- `/\b4\b/` matched "AC-ARCH-4" in an
+  // unrelated pre-existing line, `/\b5\b/` matched "n=5"/"minimum ... 5" in
+  // the CI section, and `/degraded/i` matched the hard-coded label text
+  // regardless of the actual value. Extracting the SPECIFIC rendered line
+  // and asserting the exact substrings on IT closes all three.
+  const line = result.report.split('\n').find((l) => l.startsWith('Excluded from attribution'))
+  assert.ok(line, `expected a line starting with "Excluded from attribution", report was: ${result.report}`)
+  assert.ok(line.includes('unattributable runs=2'), `got: ${line}`)
+  assert.ok(line.includes('degraded-unattributed runs=1'), `got: ${line}`)
+  assert.ok(line.includes('unattributable ci_wait/human_wait observations=4'), `got: ${line}`)
+  assert.ok(line.includes('unattributable rework records=5'), `got: ${line}`)
+})
+
+test('optimise-cycle: the report renders real ZEROS for the three exclusion counters on a clean fixture, never omitting the line entirely (M2, "a missing line means the check stopped running")', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.startsWith('Excluded from attribution'))
+  assert.ok(line, `expected a line starting with "Excluded from attribution" even when every count is zero, report was: ${result.report}`)
+  assert.ok(line.includes('unattributable runs=0'), `got: ${line}`)
+  assert.ok(line.includes('degraded-unattributed runs=0'), `got: ${line}`)
+  assert.ok(line.includes('unattributable ci_wait/human_wait observations=0'), `got: ${line}`)
+  assert.ok(line.includes('unattributable rework records=0'), `got: ${line}`)
+})
+
+// ---- Review round-1 M5 (SPEC BUG SB-1): perRepo[].root silently changed
+// contract -- optimise-cycle.js's repoLabels lookup, keyed by the OLD raw
+// absolute root, is now a guaranteed miss against the reader's new derived
+// identity, and two different roots whose derived identity happens to
+// collide (e.g. two checkouts of the same origin) render as indistinguishable
+// report lines. rootIndex restores a stable, positional, non-identifying
+// key both sides can agree on. ----
+
+test('optimise-cycle: perRepo[].rootIndex lets the report show the scope-resolved label for each repo, even when the reader\'s own derived per-repo identity COLLIDES for two different roots (M5, SPEC BUG SB-1)', async () => {
+  const twoRepoScope = scopeFixture({
+    resolved: [{ requested: '.', root: '/repoA', label: 'repoA' }, { requested: '../other', root: '/repoB', label: 'repoB' }],
+  })
+  const responses = baseResponses({
+    'scope:repos': twoRepoScope,
+    'lane:ledger': ledgerFixture({
+      // Both entries derive to the SAME identity (e.g. two checkouts
+      // sharing one origin remote) -- the collision M5's evidence measured.
+      perRepo: [
+        { root: 'acme/widget', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false },
+        { root: 'acme/widget', rootIndex: 1, uninstrumented: false, recordCount: 3, skippedCount: 0, schemaVersionsSeen: { 1: 3 }, truncatedFinalLine: false },
+      ],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: { repos: ['.', '../other'] }, agent: responses })
+  const perRepoLines = result.report.split('\n').filter((l) => /record\(s\) in window|uninstrumented/.test(l))
+  assert.equal(perRepoLines.length, 2, `expected two per-repo lines, got: ${JSON.stringify(perRepoLines)}`)
+  assert.notEqual(perRepoLines[0], perRepoLines[1], 'two DIFFERENT roots whose derived perRepo identity collides must still render as two DISTINCT lines, via rootIndex')
+  assert.ok(perRepoLines[0].includes('repoA'), `expected the scope-resolved label "repoA", got: ${perRepoLines[0]}`)
+  assert.ok(perRepoLines[1].includes('repoB'), `expected the scope-resolved label "repoB", got: ${perRepoLines[1]}`)
+})
+
+test('optimise-cycle: with no rootIndex on a perRepo entry (e.g. an older reader), the report falls back to the reader\'s own (already-safe, post-round-2) derived label rather than crashing or showing "undefined" (M5, not vacuous, defensive fallback)', async () => {
+  // Review round-2 L6: the default ledgerFixture() sets rootIndex:0, so the
+  // `typeof entry.rootIndex === 'number'` branch was always taken and the
+  // fallback (`|| entry.root`) was never reached at all -- the deletion
+  // mutation the review applied (`d.repoLabels[entry.rootIndex]`, no
+  // fallback) still passed. Explicitly omitting rootIndex here is what
+  // actually exercises the fallback branch.
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      perRepo: [{ root: 'demo-derived-label', uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.ok(!/undefined/i.test(result.report), 'the report must never render the literal string "undefined" for a repo label')
+  assert.ok(result.report.includes('demo-derived-label'), `expected the fallback to render the reader's own derived label, report was: ${result.report}`)
 })
 
 test('optimise-cycle: no repo resolves -> returns early with the unresolved reasons and makes no lane calls', async () => {
