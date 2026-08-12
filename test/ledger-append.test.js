@@ -11,7 +11,7 @@ const path = require('node:path')
 const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
-const { APPEND_SCRIPT, LEDGER_REL, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos } = require('./helpers/temp-repo.js')
+const { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos } = require('./helpers/temp-repo.js')
 const {
   makeHostileTempRepo,
   makeHomeLikeHostileTempRepo,
@@ -844,7 +844,22 @@ test('ledger-append: a real ledger line contains no personal identifier -- not t
   assert.equal(entry.repo, path.basename(repo), 'repo identity is a bare dir name, not an absolute path')
 })
 
-test('ledger-append: an absolute spec path UNDER the repo root is relativised (spec/plan_key), never rejected -- the RAW absolute form is retained separately, in spec_raw only (H2, AC-SEC-3, round 5 H-B)', () => {
+// Review round-1 L4 (also a spec bug: AC-SEC-1's headline sentence and its
+// enumerated test cases disagreed -- the headline forbids ANY absolute
+// path or account name in a ledger line; the five enumerated cases only
+// ever exercised plan_key/spec, which spec_raw is not). This test's
+// ORIGINAL assertion (spec_raw retains the caller's absolute form
+// VERBATIM) is exactly the leak: for an in-repo absolute spec on a real
+// checkout, that string is `/Volumes/.../repos/<repo>/specs/....md`,
+// carrying the local account name. Fixed by relativising spec_raw the
+// same lexical, root-matching way `spec` is -- WITHOUT the fuller
+// canonicalPlanKey pipeline's './'/'../'-collapsing step, so spec_raw is
+// never merely re-derived FROM the same canonicalisation it exists to
+// insure against (see the dedicated recoverability test below for the
+// non-vacuous proof of that). Out-of-repo specs are UNCHANGED: spec_raw is
+// still withheld entirely (AC-SEC-1 cases c/d), never merely relativised
+// against nothing.
+test('ledger-append: an absolute spec path UNDER the repo root is relativised (spec/plan_key), never rejected -- spec_raw is ALSO relativised (no leading "/", no absolute prefix, no account name), not retained verbatim (H2, AC-SEC-3, L4 -- supersedes the original round-5 H-B "verbatim" expectation)', () => {
   const repo = makeTempRepo()
   const absoluteSpec = path.join(repo, 'specs', 'optimise-cycle.md')
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec })
@@ -853,11 +868,38 @@ test('ledger-append: an absolute spec path UNDER the repo root is relativised (s
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.spec, 'specs/optimise-cycle.md', 'spec must be relativised against the repo root')
   assert.equal(entry.plan_key, 'specs/optimise-cycle.md', 'plan_key must never be the absolute form either')
-  // Round 5 (H-B): spec_raw is the ONE field allowed to carry the caller's
-  // absolute form verbatim -- this is deliberate (AC-DATA-4 recoverability),
-  // not a regression of H2/AC-SEC-3, which govern spec/plan_key and the
-  // OUTPUT boundary (the reader never emits spec_raw -- see optimise-read.mjs).
-  assert.equal(entry.spec_raw, absoluteSpec, 'spec_raw must retain the caller\'s original absolute string verbatim')
+  assert.equal(entry.spec_raw, 'specs/optimise-cycle.md', 'spec_raw must ALSO be relativised against the repo root, never the caller\'s absolute string verbatim (L4)')
+  assert.ok(!entry.spec_raw.startsWith('/'), 'spec_raw must never carry a leading "/" for an in-repo absolute spec')
+  assert.notEqual(entry.spec_raw, absoluteSpec, 'spec_raw must not equal the absolute form the caller supplied')
+})
+
+// L4's own stated proof requirement: "an absolute in-repo spec asserting
+// no account name and no leading /", against a real checkout nested under
+// a home-like path (a literal "home" segment plus the real `whoami`
+// output) -- the same technique optimise-read.test.js's leak-freedom
+// fixtures already use, so this cannot pass by coincidence of this
+// machine's own TMPDIR shape.
+test('ledger-append: spec_raw for an absolute in-repo spec leaks neither the local account name nor any path segment above the repo root, on a real checkout nested under a home-like path (L4)', () => {
+  const whoami = sh('whoami', SUITE_TMPDIR).trim()
+  const homeLikeRoot = path.join(SUITE_TMPDIR, 'home', whoami, 'repo-' + Math.random().toString(36).slice(2))
+  fs.mkdirSync(homeLikeRoot, { recursive: true })
+  trackTempDir(path.join(SUITE_TMPDIR, 'home'))
+  sh('git init -q -b main', homeLikeRoot)
+  sh('git config user.email test@example.com', homeLikeRoot)
+  sh('git config user.name Test', homeLikeRoot)
+  fs.writeFileSync(path.join(homeLikeRoot, 'README.md'), 'seed\n')
+  sh('git add README.md && git commit -q -m seed', homeLikeRoot)
+  assert.ok(/\/home\//.test(homeLikeRoot) && homeLikeRoot.includes(whoami), 'sanity: the fixture root must genuinely be home-shaped')
+
+  const absoluteSpec = path.join(homeLikeRoot, 'specs', 'a.md')
+  const res = runAppend(homeLikeRoot, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(homeLikeRoot)[0]
+  assert.ok(!line.includes('/home/'), `spec_raw (or any field) must not leak /home/, got: ${line}`)
+  assert.ok(!line.includes(whoami), `spec_raw (or any field) must not leak the account name, got: ${line}`)
+  const entry = JSON.parse(line)
+  assert.equal(entry.spec_raw, 'specs/a.md')
 })
 
 test('ledger-append: a task string containing an embedded absolute path has that path relativised/redacted, never left absolute, in the line (H2, AC-SEC-3)', () => {
@@ -1738,10 +1780,12 @@ test('ledger-append: an absolute spec path authored INSIDE a worktree is recorde
     assert.equal(entry.spec, 'specs/a.md', 'must relativise against the WORKTREE\'s own root, not fall back to the redaction placeholder just because it is not under the main checkout root')
     assert.notEqual(entry.spec, '<redacted-path>', 'must never be the redaction placeholder for a path genuinely inside the current working tree')
     assert.equal(entry.plan_key, 'specs/a.md')
-    // Round 5 (H-B): spec_raw retains the worktree-absolute form verbatim,
-    // deliberately (AC-DATA-4) -- spec/plan_key staying relative is what
-    // H2/AC-SEC-3 actually require.
-    assert.equal(entry.spec_raw, absoluteSpecInWorktree)
+    // L4: spec_raw is ALSO relativised against the worktree's own root --
+    // the original round-5 H-B expectation (verbatim absolute retention)
+    // is exactly the leak L4 fixes; see the dedicated L4 test for the
+    // full non-vacuous proof.
+    assert.equal(entry.spec_raw, 'specs/a.md')
+    assert.ok(!entry.spec_raw.startsWith('/'))
 
     // The SAME plan, run from the main checkout with an equivalent relative
     // spec, must land under the identical plan_key -- proving the split is
@@ -2024,6 +2068,33 @@ test('ledger-append (round 5, H-B, AC-DATA-4): plan_key is independently re-deri
   assert.equal(entry.plan_key, expectedCanonical, 'the writer\'s own canonicalisation must collapse "specs/../" and nothing else -- case preserved, a literal expectation, not a recomputation')
   const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
   assert.equal(canonicalPlanKey(entry.spec_raw, repo), expectedCanonical, 'a canonicaliser defect must be correctable by re-running canonicalPlanKey against the RETAINED RAW field alone -- checked against the SAME hardcoded literal, not against entry.plan_key')
+})
+
+// L4's companion case: the SAME recoverability-insurance property, but for
+// an ABSOLUTE in-repo spec -- proving the L4 fix (relativise spec_raw)
+// does not collapse it back into "just re-derived from plan_key" (which
+// would silently reintroduce H-B's original vacuous-recoverability
+// defect, this time via the relativisation step instead of the
+// truncation step). spec_raw must still differ from plan_key here: only
+// the absolute PREFIX is stripped, the awkward "../" survives untouched.
+test('ledger-append (L4): spec_raw for an ABSOLUTE in-repo spec is relativised but NOT fully canonicalised -- it still differs from plan_key when the raw form has something to collapse, so recoverability insurance survives the L4 fix (not vacuous)', async () => {
+  const repo = makeTempRepo()
+  // Plain string concatenation, NOT path.join -- path.join would silently
+  // normalise away the "../" before it ever reached the writer, defeating
+  // the whole point of this fixture.
+  const absoluteRawSpec = repo + '/specs/../Specs/Awkward.md'
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteRawSpec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  const expectedRelativised = 'specs/../Specs/Awkward.md'
+  const expectedCanonical = 'Specs/Awkward.md'
+  assert.equal(entry.spec_raw, expectedRelativised, 'spec_raw must be relativised (root prefix stripped) but NOT "../"-collapsed')
+  assert.ok(!entry.spec_raw.startsWith('/'), 'spec_raw must never carry the absolute prefix')
+  assert.equal(entry.plan_key, expectedCanonical)
+  assert.notEqual(entry.spec_raw, entry.plan_key, 'spec_raw must still differ from plan_key -- the L4 relativisation fix must not ALSO fully canonicalise it, or a canonicaliser defect in the "../"-collapsing step becomes unrecoverable again')
+  const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
+  assert.equal(canonicalPlanKey(entry.spec_raw, repo), expectedCanonical, 'a canonicaliser defect must still be correctable by re-running canonicalPlanKey against the retained (now-relativised) raw field')
 })
 
 test('ledger-append: a genuinely well-formed repo-relative spec is unaffected -- plan_key equals the spec as-is, and it is not the out-of-repo marker (not vacuous)', () => {

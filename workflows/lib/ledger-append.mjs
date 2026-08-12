@@ -947,7 +947,35 @@ export function main() {
   const specWasOverwritten = typeof payload.spec === 'string' && payload.spec !== '' && planKey !== NO_SPEC_PLAN_KEY
   if (specWasOverwritten) {
     payload.spec = planKey
-    if (planKey !== REDACTED_PATH_MARKER) payload.spec_raw = specRawInput
+    // Review round-1 L4 (AC-SEC-1's headline sentence, which forbids ANY
+    // absolute path or account name in a ledger line -- not just in
+    // plan_key/spec): specRawInput, for an in-repo ABSOLUTE spec, is the
+    // caller's literal absolute string, e.g.
+    // an absolute path shaped like /Volumes/<disk>/<user>/repos/<repo>/specs/a.md
+    // on a real checkout, which
+    // carries the local account name. Relativised here the SAME lexical,
+    // root-matching way `spec` is a few lines above -- but deliberately
+    // WITHOUT canonicalPlanKey's "./"/"../"-collapsing step, so spec_raw
+    // is never simply re-derived FROM the same canonicalisation it exists
+    // to insure against (that would silently reintroduce round 5's
+    // original vacuous-recoverability defect, one layer over). Only the
+    // absolute prefix is stripped; everything after it, including any
+    // awkward "../" segments, survives untouched (proven distinct from
+    // plan_key in ledger-append.test.js). A relative spec_raw is already
+    // safe and passes through unchanged. Out-of-repo specs are unchanged:
+    // spec_raw stays withheld entirely (AC-SEC-1 cases c/d).
+    if (planKey !== REDACTED_PATH_MARKER) {
+      const rawIsAbsolute = typeof specRawInput === 'string' && (specRawInput.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(specRawInput))
+      if (rawIsAbsolute) {
+        const matchedRoot = specRootCandidates
+          .filter((r) => typeof r === 'string' && r)
+          .map((r) => r.replace(/[\\/]+$/, ''))
+          .find((r) => specRawInput === r || specRawInput.startsWith(r + '/') || specRawInput.startsWith(r + '\\'))
+        payload.spec_raw = matchedRoot !== undefined ? specRawInput.slice(matchedRoot.length).replace(/^[\\/]+/, '') : specRawInput
+      } else {
+        payload.spec_raw = specRawInput
+      }
+    }
   }
 
   // Truncate free-text fields AFTER the above: `spec`/`spec_raw` are now
