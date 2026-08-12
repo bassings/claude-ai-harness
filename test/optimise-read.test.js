@@ -1223,6 +1223,27 @@ test('optimise-read: a genuinely clean stored plan_key is unaffected by re-canon
   assert.ok(result.byPlan.has('demo|specs/a.md'))
 })
 
+// Round 5 medium (AC-SEC-3): planKeyForRecord's line 163 branch
+// (`record.plan_key` present, re-canonicalised regardless) had a real
+// pre-PR1-shaped-line sibling test (M1, above) covering line 164's spec
+// fallback with a HOSTILE value, but no equivalent for a hostile STORED
+// plan_key -- a hand-edited or foreign ledger line (the spec itself
+// documents this can happen) that carries plan_key already set to an
+// absolute, out-of-repo path. Re-canonicalisation must catch it exactly
+// like a hostile spec would.
+test('optimise-read (round 5 medium, AC-SEC-3): a hand-seeded line whose STORED plan_key is itself an absolute, out-of-repo path is redacted on re-canonicalisation, counted as unattributable, and leaks nothing (line 163\'s branch, not just line 164\'s)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', plan_key: '/etc/hostile-secret.md', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', plan_key: '/etc/hostile-secret.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  assert.equal(result.byPlan.size, 0, 'a hostile stored plan_key must never create (or share) a byPlan bucket')
+  assert.equal(result.totals.unattributableRuns, 1)
+  const stdout = JSON.stringify([...result.byPlan.entries()]) + JSON.stringify(result.totals)
+  assert.ok(!stdout.includes('/etc/'), 'must not leak the hostile path')
+  assert.ok(!stdout.includes('hostile-secret'), 'must not leak the hostile filename')
+})
+
 // ---- Review round-1 M7: derivePerRepoLabel's no-records (uninstrumented)
 // branch was covered by no test, and its old fallback (path.basename(root))
 // could itself be the operator's account name for a home-shaped root. ----

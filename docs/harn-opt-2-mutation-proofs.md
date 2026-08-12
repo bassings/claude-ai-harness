@@ -4,7 +4,7 @@ Per AC-QA-22 and standard §11: for each guard below, the guarded behaviour
 was actually broken (edited in the working file, not "mentally mutated"),
 the suite was run, the exact failing test and message recorded, then the
 file was `cp`-restored from a pre-mutation snapshot (never `git checkout
---`, which reverts to the last commit and can destroy uncommitted work) and
+--`, which reverts to the last commit and can destroy uncommitted work),
 confirmed via `diff <working-file> <snapshot>` returning nothing before the
 next mutation. Full suite: `node --test test/*.test.js`. AC-SIMP-10 caps
 this file at 200 lines; later rounds compress earlier ones, never drop them.
@@ -14,187 +14,170 @@ verbatim. Fixed by deriving a non-identifying label (proof 10).
 
 **Round 3**: BLOCKED on CRITICAL C1 (four distinct conductor events
 collapsed to one line). Root cause: write-time regex redaction applied to a
-STRUCTURED path value (`spec`/`event_key`), not free text. Decision: strip
-write-time redaction of `spec` entirely (the ledger is gitignored,
-local-only -- AC-SEC-1 -- no privacy requirement to redact data INSIDE it;
-AC-SEC-3 governs the report/prompt OUTPUT boundary only), replaced with
-pure lexical root-matching. **Supersedes proofs 2 and 4**, corrected in
-place rather than deleted.
+STRUCTURED path value. Decision: strip write-time redaction of `spec`
+entirely (the ledger is gitignored, local-only -- AC-SEC-1; AC-SEC-3
+governs the OUTPUT boundary only), replaced with pure lexical root-matching.
+**Supersedes proofs 2 and 4**, corrected in place.
 
-**Round 4** (current tip): H3 was only half-fixed by round 3 -- an
-absolute spec through a symlinked ANCESTOR, submitted from a subdirectory
-(not repo root) of that repo, still fell through to the marker; round 3's
-own H3 test used cwd === repo root, letting its PWD candidate cover a
-narrower case by accident. Fixed and mutation-proven below; round-3's
-`realpathOrNull` finding is now resolved (deleted, genuinely dead), not
-merely flagged. Suite: 400/400 (ledger-append.test.js 123,
-optimise-read.test.js 76, optimise-cycle.test.js 63, optimise-static.test.js
-15, static-checks.test.js 18, 105 elsewhere untouched).
+**Round 4 (SHIPPED, then REVERTED by round 5)**: added `fs.realpathSync
+.native(path.dirname(spec))` in `main()` to recover a spec reached through
+a symlinked ancestor. Coordinator's own review found this made plan
+identity FILESYSTEM-STATE-dependent (the identical spec string recorded the
+marker before a symlink existed and the real key after one was created at
+the same path) -- a fresh violation of AC-ARCH-3/AC-DATA-3/AC-SEC-2, despite
+satisfying the letter of "canonicalPlanKey stays pure" (the call sat in
+`main()`, not inside it). **Entirely reverted in round 5**; see round 5
+below. This is why round 5 adds BEHAVIOURAL (not function-body-grep) purity
+guards -- a static check scoped to `canonicalPlanKey` could never have
+caught a violation living in a different function.
+
+**Round 5 (current tip)**: three High findings. **H-A**: reverts round 4 (above).
+**H-B**: AC-DATA-4's recoverability test was vacuous (re-derived from a
+field that already WAS the canonical key; proven by an invisible
+`.toLowerCase()` mutation). Fixed with a new `spec_raw` field -- the
+caller's original string, retained verbatim, EXCLUDED when the canonical
+form is the redaction marker (retaining a hostile out-of-repo/escaping
+value there would defeat AC-SEC-1's own protection through a side door).
+**H-C** (AC-ARCH-6): an event_scope's plan segment is now canonicalised
+(resolved against cwd when relative, exactly like `spec`) before minting
+the occurrence suffix, closing a C1 remnant where an absolute event_scope
+lost every occurrence after the first via the free-text pass further down.
+Suite: 405/405 (ledger-append.test.js 127, optimise-read.test.js 77,
+optimise-cycle.test.js 63, optimise-static.test.js 15, static-checks.test.js
+18, 105 elsewhere).
 
 ## Round 1/2 proofs (1-11), condensed
 
 1. **`..`-escape detection** (AC-SEC-1 case d): `if (segments.length === 0)
-   return REDACTED_PATH_MARKER` -> `if (false) ...`, ledger-append.mjs:539.
-   Failed the traversal-redaction test. Re-verified round 3 as an M1 direct
-   unit test. **Reverted, current.**
+   return REDACTED_PATH_MARKER` -> `if (false) ...`. **Reverted, current.**
 
-2. **CORRECTED (was stale)**: originally described `spec` being relativised
-   via a worktree pre-pass gate before general redaction -- that pipeline no
-   longer applies to `spec` (round 3 struck it). The mutated line,
-   `if (cwdRoot && cwdRoot !== root) {` (ledger-append.mjs:764), now guards
-   only `task`/`round_key`/`event`/`event_key`; `spec` goes through
-   `specRootCandidates` inside `canonicalPlanKey` instead (round-3 probe 9;
-   round 4 for the symlink half). Not re-mutated separately here.
+2. **CORRECTED (was stale)**: `spec` no longer goes through the worktree
+   pre-pass gate at all; it uses `specRootCandidates` inside
+   `canonicalPlanKey` (round-3 probe 9). Not re-mutated separately.
 
 3. **Repo-identity fallback uses the main-checkout basename** (AC-DATA-2):
-   `if (mainRoot) return path.basename(mainRoot)` -> `if (false) ...`,
-   ledger-append.mjs:619. Failed the worktree/main identity-agreement test.
+   `if (mainRoot) return path.basename(mainRoot)` -> `if (false) ...`.
    **Reverted, current.**
 
-4. **CORRECTED (was stale)**: original mutation targeted a standalone
-   `payload.spec = REDACTED_PATH_MARKER` override that no longer exists.
-   Current mechanism: `specWasOverwritten` (ledger-append.mjs:832-833)
-   overwrites `payload.spec` with `planKey` whenever `planKey !==
-   NO_SPEC_PLAN_KEY`. Not independently re-mutated; flagged for a future
-   round if revisited, not marked passing.
+4. **CORRECTED AGAIN (round 5)**: `specWasOverwritten` now ALSO gates
+   `spec_raw` (`if (planKey !== REDACTED_PATH_MARKER) payload.spec_raw =
+   specRawInput`) -- see round 5 probe H-B(b) below for its own proof.
 
 5. **Unattributable-run exclusion, `aggregateWallClock`** (AC-DATA-7):
-   `if (plan === REDACTED_PATH_MARKER) { unattributableRuns += 1; continue }`,
    optimise-read.mjs:475. **Reverted, current.**
 
 6. **Degraded-record exclusion, `planKeyForRecord`** (AC-QA-7):
-   `if (!record || record.degraded) return null`, optimise-read.mjs:155.
-   **Reverted, current.**
+   optimise-read.mjs:155. **Reverted, current.**
 
 7. **`ci_wait`/`human_wait` bucket key routes through `canonicalPlanKey`**
    (AC-ARCH-4): optimise-read.mjs:357. **Reverted, current.**
 
-8. **Single-definition-site static guard** (AC-ARCH-1): a second throwaway
-   `canonicalPlanKey` appended to optimise-read.mjs was caught by the static
-   check. **Reverted, current.**
+8. **Single-definition-site static guard** (AC-ARCH-1). **Reverted, current.**
 
-9. **Worktree-root resolution costs zero extra git subprocesses** (AC-QA-20):
-   reverting the fs-only walk to `git rev-parse --show-toplevel` failed the
-   PATH-shim call-count tests. **Reverted, current.**
+9. **Worktree-root resolution costs zero extra git subprocesses** (AC-QA-20).
+   **Reverted, current.**
 
-10. **`perRepo[].root` derives a non-identifying label** (AC-SEC-3 round 2):
-    `derivePerRepoLabel` left unused, raw `root` pushed, optimise-read.mjs:823.
+10. **`perRepo[].root` derives a non-identifying label** (AC-SEC-3 round 2).
     **Reverted, current.**
 
-11. **AC-DATA-6: a pre-PR1-shaped line still attributes via `spec`**:
-    `planKeyForRecord`'s fallback forced to `NO_SPEC_PLAN_KEY`,
-    optimise-read.mjs:164. **Reverted, current.**
+11. **AC-DATA-6: a pre-PR1-shaped line still attributes via `spec`**.
+    **Reverted, current.**
 
-## Round 3 probes (this round's rebuild, nine total)
+## Round 3 probes (nine total; unchanged this round, condensed)
 
-Each probe: mutate -> run the named suite -> record exact pass/fail counts
-and which named test(s) failed -> `diff` against the pre-mutation `/tmp`
-snapshot after `cp`-restoring, confirming zero lines -> full suite green
-again before the next probe. Two probes (6, 9) are differential: run twice,
-once per candidate mechanism, to isolate which one actually carries the fix.
+1. **C1**: reintroduced the destructive event_key regex. 2 targeted fails
+   (C1 repro, L2-reversion). **Reverted.**
+2/3. **Realpath vs. PWD root candidates**: differential pair proving PWD
+   (not realpathOrNull) carried round 3's narrower H3 fix. **Superseded by
+   round 4/5** (realpathOrNull deleted for good in round 4; the real gap is
+   now closed properly by round 5, see below). **Reverted.**
+4. **Bucket-key escaping** (`escapeKeyComponent` -> `String(s)`): 2 targeted
+   fails. **Reverted.**
+5. **Exclusion-counter report line** hardcoded to 0: 1 targeted fail
+   (repaired M3 test; the PRE-repair version would have passed). **Reverted.**
+6. **Raw stdin parse-error leaks**, all 3 CLI commands: 3 targeted fails.
+   **Reverted.**
+7. **L4 static O(1)-per-record guard**: inert `fs.existsSync` reference
+   trips it. **Reverted.**
+8. **L6 rootIndex label fallback**: 1 targeted fail (vacuous-to-real
+   conversion, verified). **Reverted.**
+9. **`spec` re-exposed to free-text redaction**: only the H3 PWD test
+   failed (H1/H2 satisfied independently by the narrowed regex --
+   defence in depth, thinner coverage than design prominence suggests).
+   **Reverted.**
 
-1. **C1** (`ledger-append.mjs`): reintroduced the destructive event_key
-   regex (`payload.event_key.replace(/\.\.[\\/].*$/, '<redacted-path>')`,
-   C1's exact shape -- a "../" match swallowing the whole remainder).
-   121 -> 119 pass, 2 fail: the C1 four-distinct-events reproduction, and
-   the L2-reversion test (a literal "../" inside `event_scope` must survive
-   verbatim in the minted `event_key`). No collateral failures. **Reverted,
-   zero-line diff, 121/121.**
+## Round 5 probes (H-A, H-B, H-C -- seven total)
 
-2/3. **Realpath vs. PWD root candidates** (`ledger-append.mjs`), a
-   differential pair: (a) reduced `specRootCandidates` from `[cwdRoot, root,
-   realpathOrNull(cwdRoot), realpathOrNull(root)]` to `[cwdRoot, root]` --
-   0 failures; (b) short-circuited the PWD-push (`if (fs.statSync(...).ino
-   === ...)`) to `if (false)` instead -- 121 -> 120 pass, 1 fail: exactly
-   the round-3 H3 PWD symlink test. **Conclusion: PWD, inode-matched
-   against `cwd`, was the load-bearing mechanism for round-3's own (narrower)
-   H3 test; the two `realpathOrNull` entries were unexercised by anything.**
-   Superseded by round 4: both findings resolved there (realpathOrNull
-   deleted as genuinely dead; the real gap PWD was accidentally covering
-   fixed properly). **Reverted, zero-line diff, 121/121.**
+RED confirmed first for H-A: reverting to round 4's candidate-matching
+(one-line diff) reproduced the coordinator's exact repro,
+`plan_key: '<redacted-path>'`, on a new ancestor-symlink-from-subdirectory
+fixture, before H-A's revert was applied.
 
-4. **Bucket-key escaping** (`optimise-read.mjs`): `escapeKeyComponent` ->
-   `return String(s)` (pre-M4 bare join). 76 -> 74 pass, 2 fail: the
-   `aggregateWallClock`/`aggregateRework` colliding-pair tests
-   (`('demo','a|weird.md')` vs `('demo|a','weird.md')`), nothing else.
-   **Reverted, zero-line diff, 76/76.**
+1. **H-A, round 4 fully reinstated**: round 4's exact removed dirname-realpath
+   block re-inserted verbatim (a genuine 8-line re-add, confirmed via `diff`).
+   127 -> 125 pass, 2 fail: the "H-A pinned" marker test (recorded the real
+   key again, not the marker) AND the ancestor-symlink-existence purity test
+   (probe 3 below). The target-existence purity test (probe 2) stayed
+   GREEN -- neither run in that fixture ever involves a symlink, so
+   round 4's mutation cannot diverge it; confirms probe 2 and probe 3 guard
+   genuinely different axes, not the same one twice. **Reverted, zero-line
+   diff, 127/127.**
+2. **H-A behavioural purity, target existence**: `runAppend` twice with the
+   IDENTICAL absolute spec, target file absent then present. Passes
+   unconditionally under CURRENT code (lexical matching never touches the
+   fs) and, per probe 1, is NOT what catches round 4's mutation -- kept as a
+   documented, correct invariant, not claimed as this round's load-bearing
+   guard.
+3. **H-A behavioural purity, ancestor-symlink existence**: `runAppend` twice
+   with the IDENTICAL spec string reached through a symlink path, symlink
+   absent then created between runs. **This is the test that actually
+   caught probe 1's mutation** (before=`<redacted-path>`,
+   after=`specs/a.md` under round 4's code -- diverging, exactly the
+   defect this round exists to keep dead).
+4. **H-B(a), `.toLowerCase()` corruption**: `segments.join('/')` ->
+   `segments.join('/').toLowerCase()`. 127 -> 125 pass, 2 fail: the M1
+   verbatim-preservation test AND the rewritten AC-DATA-4 test (which the
+   ORIGINAL version of this test did NOT catch -- confirmed separately
+   before the rewrite). **Reverted, zero-line diff, 127/127.**
+5. **H-B(b), spec_raw redaction-exemption**: `if (planKey !==
+   REDACTED_PATH_MARKER) payload.spec_raw = ...` -> unconditional. 127 -> 125
+   pass, 2 fail: the AC-SEC-1 case-c and case-d tests (a hostile path would
+   have reached the ledger via spec_raw). **Reverted, zero-line diff,
+   127/127.**
+6. **H-C, occurrence canonicalisation**: `canonicalScope = canonicalPlanKey
+   (...) + restOfScope` -> raw `payload.event_scope`. 127 -> 124 pass, 3
+   fail: the escaping-marker test, the legitimate-subdirectory test, and the
+   NEW two-absolute-scope AC-ARCH-6 test (`duplicate: true` on the second
+   write -- the coordinator's exact measured symptom). C1's own test stayed
+   green (independent coverage). **Reverted, zero-line diff, 127/127.**
+7. **H-C, cwd-resolution for relative plan segments** (a gap found and
+   fixed DURING this round, not present in the brief): the relative-segment
+   `path.resolve(cwd, ...)` step disabled. 127 -> 126 pass, 1 fail: only the
+   legitimate-subdirectory test -- C1's own test stayed green even here,
+   confirming it alone would NOT have caught this gap. **Reverted,
+   zero-line diff, 127/127.**
 
-5. **Exclusion-counter report line** (`optimise-cycle.js`):
-   `` `observations=${wallTotalsForExclusions.unattributableWaits ?? 0}` ``
-   -> literal `observations=0`. 63 -> 62 pass, 1 fail: the repaired M3 test
-   (exact-substring, line-scoped). The PRE-repair version, a bare `/\b4\b/`
-   whole-report scan, would have passed here since "AC-ARCH-4" appears
-   elsewhere -- confirms the repair is a real detection-power gain.
-   **Reverted, zero-line diff, 63/63.**
+Also mutation-proven (optimise-read.mjs line 163, AC-SEC-3 medium):
+`planKeyForRecord`'s stored-plan_key branch trusted verbatim instead of
+re-canonicalising -- 3 fails (2 pre-existing M1 tests + the new hostile
+-plan_key test). **Reverted, zero-line diff, 77/77.**
 
-6. **Raw stdin parse-error leaks, all three CLI commands**
-   (`optimise-read.mjs`): reverted to `'stdin was not valid JSON: ' +
-   e.message` (V8's SyntaxError embeds the failing input). 76 -> 73 pass,
-   3 fail: exactly the three parameterised L2 leak tests. **Reverted,
-   zero-line diff, 76/76.**
+Verified non-vacuous, no fix needed (AC-QA-13 medium): the order-independence
+`keys.find(...)` logic mutated to `keys[0]` -- both AC-QA-13 tests fail
+cleanly. Already solid.
 
-7. **L4 static O(1)-per-record guard**: inserted an inert `void
-   fs.existsSync` inside `parseLedgerContent`. 15 -> 14 pass, 1 fail: the
-   L4 check (extracts each function body, greps for `fs.`), confirming it
-   scopes correctly and does not false-positive on the file's CLI-layer
-   usage. **Reverted, zero-line diff, 15/15.**
-
-8. **L6 rootIndex label fallback** (`optimise-cycle.js`):
-   `(d.repoLabels && typeof entry.rootIndex === 'number' &&
-   d.repoLabels[entry.rootIndex]) || entry.root` -> bare
-   `d.repoLabels[entry.rootIndex]`. 63 -> 62 pass, 1 fail: the repaired
-   fallback test (fixture now omits `rootIndex`; the pre-repair fixture
-   always supplied `rootIndex:0` and never exercised the `||` branch --
-   vacuous-to-real conversion, verified). **Reverted, zero-line diff,
-   63/63.**
-
-9. **`spec` re-exposed to free-text redaction** (`ledger-append.mjs`,
-   central structural fix): `FREE_TEXT_FIELDS = TRUNCATABLE_FIELDS.filter((f)
-   => f !== 'spec')` -> `TRUNCATABLE_FIELDS`, reinstating C1/H1/H2's root
-   mistake. 121 -> 120 pass, 1 fail: **only** the H3 PWD symlink test; both
-   H1 tests and both H2 tests stayed GREEN. **Explanation, confirmed by
-   re-tracing:** `ABSOLUTE_PATH_RE` was independently narrowed back to
-   main's prefix form this round, so it is now harmless over a relative
-   spec with a paren/space/non-ASCII segment -- H1/H2 are satisfied by that
-   narrowing alone, defence in depth. Only an absolute spec (H3) still
-   distinguishes the two fixes: **the FREE_TEXT_FIELDS split has thinner
-   coverage than its design prominence suggests, one H3 test stands behind
-   it.** Flagged, not silently trusted. **Reverted, zero-line diff,
-   121/121. Full suite re-confirmed 398/398.**
-
-## Round 4 probes (H3, second half)
-
-Fix: `root`/`cwdRoot` are already real (git rev-parse and `process.cwd()`
-resolve symlinks), so their own realpath forms (round 3's `realpathOrNull`)
-never mattered -- deleted, confirmed dead by round-3 probes 2/3. The real
-gap was the SPEC side: for an absolute spec, `main()` resolves the real
-form of the spec's own DIRECTORY only (basename untouched) and matches
-THAT, falling back to the lexical spec if the directory does not resolve.
-`canonicalPlanKey` stays pure.
-
-RED confirmed first: reverting to round 3's candidate list (one-line diff)
-failed the new subdirectory test with `plan_key: '<redacted-path>'`, the
-coordinator's exact reproduction.
-
-1. **Neutralise the fix** (`specForMatching = payload.spec` unconditionally):
-   123 -> 122 pass, 1 fail -- exactly the ancestor-symlink-from-subdirectory
-   test; the case-e test stayed green. **Reverted, zero-line diff, 123/123.**
-
-2. **Realpath the WHOLE spec, not just its directory**: 123 -> 121 pass,
-   2 fail -- the new case-e test AND the pre-existing AC-DATA-3 case-e test
-   (ledger-append.test.js:1766), nothing else; confirms the dirname-only
-   distinction is genuinely load-bearing. **Reverted, zero-line diff,
-   123/123. Full suite re-confirmed 400/400.**
-
-No regression: the space/paren probe (`../specs/a.md` -> `specs/a.md`,
-`../specs/b.md` -> `specs/b.md`, distinct, no leak) and the C1 four-events
-probe (4 lines, 4 distinct `event_key`s, none `duplicate`) both re-run
-matching round-3 exactly.
+Verified non-vacuous, no fix needed (spec-exclusion coverage note): `spec`
+re-added to `FREE_TEXT_FIELDS` (leaving only `spec_raw` excluded) -- 5 tests
+fail, including the AC-DATA-1/AC-ARCH-3 worktree test. Genuine, multi-test
+coverage, not reliant on the narrowed regex alone.
 
 ## Not separately mutation-proven
 
-- **AC-SEC-3's whole-output zero-leak CLI test** and **`aggregateRework`'s
-  unattributable-exclusion**: unchanged from round 1/2 (see proofs 5/10).
-- **AC-DATA-17 (durability doc)**: a static-checks test, not a behavioural
-  mutation guard -- proven RED (missing prose) before GREEN (README
-  updated), per §1.
+- **AC-SEC-3's whole-output zero-leak CLI test**, **`aggregateRework`'s
+  unattributable-exclusion**: unchanged, see proofs 5/10.
+- **AC-DATA-17 (durability doc)**: static-checks test, proven RED before
+  GREEN, per §1.
+- **AC-DATA-3 (ledger-append.mjs, cwd-resolution comment)**: closed by
+  documentation clarification at the call site (why using `cwd` there is
+  consistent with "lexical, never realpath-based") -- no code change, no
+  behavioural mutation applicable.
