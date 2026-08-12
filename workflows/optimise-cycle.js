@@ -735,7 +735,22 @@ function buildReport(d) {
     if (entry.uninstrumented) {
       lines.push(`- ${label}: **uninstrumented** (no ledger file found -- not "no activity"; the harness has never written a ledger here)`)
     } else {
-      lines.push(`- ${label}: ${entry.recordCount} record(s) in window${entry.skippedCount ? `, ${entry.skippedCount} skipped` : ''}`)
+      // Review round-2 M-6: skippedCount previously rendered only when
+      // truthy (a clean repo showed NO line at all, not a real zero), and
+      // schemaVersionsSeen/truncatedFinalLine -- both already computed by
+      // the reader and both AC-OPS-3's own named data-quality signals --
+      // never reached the report at all. All three now always render, per
+      // the same "a missing line means the check stopped running" rule
+      // the exclusion counters above already follow. truncatedFinalLine is
+      // a real corruption signal (an interrupted append mid-write), stated
+      // positively (true/false) so it cannot be mistaken for absence.
+      const schemaMix = entry.schemaVersionsSeen && Object.keys(entry.schemaVersionsSeen).length
+        ? Object.entries(entry.schemaVersionsSeen).map(([v, n]) => `${v}: ${n}`).join(', ')
+        : 'none'
+      lines.push(
+        `- ${label}: ${entry.recordCount} record(s) in window, skipped=${entry.skippedCount ?? 0}, ` +
+        `schema_version mix: {${schemaMix}}, truncated final line: ${entry.truncatedFinalLine ? 'true' : 'false'}`
+      )
     }
   }
   lines.push('Instrumented invocation routes: conducted runs and every direct invocation of the harness\'s other workflows write the ledger identically (AC-ARCH-4); conduct-plan wait/PR events are conductor-only.')
@@ -746,6 +761,21 @@ function buildReport(d) {
   // reader) never reached the report. Always rendered, with a real zero
   // when clean, per the standing rule that a missing line means the check
   // stopped running, not that nothing is wrong.
+  // Review round-2 H-1 (High): `?? 0` cannot tell "the reader computed a
+  // real zero" apart from "this field does not exist on the object at
+  // all" -- the latter is the NORMAL post-merge state whenever the
+  // installed mirror at ~/.claude/workflows/lib/optimise-read.mjs (which
+  // the ledger lane prefers, see the scope prompt below) is stale or a
+  // field gets renamed, and it is worse than the pre-PR2 state, where the
+  // operator at least saw a single combined `unmeasured=6`. `undefined` now
+  // renders an explicit, unmissable marker instead of a confident 0.
+  // Defined here (before its first use, a few lines below) rather than
+  // relying on function-declaration hoisting past a `const` it closes
+  // over, which is a temporal-dead-zone ReferenceError, not a hoist.
+  const UNAVAILABLE_STALE_READER = 'unavailable (installed optimise-read.mjs predates this field)'
+  function fmtCountOrUnavailable(value) {
+    return value === undefined ? UNAVAILABLE_STALE_READER : String(value)
+  }
   const wallTotalsForExclusions = (d.wallClock && d.wallClock.totals) || {}
   lines.push(
     `Excluded from attribution (never silently dropped): unattributable runs=${wallTotalsForExclusions.unattributableRuns ?? 0}, ` +
@@ -753,6 +783,14 @@ function buildReport(d) {
     `unattributable ci_wait/human_wait observations=${wallTotalsForExclusions.unattributableWaits ?? 0}, ` +
     `unattributable rework records=${(d.rework && d.rework.unattributableCount) ?? 0}.`
   )
+  // Review round-2 M-3 (rendering half): invalid_ac_ids_dropped was
+  // computed by the writer and summed by the reader (rework.
+  // invalidAcIdsDropped), but reached no report a human reads -- this is
+  // round-1 H2's own shape (a counter reaching nothing an operator sees)
+  // reintroduced one field over. `undefined` (a stale installed reader
+  // that predates the field) renders the same explicit marker H-1 defined
+  // above, rather than a confident 0.
+  lines.push(`invalid_ac_ids_dropped (sanitised, non-conforming AC ids from lens findings/verdicts): ${fmtCountOrUnavailable(d.rework && d.rework.invalidAcIdsDropped)}.`)
   // Review round-1 H2: the two orphan classes AC-OPS-2 exists to separate
   // -- a start-only orphan (an exception escaped run(), or the process was
   // killed) and a terminal-only orphan (the START write itself failed) --
@@ -763,18 +801,6 @@ function buildReport(d) {
   function formatByKind(byKind) {
     const entries = Object.entries(byKind || {})
     return entries.length ? entries.map(([k, n]) => `${k}: ${n}`).join(', ') : 'none'
-  }
-  // Review round-2 H-1 (High): `?? 0` cannot tell "the reader computed a
-  // real zero" apart from "this field does not exist on the object at
-  // all" -- the latter is the NORMAL post-merge state whenever the
-  // installed mirror at ~/.claude/workflows/lib/optimise-read.mjs (which
-  // the ledger lane prefers, see the scope prompt below) is stale or a
-  // field gets renamed, and it is worse than the pre-PR2 state, where the
-  // operator at least saw a single combined `unmeasured=6`. `undefined` now
-  // renders an explicit, unmissable marker instead of a confident 0.
-  const UNAVAILABLE_STALE_READER = 'unavailable (installed optimise-read.mjs predates this field)'
-  function fmtCountOrUnavailable(value) {
-    return value === undefined ? UNAVAILABLE_STALE_READER : String(value)
   }
   lines.push(
     `Orphaned agent-compute runs (never silently collapsed into one number): start-only=${fmtCountOrUnavailable(wallTotalsForExclusions.agentComputeStartOnlyRuns)} ` +
@@ -793,9 +819,16 @@ function buildReport(d) {
     if (!planKeys.length) lines.push('No wall-clock data in window.')
     for (const key of planKeys) {
       const b = byPlan[key]
+      // Review round-2 L-4: agentComputeAbortedSeconds/N were computed
+      // per-plan but rendered nowhere -- this is the ACTIONABLE half of
+      // H1's own fix (the repo-wide Totals aborted count says HOW MANY
+      // runs crashed; this per-plan figure is what says WHICH plan is
+      // crashing). Rendered only when non-zero, matching the existing
+      // unterminated_waits convention on this same line.
       lines.push(
         `- ${key}: ci_wait=${b.ciWaitSeconds}s (n=${b.ciWaitN}), human_wait=${b.humanWaitSeconds}s (n=${b.humanWaitN}), ` +
         `agent_compute=${b.agentComputeSeconds}s (n=${b.agentComputeN})` +
+        (b.agentComputeAbortedN ? `, aborted=${b.agentComputeAbortedSeconds}s (n=${b.agentComputeAbortedN})` : '') +
         (b.unterminatedWaits ? `, unterminated_waits: ${b.unterminatedWaits}` : '')
       )
     }
@@ -814,7 +847,9 @@ function buildReport(d) {
     lines.push(
       `Totals: ci_wait=${fmtSeconds(t.ciWaitSeconds)} (measured n=${t.ciWaitMeasuredRuns ?? 0}, unmeasured n=${t.ciWaitUnmeasuredRuns ?? 0}), ` +
       `human_wait=${fmtSeconds(t.humanWaitSeconds)} (measured n=${t.humanWaitMeasuredRuns ?? 0}, unmeasured n=${t.humanWaitUnmeasuredRuns ?? 0}), ` +
-      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}, aborted n=${fmtCountOrUnavailable(t.agentComputeAbortedPairs)}).`
+      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}, aborted n=${fmtCountOrUnavailable(t.agentComputeAbortedPairs)}` +
+      (t.agentComputeAbortedSeconds ? ` [${fmtSeconds(t.agentComputeAbortedSeconds)}]` : '') +
+      `).`
     )
     if (t.unterminatedWaits) lines.push(`unterminated_waits: ${t.unterminatedWaits}`)
     if (d.wallClock.source) lines.push(`Sources: ci_wait=${d.wallClock.source.ci_wait}, human_wait=${d.wallClock.source.human_wait}, agent_compute=${d.wallClock.source.agent_compute}.`)

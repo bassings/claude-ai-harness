@@ -35,7 +35,7 @@ function ledgerFixture(overrides = {}) {
     // real CLI now actually emits, not the pre-round-2 raw-path shape.
     perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
     skipped: [],
-    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }] },
+    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }], invalidAcIdsDropped: 0 },
     neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false }],
     // Review round-2 H-1: the orphan/aborted fields are included here as
     // explicit real zeros -- representing an UP-TO-DATE reader that
@@ -382,6 +382,112 @@ test('optimise-cycle: the orphan-count and aborted-pairs lines render REAL numbe
   assert.ok(orphanLine.includes('terminal-only=2'), `got: ${orphanLine}`)
   const totalsLine = result.report.split('\n').find((l) => l.startsWith('Totals:'))
   assert.ok(totalsLine.includes('aborted n=1'), `got: ${totalsLine}`)
+})
+
+// ---- Review round-2 M-3 (rendering half): invalid_ac_ids_dropped was
+// computed by the writer and summed by the reader, but reached no report a
+// human reads -- rendered on the Sample completeness data-quality line
+// beside the orphan counters, real zero when clean, "unavailable" when the
+// reader is stale (H-1's own treatment, applied consistently). ----
+
+test('optimise-cycle: the Sample completeness section renders invalid_ac_ids_dropped with a real non-zero number when the fixture carries one (M-3)', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { n: 1, lensDispositionCounts: {}, acVerdicts: [], invalidAcIdsDropped: 3 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_ac_ids_dropped') || l.includes('invalid ac_id'))
+  assert.ok(line, `expected a line naming invalid_ac_ids_dropped, report was: ${result.report}`)
+  assert.ok(line.includes('3'), `got: ${line}`)
+})
+
+test('optimise-cycle: the Sample completeness section renders a real ZERO for invalid_ac_ids_dropped on a clean fixture, never omitting the line (M-3, not vacuous)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_ac_ids_dropped') || l.includes('invalid ac_id'))
+  assert.ok(line, `expected the line even when clean, report was: ${result.report}`)
+  assert.ok(/\b0\b/.test(line), `got: ${line}`)
+})
+
+// ---- Review round-2 L-4: agentComputeAbortedSeconds and the per-plan
+// aborted figures were computed but rendered nowhere -- an operator saw
+// HOW MANY runs crashed but not how much wall clock those crashes
+// consumed, and could not tell WHICH plan is crashing (the per-plan
+// figure is the actionable half). ----
+
+test('optimise-cycle: the Totals line renders agentComputeAbortedSeconds beside the aborted count (L-4)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: null, unterminatedWaits: 0,
+          agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 1, agentComputeAbortedPairs: 1, agentComputeAbortedSeconds: 2400,
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(line.includes('aborted n=1'), `got: ${line}`)
+  assert.ok(/aborted[^)]*2400s|2400s[^)]*aborted|\(2400s\)/.test(line) || line.includes('2400s'), `Totals line must render the aborted SECONDS too, got: ${line}`)
+})
+
+test('optimise-cycle: the per-plan wall-clock line renders that plan\'s own aborted seconds/count (L-4)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {
+          'demo|specs/crashy.md': {
+            repo: 'demo', plan: 'specs/crashy.md',
+            ciWaitSeconds: 0, ciWaitN: 0, humanWaitSeconds: 0, humanWaitN: 0,
+            agentComputeSeconds: 0, agentComputeN: 0, agentComputeAbortedSeconds: 900, agentComputeAbortedN: 3,
+            unterminatedWaits: 0,
+          },
+        },
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0,
+          agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 3, agentComputeAbortedPairs: 3, agentComputeAbortedSeconds: 900,
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('specs/crashy.md'))
+  assert.ok(line, `expected a per-plan line for specs/crashy.md, report was: ${result.report}`)
+  assert.ok(line.includes('900s'), `the per-plan line must name WHICH plan is crashing with its own aborted seconds, got: ${line}`)
+  assert.ok(line.includes('3'), `got: ${line}`)
+})
+
+// ---- Review round-2 M-6: the Sample completeness data-quality line
+// omitted schemaVersionsSeen and truncatedFinalLine entirely, and rendered
+// skippedCount only conditionally (a clean repo showed no line at all,
+// rather than a real zero) -- AC-OPS-3's own rule ("a missing line means
+// the check stopped running") cannot hold for a signal that never
+// renders. ----
+
+test('optimise-cycle: the per-repo Sample completeness line always renders skippedCount (a real zero when clean), schemaVersionsSeen, and truncatedFinalLine (M-6)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 4, 2: 2 }, truncatedFinalLine: false }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('demo') && l.includes('record'))
+  assert.ok(line, `expected the per-repo line, report was: ${result.report}`)
+  assert.ok(/skipped/i.test(line) && /\b0\b/.test(line), `must render skippedCount as a real zero even when clean, got: ${line}`)
+  assert.ok(line.includes('1: 4') || line.includes('"1":4') || (line.includes('1') && line.includes('4') && line.includes('2')), `must render the schemaVersionsSeen mix, got: ${line}`)
+  assert.ok(/truncat/i.test(line), `must render the truncatedFinalLine signal, got: ${line}`)
+})
+
+test('optimise-cycle: the per-repo line names a truncated final ledger line (a real corruption signal) when true, distinguishable from the false/clean case (M-6, not vacuous)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 2, schemaVersionsSeen: { 2: 6 }, truncatedFinalLine: true }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('demo') && l.includes('record'))
+  assert.ok(/truncat/i.test(line) && /true|yes/i.test(line), `must positively state the final line WAS truncated, got: ${line}`)
+  assert.ok(/skipped.*2\b/.test(line), `must render the real skippedCount of 2, got: ${line}`)
 })
 
 // ---- Review round-1 M5 (SPEC BUG SB-1): perRepo[].root silently changed

@@ -594,6 +594,20 @@ test('optimise-read CLI: the ledger command\'s output includes proposalOutcomes,
   assert.equal(out.proposalOutcomes['abc123'].rejectedCount, 1)
 })
 
+// Review round-2 M-3: aggregateRework's invalidAcIdsDropped total was
+// computed (previous test file section) but the CLI's `ledger` command
+// explicitly whitelists which rework fields reach its JSON output --
+// dropped at exactly that boundary, so it never reached optimise-cycle.js
+// at all despite being computed correctly one function away.
+test('optimise-read CLI: the ledger command\'s output includes rework.invalidAcIdsDropped, computed from a real record whose ac_id was sanitised by the writer (M-3)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', ac_verdicts: [{ ac_id: 'none', verdict: 'FAIL' }] })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.rework.invalidAcIdsDropped, 1)
+})
+
 test('optimise-read CLI: the ledger command\'s output includes a citationPool of real run_ids from the window', () => {
   const repo = makeTempRepo()
   runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })

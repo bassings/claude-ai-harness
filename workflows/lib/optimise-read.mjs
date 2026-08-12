@@ -976,7 +976,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
