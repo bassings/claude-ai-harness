@@ -1108,6 +1108,145 @@ test('optimise-read CLI: a real ledger mixing hand-seeded pre-PR1-shaped lines (
   assert.equal(sharedBuckets[0].agentComputeN, 2, 'BOTH the pre-PR1 pair and the post-PR1 pair must be measured inside the one collapsed bucket -- neither silently dropped')
 })
 
+// ---- HARN-OPT-2 PR2 (AC-DATA-10): agent_compute pairing purity. Only a
+// run_id shared by EXACTLY one 'started' record and EXACTLY one terminal
+// (non-'started') record may ever produce a measured duration. Today two
+// 'started' records sharing a run_id have their timestamps subtracted
+// anyway (the pairing loop only checked pair.length, never each record's
+// own outcome), fabricating a duration for an attempt that never actually
+// finished. ----
+
+test('optimise-read: aggregateWallClock reproduces the AC-DATA-10 bug exactly as measured -- two started records one hour apart, sharing a run_id, must NOT report agentComputeSeconds=3600/measuredRuns=1; the fixed behaviour is 0 measured, 1 unmeasured, seconds null', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'two-starts', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'two-starts', ts: '2026-08-01T01:00:00.000Z' }, // +3600s
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.notEqual(result.totals.agentComputeSeconds, 3600, 'two started records must never be treated as a measured start/terminal pair')
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, null)
+})
+
+test('optimise-read: aggregateWallClock treats two TERMINAL records (no started at all) sharing a run_id the same way -- 0 measured, 1 unmeasured, no fabricated duration (AC-DATA-10)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'two-terminals', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'aborted', spec: 'specs/a.md', run_id: 'two-terminals', ts: '2026-08-01T00:30:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, null)
+})
+
+test('optimise-read: aggregateWallClock treats three or more records sharing one run_id (1 started + 2 terminal) the same way -- 0 measured, 1 unmeasured (AC-DATA-10)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'three-way', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'three-way', ts: '2026-08-01T00:05:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'three-way', ts: '2026-08-01T00:10:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, null)
+})
+
+// ---- HARN-OPT-2 PR2 (AC-QA-12): "The pairing fix cannot manufacture
+// completions... aborted pairs are counted under their own name and never
+// contribute to any completed-run duration statistic." aggregateWallClock
+// has exactly one agent-compute duration statistic today, and it is not
+// (and must not become) outcome-specific -- a start+aborted pair represents
+// real agent compute time and is correctly measured, but the record's own
+// outcome value is never overwritten or laundered into looking like 'done'
+// anywhere in the read pipeline. ----
+
+test('optimise-read: a start/terminal pair whose terminal outcome is aborted (not done) is still measured as real agent compute time, and its outcome value is never rewritten to done anywhere in the aggregate output (AC-QA-12)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'aborted-pair', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'aborted', spec: 'specs/a.md', run_id: 'aborted-pair', ts: '2026-08-01T00:03:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1, 'the run genuinely happened and took real compute time -- it is not "unmeasured"')
+  assert.equal(result.totals.agentComputeSeconds, 180)
+  // The record itself, unmodified, must still say aborted -- nothing in the
+  // aggregate pipeline claims or implies this was a completion.
+  assert.equal(records[1].outcome, 'aborted', 'aggregateWallClock must never mutate the input record\'s outcome field')
+})
+
+test('optimise-read: aggregateWallClock still measures the genuine case -- exactly one started and one terminal record sharing a run_id (not vacuous: proves the AC-DATA-10 fix does not also break the ordinary pair)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'clean-pair', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'clean-pair', ts: '2026-08-01T00:02:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeSeconds, 120)
+})
+
+// ---- HARN-OPT-2 PR2 (AC-OPS-2): the two orphan classes -- a lone 'started'
+// record (an exception escaped run() before the terminal write, or the
+// process was killed) versus a lone terminal record (the START write
+// itself failed) -- are different defects with different fixes, and must be
+// counted and named SEPARATELY, in addition to the combined
+// agentComputeUnmeasuredRuns total, so fixing one can never read as
+// progress on the other. ----
+
+test('optimise-read: aggregateWallClock counts a lone started record as a start-only orphan (agentComputeStartOnlyRuns), broken down by kind, distinct from a lone terminal record (AC-OPS-2)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'lone-start', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeStartOnlyRuns, 1)
+  assert.equal(result.totals.agentComputeTerminalOnlyRuns, 0)
+  assert.equal(result.totals.agentComputeStartOnlyByKind.tdd_task, 1)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1, 'the new named counter is IN ADDITION to the existing total, never a replacement for it')
+})
+
+test('optimise-read: aggregateWallClock counts a lone terminal record (a failed START write) as a terminal-only orphan (agentComputeTerminalOnlyRuns), broken down by kind, distinct from a lone started record (AC-OPS-2)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'lone-terminal', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeStartOnlyRuns, 0)
+  assert.equal(result.totals.agentComputeTerminalOnlyRuns, 1)
+  assert.equal(result.totals.agentComputeTerminalOnlyByKind.review_cycle, 1)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+})
+
+test('optimise-read: a malformed pairing (two started, no terminal) is counted in the combined unmeasured total but is NEITHER a start-only NOR a terminal-only orphan -- those two counters name a specific single-record shape, not every unmeasured shape (AC-OPS-2, AC-DATA-10 boundary)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'two-starts', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'two-starts', ts: '2026-08-01T01:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1, 'still counted in the combined total -- never silently dropped')
+  assert.equal(result.totals.agentComputeStartOnlyRuns, 0, 'two started records is not the single-lone-started shape the named counter guards')
+  assert.equal(result.totals.agentComputeTerminalOnlyRuns, 0)
+})
+
+// AC-OPS-2's own worked example: "Against a copy of the current live ledger
+// it must report startOnly=4 and terminalOnly=2 rather than a single
+// unmeasured count of 6." seedNineRecordFixture (above) reproduces that
+// exact live-ledger shape: rec0/rec4/rec5/rec6 are lone 'started'
+// review_cycle records (4 start-only orphans); rec1 (review_cycle) and r1
+// (tdd_task) are lone terminal records with no matching start (2
+// terminal-only orphans, the "failed start write" class); rec7's
+// started/done pair is the one genuinely measured run.
+test('optimise-read CLI: `ledger <root>` over a fixture reproducing the real 9-record ledger reports startOnly=4 and terminalOnly=2, broken down by kind, rather than a single combined unmeasured count of 6 (AC-OPS-2, the spec\'s own worked example)', () => {
+  const repo = makeTempRepo()
+  seedNineRecordFixture(repo)
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.wallClock.totals.agentComputeUnmeasuredRuns, 6, 'sanity: the combined total must still be 6, unchanged by adding the named breakdown')
+  assert.equal(out.wallClock.totals.agentComputeStartOnlyRuns, 4, `expected startOnly=4 per the spec's own worked example, got ${out.wallClock.totals.agentComputeStartOnlyRuns}`)
+  assert.equal(out.wallClock.totals.agentComputeTerminalOnlyRuns, 2, `expected terminalOnly=2 per the spec's own worked example, got ${out.wallClock.totals.agentComputeTerminalOnlyRuns}`)
+  assert.equal(out.wallClock.totals.agentComputeStartOnlyByKind.review_cycle, 4, 'all 4 start-only orphans in this fixture are review_cycle records (rec0, rec4, rec5, rec6)')
+  assert.equal(out.wallClock.totals.agentComputeTerminalOnlyByKind.review_cycle, 1, 'rec1 is the review_cycle terminal-only orphan')
+  assert.equal(out.wallClock.totals.agentComputeTerminalOnlyByKind.tdd_task, 1, 'r1 is the tdd_task terminal-only orphan')
+})
+
 // ---- Review round-1 H2: the ci_wait/human_wait path lacked the
 // REDACTED_PATH_MARKER guard the agent_compute path already had, so two
 // DIFFERENT out-of-repo plans merged into one bucket literally named
@@ -1145,6 +1284,32 @@ test('optimise-read: a pair where one record has no spec and the other carries a
     JSON.stringify([...reversed.byPlan.entries()]),
     'forward and reversed order must produce byte-identical aggregate output (AC-QA-13)'
   )
+})
+
+// HARN-OPT-2 PR2 (AC-QA-13): the new start-only/terminal-only orphan
+// classification (AC-OPS-2) must be exactly as order-independent as every
+// other aggregate here -- pairing is by run_id, keyed via a Map, never by
+// file position or adjacency, so shuffling which orphan/pair comes first
+// must never change the counts.
+test('optimise-read: a mixed set of paired runs and both orphan classes produces byte-identical aggregate output (including the new agentComputeStartOnlyRuns/agentComputeTerminalOnlyRuns totals) regardless of record order (AC-QA-13, AC-OPS-2)', () => {
+  const paired1 = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'p1', ts: '2026-08-01T00:00:00.000Z' }
+  const paired2 = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'p1', ts: '2026-08-01T00:01:00.000Z' }
+  const startOnly = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'orphan-start', ts: '2026-08-01T00:00:00.000Z' }
+  const terminalOnly = { kind: 'plan_cycle', repo: 'demo', outcome: 'blocked', spec: 'specs/a.md', run_id: 'orphan-terminal', ts: '2026-08-01T00:00:00.000Z' }
+  const orderings = [
+    [paired1, paired2, startOnly, terminalOnly],
+    [terminalOnly, startOnly, paired2, paired1],
+    [startOnly, paired1, terminalOnly, paired2],
+    [paired2, terminalOnly, paired1, startOnly],
+  ]
+  const results = orderings.map((records) => JSON.stringify(mod.aggregateWallClock(records).totals))
+  for (const r of results) assert.equal(r, results[0], 'every ordering must produce byte-identical totals')
+  const totals = JSON.parse(results[0])
+  assert.equal(totals.agentComputeMeasuredRuns, 1)
+  assert.equal(totals.agentComputeStartOnlyRuns, 1)
+  assert.equal(totals.agentComputeTerminalOnlyRuns, 1)
+  assert.equal(totals.agentComputeStartOnlyByKind.review_cycle, 1)
+  assert.equal(totals.agentComputeTerminalOnlyByKind.plan_cycle, 1)
 })
 
 test('optimise-read: three records sharing one run_id (forward, reversed, and shuffled), only one of which carries a real spec, all attribute to the real spec and produce byte-identical aggregates (M3, AC-QA-13, shuffled)', () => {
@@ -1347,8 +1512,12 @@ test('optimise-read: aggregateWallClock excludes a fully-degraded pair (both rec
 })
 
 test('optimise-read: aggregateWallClock still attributes a pair where only ONE side degraded -- the surviving side\'s plan identity is real and must not be discarded just because its partner degraded (AC-QA-7, not vacuous)', () => {
+  // HARN-OPT-2 PR2 (AC-DATA-10): the start record must carry outcome
+  // 'started' like every other pair fixture in this file (and like every
+  // real start record the writer actually emits) -- a genuine start/terminal
+  // pair is now identified by outcome, not merely by record count.
   const records = [
-    { kind: 'tdd_task', repo: 'demo', run_id: 'partial-1', spec: 'specs/a.md', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', run_id: 'partial-1', spec: 'specs/a.md', outcome: 'started', ts: '2026-08-01T00:00:00.000Z' },
     { kind: 'tdd_task', repo: 'demo', run_id: 'partial-1', ts: '2026-08-01T00:01:00.000Z', outcome: 'done', degraded: true },
   ]
   const result = mod.aggregateWallClock(records)

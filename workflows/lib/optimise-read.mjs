@@ -454,6 +454,17 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   //     as before.
   let degradedUnattributedRuns = 0
   let unattributableRuns = 0
+  // HARN-OPT-2 PR2 (AC-OPS-2): the two orphan classes named and counted
+  // SEPARATELY, in addition to the combined agentComputeUnmeasuredN/Runs
+  // total below -- a start-only orphan (an exception escaped run() before
+  // the terminal write, or the process was killed) and a terminal-only
+  // orphan (the START write itself failed) are different defects with
+  // different fixes, so a fix landed for one must never read as progress on
+  // the other. "By kind" breaks each down by tdd_task/review_cycle/plan_cycle.
+  let agentComputeStartOnlyRuns = 0
+  let agentComputeTerminalOnlyRuns = 0
+  const agentComputeStartOnlyByKind = {}
+  const agentComputeTerminalOnlyByKind = {}
   for (const [, pair] of byRunId.entries()) {
     const repo = pair[0]?.repo || 'unknown'
     // Review round-1 M3: order-independent, main's own semantics restored
@@ -477,11 +488,28 @@ export function aggregateWallClock(records, { root = '' } = {}) {
       continue
     }
     const key = planBucketKey(repo, plan)
-    if (pair.length < 2) {
-      // An orphan start or terminal with no partner: an attempt we know
-      // happened but cannot measure a duration for -- unmeasured, never
-      // simply skipped uncounted.
+    // HARN-OPT-2 PR2 (AC-DATA-10): a measured duration is only ever
+    // computed for a run_id shared by EXACTLY one 'started' record and
+    // EXACTLY one terminal (non-'started') record. Every other shape --
+    // a lone record of either kind, two started, two terminal, or three or
+    // more sharing one run_id -- is unmeasured, and arithmetic is never
+    // performed on it. Before this, `pair.length` alone gated whether a
+    // duration was computed, so e.g. two 'started' records sharing a
+    // run_id (their timestamps subtracted anyway) fabricated a duration for
+    // an attempt that never actually finished.
+    const starts = pair.filter((p) => p.outcome === 'started')
+    const terminals = pair.filter((p) => p.outcome !== 'started')
+    if (!(pair.length === 2 && starts.length === 1 && terminals.length === 1)) {
       ensurePlan(byPlan, key, repo, plan).agentComputeUnmeasuredN += 1
+      if (pair.length === 1 && starts.length === 1) {
+        agentComputeStartOnlyRuns += 1
+        const k = pair[0].kind
+        agentComputeStartOnlyByKind[k] = (agentComputeStartOnlyByKind[k] || 0) + 1
+      } else if (pair.length === 1 && terminals.length === 1) {
+        agentComputeTerminalOnlyRuns += 1
+        const k = pair[0].kind
+        agentComputeTerminalOnlyByKind[k] = (agentComputeTerminalOnlyByKind[k] || 0) + 1
+      }
       continue
     }
     const times = pair.map((p) => tsMs(p.ts)).filter((t) => t !== null)
@@ -509,6 +537,10 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     degradedUnattributedRuns,
     unattributableRuns,
     unattributableWaits,
+    agentComputeStartOnlyRuns,
+    agentComputeTerminalOnlyRuns,
+    agentComputeStartOnlyByKind,
+    agentComputeTerminalOnlyByKind,
   }
   for (const bucket of byPlan.values()) {
     totals.ciWaitSeconds += bucket.ciWaitSeconds

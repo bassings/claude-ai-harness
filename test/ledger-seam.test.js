@@ -20,6 +20,9 @@ const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
 const { makeTempRepo, runAppend, readLedgerLines, cleanupTempRepos } = require('./helpers/temp-repo.js')
 const path = require('node:path')
+const { pathToFileURL } = require('node:url')
+
+const OPTIMISE_READ_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
 
 test.after(cleanupTempRepos)
 
@@ -120,6 +123,61 @@ test('seam: plan_cycle terminal payload, captured from a real run with a non-emp
   const entry = pipeAndAssertWritten(payload, 'plan_cycle')
   assert.equal(entry.kind, 'plan_cycle')
   assert.deepEqual(entry.lenses_run, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'])
+})
+
+// HARN-OPT-2 PR2 (AC-QA-10): the full seam, both halves at once. The tests
+// above each capture ONE payload (already known to be well-formed) and pipe
+// it into a fresh, empty temp repo. This test instead runs the REAL
+// ledger-write agent step's own logic end to end: both the start AND the
+// terminal ledger:write calls are routed through the REAL
+// ledger-append.mjs (not a scripted response), so the run_id in the file is
+// the one ledger-append.mjs itself generated (never invented by the test),
+// fed back to the terminal write exactly the way a real ledger:write agent
+// step would report it. This is the one test in the suite that proves the
+// whole pairing mechanism -- write, read-back run_id, pair, aggregate --
+// works end to end, not just that each half in isolation accepts a
+// hand-built payload.
+test('seam: a real tdd_task run\'s start AND terminal payloads, BOTH piped through the real ledger-append.mjs (the run_id it itself generates, fed back exactly as a real ledger:write agent step would), produce exactly two lines sharing one run_id and one plan key, and aggregateWallClock reports agentComputeMeasuredRuns=1, agentComputeUnmeasuredRuns=0 (AC-QA-10)', async () => {
+  const repo = makeTempRepo()
+  const WF = path.join(__dirname, '..', 'workflows', 'tdd-task.js')
+  // Stands in for the real ledger:write agent step (see tdd-task.js's own
+  // ledgerWritePrompt): decode the base64 payload the workflow embedded,
+  // pipe it into the REAL ledger-append.mjs, and hand back exactly what
+  // the script printed -- run_id included -- so the workflow's own logic
+  // (which extracts startRunId from this response and requests its reuse
+  // on the terminal write) is exercised for real, not simulated.
+  const realLedgerWriteAgent = (prompt) => {
+    const payload = extractLedgerPayload(prompt)
+    const res = runAppend(repo, payload)
+    const lastLine = res.stdout.trim().split('\n').pop()
+    return JSON.parse(lastLine)
+  }
+  const { calls } = await runWorkflow(WF, {
+    args: { task: 'seam proof', spec: 'specs/seam.md' },
+    agent: {
+      'write-test#1': { test_files: ['a.test.js'], test_command: 'node a.test.js', expected_failure: 'missing fn' },
+      'verify-red#1': { red: true, right_reason: true, evidence: 'threw', test_hashes: [{ file: 'a.test.js', sha256: 'abc' }] },
+      'implement#1': { summary: 'added fn', files_changed: ['a.js'] },
+      'verify-green#1': { green: true, suite_green: true, hashes_match: true, evidence: 'passed' },
+      commit: { sha: 'deadbeef', message: 'feat: thing' },
+      'ledger:write': realLedgerWriteAgent,
+    },
+  })
+  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected exactly one start write + one terminal write')
+
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 2, `expected exactly two lines in the real ledger file, got ${lines.length}`)
+  const [start, terminal] = lines.map((l) => JSON.parse(l))
+  assert.equal(start.outcome, 'started')
+  assert.notEqual(terminal.outcome, 'started')
+  assert.ok(start.run_id, 'the start line must carry a run_id ledger-append.mjs itself generated')
+  assert.equal(start.run_id, terminal.run_id, 'both lines must share the SAME run_id -- the terminal write requested reuse of the real generated one')
+  assert.equal(start.plan_key, terminal.plan_key, 'both lines must carry an identical canonical plan key')
+
+  const { aggregateWallClock } = await import(pathToFileURL(OPTIMISE_READ_PATH).href)
+  const result = aggregateWallClock([start, terminal])
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1, 'the real pair must be measured')
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 0, 'a genuine, real-generated-run_id pair must never be counted as unmeasured')
 })
 
 test('seam: conduct_plan_event payload, built exactly per skills/conduct-plan/SKILL.md\'s documented shape, is accepted by ledger-append.mjs', () => {
