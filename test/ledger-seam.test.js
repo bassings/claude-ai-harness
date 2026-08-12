@@ -262,6 +262,72 @@ test('seam: plan_cycle\'s THROW-path start AND terminal payloads are BOTH accept
   pipeThrowPathAndAssert(caught, 'plan_cycle')
 })
 
+// Review round-2 L-1: the three throw-path tests above only prove the throw
+// at the FIRST agent step (before any lens ever ran), where lenses_run being
+// empty is honest -- nothing ran yet. A throw at the LAST agent step
+// (synthesis), AFTER every lens already reported back, is a different case:
+// the lenses genuinely ran, but `result.lenses` (read from run()'s return
+// value) is still undefined on the throw path, since run() never reaches its
+// `return`. If lenses_run silently reports [] here too, an operator reading
+// the ledger sees "no lenses ran" for a round that actually dispatched and
+// received five lens reports before synthesis crashed -- the same
+// computed-but-not-surfaced defect class as H-1/M-3, one field over.
+test('seam: review_cycle\'s THROW-path terminal payload, when the throw happens at the LAST agent step (synthesis) AFTER every lens already reported, still carries the real lenses_run -- not [] (L-1)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
+  let caught
+  try {
+    await runWorkflow(WF, {
+      args: {},
+      agent: {
+        'scope:diff': {
+          base: 'main',
+          head_sha: 'abcdef1234567890',
+          files: [{ path: 'src/foo.js', status: 'M' }],
+          new_dependency_entries: false,
+          new_modules: false,
+          custom_rules: null,
+        },
+        'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+        'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+        synthesis: () => { throw new Error('synthesis crashed after every lens reported') },
+        'ledger:write': LEDGER_OK,
+      },
+    })
+  } catch (e) {
+    caught = e
+  }
+  assert.ok(caught, 'expected the workflow to throw')
+  const { terminal } = throwPathPayloads(caught)
+  assert.deepEqual(terminal.lenses_run, ['lens-security', 'lens-qa'], 'lenses_run must reflect the lenses that actually reported, not an empty array, even though run() never returned')
+  pipeThrowPathAndAssert(caught, 'review_cycle (throw at last step)')
+})
+
+test('seam: plan_cycle\'s THROW-path terminal payload, when the throw happens at the LAST agent step (synthesis:write-back) AFTER every lens already reported, still carries the real lenses_run -- not [] (L-1)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'plan-cycle.js')
+  const LENS_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, acceptance_criteria: [{ id: 'AC-SEC-1', statement: 'x' }] }
+  let caught
+  try {
+    await runWorkflow(WF, {
+      args: { spec: 'specs/seam-throw.md' },
+      agent: {
+        'scope:spec': { summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'] },
+        'lens-security': LENS_CLEAN,
+        'lens-qa': LENS_CLEAN,
+        'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] },
+        'lens-product': LENS_CLEAN,
+        'synthesis:write-back': () => { throw new Error('synthesis crashed after every lens reported') },
+        'ledger:write': LEDGER_OK,
+      },
+    })
+  } catch (e) {
+    caught = e
+  }
+  assert.ok(caught, 'expected the workflow to throw')
+  const { terminal } = throwPathPayloads(caught)
+  assert.deepEqual(terminal.lenses_run, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'], 'lenses_run must reflect the lenses that actually reported, not an empty array, even though run() never returned')
+  pipeThrowPathAndAssert(caught, 'plan_cycle (throw at last step)')
+})
+
 test('seam: conduct_plan_event payload, built exactly per skills/conduct-plan/SKILL.md\'s documented shape, is accepted by ledger-append.mjs', () => {
   // conduct-plan is a prose skill with no fake-runtime harness to drive it
   // (nothing sandboxes a live conducting agent); this hand-builds the

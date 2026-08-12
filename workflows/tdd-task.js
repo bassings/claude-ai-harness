@@ -129,6 +129,23 @@ async function writeLedger(payload) {
   return { write_ok: true, write_error: null, run_id: response.run_id }
 }
 
+// Review round-2 L-2: the exception guard below previously logged a thrown
+// error's message verbatim. Workflow scripts have no fs/child_process
+// access, so they cannot resolve the checkout root the way
+// ledger-append.mjs's stripRoot does (see that file) -- a real Node error
+// (ENOENT, module resolution, a stack frame) commonly embeds an absolute
+// path, and on the machine that ran this, that path discloses the local
+// account name. This is a coarser, root-agnostic pattern match instead: it
+// will not catch every leak shape, only the common absolute-path one, but
+// it is what is available at this boundary. Applies ONLY to this
+// operator-visible console log line -- never to what reaches the ledger
+// file itself, which has its own, separate, root-aware redaction.
+const ABSOLUTE_PATH_LOG_RE = /\/(?:Users|home)\/[^\s'"]+/g
+const MAX_LOG_TEXT = 500
+function redactLogText(text) {
+  return String(text).slice(0, MAX_LOG_TEXT).replace(ABSOLUTE_PATH_LOG_RE, '<redacted-path>')
+}
+
 // The entire pre-existing workflow body, unchanged in behaviour, is wrapped
 // in run() so every one of its terminating returns funnels through exactly
 // ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
@@ -313,7 +330,7 @@ try {
   runError = e
   threw = true
   raw = {}
-  log(`Run ${startRunId || 'unknown'} threw before producing a result: ${e && e.message ? e.message : String(e)}`)
+  log(`Run ${startRunId || 'unknown'} threw before producing a result: ${redactLogText(e && e.message ? e.message : String(e))}`)
 } // end PR 2 exception guard
 const result = raw
 const telemetry = {

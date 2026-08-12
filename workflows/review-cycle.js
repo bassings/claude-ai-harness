@@ -58,6 +58,14 @@ let openFindingsRaw = []
 // previously collected here and then simply never reaching the ledger
 // payload, so "which ACs never fail" had no data source at all.
 let acVerdicts = []
+// Review round-2 L-1: `lenses` (the triggered roster) is local to run(), so
+// on a throw AFTER the lenses already ran (e.g. synthesis crashing), the
+// outer telemetry code falls back to result.lenses -- undefined, because
+// run() never reached its return -- and reported an empty lenses_run even
+// though every lens genuinely ran and reported back. Mirrors
+// openFindingsRaw/acVerdicts: set as soon as lensReports exists, so a late
+// throw still leaves an accurate trail.
+let lensesRunRaw = []
 
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
@@ -160,6 +168,23 @@ async function writeLedger(payload) {
     log(`Run ${response.run_id}: invalid_ac_ids_dropped=${response.invalid_ac_ids_dropped} (a lens supplied a non-conforming ac_id; sanitised, not lost -- see ac_id_raw in the ledger line)`)
   }
   return { write_ok: true, write_error: null, run_id: response.run_id }
+}
+
+// Review round-2 L-2: the exception guard below previously logged a thrown
+// error's message verbatim. Workflow scripts have no fs/child_process
+// access, so they cannot resolve the checkout root the way
+// ledger-append.mjs's stripRoot does (see that file) -- a real Node error
+// (ENOENT, module resolution, a stack frame) commonly embeds an absolute
+// path, and on the machine that ran this, that path discloses the local
+// account name. This is a coarser, root-agnostic pattern match instead: it
+// will not catch every leak shape, only the common absolute-path one, but
+// it is what is available at this boundary. Applies ONLY to this
+// operator-visible console log line -- never to what reaches the ledger
+// file itself, which has its own, separate, root-aware redaction.
+const ABSOLUTE_PATH_LOG_RE = /\/(?:Users|home)\/[^\s'"]+/g
+const MAX_LOG_TEXT = 500
+function redactLogText(text) {
+  return String(text).slice(0, MAX_LOG_TEXT).replace(ABSOLUTE_PATH_LOG_RE, '<redacted-path>')
 }
 
 // The entire pre-existing workflow body, unchanged in behaviour, is wrapped
@@ -317,6 +342,7 @@ const reports = await parallel(lenses.map(lens => () =>
 ))
 const lensReports = reports.filter(Boolean)
 if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
+lensesRunRaw = lensReports.map(r => r.lens)
 
 // H5: capture every finding each lens reported, as-is, before synthesis
 // dedupes/arbitrates them -- this is the "open" (accepted) side that was
@@ -439,14 +465,14 @@ try {
   runError = e
   threw = true
   raw = {}
-  log(`Run ${startRunId || 'unknown'} threw before producing a result: ${e && e.message ? e.message : String(e)}`)
+  log(`Run ${startRunId || 'unknown'} threw before producing a result: ${redactLogText(e && e.message ? e.message : String(e))}`)
 } // end PR 2 exception guard
 const { __outcome, ...result } = raw
 const telemetry = {
   outcome: __outcome || 'aborted',
   spec: specPath,
   round_key: headSha,
-  lenses_run: result.lenses || [],
+  lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],
   trigger_counts: triggerCounts,
   verdicts: result.verdicts || {},

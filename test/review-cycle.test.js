@@ -496,6 +496,57 @@ test('review-cycle.js: an exception thrown by an agent() call inside run() still
   )
 })
 
+// Review round-2 L-2: see tdd-task.test.js for the identical guard and its
+// rationale -- workflow scripts have no fs/child_process access, so they
+// cannot resolve the checkout root the way ledger-append.mjs's stripRoot
+// does. This is only the operator-visible console log; the ledger file
+// itself has its own, separate, root-aware redaction.
+test('review-cycle.js: the exception guard\'s log line redacts an absolute /Users or /home path embedded in the thrown error\'s message, rather than printing it verbatim (L-2)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': () => { throw new Error("ENOENT: no such file, open '/Users/victim/secret-project/config.js'") },
+          'ledger:write': [
+            { run_id: 'start-abc', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'terminal-abc', ts: 't2', write_ok: true, write_error: null },
+          ],
+        }),
+      }),
+    (err) => {
+      const line = err.logs.find((l) => l.includes('start-abc'))
+      assert.ok(line, `expected a log line naming the run_id, got ${JSON.stringify(err.logs)}`)
+      assert.ok(!line.includes('/Users/victim/secret-project'), `the log line must not carry the raw absolute path verbatim, got: ${line}`)
+      assert.ok(!line.includes('victim'), `the log line must not leak the local account name, got: ${line}`)
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: the exception guard\'s log line is bounded in length, even when the thrown error\'s message is very long (L-2)', async () => {
+  const longMessage = 'x'.repeat(5000)
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': () => { throw new Error(longMessage) },
+          'ledger:write': [
+            { run_id: 'start-abc', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'terminal-abc', ts: 't2', write_ok: true, write_error: null },
+          ],
+        }),
+      }),
+    (err) => {
+      const line = err.logs.find((l) => l.includes('start-abc'))
+      assert.ok(line, `expected a log line naming the run_id, got ${JSON.stringify(err.logs)}`)
+      assert.ok(line.length < longMessage.length, `expected the log line to be bounded well under the 5000-char thrown message, got length ${line.length}`)
+      return true
+    }
+  )
+})
+
 test('review-cycle.js: the original error still reaches the caller even when the terminal ledger write ALSO fails (AC-OPS-1: never swallowed by a failure of the terminal write itself)', async () => {
   await assert.rejects(
     () =>
