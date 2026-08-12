@@ -1,183 +1,134 @@
-# HARN-OPT-2 PR1 mutation proofs
+# HARN-OPT-2 mutation proofs
 
 Per AC-QA-22 and standard §11: for each guard below, the guarded behaviour
 was actually broken (edited in the working file, not "mentally mutated"),
 the suite was run, the exact failing test and message recorded, then the
-file was `cp`-restored from a pre-mutation snapshot (never `git checkout
+file was restored (`cp` from a pre-mutation snapshot, never `git checkout
 --`, which reverts to the last commit and can destroy uncommitted work),
 confirmed via `diff <working-file> <snapshot>` returning nothing before the
 next mutation. Full suite: `node --test test/*.test.js`. AC-SIMP-10 caps
 this file at 200 lines; later rounds compress earlier ones, never drop them.
 
-**Round 2**: `perRepo[].root` was still the raw caller-supplied path
-verbatim. Fixed by deriving a non-identifying label (proof 10).
+## PR1 (plan-identity canonicalisation), condensed to fit the cap
 
-**Round 3**: BLOCKED on CRITICAL C1 (four distinct conductor events
-collapsed to one line). Root cause: write-time regex redaction applied to a
-STRUCTURED path value. Decision: strip write-time redaction of `spec`
-entirely (the ledger is gitignored, local-only -- AC-SEC-1; AC-SEC-3
-governs the OUTPUT boundary only), replaced with pure lexical root-matching.
-**Supersedes proofs 2 and 4**, corrected in place.
+Merged as PR #3 (squash d6ada19) after 5 fix rounds / 4 review rounds. Full
+history lived here across those rounds; condensed now that PR1 is closed,
+per this file's own stated policy.
 
-**Round 4 (SHIPPED, then REVERTED by round 5)**: added `fs.realpathSync
-.native(path.dirname(spec))` in `main()` to recover a spec reached through
-a symlinked ancestor. Coordinator's own review found this made plan
-identity FILESYSTEM-STATE-dependent (the identical spec string recorded the
-marker before a symlink existed and the real key after one was created at
-the same path) -- a fresh violation of AC-ARCH-3/AC-DATA-3/AC-SEC-2, despite
-satisfying the letter of "canonicalPlanKey stays pure" (the call sat in
-`main()`, not inside it). **Entirely reverted in round 5**; see round 5
-below. This is why round 5 adds BEHAVIOURAL (not function-body-grep) purity
-guards -- a static check scoped to `canonicalPlanKey` could never have
-caught a violation living in a different function.
+Root cause chased across rounds 3-5: write-time REDACTION (as opposed to
+canonicalisation) is inherently lossy and must never be what gets written to
+an append-only, unbacked-up file. Round 3 stripped write-time redaction of
+`spec` entirely (replaced with pure lexical root-matching); round 4 shipped
+`fs.realpathSync` inside `main()` to recover a symlinked-ancestor case, which
+the coordinator's own review caught as making plan identity
+FILESYSTEM-STATE-DEPENDENT (a live regression) -- reverted whole in round 5,
+which added spec_raw (verbatim, redaction-exempted only when the canonical
+form IS the marker) and closed a conductor-event occurrence-canonicalisation
+gap (AC-ARCH-6). All proofs below: mutation applied, suite run, exact
+failure recorded, revert confirmed byte-identical via `diff`.
 
-**Round 5 (current tip)**: three High findings. **H-A**: reverts round 4 (above).
-**H-B**: AC-DATA-4's recoverability test was vacuous (re-derived from a
-field that already WAS the canonical key; proven by an invisible
-`.toLowerCase()` mutation). Fixed with a new `spec_raw` field -- the
-caller's original string, retained verbatim, EXCLUDED when the canonical
-form is the redaction marker (retaining a hostile out-of-repo/escaping
-value there would defeat AC-SEC-1's own protection through a side door).
-**H-C** (AC-ARCH-6): an event_scope's plan segment is now canonicalised
-(resolved against cwd when relative, exactly like `spec`) before minting
-the occurrence suffix, closing a C1 remnant where an absolute event_scope
-lost every occurrence after the first via the free-text pass further down.
-Suite: 405/405 (ledger-append.test.js 127, optimise-read.test.js 77,
-optimise-cycle.test.js 63, optimise-static.test.js 15, static-checks.test.js
-18, 105 elsewhere).
+Load-bearing, confirmed by mutation (11 write-side + 7 round-5 + 2 more,
+21 total): `..`-escape detection; repo-identity main-checkout-basename
+fallback; unattributable-run exclusion in `aggregateWallClock`;
+degraded-record exclusion in `planKeyForRecord`; ci_wait/human_wait bucket
+key routing through `canonicalPlanKey`; the single-definition-site static
+guard; zero-extra-git-subprocess guard; `perRepo[].root` non-identifying
+label; AC-DATA-6 pre-PR1-line attribution; the H-A behavioural
+ancestor-symlink-existence purity test (the ONLY one of two purity tests
+that actually caught round 4's regression -- proven by a differential:
+target-existence purity stayed green under the same mutation); H-B(a)
+`.toLowerCase()` corruption of the plan key; H-B(b) unconditional
+`spec_raw` (would have reopened the AC-SEC-1 leak); H-C occurrence
+canonicalisation and its cwd-resolution sub-case; `planKeyForRecord`'s
+stored-plan_key re-canonicalisation branch (optimise-read.mjs:163).
 
-## Round 1/2 proofs (1-11), condensed
+Verified non-vacuous, no fix needed: AC-QA-13 order-independence
+(`keys.find` mutated to `keys[0]`, both tests failed cleanly); the
+spec-exclusion FREE_TEXT_FIELDS guard (5 tests failed, not reliant on the
+regex alone). Final suite: 405/405.
 
-1. **`..`-escape detection** (AC-SEC-1 case d): `if (segments.length === 0)
-   return REDACTED_PATH_MARKER` -> `if (false) ...`. **Reverted, current.**
+## PR2 (start/terminal pairing), this round
 
-2. **CORRECTED (was stale)**: `spec` no longer goes through the worktree
-   pre-pass gate at all; it uses `specRootCandidates` inside
-   `canonicalPlanKey` (round-3 probe 9). Not re-mutated separately.
+Scope: (1) an exception escaping `run()` in tdd-task.js/review-cycle.js/
+plan-cycle.js must still produce a terminal ledger write (AC-QA-8, AC-OPS-1);
+(2) the terminal-only orphan class (a failed START write) handled as its own
+case; (3) the aggregator counts and names the two orphan classes SEPARATELY
+(AC-OPS-2); (4) AC-DATA-10 pairing purity (exactly one started + one
+terminal, never fewer/more/wrong-shaped). Full suite: 422/422 (RED counts
+below are each mutation's own run, not the baseline).
 
-3. **Repo-identity fallback uses the main-checkout basename** (AC-DATA-2):
-   `if (mainRoot) return path.basename(mainRoot)` -> `if (false) ...`.
-   **Reverted, current.**
+1. **AC-ARCH-9 byte-identity, exception-guard block** (static-checks.test.js):
+   mutated plan-cycle.js's log-line text inside the guard block only.
+   21 -> 20 pass, 1 fail (the new PR2 byte-identity test, exact diff shown in
+   the failure). **Reverted, `diff` against snapshot empty.**
+2. **AC-ARCH-9/AC-QA-8/AC-OPS-1, the re-throw itself**: deleted
+   `if (runError) throw runError` from review-cycle.js only. 3 tests failed
+   simultaneously -- the static re-throw-pair guard AND both new AC-QA-8/
+   AC-OPS-1 behavioural tests in review-cycle.test.js (proving the static
+   guard and the behavioural tests are independent, not the same check
+   twice). **Reverted, `diff` empty.**
+3. **AC-QA-9 return-count pin**: added an unreachable `if (false) return {...}`
+   inside tdd-task.js's `run()`. 21 -> 20 pass, 1 fail (the count guard,
+   8 expected vs 9 actual). **Reverted, `diff` empty.**
+4. **AC-DATA-10 pairing-purity gate**: reverted the new
+   `pair.length === 2 && starts.length === 1 && terminals.length === 1`
+   condition back to the original `pair.length < 2` (i.e. any 2-record pair
+   is measured regardless of outcome shape). 85 -> 81 pass, 4 fail: both
+   fabricated-duration reproductions (two started 1h apart; two terminal),
+   the three-or-more-records case, and the malformed-pairing/AC-OPS-2
+   boundary test. The genuine-pair test stayed green (confirms the mutation
+   only widens what counts as measured, doesn't break the real case).
+   **Reverted, `diff` empty.**
+5. **AC-OPS-2 start-only counter**: gated the start-only branch with
+   `if (false && ...)`. 85 -> 83 pass, 2 fail: the direct start-only unit
+   test AND the live-9-record-ledger CLI test (startOnly=4 no longer
+   reported). The terminal-only counter test and the malformed-pairing test
+   both stayed green -- confirms the two counters are independently wired,
+   not one flag driving both. **Reverted, `diff` empty.**
+6. **AC-QA-10 seam, terminal run_id reuse**: in tdd-task.js, changed
+   `if (startRunId) terminalEntry.run_id = startRunId` to `if (false) ...`.
+   The new real-writer-to-real-writer seam test in ledger-seam.test.js
+   failed (two lines written with two DIFFERENT run_ids instead of one
+   shared one) -- the pre-existing fake-agent-response seam tests stayed
+   green (they hand-script the run_id reuse rather than exercising the
+   real writer for both halves, which is exactly why AC-QA-10 asked for a
+   real end-to-end proof beyond them). **Reverted, `diff` empty.**
+7. **AC-DATA-9, SIGKILL test non-vacuity**: not a code mutation (there is no
+   guard to mutate -- the invariant is the OS's, not this codebase's).
+   Proven non-vacuous instead by a standalone script performing the same
+   real start+terminal writes WITHOUT sending SIGKILL: confirmed 2 real
+   lines land (vs. the test's own assertion of exactly 1 when the process
+   IS killed mid-flight), so the test's `lines.length === 1` assertion is
+   not trivially true regardless of the kill.
 
-4. **CORRECTED AGAIN (round 5)**: `specWasOverwritten` now ALSO gates
-   `spec_raw` (`if (planKey !== REDACTED_PATH_MARKER) payload.spec_raw =
-   specRawInput`) -- see round 5 probe H-B(b) below for its own proof.
+8. **AC-QA-9, run_id reuse on EVERY return path (a strengthening of a
+   pre-existing gap)**: the pre-existing per-case tests only counted ledger
+   calls, never checked the terminal write actually requested the start's
+   run_id (both used the same static `LEDGER_OK` object for both calls, so
+   equal run_ids proved nothing). Strengthened to distinct start/terminal
+   run_ids per case, then in tdd-task.js changed
+   `if (startRunId) terminalEntry.run_id = startRunId` to `if (false) ...`.
+   23 -> 20 pass, 3 fail: the strengthened parametrized test failed on its
+   FIRST case (test-writer-agent-fails, an ABORTED path), proving the single
+   shared line covers every return path, not just the DONE path the old
+   dedicated pairing test exercised. **Reverted, `diff` empty.**
 
-5. **Unattributable-run exclusion, `aggregateWallClock`** (AC-DATA-7):
-   optimise-read.mjs:475. **Reverted, current.**
+## Runtime unwind fact-check (AC-ARCH-9/AC-QA-8 dependency, flagged unproven
+at planning by lens-architecture)
 
-6. **Degraded-record exclusion, `planKeyForRecord`** (AC-QA-7):
-   optimise-read.mjs:155. **Reverted, current.**
-
-7. **`ci_wait`/`human_wait` bucket key routes through `canonicalPlanKey`**
-   (AC-ARCH-4): optimise-read.mjs:357. **Reverted, current.**
-
-8. **Single-definition-site static guard** (AC-ARCH-1). **Reverted, current.**
-
-9. **Worktree-root resolution costs zero extra git subprocesses** (AC-QA-20).
-   **Reverted, current.**
-
-10. **`perRepo[].root` derives a non-identifying label** (AC-SEC-3 round 2).
-    **Reverted, current.**
-
-11. **AC-DATA-6: a pre-PR1-shaped line still attributes via `spec`**.
-    **Reverted, current.**
-
-## Round 3 probes (nine total; unchanged this round, condensed)
-
-1. **C1**: reintroduced the destructive event_key regex. 2 targeted fails
-   (C1 repro, L2-reversion). **Reverted.**
-2/3. **Realpath vs. PWD root candidates**: differential pair proving PWD
-   (not realpathOrNull) carried round 3's narrower H3 fix. **Superseded by
-   round 4/5** (realpathOrNull deleted for good in round 4; the real gap is
-   now closed properly by round 5, see below). **Reverted.**
-4. **Bucket-key escaping** (`escapeKeyComponent` -> `String(s)`): 2 targeted
-   fails. **Reverted.**
-5. **Exclusion-counter report line** hardcoded to 0: 1 targeted fail
-   (repaired M3 test; the PRE-repair version would have passed). **Reverted.**
-6. **Raw stdin parse-error leaks**, all 3 CLI commands: 3 targeted fails.
-   **Reverted.**
-7. **L4 static O(1)-per-record guard**: inert `fs.existsSync` reference
-   trips it. **Reverted.**
-8. **L6 rootIndex label fallback**: 1 targeted fail (vacuous-to-real
-   conversion, verified). **Reverted.**
-9. **`spec` re-exposed to free-text redaction**: only the H3 PWD test
-   failed (H1/H2 satisfied independently by the narrowed regex --
-   defence in depth, thinner coverage than design prominence suggests).
-   **Reverted.**
-
-## Round 5 probes (H-A, H-B, H-C -- seven total)
-
-RED confirmed first for H-A: reverting to round 4's candidate-matching
-(one-line diff) reproduced the coordinator's exact repro,
-`plan_key: '<redacted-path>'`, on a new ancestor-symlink-from-subdirectory
-fixture, before H-A's revert was applied.
-
-1. **H-A, round 4 fully reinstated**: round 4's exact removed dirname-realpath
-   block re-inserted verbatim (a genuine 8-line re-add, confirmed via `diff`).
-   127 -> 125 pass, 2 fail: the "H-A pinned" marker test (recorded the real
-   key again, not the marker) AND the ancestor-symlink-existence purity test
-   (probe 3 below). The target-existence purity test (probe 2) stayed
-   GREEN -- neither run in that fixture ever involves a symlink, so
-   round 4's mutation cannot diverge it; confirms probe 2 and probe 3 guard
-   genuinely different axes, not the same one twice. **Reverted, zero-line
-   diff, 127/127.**
-2. **H-A behavioural purity, target existence**: `runAppend` twice with the
-   IDENTICAL absolute spec, target file absent then present. Passes
-   unconditionally under CURRENT code (lexical matching never touches the
-   fs) and, per probe 1, is NOT what catches round 4's mutation -- kept as a
-   documented, correct invariant, not claimed as this round's load-bearing
-   guard.
-3. **H-A behavioural purity, ancestor-symlink existence**: `runAppend` twice
-   with the IDENTICAL spec string reached through a symlink path, symlink
-   absent then created between runs. **This is the test that actually
-   caught probe 1's mutation** (before=`<redacted-path>`,
-   after=`specs/a.md` under round 4's code -- diverging, exactly the
-   defect this round exists to keep dead).
-4. **H-B(a), `.toLowerCase()` corruption**: `segments.join('/')` ->
-   `segments.join('/').toLowerCase()`. 127 -> 125 pass, 2 fail: the M1
-   verbatim-preservation test AND the rewritten AC-DATA-4 test (which the
-   ORIGINAL version of this test did NOT catch -- confirmed separately
-   before the rewrite). **Reverted, zero-line diff, 127/127.**
-5. **H-B(b), spec_raw redaction-exemption**: `if (planKey !==
-   REDACTED_PATH_MARKER) payload.spec_raw = ...` -> unconditional. 127 -> 125
-   pass, 2 fail: the AC-SEC-1 case-c and case-d tests (a hostile path would
-   have reached the ledger via spec_raw). **Reverted, zero-line diff,
-   127/127.**
-6. **H-C, occurrence canonicalisation**: `canonicalScope = canonicalPlanKey
-   (...) + restOfScope` -> raw `payload.event_scope`. 127 -> 124 pass, 3
-   fail: the escaping-marker test, the legitimate-subdirectory test, and the
-   NEW two-absolute-scope AC-ARCH-6 test (`duplicate: true` on the second
-   write -- the coordinator's exact measured symptom). C1's own test stayed
-   green (independent coverage). **Reverted, zero-line diff, 127/127.**
-7. **H-C, cwd-resolution for relative plan segments** (a gap found and
-   fixed DURING this round, not present in the brief): the relative-segment
-   `path.resolve(cwd, ...)` step disabled. 127 -> 126 pass, 1 fail: only the
-   legitimate-subdirectory test -- C1's own test stayed green even here,
-   confirming it alone would NOT have caught this gap. **Reverted,
-   zero-line diff, 127/127.**
-
-Also mutation-proven (optimise-read.mjs line 163, AC-SEC-3 medium):
-`planKeyForRecord`'s stored-plan_key branch trusted verbatim instead of
-re-canonicalising -- 3 fails (2 pre-existing M1 tests + the new hostile
--plan_key test). **Reverted, zero-line diff, 77/77.**
-
-Verified non-vacuous, no fix needed (AC-QA-13 medium): the order-independence
-`keys.find(...)` logic mutated to `keys[0]` -- both AC-QA-13 tests fail
-cleanly. Already solid.
-
-Verified non-vacuous, no fix needed (spec-exclusion coverage note): `spec`
-re-added to `FREE_TEXT_FIELDS` (leaving only `spec_raw` excluded) -- 5 tests
-fail, including the AC-DATA-1/AC-ARCH-3 worktree test. Genuine, multi-test
-coverage, not reliant on the narrowed regex alone.
-
-## Not separately mutation-proven
-
-- **AC-SEC-3's whole-output zero-leak CLI test**, **`aggregateRework`'s
-  unattributable-exclusion**: unchanged, see proofs 5/10.
-- **AC-DATA-17 (durability doc)**: static-checks test, proven RED before
-  GREEN, per §1.
-- **AC-DATA-3 (ledger-append.mjs, cwd-resolution comment)**: closed by
-  documentation clarification at the call site (why using `cwd` there is
-  consistent with "lexical, never realpath-based") -- no code change, no
-  behavioural mutation applicable.
+- **Agent-step throw**: CONFIRMED to unwind through `try/catch` -- this is
+  ordinary JS async/await semantics (an `await`ed rejected promise throws at
+  the call site) and is directly exercised by every new AC-QA-8/AC-OPS-1
+  test above, which all pass.
+- **Budget exhaustion**: UNVERIFIED. Whether the production runtime enforces
+  a budget cutoff by throwing inside an `agent()` call (same class as an
+  agent throw, and therefore caught) or by externally terminating the
+  script (same class as a kill, and therefore NOT caught by any JS-level
+  construct) is not observable from this repo or its tests. Not assumed
+  either way.
+- **Process kill (SIGKILL/forced termination)**: CONFIRMED to NOT unwind --
+  no JS-level `try`/`catch`/`finally` runs once the OS terminates the
+  process. This is exactly why AC-DATA-9's guarantee rests on
+  ledger-append.mjs's append-only, single-syscall-per-write durability
+  (proven by the real-process SIGKILL test above), never on the try/catch
+  added for AC-QA-8.
