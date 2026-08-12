@@ -493,3 +493,22 @@ test('review-cycle.js: the original error still reaches the caller even when the
     }
   )
 })
+
+// Review round-1 M2: see tdd-task.test.js's identical guard for the
+// rationale -- `if (runError) throw runError` tests truthiness, not
+// whether the catch fired.
+for (const falsyValue of [null, undefined, 0, '']) {
+  test(`review-cycle.js: a falsy thrown value (${JSON.stringify(falsyValue)}) from an agent() call inside run() still propagates (M2, regression)`, async () => {
+    await assert.rejects(
+      () =>
+        runWorkflow(WF, {
+          args: {},
+          agent: baseAgent({ 'scope:diff': () => { throw falsyValue } }),
+        }),
+      (err) => {
+        assert.equal(err, falsyValue)
+        return true
+      }
+    )
+  })
+}

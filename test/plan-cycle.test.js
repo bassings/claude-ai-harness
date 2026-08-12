@@ -194,3 +194,22 @@ test('plan-cycle.js: the original error still reaches the caller even when the t
     }
   )
 })
+
+// Review round-1 M2: see tdd-task.test.js's identical guard for the
+// rationale -- `if (runError) throw runError` tests truthiness, not
+// whether the catch fired.
+for (const falsyValue of [null, undefined, 0, '']) {
+  test(`plan-cycle.js: a falsy thrown value (${JSON.stringify(falsyValue)}) from an agent() call inside run() still propagates (M2, regression)`, async () => {
+    await assert.rejects(
+      () =>
+        runWorkflow(WF, {
+          args: { spec: 'specs/foo.md' },
+          agent: baseAgent({ 'scope:spec': () => { throw falsyValue } }),
+        }),
+      (err) => {
+        assert.equal(err, falsyValue)
+        return true
+      }
+    )
+  })
+}

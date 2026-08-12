@@ -1151,26 +1151,72 @@ test('optimise-read: aggregateWallClock treats three or more records sharing one
   assert.equal(result.totals.agentComputeSeconds, null)
 })
 
-// ---- HARN-OPT-2 PR2 (AC-QA-12): "The pairing fix cannot manufacture
-// completions... aborted pairs are counted under their own name and never
-// contribute to any completed-run duration statistic." aggregateWallClock
-// has exactly one agent-compute duration statistic today, and it is not
-// (and must not become) outcome-specific -- a start+aborted pair represents
-// real agent compute time and is correctly measured, but the record's own
-// outcome value is never overwritten or laundered into looking like 'done'
-// anywhere in the read pipeline. ----
+// ---- HARN-OPT-2 PR2 review round 1, H1 (AC-QA-12's third clause): "aborted
+// pairs are counted under their own name and never contribute to any
+// completed-run duration statistic." The version of this test that shipped
+// in review round 1 encoded the OPPOSITE reading (asserted a crashed pair
+// as `agentComputeMeasuredRuns: 1` / `agentComputeSeconds: 180`), which is
+// exactly finding H1: the exception-guard fix (PR2's own terminal-write
+// change) turns a crash from an orphan (correctly unmeasured) into a
+// well-formed pair, and the OLD version of this test asserted that pair
+// should read as a healthy completion. Confirmed by execution against the
+// review's own repro (40 minutes apart): pre-fix this returned
+// `{agentComputeSeconds: 2400, agentComputeMeasuredRuns: 1,
+// agentComputeUnmeasuredRuns: 0}` -- byte-identical in SHAPE to a genuine
+// completion, and `isUnmeasuredSegmentMotivated` (optimise-cycle.js) reads
+// agentComputeUnmeasuredRuns to decide whether a proposal citing
+// agent_compute is built on unmeasurable data. A workflow crashing on
+// EVERY run would report as a fully measured, healthy repo. ----
 
-test('optimise-read: a start/terminal pair whose terminal outcome is aborted (not done) is still measured as real agent compute time, and its outcome value is never rewritten to done anywhere in the aggregate output (AC-QA-12)', () => {
+test('optimise-read: a start/terminal pair whose terminal outcome is aborted (not done) is EXCLUDED from agentComputeSeconds/agentComputeMeasuredRuns, STILL counts toward agentComputeUnmeasuredRuns (so the proposal-safety gate stays armed), and is reported under its own agentComputeAbortedPairs/agentComputeAbortedSeconds names -- reproducing the review\'s exact 40-minute repro (H1, AC-QA-12)', () => {
   const records = [
     { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'aborted-pair', ts: '2026-08-01T00:00:00.000Z' },
-    { kind: 'tdd_task', repo: 'demo', outcome: 'aborted', spec: 'specs/a.md', run_id: 'aborted-pair', ts: '2026-08-01T00:03:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'aborted', spec: 'specs/a.md', run_id: 'aborted-pair', ts: '2026-08-01T00:40:00.000Z' }, // 40 minutes later
   ]
   const result = mod.aggregateWallClock(records)
-  assert.equal(result.totals.agentComputeMeasuredRuns, 1, 'the run genuinely happened and took real compute time -- it is not "unmeasured"')
-  assert.equal(result.totals.agentComputeSeconds, 180)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0, 'a crashed run must never read as a measured completion')
+  assert.equal(result.totals.agentComputeSeconds, null, 'no fabricated duration must reach the completed-run statistic')
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1, 'the crash must still keep the segment "unmeasured" -- this is what keeps the proposal-safety gate armed')
+  assert.equal(result.totals.agentComputeAbortedPairs, 1, 'the crash must be named and counted under its own counter')
+  assert.equal(result.totals.agentComputeAbortedSeconds, 2400, 'the elapsed time IS known (a real number, not null) -- it is a crash duration, reported under its own name, never a work duration')
   // The record itself, unmodified, must still say aborted -- nothing in the
   // aggregate pipeline claims or implies this was a completion.
   assert.equal(records[1].outcome, 'aborted', 'aggregateWallClock must never mutate the input record\'s outcome field')
+})
+
+test('optimise-read: a start/terminal pair whose terminal outcome is blocked (not done, and not literally aborted either) is treated identically to an aborted pair -- any non-done terminal is a crash/non-completion, not just the literal "aborted" outcome (H1)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'blocked-pair', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'blocked', spec: 'specs/a.md', run_id: 'blocked-pair', ts: '2026-08-01T00:05:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeAbortedPairs, 1)
+  assert.equal(result.totals.agentComputeAbortedSeconds, 300)
+})
+
+test('optimise-read: a per-plan bucket also carries its own agentComputeAbortedN, so an operator can see WHICH plan is crashing, not just a repo-wide total (H1)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/crashy.md', run_id: 'ab-1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'aborted', spec: 'specs/crashy.md', run_id: 'ab-1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  const bucket = result.byPlan.get('demo|specs/crashy.md')
+  assert.ok(bucket, 'the crashed pair must still attribute to its real plan identity')
+  assert.equal(bucket.agentComputeAbortedN, 1)
+  assert.equal(bucket.agentComputeN, 0, 'a crashed pair must never count toward the same plan\'s completed-run count')
+})
+
+test('optimise-read: a genuine DONE pair is unaffected by the H1 fix -- still measured, seconds attributed, agentComputeAbortedPairs stays 0 (not vacuous)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'genuine-done', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'genuine-done', ts: '2026-08-01T00:03:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, 180)
+  assert.equal(result.totals.agentComputeAbortedPairs, 0)
+  assert.equal(result.totals.agentComputeAbortedSeconds, 0)
 })
 
 test('optimise-read: aggregateWallClock still measures the genuine case -- exactly one started and one terminal record sharing a run_id (not vacuous: proves the AC-DATA-10 fix does not also break the ordinary pair)', () => {
@@ -1223,6 +1269,38 @@ test('optimise-read: a malformed pairing (two started, no terminal) is counted i
   assert.equal(result.totals.agentComputeUnmeasuredRuns, 1, 'still counted in the combined total -- never silently dropped')
   assert.equal(result.totals.agentComputeStartOnlyRuns, 0, 'two started records is not the single-lone-started shape the named counter guards')
   assert.equal(result.totals.agentComputeTerminalOnlyRuns, 0)
+})
+
+// ---- Review round-1 M4: an orphan whose plan identity is unattributable
+// (out-of-repo/redaction marker) or fully degraded was counted in NEITHER
+// orphan class, because the orphan classification sat AFTER the two
+// identity `continue`s -- so AC-OPS-2's "in addition to
+// agentComputeUnmeasuredRuns" promise was untrue for these runs. Fixed by
+// classifying the orphan SHAPE (which needs no plan identity at all)
+// before the identity continues, leaving byPlan bucketing exactly where it
+// was: these orphans still cannot attribute to a plan bucket, but they DO
+// now count in the global start-only/terminal-only totals. ----
+
+test('optimise-read: a lone started record whose plan identity is unattributable (out-of-repo) still counts as a start-only orphan in the global total, even though it creates no byPlan bucket (M4)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '/etc/outside.md', run_id: 'unattrib-start', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  assert.equal(result.byPlan.size, 0, 'sanity: this really is the unattributable-identity path, no byPlan bucket created')
+  assert.equal(result.totals.unattributableRuns, 1, 'sanity: still counted under the existing unattributable total too')
+  assert.equal(result.totals.agentComputeStartOnlyRuns, 1, 'an orphan is an orphan regardless of whether its plan identity is known (M4)')
+  assert.equal(result.totals.agentComputeStartOnlyByKind.tdd_task, 1)
+})
+
+test('optimise-read: a lone terminal record that is fully degraded (no spec/plan_key survives at all) still counts as a terminal-only orphan in the global total (M4)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', run_id: 'degraded-terminal', ts: '2026-08-01T00:00:00.000Z', outcome: 'done', degraded: true },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.byPlan.size, 0)
+  assert.equal(result.totals.degradedUnattributedRuns, 1, 'sanity: still counted under the existing degraded total too')
+  assert.equal(result.totals.agentComputeTerminalOnlyRuns, 1, 'a degraded orphan is still an orphan (M4)')
+  assert.equal(result.totals.agentComputeTerminalOnlyByKind.review_cycle, 1)
 })
 
 // AC-OPS-2's own worked example: "Against a copy of the current live ledger
@@ -1291,25 +1369,65 @@ test('optimise-read: a pair where one record has no spec and the other carries a
 // other aggregate here -- pairing is by run_id, keyed via a Map, never by
 // file position or adjacency, so shuffling which orphan/pair comes first
 // must never change the counts.
-test('optimise-read: a mixed set of paired runs and both orphan classes produces byte-identical aggregate output (including the new agentComputeStartOnlyRuns/agentComputeTerminalOnlyRuns totals) regardless of record order (AC-QA-13, AC-OPS-2)', () => {
+//
+// Review round-1 M1: the FIRST version of this test used only ONE kind per
+// orphan class, so its own `agentComputeStartOnlyByKind`/
+// `agentComputeTerminalOnlyByKind` objects each held exactly one key --
+// no ordering could ever differ, so the byte-identity assertion below could
+// never fail regardless of whether the implementation serialised those maps
+// in a fixed order or in raw record-encounter order. CONFIRMED by
+// orchestrator execution: two start-only orphans of DIFFERENT kinds
+// (tdd_task, review_cycle) sharing one plan produced
+// `{"tdd_task":1,"review_cycle":1}` forward and
+// `{"review_cycle":1,"tdd_task":1}` reversed -- not byte-identical. Fixed
+// by giving EACH orphan class two different kinds, so the guard can now
+// actually distinguish "always the same order" from "coincidentally only
+// one entry".
+test('optimise-read: a mixed set of paired runs and both orphan classes -- with TWO DIFFERENT KINDS in EACH orphan class, so the byKind maps have something to reorder -- produces byte-identical aggregate output regardless of record order (AC-QA-13, AC-OPS-2, M1)', () => {
   const paired1 = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'p1', ts: '2026-08-01T00:00:00.000Z' }
   const paired2 = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'p1', ts: '2026-08-01T00:01:00.000Z' }
-  const startOnly = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'orphan-start', ts: '2026-08-01T00:00:00.000Z' }
-  const terminalOnly = { kind: 'plan_cycle', repo: 'demo', outcome: 'blocked', spec: 'specs/a.md', run_id: 'orphan-terminal', ts: '2026-08-01T00:00:00.000Z' }
+  const startOnlyA = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'orphan-start-1', ts: '2026-08-01T00:00:00.000Z' }
+  const startOnlyB = { kind: 'plan_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'orphan-start-2', ts: '2026-08-01T00:00:00.000Z' }
+  const terminalOnlyA = { kind: 'plan_cycle', repo: 'demo', outcome: 'blocked', spec: 'specs/a.md', run_id: 'orphan-terminal-1', ts: '2026-08-01T00:00:00.000Z' }
+  const terminalOnlyB = { kind: 'review_cycle', repo: 'demo', outcome: 'aborted', spec: 'specs/a.md', run_id: 'orphan-terminal-2', ts: '2026-08-01T00:00:00.000Z' }
+  const all = [paired1, paired2, startOnlyA, startOnlyB, terminalOnlyA, terminalOnlyB]
   const orderings = [
-    [paired1, paired2, startOnly, terminalOnly],
-    [terminalOnly, startOnly, paired2, paired1],
-    [startOnly, paired1, terminalOnly, paired2],
-    [paired2, terminalOnly, paired1, startOnly],
+    all,
+    [...all].reverse(),
+    [startOnlyB, terminalOnlyA, paired1, startOnlyA, paired2, terminalOnlyB],
+    [terminalOnlyB, startOnlyA, terminalOnlyA, paired2, startOnlyB, paired1],
   ]
   const results = orderings.map((records) => JSON.stringify(mod.aggregateWallClock(records).totals))
   for (const r of results) assert.equal(r, results[0], 'every ordering must produce byte-identical totals')
   const totals = JSON.parse(results[0])
   assert.equal(totals.agentComputeMeasuredRuns, 1)
-  assert.equal(totals.agentComputeStartOnlyRuns, 1)
-  assert.equal(totals.agentComputeTerminalOnlyRuns, 1)
+  assert.equal(totals.agentComputeStartOnlyRuns, 2)
+  assert.equal(totals.agentComputeTerminalOnlyRuns, 2)
   assert.equal(totals.agentComputeStartOnlyByKind.review_cycle, 1)
+  assert.equal(totals.agentComputeStartOnlyByKind.plan_cycle, 1)
   assert.equal(totals.agentComputeTerminalOnlyByKind.plan_cycle, 1)
+  assert.equal(totals.agentComputeTerminalOnlyByKind.review_cycle, 1)
+})
+
+// AC-QA-13's own literal wording: "a fixture interleaving two concurrent
+// runs' start/terminal lines, then the same lines reversed and shuffled,
+// produces byte-identical aggregate output." No test in the suite exercised
+// this literally (two genuine PAIRS, interleaved) before review round 1.
+test('optimise-read: two concurrent runs\' start/terminal lines, interleaved, then reversed, then shuffled, produce byte-identical aggregate output (AC-QA-13, literal wording)', () => {
+  const runAStart = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:00:00.000Z' }
+  const runBStart = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:05.000Z' }
+  const runAEnd = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:02:00.000Z' } // 120s
+  const runBEnd = { kind: 'review_cycle', repo: 'demo', outcome: 'done', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:35.000Z' } // 30s
+  const orderings = [
+    [runAStart, runBStart, runAEnd, runBEnd], // interleaved
+    [runBEnd, runAEnd, runBStart, runAStart], // reversed
+    [runAEnd, runBStart, runAStart, runBEnd], // shuffled
+  ]
+  const results = orderings.map((records) => JSON.stringify(mod.aggregateWallClock(records).totals))
+  for (const r of results) assert.equal(r, results[0], 'every ordering must produce byte-identical totals')
+  const totals = JSON.parse(results[0])
+  assert.equal(totals.agentComputeMeasuredRuns, 2)
+  assert.equal(totals.agentComputeSeconds, 150)
 })
 
 test('optimise-read: three records sharing one run_id (forward, reversed, and shuffled), only one of which carries a real spec, all attribute to the real spec and produce byte-identical aggregates (M3, AC-QA-13, shuffled)', () => {

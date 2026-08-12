@@ -292,6 +292,12 @@ function ensurePlan(byPlan, key, repo, plan) {
       ciWaitSeconds: 0, ciWaitN: 0, ciWaitUnmeasuredN: 0,
       humanWaitSeconds: 0, humanWaitN: 0, humanWaitUnmeasuredN: 0,
       agentComputeSeconds: 0, agentComputeN: 0, agentComputeUnmeasuredN: 0,
+      // Review round-1 H1: a well-formed start+terminal pair whose terminal
+      // outcome is not 'done' (a crash the PR2 exception guard turned into
+      // a pair instead of an orphan, or a deliberate BLOCKED/ABORTED
+      // return) is real elapsed time but not a completion -- counted here,
+      // under its own name, never folded into agentComputeSeconds/N.
+      agentComputeAbortedSeconds: 0, agentComputeAbortedN: 0,
       unterminatedWaits: 0,
       unusableIntervals: [],
     })
@@ -463,10 +469,36 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   // the other. "By kind" breaks each down by tdd_task/review_cycle/plan_cycle.
   let agentComputeStartOnlyRuns = 0
   let agentComputeTerminalOnlyRuns = 0
-  const agentComputeStartOnlyByKind = {}
-  const agentComputeTerminalOnlyByKind = {}
+  // Review round-1 M1: accumulated in whatever order run_ids are first
+  // encountered (record order), then re-serialised in RUN_KINDS' fixed
+  // order below -- so JSON.stringify(totals) is byte-identical regardless
+  // of input order, which the AC-QA-13 fixture now actually exercises with
+  // two different kinds per class.
+  const agentComputeStartOnlyByKindRaw = {}
+  const agentComputeTerminalOnlyByKindRaw = {}
+  // Review round-1 H1: real elapsed time for a crashed/aborted/blocked
+  // pair, excluded from agentComputeSeconds (that statistic means
+  // completed-run duration only).
+  let agentComputeAbortedPairs = 0
   for (const [, pair] of byRunId.entries()) {
     const repo = pair[0]?.repo || 'unknown'
+    // Review round-1 M4: orphan SHAPE is classified before either identity
+    // `continue` below, using only starts.length/terminals.length -- no
+    // plan key required -- so an orphan whose plan identity is
+    // unattributable or fully degraded still lands in exactly one counted
+    // bucket instead of neither. This does not change byPlan bucketing,
+    // which still requires a real identity and is computed further down.
+    const starts = pair.filter((p) => p.outcome === 'started')
+    const terminals = pair.filter((p) => p.outcome !== 'started')
+    if (pair.length === 1 && starts.length === 1) {
+      agentComputeStartOnlyRuns += 1
+      const k = pair[0].kind
+      agentComputeStartOnlyByKindRaw[k] = (agentComputeStartOnlyByKindRaw[k] || 0) + 1
+    } else if (pair.length === 1 && terminals.length === 1) {
+      agentComputeTerminalOnlyRuns += 1
+      const k = pair[0].kind
+      agentComputeTerminalOnlyByKindRaw[k] = (agentComputeTerminalOnlyByKindRaw[k] || 0) + 1
+    }
     // Review round-1 M3: order-independent, main's own semantics restored
     // (`pair.find(p => p.spec)?.spec`). The PREVIOUS "first non-null wins"
     // rule treated NO_SPEC_PLAN_KEY as "non-null" too, so a no-spec record
@@ -497,19 +529,8 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     // duration was computed, so e.g. two 'started' records sharing a
     // run_id (their timestamps subtracted anyway) fabricated a duration for
     // an attempt that never actually finished.
-    const starts = pair.filter((p) => p.outcome === 'started')
-    const terminals = pair.filter((p) => p.outcome !== 'started')
     if (!(pair.length === 2 && starts.length === 1 && terminals.length === 1)) {
       ensurePlan(byPlan, key, repo, plan).agentComputeUnmeasuredN += 1
-      if (pair.length === 1 && starts.length === 1) {
-        agentComputeStartOnlyRuns += 1
-        const k = pair[0].kind
-        agentComputeStartOnlyByKind[k] = (agentComputeStartOnlyByKind[k] || 0) + 1
-      } else if (pair.length === 1 && terminals.length === 1) {
-        agentComputeTerminalOnlyRuns += 1
-        const k = pair[0].kind
-        agentComputeTerminalOnlyByKind[k] = (agentComputeTerminalOnlyByKind[k] || 0) + 1
-      }
       continue
     }
     const times = pair.map((p) => tsMs(p.ts)).filter((t) => t !== null)
@@ -525,9 +546,47 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     // corrupted or reordered pair) this can never be negative -- there is
     // no unreachable branch to guard here.
     const durationS = (Math.max(...times) - Math.min(...times)) / 1000
+    // Review round-1 H1: a well-formed pair is only a MEASURED completion
+    // when its terminal record's outcome is 'done'. PR2's own
+    // exception-guard fix (the three instrumented workflow scripts) turns
+    // a crash from an orphan into exactly this shape -- a real start paired
+    // with a real terminal whose outcome is 'aborted' (or a deliberate
+    // 'blocked' return) -- so treating every well-formed pair as measured
+    // would let a workflow that crashes on EVERY run report as a fully
+    // measured, healthy repo, and would silently disarm
+    // isUnmeasuredSegmentMotivated (optimise-cycle.js), the gate that
+    // exists to stop a proposal being built on unmeasurable data. The
+    // crash duration is real and known (not null), but it is a crash
+    // duration, not a work duration: reported under its own name, EXCLUDED
+    // from agentComputeSeconds/agentComputeN, and counted a second time
+    // toward agentComputeUnmeasuredN so the segment still reads as
+    // unmeasured for the safety gate's purposes.
+    if (terminals[0].outcome !== 'done') {
+      bucket.agentComputeAbortedSeconds += durationS
+      bucket.agentComputeAbortedN += 1
+      bucket.agentComputeUnmeasuredN += 1
+      agentComputeAbortedPairs += 1
+      continue
+    }
     bucket.agentComputeSeconds += durationS
     bucket.agentComputeN += 1
   }
+  // Review round-1 M1: rebuild both byKind maps in RUN_KINDS' fixed order,
+  // regardless of which run_id was first encountered in the input records
+  // -- the raw accumulation above is order-dependent (insertion order),
+  // this rebuild is not.
+  function orderByKind(raw) {
+    const ordered = {}
+    for (const k of RUN_KINDS) {
+      if (k in raw) ordered[k] = raw[k]
+    }
+    for (const k of Object.keys(raw)) {
+      if (!(k in ordered)) ordered[k] = raw[k]
+    }
+    return ordered
+  }
+  const agentComputeStartOnlyByKind = orderByKind(agentComputeStartOnlyByKindRaw)
+  const agentComputeTerminalOnlyByKind = orderByKind(agentComputeTerminalOnlyByKindRaw)
 
   const totals = {
     ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0,
@@ -541,6 +600,8 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     agentComputeTerminalOnlyRuns,
     agentComputeStartOnlyByKind,
     agentComputeTerminalOnlyByKind,
+    agentComputeAbortedPairs,
+    agentComputeAbortedSeconds: 0,
   }
   for (const bucket of byPlan.values()) {
     totals.ciWaitSeconds += bucket.ciWaitSeconds
@@ -552,6 +613,7 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     totals.agentComputeSeconds += bucket.agentComputeSeconds
     totals.agentComputeMeasuredRuns += bucket.agentComputeN
     totals.agentComputeUnmeasuredRuns += bucket.agentComputeUnmeasuredN
+    totals.agentComputeAbortedSeconds += bucket.agentComputeAbortedSeconds
     totals.unterminatedWaits += bucket.unterminatedWaits
   }
   // AC-OPS-3: unmeasured is never silently reported as a measured zero. A

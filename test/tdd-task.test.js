@@ -271,6 +271,32 @@ test('tdd-task.js: a ledger write failure via the agent call itself throwing nev
   assert.equal(result.verdict, 'DONE')
 })
 
+// Review round-1 L2: when the response itself carries no run_id (a stopped
+// agent, or the agent call throwing), the failure log fell back to the
+// literal string "unknown" -- but for the TERMINAL write specifically, the
+// PAYLOAD it was asked to send already names the run_id to reuse (the
+// start write's own run_id). This is exactly the case that produces a
+// terminal-only orphan (a failed START write's terminal record can carry
+// no reused run_id, but a failed TERMINAL write for an otherwise-successful
+// start SHOULD still be traceable) -- naming the run in the log is what
+// lets an operator correlate the failure to a ledger line at all.
+test('tdd-task.js: when the TERMINAL ledger write fails with a response carrying no run_id, the failure log still names the run via the payload\'s own requested run_id, not the literal string "unknown" (L2)', async () => {
+  const { logs } = await runWorkflow(WF, {
+    args: { task: 'do the thing' },
+    agent: {
+      ...DONE_AGENT,
+      'ledger:write': [
+        { run_id: 'known-start-id', ts: 't1', write_ok: true, write_error: null },
+        undefined, // the terminal write's own agent call fails outright
+      ],
+    },
+  })
+  const terminalFailureLog = logs.find((l) => l.includes('Ledger write failed'))
+  assert.ok(terminalFailureLog, `expected a terminal-write failure log line, got ${JSON.stringify(logs)}`)
+  assert.ok(terminalFailureLog.includes('known-start-id'), `expected the failure log to name the run via the payload's requested run_id, got: ${terminalFailureLog}`)
+  assert.ok(!terminalFailureLog.includes('run unknown'), `the log must not fall back to "unknown" when the payload itself names the run: ${terminalFailureLog}`)
+})
+
 test('tdd-task.js: telemetry.budget_spent is null (not 0) when no budget is supplied (AC-QA-15)', async () => {
   const { result } = await runWorkflow(WF, { args: { task: 'x' }, agent: DONE_AGENT })
   assert.equal(result.telemetry.budget_spent, null)
@@ -442,3 +468,34 @@ test('tdd-task.js: the original error still reaches the caller even when the ter
     }
   )
 })
+
+// Review round-1 M2: `if (runError) throw runError` tests the THROWN
+// VALUE'S truthiness, not whether the catch fired -- `throw null`,
+// `throw undefined`, `throw 0` and `throw ''` are all falsy, so the guard
+// declines to re-throw them and the workflow resolves normally instead of
+// propagating. This is a REGRESSION: before PR2 added this guard, every
+// throw (falsy or not) reached the caller because there was no catch at
+// all. `Promise.reject()` with no argument rejects with `undefined`, so
+// this is not an exotic input a real agent step could never produce.
+for (const falsyValue of [null, undefined, 0, '']) {
+  test(`tdd-task.js: a falsy thrown value (${JSON.stringify(falsyValue)}) from an agent() call inside run() still propagates -- it must not be swallowed into a resolved promise just because the guard's re-throw check is falsy (M2, regression)`, async () => {
+    await assert.rejects(
+      () =>
+        runWorkflow(WF, {
+          args: { task: 'x' },
+          agent: {
+            'write-test#1': () => { throw falsyValue },
+            'ledger:write': LEDGER_OK,
+          },
+        }),
+      (err) => {
+        // A falsy non-Error thrown value still arrives as whatever was
+        // thrown (assert.rejects accepts a rejection with any reason, not
+        // only an Error instance) -- the only claim under test is that the
+        // promise REJECTS at all, rather than resolving.
+        assert.equal(err, falsyValue)
+        return true
+      }
+    )
+  })
+}

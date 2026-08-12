@@ -249,8 +249,8 @@ test('static: PR2 -- the exception-guard block wrapping `await run()` (the try/c
 // The re-throw itself sits after the (per-file-diverging) telemetry-build
 // and terminal writeLedger( call, so it cannot live inside the block above
 // -- pinned separately, as its own one-line-plus-return byte-identical pair.
-test('static: PR2 -- the re-throw line (`if (runError) throw runError`) immediately preceding the final `return { ...result, telemetry }` is byte-identical across all three workflow files (AC-ARCH-9)', () => {
-  const REQUIRED = 'if (runError) throw runError\nreturn { ...result, telemetry }'
+test('static: PR2 -- the re-throw line (`if (threw) throw runError`) immediately preceding the final `return { ...result, telemetry }` is byte-identical across all three workflow files (AC-ARCH-9). Round-1 review M2: gated on `threw` (whether the catch fired), not on `runError`\'s truthiness -- a falsy thrown value must still re-throw.', () => {
+  const REQUIRED = 'if (threw) throw runError\nreturn { ...result, telemetry }'
   for (const f of ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js']) {
     const contents = readAll(...f.split('/'))
     assert.ok(contents.includes(REQUIRED), `${f} must contain the exact re-throw-then-return pair:\n${REQUIRED}`)
@@ -267,15 +267,61 @@ test('static: PR2 -- the re-throw line (`if (runError) throw runError`) immediat
 // come here and to tdd-task.test.js/review-cycle.test.js/plan-cycle.test.js
 // (each of which has one test per return path, named by case) rather than
 // leaving the new path unpaired with a ledger-write assertion.
-test('static: AC-QA-9 -- the number of terminating `return {` statements inside each workflow\'s run() function is pinned, so a new return path added without a matching pairing test fails this check instead of silently going unpaired', () => {
+// Review round-1 L1: the pin only counted the `return {` (object-literal)
+// FORM of a terminating return -- a new return written any other way
+// (`return EARLY` where EARLY is a variable, an escape-hatch object built
+// on an earlier line and returned bare, etc.) changed nothing this test
+// could see. CONFIRMED by two independent mutations (both left this test
+// green before the fix): a `return escapeHatch` where `escapeHatch` was a
+// variable holding an object literal, and a bare `return EARLY` referring
+// to a pre-declared local. Fixed by ALSO counting every bare `return\b`
+// occurrence in the same body and asserting the two counts are equal -- a
+// return written in any form the object-literal regex does not match now
+// makes the two counts diverge and fails this test by name, rather than
+// silently passing because the narrower pattern happened not to match.
+// Strips string/template-literal CONTENT and `//` line comments before
+// counting `return` occurrences, so a prompt string that instructs the
+// LLM to "return X" (this codebase's agent() prompts do this constantly --
+// "Return only what the script printed", "return ac_verdicts", etc.) is
+// never mistaken for a real terminating return statement. Trusted-input
+// only (this repo's own three workflow files, not arbitrary/hostile
+// source), so a lightweight non-nested-template-aware regex is adequate --
+// this codebase's template literals never nest backticks.
+function stripStringsAndComments(source) {
+  // Comments are stripped FIRST, before any string-stripping: an apostrophe
+  // inside a `//` comment (this codebase's comments use plenty of them --
+  // "it's", "doesn't", "lens's") is an ordinary character until the quote
+  // regexes below run, and if a comment survives past that point its
+  // apostrophe pairs unpredictably with a REAL quote elsewhere in the file,
+  // desynchronising every string match after it and silently swallowing
+  // real code (including a real `return`) into what the regex believes is
+  // string content. Confirmed no `//` occurs inside genuine string content
+  // in any of the three files' run() bodies (checked by grep), so a naive
+  // per-line strip is safe here.
+  return source
+    .split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n')
+    .replace(/`(?:[^`\\]|\\.)*`/gs, '``')
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+}
+
+test('static: AC-QA-9 -- the number of terminating `return` statements (any form) inside each workflow\'s run() function is pinned, so a new return path added without a matching pairing test fails this check instead of silently going unpaired (L1: widened past the object-literal-only `return {` form)', () => {
   function countReturnsInRun(fileName) {
     const contents = readAll('workflows', fileName)
     const lines = contents.split('\n')
     const start = lines.findIndex((l) => l.trim() === 'async function run() {')
     const end = lines.findIndex((l, i) => i > start && l.trim() === '} // end run()')
     assert.ok(start >= 0 && end > start, `${fileName}: could not locate the run() function markers`)
-    const body = lines.slice(start, end + 1).join('\n')
-    return (body.match(/return\s*\{/g) || []).length
+    const rawBody = lines.slice(start, end + 1).join('\n')
+    const codeOnlyBody = stripStringsAndComments(rawBody)
+    const anyForm = (codeOnlyBody.match(/\breturn\b/g) || []).length
+    const objectLiteralForm = (rawBody.match(/return\s*\{/g) || []).length
+    assert.equal(
+      anyForm, objectLiteralForm,
+      `${fileName}: found ${anyForm} real \`return\` statement(s) (strings/comments excluded) but only ${objectLiteralForm} are the object-literal \`return {\` form -- ` +
+      `a return written in some other form (a bare variable, an escape hatch) was added without this guard being able to see it`
+    )
+    return objectLiteralForm
   }
   // tdd-task.js: 4 ABORTED, 3 BLOCKED (2 max-attempts exhaustions + the
   // hashes-changed short-circuit), 1 DONE -- see the 8-case table in

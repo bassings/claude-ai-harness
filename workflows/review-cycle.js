@@ -143,7 +143,7 @@ async function writeLedger(payload) {
   }
   if (!response || response.write_ok !== true) {
     const reason = (response && response.write_error) || 'ledger agent failed or returned no result'
-    const runId = (response && response.run_id) || 'unknown'
+    const runId = (response && response.run_id) || payload.run_id || 'unknown'
     log(`Ledger write failed for run ${runId}: ${reason}`)
     return { write_ok: false, write_error: reason, run_id: runId }
   }
@@ -412,13 +412,20 @@ const startRunId = startWrite.write_ok ? startWrite.run_id : null
 // writeLedger( call site (AC-SIMP-7) and never a fabricated 'done'
 // (AC-QA-12). The original error is re-thrown after the write so it still
 // reaches the caller (AC-OPS-1), never swallowed by a failing terminal
-// write (writeLedger itself never throws, see above).
+// write (writeLedger itself never throws, see above). Round-1 review M2:
+// `threw` tracks whether the catch fired, never the thrown value's
+// truthiness -- `throw null`/`throw undefined`/`throw 0`/`throw ''` are
+// all falsy, so gating the re-throw on `runError` itself silently resolved
+// the workflow instead of propagating, a regression against pre-PR2
+// behaviour where every throw reached the caller.
 let runError = null
+let threw = false
 let raw
 try {
   raw = await run()
 } catch (e) {
   runError = e
+  threw = true
   raw = {}
   log(`Run ${startRunId || 'unknown'} threw before producing a result: ${e && e.message ? e.message : String(e)}`)
 } // end PR 2 exception guard
@@ -445,5 +452,5 @@ const telemetry = {
 const terminalEntry = { kind: 'review_cycle', spec_bugs: specBugsRaw, rejected_findings: rejectedFindingsRaw, open_findings: openFindingsRaw, ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
 await writeLedger(terminalEntry)
-if (runError) throw runError
+if (threw) throw runError
 return { ...result, telemetry }
