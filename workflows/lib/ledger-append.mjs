@@ -81,6 +81,17 @@ export const MAX_FINDINGS = 15
 // rather than its expected frequency of use.
 export const MAX_AC_VERDICTS = 200
 
+// Review round-2 M-3: ac_id_raw retains a rejected ac_id for recoverability
+// (AC-DATA-4's pattern, applied to ac_id), but ac_id was deliberately kept
+// free of free text (AC-SEC-2, "no free text, ever") to prevent a secret or
+// a quoted source line being routed through it (M6). Bounded short enough
+// that a realistic citation form (a cross-spec-prefixed id, ~23 bytes;
+// "AC-DATA-16 (deferred)", 22 bytes) survives whole, while a longer
+// injection payload is cut down to a prefix, not retained whole -- a
+// considered, bounded exposure, not the zero-free-text guarantee the field
+// otherwise holds.
+export const AC_ID_RAW_MAX_BYTES = 32
+
 const KINDS = ['tdd_task', 'review_cycle', 'plan_cycle', 'conduct_plan_event']
 const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 // Review round-1 M3: the single definition site for the ac_id shape,
@@ -173,6 +184,14 @@ export const LEDGER_ENTRY_SCHEMA = {
           lens: { type: 'string', pattern: '^(lens|reviewer)-[a-z]+$' },
           severity: { type: 'string', enum: SEVERITIES },
           ac_id: { type: ['string', 'null'], pattern: AC_ID_PATTERN_STR },
+          // Review round-2 M-3: when ac_id is nulled by the sanitiser
+          // below (a non-conforming value), the rejected value is
+          // retained here, bounded to AC_ID_RAW_MAX_BYTES -- the AC-DATA-4
+          // recoverability pattern already used for spec/spec_raw, applied
+          // to ac_id. Bounded (not verbatim) because ac_id was
+          // deliberately kept free of free text (AC-SEC-2); see the
+          // sanitiser's own comment for the considered tradeoff.
+          ac_id_raw: { type: ['string', 'null'] },
           disposition: { type: 'string', enum: DISPOSITIONS },
         },
       },
@@ -189,7 +208,14 @@ export const LEDGER_ENTRY_SCHEMA = {
         additionalProperties: false,
         required: ['ac_id', 'verdict'],
         properties: {
-          ac_id: { type: 'string', pattern: AC_ID_PATTERN_STR },
+          // Review round-2 M-3: nullable, matching findings.ac_id -- a
+          // non-conforming ac_id is now RETAINED (never dropped), with
+          // ac_id nulled and the original preserved in ac_id_raw below.
+          // The round-1 design dropped the whole {ac_id, verdict} entry,
+          // permanently losing a PASS/FAIL verdict from the only durable
+          // copy with no way to recover which criterion it concerned.
+          ac_id: { type: ['string', 'null'], pattern: AC_ID_PATTERN_STR },
+          ac_id_raw: { type: ['string', 'null'] },
           verdict: { type: 'string', enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] },
         },
       },
@@ -706,7 +732,33 @@ function result(run_id, ts, write_ok, write_error) {
   return { run_id, ts, write_ok, write_error: write_error || null }
 }
 
+// A truthy env value opts into read-only mode; empty string, "0" and
+// "false" (case-insensitive) are treated as unset, matching common shell
+// convention for a boolean env var.
+function isReadonlyEnvTruthy(v) {
+  if (v === undefined || v === null) return false
+  const s = String(v).trim().toLowerCase()
+  return s !== '' && s !== '0' && s !== 'false'
+}
+
 export function main() {
+  // Review round-2, new harness-level guard: lenses are specified
+  // read-only, but this script resolves the MAIN checkout via
+  // --git-common-dir regardless of which worktree it is invoked from
+  // (AC-DATA-1), so a lens probing this writer from its own isolated
+  // worktree still writes to the operator's real, unbacked-up ledger --
+  // exactly what happened during review round 2 (two synthetic records
+  // appeared in the live ledger). When HARNESS_LEDGER_READONLY is set to a
+  // truthy value, NOTHING below runs: no stdin parse, no git subprocess,
+  // no gitignore check, no write -- a clean refusal, before any of that
+  // machinery starts. This is enforced at the LENS PROMPT boundary
+  // (review-cycle.js instructs every lens to export it before probing),
+  // not fully mechanical: a lens that does not follow its own
+  // instructions, or a caller other than a lens, is not stopped by this
+  // alone. Documented as such, not oversold.
+  if (isReadonlyEnvTruthy(process.env.HARNESS_LEDGER_READONLY)) {
+    return result(randomUUID(), new Date().toISOString(), false, 'ledger is read-only in this context')
+  }
   const cwd = process.cwd()
   const ts = new Date().toISOString()
   let payload
@@ -971,7 +1023,15 @@ export function main() {
           .filter((r) => typeof r === 'string' && r)
           .map((r) => r.replace(/[\\/]+$/, ''))
           .find((r) => specRawInput === r || specRawInput.startsWith(r + '/') || specRawInput.startsWith(r + '\\'))
-        payload.spec_raw = matchedRoot !== undefined ? specRawInput.slice(matchedRoot.length).replace(/^[\\/]+/, '') : specRawInput
+        // Review round-2 L-3: fails CLOSED (withholds the value) rather
+        // than falling open to the caller's verbatim absolute string. This
+        // branch is provably unreachable today -- canonicalPlanKey already
+        // matched this exact string against this exact candidate list to
+        // produce a non-marker planKey, so matchedRoot cannot be undefined
+        // here -- but a future divergence between the two matching
+        // computations must lose recoverability, never leak the account
+        // name through the side door this fallback used to be.
+        payload.spec_raw = matchedRoot !== undefined ? specRawInput.slice(matchedRoot.length).replace(/^[\\/]+/, '') : undefined
       } else {
         payload.spec_raw = specRawInput
       }
@@ -1046,32 +1106,52 @@ export function main() {
   // the real risk).
   if (Array.isArray(entry.ac_verdicts)) entry.ac_verdicts = entry.ac_verdicts.slice(0, MAX_AC_VERDICTS)
 
-  // Review round-1 M3: a single non-conforming ac_id (free text like
-  // "none", a comma-joined list, a cross-spec-prefixed id) used to fail
-  // validateEntry for the WHOLE entry -- write_ok:false, the entire line
-  // (outcome, verdicts, budget_spent, every OTHER finding and AC verdict)
-  // refused, recreating exactly the start-only orphan class AC-OPS-2
-  // exists to count and name correctly, with the wrong cause. Sanitized
-  // here, granularly, before validateEntry ever runs: findings[].ac_id is
-  // NULLABLE in the schema, so a bad value is nulled and the finding
-  // itself survives; ac_verdicts entries require ac_id as a non-null
-  // string, so a bad value there makes the {ac_id, verdict} PAIR
-  // meaningless and the entry is dropped -- never the whole array, never
-  // the whole record. Every drop is counted in one place so an operator
-  // can tell this apart from a real orphan.
+  // Review round-1 M3, corrected by round-2 M-2/M-3: a single non-conforming
+  // ac_id (free text like "none", a comma-joined list, a cross-spec-prefixed
+  // id) used to fail validateEntry for the WHOLE entry -- write_ok:false,
+  // the entire line refused, recreating exactly the start-only orphan class
+  // AC-OPS-2 exists to count and name correctly, with the wrong cause.
+  // Sanitized here, granularly, before validateEntry ever runs.
+  //
+  // Round-2 M-2 (a regression this loop introduced against `main`, which
+  // handled a null ARRAY ELEMENT cleanly via validateEntry's own type
+  // check): `f`/`v` must be checked for null/non-object BEFORE `.ac_id` is
+  // read, or a null element throws a TypeError that crashes the whole
+  // script -- no parseable result at all, which is worse than the defect
+  // being fixed (writeLedger falls into its failure branch with nothing to
+  // parse, manufacturing an orphan either way). A malformed non-null
+  // element (string/number/array) is left untouched here and still caught
+  // by validateEntry exactly as on `main`.
+  //
+  // Round-2 M-3 (round-1 DROPPED the whole ac_verdicts entry, permanently
+  // losing a PASS/FAIL verdict with no way to recover which criterion it
+  // concerned -- unlike spec_raw's AC-DATA-4 insurance for spec): both
+  // findings[].ac_id and ac_verdicts[].ac_id are now nullable, and a
+  // rejected value is retained (bounded, AC_ID_RAW_MAX_BYTES) in ac_id_raw
+  // rather than discarded -- the entry itself is NEVER dropped. Every
+  // sanitisation is counted in one place so an operator can tell this
+  // apart from a real orphan, and returned from result() so writeLedger
+  // sees it too.
   let invalidAcIdsDropped = 0
   if (Array.isArray(entry.findings)) {
     for (const f of entry.findings) {
+      if (!f || typeof f !== 'object') continue // M-2: left for validateEntry to reject the whole entry, as main did
       if (typeof f.ac_id === 'string' && !AC_ID_RE.test(f.ac_id)) {
+        f.ac_id_raw = truncateBytes(f.ac_id, AC_ID_RAW_MAX_BYTES)
         f.ac_id = null
         invalidAcIdsDropped += 1
       }
     }
   }
   if (Array.isArray(entry.ac_verdicts)) {
-    const before = entry.ac_verdicts.length
-    entry.ac_verdicts = entry.ac_verdicts.filter((v) => typeof v.ac_id === 'string' && AC_ID_RE.test(v.ac_id))
-    invalidAcIdsDropped += before - entry.ac_verdicts.length
+    for (const v of entry.ac_verdicts) {
+      if (!v || typeof v !== 'object') continue // M-2: left for validateEntry to reject the whole entry, as main did
+      if (typeof v.ac_id === 'string' && !AC_ID_RE.test(v.ac_id)) {
+        v.ac_id_raw = truncateBytes(v.ac_id, AC_ID_RAW_MAX_BYTES)
+        v.ac_id = null
+        invalidAcIdsDropped += 1
+      }
+    }
   }
   if (Array.isArray(entry.findings) || Array.isArray(entry.ac_verdicts)) {
     entry.invalid_ac_ids_dropped = invalidAcIdsDropped
@@ -1263,7 +1343,14 @@ export function main() {
 
   // M2: the caller passed event_scope, not the full key -- return the
   // minted key so the caller can log/display it, never re-derive it itself.
-  return entry.event_key ? { ...result(run_id, ts, true, null), event_key: entry.event_key } : result(run_id, ts, true, null)
+  // Review round-2 M-3: invalid_ac_ids_dropped rides on the CLI result too
+  // (not just the stored line), so writeLedger (in each of the three
+  // workflow scripts) can log a visible line when a sanitisation actually
+  // happened, the same way it already surfaces a write failure.
+  const extra = {}
+  if (entry.event_key) extra.event_key = entry.event_key
+  if (typeof entry.invalid_ac_ids_dropped === 'number') extra.invalid_ac_ids_dropped = entry.invalid_ac_ids_dropped
+  return Object.keys(extra).length ? { ...result(run_id, ts, true, null), ...extra } : result(run_id, ts, true, null)
 }
 
 // Only run as a CLI when invoked directly (`node ledger-append.mjs`), never
