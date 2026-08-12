@@ -10,69 +10,43 @@ next mutation. Full suite: `node --test test/*.test.js`. AC-SIMP-10 caps
 this file at 200 lines; later rounds compress earlier ones, never drop them.
 From review round 2 on: every fix also records whether `main` handled the
 same input correctly and whether the fix preserves that (Scott's standing
-instruction, prompted by two regressions -- PR1's realpath, round 1's own
-ac_id sanitiser -- each breaking a case main got right).
+instruction, prompted by regressions -- PR1's realpath, round 1's own ac_id
+sanitiser -- each breaking a case main got right).
 
 ## PR1 (plan-identity canonicalisation) -- condensed
 
-Merged PR #3 (squash d6ada19), 5 fix / 4 review rounds. Root cause chased
-across rounds 3-5: write-time redaction (lossy) conflated with
-canonicalisation in an append-only unbacked-up file. 21 proofs, all
-load-bearing: `..`-escape detection, repo-identity fallback,
-unattributable/degraded-run exclusion, ci_wait/human_wait key routing,
-single-definition-site guard, `perRepo[].root` labelling, AC-DATA-6
-attribution, the H-A/H-B/H-C round-5 fixes. Final suite: 405/405.
+Merged PR #3 (squash d6ada19), 5 fix / 4 review rounds. Root cause: write-time
+redaction (lossy) conflated with canonicalisation in an append-only
+unbacked-up file. 21 load-bearing proofs (`..`-escape detection,
+repo-identity fallback, orphan exclusion, ci_wait/human_wait routing,
+AC-DATA-6 attribution, the H-A/H-B/H-C round-5 fixes). Final suite: 405/405.
 
 ## PR2 initial build (start/terminal pairing) -- condensed
 
 AC-QA-8/AC-OPS-1 exception guard; AC-OPS-2 terminal-only orphan class;
-AC-DATA-10 pairing purity (exactly one started + one terminal is ever
-measured). 8 proofs, all load-bearing: AC-ARCH-9 byte-identity block + the
-re-throw line; AC-QA-9 return-count pin; the purity gate (reverted to
-`pair.length < 2` alone -- 4 tests failed, genuine-pair test stayed green);
-start/terminal-only counters proven independently wired; AC-QA-10 seam's
-real run_id reuse; AC-DATA-9's SIGKILL test proven non-vacuous. Final
-suite: 422/422.
+AC-DATA-10 pairing purity. 8 load-bearing proofs (byte-identity block +
+re-throw line; AC-QA-9 return-count pin; the purity gate; start/terminal-only
+counters proven independently wired; AC-QA-10 seam's real run_id reuse;
+AC-DATA-9's SIGKILL test proven non-vacuous). Final suite: 422/422.
 
 ## Review round 1 (5 lenses + adversarial, `main...3d33647`) -- condensed
 
-3 High, 4 Medium, 5 Low; L3 (rollback drill) explicitly the coordinator's
-own action, out of scope here.
+3 High, 4 Medium, 5 Low; L3 (rollback drill) the coordinator's own action,
+out of scope. One line per finding, each mutation-proved (revert/disable
+the fix, confirm exactly its own test(s) fail, restore, confirm green):
 
-- **H1**: an aborted/blocked pair counted as a healthy measured completion.
-  Excluded from `agentComputeSeconds`/N, counted separately as
-  `agentComputeAbortedPairs`. Mutation: revert the `outcome !== 'done'`
-  branch -- 3/4 new tests fail, DONE-path control stays green.
-- **H2**: orphan/aborted counts computed but never rendered. Added to the
-  report. Mutation: comment out each line independently -- each caught
-  only by its own test.
-- **H3** (README): AC-OPS-4 covered only `workflows/lib/`, not PR2's
-  top-level scripts. Widened to whole-tree, RED-before-GREEN against the
-  extending static test.
-- **M1**: per-kind orphan maps serialised in encounter order, not fixed
-  order -- the shipped fixture had one kind per class so this could never
-  fail. Fixed; fixture widened to two kinds per class. Mutation:
-  `orderByKind` reduced to `return raw` -- caught.
-- **M2**: `if (runError) throw runError` tested truthiness, not whether the
-  catch fired -- `throw null/undefined/0/''` resolved instead of
-  propagating, a regression (every throw reached the caller pre-PR2).
-  Fixed via a separate `threw` boolean, all 3 workflows. Mutation: `threw`
-  reverted to `runError` -- caught by the 4 falsy-value tests AND the
-  byte-identity guard simultaneously.
-- **M3**: one non-conforming `ac_id` anywhere in `ac_verdicts`/`findings`
-  failed validation for the WHOLE entry -- recreating a start-only orphan
-  with the wrong cause, reachable from a prompt-injected lens field.
-  Sanitised before `validateEntry`. Mutation: revert the filter/null-out --
-  caught by both the new test and the updated hostile-ac_id security test.
-- **M4**: an unattributable/degraded orphan counted in neither orphan
-  class. Classification moved before the identity `continue`s. Mutation:
-  disable the start-only branch -- caught, terminal-only stays green.
-- **L1/L2/L4/L5**: return-count pin widened past the object-literal form
-  (reproduced both review examples); `run_id` fallback in failure logs
-  (mutation: fallback removed -- caught); `spec_raw` relativised without
-  the `..`-collapsing step (2 mutations, caught only by the dedicated
-  non-vacuous test); throw-path seam extended to all 3 workflows, proven
-  non-vacuous via an injected undeclared field.
+- **H1**: aborted/blocked pair no longer counted as a healthy completion --
+  excluded from `agentComputeSeconds`/N, counted as `agentComputeAbortedPairs`.
+- **H2**: orphan/aborted counts, computed but never rendered, added to the report.
+- **H3** (README): AC-OPS-4 widened from `workflows/lib/` to the whole tree.
+- **M1**: per-kind orphan maps serialised in fixed `RUN_KINDS` order, not encounter order.
+- **M2**: falsy-safe re-throw via a separate `threw` boolean, all 3 workflows (a real
+  regression: `throw null/undefined/0/''` pre-PR2 always reached the caller).
+- **M3**: a non-conforming `ac_id` sanitised before `validateEntry`, not failing the whole entry.
+- **M4**: unattributable/degraded orphans classified before the identity `continue`s.
+- **L1/L2/L4/L5**: return-count pin widened past the object-literal form; `run_id`
+  fallback in failure logs; `spec_raw` relativised (not full canonicalisation);
+  throw-path seam extended to all 3 workflows.
 
 Full suite after round 1: 460/460, three consecutive runs, plus a run from
 a genuinely separate `git clone`.
@@ -191,3 +165,36 @@ harness-level finding) -- full fix round, main-comparison recorded per fix
   round. L-11 has no scheduled PR.
 
 Full suite after every round-2 fix: 498/498, run twice consecutively.
+
+## Coordinator triage, post round-2 (ledger-append.mjs only, 2 High)
+
+Both **confirmed pre-existing on `main`**, verified via `git show
+main:workflows/lib/ledger-append.mjs` from a non-symlinked control -- not
+regressions, no main-correct case to preserve.
+
+- **FINDING 1**: a null/non-object element in `open_findings`/`spec_bugs`/
+  `rejected_findings` crashed `computeFindings()` (`f.lens` on `null`)
+  before `validateEntry` ran -- non-zero exit, nothing written. Fixed once
+  in `computeFindings` (shared by all 3 callers): a malformed element
+  becomes `null` in its output, caught downstream by the pre-existing
+  `findings.items.type:'object'` check -- the same clean degrade M-2's
+  findings/ac_verdicts sanitiser already relies on. Mutation: guard
+  removed -- exactly the 4 new tests fail, reproducing the identical
+  TypeError at the identical line; nothing else moves.
+- **FINDING 2**: `isMain` compared `import.meta.url` (Node resolves this
+  through symlinks) against `path.resolve(process.argv[1])` (does not).
+  `node <symlinked-path>` made `isMain` false: exit 0, zero bytes of
+  output, no write, no error -- silent total loss, live wherever the
+  resolved script path crosses a symlinked ancestor (macOS `/tmp`,
+  `$TMPDIR`, any symlinked home/volume/install ancestor for
+  `~/.claude/workflows/lib/`). Verified independently, myself, from a
+  non-symlinked control: main via a real path writes `write_ok:true`; via
+  a symlinked path, exit 0 with EMPTY stdout. Fixed by resolving
+  `process.argv[1]` through `fs.realpathSync.native` (try/catch-guarded)
+  before comparing. New fixture `makeSymlinkedScriptInvocation()`
+  (hostile-repo.js) symlinks the REAL shipped script. Mutation: realpath
+  call reverted -- exactly the 1 new positive test fails (identical
+  empty-stdout/exit-0 no-op), both new import-does-not-execute tests
+  (one via a genuinely fresh subprocess) stay green.
+
+Full suite after both fixes: 504/504, twice, plus a `git clone` run.

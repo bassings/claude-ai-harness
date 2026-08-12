@@ -18,6 +18,7 @@ const {
   makeSpacyTempRepo,
   makeSymlinkAncestorTempRepo,
   makeInRepoSymlinkSpec,
+  makeSymlinkedScriptInvocation,
 } = require('./helpers/hostile-repo.js')
 
 const APPEND_MODULE_URL = pathToFileURL(APPEND_SCRIPT).href
@@ -1151,6 +1152,47 @@ test('ledger-append: a real empty array of spec_bugs/rejected_findings yields a 
   assert.equal(entry.rejected_finding_count, 0)
 })
 
+// Coordinator FINDING 1 (confirmed pre-existing on BOTH main and this
+// branch's tip, from a non-symlinked path -- verified directly via `git
+// show main:workflows/lib/ledger-append.mjs`, not inferred): a null element
+// in open_findings/spec_bugs/rejected_findings crashed computeFindings()
+// with an unhandled TypeError (f.lens on null) BEFORE validateEntry ever
+// ran -- Node exits non-zero, nothing written, not even a parseable
+// write_ok:false. Different code path from the M-2 findings/ac_verdicts
+// sanitiser (which already degrades cleanly): those arrays are consumed
+// AFTER computeFindings has already built entry.findings. Fixed by
+// null-guarding inside computeFindings's map, consistent with M-2's own
+// pattern: a malformed element becomes `null` in the entries array instead
+// of crashing, which flows through to entry.findings and is caught by
+// validateEntry's existing findings.items.type:'object' check -- the SAME
+// clean write_ok:false degrade, applied once so all three descriptor
+// arrays (they share this one function) get it consistently rather than
+// three separate special cases.
+for (const field of ['open_findings', 'spec_bugs', 'rejected_findings']) {
+  test(`ledger-append: a null element in ${field} degrades to a clean write_ok:false, never crashes the writer (FINDING 1)`, () => {
+    const repo = makeTempRepo()
+    const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', [field]: [null] })
+    assert.equal(res.status, 0, `${field}: the writer must always exit 0, even on a malformed descriptor array; got status ${res.status}, stderr: ${res.stderr}`)
+    assert.ok(res.stdout.trim().length > 0, `${field}: expected one line of JSON on stdout, got empty output (stderr: ${res.stderr})`)
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, false, `${field}: a null descriptor element must degrade to write_ok:false, not crash silently or succeed with garbage`)
+    assert.equal(readLedgerLines(repo).length, 0, `${field}: a rejected write must not leave a partial or malformed line on disk`)
+  })
+}
+
+test('ledger-append: a null element alongside otherwise-valid descriptors in open_findings still degrades the WHOLE entry to write_ok:false, never silently drops just the bad one and keeps the rest (FINDING 1, consistency with M-2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'a real one' }, null],
+  })
+  assert.equal(res.status, 0)
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a mix of one valid and one null descriptor must still reject the whole entry, matching the M-2 findings/ac_verdicts precedent')
+})
+
 test('ledger-append: finding ids are stable across two separate invocations with identical descriptors (AC-QA-11)', () => {
   const repoA = makeTempRepo()
   const repoB = makeTempRepo()
@@ -1212,6 +1254,58 @@ test('ledger-append module: importing it for its exports does not itself write a
   const before = readLedgerLines(repo).length
   await import(APPEND_MODULE_URL)
   assert.equal(readLedgerLines(repo).length, before, 'import must not run main() as a side effect')
+})
+
+// Coordinator FINDING 2: fixed by comparing REALPATHS of import.meta.url
+// and process.argv[1] (Node's ESM loader resolves the former through
+// symlinks; the latter needs an explicit realpath to match). Must not
+// weaken the property the two tests above already prove -- asserted here
+// directly, in a genuinely FRESH subprocess (so a bug in the fix cannot
+// be masked by this test file's own argv[1], which is node's test runner,
+// never ledger-append.mjs, in every scenario above): a plain ESM `import`
+// of the module, with no CLI invocation at all, must produce NO stdout
+// (main()'s JSON line) and must exit 0 without writing anything.
+test('ledger-append module: a fresh subprocess that ONLY imports the module (never invokes it as `node ledger-append.mjs`) prints nothing and writes nothing -- the realpath fix for FINDING 2 must not make import() itself look like a CLI invocation', () => {
+  const repo = makeTempRepo()
+  const probeDir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'import-probe-'))
+  trackTempDir(probeDir)
+  const probeScript = path.join(probeDir, 'probe.mjs')
+  fs.writeFileSync(
+    probeScript,
+    `import(${JSON.stringify(APPEND_MODULE_URL)}).then((mod) => {\n` +
+      `  if (typeof mod.main !== 'function') { console.error('main export missing'); process.exit(2) }\n` +
+      `  console.log('IMPORT_SURVIVED_NO_CLI')\n` +
+      `})\n`
+  )
+  const res = spawnSync('node', [probeScript], { cwd: repo, encoding: 'utf8' })
+  assert.equal(res.status, 0, `probe subprocess must exit 0, got status ${res.status}, stderr: ${res.stderr}`)
+  assert.equal(res.stdout.trim(), 'IMPORT_SURVIVED_NO_CLI', `import must not have printed a ledger JSON line as a side effect, got: ${res.stdout}`)
+  assert.equal(readLedgerLines(repo).length, 0, 'a plain import must never write a ledger line')
+})
+
+// Coordinator FINDING 2 (confirmed pre-existing on main too, from a
+// non-symlinked control -- the same identical file, same payload, wrote
+// write_ok:true from a real path and silently no-op'd through a symlinked
+// one): `import.meta.url` resolves symlinks (Node's ESM loader always
+// reports the REAL target path); `process.argv[1]` does not, without an
+// explicit realpath call. `isMain` compared them directly, so invoking
+// `node <symlinked-path-to-ledger-append.mjs> append` made `isMain` read
+// false: exit 0, zero bytes of output, no file written, no error --
+// success-shaped silence. This is exactly the C1 failure class (silent
+// total loss) and is live on main today: `~/.claude/workflows/lib/...`
+// sits behind macOS's /tmp -> /private/tmp and $TMPDIR's
+// /var/folders -> /private/var/folders ancestry, so any symlinked home,
+// volume or install ancestor disables ALL ledger writing with no signal.
+test('ledger-append: invoking the writer through a SYMLINKED path to the script itself still performs a real write and reports write_ok:true (FINDING 2)', () => {
+  const repo = makeTempRepo()
+  const symlinkedScript = makeSymlinkedScriptInvocation()
+  const res = spawnSync('node', [symlinkedScript], { cwd: repo, input: JSON.stringify({ schema_version: 1, kind: 'review_cycle', outcome: 'done' }), encoding: 'utf8' })
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}, stderr: ${res.stderr}`)
+  assert.ok(res.stdout.trim().length > 0, `expected one line of JSON on stdout through the symlinked invocation, got EMPTY output -- this is the silent no-op FINDING 2 describes (stderr: ${res.stderr})`)
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected a real write through the symlinked path, got: ${JSON.stringify(out)}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, `expected exactly one real ledger line written through the symlinked invocation, got ${lines.length}`)
 })
 
 test('ledger-append module: findingId is stable for the same lens+location+claim', async () => {

@@ -426,15 +426,30 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
 // null count when the descriptor array itself is null (AC-QA-13: a
 // malformed synthesis response is unmeasured, never silently zero) versus a
 // genuine empty array, which yields a real zero count (AC-OPS-3).
+// FINDING 1 (confirmed pre-existing on main too, not a regression): a null
+// or non-object descriptor element crashed here (`f.lens` on `null`) with
+// an unhandled TypeError, before validateEntry ever ran -- Node exits
+// non-zero, nothing written, not even a parseable write_ok:false. A
+// malformed element now becomes `null` in the entries array instead,
+// which flows through (via allFindings) into entry.findings below and is
+// caught there by the EXISTING findings.items.type:'object' schema check
+// -- the same clean write_ok:false degrade the findings/ac_verdicts
+// sanitiser already relies on for a malformed non-null element (see its
+// own comment, further down this file). Applied once, here, so all three
+// callers (spec_bugs, rejected_findings, open_findings) get it
+// consistently rather than three separate special cases.
 function computeFindings(descriptors, disposition) {
   if (!Array.isArray(descriptors)) return { entries: [], count: null }
-  const entries = descriptors.map((f) => ({
-    id: findingId(f.lens, f.location, f.claim),
-    lens: f.lens,
-    severity: f.severity || 'Low',
-    ac_id: f.ac_id || null,
-    disposition,
-  }))
+  const entries = descriptors.map((f) => {
+    if (!f || typeof f !== 'object') return null
+    return {
+      id: findingId(f.lens, f.location, f.claim),
+      lens: f.lens,
+      severity: f.severity || 'Low',
+      ac_id: f.ac_id || null,
+      disposition,
+    }
+  })
   return { entries, count: entries.length }
 }
 
@@ -1356,7 +1371,35 @@ export function main() {
 // Only run as a CLI when invoked directly (`node ledger-append.mjs`), never
 // as a side effect of another module importing this file for its exports
 // (tests do exactly that).
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+//
+// FINDING 2 (round-2 triage, confirmed pre-existing on main too): Node's
+// ESM loader resolves `import.meta.url` through symlinks -- it always
+// reports this module's REAL, target path -- but `path.resolve` on
+// `process.argv[1]` only resolves `.`/`..`/relative segments lexically; it
+// never follows a symlink. `node <symlinked-path>/ledger-append.mjs` then
+// makes the comparison below false even though the caller ran this exact
+// file: `isMain` reads false, the CLI branch never runs, and the process
+// exits 0 with zero bytes of output -- success-shaped silence, no write,
+// no error signal at all. This is live in production wherever the
+// resolved script path crosses a symlinked ancestor (macOS's
+// /tmp -> /private/tmp, $TMPDIR's /var/folders -> /private/var/folders, or
+// any symlinked home/volume/install ancestor for
+// ~/.claude/workflows/lib/...). Fixed by resolving `process.argv[1]`
+// through fs.realpathSync.native (which does follow symlinks, matching
+// what import.meta.url already does) before comparing. Guarded in
+// try/catch and falling back to the lexical form on failure (e.g. a
+// genuinely nonexistent argv[1], which should never happen for a running
+// script, but must fail toward the pre-fix behaviour rather than throw
+// during a plain import that never intended to invoke the CLI at all).
+function resolveArgvPathForIsMain(argPath) {
+  const lexical = path.resolve(argPath)
+  try {
+    return fs.realpathSync.native(lexical)
+  } catch (e) {
+    return lexical
+  }
+}
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolveArgvPathForIsMain(process.argv[1])
 if (isMain) {
   const out = main()
   process.stdout.write(JSON.stringify(out) + '\n')
