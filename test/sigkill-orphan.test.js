@@ -49,13 +49,20 @@ test('AC-DATA-9: a process SIGKILLed after writing the start record, before it c
   let stderr = ''
   child.stderr.on('data', (d) => { stderr += d })
 
-  // Give the child time to complete its synchronous start write and enter
-  // the setTimeout wait -- generous relative to a single local subprocess
-  // spawn, comfortably short relative to the 60s terminal-write timer.
-  await new Promise((resolve) => setTimeout(resolve, 800))
-
-  const beforeKillLines = readLedgerLines(repo)
-  assert.equal(beforeKillLines.length, 1, `sanity: the start record must already be on disk before SIGKILL, got ${beforeKillLines.length} lines (stderr: ${stderr})`)
+  // Review round-2 L-5: wait for the actual condition (the start line
+  // landing on disk), not a fixed guessed delay -- a fixed sleep either
+  // wastes time on a fast machine or flakes on a slow/loaded one (AC-QA-21).
+  // Bounded so a genuine failure to write still fails the test instead of
+  // hanging forever.
+  const POLL_INTERVAL_MS = 15
+  const POLL_TIMEOUT_MS = 10000
+  const pollDeadline = Date.now() + POLL_TIMEOUT_MS
+  let beforeKillLines = readLedgerLines(repo)
+  while (beforeKillLines.length < 1 && Date.now() < pollDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+    beforeKillLines = readLedgerLines(repo)
+  }
+  assert.equal(beforeKillLines.length, 1, `sanity: the start record must already be on disk before SIGKILL, got ${beforeKillLines.length} lines after polling for up to ${POLL_TIMEOUT_MS}ms (stderr: ${stderr})`)
 
   child.kill('SIGKILL')
   await new Promise((resolve) => child.on('close', resolve))

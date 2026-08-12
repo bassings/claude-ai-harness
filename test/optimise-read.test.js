@@ -1402,9 +1402,9 @@ test('optimise-read: aggregateWallClock never merges two DIFFERENT out-of-repo c
 
 // ---- Review round-1 M3: pair plan-identity selection must be
 // order-independent and must prefer a REAL spec over the no-spec sentinel,
-// restoring main's `pair.find(p => p.spec)?.spec` semantics. AC-QA-13. ----
+// restoring main's `pair.find(p => p.spec)?.spec` semantics. harn-opt-2:AC-QA-13. ----
 
-test('optimise-read: a pair where one record has no spec and the other carries a real spec attributes to the REAL spec, regardless of which record comes first in file order (M3, AC-QA-13)', () => {
+test('optimise-read: a pair where one record has no spec and the other carries a real spec attributes to the REAL spec, regardless of which record comes first in file order (M3, harn-opt-2:AC-QA-13)', () => {
   const noSpecRecord = { kind: 'tdd_task', repo: 'demo', outcome: 'started', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' }
   const realSpecRecord = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' }
   const forward = mod.aggregateWallClock([noSpecRecord, realSpecRecord])
@@ -1414,11 +1414,11 @@ test('optimise-read: a pair where one record has no spec and the other carries a
   assert.equal(
     JSON.stringify([...forward.byPlan.entries()]),
     JSON.stringify([...reversed.byPlan.entries()]),
-    'forward and reversed order must produce byte-identical aggregate output (AC-QA-13)'
+    'forward and reversed order must produce byte-identical aggregate output (harn-opt-2:AC-QA-13)'
   )
 })
 
-// HARN-OPT-2 PR2 (AC-QA-13): the new start-only/terminal-only orphan
+// HARN-OPT-2 PR2 (harn-opt-2:AC-QA-13): the new start-only/terminal-only orphan
 // classification (AC-OPS-2) must be exactly as order-independent as every
 // other aggregate here -- pairing is by run_id, keyed via a Map, never by
 // file position or adjacency, so shuffling which orphan/pair comes first
@@ -1437,7 +1437,7 @@ test('optimise-read: a pair where one record has no spec and the other carries a
 // by giving EACH orphan class two different kinds, so the guard can now
 // actually distinguish "always the same order" from "coincidentally only
 // one entry".
-test('optimise-read: a mixed set of paired runs and both orphan classes -- with TWO DIFFERENT KINDS in EACH orphan class, so the byKind maps have something to reorder -- produces byte-identical aggregate output regardless of record order (AC-QA-13, AC-OPS-2, M1)', () => {
+test('optimise-read: a mixed set of paired runs and both orphan classes -- with TWO DIFFERENT KINDS in EACH orphan class, so the byKind maps have something to reorder -- produces byte-identical aggregate output regardless of record order (harn-opt-2:AC-QA-13, AC-OPS-2, M1)', () => {
   const paired1 = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'p1', ts: '2026-08-01T00:00:00.000Z' }
   const paired2 = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'p1', ts: '2026-08-01T00:01:00.000Z' }
   const startOnlyA = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'orphan-start-1', ts: '2026-08-01T00:00:00.000Z' }
@@ -1463,11 +1463,11 @@ test('optimise-read: a mixed set of paired runs and both orphan classes -- with 
   assert.equal(totals.agentComputeTerminalOnlyByKind.review_cycle, 1)
 })
 
-// AC-QA-13's own literal wording: "a fixture interleaving two concurrent
+// harn-opt-2:AC-QA-13's own literal wording: "a fixture interleaving two concurrent
 // runs' start/terminal lines, then the same lines reversed and shuffled,
 // produces byte-identical aggregate output." No test in the suite exercised
 // this literally (two genuine PAIRS, interleaved) before review round 1.
-test('optimise-read: two concurrent runs\' start/terminal lines, interleaved, then reversed, then shuffled, produce byte-identical aggregate output (AC-QA-13, literal wording)', () => {
+test('optimise-read: two concurrent runs\' start/terminal lines, interleaved, then reversed, then shuffled, produce byte-identical aggregate output (harn-opt-2:AC-QA-13, literal wording)', () => {
   const runAStart = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:00:00.000Z' }
   const runBStart = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:05.000Z' }
   const runAEnd = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:02:00.000Z' } // 120s
@@ -1484,9 +1484,9 @@ test('optimise-read: two concurrent runs\' start/terminal lines, interleaved, th
   assert.equal(totals.agentComputeSeconds, 150)
 })
 
-// Review round-2 L-7: AC-QA-13's byte-identity was proven only for
+// Review round-2 L-7: harn-opt-2:AC-QA-13's byte-identity was proven only for
 // `.totals` -- `byPlan` (a Map) follows record-ENCOUNTER order, not a
-// sorted key order, and every AC-QA-13 test up to this one only ever
+// sorted key order, and every harn-opt-2:AC-QA-13 test up to this one only ever
 // stringified `.totals`, so a differently-ordered `byPlan` (e.g. from a
 // multi-repo aggregate or a resumed read) was never caught. Sorted by key
 // before being returned.
@@ -1509,7 +1509,7 @@ test('optimise-read: aggregateWallClock\'s FULL aggregate (byPlan included, not 
   assert.deepEqual(keys, [...keys].sort(), 'byPlan must be returned in sorted key order, not record-encounter order')
 })
 
-test('optimise-read: three records sharing one run_id (forward, reversed, and shuffled), only one of which carries a real spec, all attribute to the real spec and produce byte-identical aggregates (M3, AC-QA-13, shuffled)', () => {
+test('optimise-read: three records sharing one run_id (forward, reversed, and shuffled), only one of which carries a real spec, all attribute to the real spec and produce byte-identical aggregates (M3, harn-opt-2:AC-QA-13, shuffled)', () => {
   const a = { kind: 'tdd_task', repo: 'demo', outcome: 'started', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' } // no spec
   const b = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/real.md', run_id: 'r1', ts: '2026-08-01T00:00:30.000Z' }
   const c = { kind: 'tdd_task', repo: 'demo', outcome: 'done', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' } // no spec
