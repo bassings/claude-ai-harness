@@ -214,6 +214,82 @@ test('optimise-cycle: the report renders real ZEROS for the three exclusion coun
   assert.ok(line.includes('unattributable rework records=0'), `got: ${line}`)
 })
 
+// ---- Review round-1 H2: the two orphan classes AC-OPS-2 exists to
+// separate (agentComputeStartOnlyRuns/agentComputeTerminalOnlyRuns, each
+// broken down by kind) were computed by optimise-read.mjs and reached
+// neither the Sample completeness section nor anywhere else a human
+// reads -- confirmed by grep, zero matches across workflows/skills/
+// agents/hooks/README/AGENT-HARNESS/docs excluding optimise-read.mjs
+// itself. When the exception-guard fix closes the start-only half, the
+// report would move "unmeasured n=6" to "unmeasured n=2" with nothing
+// saying which class moved -- exactly the "partial fix reads as progress"
+// trap the spec names as the reason the two classes exist at all. Rendered
+// as its own always-present line in Sample completeness, next to the
+// existing "Excluded from attribution" line, with real zeros when clean
+// (M2's own pattern). ----
+
+test('optimise-cycle: the report\'s Sample completeness section renders start-only and terminal-only orphan counts, broken down by kind, with real non-zero numbers when a marker-bearing fixture is fed in (H2, AC-OPS-2)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0,
+          agentComputeStartOnlyRuns: 4, agentComputeTerminalOnlyRuns: 2,
+          agentComputeStartOnlyByKind: { review_cycle: 4 },
+          agentComputeTerminalOnlyByKind: { review_cycle: 1, tdd_task: 1 },
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('Orphaned agent-compute runs'))
+  assert.ok(line, `expected a line starting with "Orphaned agent-compute runs", report was: ${result.report}`)
+  assert.ok(line.includes('start-only=4'), `got: ${line}`)
+  assert.ok(line.includes('terminal-only=2'), `got: ${line}`)
+  assert.ok(line.includes('review_cycle: 4'), `start-only by-kind breakdown missing, got: ${line}`)
+  assert.ok(line.includes('review_cycle: 1') && line.includes('tdd_task: 1'), `terminal-only by-kind breakdown missing, got: ${line}`)
+})
+
+test('optimise-cycle: the report renders real ZEROS for the orphan counts on a clean fixture, never omitting the line entirely -- a missing line means the check stopped running, never that nothing is wrong (H2, AC-OPS-2)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.startsWith('Orphaned agent-compute runs'))
+  assert.ok(line, `expected a line starting with "Orphaned agent-compute runs" even when every count is zero, report was: ${result.report}`)
+  assert.ok(line.includes('start-only=0'), `got: ${line}`)
+  assert.ok(line.includes('terminal-only=0'), `got: ${line}`)
+})
+
+// H1's aborted-pairs counter (a crashed run's agent-compute time, excluded
+// from the completed-run duration statistic) rendered beside the existing
+// measured/unmeasured counts in the Totals line, so a workflow crashing on
+// every run is visible in the same line an operator already reads.
+test('optimise-cycle: the wall-clock Totals line renders the aborted-pairs count (H1), with a real non-zero number when a fixture carries one', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: null, unterminatedWaits: 0,
+          agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 1, agentComputeAbortedPairs: 1,
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(line, `expected a line starting with "Totals:", report was: ${result.report}`)
+  assert.ok(line.includes('aborted n=1'), `got: ${line}`)
+})
+
+test('optimise-cycle: the wall-clock Totals line renders a real ZERO for aborted-pairs on a clean fixture (H1, not vacuous)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(line, `expected a line starting with "Totals:", report was: ${result.report}`)
+  assert.ok(line.includes('aborted n=0'), `got: ${line}`)
+})
+
 // ---- Review round-1 M5 (SPEC BUG SB-1): perRepo[].root silently changed
 // contract -- optimise-cycle.js's repoLabels lookup, keyed by the OLD raw
 // absolute root, is now a guaranteed miss against the reader's new derived

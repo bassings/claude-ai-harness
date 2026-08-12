@@ -753,6 +753,23 @@ function buildReport(d) {
     `unattributable ci_wait/human_wait observations=${wallTotalsForExclusions.unattributableWaits ?? 0}, ` +
     `unattributable rework records=${(d.rework && d.rework.unattributableCount) ?? 0}.`
   )
+  // Review round-1 H2: the two orphan classes AC-OPS-2 exists to separate
+  // -- a start-only orphan (an exception escaped run(), or the process was
+  // killed) and a terminal-only orphan (the START write itself failed) --
+  // were computed by optimise-read.mjs and reached no report a human
+  // reads. Always rendered, with real zeros when clean, so a fix landed
+  // for one class never reads as progress on the other, and a missing
+  // line means the check stopped running, never that nothing is wrong.
+  function formatByKind(byKind) {
+    const entries = Object.entries(byKind || {})
+    return entries.length ? entries.map(([k, n]) => `${k}: ${n}`).join(', ') : 'none'
+  }
+  lines.push(
+    `Orphaned agent-compute runs (never silently collapsed into one number): start-only=${wallTotalsForExclusions.agentComputeStartOnlyRuns ?? 0} ` +
+    `(by kind: ${formatByKind(wallTotalsForExclusions.agentComputeStartOnlyByKind)}), ` +
+    `terminal-only=${wallTotalsForExclusions.agentComputeTerminalOnlyRuns ?? 0} ` +
+    `(by kind: ${formatByKind(wallTotalsForExclusions.agentComputeTerminalOnlyByKind)}).`
+  )
   lines.push('')
 
   // H1 / AC-OPS-11, AC-OPS-12, AC-ARCH-13: the headline deliverable --
@@ -775,10 +792,17 @@ function buildReport(d) {
     // render here, not just whether the total is null -- an operator
     // reading the persisted report (not the raw JSON return) previously
     // had no way to see how many runs were unmeasured for a segment.
+    // Review round-1 H1: a well-formed start+terminal pair whose terminal
+    // outcome is not 'done' (a crash the exception guard turns into a pair
+    // instead of an orphan, or a deliberate BLOCKED/ABORTED return) is
+    // real elapsed time but never a completion -- excluded from
+    // agent_compute's measured/unmeasured counts above, and rendered here
+    // under its own name so a workflow crashing on every run is visible in
+    // the same line an operator already reads, not silently absent.
     lines.push(
       `Totals: ci_wait=${fmtSeconds(t.ciWaitSeconds)} (measured n=${t.ciWaitMeasuredRuns ?? 0}, unmeasured n=${t.ciWaitUnmeasuredRuns ?? 0}), ` +
       `human_wait=${fmtSeconds(t.humanWaitSeconds)} (measured n=${t.humanWaitMeasuredRuns ?? 0}, unmeasured n=${t.humanWaitUnmeasuredRuns ?? 0}), ` +
-      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}).`
+      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}, aborted n=${t.agentComputeAbortedPairs ?? 0}).`
     )
     if (t.unterminatedWaits) lines.push(`unterminated_waits: ${t.unterminatedWaits}`)
     if (d.wallClock.source) lines.push(`Sources: ci_wait=${d.wallClock.source.ci_wait}, human_wait=${d.wallClock.source.human_wait}, agent_compute=${d.wallClock.source.agent_compute}.`)
