@@ -111,8 +111,24 @@ task, a Monitor, or a ScheduleWakeup.
 - A sub-agent's report is not evidence: verify its diff and gate result
   before advancing the task's state.
 - Never mark `merged` from memory; only from `gh pr view <n>`.
-- After three failed fix rounds on one task, mark it
-  `status: blocked-on-human` with the frame question instead of a fourth
-  attempt.
+- **Rework circuit-breaker. Count rounds in the conductor log and obey the
+  count.** Stop and mark `status: blocked-on-human` with the frame question,
+  rather than iterating, at whichever of these comes first:
+  - **three fix rounds on one task** (the original rule), or
+  - **the first time a review round finds a defect that the previous
+    round's fix introduced.** One self-inflicted regression is the signal
+    the frame is wrong; do not wait for three. Say plainly whose
+    instruction caused it, including when it was yours.
+  Escalate with the cost so far (review rounds, tokens, wall-clock) and what
+  the change is protecting, so the human can make a value call rather than a
+  correctness one. "The next fix is small" is not a reason to continue: it
+  was true every previous round too.
+  *Added 2026-08-12 after HARN-OPT-2 PR 1 ran 5 fix rounds and 4 review
+  rounds (~7M tokens) to harden a 9-record ledger, with three consecutive
+  rounds each introducing a defect the next round had to fix, four of them
+  traceable to the conductor's own instructions. The three-round rule
+  already existed and was blown past, so the failure was not a missing rule
+  but an unenforced one: state the count explicitly in each tick's log entry
+  so it cannot be lost track of.*
 - Do not fan out beyond what the machine and the plan's `needs:` edges
   support; two clean parallel tracks beat five entangled ones.
