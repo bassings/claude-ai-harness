@@ -135,6 +135,11 @@ async function writeLedger(payload) {
           ts: { type: 'string' },
           write_ok: { type: 'boolean' },
           write_error: { type: ['string', 'null'] },
+          // Review round-2 M-3: ledger-append.mjs's CLI result now carries
+          // invalid_ac_ids_dropped when a lens's malformed ac_id was
+          // sanitised -- optional, so an agent not carrying this field
+          // (an older writer) is unaffected.
+          invalid_ac_ids_dropped: { type: ['integer', 'null'] },
         },
       },
     })
@@ -146,6 +151,13 @@ async function writeLedger(payload) {
     const runId = (response && response.run_id) || payload.run_id || 'unknown'
     log(`Ledger write failed for run ${runId}: ${reason}`)
     return { write_ok: false, write_error: reason, run_id: runId }
+  }
+  // Review round-2 M-3: a sanitisation (a lens's non-conforming ac_id,
+  // nulled and retained in ac_id_raw by the writer) previously left no
+  // operator-visible trace at all beyond a counter buried in the ledger
+  // file itself. One log line, only when something was actually dropped.
+  if (typeof response.invalid_ac_ids_dropped === 'number' && response.invalid_ac_ids_dropped > 0) {
+    log(`Run ${response.run_id}: invalid_ac_ids_dropped=${response.invalid_ac_ids_dropped} (a lens supplied a non-conforming ac_id; sanitised, not lost -- see ac_id_raw in the ledger line)`)
   }
   return { write_ok: true, write_error: null, run_id: response.run_id }
 }

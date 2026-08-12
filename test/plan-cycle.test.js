@@ -131,6 +131,29 @@ test('plan-cycle.js: a ledger write failure via the agent call itself throwing n
   assert.equal(typeof result.report, 'string')
 })
 
+// Review round-2 M-3: see tdd-task.test.js for the identical guard and
+// its rationale.
+test('plan-cycle.js: when the ledger:write response carries invalid_ac_ids_dropped > 0, writeLedger logs one visible line naming the run and the count (M-3)', async () => {
+  const { logs } = await runWorkflow(WF, {
+    args: { spec: 'specs/foo.md' },
+    agent: baseAgent({
+      'ledger:write': [
+        { run_id: 'run-with-sanitised-ids', ts: 't1', write_ok: true, write_error: null },
+        { run_id: 'run-with-sanitised-ids', ts: 't2', write_ok: true, write_error: null, invalid_ac_ids_dropped: 2 },
+      ],
+    }),
+  })
+  const sanitiseLog = logs.find((l) => l.includes('invalid_ac_ids_dropped') || l.toLowerCase().includes('sanitised'))
+  assert.ok(sanitiseLog, `expected a log line about the sanitisation, got: ${JSON.stringify(logs)}`)
+  assert.ok(sanitiseLog.includes('run-with-sanitised-ids'), `must name the run, got: ${sanitiseLog}`)
+  assert.ok(sanitiseLog.includes('2'), `must name the count, got: ${sanitiseLog}`)
+})
+
+test('plan-cycle.js: a ledger:write response with invalid_ac_ids_dropped 0 (or absent) logs NOTHING extra (M-3, not vacuous)', async () => {
+  const { logs } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
+  assert.ok(!logs.some((l) => l.includes('invalid_ac_ids_dropped') || l.toLowerCase().includes('sanitised')), `expected no sanitisation log on the clean path, got: ${JSON.stringify(logs)}`)
+})
+
 test('plan-cycle.js: telemetry.budget_spent is null when no budget is supplied, and reflects budget.spent() when supplied (AC-QA-15)', async () => {
   const noBudget = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
   assert.equal(noBudget.result.telemetry.budget_spent, null)
