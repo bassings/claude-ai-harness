@@ -40,7 +40,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const SCHEMA_VERSION = 1
+// HARN-OPT-2 PR1: bumped from 1 -- plan_key (below) is a genuine shape
+// change to every written line, and AC-OPS-4 needs a stale installed
+// mirror (~/.claude/workflows/lib/ledger-append.mjs, still writing the old
+// shape) to be detectable from the report rather than failing silently.
+export const SCHEMA_VERSION = 2
 
 // Hard-coded and not configurable (AC-SIMP-2): resolved against the MAIN
 // checkout root (never a worktree's own .claude/) via `git rev-parse
@@ -128,6 +132,10 @@ export const LEDGER_ENTRY_SCHEMA = {
     kind: { type: 'string', enum: KINDS },
     outcome: { type: 'string', enum: OUTCOMES },
     spec: { type: ['string', 'null'] },
+    // HARN-OPT-2 PR1 round 5 (AC-DATA-4): the caller's original spec
+    // string, retained verbatim -- see main()'s own comment at the write
+    // site for why this exists. Never emitted by the reader (AC-SEC-3).
+    spec_raw: { type: ['string', 'null'] },
     task: { type: ['string', 'null'] },
     round_key: { type: ['string', 'null'] },
     lenses_run: { type: 'array', items: { type: 'string' } },
@@ -200,6 +208,15 @@ export const LEDGER_ENTRY_SCHEMA = {
     // on an ordinary record, never false (unmeasured is not "definitely not
     // degraded", it is "no degradation was needed to decide").
     degraded: { type: ['boolean', 'null'] },
+    // HARN-OPT-2 PR1 (AC-DATA-4): the plan-identity canonicalisation
+    // function's own output for this record's `spec` (or the no-spec/
+    // out-of-repo sentinel), computed and written alongside the retained
+    // `spec` field itself -- never in place of it, so a canonicaliser
+    // defect is correctable on READ from the retained field alone, without
+    // rewriting the append-only ledger. Optional (not in `required`): a
+    // pre-PR1 line has no plan_key at all, and read-side normalisation
+    // (not a rewrite of the stored line) is what makes it usable (AC-ARCH-5).
+    plan_key: { type: ['string', 'null'] },
     write_ok: { type: 'boolean' },
     write_error: { type: ['string', 'null'] },
   },
@@ -379,7 +396,7 @@ function computeFindings(descriptors, disposition) {
   return { entries, count: entries.length }
 }
 
-const TRUNCATABLE_FIELDS = ['task', 'spec', 'round_key', 'event', 'event_key']
+const TRUNCATABLE_FIELDS = ['task', 'spec', 'spec_raw', 'round_key', 'event', 'event_key']
 
 // Matches an absolute POSIX path (leading /, at least one more non-blank
 // segment) or a Windows drive-letter path, wherever it appears inside a
@@ -389,7 +406,26 @@ const TRUNCATABLE_FIELDS = ['task', 'spec', 'round_key', 'event', 'event_key']
 // or paren: without that anchor, a genuinely relative path that merely
 // CONTAINS a slash (e.g. "specs/foo.md") would have its "/foo.md" tail
 // misread as an absolute path and mangled.
+//
+// Review round-2, Decision 1: round-1's M1 widened this prefix class to
+// "anything not legal in a path segment", intending to fail closed on
+// shape. In practice a real path routinely contains characters outside
+// that class -- a space, a paren, a non-ASCII directory name -- so the
+// widened form matched INSIDE ordinary, entirely safe relative specs and
+// destroyed them (H1, H2). Restored to main's narrow form. This regex is
+// no longer applied to `spec` at all (see canonicalPlanKey and its cwd/root
+// lexical resolution in main(), below) -- it is used only for genuinely
+// free-text fields (task, round_key, event, event_key) where a shape-based
+// scan over prose is the best available tool, matching main's own scope.
 const ABSOLUTE_PATH_RE = /(^|[\s'"(])([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+
+// The fixed marker for a path that cannot be safely recorded: an absolute
+// path outside the repo root, or (HARN-OPT-2 PR1, AC-SEC-1 case d) a
+// relative path whose "../" segments lexically resolve outside it. Named
+// and exported once (AC-ARCH-1) so the writer's own `spec`/`plan_key`
+// fields and the reader's unattributable-bucket handling (AC-DATA-7,
+// AC-OPS-5) agree on one literal value, rather than each hand-rolling it.
+export const REDACTED_PATH_MARKER = '<redacted-path>'
 
 // Replaces every absolute path found inside `value` with its path relative
 // to `root` when it lives under the repo (H2: the common, recoverable
@@ -407,8 +443,118 @@ export function redactPaths(value, root) {
       const rel = path.relative(root, absPath)
       return prefix + (rel === '' ? '.' : rel)
     }
-    return prefix + '<redacted-path>'
+    return prefix + REDACTED_PATH_MARKER
   })
+}
+
+// HARN-OPT-2 PR1 (AC-ARCH-3): a narrowing PRE-PASS, run before redactPaths,
+// that makes an absolute path repo-relative when it lives under `root` and
+// leaves it COMPLETELY UNCHANGED otherwise -- unlike redactPaths, it never
+// redacts. This is what lets a path authored inside a linked WORKTREE
+// (whose own absolute root differs from the main checkout's) get relativised
+// against the worktree's own root first, before the general pass (which
+// only knows the main checkout root) ever sees it: a path still absolute
+// after this pre-pass either belongs to the main root (the next pass
+// handles it) or is genuinely outside every root this writer knows about
+// (the next pass correctly marks it).
+function relativiseAgainstRoot(value, root) {
+  if (value === null || value === undefined || !root) return value
+  const s = String(value)
+  return s.replace(ABSOLUTE_PATH_RE, (whole, prefix, absPath) => {
+    if (absPath === root || absPath.startsWith(root + path.sep)) {
+      const rel = path.relative(root, absPath)
+      return prefix + (rel === '' ? '.' : rel)
+    }
+    return whole
+  })
+}
+
+// HARN-OPT-2 PR1: the no-spec sentinel (AC-QA-2) -- distinguishable from
+// every real spec value, including one literally named "unspecified" (the
+// literal string a real, if confusingly-named, spec file could use).
+// Review round-1 L5: the plain string '<no-spec>' was itself a LEGAL single
+// path segment, so a spec file literally named "<no-spec>" collided with
+// it. canonicalPlanKey never emits a TRAILING "/" in a real key (a
+// trailing-slash segment is always dropped as empty by the segment loop
+// below), so appending one makes the sentinel structurally unproducible
+// from any real spec path, not merely implausible -- while the trailing
+// "/" still starts with a safe character, so it does not itself trip the
+// M1 shape check below.
+export const NO_SPEC_PLAN_KEY = '<no-spec>/'
+
+const WINDOWS_DRIVE_ABS_RE = /^[A-Za-z]:[\\/]/
+
+// HARN-OPT-2 PR1: plan-identity canonicalisation, the single definition
+// site (AC-ARCH-1) the writer and the reader both call. PURE (AC-ARCH-2,
+// AC-SEC-2): string arguments in, a string out, no fs/child_process/
+// process.cwd()/realpath anywhere in this function -- the canonical value
+// for a given `spec` is byte-identical whether the target exists, does
+// not, or is a symlink to somewhere hostile (AC-DATA-3 case e: a symlinked
+// spec keeps its OWN lexical path, since this function never resolves a
+// symlink's target -- collapsing that route would require realpath, which
+// was explicitly struck from scope at planning).
+//
+// Review round-2, Decision 1: no regex is used to find a path's boundary
+// here, ever. `root` is a plain STRING prefix (or an ARRAY of candidate
+// string prefixes, tried in order -- the writer may need to try both
+// `cwdRoot` and `root`, plus PWD when it names the writer's own cwd) to
+// lexically strip from an absolute `spec` -- never touched by any fs call
+// here. The caller (main(), below) resolves which real root string(s) to
+// pass; this function itself only ever does string/array arithmetic with
+// whatever it is handed, and stays that way deliberately (round 5, H-A: an
+// earlier attempt to realpath `spec`'s own directory in main() before
+// calling this function was reverted -- it made plan identity depend on
+// filesystem STATE, not just the spec string, which is exactly what this
+// function's purity exists to prevent; see main()'s own comment at the
+// call site). An absolute spec reached through a symlinked ancestor
+// directory that none of the candidate roots match lexically records the
+// out-of-repo marker -- a known, documented, deterministic limitation.
+// There is no longer a "final shape" regex check on the derived key
+// either (round-1's UNSAFE_EMBEDDED_SLASH_RE): it fired on legitimate
+// already-relative segments containing ordinary punctuation ("specs/plan
+// (v2)/a.md") indistinguishably from a genuine embedded leak, because
+// after segment-splitting the two look identical. Redaction now happens
+// only when relativisation against every known candidate root genuinely
+// fails (AC-SEC-1 cases c/d) -- never as a second-guess of an already-
+// resolved value.
+export function canonicalPlanKey(spec, root) {
+  if (spec === NO_SPEC_PLAN_KEY || spec === REDACTED_PATH_MARKER) return spec
+  if (typeof spec !== 'string' || spec === '') return NO_SPEC_PLAN_KEY
+  const candidateRoots = (Array.isArray(root) ? root : [root])
+    .filter((r) => typeof r === 'string' && r)
+    .map((r) => r.replace(/[\\/]+$/, ''))
+  let rel = spec
+  const isAbsolute = spec.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(spec)
+  if (isAbsolute) {
+    const matchedRoot = candidateRoots.find((r) => spec === r || spec.startsWith(r + '/') || spec.startsWith(r + '\\'))
+    if (matchedRoot !== undefined) {
+      rel = spec.slice(matchedRoot.length).replace(/^[\\/]+/, '')
+    } else {
+      // An absolute path that matches none of the known candidate roots:
+      // cannot be safely made repo-relative (AC-SEC-1 case c).
+      return REDACTED_PATH_MARKER
+    }
+  }
+  // Lexical normalisation only (AC-DATA-3): forward-slash-join, then
+  // collapse "." and ".." segments by plain array arithmetic -- no
+  // fs.realpath, no existence check of any kind. A ".." with nothing left
+  // to pop lexically escapes the root (AC-SEC-1 case d): a relative spec
+  // like "../../../home/<user>/.ssh/config" has no leading slash at all,
+  // so it was never absolute in the branch above, and without this check
+  // it would be recorded verbatim.
+  const posixRel = rel.split(/[\\/]+/).join('/')
+  const segments = []
+  for (const seg of posixRel.split('/')) {
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') {
+      if (segments.length === 0) return REDACTED_PATH_MARKER
+      segments.pop()
+    } else {
+      segments.push(seg)
+    }
+  }
+  if (segments.length === 0) return REDACTED_PATH_MARKER
+  return segments.join('/')
 }
 
 // Strips every occurrence of `root` (an absolute path) out of free text,
@@ -461,7 +607,17 @@ function resolveMainCheckoutRoot(cwd) {
 // through to the toplevel-basename fallback below, same as no remote at all.
 const REMOTE_HOST_RE = /^(?:[\w.-]+@[\w.-]+:|(?:https?|ssh|git):\/\/)/
 
-function resolveRepoIdentity(cwd) {
+// HARN-OPT-2 PR1 (AC-DATA-2): `mainRoot` is the already-resolved MAIN
+// checkout root (resolveMainCheckoutRoot, shared for a repo and every one
+// of its linked worktrees via --git-common-dir). The remoteless fallback
+// used to re-derive its own toplevel via a SECOND `git rev-parse
+// --show-toplevel` call from `cwd` -- which, run from inside a linked
+// worktree, returns the WORKTREE's own directory, not the main checkout,
+// so a remoteless worktree recorded its own throwaway directory name as
+// repo identity and split every bucket. Using the basename of the
+// already-resolved main root instead makes a write from any worktree of a
+// repo agree with a write from its main checkout, by construction.
+function resolveRepoIdentity(cwd, mainRoot) {
   try {
     const url = git(['remote', 'get-url', 'origin'], cwd)
     if (REMOTE_HOST_RE.test(url)) {
@@ -471,10 +627,41 @@ function resolveRepoIdentity(cwd) {
   } catch (e) {
     // no remote; fall through
   }
+  if (mainRoot) return path.basename(mainRoot)
   try {
     return path.basename(git(['rev-parse', '--show-toplevel'], cwd))
   } catch (e) {
     return 'unknown'
+  }
+}
+
+// HARN-OPT-2 PR1 (AC-ARCH-3): the CURRENT working tree's own root -- a
+// linked worktree's own directory when writing from inside one, identical
+// to the main checkout root otherwise. Used ONLY to make an absolute path
+// authored inside a worktree repo-relative (via relativiseAgainstRoot,
+// above) before the general redaction pass -- which knows only the main
+// checkout root -- ever runs. This is the fs/git-touching half of that
+// resolution; canonicalPlanKey itself stays pure and never calls this.
+// AC-QA-20: fs-only (walking up for the nearest `.git` entry, file or
+// directory -- a linked worktree's own root has a `.git` FILE containing
+// `gitdir: <path>`; an ordinary checkout has a `.git` DIRECTORY; either
+// marks `dir` as a working tree's own toplevel), never a git subprocess.
+// This mirrors `git rev-parse --show-toplevel`'s own resolution closely
+// enough for this purpose without adding a 4th git call to every write --
+// today's count (with an origin remote configured: --show-superproject-
+// working-tree, --git-common-dir, remote get-url origin, check-ignore) must
+// not grow by one just to resolve the CURRENT working tree's root, which an
+// ordinary fs stat walk already answers just as well for this narrow use
+// (never resolving GIT_DIR/GIT_WORK_TREE overrides or core.worktree, which
+// only a real `git rev-parse` call could -- accepted, since those are rare
+// enough that AC-QA-20's subprocess-count guarantee outweighs them here).
+function resolveWorkingTreeRoot(cwd) {
+  let dir = path.resolve(cwd)
+  while (true) {
+    if (fs.existsSync(path.join(dir, '.git'))) return dir
+    const parent = path.dirname(dir)
+    if (parent === dir) return null
+    dir = parent
   }
 }
 
@@ -519,16 +706,43 @@ export function main() {
   const run_id = typeof payload.run_id === 'string' && payload.run_id ? payload.run_id : randomUUID()
 
   // Resolved BEFORE redaction/truncation below: relativising an absolute
-  // path (H2) needs to know the repo root first.
+  // path (H2) needs to know the repo root first. HARN-OPT-2 PR1: cwdRoot
+  // (the CURRENT working tree's own root -- a linked worktree's own
+  // directory, when applicable) is resolved alongside root (the MAIN
+  // checkout's root) so a worktree-authored absolute spec can be
+  // relativised against the root it was actually authored under
+  // (AC-ARCH-3), and so repo identity's remoteless fallback uses the main
+  // checkout's basename rather than the worktree's own (AC-DATA-2).
   let repo
   let root
+  let cwdRoot
   try {
     root = resolveMainCheckoutRoot(cwd)
-    repo = resolveRepoIdentity(cwd)
+    cwdRoot = resolveWorkingTreeRoot(cwd)
+    repo = resolveRepoIdentity(cwd, root)
   } catch (e) {
     return result(run_id, ts, false, 'could not resolve the main checkout via git rev-parse: ' + stripRoot(e.message, root))
   }
   const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
+
+  // HARN-OPT-2 PR1: the candidate root strings canonicalPlanKey lexically
+  // matches an absolute spec (or, round 5/H-C, an absolute event_scope plan
+  // segment) against -- cwdRoot and root, plus PWD itself when it names the
+  // same directory as cwd (compared by inode, not string; a real shell's
+  // `cd <symlinked-dir>` sets PWD to the exact unresolved argument, which
+  // process.cwd() would otherwise silently normalise away). Computed once,
+  // here, and reused below by both the event_scope canonicalisation and the
+  // spec canonicalisation. canonicalPlanKey itself stays pure (AC-ARCH-2,
+  // AC-SEC-2, AC-DATA-3): every fs call needed to build this candidate list
+  // happens HERE, in main(), never inside it.
+  const specRootCandidates = [cwdRoot, root]
+  if (process.env.PWD) {
+    try {
+      if (fs.statSync(process.env.PWD).ino === fs.statSync(cwd).ino) specRootCandidates.push(process.env.PWD)
+    } catch (e) {
+      // PWD does not resolve, or does not name the same directory as cwd: not a usable candidate
+    }
+  }
 
   // M2: the occurrence discriminator inside a conduct_plan_event's event_key
   // ("<plan file>:<task id>:<event>:<occurrence>") used to be computed by
@@ -543,8 +757,38 @@ export function main() {
   // counts existing event_key values starting with "<event_scope>:" to
   // mint occurrence = count + 1, returned in the result so the caller can
   // log or display it, never re-derived by the caller itself.
+  //
+  // Round 5 (H-C, AC-ARCH-6): the plan-file segment (everything before the
+  // FIRST colon, matching the reader's own planKeyFromEventKey parsing) is
+  // canonicalised BEFORE it is used to build the counting prefix or the
+  // final event_key -- resolved against the writer's own cwd first when
+  // relative, EXACTLY like `spec` itself below (this segment is documented
+  // to follow spec's own convention, including a "../" reached from a
+  // subdirectory naming a real in-repo file -- H1's fix for `spec`, applied
+  // here identically, or a caller's ordinary relative plan path would
+  // wrongly redact to the marker the moment it starts with ".."). SKILL.md's
+  // convention is that this segment is always already repo-relative, but
+  // nothing rejects a caller that (accidentally or otherwise) supplies an
+  // absolute one, and the RAW-prefix counting this replaces broke in two
+  // ways for that case: occurrence always reset to 1 (a differently-spelled
+  // absolute path never matched a prior line's raw prefix, so every write
+  // looked like the first), and the free-text redaction pass over event_key
+  // further down -- which knows nothing about cwdRoot/PWD the way
+  // canonicalPlanKey does -- could consume the whole colon-delimited tail
+  // into a single regex match, losing the occurrence suffix entirely and
+  // dropping the record as a silent false-duplicate with write_ok: true.
+  // Canonicalising here first means event_key's plan segment is already
+  // relative (or the fixed marker) by the time the free-text pass sees it,
+  // so that pass is a no-op for it.
   if (payload.kind === 'conduct_plan_event' && typeof payload.event_scope === 'string' && payload.event_scope) {
-    const prefix = payload.event_scope + ':'
+    const colonIdx = payload.event_scope.indexOf(':')
+    let rawPlanSegment = colonIdx === -1 ? payload.event_scope : payload.event_scope.slice(0, colonIdx)
+    const restOfScope = colonIdx === -1 ? '' : payload.event_scope.slice(colonIdx)
+    if (rawPlanSegment && !(rawPlanSegment.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(rawPlanSegment))) {
+      rawPlanSegment = path.resolve(cwd, rawPlanSegment)
+    }
+    const canonicalScope = canonicalPlanKey(rawPlanSegment, specRootCandidates) + restOfScope
+    const prefix = canonicalScope + ':'
     let count = 0
     if (fs.existsSync(ledgerPath)) {
       const existing = fs.readFileSync(ledgerPath, 'utf8')
@@ -558,21 +802,35 @@ export function main() {
         }
       }
     }
-    payload.event_key = `${payload.event_scope}:${count + 1}`
+    payload.event_key = `${canonicalScope}:${count + 1}`
   }
 
-  // Relativise every recorded path against the repo root BEFORE truncation
-  // (H2, AC-SEC-3): an absolute path under the root becomes repo-relative,
-  // one outside it is redacted, so a leaked path never survives to the
-  // ledger line whichever field it arrived in. H2 round 2: this previously
-  // ran on `spec` and `task` only, by field NAME -- the conduct_plan_event
-  // route documented in SKILL.md puts an absolute plan path inside
-  // event_key, which was never covered, so it reached the ledger verbatim.
-  // Looping over every TRUNCATABLE_FIELDS entry (which already lists
-  // round_key, event and event_key alongside spec/task) closes that route
-  // and any future one that reuses the same free-text field list, rather
-  // than requiring a matching addition here every time that list grows.
-  for (const field of TRUNCATABLE_FIELDS) {
+  // Relativise every recorded FREE-TEXT path mention against the repo root
+  // BEFORE truncation (H2, AC-SEC-3): an absolute path under the root
+  // becomes repo-relative, one outside it is redacted. Applied to task,
+  // round_key, event and event_key -- NOT spec/spec_raw, which have their
+  // own dedicated, regex-free pipeline below (Decision 1: a shape-based
+  // free-text regex must never run over a structured path value;
+  // task/round_key/event/event_key stay regex-based because they genuinely
+  // are free text with no single unambiguous base to resolve an embedded
+  // mention against -- event_key's own PLAN segment is the one exception,
+  // already canonicalised above, before this pass ever sees it).
+  // HARN-OPT-2 PR1 (AC-ARCH-3): when writing from inside a linked worktree
+  // (cwdRoot differs from the main checkout root), first relativise every
+  // one of these fields against the WORKTREE's own root -- a plain lexical
+  // string substitution using the fs-resolved cwdRoot from above. A path
+  // still absolute after this pre-pass either belongs to the main root (the
+  // next pass handles it) or is genuinely outside every root this writer
+  // knows about (the next pass correctly marks it).
+  const FREE_TEXT_FIELDS = TRUNCATABLE_FIELDS.filter((f) => f !== 'spec' && f !== 'spec_raw')
+  if (cwdRoot && cwdRoot !== root) {
+    for (const field of FREE_TEXT_FIELDS) {
+      if (field in payload) payload[field] = relativiseAgainstRoot(payload[field], cwdRoot)
+    }
+    if (Array.isArray(payload.lenses_run)) payload.lenses_run = payload.lenses_run.map((v) => relativiseAgainstRoot(v, cwdRoot))
+    if (Array.isArray(payload.lenses_skipped)) payload.lenses_skipped = payload.lenses_skipped.map((v) => relativiseAgainstRoot(v, cwdRoot))
+  }
+  for (const field of FREE_TEXT_FIELDS) {
     if (field in payload) payload[field] = redactPaths(payload[field], root)
   }
   // lenses_run/lenses_skipped are arrays of lens-name strings in the
@@ -582,14 +840,116 @@ export function main() {
   if (Array.isArray(payload.lenses_run)) payload.lenses_run = payload.lenses_run.map((v) => redactPaths(v, root))
   if (Array.isArray(payload.lenses_skipped)) payload.lenses_skipped = payload.lenses_skipped.map((v) => redactPaths(v, root))
 
-  // Truncate free-text fields BEFORE validation/serialisation so an
-  // oversized field cannot push the line over the single-write() bound.
-  // Byte-based (M2), not character-based: MAX_LINE_BYTES is a byte cap, and
-  // a field of multibyte characters could exceed it on its own even at a
-  // "reasonable" character count.
+  // Review round-2, Decision 1: `spec` is plan IDENTITY, not free text, and
+  // write-time redaction of it was never required in the first place -- the
+  // ledger is local and gitignored by the AC-SEC-1 design decision, so there
+  // is no privacy requirement to redact data INSIDE it; AC-SEC-3's
+  // requirement is about the report and the agent prompts, the OUTPUT
+  // boundary. C1, H1, H2 and H3 were one root cause: a shape-based free-text
+  // regex applied destructively to spec, which real paths (a space, a
+  // paren, a non-ASCII segment, a symlinked root) defeat. Replaced with
+  // pure lexical resolution against KNOWN root strings -- never a regex
+  // guessing at where a path ends.
+  //
+  // A relative spec is resolved against the writer's own cwd first (lexical
+  // only: path.resolve does no fs I/O of its own; `cwd` was already
+  // captured via process.cwd() before any of this ran -- the same value
+  // root/cwdRoot's OWN resolution already depends on, so this stays
+  // internally consistent. AC-DATA-3's "lexical, never realpath-based"
+  // constraint is on canonicalPlanKey itself, which never touches cwd or
+  // makes any fs call at all). The result is then matched lexically against
+  // specRootCandidates, computed once above.
+  //
+  // Round 5 (H-A, REVERTING round 4): an earlier version of this resolved
+  // the real form of an absolute spec's own directory (via
+  // fs.realpathSync.native) before matching, to recover a spec reached
+  // through a symlinked ANCESTOR directory. That satisfied the LETTER of
+  // "canonicalPlanKey stays pure" (the realpath call lived in main(), not
+  // inside it) while violating what the purity requirement is FOR:
+  // AC-SEC-2's "byte-identical whether the target exists, does not exist,
+  // or is a symlink" and AC-DATA-3's "lexical, never realpath-based" are
+  // about the RESOLUTION'S OWN BEHAVIOUR, not about which function the fs
+  // call physically sits in. Proven: the IDENTICAL spec string recorded
+  // '<redacted-path>' before a symlink existed on disk at the relevant path,
+  // and 'specs/a.md' after one was created at that exact path -- plan
+  // identity had become filesystem-STATE-dependent, reintroducing the same
+  // class of bucket-splitting hazard AC-DATA-3 exists to prevent, plus an
+  // fs syscall per write driven by caller-supplied input. Removed entirely.
+  // An absolute spec reached through a symlinked ancestor now records the
+  // out-of-repo marker -- a narrow, DETERMINISTIC degradation (see README's
+  // "Known limitations"), strictly preferable to an identity that depends
+  // on what happens to exist on disk at the moment of the write.
+  // Captured BEFORE path.resolve touches it below: "as the caller supplied
+  // it" (H-B) means the literal string in the payload, not a
+  // cwd-resolved-then-thrown-away intermediate -- a relative spec's own
+  // raw form is exactly as recoverable-useful as an absolute one's, and
+  // resolving it against cwd first would silently bake this writer's own
+  // temp/checkout path into spec_raw for the overwhelmingly common
+  // (relative-spec) case, which is not "the caller's string" by any
+  // reading.
+  const specRawInput = typeof payload.spec === 'string' ? payload.spec : null
+  if (typeof payload.spec === 'string' && payload.spec && !(payload.spec.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(payload.spec))) {
+    payload.spec = path.resolve(cwd, payload.spec)
+  }
+  const planKey = canonicalPlanKey(payload.spec, specRootCandidates)
+  // AC-DATA-4: the retained `spec` field tracks the SAME resolution as
+  // plan_key -- never left as a raw, unresolved caller string (which could
+  // still be an absolute path or a "../" traversal) and never blindly
+  // overwritten when there was nothing to resolve (null/empty/wrong-typed
+  // spec keeps its own original value here; the no-spec sentinel is a
+  // plan_key concept, not something to write into `spec` itself).
+  //
+  // Round 5 (H-B): `spec` alone is no longer enough for AC-DATA-4's own
+  // recoverability requirement, because it is now ALWAYS the derived form
+  // -- there is nothing left to re-derive FROM if canonicalPlanKey itself
+  // has a defect (proven vacuous: a canonicaliser mutated to silently
+  // lowercase every key, merging distinct plans, left the old recoverability
+  // test green, because it re-derived from a field that already WAS the
+  // canonical key). `spec_raw` retains the caller's original string,
+  // exactly as supplied, before path.resolve or canonicalisation touched
+  // it: the insurance policy that makes a future canonicaliser defect --
+  // this PR has shipped a write-time identity-destroying one in every round
+  // so far -- correctable without needing to replay the original caller.
+  // Bounded the same way every other free-text field is (truncateBytes
+  // below); excluded from FREE_TEXT_FIELDS above for the same reason
+  // `spec` is (identity data, not prose; no write-time privacy requirement
+  // to redact it, per Decision 1). The reader never emits this field (see
+  // optimise-read.mjs).
+  //
+  // NOT retained when planKey is REDACTED_PATH_MARKER: AC-SEC-1 cases c/d
+  // (an absolute spec outside every known root, or a relative spec whose
+  // ".." lexically escapes the root) exist specifically to keep a hostile
+  // path -- e.g. "../../../home/<user>/.ssh/config" -- OUT of the ledger
+  // altogether, not merely out of the canonical key. Retaining it verbatim
+  // in spec_raw would undo that protection through a side door: the exact
+  // string case d exists to redact would still reach the ledger file, just
+  // one field over. Decision 1's "no write-time privacy requirement"
+  // applies to a spec that resolves somewhere IN the repo (an operator's
+  // own path, already visible in the checkout); it was never licence to
+  // retain a value canonicalPlanKey has already judged unsafe to record at
+  // all.
+  const specWasOverwritten = typeof payload.spec === 'string' && payload.spec !== '' && planKey !== NO_SPEC_PLAN_KEY
+  if (specWasOverwritten) {
+    payload.spec = planKey
+    if (planKey !== REDACTED_PATH_MARKER) payload.spec_raw = specRawInput
+  }
+
+  // Truncate free-text fields AFTER the above: `spec`/`spec_raw` are now
+  // already their final form (the short canonical key, or the caller's
+  // original string) in the ordinary case, so truncating here is a
+  // defensive bound on a pathological input, not the routine path it was
+  // when spec went through free-text redaction first. Byte-based (M2), not
+  // character-based: MAX_LINE_BYTES is a byte cap, and a field of
+  // multibyte characters could exceed it on its own even at a "reasonable"
+  // character count.
   for (const field of TRUNCATABLE_FIELDS) {
     if (field in payload) payload[field] = truncateBytes(payload[field], 500)
   }
+  // plan_key mirrors spec's post-truncation value when spec was actually
+  // set to the canonical form above; otherwise it is the standalone
+  // computed key (truncated the same way, for the same pathological-input
+  // reason truncateBytes exists at all).
+  payload.plan_key = specWasOverwritten ? payload.spec : truncateBytes(planKey, 500)
 
   // Finding computation (moved here from review-cycle.js: workflow scripts
   // have no node:crypto): raw spec_bugs/rejected_findings/open_findings

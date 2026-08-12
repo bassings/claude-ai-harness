@@ -583,7 +583,12 @@ function annotateProposalOutcome(p) {
 ranked.forEach(annotateProposalOutcome)
 insufficientDataProposals.forEach(annotateProposalOutcome)
 
-const repoLabels = Object.fromEntries(scope.resolved.map((r) => [r.root, r.label]))
+// Review round-1 M5: keyed by POSITION (matching `roots`, and therefore
+// `ledgerAgg.perRepo[].rootIndex`), not by the raw absolute root path --
+// optimise-read.mjs's own perRepo[].root is a derived, non-identifying
+// label after round-2's AC-SEC-3 fix, so a lookup keyed by the raw path
+// would never hit.
+const repoLabels = scope.resolved.map((r) => r.label)
 const reportMarkdown = buildReport({
   reposLabel: scope.resolved.map((r) => r.label).join(', '),
   unresolved: scope.unresolved,
@@ -715,7 +720,18 @@ function buildReport(d) {
   if (d.windowTruncated) lines.push('Ledger window was truncated to the most recent records; older history was not read (AC-ARCH-14 bound).')
   if (d.skipped && d.skipped.length) lines.push(`${d.skipped.length} ledger line(s) were skipped as unparseable or missing a required field; see raw skip reasons in the agent transcript.`)
   for (const entry of d.perRepo || []) {
-    const label = (d.repoLabels && d.repoLabels[entry.root]) || entry.root
+    // Review round-1 M5 (SPEC BUG SB-1): perRepo[].root is now a DERIVED,
+    // non-identifying label (round-2's AC-SEC-3 fix), not the raw absolute
+    // path scope.resolved[].root still is -- so repoLabels, keyed by that
+    // raw path, is a guaranteed miss against it, AND two different roots
+    // whose derived identity happens to collide (two checkouts of the same
+    // origin) render as indistinguishable lines. rootIndex is the stable,
+    // positional key both sides agree on: the reader's own perRepo[i]
+    // corresponds to roots[i], which is exactly scope.resolved[i]. Falls
+    // back to the reader's own (already-safe) derived label when no
+    // rootIndex is present (an older reader) or repoLabels has nothing at
+    // that index -- never to the raw root, which is never available here.
+    const label = (d.repoLabels && typeof entry.rootIndex === 'number' && d.repoLabels[entry.rootIndex]) || entry.root
     if (entry.uninstrumented) {
       lines.push(`- ${label}: **uninstrumented** (no ledger file found -- not "no activity"; the harness has never written a ledger here)`)
     } else {
@@ -723,6 +739,20 @@ function buildReport(d) {
     }
   }
   lines.push('Instrumented invocation routes: conducted runs and every direct invocation of the harness\'s other workflows write the ledger identically (AC-ARCH-4); conduct-plan wait/PR events are conductor-only.')
+  // Review round-1 M2: runs excluded from byPlan (unattributable specs,
+  // fully-degraded records, unattributable ci_wait/human_wait observations)
+  // previously vanished from every printed figure -- the totals above sum
+  // over byPlan only, and these three counters (already computed by the
+  // reader) never reached the report. Always rendered, with a real zero
+  // when clean, per the standing rule that a missing line means the check
+  // stopped running, not that nothing is wrong.
+  const wallTotalsForExclusions = (d.wallClock && d.wallClock.totals) || {}
+  lines.push(
+    `Excluded from attribution (never silently dropped): unattributable runs=${wallTotalsForExclusions.unattributableRuns ?? 0}, ` +
+    `degraded-unattributed runs=${wallTotalsForExclusions.degradedUnattributedRuns ?? 0}, ` +
+    `unattributable ci_wait/human_wait observations=${wallTotalsForExclusions.unattributableWaits ?? 0}, ` +
+    `unattributable rework records=${(d.rework && d.rework.unattributableCount) ?? 0}.`
+  )
   lines.push('')
 
   // H1 / AC-OPS-11, AC-OPS-12, AC-ARCH-13: the headline deliverable --

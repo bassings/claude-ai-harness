@@ -68,6 +68,35 @@ Then in any project:
 /review-cycle
 ```
 
+### Keeping the installed mirror in sync (AC-OPS-4)
+
+The manual-copy install above puts a **copy** of `workflows/lib/` (and any
+plugin install does the same, at its own plugin-managed path) at
+`~/.claude/workflows/lib/`. That installed copy, not this repo, is what
+actually executes for a delivery repo -- a fix landed here can be green in
+this repo's own test suite while the installed mirror keeps running the old
+code, silently. Every change to `workflows/lib/ledger-append.mjs` or
+`workflows/lib/optimise-read.mjs` must be re-synced after merging:
+
+```bash
+cp -r claude-ai-harness/workflows/lib/. ~/.claude/workflows/lib/
+```
+
+Confirm the installed copy actually matches this repo (exits 0, no output,
+when they agree; lists the differing files otherwise):
+
+```bash
+diff -rq claude-ai-harness/workflows/lib ~/.claude/workflows/lib
+```
+
+A stale mirror is also detectable from the optimiser's own report without
+running either command by hand: `workflows/lib/ledger-append.mjs`'s
+`SCHEMA_VERSION` was bumped (1 to 2) by the plan-identity canonicalisation
+change, and `optimise-read.mjs ledger`'s `perRepo[].schemaVersionsSeen`
+reports the schema-version mix actually seen per repo -- a stale installed
+writer still emitting `schema_version: 1` shows up there in the next report
+instead of continuing silently.
+
 ## Usage
 
 **Planning** (once per spec, before implementation):
@@ -221,6 +250,18 @@ opt a single run out (see above), and no setting to turn ledger writes off.
 readable with any JSONL tool. If a line is ever deliberately committed (the
 opt-in above), it survives in git history like any other tracked change.
 
+**Durability (AC-DATA-17)**: the ledger is a single local copy — nothing
+backs it up or replicates it anywhere, so it is lost along with the main
+checkout (a lost disk, a reformatted machine, an accidental `rm -rf`) with
+no way to recover it. It always resolves to the MAIN checkout root, via
+`git rev-parse --git-common-dir` (`workflows/lib/ledger-append.mjs`), never
+a linked worktree's own directory — so it survives a linked worktree
+removal; worktree removal never removes it, only removing the main
+checkout itself loses it. This is a deliberate, accepted trade-off (see the
+AC-DATA-4/AC-SEC-1 arbitration above: making it cloud-reachable would
+reopen that privacy decision), not an oversight, and would be revisited
+only if the ledger were made cloud-reachable.
+
 **Arbitration (AC-DATA-4 vs. AC-SEC-1)**: AC-DATA-4 (the ledger survives a
 routine `git clean -xdf`) and AC-SEC-1 (the ledger is gitignored) are
 mutually unsatisfiable for a single in-tree, ignored path -- `-x` removes
@@ -231,6 +272,33 @@ standing exposure, while a `git clean`-lost ledger is user-initiated,
 telemetry-only, and fully preventable by the exclusion above. This is a
 deliberate, accepted trade-off, not an oversight: AC-DATA-4's git-clean-
 survival clause is an accepted FAIL for this path.
+
+**Known limitations**: an absolute `spec` path reached through a
+**symlinked ANCESTOR directory** (e.g. a checkout cloned at, or accessed
+via, a symlink somewhere above the repo root) records the out-of-repo
+marker (`<redacted-path>`) rather than its true repo-relative key, even
+though the file is genuinely inside the working tree. `plan_key` derivation
+is deliberately **lexical only** — it compares the literal spec string
+against known root strings, never resolving a symlink to check where it
+actually points (AC-DATA-3, AC-SEC-2) — because the alternative (resolving
+the spec's real path before matching) makes plan identity depend on
+filesystem STATE at the moment of the write: the identical spec string
+would record differently depending on whether a symlink happened to exist
+on disk yet, which is worse than a narrow, deterministic degradation. Two
+mitigations already avoid the common cases: a *relative* spec (or one
+reached via `..` from a subdirectory) resolves correctly regardless of
+symlinks, since it is matched against the writer's own already-resolved
+`cwd`; and an absolute spec reached through a symlinked `cwd` **itself**
+(not merely an ancestor) resolves correctly via the `PWD`-inode-match
+candidate. Only the specific combination — an absolute spec, built from a
+symlinked path, submitted from somewhere other than that exact symlinked
+directory — hits the marker. The ledger's `spec_raw` field (AC-DATA-4: the
+caller's original spec string, retained verbatim alongside the derived
+`plan_key`, so a canonicaliser defect is correctable without replaying the
+original caller) keeps the original string recoverable regardless, though
+retained only when a canonical key was actually derived — a genuinely
+out-of-repo or `..`-escaping spec is never retained raw, matching
+`spec`/`plan_key`'s own redaction (AC-SEC-1).
 
 ## Delivery optimiser
 

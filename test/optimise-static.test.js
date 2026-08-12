@@ -150,3 +150,34 @@ test('static: skills/optimise-cycle/SKILL.md states the escaped-defect metric is
   assert.ok(/heuristic/i.test(skill))
   assert.ok(/escaped-defects/.test(skill))
 })
+
+// ---- Review round-2 L4 (AC-QA-20): the perf bound is measured but was
+// enforced by no test at all. The cheaper structural guard the AC itself
+// names -- rather than a timing assertion, which is real but slower and
+// carries a small flake risk under load -- is that the per-record parsing/
+// aggregation loops never make a filesystem call: an O(1)-per-record
+// contract, checked by construction rather than by a stopwatch. Extracts
+// each function's own source (start line to the next column-0 closing
+// brace) so a legitimate fs call elsewhere in the file (reading the ledger
+// file itself, once, at the CLI layer) is not mistaken for one inside a
+// loop that runs once per record. ----
+
+function extractFunctionBody(contents, fnNameSignature) {
+  const lines = contents.split('\n')
+  const start = lines.findIndex((l) => l.startsWith(fnNameSignature))
+  assert.ok(start >= 0, `could not locate the start of ${fnNameSignature}`)
+  let end = -1
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i] === '}') { end = i; break }
+  }
+  assert.ok(end > start, `could not locate the closing brace of ${fnNameSignature}`)
+  return lines.slice(start, end + 1).join('\n')
+}
+
+test('static: optimise-read.mjs\'s per-record loops (parseLedgerContent, aggregateRework, aggregateWallClock) contain no filesystem call -- an O(1)-per-record contract enforced by construction, not by a timing test (L4, AC-QA-20)', () => {
+  const contents = readAll('workflows', 'lib', 'optimise-read.mjs')
+  for (const signature of ['export function parseLedgerContent(', 'export function aggregateRework(', 'export function aggregateWallClock(']) {
+    const body = extractFunctionBody(contents, signature)
+    assert.ok(!/\bfs\./.test(body), `${signature} must contain no fs.* call -- got a match in:\n${body}`)
+  }
+})
