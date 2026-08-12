@@ -182,7 +182,14 @@ export function aggregateRework(records, { root = '' } = {}) {
   const lensDispositionCounts = {}
   const acVerdicts = new Map()
   let unattributableCount = 0
+  // Review round-2 M-3: invalid_ac_ids_dropped is a real, measured integer
+  // on a record only when the writer actually sanitised something (or
+  // supplied 0 when nothing needed sanitising) -- summed here across every
+  // review_cycle record in the window, exposed on the return so
+  // optimise-cycle.js can render it beside the orphan counters.
+  let invalidAcIdsDropped = 0
   for (const r of reviewRecords) {
+    if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
     for (const f of r.findings || []) {
       bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
     }
@@ -194,6 +201,15 @@ export function aggregateRework(records, { root = '' } = {}) {
       continue
     }
     for (const v of verdicts) {
+      // Review round-2 M-3: a sanitised entry (ac_id nulled by the writer,
+      // AC-DATA-4-style ac_id_raw retained instead) must never reach the
+      // bucket key -- `escapeKeyComponent(null)` stringifies to the
+      // literal "null", which would silently merge EVERY sanitised
+      // verdict from every different plan into one fake shared bucket,
+      // exactly the "different plans merge" defect class this spec exists
+      // to close. Excluded from bucketing entirely; already counted once
+      // via invalidAcIdsDropped above, never counted twice.
+      if (v.ac_id === null || v.ac_id === undefined) continue
       // Review round-2 M4: same injective-escaping fix as planBucketKey.
       const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(v.ac_id)}`
       if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
@@ -204,7 +220,7 @@ export function aggregateRework(records, { root = '' } = {}) {
       else if (v.verdict === 'UNVERIFIABLE') entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -546,22 +562,33 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     // corrupted or reordered pair) this can never be negative -- there is
     // no unreachable branch to guard here.
     const durationS = (Math.max(...times) - Math.min(...times)) / 1000
-    // Review round-1 H1: a well-formed pair is only a MEASURED completion
-    // when its terminal record's outcome is 'done'. PR2's own
-    // exception-guard fix (the three instrumented workflow scripts) turns
-    // a crash from an orphan into exactly this shape -- a real start paired
-    // with a real terminal whose outcome is 'aborted' (or a deliberate
-    // 'blocked' return) -- so treating every well-formed pair as measured
-    // would let a workflow that crashes on EVERY run report as a fully
-    // measured, healthy repo, and would silently disarm
-    // isUnmeasuredSegmentMotivated (optimise-cycle.js), the gate that
-    // exists to stop a proposal being built on unmeasurable data. The
-    // crash duration is real and known (not null), but it is a crash
-    // duration, not a work duration: reported under its own name, EXCLUDED
-    // from agentComputeSeconds/agentComputeN, and counted a second time
-    // toward agentComputeUnmeasuredN so the segment still reads as
-    // unmeasured for the safety gate's purposes.
-    if (terminals[0].outcome !== 'done') {
+    // Review round-1 H1, corrected by round-2 M-4: a well-formed pair whose
+    // terminal outcome is a genuine CRASH is excluded from the measured
+    // completion statistic. PR2's own exception-guard fix (the three
+    // instrumented workflow scripts) turns a crash from an orphan into
+    // exactly this shape -- a real start paired with a real terminal whose
+    // outcome is 'aborted' -- so treating it as measured would let a
+    // workflow that crashes on EVERY run report as a fully measured,
+    // healthy repo, and would silently disarm isUnmeasuredSegmentMotivated
+    // (optimise-cycle.js), the gate that exists to stop a proposal being
+    // built on unmeasurable data.
+    //
+    // Round-2 M-4: round-1 gated on `outcome !== 'done'`, which wrongly
+    // swept up 'blocked' (a legitimate terminating verdict one of the
+    // instrumented workflows returns) and 'no-op' (another's ordinary
+    // no-changes-found case, __outcome:'no-op') as if they were
+    // crashes -- both are genuine COMPLETIONS with real, meaningful
+    // durations. 'aborted' is the ONLY outcome the exception guard actually
+    // produces for a crash (AC-SIMP-6: no new OUTCOMES value was ever
+    // added), so it is the only value excluded here. done/blocked/no-op are
+    // all measured; their real duration is real and known -- reported
+    // under agentComputeSeconds/agentComputeN like any other completion.
+    // The crash-only path's duration is still real and known (not null),
+    // but it is a crash duration, not a work duration: reported under its
+    // own name, EXCLUDED from agentComputeSeconds/agentComputeN, and
+    // counted a second time toward agentComputeUnmeasuredN so the segment
+    // still reads as unmeasured for the safety gate's purposes.
+    if (terminals[0].outcome === 'aborted') {
       bucket.agentComputeAbortedSeconds += durationS
       bucket.agentComputeAbortedN += 1
       bucket.agentComputeUnmeasuredN += 1
@@ -627,8 +654,17 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   if (totals.humanWaitMeasuredRuns === 0 && totals.humanWaitUnmeasuredRuns > 0) totals.humanWaitSeconds = null
   if (totals.agentComputeMeasuredRuns === 0 && totals.agentComputeUnmeasuredRuns > 0) totals.agentComputeSeconds = null
 
+  // Review round-2 L-7: byPlan (a Map) previously followed record-
+  // ENCOUNTER order, not a stable sorted order -- AC-QA-13's byte-identity
+  // requirement held for `.totals` (a plain sum, order-independent by
+  // construction) but not for byPlan itself, so a future consumer that
+  // merges or re-orders records (a multi-repo aggregate, a resumed read)
+  // would produce a differently-ordered report. Sorted by key here, the
+  // single place byPlan is ever returned, rather than at each call site.
+  const sortedByPlan = new Map([...byPlan.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+
   return {
-    byPlan,
+    byPlan: sortedByPlan,
     totals,
     source: {
       ci_wait: 'ledger:conduct_plan_event',

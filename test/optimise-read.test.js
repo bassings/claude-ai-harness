@@ -1184,15 +1184,55 @@ test('optimise-read: a start/terminal pair whose terminal outcome is aborted (no
   assert.equal(records[1].outcome, 'aborted', 'aggregateWallClock must never mutate the input record\'s outcome field')
 })
 
-test('optimise-read: a start/terminal pair whose terminal outcome is blocked (not done, and not literally aborted either) is treated identically to an aborted pair -- any non-done terminal is a crash/non-completion, not just the literal "aborted" outcome (H1)', () => {
+// Review round-2 M-4: round-1's H1 fix gated on `outcome !== 'done'`,
+// which is wrong -- `blocked` (a legitimate terminating verdict,
+// tdd-task.js's OUTCOME_BY_VERDICT) and `no-op` (review-cycle.js's
+// ordinary "no changes found" case, __outcome: 'no-op') are both healthy
+// COMPLETIONS with real, meaningful durations, not crashes. Only `aborted`
+// is the outcome the exception guard actually produces for a genuine
+// crash. Negating `done` misclassified every blocked/no-op run as a crash,
+// excluding its real duration from agent_compute and rendering it as
+// `aborted n=` in the report -- the mirror-image defect of H1 (the false
+// clean; this is the false alarm), reachable for any repo whose review
+// cycles usually find no changes.
+test('optimise-read: a start/terminal pair whose terminal outcome is blocked is a LEGITIMATE COMPLETION -- measured, its duration counted, never classified as an aborted crash (M-4, corrects round-1\'s `outcome !== "done"` over-negation)', () => {
   const records = [
     { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'blocked-pair', ts: '2026-08-01T00:00:00.000Z' },
     { kind: 'tdd_task', repo: 'demo', outcome: 'blocked', spec: 'specs/a.md', run_id: 'blocked-pair', ts: '2026-08-01T00:05:00.000Z' },
   ]
   const result = mod.aggregateWallClock(records)
-  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
-  assert.equal(result.totals.agentComputeAbortedPairs, 1)
-  assert.equal(result.totals.agentComputeAbortedSeconds, 300)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1, 'a blocked run completed and took real, meaningful time -- it must count as measured')
+  assert.equal(result.totals.agentComputeSeconds, 300)
+  assert.equal(result.totals.agentComputeAbortedPairs, 0, 'blocked is not a crash and must never be counted as one')
+})
+
+test('optimise-read: a start/terminal pair whose terminal outcome is no-op (review-cycle\'s ordinary "no changes found" case) is a LEGITIMATE COMPLETION, never classified as an aborted crash (M-4)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'noop-pair', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'review_cycle', repo: 'demo', outcome: 'no-op', spec: 'specs/a.md', run_id: 'noop-pair', ts: '2026-08-01T00:00:10.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1, 'a no-op run (nothing to review) still completed and its real duration must count as measured, not be discarded as a crash')
+  assert.equal(result.totals.agentComputeSeconds, 10)
+  assert.equal(result.totals.agentComputeAbortedPairs, 0)
+})
+
+test('optimise-read: only outcome "aborted" is classified as a crash -- the exhaustive enumeration proof (done, blocked, no-op all measured; aborted alone excluded) (M-4)', () => {
+  const outcomes = ['done', 'blocked', 'no-op', 'aborted']
+  for (const outcome of outcomes) {
+    const records = [
+      { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: `run-${outcome}`, ts: '2026-08-01T00:00:00.000Z' },
+      { kind: 'tdd_task', repo: 'demo', outcome, spec: 'specs/a.md', run_id: `run-${outcome}`, ts: '2026-08-01T00:01:00.000Z' },
+    ]
+    const result = mod.aggregateWallClock(records)
+    if (outcome === 'aborted') {
+      assert.equal(result.totals.agentComputeMeasuredRuns, 0, `${outcome} must be excluded from measured`)
+      assert.equal(result.totals.agentComputeAbortedPairs, 1, `${outcome} must be counted as aborted`)
+    } else {
+      assert.equal(result.totals.agentComputeMeasuredRuns, 1, `${outcome} must be counted as measured`)
+      assert.equal(result.totals.agentComputeAbortedPairs, 0, `${outcome} must NOT be counted as aborted`)
+    }
+  }
 })
 
 test('optimise-read: a per-plan bucket also carries its own agentComputeAbortedN, so an operator can see WHICH plan is crashing, not just a repo-wide total (H1)', () => {
@@ -1430,6 +1470,31 @@ test('optimise-read: two concurrent runs\' start/terminal lines, interleaved, th
   assert.equal(totals.agentComputeSeconds, 150)
 })
 
+// Review round-2 L-7: AC-QA-13's byte-identity was proven only for
+// `.totals` -- `byPlan` (a Map) follows record-ENCOUNTER order, not a
+// sorted key order, and every AC-QA-13 test up to this one only ever
+// stringified `.totals`, so a differently-ordered `byPlan` (e.g. from a
+// multi-repo aggregate or a resumed read) was never caught. Sorted by key
+// before being returned.
+test('optimise-read: aggregateWallClock\'s FULL aggregate (byPlan included, not just totals) is byte-identical regardless of record order -- byPlan is sorted by key, not left in record-encounter order (L-7)', () => {
+  const runAStart = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:00:00.000Z' }
+  const runBStart = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:05.000Z' }
+  const runAEnd = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:02:00.000Z' }
+  const runBEnd = { kind: 'review_cycle', repo: 'demo', outcome: 'done', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:35.000Z' }
+  const orderings = [
+    [runAStart, runBStart, runAEnd, runBEnd],
+    [runBEnd, runAEnd, runBStart, runAStart],
+    [runAEnd, runBStart, runAStart, runBEnd],
+  ]
+  const results = orderings.map((records) => {
+    const { byPlan } = mod.aggregateWallClock(records)
+    return JSON.stringify([...byPlan.entries()])
+  })
+  for (const r of results) assert.equal(r, results[0], 'byPlan itself (key order included) must be byte-identical regardless of record order')
+  const keys = JSON.parse(results[0]).map(([k]) => k)
+  assert.deepEqual(keys, [...keys].sort(), 'byPlan must be returned in sorted key order, not record-encounter order')
+})
+
 test('optimise-read: three records sharing one run_id (forward, reversed, and shuffled), only one of which carries a real spec, all attribute to the real spec and produce byte-identical aggregates (M3, AC-QA-13, shuffled)', () => {
   const a = { kind: 'tdd_task', repo: 'demo', outcome: 'started', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' } // no spec
   const b = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/real.md', run_id: 'r1', ts: '2026-08-01T00:00:30.000Z' }
@@ -1617,6 +1682,52 @@ test('optimise-read: aggregateRework excludes an out-of-repo spec from acVerdict
   const result = mod.aggregateRework(records, { root: '/repo' })
   assert.equal(result.acVerdicts.size, 0)
   assert.equal(result.unattributableCount, 1)
+})
+
+// ---- Review round-2 M-3, read side: ledger-append.mjs now writes
+// ac_verdicts entries with a NULLED ac_id (never dropped) when the
+// original was non-conforming, retaining ac_id_raw instead. aggregateRework
+// keys its acVerdicts map by `${repo}|${plan}|${v.ac_id}` -- an unguarded
+// null ac_id would stringify to the literal "null" and merge EVERY
+// sanitised verdict from every plan into one fake "null" AC bucket,
+// exactly the "different plans merge" bug class this whole spec exists to
+// close, one field over. Guarded by excluding null-ac_id verdicts from
+// bucketing; the per-record invalid_ac_ids_dropped counter (already
+// computed by the writer, covering both findings and ac_verdicts) is
+// summed across the window and exposed on the return so
+// optimise-cycle.js can render it. ----
+
+test('optimise-read: aggregateRework never merges verdicts with a NULLED ac_id (a sanitised, non-conforming id) into one fake "null" AC bucket -- two DIFFERENT plans\' sanitised verdicts must never collide (M-3, read-side guard)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'none', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'also-bad', verdict: 'PASS' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const result = mod.aggregateRework(records)
+  for (const [, entry] of result.acVerdicts.entries()) {
+    assert.notEqual(entry.ac_id, null, 'a null ac_id must never reach a real bucket')
+  }
+  assert.equal(result.acVerdicts.size, 0, 'both sanitised verdicts must be excluded from acVerdicts entirely, never merged into one shared bucket')
+})
+
+test('optimise-read: aggregateRework still buckets a WELL-FORMED ac_verdicts entry normally when it shares a record with a sanitised (nulled) one -- the guard must not over-exclude (M-3, not vacuous)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-SEC-1', verdict: 'PASS' }, { ac_id: null, ac_id_raw: 'none', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.acVerdicts.size, 1)
+  const entry = [...result.acVerdicts.values()][0]
+  assert.equal(entry.ac_id, 'AC-SEC-1')
+  assert.equal(entry.pass, 1)
+})
+
+test('optimise-read: aggregateRework sums invalid_ac_ids_dropped across the window and returns it, a real zero when clean (M-3)', () => {
+  const clean = mod.aggregateRework([{ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-SEC-1', verdict: 'PASS' }], invalid_ac_ids_dropped: 0 }])
+  assert.equal(clean.invalidAcIdsDropped, 0)
+  const dirty = mod.aggregateRework([
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', invalid_ac_ids_dropped: 2 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', invalid_ac_ids_dropped: 1 },
+  ])
+  assert.equal(dirty.invalidAcIdsDropped, 3, 'must sum across every review_cycle record in the window')
 })
 
 test('optimise-read: aggregateWallClock excludes a fully-degraded pair (both records marked degraded:true, no spec survives) from byPlan -- counted under a named degraded-run total, never silently folded into the no-spec bucket (AC-QA-7)', () => {
