@@ -52,12 +52,19 @@ test('plan-cycle.js: normal completion preserves the existing return shape and a
 // from its own process, which resolves the MAIN checkout via
 // --git-common-dir regardless of who invokes it -- AC-DATA-1) applies here
 // too. Same mechanism, same wording.
-test('plan-cycle.js: every lens\'s prompt instructs it to export HARNESS_LEDGER_READONLY (a truthy value) before it probes ledger-append.mjs, so a lens\'s own mutation experiments never reach the operator\'s real ledger', async () => {
+//
+// Review round-4 M2: see review-cycle.test.js's identical test for the
+// full rationale -- the original `export`-then-invoke wording (this file's
+// own, propagated from round 3) cannot work in this runtime, because shell
+// state does not persist across separate tool calls. Fixed to the
+// SAME-COMMAND form here too.
+test('plan-cycle.js: every lens\'s prompt instructs it to set HARNESS_LEDGER_READONLY on the SAME command line as the writer invocation (never a separate `export`, which cannot survive to the next tool call), before it probes ledger-append.mjs (M2)', async () => {
   const { calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
   const lensCall = calls.find((c) => c.opts.label === 'lens-security')
   assert.ok(lensCall, 'expected a lens-security call')
   assert.match(lensCall.prompt, /HARNESS_LEDGER_READONLY/, 'the lens prompt must name the env var')
-  assert.match(lensCall.prompt, /export HARNESS_LEDGER_READONLY=1/i, 'the lens prompt must give a concrete, truthy export the lens can copy verbatim')
+  assert.match(lensCall.prompt, /HARNESS_LEDGER_READONLY=1 node\b/, 'the lens prompt must give the concrete SAME-COMMAND form (var=value prefixed onto the invocation), never a separate export')
+  assert.doesNotMatch(lensCall.prompt, /\bexport HARNESS_LEDGER_READONLY/i, 'the lens prompt must NEVER instruct a bare `export` -- it cannot survive to the next tool call in this runtime')
 })
 
 // L5: see review-cycle.js's identical test for the rationale -- nothing

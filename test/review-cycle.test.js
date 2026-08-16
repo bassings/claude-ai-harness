@@ -468,15 +468,30 @@ test('review-cycle.js: a finding\'s ac_id survives into open_findings when a len
 // which worktree invoked it, so a lens's own probe from its isolated
 // worktree still lands in the operator's real ledger. ledger-append.mjs now
 // honours HARNESS_LEDGER_READONLY (see its own tests); this is the other
-// half -- every lens must be TOLD to export it before it probes the writer.
+// half -- every lens must be TOLD to set it before it probes the writer.
 // This is prompt-enforced at the lens boundary, not fully mechanical: a
 // lens that ignores its own instructions is not stopped by this alone.
-test('review-cycle.js: every lens\'s prompt instructs it to export HARNESS_LEDGER_READONLY (a truthy value) before it probes ledger-append.mjs, so a lens\'s own mutation experiments never reach the operator\'s real ledger', async () => {
+//
+// Review round-4 M2 (the coordinator's own design error, corrected): the
+// FIRST wording here told a lens to `export HARNESS_LEDGER_READONLY=1` in
+// one command, then invoke the writer in a SEPARATE one -- inoperative,
+// because this tool runtime does not persist shell state (env vars) across
+// separate tool calls, confirmed directly (`export X=1` in one Bash call,
+// `printenv X` in the next, returns nothing). The export died with the
+// call that made it, so the guard was NEVER actually armed by ANY lens,
+// ever, regardless of how carefully it followed the instruction. Fixed to
+// the SAME-COMMAND form, the one shape that does not depend on anything
+// surviving between calls: `HARNESS_LEDGER_READONLY=1 node <path> ...`, one
+// command line, prefix and invocation together. The prompt states WHY
+// (shell state does not persist), so an agent that understands the reason
+// will not "helpfully" split it back into two commands.
+test('review-cycle.js: every lens\'s prompt instructs it to set HARNESS_LEDGER_READONLY on the SAME command line as the writer invocation (never a separate `export`, which cannot survive to the next tool call), before it probes ledger-append.mjs (M2)', async () => {
   const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   const lensCall = calls.find((c) => c.opts.label === 'lens-security')
   assert.ok(lensCall, 'expected a lens-security call')
   assert.match(lensCall.prompt, /HARNESS_LEDGER_READONLY/, 'the lens prompt must name the env var')
-  assert.match(lensCall.prompt, /export HARNESS_LEDGER_READONLY=1/i, 'the lens prompt must give a concrete, truthy export the lens can copy verbatim')
+  assert.match(lensCall.prompt, /HARNESS_LEDGER_READONLY=1 node\b/, 'the lens prompt must give the concrete SAME-COMMAND form (var=value prefixed onto the invocation), never a separate export')
+  assert.doesNotMatch(lensCall.prompt, /\bexport HARNESS_LEDGER_READONLY/i, 'the lens prompt must NEVER instruct a bare `export` -- it cannot survive to the next tool call in this runtime')
 })
 
 // HARN-OPT-2 PR2 (AC-QA-8, AC-OPS-1, AC-ARCH-9): the measured defect. See

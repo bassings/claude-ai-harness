@@ -333,9 +333,12 @@ const lensPrompt = (lens) =>
   `project's interpreter or test runner, invoke the main checkout's copy by absolute path (locate the main checkout ` +
   `with \`cd "$(git rev-parse --git-common-dir)/.." && pwd\`), and never modify anything under the main checkout.\n\n` +
   `Before you run or invoke workflows/lib/ledger-append.mjs for ANY reason (a mutation experiment, a manual probe, ` +
-  `reading its behaviour): export HARNESS_LEDGER_READONLY=1 in that shell first. That script resolves the operator's ` +
-  `real, main-checkout ledger regardless of which worktree invokes it (AC-DATA-1), so without this it is not a test ` +
-  `double, it is the live ledger. You are read-only: never write to the harness's own ledger.\n\n` +
+  `reading its behaviour), prefix the variable onto that same command line: ` +
+  `\`HARNESS_LEDGER_READONLY=1 node <path-to>/ledger-append.mjs ...\`. It MUST be on the one command line that runs ` +
+  `node. Do NOT set it with a separate \`export\` in an earlier command: this runtime does not persist shell state ` +
+  `between tool calls, so an export dies with the call that made it and the guard would never be armed. That script ` +
+  `resolves the operator's real, main-checkout ledger regardless of which worktree invokes it (AC-DATA-1), so without ` +
+  `this it is not a test double, it is the live ledger. You are read-only: never write to the harness's own ledger.\n\n` +
   `Your final structured output maps the AGENT-HARNESS.md output contract onto the schema fields: verdict, coverage ` +
   `(could_not_check is mandatory and must be honest, not "nothing"), ac_verdicts, findings (each with file:line in location). ` +
   `You are licensed to return CLEAN with empty findings.`
