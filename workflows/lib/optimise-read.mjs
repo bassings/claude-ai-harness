@@ -32,7 +32,26 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, RAW_SIBLING_FIELDS } from './ledger-append.mjs'
+
+// Round-6 H1 (§12 reframe, read-side half): the writer's degradeEntry can
+// neutralise ANY value covered by RAW_SIBLING_FIELDS (ac_id/lens/severity/
+// verdict, all as of round 5) -- null the field, retain the rejected value
+// bounded in its *_raw sibling. A neutralised value must never be read as
+// evidence: wherever this file draws a conclusion FROM one of these
+// fields, it must first ask whether the value in front of it is real or a
+// stand-in for "unknown". Derived from the SAME RAW_SIBLING_FIELDS set the
+// writer exports (one definition site) rather than a second field list
+// declared here, so the two sides cannot drift apart the way ac_id and
+// verdict already did once (round-4 M3 fixed ac_id; this round's H1 is the
+// identical gap for verdict, found because the write-side rule shipped
+// without its read-side twin).
+function isNeutralised(obj, field) {
+  if (!obj || typeof obj !== 'object') return false
+  const siblingField = RAW_SIBLING_FIELDS[field]
+  if (!siblingField) return false
+  return obj[field] === null && obj[siblingField] !== null && obj[siblingField] !== undefined
+}
 
 // AC-ARCH-14: the default bound on how much ledger history a single
 // aggregation pass reads -- proven against a >=2000-line synthetic ledger
@@ -203,10 +222,25 @@ export function aggregateRework(records, { root = '' } = {}) {
   // review_cycle record in the window, exposed on the return so
   // optimise-cycle.js can render it beside the orphan counters.
   let invalidAcIdsDropped = 0
+  // Round-6 review, instruction 4: invalid_record_values_dropped (the
+  // round-5 H1 general degrade mechanism's own counter) was written to
+  // every line and read by nothing -- summed here the same way
+  // invalidAcIdsDropped already is, so an operator can see that generic
+  // values (verdicts.<lens>, lenses_run[] entries, ...) were neutralised
+  // in the window, not just infer it from the ac_id-specific counter.
+  let invalidRecordValuesDropped = 0
   for (const r of reviewRecords) {
     if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
+    if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
     for (const f of r.findings || []) {
-      bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
+      // Round-6 H1 (read-side sweep): a neutralised `lens` (null, with
+      // lens_raw retained -- round-5's own degrade mechanism) must not be
+      // read as a real lens name. Unguarded, `bumpDisposition(counts,
+      // null, ...)` stringifies to the key "null" and merges every
+      // neutralised finding's disposition from every DIFFERENT lens into
+      // one fake shared bucket -- the identical "different things merge"
+      // defect class already closed for ac_id, one field over.
+      if (!isNeutralised(f, 'lens')) bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
     }
     const verdicts = r.ac_verdicts || []
     if (!verdicts.length) continue
@@ -237,15 +271,31 @@ export function aggregateRework(records, { root = '' } = {}) {
       }
       // Review round-2 M4: same injective-escaping fix as planBucketKey.
       const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(v.ac_id)}`
-      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
+      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0, unattributedVerdicts: 0 })
       const entry = acVerdicts.get(key)
+      // Round-6 H1: the ac_id is known (we are inside this branch because
+      // it is), but the VERDICT itself may be neutralised (null, with
+      // verdict_raw retained) -- round-5's own repro. A neutralised
+      // verdict is not evidence of PASS, FAIL or UNVERIFIABLE: it must
+      // not count toward n (the "how many runs support this claim"
+      // figure feeding MIN_RUNS_FOR_NEVER_FAILED) and must not move
+      // pass/fail, or five unknowns clear the run-count floor and report
+      // never_failed:true on zero real evidence -- the exact inversion
+      // H1 reproduced. The entry is still created/kept above (not
+      // skipped entirely) so this ac_id remains VISIBLE in the report
+      // even when EVERY verdict seen for it was neutralised, rather than
+      // silently disappearing the way an entry that never existed would.
+      if (isNeutralised(v, 'verdict')) {
+        entry.unattributedVerdicts += 1
+        continue
+      }
       entry.n += 1
       if (v.verdict === 'PASS') entry.pass += 1
       else if (v.verdict === 'FAIL') entry.fail += 1
       else if (v.verdict === 'UNVERIFIABLE') entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, unattributedFailBuckets }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, unattributedFailBuckets }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -264,6 +314,14 @@ export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILE
   for (const [key, entry] of acVerdicts.entries()) {
     const insufficient_data = entry.n < minRuns
     const unattributed_fail_in_window = unattributedFailBuckets.has(`${escapeKeyComponent(entry.repo)}|${escapeKeyComponent(entry.spec)}`)
+    // Round-6 H1: this ac_id's OWN entry saw at least one neutralised
+    // verdict (aggregateRework's unattributedVerdicts, above) -- a
+    // DIFFERENT taint reason from unattributed_fail_in_window (that one
+    // fires on an unattributed ac_id ANYWHERE in the window; this one
+    // fires on a known ac_id whose verdict value itself could not be
+    // trusted). Both degrade never_failed to null; neither is folded into
+    // the other, so the render can name the right cause.
+    const unattributed_verdict_in_entry = (entry.unattributedVerdicts || 0) > 0
     out.push({
       key,
       repo: entry.repo,
@@ -272,7 +330,8 @@ export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILE
       n: entry.n,
       insufficient_data,
       unattributed_fail_in_window,
-      never_failed: insufficient_data || unattributed_fail_in_window ? null : entry.fail === 0,
+      unattributed_verdict_in_entry,
+      never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry ? null : entry.fail === 0,
     })
   }
   return out
@@ -1022,7 +1081,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },

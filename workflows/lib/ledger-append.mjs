@@ -302,6 +302,13 @@ export const LEDGER_ENTRY_SCHEMA = {
     // was dropped) when finding arrays were supplied at all, null when
     // they were not (a kind with no findings concept, e.g. tdd_task).
     findings_truncated: { type: ['integer', 'null'] },
+    // Round-6 review M2: ac_verdicts is truncated at MAX_AC_VERDICTS with
+    // no counter of its own, unlike findings/findings_truncated -- the
+    // same "the surplus was cut and NOTHING records that it happened"
+    // shape M2 (round 2) closed for findings. A real, measured 0 when
+    // ac_verdicts was supplied and nothing was dropped, null when
+    // ac_verdicts was not supplied at all.
+    ac_verdicts_truncated: { type: ['integer', 'null'] },
     rounds: { type: ['object', 'null'], additionalProperties: { type: 'integer' } },
     budget_spent: { type: ['number', 'null'] },
     // conduct_plan_event only: which state transition this line records, and
@@ -569,7 +576,14 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
 // these names but no matching *_raw sibling in ITS OWN schema would need
 // its own entry here (or its own name) -- noted so the coupling is
 // discoverable, not silently assumed.
-const RAW_SIBLING_FIELDS = { ac_id: 'ac_id_raw', lens: 'lens_raw', severity: 'severity_raw', verdict: 'verdict_raw' }
+//
+// Round-6 H1: EXPORTED (AC-ARCH-1-style single definition site) so
+// optimise-read.mjs can derive its OWN "is this value neutralised?" test
+// from the identical set the writer uses, rather than redeclaring the
+// four field names a second time -- the round-5 write-side fix and this
+// round's read-side taint fix must never be able to drift apart about
+// which fields carry a raw sibling.
+export const RAW_SIBLING_FIELDS = { ac_id: 'ac_id_raw', lens: 'lens_raw', severity: 'severity_raw', verdict: 'verdict_raw' }
 // Defensive bound on degraded_raw (see its own schema comment) -- generic
 // degradations are expected to be rare; this is a ceiling, not a routine
 // path, mirroring MAX_AC_VERDICTS's own "safety net, not an expected
@@ -689,10 +703,33 @@ export function degradeEntry(entry, redactRawField = (v) => v) {
     entry.invalid_finding_fields_dropped = invalidFindingFieldsDropped
   }
   entry.invalid_record_values_dropped = generalOnes.length
+  // Round-6 review L1/M1: `path` is built from pathParts, and a DICT KEY
+  // segment (verdicts.<lens-name>, trigger_counts.<key>, rounds.<key>) is
+  // caller-controlled free text just like `raw` is -- it had neither
+  // redaction nor a length bound. Redacting the JOINED string (the way
+  // free-text fields elsewhere use redactRawField) would miss a hostile
+  // key here: ABSOLUTE_PATH_RE only recognises an absolute path anchored
+  // at start-of-string or after whitespace/quote/paren, and
+  // pathPartsToPrefix joins a dict key onto its parent with a bare '.'
+  // (e.g. 'verdicts./etc/shadow'), which is not in that anchor set --
+  // exactly the gap M1 names. Fixed at the SEGMENT level instead: each
+  // string pathPart is redacted on its own, where a hostile value starts
+  // at position 0 and the '^' anchor always matches, before the safe
+  // (schema-fixed) and caller-controlled segments are joined -- this
+  // closes the gap without touching ABSOLUTE_PATH_RE itself, which this
+  // spec's own round-2 history (three regressions from widening it) is
+  // reason enough to leave alone for the free-text pipeline it already
+  // serves correctly.
   const degradedRaw = generalOnes
     .filter((n) => n.kind === 'generic')
     .slice(0, MAX_DEGRADED_RAW)
-    .map((n) => ({ path: pathPartsToPrefix(n.pathParts), raw: truncateBytes(redactRawField(n.raw), AC_ID_RAW_MAX_BYTES) }))
+    .map((n) => {
+      const safePathParts = n.pathParts.map((p) => (typeof p === 'string' ? redactRawField(p) : p))
+      return {
+        path: truncateBytes(pathPartsToPrefix(safePathParts), AC_ID_RAW_MAX_BYTES),
+        raw: truncateBytes(redactRawField(n.raw), AC_ID_RAW_MAX_BYTES),
+      }
+    })
   if (degradedRaw.length) entry.degraded_raw = degradedRaw
   return { ok: true }
 }
@@ -1392,10 +1429,20 @@ export function main() {
   // is sized by the spec's own AC count times the lens roster -- a few
   // dozen entries at most -- so this is a safety net against a pathological
   // input, not a path expected to fire on a real run (unlike MAX_FINDINGS,
-  // which does fire routinely; no separate truncated-count field is kept
-  // for the same reason AC-SIMP-4 favours the simplest guard that closes
-  // the real risk).
-  if (Array.isArray(entry.ac_verdicts)) entry.ac_verdicts = entry.ac_verdicts.slice(0, MAX_AC_VERDICTS)
+  // which does fire routinely).
+  // Round-6 review M2: "no separate truncated-count field is kept" (the
+  // original AC-SIMP-4 reasoning above) was itself the defect -- a bound
+  // that silently drops the surplus with nothing recording it happened is
+  // exactly the "correct in source, absent from the visibility" shape this
+  // whole spec exists to close, one field over from findings_truncated.
+  // Real, measured 0 when ac_verdicts was supplied and nothing was
+  // dropped, null when it was not supplied at all -- same null-vs-zero
+  // convention as findings_truncated.
+  if (Array.isArray(entry.ac_verdicts)) {
+    const acVerdictsTruncated = Math.max(0, entry.ac_verdicts.length - MAX_AC_VERDICTS)
+    entry.ac_verdicts = entry.ac_verdicts.slice(0, MAX_AC_VERDICTS)
+    entry.ac_verdicts_truncated = acVerdictsTruncated
+  }
 
   // Round-5 H1 (§12 reframe): replaces the round-2 (ac_id) and round-4
   // (lens/severity) per-field allowlists with the general degrade

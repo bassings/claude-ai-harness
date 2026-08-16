@@ -744,7 +744,7 @@ test('ledger-append: ac_id_raw redacts an absolute path outside the repo the sam
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    ac_verdicts: [{ ac_id: '/Users/scott.b/.ssh/id_rsa', verdict: 'FAIL' }],
+    ac_verdicts: [{ ac_id: '/Users/someoperator/.ssh/id_rsa', verdict: 'FAIL' }],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
@@ -773,7 +773,7 @@ test('ledger-append: lens_raw and severity_raw are redacted the same way ac_id_r
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: '/Users/scott.b/.aws/credentials', location: 'x', claim: 'y', severity: '/Users/scott.b/.aws/credentials2' }],
+    open_findings: [{ lens: '/Users/someoperator/.aws/credentials', location: 'x', claim: 'y', severity: '/Users/someoperator/.aws/credentials2' }],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
@@ -1293,6 +1293,56 @@ test('ledger-append: verdicts.<lens> outside the CLEAN/FINDINGS/BLOCKED enum is 
   const entry = JSON.parse(lines[0])
   assert.equal(entry.verdicts['lens-data'], undefined, 'the non-conforming verdicts entry must be dropped, not written with an out-of-enum value')
   assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+// Round-6 review L1/M1: degraded_raw.raw was redacted (round-5's own
+// fix), but degraded_raw.path was not -- and the caller-controlled
+// segment of a generic drop's path is exactly a DICT KEY (verdicts.
+// <lens-name>), which can itself be a hostile absolute path. M1: the
+// naive fix (running the shared redactPaths over the already-JOINED path
+// string) would still leak, because pathPartsToPrefix joins a dict key
+// onto its parent with a bare '.' ('verdicts./etc/shadow'), and
+// ABSOLUTE_PATH_RE only recognises an absolute path anchored at
+// start-of-string or after whitespace/quote/paren -- not after a plain
+// '.'. Fixed by redacting each pathPart SEGMENT independently (where a
+// hostile value starts at position 0 and always matches) before joining,
+// never by widening the shared regex (which this spec's own history
+// shows breaks ordinary relative paths when done carelessly).
+test('ledger-append: degraded_raw.path redacts a hostile absolute-path DICT KEY, not just degraded_raw.raw -- and does so even though the path is JOINED with a bare "." separator the shared redaction regex does not anchor on (round-6 L1/M1)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    // The VALUE must also be non-conforming, or nothing is dropped at all
+    // and there is no degraded_raw entry to check: dict KEYS are not
+    // schema-constrained by anything in this file (only dict VALUES are,
+    // since round-2 H2's own fix) -- a hostile key paired with a
+    // perfectly valid value reaches the ledger untouched regardless of
+    // this fix. That is a real, separate, PRE-EXISTING gap (latent since
+    // round 2, not introduced or closed here); recorded as a caveat, not
+    // fixed, since it was not what L1/M1 named and fixing it is a genuine
+    // scope decision (validate/redact dict KEYS themselves) beyond this
+    // round's ask.
+    verdicts: { '/Users/someoperator/.ssh/id_rsa': 'MAYBE' },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const lines = readLedgerLines(repo)
+  assert.ok(!lines[0].includes('someoperator'), `the account name must never reach the ledger via degraded_raw.path, got: ${lines[0]}`)
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.degraded_raw.length, 1)
+  assert.equal(entry.degraded_raw[0].path, 'verdicts.<redacted-path>', `the hostile dict-key segment must be redacted even though it is joined with a bare "." separator, got: ${entry.degraded_raw[0].path}`)
+})
+
+test('ledger-append: degraded_raw.path is bounded the same way degraded_raw.raw already is (round-6 L1, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const hostileKey = 'a'.repeat(200)
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', verdicts: { [hostileKey]: 'MAYBE' } })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.degraded_raw[0].path.length <= 32, `degraded_raw.path must be bounded, got length ${entry.degraded_raw[0].path.length}`)
 })
 
 test('ledger-append: ac_verdicts[].verdict outside PASS/FAIL/UNVERIFIABLE is NULLED with the original preserved in verdict_raw, and the record IS WRITTEN (round-5 H1, exact coordinator repro)', () => {
@@ -1940,6 +1990,35 @@ test('ledger-append: ac_verdicts pairs survive to the written line verbatim (H4)
     { ac_id: 'AC-SEC-3', verdict: 'FAIL' },
     { ac_id: 'AC-QA-9', verdict: 'PASS' },
   ])
+})
+
+// Round-6 review M2: ac_verdicts was bounded at MAX_AC_VERDICTS with no
+// counter recording how many were dropped, unlike findings/
+// findings_truncated -- a surplus of AC verdicts silently vanished with
+// nothing on the line saying so.
+test('ledger-append: ac_verdicts_truncated is a real, measured count when more than MAX_AC_VERDICTS entries are supplied (round-6 M2)', () => {
+  const repo = makeTempRepo()
+  const acVerdicts = Array.from({ length: 205 }, (_, i) => ({ ac_id: `AC-QA-${i + 1}`, verdict: 'PASS' }))
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', ac_verdicts: acVerdicts })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts.length, 200, 'the bound itself is unchanged')
+  assert.equal(entry.ac_verdicts_truncated, 5, 'the surplus must be counted, not silently dropped')
+})
+
+test('ledger-append: ac_verdicts_truncated is a real zero (not null) when ac_verdicts was supplied and nothing was dropped (round-6 M2, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PASS' }] })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts_truncated, 0)
+})
+
+test('ledger-append: ac_verdicts_truncated is absent/null when ac_verdicts was not supplied at all (round-6 M2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.ac_verdicts_truncated === null || entry.ac_verdicts_truncated === undefined)
 })
 
 test('ledger-append: an ac_verdicts entry carrying an "evidence" key is rejected outright, not silently stripped (H4, AC-SEC-2)', () => {

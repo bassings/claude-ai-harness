@@ -154,9 +154,9 @@ test('optimise-read: aggregateRework produces byte-identical, hand-computable co
   const keyA = 'demo|specs/a.md|AC-QA-1'
   const keyB = 'demo|specs/b.md|AC-QA-1'
   assert.notEqual(keyA, keyB)
-  assert.deepEqual(result.acVerdicts.get(keyA), { repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 2, fail: 0, unverifiable: 0, n: 2 })
-  assert.deepEqual(result.acVerdicts.get(keyB), { repo: 'demo', spec: 'specs/b.md', ac_id: 'AC-QA-1', pass: 0, fail: 1, unverifiable: 0, n: 1 })
-  assert.deepEqual(result.acVerdicts.get('demo|specs/a.md|AC-SEC-1'), { repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-SEC-1', pass: 0, fail: 1, unverifiable: 0, n: 1 })
+  assert.deepEqual(result.acVerdicts.get(keyA), { repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 2, fail: 0, unverifiable: 0, n: 2, unattributedVerdicts: 0 })
+  assert.deepEqual(result.acVerdicts.get(keyB), { repo: 'demo', spec: 'specs/b.md', ac_id: 'AC-QA-1', pass: 0, fail: 1, unverifiable: 0, n: 1, unattributedVerdicts: 0 })
+  assert.deepEqual(result.acVerdicts.get('demo|specs/a.md|AC-SEC-1'), { repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-SEC-1', pass: 0, fail: 1, unverifiable: 0, n: 1, unattributedVerdicts: 0 })
 })
 
 test('optimise-read: aggregateRework called twice on the identical fixture produces byte-identical JSON output (AC-QA-21)', () => {
@@ -1869,6 +1869,120 @@ test('optimise-read: neverFailingAcs called with no unattributedFailBuckets opti
   const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5 })
   assert.equal(never[0].never_failed, true)
   assert.equal(never[0].unattributed_fail_in_window, false)
+})
+
+// ---- Round-6 review H1 (§12 reframe, read-side half): the round-5 write-
+// side fix shipped without its symmetric read-side rule. A neutralised
+// value (null, with a retained *_raw sibling) is a stand-in for "unknown",
+// and the reader was still reading it as a real PASS/FAIL/lens-name in
+// every place it draws a conclusion. Coordinator's own repro: five records
+// each carrying {ac_id:'AC-DATA-9', verdict:null, verdict_raw:'FAILED'}
+// reported never_failed:true, n:5 -- five UNKNOWNS clearing
+// MIN_RUNS_FOR_NEVER_FAILED and asserting the opposite of the truth.
+//
+// This table is the guard against a FIFTH recurrence of the "allowlist,
+// not a rule" mistake -- a table naming only `verdict` (this round's own
+// repro field) would be the identical mistake one level up, in test form.
+// Drives every field RAW_SIBLING_FIELDS declares (ac_id, lens, severity,
+// verdict), asserting for each: the record still aggregates without
+// throwing, the neutralised value is never read as real evidence, and the
+// specific conclusion the reader draws from that field is tainted rather
+// than asserted as fact. Where a field has NO current read-side consumer
+// (severity), that is stated and proven directly, not silently skipped. ----
+
+test('optimise-read: NEUTRALISED-VALUE TABLE -- ac_verdicts[].verdict, neutralised (round-6 H1, exact coordinator repro): does not count toward n, does not move pass/fail, taints never_failed to null for THIS ac_id', () => {
+  const neutralised = Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-9', verdict: null, verdict_raw: 'FAILED' }] }))
+  const rework = mod.aggregateRework(neutralised)
+  const entry = [...rework.acVerdicts.values()].find((e) => e.ac_id === 'AC-DATA-9')
+  assert.ok(entry, 'the ac_id must still be VISIBLE in the report even though every verdict seen for it was neutralised -- not silently absent')
+  assert.equal(entry.n, 0, 'five neutralised verdicts must not clear MIN_RUNS_FOR_NEVER_FAILED')
+  assert.equal(entry.pass, 0)
+  assert.equal(entry.fail, 0)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+  const nf = never.find((a) => a.ac_id === 'AC-DATA-9')
+  assert.equal(nf.never_failed, null, 'must NEVER report true on zero real evidence -- this is the exact inversion H1 reproduced')
+  // n correctly drops to 0 (none of the 5 neutralised verdicts counted),
+  // which ALSO trips insufficient_data via the pre-existing minRuns check
+  // -- both signals firing together is fine, never_failed is null either
+  // way. unattributed_verdict_in_entry is asserted independently so it is
+  // proven to fire on its own, not merely riding along on insufficient_data.
+  assert.equal(nf.unattributed_verdict_in_entry, true)
+})
+
+test('optimise-read: NEUTRALISED-VALUE TABLE -- findings[].lens, neutralised: excluded from lensDispositionCounts, never merged into a fake shared "null" bucket with a DIFFERENT neutralised lens', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [{ id: 'f1', lens: null, lens_raw: 'orchestrator', severity: 'Low', ac_id: null, disposition: 'open' }] },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [{ id: 'f2', lens: null, lens_raw: 'a-totally-different-bad-name', severity: 'Low', ac_id: null, disposition: 'spec_bug' }] },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [{ id: 'f3', lens: 'lens-security', severity: 'Low', ac_id: null, disposition: 'rejected' }] },
+  ]
+  const rework = mod.aggregateRework(records)
+  assert.equal(rework.lensDispositionCounts['null'], undefined, 'two DIFFERENT neutralised lenses must never merge into one fake "null" bucket -- the identical defect class already closed for ac_id')
+  assert.deepEqual(rework.lensDispositionCounts['lens-security'], { fixed: 0, rejected: 1, spec_bug: 0, open: 0 }, 'the one genuine lens must still be counted normally -- the guard must not over-exclude')
+  assert.equal(Object.keys(rework.lensDispositionCounts).length, 1, 'only the genuine lens should appear at all')
+})
+
+test('optimise-read: NEUTRALISED-VALUE TABLE -- ac_verdicts[].ac_id, neutralised: already excluded from bucketing (pre-existing round-4 M3 mechanism), still holds under the round-6 general isNeutralised test', () => {
+  const records = Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'FAIL' }] }))
+  const rework = mod.aggregateRework(records)
+  assert.equal(rework.acVerdicts.size, 0, 'a neutralised ac_id must never create a bucket keyed on the literal string "null"')
+})
+
+test('optimise-read: NEUTRALISED-VALUE TABLE -- findings[].severity, neutralised: has NO current read-side consumer, so there is nothing to taint -- stated and proven directly, not silently skipped (round-6 instruction 3)', () => {
+  const records = [{ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [{ id: 'f1', lens: 'lens-security', severity: null, severity_raw: 'Urgent', ac_id: null, disposition: 'open' }] }]
+  const rework = mod.aggregateRework(records)
+  // The only conclusion aggregateRework draws from a finding is its
+  // disposition (bumpDisposition, by lens) -- severity never reaches any
+  // aggregate today. Proven, not assumed: the genuine lens's disposition
+  // count is unaffected by severity being neutralised alongside it.
+  assert.deepEqual(rework.lensDispositionCounts['lens-security'], { fixed: 0, rejected: 0, spec_bug: 0, open: 1 })
+})
+
+test('optimise-read: NEUTRALISED-VALUE TABLE -- invalid_record_values_dropped is summed across the window and returned, mirroring invalidAcIdsDropped exactly (round-6 instruction 4)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', invalid_record_values_dropped: 2 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', invalid_record_values_dropped: 1 },
+  ]
+  const rework = mod.aggregateRework(records)
+  assert.equal(rework.invalidRecordValuesDropped, 3)
+})
+
+// ---- Round-6: the NON-neutralised control. The fix must not degenerate
+// into tainting everything -- a genuine FAIL must still report
+// never_failed:false, and a genuine all-PASS window must still report
+// true. Run in the SAME file, immediately after the neutralised table, so
+// a reader sees both halves of the proof together. ----
+
+test('optimise-read: NON-neutralised control -- a genuine FAIL verdict (not null, no *_raw sibling involved) still reports never_failed:false, exactly as before (round-6, proves the fix does not over-taint)', () => {
+  const records = Array.from({ length: 5 }, (_, i) => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-10', verdict: i === 2 ? 'FAIL' : 'PASS' }] }))
+  const rework = mod.aggregateRework(records)
+  const entry = [...rework.acVerdicts.values()].find((e) => e.ac_id === 'AC-DATA-10')
+  assert.equal(entry.n, 5)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+  const nf = never.find((a) => a.ac_id === 'AC-DATA-10')
+  assert.equal(nf.never_failed, false, 'a genuine, real FAIL must still be reported as a real FAIL')
+  assert.equal(nf.unattributed_verdict_in_entry, false)
+})
+
+test('optimise-read: NON-neutralised control -- a genuine all-PASS window (n meeting the minimum, no neutralised verdicts anywhere) still reports never_failed:true (round-6, proves the fix does not over-taint)', () => {
+  const records = Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-11', verdict: 'PASS' }] }))
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+  const nf = never.find((a) => a.ac_id === 'AC-DATA-11')
+  assert.equal(nf.never_failed, true, 'a genuinely well-supported never-failing criterion must still be reported as such -- the fix must not blind the report entirely')
+  assert.equal(nf.unattributed_verdict_in_entry, false)
+})
+
+test('optimise-read: NON-neutralised control -- a MIX of real verdicts and one neutralised verdict for the SAME ac_id still taints never_failed to null (not diluted into a false confidence by the real evidence sitting alongside it)', () => {
+  const records = [
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-12', verdict: 'PASS' }] })),
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-12', verdict: null, verdict_raw: 'FAILED' }] },
+  ]
+  const rework = mod.aggregateRework(records)
+  const entry = [...rework.acVerdicts.values()].find((e) => e.ac_id === 'AC-DATA-12')
+  assert.equal(entry.n, 5, 'the 5 real PASS verdicts must still count -- the neutralised one must not subtract from n, only fail to ADD to it')
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+  const nf = never.find((a) => a.ac_id === 'AC-DATA-12')
+  assert.equal(nf.never_failed, null, 'one neutralised verdict alongside five real PASSes must still taint the claim -- real evidence does not vouch for the unknown sitting next to it')
 })
 
 test('optimise-read: aggregateWallClock excludes a fully-degraded pair (both records marked degraded:true, no spec survives) from byPlan -- counted under a named degraded-run total, never silently folded into the no-spec bucket (AC-QA-7)', () => {

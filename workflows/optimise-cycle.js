@@ -894,6 +894,15 @@ function buildReport(d) {
   // that predates the field) renders the same explicit marker H-1 defined
   // above, rather than a confident 0.
   lines.push(`invalid_ac_ids_dropped (sanitised, non-conforming AC ids from lens findings/verdicts): ${fmtCountOrUnavailable(d.rework && d.rework.invalidAcIdsDropped)}.`)
+  // Round-6 review, instruction 4: invalid_record_values_dropped (the
+  // round-5 H1 general degrade mechanism's own counter -- verdicts.<lens>,
+  // ac_verdicts[].verdict, lenses_run[]/lenses_skipped[] entries, and any
+  // future field it comes to cover) was written to every line and read by
+  // NOTHING -- the exact "a counter reaching nothing a human sees" shape
+  // the invalid_ac_ids_dropped comment above already names, for a
+  // different counter. A silent neutralisation is how the H1 regression
+  // stayed invisible in the first place.
+  lines.push(`invalid_record_values_dropped (sanitised, non-conforming values elsewhere -- verdicts/ac_verdicts.verdict/lenses_run entries): ${fmtCountOrUnavailable(d.rework && d.rework.invalidRecordValuesDropped)}.`)
   // Review round-1 H2: the two orphan classes AC-OPS-2 exists to separate
   // -- a start-only orphan and a terminal-only orphan (the START write
   // itself failed) -- were computed by optimise-read.mjs and reached no
@@ -989,11 +998,17 @@ function buildReport(d) {
       // Rendered distinctly so an operator does not read "insufficient
       // data" (implying a small window) for a defect that is actually
       // about lost attribution.
+      // Round-6 H1: unattributed_verdict_in_entry is a THIRD distinct
+      // reason -- this specific ac_id's own verdict values were
+      // neutralised (see invalid_record_values_dropped), not merely an
+      // unattributed ac_id somewhere else in the window.
       const reasonSuffix = a.insufficient_data
         ? ' (insufficient data)'
         : a.unattributed_fail_in_window
           ? ' (unattributed FAIL in window -- see invalid_ac_ids_dropped)'
-          : `, never_failed=${a.never_failed}`
+          : a.unattributed_verdict_in_entry
+            ? ' (unattributed verdict for this criterion -- see invalid_record_values_dropped)'
+            : `, never_failed=${a.never_failed}`
       lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}`)
     }
   } else {
