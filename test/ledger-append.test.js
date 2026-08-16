@@ -567,6 +567,92 @@ test('ledger-append: a findings[].ac_id that fails the pattern is NULLED with th
   assert.equal(entry.invalid_ac_ids_dropped, 1)
 })
 
+// M1 (conductor tick 26 remainder): reproduces the live-tip repro exactly
+// -- {"kind":"review_cycle","outcome":"done","spec":"a.md","run_id":"m1t",
+// "spec_bugs":[{"lens":"orchestrator","location":"a.md:1","claim":"x"}]}
+// returned write_ok:false ("findings[0].lens: ...") and wrote NOTHING,
+// permanently losing the run's outcome/verdicts/ac_verdicts/findings/budget
+// from the only durable, unbacked-up copy. 'orchestrator' is not exotic:
+// this spec's own veto table attributes decisions to the orchestrator, and
+// review-cycle.js passes synthesis.spec_bugs through unmapped, so a model
+// can produce it on any run. Extends the ac_id treatment (M-3, above) to
+// `lens`: nulled, retained bounded in lens_raw, counted under its own named
+// field, and -- the point of this fix -- the record is WRITTEN.
+test('ledger-append: a findings[].lens value that fails the lens/reviewer pattern is NULLED with the original preserved in lens_raw, and the record IS WRITTEN -- a malformed field costs that field, never the line (M1)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec: 'a.md',
+    run_id: 'm1t',
+    spec_bugs: [{ lens: 'orchestrator', location: 'a.md:1', claim: 'x' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed with the offending field neutralised, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- a malformed field must cost that field, never the whole line')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.findings.length, 1, 'the finding itself must survive')
+  assert.equal(entry.findings[0].lens, null, 'the non-conforming lens value must be nulled, not left in a shape that fails validation')
+  assert.equal(entry.findings[0].lens_raw, 'orchestrator', 'the rejected value must be recoverable, mirroring ac_id_raw')
+  assert.equal(entry.findings[0].disposition, 'spec_bug', 'the rest of the finding must survive')
+  assert.equal(entry.invalid_finding_fields_dropped, 1, 'the sanitisation must be counted under its own named field, distinguishable from a real orphan')
+  assert.equal(out.invalid_finding_fields_dropped, 1, 'the CLI result (what writeLedger actually sees) must also carry the count, not just the stored line')
+})
+
+for (const field of ['open_findings', 'spec_bugs', 'rejected_findings']) {
+  test(`ledger-append: a non-conforming lens in ${field} is neutralised, not fatal to the write (M1, same treatment across all three descriptor arrays)`, () => {
+    const repo = makeTempRepo()
+    const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', [field]: [{ lens: 'orchestrator', location: 'a.md:1', claim: 'x' }] })
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, true, `${field}: expected the write to succeed, got: ${out.write_error}`)
+    assert.equal(readLedgerLines(repo).length, 1, `${field}: the record must be written`)
+  })
+}
+
+test('ledger-append: a well-formed findings[].lens value is left completely untouched -- never nulled, never counted (M1, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'x' }] })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].lens, 'lens-security')
+  assert.equal(entry.findings[0].lens_raw, undefined, 'lens_raw must not appear at all when nothing was sanitised')
+  assert.equal(entry.invalid_finding_fields_dropped, 0)
+})
+
+// M1: severity is the same defect class as lens -- an enum-constrained
+// field inside the same descriptor element that used to fail the WHOLE
+// entry. Same treatment, same loop, same counter.
+test('ledger-append: a findings[].severity value outside the enum is NULLED with the original preserved in severity_raw, and the record IS WRITTEN (M1, same defect class as lens)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'x', severity: 'Urgent' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed, got: ${out.write_error}`)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].severity, null)
+  assert.equal(entry.findings[0].severity_raw, 'Urgent')
+  assert.equal(entry.invalid_finding_fields_dropped, 1)
+})
+
+test('ledger-append: invalid_finding_fields_dropped is a real zero (not null) when a findings array was supplied and every lens/severity was well-formed (M1, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'x', severity: 'High' }] })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.invalid_finding_fields_dropped, 0)
+})
+
+test('ledger-append: invalid_finding_fields_dropped is absent/null when no findings array was supplied at all (tdd_task has no findings concept) (M1)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.invalid_finding_fields_dropped === null || entry.invalid_finding_fields_dropped === undefined)
+})
+
 test('ledger-append: invalid_ac_ids_dropped is a real zero (not null) when ac_verdicts/findings were supplied and every ac_id was well-formed (M3, not vacuous)', () => {
   const repo = makeTempRepo()
   runAppend(repo, {
@@ -1373,11 +1459,22 @@ test('ledger-append module: LEDGER_ENTRY_SCHEMA never declares an "evidence", "l
 // Review round-2 M-3: ac_id_raw added (bounded, AC-DATA-4-style
 // recoverability for a rejected ac_id) -- still no evidence/location/claim
 // field, the AC-SEC-2 exclusion this test guards is unaffected.
-test('ledger-append module: findings schema entries only carry lens, severity, ac id (plus its bounded raw form), and disposition (AC-SEC-2, M-3)', async () => {
+// M1 (round 4 remainder): lens_raw/severity_raw added, same pattern, for
+// the same recoverability reason -- see the M1 tests above.
+test('ledger-append module: findings schema entries only carry lens (plus its bounded raw form), severity (plus its bounded raw form), ac id (plus its bounded raw form), and disposition (AC-SEC-2, M-3, M1)', async () => {
   const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
   const findingProps = Object.keys(LEDGER_ENTRY_SCHEMA.properties.findings.items.properties)
-  assert.deepEqual(findingProps.sort(), ['ac_id', 'ac_id_raw', 'disposition', 'id', 'lens', 'severity'])
+  assert.deepEqual(findingProps.sort(), ['ac_id', 'ac_id_raw', 'disposition', 'id', 'lens', 'lens_raw', 'severity', 'severity_raw'])
   assert.equal(LEDGER_ENTRY_SCHEMA.properties.findings.items.additionalProperties, false)
+})
+
+// M1: lens and severity are now nullable, mirroring ac_id -- a rejected
+// value is retained via *_raw, never dropping the whole finding.
+test('ledger-append module: LEDGER_ENTRY_SCHEMA declares findings.lens and findings.severity as nullable (M1, mirrors ac_id)', async () => {
+  const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
+  const props = LEDGER_ENTRY_SCHEMA.properties.findings.items.properties
+  assert.deepEqual(props.lens.type.slice().sort(), ['null', 'string'])
+  assert.deepEqual(props.severity.type.slice().sort(), ['null', 'string'])
 })
 
 // L4: outcome must not be unconditionally required -- it is not a
@@ -1483,17 +1580,33 @@ test('ledger-append: open, spec_bug and rejected findings all coexist in the sam
   assert.ok(byDisposition.open && byDisposition.spec_bug && byDisposition.rejected)
 })
 
-test('ledger-append: a finding\'s "lens" field is constrained to the roster pattern, so routing a secret through it is rejected rather than written verbatim (M6)', () => {
+// M1 supersedes this M6 test's ORIGINAL zero-tolerance assertion
+// (write_ok:false, zero lines written) the same way round-2 M-3 superseded
+// it for ac_id (see that superseding test's own comment, immediately
+// below): rejecting the whole entry over one bad lens value is exactly the
+// defect M1 fixes -- it destroyed the run's outcome/verdicts/findings/
+// budget over one free-text field. The secret-exfiltration guarantee M6
+// actually cares about (never write the secret verbatim) is preserved by
+// lens_raw's bound, not by refusing the write.
+test('ledger-append: a finding\'s "lens" field is constrained to the roster pattern -- a secret routed through it is NULLED, the finding survives, and lens_raw retains only a BOUNDED prefix that excludes the actual secret-shaped payload (M1 supersedes M6\'s zero-tolerance verbatim claim with a considered, bounded one, mirroring ac_id\'s M-3 treatment)', () => {
   const repo = makeTempRepo()
+  const hostileLens = 'not a real lens, just filler prose to push the secret past the bound sk-live-CANARY-9999'
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: 'secret sk-live-CANARY-9999 seen at ... process.env.API_KEY', location: 'x', claim: 'y' }],
+    spec_bugs: [{ lens: hostileLens, location: 'x', claim: 'y' }],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.equal(out.write_ok, false, 'a lens field that is not a real roster identifier must be rejected, not written')
-  assert.equal(readLedgerLines(repo).length, 0)
+  assert.equal(out.write_ok, true, `expected the write to succeed with the hostile lens sanitised, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1)
+  assert.ok(!lines[0].includes('sk-live-CANARY-9999'), 'the actual secret-shaped payload must never reach the ledger, bounded or not')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.findings[0].lens, null)
+  assert.ok(entry.findings[0].lens_raw.length <= 32, `lens_raw must be bounded, got length ${entry.findings[0].lens_raw.length}`)
+  assert.equal(entry.findings[0].claim, undefined, 'sanity: claim was never a declared field to begin with (AC-SEC-2 evidence exclusion, unrelated to this fix)')
+  assert.equal(entry.invalid_finding_fields_dropped, 1)
 })
 
 // Review round-1 M3, corrected by round-2 M-3: the ORIGINAL M6 assertion

@@ -1285,12 +1285,14 @@ test('optimise-read: aggregateWallClock still measures the genuine case -- exact
 })
 
 // ---- HARN-OPT-2 PR2 (AC-OPS-2): the two orphan classes -- a lone 'started'
-// record (an exception escaped run() before the terminal write, or the
-// process was killed) versus a lone terminal record (the START write
-// itself failed) -- are different defects with different fixes, and must be
-// counted and named SEPARATELY, in addition to the combined
-// agentComputeUnmeasuredRuns total, so fixing one can never read as
-// progress on the other. ----
+// record (M1, round 4 remainder: the process was killed before the
+// terminal write, or the terminal write's own payload was refused -- an
+// exception escaping run() no longer causes this, since PR2's try/finally
+// always attempts a terminal write) versus a lone terminal record (the
+// START write itself failed) -- are different defects with different
+// fixes, and must be counted and named SEPARATELY, in addition to the
+// combined agentComputeUnmeasuredRuns total, so fixing one can never read
+// as progress on the other. ----
 
 test('optimise-read: aggregateWallClock counts a lone started record as a start-only orphan (agentComputeStartOnlyRuns), broken down by kind, distinct from a lone terminal record (AC-OPS-2)', () => {
   const records = [

@@ -478,11 +478,22 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   let unattributableRuns = 0
   // HARN-OPT-2 PR2 (AC-OPS-2): the two orphan classes named and counted
   // SEPARATELY, in addition to the combined agentComputeUnmeasuredN/Runs
-  // total below -- a start-only orphan (an exception escaped run() before
-  // the terminal write, or the process was killed) and a terminal-only
-  // orphan (the START write itself failed) are different defects with
-  // different fixes, so a fix landed for one must never read as progress on
-  // the other. "By kind" breaks each down by tdd_task/review_cycle/plan_cycle.
+  // total below -- a start-only orphan and a terminal-only orphan (the
+  // START write itself failed) are different defects with different fixes,
+  // so a fix landed for one must never read as progress on the other. "By
+  // kind" breaks each down by tdd_task/review_cycle/plan_cycle.
+  //
+  // M1 (round 4 remainder): this comment used to name "an exception
+  // escaped run() before the terminal write" as a start-only-orphan cause.
+  // That is now WRONG: PR2's try/finally means an exception escaping run()
+  // always attempts a terminal write, which lands as a PAIRED `aborted`
+  // record, not a start-only orphan. A start-only orphan today means either
+  // the process was killed before the terminal write ran (no JS-level
+  // unwind occurs at all), or the terminal write's own payload was refused
+  // -- which used to include a single malformed descriptor element (a
+  // model-supplied `lens`/`ac_id` failing the schema), now neutralised
+  // field-by-field by ledger-append.mjs before validateEntry runs (see its
+  // own comments on invalid_ac_ids_dropped/invalid_finding_fields_dropped).
   let agentComputeStartOnlyRuns = 0
   let agentComputeTerminalOnlyRuns = 0
   // Review round-1 M1: accumulated in whatever order run_ids are first

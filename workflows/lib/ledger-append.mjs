@@ -100,6 +100,12 @@ const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 // free-text ac_id from a lens no longer fails the WHOLE record).
 const AC_ID_PATTERN_STR = '^AC-[A-Z]+-[0-9]+$'
 const AC_ID_RE = new RegExp(AC_ID_PATTERN_STR)
+// M1 (round 4 remainder): the single definition site for the `lens` shape,
+// shared by the schema declaration above and by the findings sanitiser
+// (which nulls a non-conforming value BEFORE validateEntry runs, mirroring
+// AC_ID_PATTERN_STR/AC_ID_RE exactly).
+const LENS_PATTERN_STR = '^(lens|reviewer)-[a-z]+$'
+const LENS_RE = new RegExp(LENS_PATTERN_STR)
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // 'fixed' is never written by the workflows in this PR: no single run can
 // know a finding from an earlier round was fixed. It is reserved for a
@@ -181,8 +187,20 @@ export const LEDGER_ENTRY_SCHEMA = {
           // or a quoted source line routed through either field wrote
           // verbatim. additionalProperties:false on `evidence` itself
           // cannot catch this: it is a different route into the same line.
-          lens: { type: 'string', pattern: '^(lens|reviewer)-[a-z]+$' },
-          severity: { type: 'string', enum: SEVERITIES },
+          //
+          // M1 (round 4 remainder): `lens` and `severity` are now nullable,
+          // matching ac_id's own M-3 treatment below -- a non-conforming
+          // value used to fail validateEntry for the WHOLE entry
+          // (write_ok:false, the record gone from the only durable copy).
+          // The findings sanitiser nulls the value and retains it, bounded,
+          // in *_raw instead, so one bad field costs that field, never the
+          // line. Reuses AC_ID_RAW_MAX_BYTES's bound and its reasoning
+          // (M6, below): long enough for a realistic value, short enough
+          // that a hostile payload appended after it is cut off.
+          lens: { type: ['string', 'null'], pattern: LENS_PATTERN_STR },
+          lens_raw: { type: ['string', 'null'] },
+          severity: { type: ['string', 'null'], enum: SEVERITIES },
+          severity_raw: { type: ['string', 'null'] },
           ac_id: { type: ['string', 'null'], pattern: AC_ID_PATTERN_STR },
           // Review round-2 M-3: when ac_id is nulled by the sanitiser
           // below (a non-conforming value), the rejected value is
@@ -229,9 +247,21 @@ export const LEDGER_ENTRY_SCHEMA = {
     // (including a real 0 when every value was well-formed), null when
     // neither was supplied (mirrors findings_truncated's own semantics).
     // Named distinctly from AC-OPS-2's start-only/terminal-only orphan
-    // counters so this cause is never mistaken for "an exception escaped
-    // run() or the process was killed".
+    // counters so this cause is never mistaken for a start-only orphan's
+    // actual causes (the process being killed before the terminal write,
+    // or the terminal write itself failing for a reason this sanitiser
+    // does not cover).
     invalid_ac_ids_dropped: { type: ['integer', 'null'] },
+    // M1 (round 4 remainder): companion counter for invalid_ac_ids_dropped
+    // -- how many findings[].lens/severity values were non-conforming and
+    // nulled (with the rejected value retained, bounded, in lens_raw/
+    // severity_raw). Named separately rather than folded into
+    // invalid_ac_ids_dropped: a different field failed for a different
+    // reason, and conflating the two would make one counter answer two
+    // different operator questions. Same null-vs-zero semantics as
+    // invalid_ac_ids_dropped: a real 0 when findings were supplied and all
+    // were well-formed, null when no findings array was supplied at all.
+    invalid_finding_fields_dropped: { type: ['integer', 'null'] },
     // M2: how many findings were computed but dropped to keep `findings`
     // within MAX_FINDINGS -- an integer (a real, measured 0 when nothing
     // was dropped) when finding arrays were supplied at all, null when
@@ -1148,6 +1178,20 @@ export function main() {
   // apart from a real orphan, and returned from result() so writeLedger
   // sees it too.
   let invalidAcIdsDropped = 0
+  // M1 (round 4 remainder): a non-conforming `lens` or `severity` value
+  // used to fail validateEntry for the WHOLE entry, exactly the ac_id
+  // defect above -- reproduced live: `spec_bugs: [{lens:'orchestrator',
+  // location:'a.md:1', claim:'x'}]` (a value this spec's own veto table
+  // uses, so a model can emit it on any run) returned write_ok:false and
+  // wrote nothing, permanently losing the run's outcome, verdicts,
+  // ac_verdicts, findings and budget from the only durable copy. The lost
+  // run then reappeared as a start-only orphan with the wrong stated
+  // cause (see the corrected comment on invalid_ac_ids_dropped's schema
+  // declaration, above). Same treatment as ac_id, in the SAME loop over
+  // entry.findings so spec_bugs/rejected_findings/open_findings (already
+  // merged into entry.findings by computeFindings, above) all get it
+  // uniformly -- reusing the existing mechanism rather than a parallel one.
+  let invalidFindingFieldsDropped = 0
   if (Array.isArray(entry.findings)) {
     for (const f of entry.findings) {
       if (!f || typeof f !== 'object') continue // M-2: left for validateEntry to reject the whole entry, as main did
@@ -1155,6 +1199,16 @@ export function main() {
         f.ac_id_raw = truncateBytes(f.ac_id, AC_ID_RAW_MAX_BYTES)
         f.ac_id = null
         invalidAcIdsDropped += 1
+      }
+      if (typeof f.lens === 'string' && !LENS_RE.test(f.lens)) {
+        f.lens_raw = truncateBytes(f.lens, AC_ID_RAW_MAX_BYTES)
+        f.lens = null
+        invalidFindingFieldsDropped += 1
+      }
+      if (typeof f.severity === 'string' && !SEVERITIES.includes(f.severity)) {
+        f.severity_raw = truncateBytes(f.severity, AC_ID_RAW_MAX_BYTES)
+        f.severity = null
+        invalidFindingFieldsDropped += 1
       }
     }
   }
@@ -1170,6 +1224,9 @@ export function main() {
   }
   if (Array.isArray(entry.findings) || Array.isArray(entry.ac_verdicts)) {
     entry.invalid_ac_ids_dropped = invalidAcIdsDropped
+  }
+  if (Array.isArray(entry.findings)) {
+    entry.invalid_finding_fields_dropped = invalidFindingFieldsDropped
   }
 
   const errors = validateEntry(entry)
@@ -1365,6 +1422,9 @@ export function main() {
   const extra = {}
   if (entry.event_key) extra.event_key = entry.event_key
   if (typeof entry.invalid_ac_ids_dropped === 'number') extra.invalid_ac_ids_dropped = entry.invalid_ac_ids_dropped
+  // M1 (round 4 remainder): invalid_finding_fields_dropped rides on the CLI
+  // result too, mirroring invalid_ac_ids_dropped exactly, above.
+  if (typeof entry.invalid_finding_fields_dropped === 'number') extra.invalid_finding_fields_dropped = entry.invalid_finding_fields_dropped
   return Object.keys(extra).length ? { ...result(run_id, ts, true, null), ...extra } : result(run_id, ts, true, null)
 }
 

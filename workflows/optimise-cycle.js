@@ -849,12 +849,15 @@ function buildReport(d) {
   // above, rather than a confident 0.
   lines.push(`invalid_ac_ids_dropped (sanitised, non-conforming AC ids from lens findings/verdicts): ${fmtCountOrUnavailable(d.rework && d.rework.invalidAcIdsDropped)}.`)
   // Review round-1 H2: the two orphan classes AC-OPS-2 exists to separate
-  // -- a start-only orphan (an exception escaped run(), or the process was
-  // killed) and a terminal-only orphan (the START write itself failed) --
-  // were computed by optimise-read.mjs and reached no report a human
-  // reads. Always rendered, with real zeros when clean, so a fix landed
-  // for one class never reads as progress on the other, and a missing
-  // line means the check stopped running, never that nothing is wrong.
+  // -- a start-only orphan and a terminal-only orphan (the START write
+  // itself failed) -- were computed by optimise-read.mjs and reached no
+  // report a human reads. Always rendered, with real zeros when clean, so a
+  // fix landed for one class never reads as progress on the other, and a
+  // missing line means the check stopped running, never that nothing is
+  // wrong. M1 (round 4 remainder): a start-only orphan's causes are named
+  // accurately at optimise-read.mjs's own comment on this counter -- an
+  // exception escaping run() no longer produces one (PR2's try/finally
+  // always attempts a terminal write).
   function formatByKind(byKind) {
     const entries = Object.entries(byKind || {})
     return entries.length ? entries.map(([k, n]) => `${k}: ${n}`).join(', ') : 'none'
