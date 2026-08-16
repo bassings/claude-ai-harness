@@ -813,6 +813,47 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combine
   assert.equal(perRepoSum, out.n, 'with no window truncation, perRepo\'s summed counts must equal n exactly -- no starvation, no divergence')
 })
 
+// Round-4 review L8 (AC-QA-20): the AC states a 0.5s wall-clock bound over
+// a 2000-record ledger, but the ONLY thing enforcing it was a structural
+// guard (test/optimise-static.test.js: the per-record loops contain no fs
+// call) -- real, but it proves an O(1)-per-record SHAPE, not a wall-clock
+// NUMBER; an algorithmic regression that stayed fs-free but went quadratic
+// in record count would pass every existing check. This is the timing
+// assertion itself, generous (2s, not 0.5s) so it cannot flake under
+// parallel suite load the way a tight bound would -- both lenses measured
+// one to two orders of magnitude inside 0.5s (3.9-6.6ms via the exported
+// functions, 43-50ms via the real CLI), so 2s leaves ample headroom while
+// still catching a genuine quadratic-blowup regression.
+test('optimise-read CLI: aggregating a real 2000-record ledger through the CLI stays well under a generous 2s wall-clock ceiling, three consecutive runs (L8, AC-QA-20)', () => {
+  const repo = makeTempRepo()
+  const ledgerPath = path.join(repo, LEDGER_REL)
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
+  const lines = []
+  for (let i = 0; i < 2000; i++) {
+    lines.push(JSON.stringify({
+      schema_version: 2, run_id: `r${i}`, ts: `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+      repo: 'demo', kind: 'review_cycle', outcome: 'done', spec: `specs/${i % 20}.md`, plan_key: `specs/${i % 20}.md`,
+      lenses_run: ['lens-security', 'lens-qa'], lenses_skipped: [],
+      findings: [{ id: `f${i}`, lens: 'lens-qa', severity: 'Low', ac_id: `AC-QA-${(i % 5) + 1}`, disposition: 'open' }],
+      ac_verdicts: [{ ac_id: `AC-QA-${(i % 5) + 1}`, verdict: i % 7 === 0 ? 'FAIL' : 'PASS' }],
+      write_ok: true, write_error: null,
+    }))
+  }
+  fs.writeFileSync(ledgerPath, lines.join('\n') + '\n')
+  const elapsedMs = []
+  for (let run = 0; run < 3; run++) {
+    const before = Date.now()
+    const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+    elapsedMs.push(Date.now() - before)
+    assert.equal(res.status, 0, res.stderr)
+    const out = JSON.parse(res.stdout.trim())
+    assert.equal(out.n, 2000, 'sanity: the real fixture must actually reach aggregation, not be windowed/skipped away')
+  }
+  for (const ms of elapsedMs) {
+    assert.ok(ms < 2000, `expected each of 3 runs under 2000ms, got ${elapsedMs.join(', ')}ms`)
+  }
+})
+
 test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal targets from stdin and returns a stable id per target, in order', () => {
   const payload = { targets: [{ category: 'ci_demote', job_name: 'lint' }, { category: 'ci_demote', job_name: 'test' }] }
   const res = spawnSync('node', [MODULE_PATH, 'ids'], { input: JSON.stringify(payload), encoding: 'utf8' })
@@ -1744,6 +1785,90 @@ test('optimise-read: aggregateRework sums invalid_ac_ids_dropped across the wind
     { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', invalid_ac_ids_dropped: 1 },
   ])
   assert.equal(dirty.invalidAcIdsDropped, 3, 'must sum across every review_cycle record in the window')
+})
+
+// ---- Round-4 review M3: a FAILED criterion silently inverts to
+// never_failed:true when the failing verdict's ac_id was sanitised (round-
+// 2 M-3's own ac_id_raw retention) or supplied explicitly null. Both
+// routes reach the exact same silent `continue` in aggregateRework: the
+// FAIL is on disk (ac_id_raw, or just the bare FAIL verdict) but never
+// enters any acVerdicts bucket, so a key with only PASS entries for the
+// same (repo, plan) window reports a confident never_failed:true while the
+// FAIL sits unread two lines away. This is precisely what neverFailingAcs
+// feeds to the retire-the-guard proposal lane -- an inverted conclusion
+// here means proposing to delete a check that DOES fail. Fixed minimally
+// and safely (the review's own "or, minimally" option, chosen over
+// re-attribution by ac_id_raw pattern-matching: re-attribution would let a
+// hostile ac_id/ac_id_raw string ending in a real AC id redirect its own
+// FAIL onto an unrelated criterion, a second injection route into
+// telemetry): aggregateRework now tracks which (repo, plan) windows saw an
+// unattributed FAIL, and neverFailingAcs degrades every ac_id in that
+// window to never_failed:null with unattributed_fail_in_window:true,
+// rather than computing from the (incomplete) pass/fail counts it can see. ----
+
+test('optimise-read: neverFailingAcs never reports never_failed:true when an unattributed FAIL verdict (a sanitised, non-conforming ac_id) exists in the same repo+plan window -- a dropped FAIL row must degrade the claim to unknown, never invert it to true (M3, lens-data route, mirrors the review\'s own fixture)', () => {
+  const passRecords = Array.from({ length: 5 }, () => ({
+    kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done',
+    ac_verdicts: [{ ac_id: 'AC-DATA-1', verdict: 'PASS' }],
+  }))
+  const failRecords = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const rework = mod.aggregateRework([...passRecords, ...failRecords])
+  const never = mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  assert.equal(never.length, 1, 'sanity: the 2 unattributed FAILs must not have created a second bucket')
+  const entry = never[0]
+  assert.equal(entry.ac_id, 'AC-DATA-1')
+  assert.equal(entry.n, 5, 'sanity: the 2 unattributed FAILs must not have entered this bucket by any other route')
+  assert.equal(entry.never_failed, null, 'a hidden FAIL must never be reported as a confident never_failed:true')
+  assert.equal(entry.unattributed_fail_in_window, true, 'the degradation reason must be distinguishable from insufficient_data')
+})
+
+test('optimise-read: an EXPLICITLY-null ac_id FAIL (never sanitised -- supplied that way, no ac_id_raw at all) taints the bucket the same way a sanitised one does (M3, lens-security route)', () => {
+  const records = [
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-SEC-9', verdict: 'PASS' }] })),
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, verdict: 'FAIL' }] },
+  ]
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  const entry = never.find((e) => e.ac_id === 'AC-SEC-9')
+  assert.equal(entry.never_failed, null)
+  assert.equal(entry.unattributed_fail_in_window, true)
+})
+
+test('optimise-read: neverFailingAcs does NOT taint a bucket when the unattributed verdict was a PASS or UNVERIFIABLE, not a FAIL -- only a hidden FAIL is the inversion risk (M3, not vacuous)', () => {
+  const records = [
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-1', verdict: 'PASS' }] })),
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'PASS' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  const entry = never.find((e) => e.ac_id === 'AC-DATA-1')
+  assert.equal(entry.never_failed, true, 'an unattributed PASS carries no inversion risk and must not suppress a genuine never_failed:true')
+  assert.equal(entry.unattributed_fail_in_window, false)
+})
+
+test('optimise-read: an unattributed FAIL in one plan\'s window does not taint a DIFFERENT plan\'s never_failed claim (M3, not over-broad)', () => {
+  const records = [
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-1', verdict: 'PASS' }] })),
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-2', verdict: 'PASS' }] })),
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  const tainted = never.find((e) => e.ac_id === 'AC-DATA-1')
+  const clean = never.find((e) => e.ac_id === 'AC-DATA-2')
+  assert.equal(tainted.never_failed, null)
+  assert.equal(clean.never_failed, true, 'a different plan\'s bucket must never be tainted by another plan\'s unattributed FAIL')
+})
+
+test('optimise-read: neverFailingAcs called with no unattributedFailBuckets option at all (every pre-M3 call site) behaves exactly as before -- backward compatible, no default taint (M3)', () => {
+  const records = Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-1', verdict: 'PASS' }] }))
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5 })
+  assert.equal(never[0].never_failed, true)
+  assert.equal(never[0].unattributed_fail_in_window, false)
 })
 
 test('optimise-read: aggregateWallClock excludes a fully-degraded pair (both records marked degraded:true, no spec survives) from byPlan -- counted under a named degraded-run total, never silently folded into the no-spec bucket (AC-QA-7)', () => {

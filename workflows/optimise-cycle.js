@@ -518,12 +518,47 @@ function segmentMeasuredRuns(segment) {
 function segmentTotalRuns(segment) {
   return segmentMeasuredRuns(segment) + segmentUnmeasuredRuns(segment)
 }
+// Round-4 review M5: whether the reader's totals object actually carries
+// the measured/unmeasured fields a segment's share needs -- the render
+// loop further down needs the two flags SEPARATELY (measuredFieldPresent/
+// unmeasuredFieldPresent, matching H-1's own convention), the gate needs
+// only their AND. Single definition site for all three: `undefined` when
+// the reader's totals object never carried the field at all (a stale or
+// partial installed optimise-read.mjs), distinguishable from a genuine 0.
+// Before this fix, the gate re-derived presence independently (inline
+// `!== undefined` at the render site only) and a stale reader's own
+// absence silently coerced into a share of 0 via the `typeof v ===
+// 'number' ? v : 0` defaults above -- the one brake this PR added
+// released in exactly the run its own report labels unavailable.
+function segmentMeasuredFieldPresent(segment) {
+  const prefix = WALL_CLOCK_SEGMENT_FIELD_PREFIX[segment]
+  return !!prefix && wallClockTotals[`${prefix}MeasuredRuns`] !== undefined
+}
+function segmentUnmeasuredFieldPresent(segment) {
+  const prefix = WALL_CLOCK_SEGMENT_FIELD_PREFIX[segment]
+  return !!prefix && wallClockTotals[`${prefix}UnmeasuredRuns`] !== undefined
+}
+function segmentFieldsPresent(segment) {
+  return segmentMeasuredFieldPresent(segment) && segmentUnmeasuredFieldPresent(segment)
+}
 // A segment with zero total attempts has nothing to be uncertain ABOUT --
 // share is 0, not NaN/undefined, so the gate below never suppresses on a
-// segment nobody has touched yet.
+// segment nobody has touched yet. Round-4 review M5: null, distinct from a
+// real 0, when the reader's totals genuinely lack the fields -- "field
+// absent" must never be read as "share 0".
 function segmentUnmeasuredShare(segment) {
+  if (!segmentFieldsPresent(segment)) return null
   const total = segmentTotalRuns(segment)
   return total > 0 ? segmentUnmeasuredRuns(segment) / total : 0
+}
+// Round-4 review M5: the single place "does this segment's measurement
+// quality justify suppression" is decided -- an unavailable share (null)
+// suppresses exactly like a share at or above the threshold; the gate,
+// the drop-reason detail and the render's own `suppressed` flag all route
+// through this one function so the three cannot disagree.
+function isSegmentSuppressed(segment) {
+  const share = segmentUnmeasuredShare(segment)
+  return share === null || share >= UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD
 }
 // Round-3 F4: the typed `target.segment` tag alone made this gate
 // agent-tag-dependent -- a proposal genuinely motivated by a null segment
@@ -540,7 +575,7 @@ function motivatingSegments(p) {
   return [...new Set([...tagged, ...mentioned])]
 }
 function isUnmeasuredSegmentMotivated(p) {
-  return motivatingSegments(p).some((seg) => segmentUnmeasuredShare(seg) >= UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD)
+  return motivatingSegments(p).some(isSegmentSuppressed)
 }
 const droppedUnmeasuredSegment = proposals.filter(isUnmeasuredSegmentMotivated)
 proposals = proposals.filter((p) => !isUnmeasuredSegmentMotivated(p))
@@ -659,10 +694,18 @@ const reportMarkdown = buildReport({
   // free text, or both -- report every segment that actually motivated the
   // drop (has >=1 unmeasured run), not just whatever target.segment says
   // (which may be unset for a free-text-caught proposal).
+  // Round-4 review M5: a segment can be suppressed for TWO different
+  // reasons now -- a real, computed unmeasured share at or above the
+  // threshold, or the reader's totals lacking the fields entirely. Naming
+  // both with the same "N unmeasured runs" phrasing would fabricate a
+  // count of 0 for the second case, which is exactly the false-clean
+  // signal this fix exists to close one layer up (the gate).
   droppedUnmeasuredSegmentDetails: droppedUnmeasuredSegment.flatMap((p) =>
     motivatingSegments(p)
-      .filter((seg) => segmentUnmeasuredShare(seg) >= UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD)
-      .map((seg) => ({ segment: seg, unmeasuredRuns: segmentUnmeasuredRuns(seg) }))
+      .filter(isSegmentSuppressed)
+      .map((seg) => segmentFieldsPresent(seg)
+        ? { segment: seg, unmeasuredRuns: segmentUnmeasuredRuns(seg), reason: 'unmeasured_share' }
+        : { segment: seg, unmeasuredRuns: null, reason: 'reader_field_unavailable' })
   ),
   // Owner decision: the ratio must always print, whether or not the gate
   // fires for anything this cycle -- an operator must be able to see how
@@ -675,9 +718,12 @@ const reportMarkdown = buildReport({
     // undefined when the reader's totals object never carried this
     // segment's fields at all (a stale installed optimise-read.mjs) --
     // distinguishable from a genuine 0/0, matching H-1's own convention.
-    measuredFieldPresent: wallClockTotals[`${WALL_CLOCK_SEGMENT_FIELD_PREFIX[seg]}MeasuredRuns`] !== undefined,
-    unmeasuredFieldPresent: wallClockTotals[`${WALL_CLOCK_SEGMENT_FIELD_PREFIX[seg]}UnmeasuredRuns`] !== undefined,
-    suppressed: segmentUnmeasuredShare(seg) >= UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD,
+    // Round-4 review M5: routed through the same presence check the gate
+    // uses (segmentMeasuredFieldPresent/segmentUnmeasuredFieldPresent),
+    // rather than a second inline computation of the same thing.
+    measuredFieldPresent: segmentMeasuredFieldPresent(seg),
+    unmeasuredFieldPresent: segmentUnmeasuredFieldPresent(seg),
+    suppressed: isSegmentSuppressed(seg),
   })),
   droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
   ranked,
@@ -936,7 +982,19 @@ function buildReport(d) {
   lines.push('## Never-failing acceptance criteria (source: ledger)')
   if (d.neverFailingAcs && d.neverFailingAcs.length) {
     for (const a of d.neverFailingAcs) {
-      lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${a.insufficient_data ? ' (insufficient data)' : `, never_failed=${a.never_failed}`}`)
+      // Round-4 review M3: unattributed_fail_in_window is a DIFFERENT
+      // reason for never_failed:null than insufficient_data -- a
+      // sanitised/null-ac_id FAIL sits somewhere in a window with plenty
+      // of runs, it is simply not attributable to this specific criterion.
+      // Rendered distinctly so an operator does not read "insufficient
+      // data" (implying a small window) for a defect that is actually
+      // about lost attribution.
+      const reasonSuffix = a.insufficient_data
+        ? ' (insufficient data)'
+        : a.unattributed_fail_in_window
+          ? ' (unattributed FAIL in window -- see invalid_ac_ids_dropped)'
+          : `, never_failed=${a.never_failed}`
+      lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}`)
     }
   } else {
     lines.push('None recorded.')
@@ -1006,7 +1064,15 @@ function buildReport(d) {
       lines.push(`${entry.segment}: ${UNAVAILABLE_STALE_READER}`)
       continue
     }
-    const pct = entry.totalRuns > 0 ? Math.round((entry.unmeasuredRuns / entry.totalRuns) * 100) : 0
+    // Round-4 review L7: Math.round could round the DISPLAYED percentage
+    // up past the threshold while the GATE's own exact-ratio comparison
+    // (unrounded, in isSegmentSuppressed) says "below it" -- e.g. 8/41 =
+    // 19.512%, rounds to 20%, prints "(20%) -- below the 20% suppression
+    // threshold", a self-contradicting line that reads exactly like the
+    // gate silently failing. Math.floor never rounds a sub-threshold ratio
+    // up to the threshold's own display value, so the printed percentage
+    // and the gate's verdict can never disagree.
+    const pct = entry.totalRuns > 0 ? Math.floor((entry.unmeasuredRuns / entry.totalRuns) * 100) : 0
     const verdict = entry.suppressed
       ? `at/above the ${thresholdPct}% suppression threshold: wall-clock proposals citing this segment are suppressed`
       : `below the ${thresholdPct}% suppression threshold`
@@ -1017,9 +1083,14 @@ function buildReport(d) {
   // an operator reading this line could not previously tell WHICH segment
   // blocked a proposal, or how badly unmeasured it was, without parsing
   // the raw JSON return.
+  // Round-4 review M5: a suppression can now be a real, computed count OR
+  // "the reader field is unavailable" -- rendered distinctly, never a
+  // fabricated 0.
   const unmeasuredSegmentBySegment = {}
-  for (const entry of d.droppedUnmeasuredSegmentDetails || []) unmeasuredSegmentBySegment[entry.segment] = entry.unmeasuredRuns
-  const unmeasuredSegmentDetail = Object.entries(unmeasuredSegmentBySegment).map(([seg, n]) => `${seg} (${n} unmeasured runs)`).join(', ')
+  for (const entry of d.droppedUnmeasuredSegmentDetails || []) {
+    unmeasuredSegmentBySegment[entry.segment] = entry.reason === 'reader_field_unavailable' ? 'reader field unavailable' : `${entry.unmeasuredRuns} unmeasured runs`
+  }
+  const unmeasuredSegmentDetail = Object.entries(unmeasuredSegmentBySegment).map(([seg, detail]) => `${seg} (${detail})`).join(', ')
   lines.push(
     `Drafted: ${d.draftedCount}. Dropped (no resolvable citation): ${d.droppedNoCitationCount}. ` +
     `Dropped (always-on security lens removal, never permitted): ${d.droppedAlwaysOnSecurityCount}. ` +

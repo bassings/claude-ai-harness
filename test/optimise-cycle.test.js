@@ -989,6 +989,115 @@ test('optimise-cycle: a proposal whose target.segment is fully measured (0 unmea
   assert.equal(result.proposals_ranked.length, 1)
 })
 
+// ---- Round-4 review M5/M6: the round-3 owner fix (proportion-based
+// suppression) coerces a MISSING measured/unmeasured field to a share of
+// 0 (`typeof v === 'number' ? v : 0`), so the one brake standing between
+// unmeasurable data and a shipped proposal silently releases in exactly
+// the run where the report itself prints "unavailable" for that segment --
+// the inverse of the round-3 fix's own stated principle ("a false pass
+// could ship a proposal built on a window that turns out to be mostly
+// unmeasured"). M6 is the same defect one layer up: the render branch that
+// prints "unavailable" for this exact totals shape already exists
+// (measuredFieldPresent/unmeasuredFieldPresent, computed for the render
+// loop) but nothing wired those same presence flags into the GATE, and no
+// test drove a totals shape missing the fields through the real gate to
+// notice -- deleting the render branch left the full suite green. Both
+// fixed by routing the gate through the same presence check the renderer
+// already computes, so "absent" and "a real, computed 0" cannot be
+// confused in either direction. ----
+
+test('optimise-cycle: a proposal motivated by a segment FAILS CLOSED (is suppressed) when the reader totals lack the measured/unmeasured fields entirely -- "field absent" must never be read as "share 0" (M5, a defect in the round-3 owner fix)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        // Deliberately the shape a stale/partial reader would return:
+        // no agentComputeMeasuredRuns/agentComputeUnmeasuredRuns at all,
+        // exactly the totals shape the H-1 stale-reader test above uses.
+        totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute dominates wall-clock', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0, 'a proposal motivated by a segment whose measurement quality is UNKNOWN must never ship, the same as one motivated by a genuinely high-unmeasured segment')
+})
+
+test('optimise-cycle: the SAME stale-reader totals shape still renders "unavailable" in the Filtering drop-reason detail, naming the actual reason rather than a fabricated unmeasured-run count of 0 (M5, drop-reason detail must not lie either)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute dominates wall-clock', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const filteringLine = result.report.split('\n').find((l) => l.startsWith('Drafted:'))
+  assert.ok(filteringLine, `expected the Filtering summary line, report was: ${result.report}`)
+  assert.match(filteringLine, /agent_compute \(reader field unavailable\)/, `must name the real reason, not a fabricated count, got: ${filteringLine}`)
+})
+
+test('optimise-cycle: the Filtering section\'s per-segment ratio line renders "unavailable" (not a confident 0/0 or 0%) when the reader totals lack the measured/unmeasured fields entirely -- guards the stale-reader render branch a full-suite mutation could not previously see (M6)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('agent_compute:'))
+  assert.ok(line, `expected an agent_compute ratio line in the Filtering section, report was: ${result.report}`)
+  assert.match(line, /unavailable/i, `got: ${line}`)
+  assert.ok(!/0\/0|\(0%\)/.test(line), `must not render a confident 0/0 or (0%) when the fields are genuinely absent, got: ${line}`)
+})
+
+test('optimise-cycle: a proposal motivated by a segment still SURVIVES when that segment\'s totals are genuinely present and fully measured -- M5\'s fail-closed fix must not fail closed on a real, computed 0 too (not vacuous)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 100, agentComputeMeasuredRuns: 10, agentComputeUnmeasuredRuns: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute dominates wall-clock', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1, 'a genuinely fully-measured, zero-unmeasured segment must still survive -- the fix must distinguish absent from a real 0')
+})
+
+// Round-4 review L7: 8/41 = 19.512%, which Math.round pushed to 20% --
+// the exact same integer as the threshold, so the line printed "(20%) --
+// below the 20% suppression threshold", a self-contradicting statement
+// (the ratio line's OWN reported percentage equals the threshold while
+// claiming to be below it) that reads exactly like the gate silently
+// failing. The gate itself compares the UNROUNDED ratio (0.19512 >= 0.2
+// is false), so the proposal correctly survives either way -- this test
+// pins the DISPLAY text, not the gate's verdict.
+test('optimise-cycle: the ratio line\'s displayed percentage never contradicts its own verdict clause -- 8/41 (19.512%) must print a percentage strictly below 20, never the threshold\'s own value (L7)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 4100, agentComputeMeasuredRuns: 33, agentComputeUnmeasuredRuns: 8, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('agent_compute:'))
+  assert.ok(line, `expected an agent_compute ratio line, report was: ${result.report}`)
+  assert.match(line, /8\/41 runs unmeasured \(19%\) -- below the 20% suppression threshold/, `got: ${line}`)
+  assert.ok(!line.includes('(20%)'), `the displayed percentage must never equal the threshold while the line claims to be below it, got: ${line}`)
+})
+
 // ---- Review round-3 F4 (AC-OPS-3, spec bug): the unmeasured-segment gate must not depend on the agent having set target.segment ----
 
 test('optimise-cycle: an UNTAGGED proposal (no target.segment at all) whose motivating_measurement mentions "agent_compute" is still dropped when that segment has unmeasured runs -- the gate reads the free text, not just the typed tag (round-3 F4)', async () => {

@@ -182,6 +182,21 @@ export function aggregateRework(records, { root = '' } = {}) {
   const lensDispositionCounts = {}
   const acVerdicts = new Map()
   let unattributableCount = 0
+  // Round-4 review M3: an unattributed (sanitised, or explicitly null)
+  // ac_id whose verdict is FAIL must not simply vanish from this
+  // aggregation -- neverFailingAcs feeds directly into a "retire this
+  // guard" proposal, and a hidden FAIL there is an INVERTED conclusion
+  // (the guard fails and the report says it never has), not merely a lost
+  // measurement. Tracked per (repo, plan) bucket -- the same key shape
+  // acVerdicts itself uses, minus the ac_id segment -- rather than
+  // attempting to re-attribute the FAIL to a specific ac_id from
+  // ac_id_raw: a hostile ac_id/ac_id_raw crafted to END in a real AC id
+  // (e.g. "ignore previous instructions AC-SEC-1") could otherwise redirect
+  // its own FAIL onto an unrelated criterion, a second injection route
+  // into telemetry. neverFailingAcs (below) degrades every ac_id in a
+  // tainted bucket to never_failed:null rather than computing from the
+  // (necessarily incomplete) counts it can see.
+  const unattributedFailBuckets = new Set()
   // Review round-2 M-3: invalid_ac_ids_dropped is a real, measured integer
   // on a record only when the writer actually sanitised something (or
   // supplied 0 when nothing needed sanitising) -- summed here across every
@@ -209,7 +224,17 @@ export function aggregateRework(records, { root = '' } = {}) {
       // exactly the "different plans merge" defect class this spec exists
       // to close. Excluded from bucketing entirely; already counted once
       // via invalidAcIdsDropped above, never counted twice.
-      if (v.ac_id === null || v.ac_id === undefined) continue
+      if (v.ac_id === null || v.ac_id === undefined) {
+        // Round-4 review M3: the FAIL is real data sitting two lines away
+        // in the same window -- taint this (repo, plan) bucket so
+        // neverFailingAcs never reports a confident never_failed:true
+        // while it exists. A PASS/UNVERIFIABLE unattributed verdict
+        // carries no inversion risk and is left exactly as before.
+        if (v.verdict === 'FAIL') {
+          unattributedFailBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}`)
+        }
+        continue
+      }
       // Review round-2 M4: same injective-escaping fix as planBucketKey.
       const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(v.ac_id)}`
       if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
@@ -220,16 +245,25 @@ export function aggregateRework(records, { root = '' } = {}) {
       else if (v.verdict === 'UNVERIFIABLE') entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, unattributedFailBuckets }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
 // count backing it) and is insufficient_data below minRuns, regardless of
 // whether every recorded verdict happens to be PASS.
-export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED } = {}) {
+//
+// Round-4 review M3: `unattributedFailBuckets` (aggregateRework's own
+// return value, above) degrades every ac_id sharing a (repo, plan) window
+// with an unattributed FAIL to never_failed:null -- computing PASS/FAIL
+// from `entry` alone is exactly the inversion this fix closes, since
+// `entry` by construction never saw the hidden FAIL. Defaults to an empty
+// Set so every pre-existing call site (none of which knows this option
+// exists) behaves identically to before: no tainted buckets, no change.
+export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set() } = {}) {
   const out = []
   for (const [key, entry] of acVerdicts.entries()) {
     const insufficient_data = entry.n < minRuns
+    const unattributed_fail_in_window = unattributedFailBuckets.has(`${escapeKeyComponent(entry.repo)}|${escapeKeyComponent(entry.spec)}`)
     out.push({
       key,
       repo: entry.repo,
@@ -237,7 +271,8 @@ export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILE
       ac_id: entry.ac_id,
       n: entry.n,
       insufficient_data,
-      never_failed: insufficient_data ? null : entry.fail === 0,
+      unattributed_fail_in_window,
+      never_failed: insufficient_data || unattributed_fail_in_window ? null : entry.fail === 0,
     })
   }
   return out
@@ -977,7 +1012,7 @@ function runLedgerCommand(roots, window) {
   // unaffected.
   const canonicalRoot = roots[0] || ''
   const rework = aggregateRework(windowed, { root: canonicalRoot })
-  const neverFailing = neverFailingAcs(rework.acVerdicts, {})
+  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
   const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
   const trigger = aggregateTriggerAccuracy(windowed)
   const proposalOutcomes = aggregateProposalOutcomes(windowed)

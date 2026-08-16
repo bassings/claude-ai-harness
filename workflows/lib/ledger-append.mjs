@@ -1177,6 +1177,21 @@ export function main() {
   // sanitisation is counted in one place so an operator can tell this
   // apart from a real orphan, and returned from result() so writeLedger
   // sees it too.
+  // Round-4 review L1: ac_id_raw (and lens_raw/severity_raw below) is a
+  // FREE-TEXT field carrying whatever the caller supplied -- exactly the
+  // same class of value task/round_key/event/event_key already go
+  // through relativiseAgainstRoot+redactPaths for, above. The sanitiser
+  // below runs AFTER that pass, so these *_raw fields were never in scope
+  // for it: a non-conforming ac_id/lens/severity containing an absolute
+  // path leaked the operator's account name verbatim into the ledger.
+  // Reuses the SAME redaction pipeline (never a parallel one), applied
+  // BEFORE truncation so a path is made safe before it is cut down, not
+  // after (cutting first could leave a recognisable path fragment inside
+  // the bound).
+  function redactRawField(value) {
+    let v = cwdRoot && cwdRoot !== root ? relativiseAgainstRoot(value, cwdRoot) : value
+    return redactPaths(v, root)
+  }
   let invalidAcIdsDropped = 0
   // M1 (round 4 remainder): a non-conforming `lens` or `severity` value
   // used to fail validateEntry for the WHOLE entry, exactly the ac_id
@@ -1196,17 +1211,17 @@ export function main() {
     for (const f of entry.findings) {
       if (!f || typeof f !== 'object') continue // M-2: left for validateEntry to reject the whole entry, as main did
       if (typeof f.ac_id === 'string' && !AC_ID_RE.test(f.ac_id)) {
-        f.ac_id_raw = truncateBytes(f.ac_id, AC_ID_RAW_MAX_BYTES)
+        f.ac_id_raw = truncateBytes(redactRawField(f.ac_id), AC_ID_RAW_MAX_BYTES)
         f.ac_id = null
         invalidAcIdsDropped += 1
       }
       if (typeof f.lens === 'string' && !LENS_RE.test(f.lens)) {
-        f.lens_raw = truncateBytes(f.lens, AC_ID_RAW_MAX_BYTES)
+        f.lens_raw = truncateBytes(redactRawField(f.lens), AC_ID_RAW_MAX_BYTES)
         f.lens = null
         invalidFindingFieldsDropped += 1
       }
       if (typeof f.severity === 'string' && !SEVERITIES.includes(f.severity)) {
-        f.severity_raw = truncateBytes(f.severity, AC_ID_RAW_MAX_BYTES)
+        f.severity_raw = truncateBytes(redactRawField(f.severity), AC_ID_RAW_MAX_BYTES)
         f.severity = null
         invalidFindingFieldsDropped += 1
       }
@@ -1216,8 +1231,20 @@ export function main() {
     for (const v of entry.ac_verdicts) {
       if (!v || typeof v !== 'object') continue // M-2: left for validateEntry to reject the whole entry, as main did
       if (typeof v.ac_id === 'string' && !AC_ID_RE.test(v.ac_id)) {
-        v.ac_id_raw = truncateBytes(v.ac_id, AC_ID_RAW_MAX_BYTES)
+        v.ac_id_raw = truncateBytes(redactRawField(v.ac_id), AC_ID_RAW_MAX_BYTES)
         v.ac_id = null
+        invalidAcIdsDropped += 1
+      } else if (v.ac_id === null) {
+        // Round-4 review M3 (writer half): an ac_verdicts entry ALWAYS
+        // concerns a specific criterion (unlike findings.ac_id, which
+        // legitimately has no-AC-attached) -- an explicit null supplied by
+        // the caller, never touched by the string-pattern branch above
+        // since it was never a string, must still be counted, or a FAIL
+        // verdict can vanish from the reader's aggregate while
+        // invalid_ac_ids_dropped reports 0 sanitisations, which is exactly
+        // the false-clean signal an operator would trust. On `main` the
+        // same payload was refused outright (ac_id was not nullable at
+        // all); this branch's own nullable design reopened the route.
         invalidAcIdsDropped += 1
       }
     }

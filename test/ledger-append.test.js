@@ -686,6 +686,102 @@ test('ledger-append: a null ac_id in findings (the ordinary "no AC" case) is lef
   assert.equal(entry.invalid_ac_ids_dropped, 0, 'a genuinely absent ac_id is not an invalid one -- must not be counted as a drop')
 })
 
+// Round-4 review M3 (writer half): an ac_verdicts entry ALWAYS concerns a
+// specific criterion -- unlike findings.ac_id, there is no legitimate
+// "verdict not about any AC" case -- so an explicit `ac_id: null` supplied
+// by the caller (never touched by the string-pattern sanitiser above,
+// since it is already null, not a non-conforming string) reached
+// validateEntry silently uncounted: write_ok:true with
+// invalid_ac_ids_dropped:0, and the reader's aggregateRework then drops the
+// verdict with no trace at all. On main the same payload was refused
+// outright (main required ac_verdicts.ac_id as a plain pattern-matching
+// string, so an explicit null failed schema validation), so this branch's
+// own nullable-ac_id design (M-3, round 2) reopened a silent-loss route
+// main did not have. Counted here, at the one place both routes (a
+// rejected string, or an explicit null) converge.
+test('ledger-append: an ac_verdicts entry with ac_id EXPLICITLY null (never sanitised -- supplied that way, not produced by the string-pattern check) is counted under invalid_ac_ids_dropped, never left silently at zero (round-4 review M3, writer half)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: null, verdict: 'FAIL' }, { ac_id: 'AC-SEC-9', verdict: 'PASS' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts.length, 2, 'the FAIL verdict itself must still survive on the line')
+  assert.equal(entry.invalid_ac_ids_dropped, 1, 'an explicit null ac_id must be counted, never silently reported as zero sanitisations')
+  assert.equal(out.invalid_ac_ids_dropped, 1, 'the CLI result must also carry the count')
+})
+
+test('ledger-append: an explicitly-null ac_id in FINDINGS (not ac_verdicts) is left completely alone -- findings legitimately have no-AC-attached, unlike ac_verdicts, so this must not be counted (round-4 review M3, not over-broad)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: null }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].ac_id, null)
+  assert.equal(entry.invalid_ac_ids_dropped, 0, 'an explicit null ac_id on a FINDING is the ordinary no-AC case, not an invalid one')
+})
+
+// Round-4 review L1: ac_id_raw (and this PR's own new lens_raw/severity_raw,
+// which ride the identical retention mechanism -- fixed together, not one
+// at a time) persisted lens-supplied free text VERBATIM, bypassing the
+// redaction round-1's L4 fix already applies to spec_raw one field over.
+// The sanitiser ran AFTER redactPaths' free-text pass, so *_raw fields were
+// never in scope for it. Fixed by running the same redactPaths/
+// relativiseAgainstRoot pipeline spec_raw uses, at the point each raw value
+// is created, before truncation (so a path is made safe BEFORE it is cut
+// down, never the reverse -- cutting an unsafe absolute path first could
+// leave a recognisable partial account name inside the 32-byte bound).
+test('ledger-append: ac_id_raw redacts an absolute path outside the repo the same way spec_raw does -- an account name in a non-conforming ac_id never reaches the ledger verbatim (round-4 review L1)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: '/Users/scott.b/.ssh/id_rsa', verdict: 'FAIL' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts[0].ac_id, null)
+  assert.equal(entry.ac_verdicts[0].ac_id_raw, '<redacted-path>', `an out-of-repo absolute path must be redacted, not retained verbatim, got: ${entry.ac_verdicts[0].ac_id_raw}`)
+})
+
+test('ledger-append: ac_id_raw relativises an absolute path that lives INSIDE the repo root, rather than redacting it away entirely (round-4 review L1, mirrors spec_raw\'s H2 recoverability)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: `${repo}/specs/a.md`, verdict: 'FAIL' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts[0].ac_id_raw, 'specs/a.md', 'an in-repo path is recoverable, not merely redacted away -- the whole point of retaining it at all')
+})
+
+test('ledger-append: lens_raw and severity_raw are redacted the same way ac_id_raw is (round-4 review L1, fixed together not one at a time)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: '/Users/scott.b/.aws/credentials', location: 'x', claim: 'y', severity: '/Users/scott.b/.aws/credentials2' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].lens_raw, '<redacted-path>', `got: ${entry.findings[0].lens_raw}`)
+  assert.equal(entry.findings[0].severity_raw, '<redacted-path>', `got: ${entry.findings[0].severity_raw}`)
+})
+
 // H3 round 2: at the OLD 2048-byte cap, a realistic review round (roughly
 // 10-12 findings across a full lens roster) degraded to a ~221-byte
 // envelope-only record -- the ledger kept LEAST data for the BUSIEST
