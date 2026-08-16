@@ -1237,7 +1237,17 @@ test('ledger-append: an absolute path riding an element of lenses_run/lenses_ski
   assertNoAbsolutePaths(line, 'lenses_run/lenses_skipped with an embedded absolute path')
 })
 
-test('ledger-append: a hostile payload cannot smuggle a canary secret or an absolute path through trigger_counts, verdicts or rounds -- each is constrained to its declared value type/enum, so the write is rejected rather than writing the secret verbatim (H2 round 2, AC-SEC-3)', () => {
+// Round-5 H1 (§12 reframe) supersedes this test's ORIGINAL assertion
+// (write_ok:false, zero lines written) the same way round-4 superseded the
+// equivalent M6 "lens" test: refusing the WHOLE entry over one hostile
+// dict value was exactly the defect class H1 exists to close -- three
+// rounds of "sanitise the named fields" (ac_id, then lens/severity, then
+// this round's verdicts/ac_verdicts.verdict/lenses_run) proved an
+// allowlist can never catch every sibling. The general mechanism now
+// drops each OFFENDING KEY from its dict (there is no natural per-key raw
+// sibling the way ac_id_raw/lens_raw work for a fixed object shape), the
+// secret never reaches the ledger either way, and the record survives.
+test('ledger-append: a hostile payload cannot smuggle a canary secret or an absolute path through trigger_counts, verdicts or rounds -- each offending KEY is dropped from its dict and counted, the secret never reaches the ledger, and the record is WRITTEN (H2 round 2 superseded by round-5 H1)', () => {
   const repo = makeTempRepo()
   const canary = '/etc/shadow-canary-secret-XYZZY'
   const res = runAppend(repo, {
@@ -1249,8 +1259,312 @@ test('ledger-append: a hostile payload cannot smuggle a canary secret or an abso
     rounds: { test_attempts: canary },
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.equal(out.write_ok, false, 'a value of the wrong declared type inside trigger_counts/verdicts/rounds must fail validation, not write the payload verbatim')
-  assert.equal(readLedgerLines(repo).length, 0, 'a rejected write must not append any line at all')
+  assert.equal(out.write_ok, true, `expected the write to succeed with the three hostile dict entries dropped, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- a malformed value must cost that value, never the line')
+  assert.ok(!lines[0].includes(canary), 'the canary secret must never reach the ledger, dropped or not')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.trigger_counts['lens-security'], undefined, 'the offending trigger_counts key must be dropped, not written with the wrong type')
+  assert.equal(entry.verdicts['lens-security'], undefined, 'the offending verdicts key must be dropped')
+  assert.equal(entry.rounds.test_attempts, undefined, 'the offending rounds key must be dropped')
+  assert.equal(entry.invalid_record_values_dropped, 3, 'all three drops must be counted under the general mechanism\'s own counter')
+})
+
+// Round-5 H1: reproduces the coordinator's own live-tip repro exactly.
+// `verdicts: {"lens-data": "CLEAN (with caveats)"}` -> write_ok:false,
+// nothing written. `ac_verdicts: [{ac_id:"AC-QA-1", verdict:"PARTIAL"}]`
+// -> write_ok:false, nothing written. This is the THIRD time this exact
+// defect class was found: round-2 M-3 (ac_id), round-4 M1 (lens/severity),
+// now verdicts/ac_verdicts.verdict/lenses_run -- the general mechanism
+// closes the CLASS, not just these three fields (see the table test
+// below).
+test('ledger-append: verdicts.<lens> outside the CLEAN/FINDINGS/BLOCKED enum is DROPPED from the dict, counted, and the record IS WRITTEN (round-5 H1, exact coordinator repro)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    verdicts: { 'lens-data': 'CLEAN (with caveats)' },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- a malformed field must cost that field, never the line')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.verdicts['lens-data'], undefined, 'the non-conforming verdicts entry must be dropped, not written with an out-of-enum value')
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+test('ledger-append: ac_verdicts[].verdict outside PASS/FAIL/UNVERIFIABLE is NULLED with the original preserved in verdict_raw, and the record IS WRITTEN (round-5 H1, exact coordinator repro)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    run_id: 'm1t',
+    ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PARTIAL' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.ac_verdicts[0].ac_id, 'AC-QA-1', 'the ac_id itself must survive untouched')
+  assert.equal(entry.ac_verdicts[0].verdict, null, 'the non-conforming verdict must be nulled, not left in a shape that fails validation')
+  assert.equal(entry.ac_verdicts[0].verdict_raw, 'PARTIAL', 'the rejected value must be recoverable, mirroring ac_id_raw')
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+// These two drive degradeEntry DIRECTLY rather than through the real CLI.
+// Discovered while writing the end-to-end form: main()'s OWN pre-existing
+// free-text pass (relativiseAgainstRoot/redactPaths, applied to
+// lenses_run/lenses_skipped before this validator ever runs) calls
+// String(value) on every element, so a numeric element arrives at
+// collectErrors ALREADY coerced to "12345" -- the TYPE check can never
+// actually fire from a real payload for this specific field. Not
+// something this fix introduced or should paper over: recorded here, and
+// the direct-degradeEntry form still proves the mechanism itself handles
+// a genuinely wrong-typed element correctly, which the schema declares as
+// a possibility regardless of what upstream coercion happens to do today.
+test('ledger-append: a wrong-typed lenses_run[] element is dropped from the array (not the record), counted, and the rest of the array survives (round-5 H1)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ lenses_run: ['lens-security', 12345, 'lens-qa'] })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, true, `expected degradeEntry to succeed, got: ${JSON.stringify(result.errors)}`)
+  assert.deepEqual(entry.lenses_run, ['lens-security', 'lens-qa'], 'the bad element must be dropped, the rest of the array must survive in order')
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+test('ledger-append: TWO wrong-typed elements in the SAME primitive array are both dropped correctly, without an index-shift bug (round-5 H1, not vacuous)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ lenses_run: ['a', 111, 'b', 222, 'c'] })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, true, `expected degradeEntry to succeed, got: ${JSON.stringify(result.errors)}`)
+  assert.deepEqual(entry.lenses_run, ['a', 'b', 'c'], 'both bad elements must be dropped, and dropping the earlier one must not shift which element the later drop removes')
+  assert.equal(entry.invalid_record_values_dropped, 2)
+})
+
+// ---- Round-5 H1: the malformed-value table. This is the guard against a
+// FOURTH recurrence -- a table naming only `verdict` (this round's own
+// repro field) would be the identical allowlist mistake in test form, one
+// level up. Drives degradeEntry DIRECTLY (not through the CLI) so every
+// value-typed shape the schema declares is covered, including fields no
+// real caller payload can reach today (spec/plan_key, always internally
+// overwritten by main() before this point) -- the point is proving the
+// MECHANISM covers the whole schema, not just what is reachable this
+// week. Every row here expects ok:true (the record degrades and writes);
+// the separate "boundary" and "structural" test groups below cover the
+// two ways a write can still legitimately be refused. ----
+
+function baseValidEntry(overrides = {}) {
+  return { schema_version: 2, run_id: 'r1', ts: '2026-01-01T00:00:00.000Z', repo: 'demo', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null, ...overrides }
+}
+
+const MALFORMED_VALUE_TABLE = [
+  {
+    name: 'verdicts.<lens> (dict, enum)',
+    mutate: (e) => { e.verdicts = { 'lens-security': 'MAYBE' } },
+    check: (e) => { assert.equal(e.verdicts['lens-security'], undefined) },
+  },
+  {
+    name: 'trigger_counts.<key> (dict, type integer)',
+    mutate: (e) => { e.trigger_counts = { 'lens-security': 'nope' } },
+    check: (e) => { assert.equal(e.trigger_counts['lens-security'], undefined) },
+  },
+  {
+    name: 'rounds.<key> (nullable dict, type integer)',
+    mutate: (e) => { e.rounds = { test_attempts: 'nope' } },
+    check: (e) => { assert.equal(e.rounds.test_attempts, undefined) },
+  },
+  {
+    name: 'findings[].lens (object-array item, pattern, sibling raw)',
+    mutate: (e) => { e.findings = [{ id: 'x', lens: 'bad-lens-name', severity: 'Low', ac_id: null, disposition: 'open' }] },
+    check: (e) => { assert.equal(e.findings[0].lens, null); assert.equal(e.findings[0].lens_raw, 'bad-lens-name') },
+    // Pre-existing dedicated counter (round-4 M1), not the general one --
+    // ac_id/lens/severity within findings kept their OWN counter names on
+    // purpose (see degradeEntry's own comment), so this row proves the
+    // reframe did not silently fold them into the new general counter.
+    expectCounter: 'invalid_finding_fields_dropped',
+  },
+  {
+    name: 'findings[].severity (object-array item, enum, sibling raw)',
+    mutate: (e) => { e.findings = [{ id: 'x', lens: 'lens-qa', severity: 'Urgent', ac_id: null, disposition: 'open' }] },
+    check: (e) => { assert.equal(e.findings[0].severity, null); assert.equal(e.findings[0].severity_raw, 'Urgent') },
+    expectCounter: 'invalid_finding_fields_dropped',
+  },
+  {
+    name: 'findings[].ac_id (object-array item, pattern, sibling raw)',
+    mutate: (e) => { e.findings = [{ id: 'x', lens: 'lens-qa', severity: 'Low', ac_id: 'none', disposition: 'open' }] },
+    check: (e) => { assert.equal(e.findings[0].ac_id, null); assert.equal(e.findings[0].ac_id_raw, 'none') },
+    expectCounter: 'invalid_ac_ids_dropped',
+  },
+  {
+    name: 'ac_verdicts[].ac_id (object-array item, pattern, sibling raw)',
+    mutate: (e) => { e.ac_verdicts = [{ ac_id: 'bad', verdict: 'PASS' }] },
+    check: (e) => { assert.equal(e.ac_verdicts[0].ac_id, null); assert.equal(e.ac_verdicts[0].ac_id_raw, 'bad') },
+    expectCounter: 'invalid_ac_ids_dropped',
+  },
+  {
+    name: 'ac_verdicts[].verdict (object-array item, enum, sibling raw -- round-5 H1\'s own repro field)',
+    mutate: (e) => { e.ac_verdicts = [{ ac_id: 'AC-QA-1', verdict: 'PARTIAL' }] },
+    check: (e) => { assert.equal(e.ac_verdicts[0].verdict, null); assert.equal(e.ac_verdicts[0].verdict_raw, 'PARTIAL') },
+  },
+  {
+    name: 'lenses_run[i] (primitive array item, type string)',
+    mutate: (e) => { e.lenses_run = ['ok', 999] },
+    check: (e) => { assert.deepEqual(e.lenses_run, ['ok']) },
+  },
+  {
+    name: 'lenses_skipped[i] (primitive array item, type string)',
+    mutate: (e) => { e.lenses_skipped = ['ok', 999] },
+    check: (e) => { assert.deepEqual(e.lenses_skipped, ['ok']) },
+  },
+  {
+    name: 'task (nullable top-level scalar, no enum/pattern)',
+    mutate: (e) => { e.task = 42 },
+    check: (e) => { assert.equal('task' in e, false) },
+  },
+  {
+    name: 'round_key (nullable top-level scalar)',
+    mutate: (e) => { e.round_key = 42 },
+    check: (e) => { assert.equal('round_key' in e, false) },
+  },
+  {
+    name: 'event (nullable top-level scalar)',
+    mutate: (e) => { e.event = 42 },
+    check: (e) => { assert.equal('event' in e, false) },
+  },
+  {
+    name: 'event_key on a kind that does NOT require it (type mismatch only)',
+    mutate: (e) => { e.event_key = 42 },
+    check: (e) => { assert.equal('event_key' in e, false) },
+  },
+  {
+    name: 'degraded (nullable boolean)',
+    mutate: (e) => { e.degraded = 'yes' },
+    check: (e) => { assert.equal('degraded' in e, false) },
+  },
+  {
+    name: 'budget_spent (nullable number)',
+    mutate: (e) => { e.budget_spent = 'lots' },
+    check: (e) => { assert.equal('budget_spent' in e, false) },
+  },
+  {
+    name: 'spec (nullable string) -- defensive: pre-processed before this point in the real write path, tested here so the SCHEMA-driven mechanism covers it regardless of reachability',
+    mutate: (e) => { e.spec = 42 },
+    check: (e) => { assert.equal('spec' in e, false) },
+  },
+  {
+    name: 'plan_key (nullable string) -- defensive, same reason as spec',
+    mutate: (e) => { e.plan_key = 42 },
+    check: (e) => { assert.equal('plan_key' in e, false) },
+  },
+  {
+    // The remaining ['integer','null']-typed counters (spec_bug_count,
+    // rejected_finding_count, findings_truncated, invalid_ac_ids_dropped,
+    // invalid_finding_fields_dropped, invalid_record_values_dropped) share
+    // this EXACT constraint shape and are always internally overwritten by
+    // main() before a caller value could reach them -- one representative
+    // is deliberate scoping (round-2's own L-8 precedent: "not a
+    // repo-wide rename, out of proportion"), not an oversight; the
+    // mechanism itself is per-shape, not per-field-name, so this one row
+    // stands for all six.
+    name: 'findings_truncated (nullable integer) -- representative of every ["integer","null"] counter field',
+    mutate: (e) => { e.findings_truncated = 'lots' },
+    check: (e) => { assert.equal('findings_truncated' in e, false) },
+  },
+]
+
+for (const row of MALFORMED_VALUE_TABLE) {
+  test(`ledger-append: malformed-value table -- ${row.name} is neutralised and counted, the record IS WRITTEN, never refused (round-5 H1)`, async () => {
+    const { degradeEntry } = await import(APPEND_MODULE_URL)
+    const entry = baseValidEntry()
+    row.mutate(entry)
+    const result = degradeEntry(entry)
+    assert.equal(result.ok, true, `expected degradeEntry to succeed for ${row.name}, got errors: ${JSON.stringify(result.errors)}`)
+    row.check(entry)
+    // Every neutralisation must be counted under EXACTLY one of the three
+    // counters -- never left invisible, never double-counted across two.
+    // ac_id (either array) and findings[].lens/severity route to their
+    // own dedicated pre-existing counters (invalid_ac_ids_dropped /
+    // invalid_finding_fields_dropped); everything else routes to the
+    // general mechanism's own counter. Each row asserts its OWN expected
+    // counter via row.expectCounter, defaulting to the general one.
+    const counterField = row.expectCounter || 'invalid_record_values_dropped'
+    assert.equal(entry[counterField], 1, `expected exactly one neutralisation counted under ${counterField} for ${row.name}, entry: ${JSON.stringify(entry)}`)
+  })
+}
+
+// ---- Round-5 H1: the boundary group. A value error on a field that is
+// ALSO (conditionally) required is neutralised by DELETION like any other
+// generic field, but deletion then correctly resurfaces as a
+// required-property-missing error on re-validation -- genuinely
+// structural, so the write is refused. This is the self-limiting
+// behaviour the coordinator's spec names explicitly ("Only if the record
+// still fails on something STRUCTURAL... may the write be refused"), not
+// a special-cased exclusion list of "never touch these fields". ----
+
+test('ledger-append: a malformed `kind` (unconditionally required) is neutralised by deletion, which then correctly fails as required-missing on re-validation -- the write IS refused, for the right reason (round-5 H1 boundary)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ kind: 'not-a-real-kind' })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /kind: required property missing/.test(e)), `expected the FINAL refusal reason to name kind as missing (post-deletion), got: ${JSON.stringify(result.errors)}`)
+})
+
+test('ledger-append: a malformed `outcome` on a kind that REQUIRES it (review_cycle) is neutralised by deletion, which then correctly fails as required-missing -- the write IS refused (round-5 H1 boundary)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ kind: 'review_cycle', outcome: 'not-a-real-outcome' })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /outcome: required when/.test(e)), `got: ${JSON.stringify(result.errors)}`)
+})
+
+test('ledger-append: the SAME malformed `outcome` on a kind that does NOT require it (conduct_plan_event) is neutralised cleanly and the write SUCCEEDS -- proves the mechanism is schema-driven, not hardcoded per field name (round-5 H1 boundary, not vacuous)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ kind: 'conduct_plan_event', outcome: 'not-a-real-outcome', event_key: 'specs/a.md:T1:ci_wait_started:1' })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, true, `expected the write to succeed, got: ${JSON.stringify(result.errors)}`)
+  assert.equal('outcome' in entry, false, 'outcome must have been deleted, not left in an invalid shape')
+})
+
+test('ledger-append: a malformed `event_key` on conduct_plan_event (which REQUIRES it) is neutralised by deletion, which then correctly fails as required-when-missing -- the write IS refused (round-5 H1 boundary)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ kind: 'conduct_plan_event' })
+  delete entry.outcome
+  entry.event_key = 42
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /event_key: required when/.test(e)), `got: ${JSON.stringify(result.errors)}`)
+})
+
+// ---- Round-5 H1: the structural group. These fail BEFORE any
+// neutralisation is even attempted -- the FINDING-1/M-2 precedent,
+// unchanged by this reframe, and matching main's own behaviour. ----
+
+test('ledger-append: a genuinely missing required field (schema_version absent from the start) is refused outright, no degrade attempted (round-5 H1, structural precedent unchanged)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry()
+  delete entry.schema_version
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /schema_version: required property missing/.test(e)))
+})
+
+test('ledger-append: an unknown top-level property is refused outright, no degrade attempted (round-5 H1, structural precedent unchanged, AC-SEC-2)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ evidence: 'a secret quoted source line' })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /evidence: not an allowed property/.test(e)))
+})
+
+test('ledger-append: findings:[null] (a non-object array element) is refused outright, no degrade attempted (round-5 H1, FINDING-1/M-2 precedent unchanged)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', findings: [null] })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a null array element has no field to neutralise -- must still refuse, matching main')
+  assert.equal(readLedgerLines(repo).length, 0)
 })
 
 test('ledger-append: an origin remote that is a bare local filesystem path (not a recognised host form) is never used as repo identity -- it falls back to the toplevel basename instead (H2 round 2, AC-SEC-3)', () => {
@@ -1593,15 +1907,18 @@ test('ledger-append module: outcome is required only for tdd_task/review_cycle/p
 // rejected ac_id, AC-DATA-4's pattern) -- still no evidence field, and
 // ac_id is now nullable (a rejected id is retained via ac_id_raw, never
 // dropping the whole {ac_id, verdict} pair).
-test('ledger-append module: LEDGER_ENTRY_SCHEMA declares ac_verdicts as a bounded array of {ac_id, ac_id_raw, verdict} entries only, no evidence, with ac_id nullable (H4, AC-SEC-2, M-3)', async () => {
+// Round-5 H1: verdict_raw added, same pattern -- verdict is now nullable
+// too (see the H1 tests below).
+test('ledger-append module: LEDGER_ENTRY_SCHEMA declares ac_verdicts as a bounded array of {ac_id, ac_id_raw, verdict, verdict_raw} entries only, no evidence, with ac_id and verdict both nullable (H4, AC-SEC-2, M-3, H1)', async () => {
   const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
   const acVerdictsSchema = LEDGER_ENTRY_SCHEMA.properties.ac_verdicts
   assert.ok(acVerdictsSchema, 'expected an ac_verdicts property on the schema')
   assert.equal(acVerdictsSchema.type, 'array')
   const itemProps = Object.keys(acVerdictsSchema.items.properties)
-  assert.deepEqual(itemProps.sort(), ['ac_id', 'ac_id_raw', 'verdict'], 'ac_verdicts items must carry only ac_id, ac_id_raw and verdict, never evidence')
+  assert.deepEqual(itemProps.sort(), ['ac_id', 'ac_id_raw', 'verdict', 'verdict_raw'], 'ac_verdicts items must carry only ac_id/ac_id_raw/verdict/verdict_raw, never evidence')
   assert.equal(acVerdictsSchema.items.additionalProperties, false)
   assert.deepEqual(acVerdictsSchema.items.properties.ac_id.type.sort(), ['null', 'string'], 'ac_id must be nullable so a rejected value is retained, not dropped (M-3)')
+  assert.deepEqual(acVerdictsSchema.items.properties.verdict.type.sort(), ['null', 'string'], 'verdict must be nullable so a rejected value is retained, not dropped (H1)')
   assert.deepEqual(acVerdictsSchema.items.properties.verdict.enum.sort(), ['FAIL', 'PASS', 'UNVERIFIABLE'])
 })
 
