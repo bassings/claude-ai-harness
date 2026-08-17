@@ -54,17 +54,26 @@ test('AC-DATA-9: a process SIGKILLed after writing the start record, before it c
   // wastes time on a fast machine or flakes on a slow/loaded one (AC-QA-21).
   // Bounded so a genuine failure to write still fails the test instead of
   // hanging forever.
+  //
+  // Round-7 review F16: the sanity assertion below used to run BEFORE the
+  // kill, with no try/finally -- if it ever threw (a loaded machine, a
+  // writer regression, a temp-repo problem), `child.kill` never executed,
+  // leaving a real child process alive on its 60-second setTimeout,
+  // referenced by the test process, for the rest of the suite run. Killed
+  // in a finally now, so a failing assertion here fails FAST, not slow.
   const POLL_INTERVAL_MS = 15
   const POLL_TIMEOUT_MS = 10000
   const pollDeadline = Date.now() + POLL_TIMEOUT_MS
   let beforeKillLines = readLedgerLines(repo)
-  while (beforeKillLines.length < 1 && Date.now() < pollDeadline) {
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
-    beforeKillLines = readLedgerLines(repo)
+  try {
+    while (beforeKillLines.length < 1 && Date.now() < pollDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+      beforeKillLines = readLedgerLines(repo)
+    }
+    assert.equal(beforeKillLines.length, 1, `sanity: the start record must already be on disk before SIGKILL, got ${beforeKillLines.length} lines after polling for up to ${POLL_TIMEOUT_MS}ms (stderr: ${stderr})`)
+  } finally {
+    child.kill('SIGKILL')
   }
-  assert.equal(beforeKillLines.length, 1, `sanity: the start record must already be on disk before SIGKILL, got ${beforeKillLines.length} lines after polling for up to ${POLL_TIMEOUT_MS}ms (stderr: ${stderr})`)
-
-  child.kill('SIGKILL')
   await new Promise((resolve) => child.on('close', resolve))
 
   const lines = readLedgerLines(repo)

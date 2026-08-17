@@ -574,7 +574,7 @@ test('review-cycle.js: the exception guard\'s log line is bounded in length, eve
     (err) => {
       const line = err.logs.find((l) => l.includes('start-abc'))
       assert.ok(line, `expected a log line naming the run_id, got ${JSON.stringify(err.logs)}`)
-      assert.ok(line.length < longMessage.length, `expected the log line to be bounded well under the 5000-char thrown message, got length ${line.length}`)
+      assert.ok(line.length < 700, `expected the log line bounded near MAX_LOG_TEXT (500) plus its fixed prefix, not merely under the 5000-char thrown message (round-7 review F14: the old bound could not catch MAX_LOG_TEXT being widened by an order of magnitude), got length ${line.length}`)
       return true
     }
   )

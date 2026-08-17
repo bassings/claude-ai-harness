@@ -35,7 +35,7 @@ function ledgerFixture(overrides = {}) {
     // real CLI now actually emits, not the pre-round-2 raw-path shape.
     perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
     skipped: [],
-    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }], invalidAcIdsDropped: 0 },
+    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }], invalidAcIdsDropped: 0, invalidRecordValuesDropped: 0 },
     neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false }],
     // Review round-2 H-1: the orphan/aborted fields are included here as
     // explicit real zeros -- representing an UP-TO-DATE reader that
@@ -403,6 +403,65 @@ test('optimise-cycle: the Sample completeness section renders a real ZERO for in
   const line = result.report.split('\n').find((l) => l.includes('invalid_ac_ids_dropped') || l.includes('invalid ac_id'))
   assert.ok(line, `expected the line even when clean, report was: ${result.report}`)
   assert.ok(/\b0\b/.test(line), `got: ${line}`)
+})
+
+// ---- Round-7 review F7: invalid_record_values_dropped (round-6's own
+// wiring, general-degrade counterpart to invalid_ac_ids_dropped above) had
+// exactly one test in the whole suite, asserting the READER's sum -- never
+// that the report actually renders it. The sibling invalid_ac_ids_dropped
+// line above has both a non-zero and a real-zero render test; this mirrors
+// that pair, so a later edit that drops the line (or makes it conditional
+// on a truthy count, the round-2 M-6 shape) cannot pass silently. ----
+
+test('optimise-cycle: the Sample completeness section renders invalid_record_values_dropped with a real non-zero number when the fixture carries one (round-7 F7)', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { n: 1, lensDispositionCounts: {}, acVerdicts: [], invalidAcIdsDropped: 0, invalidRecordValuesDropped: 4 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_record_values_dropped'))
+  assert.ok(line, `expected a line naming invalid_record_values_dropped, report was: ${result.report}`)
+  assert.ok(line.includes('4'), `got: ${line}`)
+})
+
+test('optimise-cycle: the Sample completeness section renders a real ZERO for invalid_record_values_dropped on a clean fixture, never omitting the line (round-7 F7, not vacuous)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_record_values_dropped'))
+  assert.ok(line, `expected the line even when clean, report was: ${result.report}`)
+  assert.ok(/\b0\b/.test(line), `got: ${line}`)
+})
+
+// Round-7 review F7: the two never-failing taint-reason suffixes
+// (unattributed_fail_in_window, unattributed_verdict_in_entry) were
+// rendered but had no test asserting their text, or that the two are
+// textually distinct from (insufficient data) and from each other.
+test('optimise-cycle: the Never-failing acceptance criteria section renders the unattributed_fail_in_window reason distinctly from (insufficient data) (round-7 F7)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, unattributed_fail_in_window: true, unattributed_verdict_in_entry: false, never_failed: null }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('AC-QA-1'))
+  assert.ok(line, `expected a never-failing line for AC-QA-1, report was: ${result.report}`)
+  assert.match(line, /unattributed FAIL in window/i, `got: ${line}`)
+  assert.ok(!line.includes('insufficient data'), `must not read as insufficient data, got: ${line}`)
+})
+
+test('optimise-cycle: the Never-failing acceptance criteria section renders the unattributed_verdict_in_entry reason distinctly from both other reasons (round-7 F7)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      // insufficient_data is deliberately false here (even though the real
+      // aggregator's n:0 case also trips it) to isolate the render's
+      // unattributed_verdict_in_entry branch specifically -- insufficient_data
+      // is checked first in the render precedence, so leaving it true would
+      // test the WRONG branch. AC-QA-1's own reader-side test already covers
+      // the real n:0-implies-insufficient_data interaction.
+      neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-2', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-2', n: 6, insufficient_data: false, unattributed_fail_in_window: false, unattributed_verdict_in_entry: true, never_failed: null }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('AC-QA-2'))
+  assert.ok(line, `expected a never-failing line for AC-QA-2, report was: ${result.report}`)
+  assert.match(line, /unattributed verdict/i, `got: ${line}`)
+  assert.ok(!line.includes('unattributed FAIL in window'), `must be textually distinct from the other taint reason, got: ${line}`)
 })
 
 // ---- Review round-2 L-4: agentComputeAbortedSeconds and the per-plan

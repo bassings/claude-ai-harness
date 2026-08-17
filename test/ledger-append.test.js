@@ -601,6 +601,37 @@ test('ledger-append: a findings[].lens value that fails the lens/reviewer patter
   assert.equal(out.invalid_finding_fields_dropped, 1, 'the CLI result (what writeLedger actually sees) must also carry the count, not just the stored line')
 })
 
+// Round-7 review F2 (total-loss class, again): a findings descriptor that
+// OMITS `lens` entirely (not merely a wrong-typed value) still produces a
+// `lens` KEY with value undefined, since computeFindings does
+// `lens: f.lens` unconditionally with no fallback (unlike severity/ac_id,
+// which both default to a real value). That undefined value fails the
+// type check exactly like a wrong-typed one, degradeEntry's neutraliser
+// used to write that SAME undefined straight into lens_raw
+// (truncateBytes/redactRawField both pass undefined through unchanged BY
+// DESIGN, for the "field genuinely not supplied" case), and a property
+// whose value is undefined then fails ITS OWN re-validation on the
+// second pass -- refusing the whole record over one INCOMPLETE (not even
+// malformed) finding descriptor. The exact total-loss class this whole
+// mechanism exists to close, reopened by the fix meant to close it.
+test('ledger-append: a findings descriptor that OMITS "lens" entirely (not merely malformed) still writes -- lens is nulled, lens_raw is left ABSENT (never undefined), and the record is NOT refused (round-7 F2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ location: 'a.md:1', claim: 'x' }], // no `lens` key at all
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed despite the omitted lens, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- an INCOMPLETE descriptor must cost that field, never the whole line')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.findings.length, 1)
+  assert.equal(entry.findings[0].lens, null, 'lens must be nulled, matching the malformed-value case')
+  assert.equal('lens_raw' in entry.findings[0], false, 'lens_raw must be ABSENT (nothing to retain), never written as literal undefined -- which would itself fail schema validation')
+})
+
 for (const field of ['open_findings', 'spec_bugs', 'rejected_findings']) {
   test(`ledger-append: a non-conforming lens in ${field} is neutralised, not fatal to the write (M1, same treatment across all three descriptor arrays)`, () => {
     const repo = makeTempRepo()
@@ -713,6 +744,94 @@ test('ledger-append: an ac_verdicts entry with ac_id EXPLICITLY null (never sani
   assert.equal(entry.ac_verdicts.length, 2, 'the FAIL verdict itself must still survive on the line')
   assert.equal(entry.invalid_ac_ids_dropped, 1, 'an explicit null ac_id must be counted, never silently reported as zero sanitisations')
   assert.equal(out.invalid_ac_ids_dropped, 1, 'the CLI result must also carry the count')
+})
+
+// Round-7 review, instruction 3: the identical gap as the ac_id one above,
+// for `verdict` -- also schema-nullable on purpose, so collectErrors never
+// flags an explicit `verdict: null` as an error, and it never touches
+// degradeEntry. The reader's F1 fix already treats this correctly as
+// non-evidence regardless of whether the writer counts it, but the count
+// itself was silently staying at zero, which is exactly how the round-6
+// defect went unnoticed in the first place.
+test('ledger-append: an ac_verdicts entry with verdict EXPLICITLY null (never sanitised -- supplied that way, no verdict_raw at all) is counted under invalid_record_values_dropped, never left silently at zero (round-7, instruction 3)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: 'AC-DATA-9', verdict: null }, { ac_id: 'AC-SEC-9', verdict: 'PASS' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts.length, 2, 'the entry itself must still survive on the line')
+  assert.equal('verdict_raw' in entry.ac_verdicts[0], false, 'nothing to retain -- the caller supplied null directly, not a rejected string')
+  assert.equal(entry.invalid_record_values_dropped, 1, 'an explicit null verdict must be counted, never silently reported as zero')
+  assert.equal(out.invalid_record_values_dropped, 1, 'the CLI result must also carry the count')
+})
+
+// Round-7 review F3 (total-loss class, again): an ac_verdicts item missing
+// `ac_id` ENTIRELY (not merely malformed) used to be classified structural
+// -- a `required` error is not naturally "one value is wrong", it is "no
+// value was ever supplied" -- and refused the WHOLE record. review-cycle.js
+// builds exactly this shape whenever a lens's own reported item omits
+// `id` (JSON.stringify drops the key, producing ac_id:undefined, which
+// `required` catches the same way `required` catches a wholly-absent
+// key). Fixed by treating a `required` error nested inside an array item
+// as an item-level drop (the whole item removed from ITS array) rather
+// than a record-level structural refusal -- a genuinely top-level
+// required field (schema_version, run_id, ...) is unaffected and still
+// refuses exactly as before.
+test('ledger-append: an ac_verdicts item missing "ac_id" entirely (not merely malformed -- the shape review-cycle.js produces when a lens report omits "id") is DROPPED from the array, and the record IS WRITTEN, never refused (round-7 F3)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ verdict: 'PASS' }, { ac_id: 'AC-SEC-9', verdict: 'FAIL' }], // first item has no ac_id key at all
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed with the incomplete item dropped, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- an incomplete item must cost that item, never the whole line')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.ac_verdicts.length, 1, 'the incomplete item must be dropped; the complete one survives')
+  assert.deepEqual(entry.ac_verdicts[0], { ac_id: 'AC-SEC-9', verdict: 'FAIL' })
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+test('ledger-append: TWO ac_verdicts items each missing "ac_id" are BOTH dropped correctly, without an index-shift bug (round-7 F3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ verdict: 'PASS' }, { ac_id: 'AC-SEC-9', verdict: 'FAIL' }, { verdict: 'UNVERIFIABLE' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts.length, 1, 'both incomplete items must be dropped, without the first drop shifting which item the second drop removes')
+  assert.deepEqual(entry.ac_verdicts[0], { ac_id: 'AC-SEC-9', verdict: 'FAIL' })
+  assert.equal(entry.invalid_record_values_dropped, 2)
+})
+
+test('ledger-append: a findings item missing "id" (not reachable from computeFindings, which always sets it -- defensive, proves the mechanism generalises) is DROPPED from the array (round-7 F3)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = { schema_version: 2, run_id: 'r', ts: 't', repo: 'r', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null, findings: [{ lens: 'lens-qa', severity: 'Low', ac_id: null, disposition: 'open' }] }
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, true, `expected degradeEntry to succeed, got: ${JSON.stringify(result.errors)}`)
+  assert.equal(entry.findings.length, 0, 'the incomplete item must be dropped')
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+test('ledger-append: a genuinely top-level required field missing entirely (kind, which is NOT internally overwritten by main() the way run_id/ts/repo/write_ok/schema_version are) is STILL refused outright -- round-7 F3 must not weaken the top-level structural precedent', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, outcome: 'done', ac_verdicts: [{ verdict: 'PASS' }] }) // `kind` omitted entirely
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a top-level required field missing must still refuse the whole record')
+  assert.ok(/kind: required property missing/.test(out.write_error), `got: ${out.write_error}`)
+  assert.equal(readLedgerLines(repo).length, 0)
 })
 
 test('ledger-append: an explicitly-null ac_id in FINDINGS (not ac_verdicts) is left completely alone -- findings legitimately have no-AC-attached, unlike ac_verdicts, so this must not be counted (round-4 review M3, not over-broad)', () => {

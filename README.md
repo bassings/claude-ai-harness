@@ -381,13 +381,17 @@ symlinks, since it is matched against the writer's own already-resolved
 (not merely an ancestor) resolves correctly via the `PWD`-inode-match
 candidate. Only the specific combination — an absolute spec, built from a
 symlinked path, submitted from somewhere other than that exact symlinked
-directory — hits the marker. The ledger's `spec_raw` field (AC-DATA-4: the
-caller's original spec string, retained verbatim alongside the derived
-`plan_key`, so a canonicaliser defect is correctable without replaying the
-original caller) keeps the original string recoverable regardless, though
-retained only when a canonical key was actually derived — a genuinely
-out-of-repo or `..`-escaping spec is never retained raw, matching
-`spec`/`plan_key`'s own redaction (AC-SEC-1).
+directory — hits the marker. The ledger's `spec_raw` field (AC-DATA-4)
+keeps the caller's original spec string recoverable regardless, though
+**not verbatim**: an absolute spec found to live inside the repo root has
+only that in-repo prefix stripped (never the `./`/`..`-collapsing step
+`plan_key` itself performs), so `spec_raw` and `plan_key` can legitimately
+differ for the same record — `spec_raw` is the writer's insurance against
+a canonicaliser defect, correctable without replaying the original
+caller, not a byte-identical copy of what the caller sent. Retained only
+when a canonical key was actually derived — a genuinely out-of-repo or
+`..`-escaping spec is never retained raw, matching `spec`/`plan_key`'s own
+redaction (AC-SEC-1).
 
 ## Delivery optimiser
 
@@ -409,7 +413,16 @@ cycle was invoked in — gitignored via `.git/info/exclude` and verified with
 `git check-ignore -q` before every write (the write is refused if that
 check fails), mirroring `ledger-append.mjs`'s own discipline exactly via
 `workflows/lib/optimise-report-ignore.mjs`, and the **only** file any of
-its steps may create or modify. Every proposal carries
+its steps may create or modify.
+
+**Retention (F12, round-7 review)**: the report is a SECOND artefact
+derived from the ledger (plan keys, run ids, per-plan seconds, orphan
+counts) — deleting the ledger alone does not remove it. Overwritten in
+place on every cycle run, otherwise kept indefinitely; nothing in this
+repo prunes or rotates it. **Delete it** with `rm
+.claude/optimise-cycle-report.md` — the next scheduled cycle recreates it.
+
+Every proposal carries
 the measurement that motivated it and the measurement that would confirm or
 refute it after adoption, and cites a real ledger `run_id` or `gh` run id
 present in what it actually read; an uncited proposal is dropped

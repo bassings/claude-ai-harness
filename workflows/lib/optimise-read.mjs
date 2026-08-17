@@ -32,26 +32,44 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, RAW_SIBLING_FIELDS } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR } from './ledger-append.mjs'
 
-// Round-6 H1 (§12 reframe, read-side half): the writer's degradeEntry can
-// neutralise ANY value covered by RAW_SIBLING_FIELDS (ac_id/lens/severity/
-// verdict, all as of round 5) -- null the field, retain the rejected value
-// bounded in its *_raw sibling. A neutralised value must never be read as
-// evidence: wherever this file draws a conclusion FROM one of these
-// fields, it must first ask whether the value in front of it is real or a
-// stand-in for "unknown". Derived from the SAME RAW_SIBLING_FIELDS set the
-// writer exports (one definition site) rather than a second field list
-// declared here, so the two sides cannot drift apart the way ac_id and
-// verdict already did once (round-4 M3 fixed ac_id; this round's H1 is the
-// identical gap for verdict, found because the write-side rule shipped
-// without its read-side twin).
-function isNeutralised(obj, field) {
-  if (!obj || typeof obj !== 'object') return false
-  const siblingField = RAW_SIBLING_FIELDS[field]
-  if (!siblingField) return false
-  return obj[field] === null && obj[siblingField] !== null && obj[siblingField] !== undefined
-}
+// Round-7 review F1 (§12 reframe, corrected a second time): round-6's
+// isNeutralised(obj, field) asked a SHAPE question -- "is this value null
+// AND does a *_raw sibling happen to be present?" -- when the real
+// question is SEMANTIC: "is this a value I can actually treat as
+// evidence?" The two are NOT the same test. A bare `verdict: null` with
+// NO verdict_raw sibling (a caller can supply this directly; it never
+// touches degradeEntry at all, since null is a schema-legal value for
+// verdict) sailed straight past isNeutralised and was still counted as a
+// real, unknown-shaped verdict -- n incremented, pass/fail untouched,
+// insufficient_data/unattributed_verdict_in_entry both false, and five
+// such records cleared MIN_RUNS_FOR_NEVER_FAILED and reported
+// never_failed:true. The exact round-6 bug, reproduced verbatim, because
+// the guard matched the FIX's own assumption about what a neutralised
+// value looks like rather than asking whether the value was real.
+//
+// THE STANDING RULE, so this is not lost a third time: an "is this
+// evidence?" test must enumerate the VALID values and treat everything
+// else -- null, undefined, missing, a neutralised value with its sibling
+// present, a neutralised value with no sibling at all, a hand-typed
+// ledger line predating any of this, an arbitrary junk string -- as not
+// evidence. It must never match on the shape a particular fix happens to
+// produce. See the KNOWN_VERDICTS check below and the LENS_RE check in
+// bumpDisposition's caller for the two live examples; see
+// test/optimise-read.test.js's NEUTRALISED-VALUE TABLE for the test-side
+// half of this rule.
+const KNOWN_VERDICTS = new Set(['PASS', 'FAIL', 'UNVERIFIABLE'])
+// Round-7 sweep: the SAME shape-vs-value confusion existed one field over.
+// `f.lens` feeding bumpDisposition asked "was this neutralised" instead of
+// "is this a real lens name" -- a bare `lens: null` (no lens_raw) would
+// have stringified to the bucket key "null" exactly like the verdict bug,
+// merging two different neutralised findings' dispositions into one fake
+// shared bucket. Value-based: imports the writer's own pattern (one
+// definition site, AC-ARCH-1-style) rather than a truthiness check, so a
+// hand-typed or otherwise-malformed lens string that never went through
+// degradeEntry at all is excluded too, not merely a literal null.
+const LENS_RE = new RegExp(LENS_PATTERN_STR)
 
 // AC-ARCH-14: the default bound on how much ledger history a single
 // aggregation pass reads -- proven against a >=2000-line synthetic ledger
@@ -233,14 +251,17 @@ export function aggregateRework(records, { root = '' } = {}) {
     if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
     if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
     for (const f of r.findings || []) {
-      // Round-6 H1 (read-side sweep): a neutralised `lens` (null, with
-      // lens_raw retained -- round-5's own degrade mechanism) must not be
-      // read as a real lens name. Unguarded, `bumpDisposition(counts,
-      // null, ...)` stringifies to the key "null" and merges every
-      // neutralised finding's disposition from every DIFFERENT lens into
-      // one fake shared bucket -- the identical "different things merge"
-      // defect class already closed for ac_id, one field over.
-      if (!isNeutralised(f, 'lens')) bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
+      // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
+      // not shape-based -- see this file's own header comment): a `lens`
+      // that is not a real, pattern-matching lens name must not be read
+      // as one. Unguarded, `bumpDisposition(counts, null, ...)` (or any
+      // other non-matching value) stringifies to a fake shared bucket key,
+      // merging DIFFERENT findings' dispositions together -- the
+      // identical "different things merge" defect class already closed
+      // for ac_id, one field over. `typeof f.lens === 'string'` short-
+      // circuits before the regex so `null`/`undefined`/a non-string never
+      // reach it.
+      if (typeof f.lens === 'string' && LENS_RE.test(f.lens)) bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
     }
     const verdicts = r.ac_verdicts || []
     if (!verdicts.length) continue
@@ -259,12 +280,29 @@ export function aggregateRework(records, { root = '' } = {}) {
       // to close. Excluded from bucketing entirely; already counted once
       // via invalidAcIdsDropped above, never counted twice.
       if (v.ac_id === null || v.ac_id === undefined) {
-        // Round-4 review M3: the FAIL is real data sitting two lines away
-        // in the same window -- taint this (repo, plan) bucket so
-        // neverFailingAcs never reports a confident never_failed:true
-        // while it exists. A PASS/UNVERIFIABLE unattributed verdict
-        // carries no inversion risk and is left exactly as before.
-        if (v.verdict === 'FAIL') {
+        // Round-4 review M3: a FAIL (or, round-7 F4 below, anything that
+        // is not provably a clean PASS/UNVERIFIABLE) is real data sitting
+        // two lines away in the same window -- taint this (repo, plan)
+        // bucket so neverFailingAcs never reports a confident
+        // never_failed:true while it exists. A genuine PASS/UNVERIFIABLE
+        // unattributed verdict carries no inversion risk and is left
+        // exactly as before.
+        //
+        // Round-7 review F4: this used to test `v.verdict === 'FAIL'`
+        // literally, so DUAL corruption -- an unattributed ac_id AND a
+        // non-evidence verdict on the SAME entry (both null, or a model
+        // writing a combined id+verdict like {ac_id:'AC-QA-8 (partial)',
+        // verdict:'PARTIAL'}, which degradeEntry independently neutralises
+        // to {ac_id:null, verdict:null}) -- produced NO taint at all: the
+        // literal FAIL string never matched. More corruption than a
+        // single unattributed FAIL, but LESS confidence, produced MORE
+        // confidence (a bare never_failed:true) than the single-corruption
+        // case. Fixed the same way F1 fixed the verdict branch one level
+        // up: value-based -- taint unless the verdict is affirmatively
+        // clean (PASS or UNVERIFIABLE), so an unknown verdict is treated
+        // exactly like an unknown ac_id's own worst case, not exonerated
+        // by ALSO being unknown.
+        if (v.verdict !== 'PASS' && v.verdict !== 'UNVERIFIABLE') {
           unattributedFailBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}`)
         }
         continue
@@ -274,25 +312,34 @@ export function aggregateRework(records, { root = '' } = {}) {
       if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0, unattributedVerdicts: 0 })
       const entry = acVerdicts.get(key)
       // Round-6 H1: the ac_id is known (we are inside this branch because
-      // it is), but the VERDICT itself may be neutralised (null, with
-      // verdict_raw retained) -- round-5's own repro. A neutralised
-      // verdict is not evidence of PASS, FAIL or UNVERIFIABLE: it must
-      // not count toward n (the "how many runs support this claim"
-      // figure feeding MIN_RUNS_FOR_NEVER_FAILED) and must not move
-      // pass/fail, or five unknowns clear the run-count floor and report
-      // never_failed:true on zero real evidence -- the exact inversion
-      // H1 reproduced. The entry is still created/kept above (not
-      // skipped entirely) so this ac_id remains VISIBLE in the report
-      // even when EVERY verdict seen for it was neutralised, rather than
-      // silently disappearing the way an entry that never existed would.
-      if (isNeutralised(v, 'verdict')) {
+      // it is), but the VERDICT itself may not be usable evidence -- round-
+      // 5's own repro (null, with verdict_raw retained). Round-7 F1
+      // (corrected a second time, see this file's header comment): the
+      // test is now VALUE-based -- is v.verdict one of the three known
+      // verdicts? -- not shape-based ("was it neutralised with a sibling
+      // present"). This single change subsumes null WITH a sibling, a
+      // BARE null with no sibling at all (schema-legal, never touches
+      // degradeEntry, and is exactly the case round-6's own verification
+      // missed), undefined, a missing key read as undefined, and any
+      // arbitrary junk string a hand-edited or pre-degradeEntry ledger
+      // line could carry -- no enumeration of neutralisation shapes to
+      // maintain. A non-evidence verdict must not count toward n (the
+      // "how many runs support this claim" figure feeding
+      // MIN_RUNS_FOR_NEVER_FAILED) and must not move pass/fail, or
+      // unknowns clear the run-count floor and report never_failed:true
+      // on zero real evidence -- the exact inversion H1 reproduced. The
+      // entry is still created/kept above (not skipped entirely) so this
+      // ac_id remains VISIBLE in the report even when EVERY verdict seen
+      // for it was unusable, rather than silently disappearing the way an
+      // entry that never existed would.
+      if (!KNOWN_VERDICTS.has(v.verdict)) {
         entry.unattributedVerdicts += 1
         continue
       }
       entry.n += 1
       if (v.verdict === 'PASS') entry.pass += 1
       else if (v.verdict === 'FAIL') entry.fail += 1
-      else if (v.verdict === 'UNVERIFIABLE') entry.unverifiable += 1
+      else entry.unverifiable += 1
     }
   }
   return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, unattributedFailBuckets }

@@ -103,8 +103,11 @@ const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 // compiled RegExp would be genuinely dead code, not merely unused.
 const AC_ID_PATTERN_STR = '^AC-[A-Z]+-[0-9]+$'
 // M1 (round 4 remainder): the single definition site for the `lens` shape,
-// shared with the schema declaration above.
-const LENS_PATTERN_STR = '^(lens|reviewer)-[a-z]+$'
+// shared with the schema declaration above. Round-7 review, F1 sweep:
+// EXPORTED so optimise-read.mjs can ask "is this a REAL lens name?"
+// (value-based) instead of redeclaring the pattern or asking a shape
+// question about whether the writer happened to neutralise it.
+export const LENS_PATTERN_STR = '^(lens|reviewer)-[a-z]+$'
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // 'fixed' is never written by the workflows in this PR: no single run can
 // know a finding from an earlier round was fixed. It is reserved for a
@@ -607,6 +610,30 @@ function resolveValue(entry, pathParts) {
   return node
 }
 
+// Round-7 review F3: a `required` error is STRUCTURAL only when it names a
+// field missing from the RECORD's own envelope -- when it names a field
+// missing from inside an OBJECT-ARRAY ITEM (ac_verdicts[i].ac_id,
+// findings[i].lens), there is no value to null (nothing was ever
+// supplied), but the ITEM can still be dropped, exactly like a malformed
+// primitive array element. Returns [arrayKey, index] when `pathParts`
+// points inside such an item, else null.
+function itemDropPathParts(pathParts) {
+  if (pathParts.length >= 3 && typeof pathParts[1] === 'number') return pathParts.slice(0, 2)
+  return null
+}
+
+// Round-7 review F3: required-missing nested inside an array item is
+// VALUE-level (item-level, see itemDropPathParts above); requiredWhen
+// never nests (only the top-level schema declares it) and rootType/
+// additionalProperty always name a genuine shape break. Single definition
+// site for "is this error a record-level refusal reason", used both by
+// the up-front gate and nowhere else -- STRUCTURAL_KINDS alone is no
+// longer sufficient once `required` needs this distinction.
+function isStructuralError(err) {
+  if (err.kind === 'required') return !itemDropPathParts(err.pathParts)
+  return STRUCTURAL_KINDS.has(err.kind)
+}
+
 // Round-5 H1 (§12 reframe). This is the third time this exact defect class
 // has been found and "fixed": round-2 M-3 sanitised ac_id; round-4 M1
 // sanitised lens/severity; round-5 H1 would have sanitised
@@ -621,46 +648,63 @@ function resolveValue(entry, pathParts) {
 // Inverted from allowlist to general degrade-on-validation-failure:
 // 1. Validate the built entry (collectErrors).
 // 2. If clean, done (mirrors the old fast path exactly).
-// 3. If every error is VALUE-kind (type/enum/pattern -- never rootType/
-//    required/requiredWhen/additionalProperty), neutralise each in place:
-//    a known sibling field (ac_id/lens/severity/verdict, inside an
-//    object-array item) is nulled with a bounded, redacted raw form
-//    retained in its sibling; a dict entry (verdicts.<lens>,
-//    trigger_counts.<key>, rounds.<key>) is dropped from the dict; a
-//    primitive array element (lenses_run[i]) is dropped from the array
-//    (batched per array, so two bad elements in one array cannot shift
-//    each other's index mid-removal); any other top-level scalar
-//    (task/round_key/event/kind/outcome/...) is simply deleted from the
-//    entry. Deletion is deliberate, not nulling: it lets the NEXT
-//    validation pass decide the field's own fate through the schema it
-//    already declares -- an OPTIONAL field just becomes absent (a clean
-//    degrade), while a field that turns out to be required (kind,
-//    outcome/event_key when their requiredWhen condition matches) then
-//    fails as a required-property-missing error, which is genuinely
-//    structural and correctly refuses. This is what makes the mechanism
-//    self-limiting without a hand-maintained "never touch these fields"
-//    exclusion list: the schema's OWN required/requiredWhen declarations
-//    already say which fields are load-bearing.
+// 3. If every error is VALUE-kind (type/enum/pattern, plus -- round-7 F3
+//    -- a `required` error nested inside an array item; never rootType/
+//    requiredWhen/additionalProperty, and never a `required` error naming
+//    a top-level envelope field), neutralise each in place: a known
+//    sibling field (ac_id/lens/severity/verdict, inside an object-array
+//    item) is nulled with a bounded, redacted raw form retained in its
+//    sibling; a dict entry (verdicts.<lens>, trigger_counts.<key>,
+//    rounds.<key>) is dropped from the dict; a primitive array element
+//    (lenses_run[i]) is dropped from the array; an object-array item
+//    missing a required field entirely (round-7 F3) is dropped from ITS
+//    array the same way -- all three array-drop cases batched per array,
+//    so two bad elements/items in one array cannot shift each other's
+//    index mid-removal; any other top-level scalar (task/round_key/
+//    event/kind/outcome/...) is simply deleted from the entry. Deletion
+//    is deliberate, not nulling: it lets the NEXT validation pass decide
+//    the field's own fate through the schema it already declares -- an
+//    OPTIONAL field just becomes absent (a clean degrade), while a field
+//    that turns out to be required (kind, outcome/event_key when their
+//    requiredWhen condition matches) then fails as a required-property-
+//    missing error, which is genuinely structural and correctly refuses.
+//    This is what makes the mechanism self-limiting without a hand-
+//    maintained "never touch these fields" exclusion list: the schema's
+//    OWN required/requiredWhen declarations already say which fields are
+//    load-bearing.
 // 4. Re-validate. Anything still wrong -- including a required-missing
 //    error freshly surfaced by step 3's deletions -- is now genuinely
 //    unrecoverable at the value level and the record is refused, citing
 //    the FINAL error list (never the original one, so the refusal reason
 //    is honest about what actually stopped the write).
-// If ANY error from the first pass is STRUCTURAL (a required field was
-// ALREADY absent, the entry or an array item is not an object, or an
-// unknown top-level key exists), no neutralisation is attempted at all --
-// exactly the FINDING-1/M-2 precedent, matching main's own behaviour for
-// those inputs.
+// If ANY error from the first pass is STRUCTURAL (a required TOP-LEVEL
+// field was already absent, the entry or an array item is not an object,
+// or an unknown top-level key exists), no neutralisation is attempted at
+// all -- exactly the FINDING-1/M-2 precedent, matching main's own
+// behaviour for those inputs.
 export function degradeEntry(entry, redactRawField = (v) => v) {
   let errs = collectErrors(entry, LEDGER_ENTRY_SCHEMA, [])
   const neutralisations = []
   if (errs.length) {
-    if (errs.some((e) => STRUCTURAL_KINDS.has(e.kind))) {
+    if (errs.some(isStructuralError)) {
       return { ok: false, errors: errs.map((e) => e.message) }
     }
     const arrayDrops = new Map() // pathPrefix of the array -> {pathParts, indices}
     for (const err of errs) {
       const last = err.pathParts[err.pathParts.length - 1]
+      // Round-7 F3: a required field missing from inside an array item
+      // drops the WHOLE ITEM -- there is no value to null, only an
+      // identity that was never supplied. Reuses the SAME batched
+      // arrayDrops mechanism the primitive-array-item case (below) uses.
+      if (err.kind === 'required') {
+        const itemPrefix = itemDropPathParts(err.pathParts)
+        const arrayPathParts = [itemPrefix[0]]
+        const groupKey = pathPartsToPrefix(arrayPathParts)
+        if (!arrayDrops.has(groupKey)) arrayDrops.set(groupKey, { pathParts: arrayPathParts, indices: new Set() })
+        arrayDrops.get(groupKey).indices.add(itemPrefix[1])
+        neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'generic', raw: null })
+        continue
+      }
       if (typeof last === 'number') {
         const arrayPathParts = err.pathParts.slice(0, -1)
         const groupKey = pathPartsToPrefix(arrayPathParts)
@@ -674,7 +718,27 @@ export function degradeEntry(entry, redactRawField = (v) => v) {
       const siblingField = RAW_SIBLING_FIELDS[last]
       const isKnownItemField = siblingField && err.pathParts.length === 3 && typeof err.pathParts[1] === 'number'
       if (isKnownItemField) {
-        container[siblingField] = truncateBytes(redactRawField(rawValue), AC_ID_RAW_MAX_BYTES)
+        // Round-7 review F2: the field being neutralised can itself be
+        // `undefined` -- not merely a wrong-typed VALUE, but genuinely
+        // OMITTED by the caller. computeFindings (above) unconditionally
+        // creates a `lens` PROPERTY on every finding entry (`lens: f.lens`,
+        // no fallback, unlike severity/ac_id which both default to a real
+        // value) -- so a descriptor that never supplied `lens` at all still
+        // produces a `lens` KEY present with value undefined, which fails
+        // the type check the same way a wrong-typed value would. Writing
+        // that `undefined` straight into the *_raw sibling (truncateBytes/
+        // redactRawField both pass null/undefined through UNCHANGED, by
+        // design, so it stays undefined) creates a property whose OWN
+        // value then fails re-validation on the second pass -- one
+        // malformed (in this case, merely INCOMPLETE) findings descriptor
+        // destroying the whole record again, the identical total-loss
+        // class this entire mechanism exists to close. Only retain a raw
+        // form when there is something concrete TO retain; otherwise leave
+        // the sibling untouched (absent), which is schema-legal (neither
+        // field is in the item's own `required` list).
+        if (rawValue !== undefined) {
+          container[siblingField] = truncateBytes(redactRawField(rawValue), AC_ID_RAW_MAX_BYTES)
+        }
         container[last] = null
         const bucket = last === 'ac_id' ? 'ac_id' : err.pathParts[0] === 'findings' && (last === 'lens' || last === 'severity') ? 'finding_field' : 'general'
         neutralisations.push({ pathParts: err.pathParts, bucket, kind: 'siblingField' })
@@ -1469,10 +1533,25 @@ export function main() {
   // EXPLICIT null supplied by the caller is still semantically suspect: a
   // FAIL verdict with no ac_id must not read as zero sanitisations
   // (round-4 M3's own reader-side taint depends on this counter).
+  //
+  // Round-7 review, instruction 3: the identical gap exists for `verdict`
+  // -- also schema-nullable on purpose, so an EXPLICIT `verdict: null`
+  // (no verdict_raw at all) never touches degradeEntry either, and the
+  // writer previously left it silently uncounted. The reader's F1 fix
+  // (value-based: is this one of PASS/FAIL/UNVERIFIABLE?) already treats
+  // this shape correctly as non-evidence regardless of whether the writer
+  // counts it -- but a silent neutralisation is how the round-6 defect
+  // stayed invisible in the first place, so it is counted here too, under
+  // invalid_record_values_dropped (verdict is not ac_id -- same counter
+  // round-5 already routes every other non-ac_id/lens/severity
+  // neutralisation through).
   let explicitNullAcVerdictAcId = 0
+  let explicitNullVerdict = 0
   if (Array.isArray(entry.ac_verdicts)) {
     for (const v of entry.ac_verdicts) {
-      if (v && typeof v === 'object' && v.ac_id === null) explicitNullAcVerdictAcId += 1
+      if (!v || typeof v !== 'object') continue
+      if (v.ac_id === null) explicitNullAcVerdictAcId += 1
+      if (v.verdict === null) explicitNullVerdict += 1
     }
   }
 
@@ -1482,6 +1561,9 @@ export function main() {
   }
   if (explicitNullAcVerdictAcId > 0) {
     entry.invalid_ac_ids_dropped = (entry.invalid_ac_ids_dropped || 0) + explicitNullAcVerdictAcId
+  }
+  if (explicitNullVerdict > 0) {
+    entry.invalid_record_values_dropped = (entry.invalid_record_values_dropped || 0) + explicitNullVerdict
   }
 
   let line = JSON.stringify(entry)
