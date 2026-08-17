@@ -18,13 +18,75 @@ const DEFAULT_RULES = {
   operability: ['Dockerfile*', 'docker-*.yml', 'compose*.yml', '.github/workflows/**', 'scripts/**', 'Procfile', 'helm/**', 'terraform/**', '**/*logging*', '**/*logger*'],
 }
 
+// Security review round 2 of specs/custom-rules-fail-closed.md, item 1
+// [HIGH]: globToRe expands every "**" to ".*", producing an unanchored
+// alternation with no backtracking bound. Both the override file's globs and
+// the changed filenames they are matched against are attacker-controlled on
+// a public repo (the override file and the filename both live in a
+// contributor's own branch). Measured against this exact compiler, with one
+// changed filename 61 chars long: "**a**a**a**a**b" (5 occurrences of "**",
+// 15 chars) took 58ms; "**a**a**a**a**a**a**b" (7 occurrences, 21 chars) took
+// 5060ms -- roughly 9x per added "**a". A ~30-char glob does not return, and
+// the workflow wedges with no error, no verdict, and no terminal ledger line.
+//
+// Do NOT try to make globToRe itself backtracking-proof -- rewriting glob
+// compilation is a much larger change with its own risk. Bound the input
+// instead, in the validation loop that already walks every custom_rules
+// value, before any regex is ever compiled: glob length, "**" occurrences per
+// glob, and glob count per key.
+const MAX_GLOB_LENGTH = 200
+const MAX_GLOB_DOUBLESTAR = 4 // this repo's own real DEFAULT_RULES globs use at most 1
+const MAX_GLOBS_PER_KEY = 50 // this repo's own real DEFAULT_RULES entries use at most ~11; generous headroom
+
+// Item 3 [MEDIUM]: an attacker-authored custom_rules key or glob string was
+// previously interpolated verbatim into a thrown Error's message, and from
+// there into the operator-visible log line (redactLogText only truncates at
+// 500 chars and redacts absolute paths, not general injection -- and the
+// re-thrown error itself is neither truncated nor redacted at all). Before
+// this change no custom_rules string was rendered anywhere; this change
+// creates that channel, so every message built from untrusted custom_rules
+// content goes through this first: collapsing whitespace strips a crafted
+// newline from faking a second log line or a second sentence, truncating to
+// ~60 chars bounds how much attacker text ever reaches an operator, and
+// JSON.stringify quotes and escapes the result so a literal double-quote in
+// the input cannot break out of the surrounding sentence.
+function neutralise(text) {
+  const collapsed = String(text).replace(/\s+/g, ' ').trim()
+  const truncated = collapsed.length > 60 ? collapsed.slice(0, 60) + '…' : collapsed
+  return JSON.stringify(truncated)
+}
+
 function globToRe(g) {
   let s = g.replace(/[.+^${}()|[\]\\]/g, '\\$&')
   s = s.replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*').replace(/\u0001/g, '.*')
+  // Item 2 [MEDIUM]: "?" was previously left unescaped by the class above, so
+  // it either threw ("Nothing to repeat" for a bare "?", an error naming
+  // neither the file nor the key) or, for globs that did compile, survived as
+  // a regex quantifier -- the inverse of glob semantics: src/v?/** matched
+  // src/v/x but NOT src/v1/x. Map it to "exactly one non-separator character"
+  // instead, which is what a glob author expects. No other step in this
+  // function touches "?", so it is safe to apply last.
+  s = s.replace(/\?/g, '[^/]')
   return new RegExp('^' + s + '$')
 }
 function matches(paths, globs) {
-  const res = (globs || []).map(globToRe)
+  const res = (globs || []).map(g => {
+    try {
+      return globToRe(g)
+    } catch (e) {
+      // Defence in depth: after the length/"**"-count bounds above and the
+      // "?" fix, no shape-valid custom_rules glob is known to reach this
+      // catch (every remaining regex metacharacter is escaped before this
+      // point) -- but a construction failure here must still name the
+      // offending glob and abort, rather than surfacing as an unrelated
+      // SyntaxError deep in glob compilation.
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json has a glob that failed to compile as a regex: ` +
+        `${neutralise(g)} (${e && e.message ? e.message : String(e)}). Aborting the review rather than proceeding ` +
+        `with an unvalidated override.`
+      )
+    }
+  })
   return paths.filter(p => res.some(r => r.test(p)))
 }
 
@@ -261,6 +323,23 @@ if (scope.harness_triggers_file_exists === true && scope.custom_rules === null) 
   )
 }
 
+// Item 4, from the security review: the contradiction check was one-directional.
+// The design's whole insight is that two independent answers can contradict, so
+// treating only one direction as a failure leaves the other silent. A scope step
+// that reports no override file while delivering custom_rules has misread
+// something, and applying those rules would narrow the lens roster on the word
+// of an answer the other field contradicts -- while the log cheerfully reports
+// "repo-tuned" for a repo with no tuning.
+if (scope.harness_triggers_file_exists === false && scope.custom_rules !== null) {
+  throw new Error(
+    'HarnessTriggersContradiction: the scope step reported no .claude/harness-triggers.json at the repo root ' +
+    '(harness_triggers_file_exists is false) yet delivered custom_rules anyway -- the two answers contradict, so ' +
+    'one of them is wrong and there is no way to tell which. Aborting rather than narrowing the lens roster on the ' +
+    'strength of an override the same step says does not exist. Re-run the review; if this recurs, the scope step ' +
+    'is misreading the repo root.'
+  )
+}
+
 // AC-SEC-3: shape-validate custom_rules before it is merged into the trigger
 // rules and reaches matches()/glob compilation. Unvalidated, a non-array
 // value throws an unrelated error deep in glob compilation and a stray key
@@ -271,7 +350,7 @@ if (scope.custom_rules !== null) {
   for (const key of Object.keys(scope.custom_rules)) {
     if (!CUSTOM_RULE_KEYS.includes(key)) {
       throw new Error(
-        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json has an unrecognised key "${key}" -- only ` +
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json has an unrecognised key ${neutralise(key)} -- only ` +
         `${CUSTOM_RULE_KEYS.join(', ')} are accepted. Aborting the review rather than proceeding with an ` +
         `unvalidated override.`
       )
@@ -309,6 +388,46 @@ if (scope.custom_rules !== null) {
         `path. Omit the key entirely to inherit the defaults. Aborting rather than reviewing with a lens ` +
         `disabled by what may be a transcription failure.`
       )
+    }
+    // Item 1 [HIGH], from the security review of this PR. globToRe expands
+    // every "**" to ".*", producing an unanchored alternation with no
+    // backtracking bound, so a crafted glob makes matches() run effectively
+    // forever. Measured against the real compiler with a 61-char filename:
+    // 12 chars 4.7ms, 15 chars 58ms, 18 chars 586ms, 21 chars 5060ms -- about
+    // 9x per added "**a", and a 30-char glob does not return. Both halves are
+    // attacker-controlled on a public repo (the override file and the filename
+    // both live in a contributor's branch), and the workflow wedges inside the
+    // sandbox with no error, no verdict and no terminal ledger line, leaving
+    // the run's started record a permanent orphan. That is strictly worse than
+    // an abort, which at least says what happened.
+    //
+    // The input is bounded rather than globToRe made backtracking-proof:
+    // rewriting glob compilation is a much larger change carrying its own
+    // risk, and these bounds are far above anything a real override needs
+    // (the harness's own DEFAULT_RULES use at most one "**" per glob).
+    if (value.length > MAX_GLOBS_PER_KEY) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" has too many globs: ${value.length}, ` +
+        `more than the limit of ${MAX_GLOBS_PER_KEY}. Each glob is compiled to a regex and matched against every changed path, so ` +
+        `an unbounded list is a denial-of-service surface. Aborting the review.`
+      )
+    }
+    for (const g of value) {
+      if (g.length > MAX_GLOB_LENGTH) {
+        throw new Error(
+          `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" contains a glob that is too long: ` +
+          `${g.length} characters, over the limit of ${MAX_GLOB_LENGTH}: ${neutralise(g)}. Long globs compile to regexes whose ` +
+          `backtracking cost grows exponentially. Aborting the review.`
+        )
+      }
+      const doubleStars = g.split('**').length - 1
+      if (doubleStars > MAX_GLOB_DOUBLESTAR) {
+        throw new Error(
+          `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" contains a glob with too many "**" ` +
+          `segments: ${doubleStars}, over the limit of ${MAX_GLOB_DOUBLESTAR}: ${neutralise(g)}. Each "**" becomes ".*", and ` +
+          `stacking them makes matching cost grow about 9x per segment. Aborting the review.`
+        )
+      }
     }
     if (value.some(v => v.trim() === '')) {
       throw new Error(

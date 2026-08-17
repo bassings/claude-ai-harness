@@ -86,10 +86,46 @@ defaults, so an empty array is not the spelling of anything). An **empty-string
 glob** is rejected for the same reason in miniature: it matches nothing, so the
 override silently covers less than it appears to.
 
-**AC-SEC-4**: No content from `custom_rules` is interpolated into any later
-agent prompt. The overrides are matched by regex in the sandbox; a repo's
-override file is attacker-influenceable on a public repo, so its strings must
-never reach a model through this workflow.
+**AC-SEC-4** *(reworded after review round 2 -- the original pinned the
+mechanism, not the property)*: No content from `custom_rules` reaches a model
+in any form -- not through a later agent prompt, and not through an error
+message or log line, both of which are rendered into the invoking session's
+context. A repo's override file is attacker-influenceable on a public repo.
+Where an offending key or glob must be named for the operator, it is
+neutralised first: whitespace collapsed, truncated to ~60 characters, and
+JSON-quoted so a crafted value cannot break out of the surrounding sentence or
+fake a second log line. The original wording constrained "any later agent
+prompt" and passed while the property it existed to protect did not: the
+change added an interpolation into exactly the paths it did not cover.
+
+**AC-SEC-5** *(added after review round 2; nothing previously covered glob
+*contents*)*: Glob strings are bounded before any regex is compiled from them.
+`globToRe` expands every `**` to `.*`, producing an unanchored alternation with
+no backtracking bound, and both halves of the input are attacker-controlled on
+a public repo. Measured against the real compiler with a 61-character filename:
+12 chars 4.7ms, 15 chars 58ms, 18 chars 586ms, 21 chars 5060ms -- about 9x per
+added `**a`, and a 30-character glob does not return. The workflow wedges
+inside the sandbox with no error, no verdict and no terminal ledger line,
+leaving the run's `started` record a permanent orphan, which is strictly worse
+than the abort this design deliberately chose. Bound the input (glob length,
+`**` count per glob, glob count per key) rather than rewriting glob
+compilation, and prove the bound by timing: the measured pathological glob must
+be rejected in microseconds rather than compiled.
+
+**AC-SEC-6** *(added after review round 2)*: `?` is handled as a glob
+metacharacter, not passed through to the regex engine. Unescaped it either
+threw `Nothing to repeat` -- an error naming neither the file nor the key, so
+AC-OPS-3's actionability was lost on that path -- or survived as a regex
+quantifier, inverting the author's intent: `src/v?/**` matched `src/v/x` but
+NOT `src/v1/x`. It maps to `[^/]`, exactly one non-separator character. Any
+remaining `RegExp` construction failure is re-thrown naming the offending glob.
+
+**AC-SEC-7** *(added after review round 2)*: The contradiction check is
+symmetric. `harness_triggers_file_exists: false` with `custom_rules` delivered
+is as much a contradiction as the reverse, and was previously accepted, applied
+and logged as `repo-tuned` for a repo with no tuning. It aborts under its own
+error name, distinct from the transcription failure, so the two causes stay
+distinguishable in the artefact.
 
 ### lens-qa
 
@@ -109,6 +145,12 @@ an array containing a non-string.
 used, distinguishing repo-tuned from defaulted, and that it reports the number
 of overridden keys. Asserting only that a log line exists would pass with the
 source omitted.
+
+**AC-QA-6** *(added after review round 2)*: The AC-SEC-4 regression test plants
+its marker in a `custom_rules` **key** as well as a glob value. As originally
+written it planted the marker only in a value, so it structurally could not
+fail on a key -- the repo's own recurring fixture-agrees-with-the-code failure,
+inside the test written to prevent exactly this.
 
 **AC-QA-5**: Every guard added here is proven load-bearing: the mutation
 applied, the test observed failing, `git diff` confirming the edit landed on
