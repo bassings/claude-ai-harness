@@ -4,9 +4,14 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
+const { spawnSync } = require('node:child_process')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
+const { makeTempRepo, runAppend, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
 const WORKFLOW = path.join(__dirname, '..', 'workflows', 'optimise-cycle.js')
+const OPTIMISE_READ_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
+
+test.after(cleanupTempRepos)
 
 // Round-2 M3: a fixed, known nonce for fixtures. In production this comes
 // from a Bash-generated random token (openssl rand -hex 16 or equivalent)
@@ -30,9 +35,25 @@ function ledgerFixture(overrides = {}) {
     // real CLI now actually emits, not the pre-round-2 raw-path shape.
     perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
     skipped: [],
-    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }] },
+    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }], invalidAcIdsDropped: 0, invalidRecordValuesDropped: 0 },
     neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false }],
-    wallClock: { byPlan: {}, totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 }, source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' } },
+    // Review round-2 H-1: the orphan/aborted fields are included here as
+    // explicit real zeros -- representing an UP-TO-DATE reader that
+    // genuinely computed "nothing to report" -- so this default fixture
+    // (used by most tests as "the clean case") is distinguishable from a
+    // STALE reader that never computed these fields at all (undefined).
+    // Tests that specifically want the stale-reader case build their own
+    // totals object omitting these fields.
+    wallClock: {
+      byPlan: {},
+      totals: {
+        ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0,
+        agentComputeStartOnlyRuns: 0, agentComputeTerminalOnlyRuns: 0,
+        agentComputeStartOnlyByKind: {}, agentComputeTerminalOnlyByKind: {},
+        agentComputeAbortedPairs: 0,
+      },
+      source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+    },
     triggerAccuracy: { byLens: {} },
     proposalOutcomes: {},
     citationPool: ['run-1', 'run-2', 'run-3', 'run-4', 'run-5', 'run-6'],
@@ -212,6 +233,320 @@ test('optimise-cycle: the report renders real ZEROS for the three exclusion coun
   assert.ok(line.includes('degraded-unattributed runs=0'), `got: ${line}`)
   assert.ok(line.includes('unattributable ci_wait/human_wait observations=0'), `got: ${line}`)
   assert.ok(line.includes('unattributable rework records=0'), `got: ${line}`)
+})
+
+// ---- Review round-1 H2: the two orphan classes AC-OPS-2 exists to
+// separate (agentComputeStartOnlyRuns/agentComputeTerminalOnlyRuns, each
+// broken down by kind) were computed by optimise-read.mjs and reached
+// neither the Sample completeness section nor anywhere else a human
+// reads -- confirmed by grep, zero matches across workflows/skills/
+// agents/hooks/README/AGENT-HARNESS/docs excluding optimise-read.mjs
+// itself. When the exception-guard fix closes the start-only half, the
+// report would move "unmeasured n=6" to "unmeasured n=2" with nothing
+// saying which class moved -- exactly the "partial fix reads as progress"
+// trap the spec names as the reason the two classes exist at all. Rendered
+// as its own always-present line in Sample completeness, next to the
+// existing "Excluded from attribution" line, with real zeros when clean
+// (M2's own pattern). ----
+
+test('optimise-cycle: the report\'s Sample completeness section renders start-only and terminal-only orphan counts, broken down by kind, with real non-zero numbers when a marker-bearing fixture is fed in (H2, AC-OPS-2)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0,
+          agentComputeStartOnlyRuns: 4, agentComputeTerminalOnlyRuns: 2,
+          agentComputeStartOnlyByKind: { review_cycle: 4 },
+          agentComputeTerminalOnlyByKind: { review_cycle: 1, tdd_task: 1 },
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('Orphaned agent-compute runs'))
+  assert.ok(line, `expected a line starting with "Orphaned agent-compute runs", report was: ${result.report}`)
+  assert.ok(line.includes('start-only=4'), `got: ${line}`)
+  assert.ok(line.includes('terminal-only=2'), `got: ${line}`)
+  assert.ok(line.includes('review_cycle: 4'), `start-only by-kind breakdown missing, got: ${line}`)
+  assert.ok(line.includes('review_cycle: 1') && line.includes('tdd_task: 1'), `terminal-only by-kind breakdown missing, got: ${line}`)
+})
+
+test('optimise-cycle: the report renders real ZEROS for the orphan counts on a clean fixture, never omitting the line entirely -- a missing line means the check stopped running, never that nothing is wrong (H2, AC-OPS-2)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.startsWith('Orphaned agent-compute runs'))
+  assert.ok(line, `expected a line starting with "Orphaned agent-compute runs" even when every count is zero, report was: ${result.report}`)
+  assert.ok(line.includes('start-only=0'), `got: ${line}`)
+  assert.ok(line.includes('terminal-only=0'), `got: ${line}`)
+})
+
+// H1's aborted-pairs counter (a crashed run's agent-compute time, excluded
+// from the completed-run duration statistic) rendered beside the existing
+// measured/unmeasured counts in the Totals line, so a workflow crashing on
+// every run is visible in the same line an operator already reads.
+test('optimise-cycle: the wall-clock Totals line renders the aborted-pairs count (H1), with a real non-zero number when a fixture carries one', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: null, unterminatedWaits: 0,
+          agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 1, agentComputeAbortedPairs: 1,
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(line, `expected a line starting with "Totals:", report was: ${result.report}`)
+  assert.ok(line.includes('aborted n=1'), `got: ${line}`)
+})
+
+test('optimise-cycle: the wall-clock Totals line renders a real ZERO for aborted-pairs on a clean fixture (H1, not vacuous)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(line, `expected a line starting with "Totals:", report was: ${result.report}`)
+  assert.ok(line.includes('aborted n=0'), `got: ${line}`)
+})
+
+// ---- Review round-2 H-1 (High): the renderers `?? 0`'d a MISSING field,
+// so a STALE installed reader (one that predates these fields -- the
+// NORMAL state post-merge, since the ledger lane prefers the installed
+// mirror at ~/.claude/workflows/lib/optimise-read.mjs) or a renamed field
+// prints `start-only=0, terminal-only=0, aborted n=0` when the truth is
+// 4/2/N -- worse than pre-PR2, where the operator at least saw
+// `unmeasured=6`. Confirmed by execution: renaming the reader's own
+// exported field names left the FULL SUITE 460/460 green, because every
+// report test built its totals fixture by hand and none omitted these
+// fields to prove the undefined case. Fixed: `undefined` (field genuinely
+// absent) now renders an explicit "unavailable" marker, distinguishable
+// from a real, computed `0`. ----
+
+test('optimise-cycle: when the installed reader is STALE (predates the orphan-count fields entirely -- totals lacks them, not merely zero), the report renders an explicit "unavailable" marker, never a confident 0 (H-1)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        // Deliberately the SHAPE a pre-round-1 optimise-read.mjs would
+        // return: no orphan/aborted fields exist on totals at all.
+        totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const orphanLine = result.report.split('\n').find((l) => l.startsWith('Orphaned agent-compute runs'))
+  assert.ok(orphanLine, `expected the line to still render, report was: ${result.report}`)
+  assert.ok(!orphanLine.includes('start-only=0'), `must NOT render a confident 0 when the field is genuinely absent, got: ${orphanLine}`)
+  assert.ok(!orphanLine.includes('terminal-only=0'), `must NOT render a confident 0 when the field is genuinely absent, got: ${orphanLine}`)
+  assert.ok(/unavailable/i.test(orphanLine), `must state the value is unavailable, got: ${orphanLine}`)
+
+  const totalsLine = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(!totalsLine.includes('aborted n=0'), `must NOT render a confident 0 for aborted n when the field is genuinely absent, got: ${totalsLine}`)
+  assert.ok(/unavailable/i.test(totalsLine), `must state the value is unavailable, got: ${totalsLine}`)
+})
+
+// AC-QA-10-style reader-to-report SEAM test (H-1's own required second
+// part): builds the totals from the REAL optimise-read.mjs output over a
+// real temp ledger with known non-zero counts, not a hand-built fixture --
+// so a rename of the reader's exported field names (which left the whole
+// suite green in round-2's own reproduction) is caught HERE, because this
+// is the one test whose fixture is not hand-typed to match whatever the
+// reader currently calls its fields.
+test('optimise-cycle: the orphan-count and aborted-pairs lines render REAL numbers computed by the REAL optimise-read.mjs over a real temp ledger -- not a hand-built fixture, so a field rename in the reader cannot leave this test green (H-1 seam test)', async () => {
+  const repo = makeTempRepo()
+  // Reproduces the spec's own worked example: 4 start-only, 2 terminal-only,
+  // 1 genuinely paired/measured run, all attributed to one repo-relative plan.
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/a.md', run_id: 'so-1' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/a.md', run_id: 'so-2' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/a.md', run_id: 'so-3' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'started', spec: 'specs/a.md', run_id: 'so-4' })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', run_id: 'to-1' })
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done', spec: 'specs/a.md', run_id: 'to-2' })
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'started', spec: 'specs/a.md', run_id: 'paired-1' })
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'aborted', spec: 'specs/a.md', run_id: 'paired-1' })
+
+  const res = spawnSync('node', [OPTIMISE_READ_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const realLedgerOutput = JSON.parse(res.stdout.trim())
+  assert.equal(realLedgerOutput.wallClock.totals.agentComputeStartOnlyRuns, 4, 'sanity: the real fixture must genuinely produce 4 start-only orphans')
+  assert.equal(realLedgerOutput.wallClock.totals.agentComputeTerminalOnlyRuns, 2, 'sanity: the real fixture must genuinely produce 2 terminal-only orphans')
+  assert.equal(realLedgerOutput.wallClock.totals.agentComputeAbortedPairs, 1, 'sanity: the real fixture must genuinely produce 1 aborted pair')
+
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ wallClock: realLedgerOutput.wallClock }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const orphanLine = result.report.split('\n').find((l) => l.startsWith('Orphaned agent-compute runs'))
+  assert.ok(orphanLine.includes('start-only=4'), `got: ${orphanLine}`)
+  assert.ok(orphanLine.includes('terminal-only=2'), `got: ${orphanLine}`)
+  const totalsLine = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(totalsLine.includes('aborted n=1'), `got: ${totalsLine}`)
+})
+
+// ---- Review round-2 M-3 (rendering half): invalid_ac_ids_dropped was
+// computed by the writer and summed by the reader, but reached no report a
+// human reads -- rendered on the Sample completeness data-quality line
+// beside the orphan counters, real zero when clean, "unavailable" when the
+// reader is stale (H-1's own treatment, applied consistently). ----
+
+test('optimise-cycle: the Sample completeness section renders invalid_ac_ids_dropped with a real non-zero number when the fixture carries one (M-3)', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { n: 1, lensDispositionCounts: {}, acVerdicts: [], invalidAcIdsDropped: 3 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_ac_ids_dropped') || l.includes('invalid ac_id'))
+  assert.ok(line, `expected a line naming invalid_ac_ids_dropped, report was: ${result.report}`)
+  assert.ok(line.includes('3'), `got: ${line}`)
+})
+
+test('optimise-cycle: the Sample completeness section renders a real ZERO for invalid_ac_ids_dropped on a clean fixture, never omitting the line (M-3, not vacuous)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_ac_ids_dropped') || l.includes('invalid ac_id'))
+  assert.ok(line, `expected the line even when clean, report was: ${result.report}`)
+  assert.ok(/\b0\b/.test(line), `got: ${line}`)
+})
+
+// ---- Round-7 review F7: invalid_record_values_dropped (round-6's own
+// wiring, general-degrade counterpart to invalid_ac_ids_dropped above) had
+// exactly one test in the whole suite, asserting the READER's sum -- never
+// that the report actually renders it. The sibling invalid_ac_ids_dropped
+// line above has both a non-zero and a real-zero render test; this mirrors
+// that pair, so a later edit that drops the line (or makes it conditional
+// on a truthy count, the round-2 M-6 shape) cannot pass silently. ----
+
+test('optimise-cycle: the Sample completeness section renders invalid_record_values_dropped with a real non-zero number when the fixture carries one (round-7 F7)', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { n: 1, lensDispositionCounts: {}, acVerdicts: [], invalidAcIdsDropped: 0, invalidRecordValuesDropped: 4 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_record_values_dropped'))
+  assert.ok(line, `expected a line naming invalid_record_values_dropped, report was: ${result.report}`)
+  assert.ok(line.includes('4'), `got: ${line}`)
+})
+
+test('optimise-cycle: the Sample completeness section renders a real ZERO for invalid_record_values_dropped on a clean fixture, never omitting the line (round-7 F7, not vacuous)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_record_values_dropped'))
+  assert.ok(line, `expected the line even when clean, report was: ${result.report}`)
+  assert.ok(/\b0\b/.test(line), `got: ${line}`)
+})
+
+// Round-7 review F7: the two never-failing taint-reason suffixes
+// (unattributed_fail_in_window, unattributed_verdict_in_entry) were
+// rendered but had no test asserting their text, or that the two are
+// textually distinct from (insufficient data) and from each other.
+test('optimise-cycle: the Never-failing acceptance criteria section renders the unattributed_fail_in_window reason distinctly from (insufficient data) (round-7 F7)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, unattributed_fail_in_window: true, unattributed_verdict_in_entry: false, never_failed: null }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('AC-QA-1'))
+  assert.ok(line, `expected a never-failing line for AC-QA-1, report was: ${result.report}`)
+  assert.match(line, /unattributed FAIL in window/i, `got: ${line}`)
+  assert.ok(!line.includes('insufficient data'), `must not read as insufficient data, got: ${line}`)
+})
+
+test('optimise-cycle: the Never-failing acceptance criteria section renders the unattributed_verdict_in_entry reason distinctly from both other reasons (round-7 F7)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      // insufficient_data is deliberately false here (even though the real
+      // aggregator's n:0 case also trips it) to isolate the render's
+      // unattributed_verdict_in_entry branch specifically -- insufficient_data
+      // is checked first in the render precedence, so leaving it true would
+      // test the WRONG branch. AC-QA-1's own reader-side test already covers
+      // the real n:0-implies-insufficient_data interaction.
+      neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-2', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-2', n: 6, insufficient_data: false, unattributed_fail_in_window: false, unattributed_verdict_in_entry: true, never_failed: null }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('AC-QA-2'))
+  assert.ok(line, `expected a never-failing line for AC-QA-2, report was: ${result.report}`)
+  assert.match(line, /unattributed verdict/i, `got: ${line}`)
+  assert.ok(!line.includes('unattributed FAIL in window'), `must be textually distinct from the other taint reason, got: ${line}`)
+})
+
+// ---- Review round-2 L-4: agentComputeAbortedSeconds and the per-plan
+// aborted figures were computed but rendered nowhere -- an operator saw
+// HOW MANY runs crashed but not how much wall clock those crashes
+// consumed, and could not tell WHICH plan is crashing (the per-plan
+// figure is the actionable half). ----
+
+test('optimise-cycle: the Totals line renders agentComputeAbortedSeconds beside the aborted count (L-4)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: null, unterminatedWaits: 0,
+          agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 1, agentComputeAbortedPairs: 1, agentComputeAbortedSeconds: 2400,
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('Totals:'))
+  assert.ok(line.includes('aborted n=1'), `got: ${line}`)
+  assert.ok(/aborted[^)]*2400s|2400s[^)]*aborted|\(2400s\)/.test(line) || line.includes('2400s'), `Totals line must render the aborted SECONDS too, got: ${line}`)
+})
+
+test('optimise-cycle: the per-plan wall-clock line renders that plan\'s own aborted seconds/count (L-4)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {
+          'demo|specs/crashy.md': {
+            repo: 'demo', plan: 'specs/crashy.md',
+            ciWaitSeconds: 0, ciWaitN: 0, humanWaitSeconds: 0, humanWaitN: 0,
+            agentComputeSeconds: 0, agentComputeN: 0, agentComputeAbortedSeconds: 900, agentComputeAbortedN: 3,
+            unterminatedWaits: 0,
+          },
+        },
+        totals: {
+          ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0,
+          agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 3, agentComputeAbortedPairs: 3, agentComputeAbortedSeconds: 900,
+        },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('specs/crashy.md'))
+  assert.ok(line, `expected a per-plan line for specs/crashy.md, report was: ${result.report}`)
+  assert.ok(line.includes('900s'), `the per-plan line must name WHICH plan is crashing with its own aborted seconds, got: ${line}`)
+  assert.ok(line.includes('3'), `got: ${line}`)
+})
+
+// ---- Review round-2 M-6: the Sample completeness data-quality line
+// omitted schemaVersionsSeen and truncatedFinalLine entirely, and rendered
+// skippedCount only conditionally (a clean repo showed no line at all,
+// rather than a real zero) -- AC-OPS-3's own rule ("a missing line means
+// the check stopped running") cannot hold for a signal that never
+// renders. ----
+
+test('optimise-cycle: the per-repo Sample completeness line always renders skippedCount (a real zero when clean), schemaVersionsSeen, and truncatedFinalLine (M-6)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 4, 2: 2 }, truncatedFinalLine: false }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('demo') && l.includes('record'))
+  assert.ok(line, `expected the per-repo line, report was: ${result.report}`)
+  assert.ok(/skipped/i.test(line) && /\b0\b/.test(line), `must render skippedCount as a real zero even when clean, got: ${line}`)
+  assert.ok(line.includes('1: 4') || line.includes('"1":4') || (line.includes('1') && line.includes('4') && line.includes('2')), `must render the schemaVersionsSeen mix, got: ${line}`)
+  assert.ok(/truncat/i.test(line), `must render the truncatedFinalLine signal, got: ${line}`)
+})
+
+test('optimise-cycle: the per-repo line names a truncated final ledger line (a real corruption signal) when true, distinguishable from the false/clean case (M-6, not vacuous)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 2, schemaVersionsSeen: { 2: 6 }, truncatedFinalLine: true }],
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('demo') && l.includes('record'))
+  assert.ok(/truncat/i.test(line) && /true|yes/i.test(line), `must positively state the final line WAS truncated, got: ${line}`)
+  assert.ok(/skipped.*2\b/.test(line), `must render the real skippedCount of 2, got: ${line}`)
 })
 
 // ---- Review round-1 M5 (SPEC BUG SB-1): perRepo[].root silently changed
@@ -713,6 +1048,115 @@ test('optimise-cycle: a proposal whose target.segment is fully measured (0 unmea
   assert.equal(result.proposals_ranked.length, 1)
 })
 
+// ---- Round-4 review M5/M6: the round-3 owner fix (proportion-based
+// suppression) coerces a MISSING measured/unmeasured field to a share of
+// 0 (`typeof v === 'number' ? v : 0`), so the one brake standing between
+// unmeasurable data and a shipped proposal silently releases in exactly
+// the run where the report itself prints "unavailable" for that segment --
+// the inverse of the round-3 fix's own stated principle ("a false pass
+// could ship a proposal built on a window that turns out to be mostly
+// unmeasured"). M6 is the same defect one layer up: the render branch that
+// prints "unavailable" for this exact totals shape already exists
+// (measuredFieldPresent/unmeasuredFieldPresent, computed for the render
+// loop) but nothing wired those same presence flags into the GATE, and no
+// test drove a totals shape missing the fields through the real gate to
+// notice -- deleting the render branch left the full suite green. Both
+// fixed by routing the gate through the same presence check the renderer
+// already computes, so "absent" and "a real, computed 0" cannot be
+// confused in either direction. ----
+
+test('optimise-cycle: a proposal motivated by a segment FAILS CLOSED (is suppressed) when the reader totals lack the measured/unmeasured fields entirely -- "field absent" must never be read as "share 0" (M5, a defect in the round-3 owner fix)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        // Deliberately the shape a stale/partial reader would return:
+        // no agentComputeMeasuredRuns/agentComputeUnmeasuredRuns at all,
+        // exactly the totals shape the H-1 stale-reader test above uses.
+        totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute dominates wall-clock', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0, 'a proposal motivated by a segment whose measurement quality is UNKNOWN must never ship, the same as one motivated by a genuinely high-unmeasured segment')
+})
+
+test('optimise-cycle: the SAME stale-reader totals shape still renders "unavailable" in the Filtering drop-reason detail, naming the actual reason rather than a fabricated unmeasured-run count of 0 (M5, drop-reason detail must not lie either)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute dominates wall-clock', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const filteringLine = result.report.split('\n').find((l) => l.startsWith('Drafted:'))
+  assert.ok(filteringLine, `expected the Filtering summary line, report was: ${result.report}`)
+  assert.match(filteringLine, /agent_compute \(reader field unavailable\)/, `must name the real reason, not a fabricated count, got: ${filteringLine}`)
+})
+
+test('optimise-cycle: the Filtering section\'s per-segment ratio line renders "unavailable" (not a confident 0/0 or 0%) when the reader totals lack the measured/unmeasured fields entirely -- guards the stale-reader render branch a full-suite mutation could not previously see (M6)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('agent_compute:'))
+  assert.ok(line, `expected an agent_compute ratio line in the Filtering section, report was: ${result.report}`)
+  assert.match(line, /unavailable/i, `got: ${line}`)
+  assert.ok(!/0\/0|\(0%\)/.test(line), `must not render a confident 0/0 or (0%) when the fields are genuinely absent, got: ${line}`)
+})
+
+test('optimise-cycle: a proposal motivated by a segment still SURVIVES when that segment\'s totals are genuinely present and fully measured -- M5\'s fail-closed fix must not fail closed on a real, computed 0 too (not vacuous)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 100, agentComputeMeasuredRuns: 10, agentComputeUnmeasuredRuns: 0, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute dominates wall-clock', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1, 'a genuinely fully-measured, zero-unmeasured segment must still survive -- the fix must distinguish absent from a real 0')
+})
+
+// Round-4 review L7: 8/41 = 19.512%, which Math.round pushed to 20% --
+// the exact same integer as the threshold, so the line printed "(20%) --
+// below the 20% suppression threshold", a self-contradicting statement
+// (the ratio line's OWN reported percentage equals the threshold while
+// claiming to be below it) that reads exactly like the gate silently
+// failing. The gate itself compares the UNROUNDED ratio (0.19512 >= 0.2
+// is false), so the proposal correctly survives either way -- this test
+// pins the DISPLAY text, not the gate's verdict.
+test('optimise-cycle: the ratio line\'s displayed percentage never contradicts its own verdict clause -- 8/41 (19.512%) must print a percentage strictly below 20, never the threshold\'s own value (L7)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 4100, agentComputeMeasuredRuns: 33, agentComputeUnmeasuredRuns: 8, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.startsWith('agent_compute:'))
+  assert.ok(line, `expected an agent_compute ratio line, report was: ${result.report}`)
+  assert.match(line, /8\/41 runs unmeasured \(19%\) -- below the 20% suppression threshold/, `got: ${line}`)
+  assert.ok(!line.includes('(20%)'), `the displayed percentage must never equal the threshold while the line claims to be below it, got: ${line}`)
+})
+
 // ---- Review round-3 F4 (AC-OPS-3, spec bug): the unmeasured-segment gate must not depend on the agent having set target.segment ----
 
 test('optimise-cycle: an UNTAGGED proposal (no target.segment at all) whose motivating_measurement mentions "agent_compute" is still dropped when that segment has unmeasured runs -- the gate reads the free text, not just the typed tag (round-3 F4)', async () => {
@@ -771,6 +1215,105 @@ test('optimise-cycle: an untagged proposal that mentions a segment name while th
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 1)
+})
+
+// ---- Owner decision, round-3 coordinator triage: the suppression gate
+// moves from PRESENCE (>=1 unmeasured run anywhere in the segment) to
+// PROPORTION (the unmeasured/aborted share of the window exceeds a stated
+// threshold, UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD = 20%). Scott's own
+// design error, corrected: presence-based gating meant one ROUTINE aborted
+// run (a handled crash, not a data problem) permanently suppressed the
+// entire wall-clock proposal lane -- the analysis this whole programme
+// exists to produce. Both directions proven here, plus the exact boundary,
+// so this cannot be the vacuous one-directional guard the project keeps
+// finding: a low-share window must survive, a high-share window must still
+// be dropped, and the threshold's own inclusivity (>=, chosen to match the
+// old gate's own >=1 inclusivity and to err toward caution: a false
+// suppression only delays analysis, a false pass could ship a proposal
+// built on a badly corrupted window) must be pinned exactly, not just
+// approximately. ----
+
+test('optimise-cycle: a proposal motivated by a segment at a LOW unmeasured share (1/10 = 10%, below the 20% threshold) SURVIVES -- one routine aborted run must never blind the whole wall-clock lane (owner decision)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 900, agentComputeMeasuredRuns: 9, agentComputeUnmeasuredRuns: 1, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a large share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1, 'a 10% unmeasured share must not suppress a proposal citing that segment')
+  assert.match(result.report, /agent_compute:\s*1\/10 runs unmeasured \(10%\)/, 'the ratio line must print the exact fraction and percentage')
+  assert.match(result.report, /agent_compute:\s*1\/10[^\n]*below[^\n]*20%/i, 'the ratio line must state it is below the 20% suppression threshold')
+})
+
+test('optimise-cycle: a proposal motivated by a segment at a HIGH unmeasured share (3/10 = 30%, above the 20% threshold) is DROPPED -- the brake must still fire (owner decision)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 700, agentComputeMeasuredRuns: 7, agentComputeUnmeasuredRuns: 3, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a large share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0, 'a 30% unmeasured share must still suppress a proposal citing that segment -- the brake is not disabled by the fix')
+  assert.match(result.report, /agent_compute:\s*3\/10 runs unmeasured \(30%\)/, 'the ratio line must print the exact fraction and percentage even when the gate fires')
+  assert.match(result.report, /agent_compute:\s*3\/10[^\n]*(at.?\/?.?above|exceeds|>=)[^\n]*20%/i, 'the ratio line must state the threshold was crossed')
+})
+
+test('optimise-cycle: EXACTLY at the 20% boundary (2/10), the gate is INCLUSIVE (>=) and the proposal is DROPPED (owner decision: boundary is >=, pinned exactly, not approximately)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 800, agentComputeMeasuredRuns: 8, agentComputeUnmeasuredRuns: 2, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a large share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0, 'exactly 20% must be treated as AT the threshold, not below it -- the gate is >=')
+})
+
+test('optimise-cycle: JUST below the 20% boundary (19/100), the proposal SURVIVES -- the boundary is precise, not off by one (owner decision)', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 8100, agentComputeMeasuredRuns: 81, agentComputeUnmeasuredRuns: 19, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'concurrency', segment: 'agent_compute' }, statement: 'Agent compute is a large share of wall-clock; add concurrency', citations: ['run-1'] })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1, '19% must survive -- one percentage point below the 20% threshold must not be treated as at it')
+})
+
+test('optimise-cycle: the segment ratio line renders for EVERY wall-clock segment unconditionally, even when no proposal cites or is dropped for any of them (owner decision: "always print the ratio, whether or not the gate fires")', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      wallClock: {
+        byPlan: {},
+        totals: { ciWaitSeconds: 500, ciWaitMeasuredRuns: 4, ciWaitUnmeasuredRuns: 1, humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 900, agentComputeMeasuredRuns: 9, agentComputeUnmeasuredRuns: 1, unterminatedWaits: 0 },
+        source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' },
+      },
+    }),
+    // Deliberately the DEFAULT proposal (mentions no wall-clock segment at
+    // all, by name or tag) -- the gate never fires, no proposal is dropped,
+    // yet the ratio must still print for every segment.
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.match(result.report, /ci_wait:\s*1\/5 runs unmeasured \(20%\)/, 'ci_wait ratio must render even though nothing was dropped')
+  assert.match(result.report, /agent_compute:\s*1\/10 runs unmeasured \(10%\)/, 'agent_compute ratio must render even though nothing was dropped')
+  assert.match(result.report, /human_wait:\s*0\/0 runs unmeasured/, 'human_wait (zero activity) must still render its own line, a real zero, not silently omitted')
 })
 
 // ---- Review round-1 M6 (AC-DATA-8): a removal proposal citing a weakly-grounded CI job claim is dropped ----

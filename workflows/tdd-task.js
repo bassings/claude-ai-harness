@@ -102,6 +102,11 @@ async function writeLedger(payload) {
           ts: { type: 'string' },
           write_ok: { type: 'boolean' },
           write_error: { type: ['string', 'null'] },
+          // Review round-2 M-3: ledger-append.mjs's CLI result now carries
+          // invalid_ac_ids_dropped when a lens's malformed ac_id was
+          // sanitised -- optional, so an agent not carrying this field
+          // (an older writer) is unaffected.
+          invalid_ac_ids_dropped: { type: ['integer', 'null'] },
         },
       },
     })
@@ -110,11 +115,35 @@ async function writeLedger(payload) {
   }
   if (!response || response.write_ok !== true) {
     const reason = (response && response.write_error) || 'ledger agent failed or returned no result'
-    const runId = (response && response.run_id) || 'unknown'
+    const runId = (response && response.run_id) || payload.run_id || 'unknown'
     log(`Ledger write failed for run ${runId}: ${reason}`)
     return { write_ok: false, write_error: reason, run_id: runId }
   }
+  // Review round-2 M-3: a sanitisation (a lens's non-conforming ac_id,
+  // nulled and retained in ac_id_raw by the writer) previously left no
+  // operator-visible trace at all beyond a counter buried in the ledger
+  // file itself. One log line, only when something was actually dropped.
+  if (typeof response.invalid_ac_ids_dropped === 'number' && response.invalid_ac_ids_dropped > 0) {
+    log(`Run ${response.run_id}: invalid_ac_ids_dropped=${response.invalid_ac_ids_dropped} (a lens supplied a non-conforming ac_id; sanitised, not lost -- see ac_id_raw in the ledger line)`)
+  }
   return { write_ok: true, write_error: null, run_id: response.run_id }
+}
+
+// Review round-2 L-2: the exception guard below previously logged a thrown
+// error's message verbatim. Workflow scripts have no fs/child_process
+// access, so they cannot resolve the checkout root the way
+// ledger-append.mjs's stripRoot does (see that file) -- a real Node error
+// (ENOENT, module resolution, a stack frame) commonly embeds an absolute
+// path, and on the machine that ran this, that path discloses the local
+// account name. This is a coarser, root-agnostic pattern match instead: it
+// will not catch every leak shape, only the common absolute-path one, but
+// it is what is available at this boundary. Applies ONLY to this
+// operator-visible console log line -- never to what reaches the ledger
+// file itself, which has its own, separate, root-aware redaction.
+const ABSOLUTE_PATH_LOG_RE = /\/(?:Users|home)\/[^\s'"]+/g
+const MAX_LOG_TEXT = 500
+function redactLogText(text) {
+  return String(text).slice(0, MAX_LOG_TEXT).replace(ABSOLUTE_PATH_LOG_RE, '<redacted-path>')
 }
 
 // The entire pre-existing workflow body, unchanged in behaviour, is wrapped
@@ -280,7 +309,30 @@ const OUTCOME_BY_VERDICT = { DONE: 'done', BLOCKED: 'blocked', ABORTED: 'aborted
 const startWrite = await writeLedger({ kind: 'tdd_task', outcome: 'started', task: opts.task, spec: opts.spec || null })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
-const result = await run()
+// PR 2 (AC-QA-8, AC-ARCH-9): an exception escaping run() must still
+// produce exactly one terminal ledger write, carrying the existing
+// aborted outcome via the SAME mapping site below -- never a second
+// writeLedger( call site (AC-SIMP-7) and never a fabricated 'done'
+// (AC-QA-12). The original error is re-thrown after the write so it still
+// reaches the caller (AC-OPS-1), never swallowed by a failing terminal
+// write (writeLedger itself never throws, see above). Round-1 review M2:
+// `threw` tracks whether the catch fired, never the thrown value's
+// truthiness -- `throw null`/`throw undefined`/`throw 0`/`throw ''` are
+// all falsy, so gating the re-throw on `runError` itself silently resolved
+// the workflow instead of propagating, a regression against pre-PR2
+// behaviour where every throw reached the caller.
+let runError = null
+let threw = false
+let raw
+try {
+  raw = await run()
+} catch (e) {
+  runError = e
+  threw = true
+  raw = {}
+  log(`Run ${startRunId || 'unknown'} threw before producing a result: ${redactLogText(e && e.message ? e.message : String(e))}`)
+} // end PR 2 exception guard
+const result = raw
 const telemetry = {
   outcome: OUTCOME_BY_VERDICT[result.verdict] || 'aborted',
   spec: opts.spec || null,
@@ -290,4 +342,5 @@ const telemetry = {
 const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
 await writeLedger(terminalEntry)
+if (threw) throw runError
 return { ...result, telemetry }

@@ -12,7 +12,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
-const { SUITE_TMPDIR, sh, trackTempDir } = require('./temp-repo.js')
+const { SUITE_TMPDIR, APPEND_SCRIPT, sh, trackTempDir } = require('./temp-repo.js')
 
 function initGitRepo(repo) {
   fs.mkdirSync(repo, { recursive: true })
@@ -102,10 +102,32 @@ function makeInRepoSymlinkSpec(repo, relPath) {
   return linkPath
 }
 
+// Coordinator FINDING 2 (round-2 triage of the M-2 pre-existing-crash
+// report): a symlinked ancestor in the WRITER SCRIPT'S OWN invocation
+// path -- distinct from every helper above, which symlinks the REPO/cwd.
+// `import.meta.url` resolves through symlinks (Node's ESM loader always
+// reports the real, target path); `process.argv[1]` does not, without a
+// realpath fix -- so `isMain` silently reads false and the whole CLI
+// invocation becomes a no-op import: exit 0, zero bytes of output, no
+// write, no error. Reproduces macOS's /tmp -> /private/tmp, $TMPDIR's
+// /var/folders -> /private/var/folders, and any symlinked home, volume or
+// install ancestor for ~/.claude/workflows/lib/. Returns a symlink whose
+// target is the REAL ledger-append.mjs this checkout ships (not a copy),
+// so the two path-resolution mechanisms diverge exactly the way
+// production does.
+function makeSymlinkedScriptInvocation() {
+  const linkParent = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'hostile-script-link-'))
+  const linkPath = path.join(linkParent, 'ledger-append.mjs')
+  fs.symlinkSync(APPEND_SCRIPT, linkPath, 'file')
+  trackTempDir(linkParent)
+  return linkPath
+}
+
 module.exports = {
   makeHostileTempRepo,
   makeHomeLikeHostileTempRepo,
   makeSpacyTempRepo,
   makeSymlinkAncestorTempRepo,
   makeInRepoSymlinkSpec,
+  makeSymlinkedScriptInvocation,
 }

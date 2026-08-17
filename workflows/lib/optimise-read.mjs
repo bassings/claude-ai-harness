@@ -32,7 +32,44 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR } from './ledger-append.mjs'
+
+// Round-7 review F1 (§12 reframe, corrected a second time): round-6's
+// isNeutralised(obj, field) asked a SHAPE question -- "is this value null
+// AND does a *_raw sibling happen to be present?" -- when the real
+// question is SEMANTIC: "is this a value I can actually treat as
+// evidence?" The two are NOT the same test. A bare `verdict: null` with
+// NO verdict_raw sibling (a caller can supply this directly; it never
+// touches degradeEntry at all, since null is a schema-legal value for
+// verdict) sailed straight past isNeutralised and was still counted as a
+// real, unknown-shaped verdict -- n incremented, pass/fail untouched,
+// insufficient_data/unattributed_verdict_in_entry both false, and five
+// such records cleared MIN_RUNS_FOR_NEVER_FAILED and reported
+// never_failed:true. The exact round-6 bug, reproduced verbatim, because
+// the guard matched the FIX's own assumption about what a neutralised
+// value looks like rather than asking whether the value was real.
+//
+// THE STANDING RULE, so this is not lost a third time: an "is this
+// evidence?" test must enumerate the VALID values and treat everything
+// else -- null, undefined, missing, a neutralised value with its sibling
+// present, a neutralised value with no sibling at all, a hand-typed
+// ledger line predating any of this, an arbitrary junk string -- as not
+// evidence. It must never match on the shape a particular fix happens to
+// produce. See the KNOWN_VERDICTS check below and the LENS_RE check in
+// bumpDisposition's caller for the two live examples; see
+// test/optimise-read.test.js's NEUTRALISED-VALUE TABLE for the test-side
+// half of this rule.
+const KNOWN_VERDICTS = new Set(['PASS', 'FAIL', 'UNVERIFIABLE'])
+// Round-7 sweep: the SAME shape-vs-value confusion existed one field over.
+// `f.lens` feeding bumpDisposition asked "was this neutralised" instead of
+// "is this a real lens name" -- a bare `lens: null` (no lens_raw) would
+// have stringified to the bucket key "null" exactly like the verdict bug,
+// merging two different neutralised findings' dispositions into one fake
+// shared bucket. Value-based: imports the writer's own pattern (one
+// definition site, AC-ARCH-1-style) rather than a truthiness check, so a
+// hand-typed or otherwise-malformed lens string that never went through
+// degradeEntry at all is excluded too, not merely a literal null.
+const LENS_RE = new RegExp(LENS_PATTERN_STR)
 
 // AC-ARCH-14: the default bound on how much ledger history a single
 // aggregation pass reads -- proven against a >=2000-line synthetic ledger
@@ -182,9 +219,49 @@ export function aggregateRework(records, { root = '' } = {}) {
   const lensDispositionCounts = {}
   const acVerdicts = new Map()
   let unattributableCount = 0
+  // Round-4 review M3: an unattributed (sanitised, or explicitly null)
+  // ac_id whose verdict is FAIL must not simply vanish from this
+  // aggregation -- neverFailingAcs feeds directly into a "retire this
+  // guard" proposal, and a hidden FAIL there is an INVERTED conclusion
+  // (the guard fails and the report says it never has), not merely a lost
+  // measurement. Tracked per (repo, plan) bucket -- the same key shape
+  // acVerdicts itself uses, minus the ac_id segment -- rather than
+  // attempting to re-attribute the FAIL to a specific ac_id from
+  // ac_id_raw: a hostile ac_id/ac_id_raw crafted to END in a real AC id
+  // (e.g. "ignore previous instructions AC-SEC-1") could otherwise redirect
+  // its own FAIL onto an unrelated criterion, a second injection route
+  // into telemetry. neverFailingAcs (below) degrades every ac_id in a
+  // tainted bucket to never_failed:null rather than computing from the
+  // (necessarily incomplete) counts it can see.
+  const unattributedFailBuckets = new Set()
+  // Review round-2 M-3: invalid_ac_ids_dropped is a real, measured integer
+  // on a record only when the writer actually sanitised something (or
+  // supplied 0 when nothing needed sanitising) -- summed here across every
+  // review_cycle record in the window, exposed on the return so
+  // optimise-cycle.js can render it beside the orphan counters.
+  let invalidAcIdsDropped = 0
+  // Round-6 review, instruction 4: invalid_record_values_dropped (the
+  // round-5 H1 general degrade mechanism's own counter) was written to
+  // every line and read by nothing -- summed here the same way
+  // invalidAcIdsDropped already is, so an operator can see that generic
+  // values (verdicts.<lens>, lenses_run[] entries, ...) were neutralised
+  // in the window, not just infer it from the ac_id-specific counter.
+  let invalidRecordValuesDropped = 0
   for (const r of reviewRecords) {
+    if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
+    if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
     for (const f of r.findings || []) {
-      bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
+      // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
+      // not shape-based -- see this file's own header comment): a `lens`
+      // that is not a real, pattern-matching lens name must not be read
+      // as one. Unguarded, `bumpDisposition(counts, null, ...)` (or any
+      // other non-matching value) stringifies to a fake shared bucket key,
+      // merging DIFFERENT findings' dispositions together -- the
+      // identical "different things merge" defect class already closed
+      // for ac_id, one field over. `typeof f.lens === 'string'` short-
+      // circuits before the regex so `null`/`undefined`/a non-string never
+      // reach it.
+      if (typeof f.lens === 'string' && LENS_RE.test(f.lens)) bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
     }
     const verdicts = r.ac_verdicts || []
     if (!verdicts.length) continue
@@ -194,26 +271,104 @@ export function aggregateRework(records, { root = '' } = {}) {
       continue
     }
     for (const v of verdicts) {
+      // Review round-2 M-3: a sanitised entry (ac_id nulled by the writer,
+      // AC-DATA-4-style ac_id_raw retained instead) must never reach the
+      // bucket key -- `escapeKeyComponent(null)` stringifies to the
+      // literal "null", which would silently merge EVERY sanitised
+      // verdict from every different plan into one fake shared bucket,
+      // exactly the "different plans merge" defect class this spec exists
+      // to close. Excluded from bucketing entirely; already counted once
+      // via invalidAcIdsDropped above, never counted twice.
+      if (v.ac_id === null || v.ac_id === undefined) {
+        // Round-4 review M3: a FAIL (or, round-7 F4 below, anything that
+        // is not provably a clean PASS/UNVERIFIABLE) is real data sitting
+        // two lines away in the same window -- taint this (repo, plan)
+        // bucket so neverFailingAcs never reports a confident
+        // never_failed:true while it exists. A genuine PASS/UNVERIFIABLE
+        // unattributed verdict carries no inversion risk and is left
+        // exactly as before.
+        //
+        // Round-7 review F4: this used to test `v.verdict === 'FAIL'`
+        // literally, so DUAL corruption -- an unattributed ac_id AND a
+        // non-evidence verdict on the SAME entry (both null, or a model
+        // writing a combined id+verdict like {ac_id:'AC-QA-8 (partial)',
+        // verdict:'PARTIAL'}, which degradeEntry independently neutralises
+        // to {ac_id:null, verdict:null}) -- produced NO taint at all: the
+        // literal FAIL string never matched. More corruption than a
+        // single unattributed FAIL, but LESS confidence, produced MORE
+        // confidence (a bare never_failed:true) than the single-corruption
+        // case. Fixed the same way F1 fixed the verdict branch one level
+        // up: value-based -- taint unless the verdict is affirmatively
+        // clean (PASS or UNVERIFIABLE), so an unknown verdict is treated
+        // exactly like an unknown ac_id's own worst case, not exonerated
+        // by ALSO being unknown.
+        if (v.verdict !== 'PASS' && v.verdict !== 'UNVERIFIABLE') {
+          unattributedFailBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}`)
+        }
+        continue
+      }
       // Review round-2 M4: same injective-escaping fix as planBucketKey.
       const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(v.ac_id)}`
-      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0 })
+      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0, unattributedVerdicts: 0 })
       const entry = acVerdicts.get(key)
+      // Round-6 H1: the ac_id is known (we are inside this branch because
+      // it is), but the VERDICT itself may not be usable evidence -- round-
+      // 5's own repro (null, with verdict_raw retained). Round-7 F1
+      // (corrected a second time, see this file's header comment): the
+      // test is now VALUE-based -- is v.verdict one of the three known
+      // verdicts? -- not shape-based ("was it neutralised with a sibling
+      // present"). This single change subsumes null WITH a sibling, a
+      // BARE null with no sibling at all (schema-legal, never touches
+      // degradeEntry, and is exactly the case round-6's own verification
+      // missed), undefined, a missing key read as undefined, and any
+      // arbitrary junk string a hand-edited or pre-degradeEntry ledger
+      // line could carry -- no enumeration of neutralisation shapes to
+      // maintain. A non-evidence verdict must not count toward n (the
+      // "how many runs support this claim" figure feeding
+      // MIN_RUNS_FOR_NEVER_FAILED) and must not move pass/fail, or
+      // unknowns clear the run-count floor and report never_failed:true
+      // on zero real evidence -- the exact inversion H1 reproduced. The
+      // entry is still created/kept above (not skipped entirely) so this
+      // ac_id remains VISIBLE in the report even when EVERY verdict seen
+      // for it was unusable, rather than silently disappearing the way an
+      // entry that never existed would.
+      if (!KNOWN_VERDICTS.has(v.verdict)) {
+        entry.unattributedVerdicts += 1
+        continue
+      }
       entry.n += 1
       if (v.verdict === 'PASS') entry.pass += 1
       else if (v.verdict === 'FAIL') entry.fail += 1
-      else if (v.verdict === 'UNVERIFIABLE') entry.unverifiable += 1
+      else entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, unattributedFailBuckets }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
 // count backing it) and is insufficient_data below minRuns, regardless of
 // whether every recorded verdict happens to be PASS.
-export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED } = {}) {
+//
+// Round-4 review M3: `unattributedFailBuckets` (aggregateRework's own
+// return value, above) degrades every ac_id sharing a (repo, plan) window
+// with an unattributed FAIL to never_failed:null -- computing PASS/FAIL
+// from `entry` alone is exactly the inversion this fix closes, since
+// `entry` by construction never saw the hidden FAIL. Defaults to an empty
+// Set so every pre-existing call site (none of which knows this option
+// exists) behaves identically to before: no tainted buckets, no change.
+export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set() } = {}) {
   const out = []
   for (const [key, entry] of acVerdicts.entries()) {
     const insufficient_data = entry.n < minRuns
+    const unattributed_fail_in_window = unattributedFailBuckets.has(`${escapeKeyComponent(entry.repo)}|${escapeKeyComponent(entry.spec)}`)
+    // Round-6 H1: this ac_id's OWN entry saw at least one neutralised
+    // verdict (aggregateRework's unattributedVerdicts, above) -- a
+    // DIFFERENT taint reason from unattributed_fail_in_window (that one
+    // fires on an unattributed ac_id ANYWHERE in the window; this one
+    // fires on a known ac_id whose verdict value itself could not be
+    // trusted). Both degrade never_failed to null; neither is folded into
+    // the other, so the render can name the right cause.
+    const unattributed_verdict_in_entry = (entry.unattributedVerdicts || 0) > 0
     out.push({
       key,
       repo: entry.repo,
@@ -221,7 +376,9 @@ export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILE
       ac_id: entry.ac_id,
       n: entry.n,
       insufficient_data,
-      never_failed: insufficient_data ? null : entry.fail === 0,
+      unattributed_fail_in_window,
+      unattributed_verdict_in_entry,
+      never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry ? null : entry.fail === 0,
     })
   }
   return out
@@ -292,6 +449,12 @@ function ensurePlan(byPlan, key, repo, plan) {
       ciWaitSeconds: 0, ciWaitN: 0, ciWaitUnmeasuredN: 0,
       humanWaitSeconds: 0, humanWaitN: 0, humanWaitUnmeasuredN: 0,
       agentComputeSeconds: 0, agentComputeN: 0, agentComputeUnmeasuredN: 0,
+      // Review round-1 H1: a well-formed start+terminal pair whose terminal
+      // outcome is not 'done' (a crash the PR2 exception guard turned into
+      // a pair instead of an orphan, or a deliberate BLOCKED/ABORTED
+      // return) is real elapsed time but not a completion -- counted here,
+      // under its own name, never folded into agentComputeSeconds/N.
+      agentComputeAbortedSeconds: 0, agentComputeAbortedN: 0,
       unterminatedWaits: 0,
       unusableIntervals: [],
     })
@@ -454,8 +617,56 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   //     as before.
   let degradedUnattributedRuns = 0
   let unattributableRuns = 0
+  // HARN-OPT-2 PR2 (AC-OPS-2): the two orphan classes named and counted
+  // SEPARATELY, in addition to the combined agentComputeUnmeasuredN/Runs
+  // total below -- a start-only orphan and a terminal-only orphan (the
+  // START write itself failed) are different defects with different fixes,
+  // so a fix landed for one must never read as progress on the other. "By
+  // kind" breaks each down by tdd_task/review_cycle/plan_cycle.
+  //
+  // M1 (round 4 remainder): this comment used to name "an exception
+  // escaped run() before the terminal write" as a start-only-orphan cause.
+  // That is now WRONG: PR2's try/finally means an exception escaping run()
+  // always attempts a terminal write, which lands as a PAIRED `aborted`
+  // record, not a start-only orphan. A start-only orphan today means either
+  // the process was killed before the terminal write ran (no JS-level
+  // unwind occurs at all), or the terminal write's own payload was refused
+  // -- which used to include a single malformed descriptor element (a
+  // model-supplied `lens`/`ac_id` failing the schema), now neutralised
+  // field-by-field by ledger-append.mjs before validateEntry runs (see its
+  // own comments on invalid_ac_ids_dropped/invalid_finding_fields_dropped).
+  let agentComputeStartOnlyRuns = 0
+  let agentComputeTerminalOnlyRuns = 0
+  // Review round-1 M1: accumulated in whatever order run_ids are first
+  // encountered (record order), then re-serialised in RUN_KINDS' fixed
+  // order below -- so JSON.stringify(totals) is byte-identical regardless
+  // of input order, which the AC-QA-13 fixture now actually exercises with
+  // two different kinds per class.
+  const agentComputeStartOnlyByKindRaw = {}
+  const agentComputeTerminalOnlyByKindRaw = {}
+  // Review round-1 H1: real elapsed time for a crashed/aborted/blocked
+  // pair, excluded from agentComputeSeconds (that statistic means
+  // completed-run duration only).
+  let agentComputeAbortedPairs = 0
   for (const [, pair] of byRunId.entries()) {
     const repo = pair[0]?.repo || 'unknown'
+    // Review round-1 M4: orphan SHAPE is classified before either identity
+    // `continue` below, using only starts.length/terminals.length -- no
+    // plan key required -- so an orphan whose plan identity is
+    // unattributable or fully degraded still lands in exactly one counted
+    // bucket instead of neither. This does not change byPlan bucketing,
+    // which still requires a real identity and is computed further down.
+    const starts = pair.filter((p) => p.outcome === 'started')
+    const terminals = pair.filter((p) => p.outcome !== 'started')
+    if (pair.length === 1 && starts.length === 1) {
+      agentComputeStartOnlyRuns += 1
+      const k = pair[0].kind
+      agentComputeStartOnlyByKindRaw[k] = (agentComputeStartOnlyByKindRaw[k] || 0) + 1
+    } else if (pair.length === 1 && terminals.length === 1) {
+      agentComputeTerminalOnlyRuns += 1
+      const k = pair[0].kind
+      agentComputeTerminalOnlyByKindRaw[k] = (agentComputeTerminalOnlyByKindRaw[k] || 0) + 1
+    }
     // Review round-1 M3: order-independent, main's own semantics restored
     // (`pair.find(p => p.spec)?.spec`). The PREVIOUS "first non-null wins"
     // rule treated NO_SPEC_PLAN_KEY as "non-null" too, so a no-spec record
@@ -477,10 +688,16 @@ export function aggregateWallClock(records, { root = '' } = {}) {
       continue
     }
     const key = planBucketKey(repo, plan)
-    if (pair.length < 2) {
-      // An orphan start or terminal with no partner: an attempt we know
-      // happened but cannot measure a duration for -- unmeasured, never
-      // simply skipped uncounted.
+    // HARN-OPT-2 PR2 (AC-DATA-10): a measured duration is only ever
+    // computed for a run_id shared by EXACTLY one 'started' record and
+    // EXACTLY one terminal (non-'started') record. Every other shape --
+    // a lone record of either kind, two started, two terminal, or three or
+    // more sharing one run_id -- is unmeasured, and arithmetic is never
+    // performed on it. Before this, `pair.length` alone gated whether a
+    // duration was computed, so e.g. two 'started' records sharing a
+    // run_id (their timestamps subtracted anyway) fabricated a duration for
+    // an attempt that never actually finished.
+    if (!(pair.length === 2 && starts.length === 1 && terminals.length === 1)) {
       ensurePlan(byPlan, key, repo, plan).agentComputeUnmeasuredN += 1
       continue
     }
@@ -497,9 +714,58 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     // corrupted or reordered pair) this can never be negative -- there is
     // no unreachable branch to guard here.
     const durationS = (Math.max(...times) - Math.min(...times)) / 1000
+    // Review round-1 H1, corrected by round-2 M-4: a well-formed pair whose
+    // terminal outcome is a genuine CRASH is excluded from the measured
+    // completion statistic. PR2's own exception-guard fix (the three
+    // instrumented workflow scripts) turns a crash from an orphan into
+    // exactly this shape -- a real start paired with a real terminal whose
+    // outcome is 'aborted' -- so treating it as measured would let a
+    // workflow that crashes on EVERY run report as a fully measured,
+    // healthy repo, and would silently disarm isUnmeasuredSegmentMotivated
+    // (optimise-cycle.js), the gate that exists to stop a proposal being
+    // built on unmeasurable data.
+    //
+    // Round-2 M-4: round-1 gated on `outcome !== 'done'`, which wrongly
+    // swept up 'blocked' (a legitimate terminating verdict one of the
+    // instrumented workflows returns) and 'no-op' (another's ordinary
+    // no-changes-found case, __outcome:'no-op') as if they were
+    // crashes -- both are genuine COMPLETIONS with real, meaningful
+    // durations. 'aborted' is the ONLY outcome the exception guard actually
+    // produces for a crash (AC-SIMP-6: no new OUTCOMES value was ever
+    // added), so it is the only value excluded here. done/blocked/no-op are
+    // all measured; their real duration is real and known -- reported
+    // under agentComputeSeconds/agentComputeN like any other completion.
+    // The crash-only path's duration is still real and known (not null),
+    // but it is a crash duration, not a work duration: reported under its
+    // own name, EXCLUDED from agentComputeSeconds/agentComputeN, and
+    // counted a second time toward agentComputeUnmeasuredN so the segment
+    // still reads as unmeasured for the safety gate's purposes.
+    if (terminals[0].outcome === 'aborted') {
+      bucket.agentComputeAbortedSeconds += durationS
+      bucket.agentComputeAbortedN += 1
+      bucket.agentComputeUnmeasuredN += 1
+      agentComputeAbortedPairs += 1
+      continue
+    }
     bucket.agentComputeSeconds += durationS
     bucket.agentComputeN += 1
   }
+  // Review round-1 M1: rebuild both byKind maps in RUN_KINDS' fixed order,
+  // regardless of which run_id was first encountered in the input records
+  // -- the raw accumulation above is order-dependent (insertion order),
+  // this rebuild is not.
+  function orderByKind(raw) {
+    const ordered = {}
+    for (const k of RUN_KINDS) {
+      if (k in raw) ordered[k] = raw[k]
+    }
+    for (const k of Object.keys(raw)) {
+      if (!(k in ordered)) ordered[k] = raw[k]
+    }
+    return ordered
+  }
+  const agentComputeStartOnlyByKind = orderByKind(agentComputeStartOnlyByKindRaw)
+  const agentComputeTerminalOnlyByKind = orderByKind(agentComputeTerminalOnlyByKindRaw)
 
   const totals = {
     ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0,
@@ -509,6 +775,12 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     degradedUnattributedRuns,
     unattributableRuns,
     unattributableWaits,
+    agentComputeStartOnlyRuns,
+    agentComputeTerminalOnlyRuns,
+    agentComputeStartOnlyByKind,
+    agentComputeTerminalOnlyByKind,
+    agentComputeAbortedPairs,
+    agentComputeAbortedSeconds: 0,
   }
   for (const bucket of byPlan.values()) {
     totals.ciWaitSeconds += bucket.ciWaitSeconds
@@ -520,6 +792,7 @@ export function aggregateWallClock(records, { root = '' } = {}) {
     totals.agentComputeSeconds += bucket.agentComputeSeconds
     totals.agentComputeMeasuredRuns += bucket.agentComputeN
     totals.agentComputeUnmeasuredRuns += bucket.agentComputeUnmeasuredN
+    totals.agentComputeAbortedSeconds += bucket.agentComputeAbortedSeconds
     totals.unterminatedWaits += bucket.unterminatedWaits
   }
   // AC-OPS-3: unmeasured is never silently reported as a measured zero. A
@@ -533,8 +806,17 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   if (totals.humanWaitMeasuredRuns === 0 && totals.humanWaitUnmeasuredRuns > 0) totals.humanWaitSeconds = null
   if (totals.agentComputeMeasuredRuns === 0 && totals.agentComputeUnmeasuredRuns > 0) totals.agentComputeSeconds = null
 
+  // Review round-2 L-7: byPlan (a Map) previously followed record-
+  // ENCOUNTER order, not a stable sorted order -- AC-QA-13's byte-identity
+  // requirement held for `.totals` (a plain sum, order-independent by
+  // construction) but not for byPlan itself, so a future consumer that
+  // merges or re-orders records (a multi-repo aggregate, a resumed read)
+  // would produce a differently-ordered report. Sorted by key here, the
+  // single place byPlan is ever returned, rather than at each call site.
+  const sortedByPlan = new Map([...byPlan.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+
   return {
-    byPlan,
+    byPlan: sortedByPlan,
     totals,
     source: {
       ci_wait: 'ledger:conduct_plan_event',
@@ -836,7 +1118,7 @@ function runLedgerCommand(roots, window) {
   // unaffected.
   const canonicalRoot = roots[0] || ''
   const rework = aggregateRework(windowed, { root: canonicalRoot })
-  const neverFailing = neverFailingAcs(rework.acVerdicts, {})
+  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
   const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
   const trigger = aggregateTriggerAccuracy(windowed)
   const proposalOutcomes = aggregateProposalOutcomes(windowed)
@@ -846,7 +1128,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
