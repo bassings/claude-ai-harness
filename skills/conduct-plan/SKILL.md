@@ -74,9 +74,12 @@ task, a Monitor, or a ScheduleWakeup.
    script does not require it here -- only for `tdd_task`/`review_cycle`/
    `plan_cycle`, whose lines are meaningfully terminal.
    `<plan file>` must be repo-relative (e.g. `specs/optimise-cycle.md`), never
-   an absolute path: the ledger writer redacts an absolute path it finds
-   embedded in the resulting event_key, and a redacted-away path can collide
-   across two different plans, which a repo-relative one never does.
+   an absolute path. The writer canonicalises this segment before building the
+   event_key (`canonicalPlanKey`, `workflows/lib/ledger-append.mjs:1250`), so a
+   lexically in-repo absolute path is safe in practice -- but one reached via a
+   symlinked ancestor, or from outside the repo, canonicalises to a fixed
+   out-of-repo marker, and two different plans can collapse onto that one key.
+   A repo-relative path never reaches the marker.
    `event_scope` (never a pre-built `event_key`) is required for this kind:
    the script refuses a conduct_plan_event line without one. The script
    itself computes the occurrence number and mints `event_key` as

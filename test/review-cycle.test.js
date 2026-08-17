@@ -88,24 +88,36 @@ test('review-cycle.js: the start-record ledger write is the very first agent() c
   assert.equal(calls[1].opts.label, 'scope:diff', 'the second call must be the first real work step, not another ledger write')
 })
 
-test('review-cycle.js: the "no changes found" early return (line 65 historically) still reaches the ledger write, with outcome no-op (AC-ARCH-3)', async () => {
+// AC-QA-9: distinct run_ids per call, and the terminal request checked
+// against the START write's run_id, not just a call count -- see
+// tdd-task.test.js's parametrized version for the identical rationale.
+const PAIRED_LEDGER = [
+  { run_id: 'return-path-start', ts: 't1', write_ok: true, write_error: null },
+  { run_id: 'return-path-terminal', ts: 't2', write_ok: true, write_error: null },
+]
+
+test('review-cycle.js: the "no changes found" early return (line 65 historically) still reaches the ledger write, with outcome no-op, and the terminal write reuses the start run_id (AC-ARCH-3, AC-QA-9)', async () => {
   const { result, calls } = await runWorkflow(WF, {
     args: {},
-    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, files: [] } }),
+    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, files: [] }, 'ledger:write': PAIRED_LEDGER }),
   })
   assert.equal(result.report, 'No changes found between the base ref and HEAD. Nothing to review.')
   assert.equal(result.telemetry.outcome, 'no-op')
-  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
+  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
 })
 
-test('review-cycle.js: "every lens agent failed" early return (line 149 historically) still reaches the ledger write, with outcome aborted (AC-ARCH-3)', async () => {
+test('review-cycle.js: "every lens agent failed" early return (line 149 historically) still reaches the ledger write, with outcome aborted, and the terminal write reuses the start run_id (AC-ARCH-3, AC-QA-9)', async () => {
   const { result, calls } = await runWorkflow(WF, {
     args: {},
-    agent: baseAgent({ 'lens-security': undefined, 'lens-qa': undefined }),
+    agent: baseAgent({ 'lens-security': undefined, 'lens-qa': undefined, 'ledger:write': PAIRED_LEDGER }),
   })
   assert.equal(result.report, 'Every lens agent failed or was stopped; no review produced.')
   assert.equal(result.telemetry.outcome, 'aborted')
-  assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'expected one start write + one terminal write')
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
+  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
 })
 
 test('review-cycle.js: outcome is blocked when any lens returns BLOCKED', async () => {
@@ -325,6 +337,30 @@ test('review-cycle.js: a ledger write failure via the agent call itself throwing
   assert.equal(typeof result.report, 'string')
 })
 
+// Review round-2 M-3: see tdd-task.test.js for the identical guard and
+// its rationale -- see the L5 byte-identity guard for why this trio is
+// necessarily triplicated.
+test('review-cycle.js: when the ledger:write response carries invalid_ac_ids_dropped > 0, writeLedger logs one visible line naming the run and the count (M-3)', async () => {
+  const { logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'ledger:write': [
+        { run_id: 'run-with-sanitised-ids', ts: 't1', write_ok: true, write_error: null },
+        { run_id: 'run-with-sanitised-ids', ts: 't2', write_ok: true, write_error: null, invalid_ac_ids_dropped: 2 },
+      ],
+    }),
+  })
+  const sanitiseLog = logs.find((l) => l.includes('invalid_ac_ids_dropped') || l.toLowerCase().includes('sanitised'))
+  assert.ok(sanitiseLog, `expected a log line about the sanitisation, got: ${JSON.stringify(logs)}`)
+  assert.ok(sanitiseLog.includes('run-with-sanitised-ids'), `must name the run, got: ${sanitiseLog}`)
+  assert.ok(sanitiseLog.includes('2'), `must name the count, got: ${sanitiseLog}`)
+})
+
+test('review-cycle.js: a ledger:write response with invalid_ac_ids_dropped 0 (or absent) logs NOTHING extra (M-3, not vacuous)', async () => {
+  const { logs } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.ok(!logs.some((l) => l.includes('invalid_ac_ids_dropped') || l.toLowerCase().includes('sanitised')), `expected no sanitisation log on the clean path, got: ${JSON.stringify(logs)}`)
+})
+
 test('review-cycle.js: telemetry.budget_spent is null when no budget is supplied (AC-QA-15)', async () => {
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   assert.equal(result.telemetry.budget_spent, null)
@@ -424,3 +460,163 @@ test('review-cycle.js: a finding\'s ac_id survives into open_findings when a len
   const payload = extractLedgerPayload(terminalCall.prompt)
   assert.equal(payload.open_findings[0].ac_id, 'AC-SEC-3', 'a lens-supplied ac_id must survive, not be discarded to null')
 })
+
+// Review round-2, new harness-level finding: during review round 2, a lens
+// wrote two TEST-FIXTURE records into the live ledger while probing
+// ledger-append.mjs -- lenses are specified read-only, but the writer
+// resolves the MAIN checkout via --git-common-dir (AC-DATA-1) regardless of
+// which worktree invoked it, so a lens's own probe from its isolated
+// worktree still lands in the operator's real ledger. ledger-append.mjs now
+// honours HARNESS_LEDGER_READONLY (see its own tests); this is the other
+// half -- every lens must be TOLD to set it before it probes the writer.
+// This is prompt-enforced at the lens boundary, not fully mechanical: a
+// lens that ignores its own instructions is not stopped by this alone.
+//
+// Review round-4 M2 (the coordinator's own design error, corrected): the
+// FIRST wording here told a lens to `export HARNESS_LEDGER_READONLY=1` in
+// one command, then invoke the writer in a SEPARATE one -- inoperative,
+// because this tool runtime does not persist shell state (env vars) across
+// separate tool calls, confirmed directly (`export X=1` in one Bash call,
+// `printenv X` in the next, returns nothing). The export died with the
+// call that made it, so the guard was NEVER actually armed by ANY lens,
+// ever, regardless of how carefully it followed the instruction. Fixed to
+// the SAME-COMMAND form, the one shape that does not depend on anything
+// surviving between calls: `HARNESS_LEDGER_READONLY=1 node <path> ...`, one
+// command line, prefix and invocation together. The prompt states WHY
+// (shell state does not persist), so an agent that understands the reason
+// will not "helpfully" split it back into two commands.
+test('review-cycle.js: every lens\'s prompt instructs it to set HARNESS_LEDGER_READONLY on the SAME command line as the writer invocation (never a separate `export`, which cannot survive to the next tool call), before it probes ledger-append.mjs (M2)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const lensCall = calls.find((c) => c.opts.label === 'lens-security')
+  assert.ok(lensCall, 'expected a lens-security call')
+  assert.match(lensCall.prompt, /HARNESS_LEDGER_READONLY/, 'the lens prompt must name the env var')
+  assert.match(lensCall.prompt, /HARNESS_LEDGER_READONLY=1 node\b/, 'the lens prompt must give the concrete SAME-COMMAND form (var=value prefixed onto the invocation), never a separate export')
+  assert.doesNotMatch(lensCall.prompt, /\bexport HARNESS_LEDGER_READONLY/i, 'the lens prompt must NEVER instruct a bare `export` -- it cannot survive to the next tool call in this runtime')
+})
+
+// HARN-OPT-2 PR2 (AC-QA-8, AC-OPS-1, AC-ARCH-9): the measured defect. See
+// tdd-task.test.js for the identical pattern and its rationale -- an
+// exception thrown by an agent() call inside run() previously escaped past
+// the single start/terminal ledger write entirely.
+test('review-cycle.js: an exception thrown by an agent() call inside run() still produces exactly one terminal ledger write, carrying the start run_id and outcome aborted, AND the original error still reaches the caller (AC-QA-8, AC-OPS-1)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': () => { throw new Error('agent step crashed mid-run') },
+          'ledger:write': [
+            { run_id: 'start-abc', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'terminal-abc', ts: 't2', write_ok: true, write_error: null },
+          ],
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /agent step crashed mid-run/, 'the ORIGINAL error must reach the caller unchanged')
+      const ledgerCalls = err.calls.filter((c) => c.opts.label === 'ledger:write')
+      assert.equal(ledgerCalls.length, 2, `expected one start write + one terminal write even though run() threw, got ${ledgerCalls.length}`)
+      const startPayload = extractLedgerPayload(ledgerCalls[0].prompt)
+      const terminalPayload = extractLedgerPayload(ledgerCalls[1].prompt)
+      assert.ok(!('run_id' in startPayload), 'the start write does not request an existing run_id')
+      assert.equal(terminalPayload.run_id, 'start-abc', 'the terminal write must reuse the start run_id')
+      assert.equal(terminalPayload.outcome, 'aborted', 'a thrown run() must never be recorded as done or blocked (AC-QA-12)')
+      assert.ok(
+        err.logs.some((l) => l.includes('start-abc') && l.includes('agent step crashed mid-run')),
+        `expected one log line naming the run_id and the failure, got ${JSON.stringify(err.logs)}`
+      )
+      return true
+    }
+  )
+})
+
+// Review round-2 L-2: see tdd-task.test.js for the identical guard and its
+// rationale -- workflow scripts have no fs/child_process access, so they
+// cannot resolve the checkout root the way ledger-append.mjs's stripRoot
+// does. This is only the operator-visible console log; the ledger file
+// itself has its own, separate, root-aware redaction.
+test('review-cycle.js: the exception guard\'s log line redacts an absolute /Users or /home path embedded in the thrown error\'s message, rather than printing it verbatim (L-2)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': () => { throw new Error("ENOENT: no such file, open '/Users/victim/secret-project/config.js'") },
+          'ledger:write': [
+            { run_id: 'start-abc', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'terminal-abc', ts: 't2', write_ok: true, write_error: null },
+          ],
+        }),
+      }),
+    (err) => {
+      const line = err.logs.find((l) => l.includes('start-abc'))
+      assert.ok(line, `expected a log line naming the run_id, got ${JSON.stringify(err.logs)}`)
+      assert.ok(!line.includes('/Users/victim/secret-project'), `the log line must not carry the raw absolute path verbatim, got: ${line}`)
+      assert.ok(!line.includes('victim'), `the log line must not leak the local account name, got: ${line}`)
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: the exception guard\'s log line is bounded in length, even when the thrown error\'s message is very long (L-2)', async () => {
+  const longMessage = 'x'.repeat(5000)
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': () => { throw new Error(longMessage) },
+          'ledger:write': [
+            { run_id: 'start-abc', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'terminal-abc', ts: 't2', write_ok: true, write_error: null },
+          ],
+        }),
+      }),
+    (err) => {
+      const line = err.logs.find((l) => l.includes('start-abc'))
+      assert.ok(line, `expected a log line naming the run_id, got ${JSON.stringify(err.logs)}`)
+      assert.ok(line.length < 700, `expected the log line bounded near MAX_LOG_TEXT (500) plus its fixed prefix, not merely under the 5000-char thrown message (round-7 review F14: the old bound could not catch MAX_LOG_TEXT being widened by an order of magnitude), got length ${line.length}`)
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: the original error still reaches the caller even when the terminal ledger write ALSO fails (AC-OPS-1: never swallowed by a failure of the terminal write itself)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': () => { throw new Error('body boom') },
+          'ledger:write': [
+            { run_id: 'start-xyz', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'irrelevant', ts: 't2', write_ok: false, write_error: 'disk full' },
+          ],
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /body boom/, 'the run() error must win, not a ledger-write-failure error')
+      const ledgerCalls = err.calls.filter((c) => c.opts.label === 'ledger:write')
+      assert.equal(ledgerCalls.length, 2, 'a failing terminal write must still be ATTEMPTED before the original error is re-thrown')
+      return true
+    }
+  )
+})
+
+// Review round-1 M2: see tdd-task.test.js's identical guard for the
+// rationale -- `if (runError) throw runError` tests truthiness, not
+// whether the catch fired.
+for (const falsyValue of [null, undefined, 0, '']) {
+  test(`review-cycle.js: a falsy thrown value (${JSON.stringify(falsyValue)}) from an agent() call inside run() still propagates (M2, regression)`, async () => {
+    await assert.rejects(
+      () =>
+        runWorkflow(WF, {
+          args: {},
+          agent: baseAgent({ 'scope:diff': () => { throw falsyValue } }),
+        }),
+      (err) => {
+        assert.equal(err, falsyValue)
+        return true
+      }
+    )
+  })
+}

@@ -81,8 +81,33 @@ export const MAX_FINDINGS = 15
 // rather than its expected frequency of use.
 export const MAX_AC_VERDICTS = 200
 
+// Review round-2 M-3: ac_id_raw retains a rejected ac_id for recoverability
+// (AC-DATA-4's pattern, applied to ac_id), but ac_id was deliberately kept
+// free of free text (AC-SEC-2, "no free text, ever") to prevent a secret or
+// a quoted source line being routed through it (M6). Bounded short enough
+// that a realistic citation form (a cross-spec-prefixed id, ~23 bytes;
+// "AC-DATA-16 (deferred)", 22 bytes) survives whole, while a longer
+// injection payload is cut down to a prefix, not retained whole -- a
+// considered, bounded exposure, not the zero-free-text guarantee the field
+// otherwise holds.
+export const AC_ID_RAW_MAX_BYTES = 32
+
 const KINDS = ['tdd_task', 'review_cycle', 'plan_cycle', 'conduct_plan_event']
 const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
+// Review round-1 M3: the single definition site for the ac_id shape,
+// used by the schema declarations below. Round-5 H1: the precompiled
+// AC_ID_RE/LENS_RE RegExps that used to back the round-2/round-4 per-field
+// sanitisers were deleted along with those sanitisers -- collectErrors
+// (below) compiles `new RegExp(propSchema.pattern)` generically from the
+// pattern STRING for every patterned field, so a second, field-specific
+// compiled RegExp would be genuinely dead code, not merely unused.
+const AC_ID_PATTERN_STR = '^AC-[A-Z]+-[0-9]+$'
+// M1 (round 4 remainder): the single definition site for the `lens` shape,
+// shared with the schema declaration above. Round-7 review, F1 sweep:
+// EXPORTED so optimise-read.mjs can ask "is this a REAL lens name?"
+// (value-based) instead of redeclaring the pattern or asking a shape
+// question about whether the writer happened to neutralise it.
+export const LENS_PATTERN_STR = '^(lens|reviewer)-[a-z]+$'
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // 'fixed' is never written by the workflows in this PR: no single run can
 // know a finding from an earlier round was fixed. It is reserved for a
@@ -164,9 +189,29 @@ export const LEDGER_ENTRY_SCHEMA = {
           // or a quoted source line routed through either field wrote
           // verbatim. additionalProperties:false on `evidence` itself
           // cannot catch this: it is a different route into the same line.
-          lens: { type: 'string', pattern: '^(lens|reviewer)-[a-z]+$' },
-          severity: { type: 'string', enum: SEVERITIES },
-          ac_id: { type: ['string', 'null'], pattern: '^AC-[A-Z]+-[0-9]+$' },
+          //
+          // M1 (round 4 remainder): `lens` and `severity` are now nullable,
+          // matching ac_id's own M-3 treatment below -- a non-conforming
+          // value used to fail validateEntry for the WHOLE entry
+          // (write_ok:false, the record gone from the only durable copy).
+          // The findings sanitiser nulls the value and retains it, bounded,
+          // in *_raw instead, so one bad field costs that field, never the
+          // line. Reuses AC_ID_RAW_MAX_BYTES's bound and its reasoning
+          // (M6, below): long enough for a realistic value, short enough
+          // that a hostile payload appended after it is cut off.
+          lens: { type: ['string', 'null'], pattern: LENS_PATTERN_STR },
+          lens_raw: { type: ['string', 'null'] },
+          severity: { type: ['string', 'null'], enum: SEVERITIES },
+          severity_raw: { type: ['string', 'null'] },
+          ac_id: { type: ['string', 'null'], pattern: AC_ID_PATTERN_STR },
+          // Review round-2 M-3: when ac_id is nulled by the sanitiser
+          // below (a non-conforming value), the rejected value is
+          // retained here, bounded to AC_ID_RAW_MAX_BYTES -- the AC-DATA-4
+          // recoverability pattern already used for spec/spec_raw, applied
+          // to ac_id. Bounded (not verbatim) because ac_id was
+          // deliberately kept free of free text (AC-SEC-2); see the
+          // sanitiser's own comment for the considered tradeoff.
+          ac_id_raw: { type: ['string', 'null'] },
           disposition: { type: 'string', enum: DISPOSITIONS },
         },
       },
@@ -183,18 +228,90 @@ export const LEDGER_ENTRY_SCHEMA = {
         additionalProperties: false,
         required: ['ac_id', 'verdict'],
         properties: {
-          ac_id: { type: 'string', pattern: '^AC-[A-Z]+-[0-9]+$' },
-          verdict: { type: 'string', enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] },
+          // Review round-2 M-3: nullable, matching findings.ac_id -- a
+          // non-conforming ac_id is now RETAINED (never dropped), with
+          // ac_id nulled and the original preserved in ac_id_raw below.
+          // The round-1 design dropped the whole {ac_id, verdict} entry,
+          // permanently losing a PASS/FAIL verdict from the only durable
+          // copy with no way to recover which criterion it concerned.
+          ac_id: { type: ['string', 'null'], pattern: AC_ID_PATTERN_STR },
+          ac_id_raw: { type: ['string', 'null'] },
+          // Round-5 H1: nullable, matching ac_id's own treatment -- a
+          // non-conforming verdict (the round-5 repro: "PARTIAL", not one
+          // of PASS/FAIL/UNVERIFIABLE) used to fail validateEntry for the
+          // WHOLE entry. Retained bounded in verdict_raw rather than
+          // dropped, same recoverability pattern as ac_id_raw.
+          verdict: { type: ['string', 'null'], enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] },
+          verdict_raw: { type: ['string', 'null'] },
         },
       },
     },
     spec_bug_count: { type: ['integer', 'null'] },
     rejected_finding_count: { type: ['integer', 'null'] },
+    // Review round-1 M3: how many ac_id values (across ac_verdicts entries
+    // dropped entirely, and findings[].ac_id values nulled) failed the
+    // AC-<LENS>-<n> pattern and were sanitized before validateEntry ran --
+    // a real, measured integer when either array was supplied at all
+    // (including a real 0 when every value was well-formed), null when
+    // neither was supplied (mirrors findings_truncated's own semantics).
+    // Named distinctly from AC-OPS-2's start-only/terminal-only orphan
+    // counters so this cause is never mistaken for a start-only orphan's
+    // actual causes (the process being killed before the terminal write,
+    // or the terminal write itself failing for a reason this sanitiser
+    // does not cover).
+    invalid_ac_ids_dropped: { type: ['integer', 'null'] },
+    // M1 (round 4 remainder): companion counter for invalid_ac_ids_dropped
+    // -- how many findings[].lens/severity values were non-conforming and
+    // nulled (with the rejected value retained, bounded, in lens_raw/
+    // severity_raw). Named separately rather than folded into
+    // invalid_ac_ids_dropped: a different field failed for a different
+    // reason, and conflating the two would make one counter answer two
+    // different operator questions. Same null-vs-zero semantics as
+    // invalid_ac_ids_dropped: a real 0 when findings were supplied and all
+    // were well-formed, null when no findings array was supplied at all.
+    invalid_finding_fields_dropped: { type: ['integer', 'null'] },
+    // Round-5 H1 (§12 reframe): the general degrade mechanism's own
+    // counter, for every value-level neutralisation NOT already covered by
+    // invalid_ac_ids_dropped/invalid_finding_fields_dropped above -- a bad
+    // verdicts.<lens>/ac_verdicts[].verdict/lenses_run[] entry, or any
+    // future field the schema declares a value constraint for. Unlike the
+    // two counters above, this one is never null: it measures "how many
+    // general neutralisations happened on THIS write," which is a
+    // meaningful real number (including 0) on every write, not gated on
+    // one specific input array's presence the way the ac_id/finding-field
+    // counters are.
+    invalid_record_values_dropped: { type: ['integer', 'null'] },
+    // Round-5 H1: bounded, redacted raw retention for exactly the
+    // neutralisations counted above (never for ac_id/lens/severity/verdict,
+    // which already have their own dedicated *_raw sibling field) -- a
+    // dict key or array element does not have a natural per-instance
+    // sibling field the way a fixed object shape does, so this is the one
+    // shared side channel for "what was dropped and from where". Absent
+    // when nothing generic was dropped (mirrors findings_truncated's own
+    // absent-vs-zero convention); capped at MAX_DEGRADED_RAW entries as a
+    // defensive bound, since a genuinely pathological record could in
+    // principle carry many.
+    degraded_raw: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['path', 'raw'],
+        properties: { path: { type: 'string' }, raw: { type: ['string', 'null'] } },
+      },
+    },
     // M2: how many findings were computed but dropped to keep `findings`
     // within MAX_FINDINGS -- an integer (a real, measured 0 when nothing
     // was dropped) when finding arrays were supplied at all, null when
     // they were not (a kind with no findings concept, e.g. tdd_task).
     findings_truncated: { type: ['integer', 'null'] },
+    // Round-6 review M2: ac_verdicts is truncated at MAX_AC_VERDICTS with
+    // no counter of its own, unlike findings/findings_truncated -- the
+    // same "the surplus was cut and NOTHING records that it happened"
+    // shape M2 (round 2) closed for findings. A real, measured 0 when
+    // ac_verdicts was supplied and nothing was dropped, null when
+    // ac_verdicts was not supplied at all.
+    ac_verdicts_truncated: { type: ['integer', 'null'] },
     rounds: { type: ['object', 'null'], additionalProperties: { type: 'integer' } },
     budget_spent: { type: ['number', 'null'] },
     // conduct_plan_event only: which state transition this line records, and
@@ -281,17 +398,66 @@ function typeMatches(value, declaredType) {
   return types.some((t) => (t === 'number' ? actual === 'number' || actual === 'integer' : actual === t))
 }
 
-// A minimal, dependency-free structural validator against
-// LEDGER_ENTRY_SCHEMA: required fields present, no properties outside the
-// declared set, enums honoured. Not a general JSON Schema engine -- just
-// enough to keep this dependency-free (AC-SIMP-1).
-export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = '') {
+// Reconstructs the exact string path format the pre-round-5 string-only
+// validator used (see validateEntry, below), from a structured pathParts
+// array (string object-keys, number array-indices). Verified against every
+// message-producing site in collectErrors below: a string key gets a
+// leading '.' unless it is the first segment or immediately follows an
+// index bracket (the bracket already visually separates); a number index
+// is appended directly with no separator. E.g. ['findings', 0, 'lens'] ->
+// 'findings[0].lens'; ['verdicts', 'lens-data'] -> 'verdicts.lens-data';
+// ['lenses_run', 2] -> 'lenses_run[2]'.
+function pathPartsToPrefix(pathParts) {
+  let s = ''
+  for (const part of pathParts) {
+    if (typeof part === 'number') s += `[${part}]`
+    else s += (s ? '.' : '') + part
+  }
+  return s
+}
+
+// Round-5 H1 reframe (§12 frame fix, replacing the third recurring
+// per-field allowlist -- see main()'s own comment at the degrade call site
+// for the full history: round-2 M-3 sanitised ac_id, round-4 M1 sanitised
+// lens/severity, round-5 H1 would have sanitised verdicts/ac_verdicts.
+// verdict/lenses_run next. Each round the RULE was "these enumerated
+// fields may be malformed"; the rule the ledger actually needs is
+// universal -- a malformed VALUE must never cost the LINE.
+//
+// collectErrors is the SAME validation logic the pre-round-5 validateEntry
+// ran (mirrored field for field, not reinvented), but returns structured
+// {pathParts, kind, message} objects instead of bare strings, so the
+// degrade mechanism (below, in main()) can locate and neutralise exactly
+// the value that failed. `kind` classifies each error as STRUCTURAL
+// (required/requiredWhen/additionalProperty/rootType -- the record's own
+// shape is broken, never neutralisable: a required field is absent, the
+// entry or an array item is not an object at all, or an unknown top-level
+// key exists under additionalProperties:false) or VALUE (type/enum/pattern
+// -- exactly one value is wrong and can always be neutralised: dropped
+// from its array/dict, or nulled with a bounded raw form retained).
+// message is built with the IDENTICAL string templates the old code used,
+// so validateEntry's public string-array contract (and every existing test
+// asserting on it) is unaffected by this refactor.
+const STRUCTURAL_KINDS = new Set(['required', 'requiredWhen', 'additionalProperty', 'rootType'])
+
+function collectErrors(entry, schema, pathParts = []) {
   const errors = []
   if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
-    return [`${pathPrefix || '(root)'}: expected an object`]
+    const prefix = pathPartsToPrefix(pathParts)
+    // FINDING 1 / M-2 precedent (unchanged): a null or non-object element
+    // inside findings/ac_verdicts is STRUCTURAL, never neutralised -- there
+    // is no field to null out on something that is not an object at all.
+    // Matches main's own behaviour for this exact input (confirmed by
+    // direct execution, round-2 triage).
+    const message = prefix ? `${prefix}.: expected an object` : '(root): expected an object'
+    errors.push({ pathParts, kind: 'rootType', message })
+    return errors
   }
   for (const key of schema.required || []) {
-    if (!(key in entry)) errors.push(`${pathPrefix}${key}: required property missing`)
+    if (!(key in entry)) {
+      const keyPath = [...pathParts, key]
+      errors.push({ pathParts: keyPath, kind: 'required', message: `${pathPartsToPrefix(keyPath)}: required property missing` })
+    }
   }
   // M3: conditional-required rules, e.g. event_key is only required when
   // kind === 'conduct_plan_event'. Generic (matches every key/value pair
@@ -302,19 +468,25 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
     if (matches) {
       for (const key of rule.require) {
         if (!(key in entry) || entry[key] === null || entry[key] === undefined) {
-          errors.push(`${pathPrefix}${key}: required when ${JSON.stringify(rule.when)}`)
+          const keyPath = [...pathParts, key]
+          errors.push({ pathParts: keyPath, kind: 'requiredWhen', message: `${pathPartsToPrefix(keyPath)}: required when ${JSON.stringify(rule.when)}` })
         }
       }
     }
   }
   if (schema.additionalProperties === false) {
     for (const key of Object.keys(entry)) {
-      if (!(key in schema.properties)) errors.push(`${pathPrefix}${key}: not an allowed property`)
+      if (!(key in schema.properties)) {
+        const keyPath = [...pathParts, key]
+        errors.push({ pathParts: keyPath, kind: 'additionalProperty', message: `${pathPartsToPrefix(keyPath)}: not an allowed property` })
+      }
     }
   }
   for (const [key, propSchema] of Object.entries(schema.properties || {})) {
     if (!(key in entry)) continue
     const value = entry[key]
+    const keyPath = [...pathParts, key]
+    const keyPrefix = pathPartsToPrefix(keyPath)
     // H2 round 2: previously the ONLY checks below this line were enum,
     // pattern and array-item shape -- a property's own declared `type` was
     // never enforced, so a number, an object, or an array could sit in a
@@ -323,7 +495,7 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
     // (matching an enum/pattern against the wrong kind of value is not a
     // real check), so it short-circuits the rest of this property's checks.
     if (propSchema.type && !typeMatches(value, propSchema.type)) {
-      errors.push(`${pathPrefix}${key}: expected type ${JSON.stringify(propSchema.type)}, got ${jsonType(value)}`)
+      errors.push({ pathParts: keyPath, kind: 'type', message: `${keyPrefix}: expected type ${JSON.stringify(propSchema.type)}, got ${jsonType(value)}` })
       continue
     }
     // Dictionary-shaped objects (trigger_counts, verdicts, rounds): the key
@@ -334,21 +506,22 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
     if (value !== null && typeof value === 'object' && !Array.isArray(value) && propSchema.additionalProperties && typeof propSchema.additionalProperties === 'object') {
       const valueSchema = propSchema.additionalProperties
       for (const [dictKey, dictValue] of Object.entries(value)) {
-        const dictPath = `${pathPrefix}${key}.${dictKey}`
+        const dictPath = [...keyPath, dictKey]
+        const dictPrefix = pathPartsToPrefix(dictPath)
         if (valueSchema.type && !typeMatches(dictValue, valueSchema.type)) {
-          errors.push(`${dictPath}: expected type ${JSON.stringify(valueSchema.type)}, got ${jsonType(dictValue)}`)
+          errors.push({ pathParts: dictPath, kind: 'type', message: `${dictPrefix}: expected type ${JSON.stringify(valueSchema.type)}, got ${jsonType(dictValue)}` })
           continue
         }
         if (valueSchema.enum && !valueSchema.enum.includes(dictValue)) {
-          errors.push(`${dictPath}: "${dictValue}" is not one of ${JSON.stringify(valueSchema.enum)}`)
+          errors.push({ pathParts: dictPath, kind: 'enum', message: `${dictPrefix}: "${dictValue}" is not one of ${JSON.stringify(valueSchema.enum)}` })
         }
       }
     }
     if (propSchema.enum && value !== null && value !== undefined && !propSchema.enum.includes(value)) {
-      errors.push(`${pathPrefix}${key}: "${value}" is not one of ${JSON.stringify(propSchema.enum)}`)
+      errors.push({ pathParts: keyPath, kind: 'enum', message: `${keyPrefix}: "${value}" is not one of ${JSON.stringify(propSchema.enum)}` })
     }
     if (propSchema.pattern && value !== null && value !== undefined && !new RegExp(propSchema.pattern).test(value)) {
-      errors.push(`${pathPrefix}${key}: "${value}" does not match ${propSchema.pattern}`)
+      errors.push({ pathParts: keyPath, kind: 'pattern', message: `${keyPrefix}: "${value}" does not match ${propSchema.pattern}` })
     }
     if (propSchema.type === 'array' && propSchema.items && Array.isArray(value)) {
       const itemsSchema = propSchema.items
@@ -356,21 +529,22 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
         // Object-item arrays (e.g. findings): recurse fully, including the
         // additionalProperties/required checks above.
         value.forEach((item, i) => {
-          errors.push(...validateEntry(item, itemsSchema, `${pathPrefix}${key}[${i}].`))
+          errors.push(...collectErrors(item, itemsSchema, [...keyPath, i]))
         })
       } else {
         // Primitive-item arrays (e.g. lenses_run: string[]): checking each
-        // element against the object-shaped validateEntry contract above
-        // would reject every element outright (a string is never "an
-        // object"), silently refusing the entire record. Check the
-        // primitive's own type/enum instead.
+        // element against the object-shaped rootType check above would
+        // reject every element outright (a string is never "an object"),
+        // silently refusing the entire record. Check the primitive's own
+        // type/enum instead.
         value.forEach((item, i) => {
-          const itemPath = `${pathPrefix}${key}[${i}]`
+          const itemPath = [...keyPath, i]
+          const itemPrefix = pathPartsToPrefix(itemPath)
           if (itemsSchema.type && typeof item !== itemsSchema.type) {
-            errors.push(`${itemPath}: expected ${itemsSchema.type}, got ${typeof item}`)
+            errors.push({ pathParts: itemPath, kind: 'type', message: `${itemPrefix}: expected ${itemsSchema.type}, got ${typeof item}` })
           }
           if (itemsSchema.enum && !itemsSchema.enum.includes(item)) {
-            errors.push(`${itemPath}: "${item}" is not one of ${JSON.stringify(itemsSchema.enum)}`)
+            errors.push({ pathParts: itemPath, kind: 'enum', message: `${itemPrefix}: "${item}" is not one of ${JSON.stringify(itemsSchema.enum)}` })
           }
         })
       }
@@ -379,20 +553,280 @@ export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = 
   return errors
 }
 
+// A minimal, dependency-free structural validator against
+// LEDGER_ENTRY_SCHEMA: required fields present, no properties outside the
+// declared set, enums honoured. Not a general JSON Schema engine -- just
+// enough to keep this dependency-free (AC-SIMP-1).
+//
+// Round-5 H1: now a thin string-only projection of collectErrors (the
+// single implementation, AC-ARCH-1-style) rather than its own recursive
+// walk -- `schema`/`pathPrefix` are retained for signature compatibility
+// only; no caller in this codebase passes a non-default value for either
+// (verified by grep), since the array-item recursion that used to need
+// them now lives inside collectErrors itself.
+export function validateEntry(entry, schema = LEDGER_ENTRY_SCHEMA, pathPrefix = '') {
+  return collectErrors(entry, schema, []).map((e) => e.message)
+}
+
+// Round-5 H1: the four fields with an established dedicated *_raw sibling
+// (ac_id_raw/lens_raw/severity_raw already shipped in rounds 2 and 4;
+// verdict_raw added above, same round). Recognised by field NAME, not by
+// which array it lives in -- collectErrors only ever reaches a property
+// name that THAT item's own schema actually declares (findings items have
+// no `verdict`, ac_verdicts items have no `lens`/`severity`), so there is
+// no cross-contamination between the two arrays in today's schema. A
+// future object-array item that happens to declare a field with one of
+// these names but no matching *_raw sibling in ITS OWN schema would need
+// its own entry here (or its own name) -- noted so the coupling is
+// discoverable, not silently assumed.
+//
+// Round-6 H1: EXPORTED (AC-ARCH-1-style single definition site) so
+// optimise-read.mjs can derive its OWN "is this value neutralised?" test
+// from the identical set the writer uses, rather than redeclaring the
+// four field names a second time -- the round-5 write-side fix and this
+// round's read-side taint fix must never be able to drift apart about
+// which fields carry a raw sibling.
+export const RAW_SIBLING_FIELDS = { ac_id: 'ac_id_raw', lens: 'lens_raw', severity: 'severity_raw', verdict: 'verdict_raw' }
+// Defensive bound on degraded_raw (see its own schema comment) -- generic
+// degradations are expected to be rare; this is a ceiling, not a routine
+// path, mirroring MAX_AC_VERDICTS's own "safety net, not an expected
+// frequency of use" reasoning.
+const MAX_DEGRADED_RAW = 10
+
+// Walks `pathParts` and returns the CONTAINER that holds the final
+// segment (i.e. one level short of the full path) -- e.g. for
+// ['findings', 0, 'lens'] returns entry.findings[0]; for ['lenses_run']
+// (a single segment) returns entry itself.
+function resolveContainer(entry, pathParts) {
+  let node = entry
+  for (let i = 0; i < pathParts.length - 1; i++) node = node[pathParts[i]]
+  return node
+}
+
+// Walks the FULL pathParts and returns the value AT that path.
+function resolveValue(entry, pathParts) {
+  let node = entry
+  for (const part of pathParts) node = node[part]
+  return node
+}
+
+// Round-7 review F3: a `required` error is STRUCTURAL only when it names a
+// field missing from the RECORD's own envelope -- when it names a field
+// missing from inside an OBJECT-ARRAY ITEM (ac_verdicts[i].ac_id,
+// findings[i].lens), there is no value to null (nothing was ever
+// supplied), but the ITEM can still be dropped, exactly like a malformed
+// primitive array element. Returns [arrayKey, index] when `pathParts`
+// points inside such an item, else null.
+function itemDropPathParts(pathParts) {
+  if (pathParts.length >= 3 && typeof pathParts[1] === 'number') return pathParts.slice(0, 2)
+  return null
+}
+
+// Round-7 review F3: required-missing nested inside an array item is
+// VALUE-level (item-level, see itemDropPathParts above); requiredWhen
+// never nests (only the top-level schema declares it) and rootType/
+// additionalProperty always name a genuine shape break. Single definition
+// site for "is this error a record-level refusal reason", used both by
+// the up-front gate and nowhere else -- STRUCTURAL_KINDS alone is no
+// longer sufficient once `required` needs this distinction.
+function isStructuralError(err) {
+  if (err.kind === 'required') return !itemDropPathParts(err.pathParts)
+  return STRUCTURAL_KINDS.has(err.kind)
+}
+
+// Round-5 H1 (§12 reframe). This is the third time this exact defect class
+// has been found and "fixed": round-2 M-3 sanitised ac_id; round-4 M1
+// sanitised lens/severity; round-5 H1 would have sanitised
+// verdicts/ac_verdicts.verdict/lenses_run next. Each round extended a
+// per-field ALLOWLIST to cover exactly the fields that round's review
+// happened to name, and the next review found the next sibling -- because
+// the writer's rule was "these enumerated fields may be malformed", when
+// the rule the ledger actually needs is universal: a malformed VALUE must
+// never cost the LINE. Every one of these fields is model-supplied free
+// text; there will always be another one.
+//
+// Inverted from allowlist to general degrade-on-validation-failure:
+// 1. Validate the built entry (collectErrors).
+// 2. If clean, done (mirrors the old fast path exactly).
+// 3. If every error is VALUE-kind (type/enum/pattern, plus -- round-7 F3
+//    -- a `required` error nested inside an array item; never rootType/
+//    requiredWhen/additionalProperty, and never a `required` error naming
+//    a top-level envelope field), neutralise each in place: a known
+//    sibling field (ac_id/lens/severity/verdict, inside an object-array
+//    item) is nulled with a bounded, redacted raw form retained in its
+//    sibling; a dict entry (verdicts.<lens>, trigger_counts.<key>,
+//    rounds.<key>) is dropped from the dict; a primitive array element
+//    (lenses_run[i]) is dropped from the array; an object-array item
+//    missing a required field entirely (round-7 F3) is dropped from ITS
+//    array the same way -- all three array-drop cases batched per array,
+//    so two bad elements/items in one array cannot shift each other's
+//    index mid-removal; any other top-level scalar (task/round_key/
+//    event/kind/outcome/...) is simply deleted from the entry. Deletion
+//    is deliberate, not nulling: it lets the NEXT validation pass decide
+//    the field's own fate through the schema it already declares -- an
+//    OPTIONAL field just becomes absent (a clean degrade), while a field
+//    that turns out to be required (kind, outcome/event_key when their
+//    requiredWhen condition matches) then fails as a required-property-
+//    missing error, which is genuinely structural and correctly refuses.
+//    This is what makes the mechanism self-limiting without a hand-
+//    maintained "never touch these fields" exclusion list: the schema's
+//    OWN required/requiredWhen declarations already say which fields are
+//    load-bearing.
+// 4. Re-validate. Anything still wrong -- including a required-missing
+//    error freshly surfaced by step 3's deletions -- is now genuinely
+//    unrecoverable at the value level and the record is refused, citing
+//    the FINAL error list (never the original one, so the refusal reason
+//    is honest about what actually stopped the write).
+// If ANY error from the first pass is STRUCTURAL (a required TOP-LEVEL
+// field was already absent, the entry or an array item is not an object,
+// or an unknown top-level key exists), no neutralisation is attempted at
+// all -- exactly the FINDING-1/M-2 precedent, matching main's own
+// behaviour for those inputs.
+export function degradeEntry(entry, redactRawField = (v) => v) {
+  let errs = collectErrors(entry, LEDGER_ENTRY_SCHEMA, [])
+  const neutralisations = []
+  if (errs.length) {
+    if (errs.some(isStructuralError)) {
+      return { ok: false, errors: errs.map((e) => e.message) }
+    }
+    const arrayDrops = new Map() // pathPrefix of the array -> {pathParts, indices}
+    for (const err of errs) {
+      const last = err.pathParts[err.pathParts.length - 1]
+      // Round-7 F3: a required field missing from inside an array item
+      // drops the WHOLE ITEM -- there is no value to null, only an
+      // identity that was never supplied. Reuses the SAME batched
+      // arrayDrops mechanism the primitive-array-item case (below) uses.
+      if (err.kind === 'required') {
+        const itemPrefix = itemDropPathParts(err.pathParts)
+        const arrayPathParts = [itemPrefix[0]]
+        const groupKey = pathPartsToPrefix(arrayPathParts)
+        if (!arrayDrops.has(groupKey)) arrayDrops.set(groupKey, { pathParts: arrayPathParts, indices: new Set() })
+        arrayDrops.get(groupKey).indices.add(itemPrefix[1])
+        neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'generic', raw: null })
+        continue
+      }
+      if (typeof last === 'number') {
+        const arrayPathParts = err.pathParts.slice(0, -1)
+        const groupKey = pathPartsToPrefix(arrayPathParts)
+        if (!arrayDrops.has(groupKey)) arrayDrops.set(groupKey, { pathParts: arrayPathParts, indices: new Set() })
+        arrayDrops.get(groupKey).indices.add(last)
+        neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'generic', raw: resolveValue(entry, err.pathParts) })
+        continue
+      }
+      const container = resolveContainer(entry, err.pathParts)
+      const rawValue = container[last]
+      const siblingField = RAW_SIBLING_FIELDS[last]
+      const isKnownItemField = siblingField && err.pathParts.length === 3 && typeof err.pathParts[1] === 'number'
+      if (isKnownItemField) {
+        // Round-7 review F2: the field being neutralised can itself be
+        // `undefined` -- not merely a wrong-typed VALUE, but genuinely
+        // OMITTED by the caller. computeFindings (above) unconditionally
+        // creates a `lens` PROPERTY on every finding entry (`lens: f.lens`,
+        // no fallback, unlike severity/ac_id which both default to a real
+        // value) -- so a descriptor that never supplied `lens` at all still
+        // produces a `lens` KEY present with value undefined, which fails
+        // the type check the same way a wrong-typed value would. Writing
+        // that `undefined` straight into the *_raw sibling (truncateBytes/
+        // redactRawField both pass null/undefined through UNCHANGED, by
+        // design, so it stays undefined) creates a property whose OWN
+        // value then fails re-validation on the second pass -- one
+        // malformed (in this case, merely INCOMPLETE) findings descriptor
+        // destroying the whole record again, the identical total-loss
+        // class this entire mechanism exists to close. Only retain a raw
+        // form when there is something concrete TO retain; otherwise leave
+        // the sibling untouched (absent), which is schema-legal (neither
+        // field is in the item's own `required` list).
+        if (rawValue !== undefined) {
+          container[siblingField] = truncateBytes(redactRawField(rawValue), AC_ID_RAW_MAX_BYTES)
+        }
+        container[last] = null
+        const bucket = last === 'ac_id' ? 'ac_id' : err.pathParts[0] === 'findings' && (last === 'lens' || last === 'severity') ? 'finding_field' : 'general'
+        neutralisations.push({ pathParts: err.pathParts, bucket, kind: 'siblingField' })
+      } else {
+        delete container[last]
+        neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'generic', raw: rawValue })
+      }
+    }
+    for (const { pathParts, indices } of arrayDrops.values()) {
+      const container = resolveContainer(entry, pathParts)
+      const arrKey = pathParts[pathParts.length - 1]
+      container[arrKey] = container[arrKey].filter((_, i) => !indices.has(i))
+    }
+    errs = collectErrors(entry, LEDGER_ENTRY_SCHEMA, [])
+    if (errs.length) {
+      return { ok: false, errors: errs.map((e) => e.message) }
+    }
+  }
+  const invalidAcIdsDropped = neutralisations.filter((n) => n.bucket === 'ac_id').length
+  const invalidFindingFieldsDropped = neutralisations.filter((n) => n.bucket === 'finding_field').length
+  const generalOnes = neutralisations.filter((n) => n.bucket === 'general')
+  if (Array.isArray(entry.findings) || Array.isArray(entry.ac_verdicts)) {
+    entry.invalid_ac_ids_dropped = invalidAcIdsDropped
+  }
+  if (Array.isArray(entry.findings)) {
+    entry.invalid_finding_fields_dropped = invalidFindingFieldsDropped
+  }
+  entry.invalid_record_values_dropped = generalOnes.length
+  // Round-6 review L1/M1: `path` is built from pathParts, and a DICT KEY
+  // segment (verdicts.<lens-name>, trigger_counts.<key>, rounds.<key>) is
+  // caller-controlled free text just like `raw` is -- it had neither
+  // redaction nor a length bound. Redacting the JOINED string (the way
+  // free-text fields elsewhere use redactRawField) would miss a hostile
+  // key here: ABSOLUTE_PATH_RE only recognises an absolute path anchored
+  // at start-of-string or after whitespace/quote/paren, and
+  // pathPartsToPrefix joins a dict key onto its parent with a bare '.'
+  // (e.g. 'verdicts./etc/shadow'), which is not in that anchor set --
+  // exactly the gap M1 names. Fixed at the SEGMENT level instead: each
+  // string pathPart is redacted on its own, where a hostile value starts
+  // at position 0 and the '^' anchor always matches, before the safe
+  // (schema-fixed) and caller-controlled segments are joined -- this
+  // closes the gap without touching ABSOLUTE_PATH_RE itself, which this
+  // spec's own round-2 history (three regressions from widening it) is
+  // reason enough to leave alone for the free-text pipeline it already
+  // serves correctly.
+  const degradedRaw = generalOnes
+    .filter((n) => n.kind === 'generic')
+    .slice(0, MAX_DEGRADED_RAW)
+    .map((n) => {
+      const safePathParts = n.pathParts.map((p) => (typeof p === 'string' ? redactRawField(p) : p))
+      return {
+        path: truncateBytes(pathPartsToPrefix(safePathParts), AC_ID_RAW_MAX_BYTES),
+        raw: truncateBytes(redactRawField(n.raw), AC_ID_RAW_MAX_BYTES),
+      }
+    })
+  if (degradedRaw.length) entry.degraded_raw = degradedRaw
+  return { ok: true }
+}
+
 // Turns raw finding descriptors ({lens, location, claim, severity?, ac_id?})
 // into schema-shaped {id, lens, severity, ac_id, disposition} entries, or a
 // null count when the descriptor array itself is null (AC-QA-13: a
 // malformed synthesis response is unmeasured, never silently zero) versus a
 // genuine empty array, which yields a real zero count (AC-OPS-3).
+// FINDING 1 (confirmed pre-existing on main too, not a regression): a null
+// or non-object descriptor element crashed here (`f.lens` on `null`) with
+// an unhandled TypeError, before validateEntry ever ran -- Node exits
+// non-zero, nothing written, not even a parseable write_ok:false. A
+// malformed element now becomes `null` in the entries array instead,
+// which flows through (via allFindings) into entry.findings below and is
+// caught there by the EXISTING findings.items.type:'object' schema check
+// -- the same clean write_ok:false degrade the findings/ac_verdicts
+// sanitiser already relies on for a malformed non-null element (see its
+// own comment, further down this file). Applied once, here, so all three
+// callers (spec_bugs, rejected_findings, open_findings) get it
+// consistently rather than three separate special cases.
 function computeFindings(descriptors, disposition) {
   if (!Array.isArray(descriptors)) return { entries: [], count: null }
-  const entries = descriptors.map((f) => ({
-    id: findingId(f.lens, f.location, f.claim),
-    lens: f.lens,
-    severity: f.severity || 'Low',
-    ac_id: f.ac_id || null,
-    disposition,
-  }))
+  const entries = descriptors.map((f) => {
+    if (!f || typeof f !== 'object') return null
+    return {
+      id: findingId(f.lens, f.location, f.claim),
+      lens: f.lens,
+      severity: f.severity || 'Low',
+      ac_id: f.ac_id || null,
+      disposition,
+    }
+  })
   return { entries, count: entries.length }
 }
 
@@ -690,7 +1124,33 @@ function result(run_id, ts, write_ok, write_error) {
   return { run_id, ts, write_ok, write_error: write_error || null }
 }
 
+// A truthy env value opts into read-only mode; empty string, "0" and
+// "false" (case-insensitive) are treated as unset, matching common shell
+// convention for a boolean env var.
+function isReadonlyEnvTruthy(v) {
+  if (v === undefined || v === null) return false
+  const s = String(v).trim().toLowerCase()
+  return s !== '' && s !== '0' && s !== 'false'
+}
+
 export function main() {
+  // Review round-2, new harness-level guard: lenses are specified
+  // read-only, but this script resolves the MAIN checkout via
+  // --git-common-dir regardless of which worktree it is invoked from
+  // (AC-DATA-1), so a lens probing this writer from its own isolated
+  // worktree still writes to the operator's real, unbacked-up ledger --
+  // exactly what happened during review round 2 (two synthetic records
+  // appeared in the live ledger). When HARNESS_LEDGER_READONLY is set to a
+  // truthy value, NOTHING below runs: no stdin parse, no git subprocess,
+  // no gitignore check, no write -- a clean refusal, before any of that
+  // machinery starts. This is enforced at the LENS PROMPT boundary
+  // (review-cycle.js instructs every lens to export it before probing),
+  // not fully mechanical: a lens that does not follow its own
+  // instructions, or a caller other than a lens, is not stopped by this
+  // alone. Documented as such, not oversold.
+  if (isReadonlyEnvTruthy(process.env.HARNESS_LEDGER_READONLY)) {
+    return result(randomUUID(), new Date().toISOString(), false, 'ledger is read-only in this context')
+  }
   const cwd = process.cwd()
   const ts = new Date().toISOString()
   let payload
@@ -931,7 +1391,43 @@ export function main() {
   const specWasOverwritten = typeof payload.spec === 'string' && payload.spec !== '' && planKey !== NO_SPEC_PLAN_KEY
   if (specWasOverwritten) {
     payload.spec = planKey
-    if (planKey !== REDACTED_PATH_MARKER) payload.spec_raw = specRawInput
+    // Review round-1 L4 (AC-SEC-1's headline sentence, which forbids ANY
+    // absolute path or account name in a ledger line -- not just in
+    // plan_key/spec): specRawInput, for an in-repo ABSOLUTE spec, is the
+    // caller's literal absolute string, e.g.
+    // an absolute path shaped like /Volumes/<disk>/<user>/repos/<repo>/specs/a.md
+    // on a real checkout, which
+    // carries the local account name. Relativised here the SAME lexical,
+    // root-matching way `spec` is a few lines above -- but deliberately
+    // WITHOUT canonicalPlanKey's "./"/"../"-collapsing step, so spec_raw
+    // is never simply re-derived FROM the same canonicalisation it exists
+    // to insure against (that would silently reintroduce round 5's
+    // original vacuous-recoverability defect, one layer over). Only the
+    // absolute prefix is stripped; everything after it, including any
+    // awkward "../" segments, survives untouched (proven distinct from
+    // plan_key in ledger-append.test.js). A relative spec_raw is already
+    // safe and passes through unchanged. Out-of-repo specs are unchanged:
+    // spec_raw stays withheld entirely (AC-SEC-1 cases c/d).
+    if (planKey !== REDACTED_PATH_MARKER) {
+      const rawIsAbsolute = typeof specRawInput === 'string' && (specRawInput.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(specRawInput))
+      if (rawIsAbsolute) {
+        const matchedRoot = specRootCandidates
+          .filter((r) => typeof r === 'string' && r)
+          .map((r) => r.replace(/[\\/]+$/, ''))
+          .find((r) => specRawInput === r || specRawInput.startsWith(r + '/') || specRawInput.startsWith(r + '\\'))
+        // Review round-2 L-3: fails CLOSED (withholds the value) rather
+        // than falling open to the caller's verbatim absolute string. This
+        // branch is provably unreachable today -- canonicalPlanKey already
+        // matched this exact string against this exact candidate list to
+        // produce a non-marker planKey, so matchedRoot cannot be undefined
+        // here -- but a future divergence between the two matching
+        // computations must lose recoverability, never leak the account
+        // name through the side door this fallback used to be.
+        payload.spec_raw = matchedRoot !== undefined ? specRawInput.slice(matchedRoot.length).replace(/^[\\/]+/, '') : undefined
+      } else {
+        payload.spec_raw = specRawInput
+      }
+    }
   }
 
   // Truncate free-text fields AFTER the above: `spec`/`spec_raw` are now
@@ -997,14 +1493,77 @@ export function main() {
   // is sized by the spec's own AC count times the lens roster -- a few
   // dozen entries at most -- so this is a safety net against a pathological
   // input, not a path expected to fire on a real run (unlike MAX_FINDINGS,
-  // which does fire routinely; no separate truncated-count field is kept
-  // for the same reason AC-SIMP-4 favours the simplest guard that closes
-  // the real risk).
-  if (Array.isArray(entry.ac_verdicts)) entry.ac_verdicts = entry.ac_verdicts.slice(0, MAX_AC_VERDICTS)
+  // which does fire routinely).
+  // Round-6 review M2: "no separate truncated-count field is kept" (the
+  // original AC-SIMP-4 reasoning above) was itself the defect -- a bound
+  // that silently drops the surplus with nothing recording it happened is
+  // exactly the "correct in source, absent from the visibility" shape this
+  // whole spec exists to close, one field over from findings_truncated.
+  // Real, measured 0 when ac_verdicts was supplied and nothing was
+  // dropped, null when it was not supplied at all -- same null-vs-zero
+  // convention as findings_truncated.
+  if (Array.isArray(entry.ac_verdicts)) {
+    const acVerdictsTruncated = Math.max(0, entry.ac_verdicts.length - MAX_AC_VERDICTS)
+    entry.ac_verdicts = entry.ac_verdicts.slice(0, MAX_AC_VERDICTS)
+    entry.ac_verdicts_truncated = acVerdictsTruncated
+  }
 
-  const errors = validateEntry(entry)
-  if (errors.length) {
-    return result(run_id, ts, false, 'payload failed ledger schema validation: ' + errors.join('; '))
+  // Round-5 H1 (§12 reframe): replaces the round-2 (ac_id) and round-4
+  // (lens/severity) per-field allowlists with the general degrade
+  // mechanism (degradeEntry, above) -- see its own comment for the full
+  // history and why an allowlist could never actually close this class.
+  // redactRawField stays local to main(): it needs cwdRoot/root, which are
+  // resolved only here, and is passed into degradeEntry so that function
+  // itself stays pure of filesystem/git state (directly unit-testable).
+  // Applied BEFORE truncation (inside degradeEntry) so a path is made safe
+  // before it is cut down, not after (cutting first could leave a
+  // recognisable path fragment inside the bound).
+  function redactRawField(value) {
+    let v = cwdRoot && cwdRoot !== root ? relativiseAgainstRoot(value, cwdRoot) : value
+    return redactPaths(v, root)
+  }
+
+  // Round-4 review M3 (writer half) -- NOT subsumed by degradeEntry, and
+  // deliberately kept separate from it: ac_verdicts.ac_id is schema-
+  // nullable ON PURPOSE (that is exactly what a sanitised value looks
+  // like), so collectErrors never flags an explicit null as an error at
+  // all -- there is nothing for the general mechanism to catch here. But
+  // an ac_verdicts entry ALWAYS concerns a specific criterion (unlike
+  // findings.ac_id, which legitimately has no AC attached), so an
+  // EXPLICIT null supplied by the caller is still semantically suspect: a
+  // FAIL verdict with no ac_id must not read as zero sanitisations
+  // (round-4 M3's own reader-side taint depends on this counter).
+  //
+  // Round-7 review, instruction 3: the identical gap exists for `verdict`
+  // -- also schema-nullable on purpose, so an EXPLICIT `verdict: null`
+  // (no verdict_raw at all) never touches degradeEntry either, and the
+  // writer previously left it silently uncounted. The reader's F1 fix
+  // (value-based: is this one of PASS/FAIL/UNVERIFIABLE?) already treats
+  // this shape correctly as non-evidence regardless of whether the writer
+  // counts it -- but a silent neutralisation is how the round-6 defect
+  // stayed invisible in the first place, so it is counted here too, under
+  // invalid_record_values_dropped (verdict is not ac_id -- same counter
+  // round-5 already routes every other non-ac_id/lens/severity
+  // neutralisation through).
+  let explicitNullAcVerdictAcId = 0
+  let explicitNullVerdict = 0
+  if (Array.isArray(entry.ac_verdicts)) {
+    for (const v of entry.ac_verdicts) {
+      if (!v || typeof v !== 'object') continue
+      if (v.ac_id === null) explicitNullAcVerdictAcId += 1
+      if (v.verdict === null) explicitNullVerdict += 1
+    }
+  }
+
+  const degraded = degradeEntry(entry, redactRawField)
+  if (!degraded.ok) {
+    return result(run_id, ts, false, 'payload failed ledger schema validation: ' + degraded.errors.join('; '))
+  }
+  if (explicitNullAcVerdictAcId > 0) {
+    entry.invalid_ac_ids_dropped = (entry.invalid_ac_ids_dropped || 0) + explicitNullAcVerdictAcId
+  }
+  if (explicitNullVerdict > 0) {
+    entry.invalid_record_values_dropped = (entry.invalid_record_values_dropped || 0) + explicitNullVerdict
   }
 
   let line = JSON.stringify(entry)
@@ -1188,13 +1747,54 @@ export function main() {
 
   // M2: the caller passed event_scope, not the full key -- return the
   // minted key so the caller can log/display it, never re-derive it itself.
-  return entry.event_key ? { ...result(run_id, ts, true, null), event_key: entry.event_key } : result(run_id, ts, true, null)
+  // Review round-2 M-3: invalid_ac_ids_dropped rides on the CLI result too
+  // (not just the stored line), so writeLedger (in each of the three
+  // workflow scripts) can log a visible line when a sanitisation actually
+  // happened, the same way it already surfaces a write failure.
+  const extra = {}
+  if (entry.event_key) extra.event_key = entry.event_key
+  if (typeof entry.invalid_ac_ids_dropped === 'number') extra.invalid_ac_ids_dropped = entry.invalid_ac_ids_dropped
+  // M1 (round 4 remainder): invalid_finding_fields_dropped rides on the CLI
+  // result too, mirroring invalid_ac_ids_dropped exactly, above.
+  if (typeof entry.invalid_finding_fields_dropped === 'number') extra.invalid_finding_fields_dropped = entry.invalid_finding_fields_dropped
+  // Round-5 H1: invalid_record_values_dropped (the general degrade
+  // mechanism's own counter) rides on the CLI result too, same reason.
+  if (typeof entry.invalid_record_values_dropped === 'number') extra.invalid_record_values_dropped = entry.invalid_record_values_dropped
+  return Object.keys(extra).length ? { ...result(run_id, ts, true, null), ...extra } : result(run_id, ts, true, null)
 }
 
 // Only run as a CLI when invoked directly (`node ledger-append.mjs`), never
 // as a side effect of another module importing this file for its exports
 // (tests do exactly that).
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+//
+// FINDING 2 (round-2 triage, confirmed pre-existing on main too): Node's
+// ESM loader resolves `import.meta.url` through symlinks -- it always
+// reports this module's REAL, target path -- but `path.resolve` on
+// `process.argv[1]` only resolves `.`/`..`/relative segments lexically; it
+// never follows a symlink. `node <symlinked-path>/ledger-append.mjs` then
+// makes the comparison below false even though the caller ran this exact
+// file: `isMain` reads false, the CLI branch never runs, and the process
+// exits 0 with zero bytes of output -- success-shaped silence, no write,
+// no error signal at all. This is live in production wherever the
+// resolved script path crosses a symlinked ancestor (macOS's
+// /tmp -> /private/tmp, $TMPDIR's /var/folders -> /private/var/folders, or
+// any symlinked home/volume/install ancestor for
+// ~/.claude/workflows/lib/...). Fixed by resolving `process.argv[1]`
+// through fs.realpathSync.native (which does follow symlinks, matching
+// what import.meta.url already does) before comparing. Guarded in
+// try/catch and falling back to the lexical form on failure (e.g. a
+// genuinely nonexistent argv[1], which should never happen for a running
+// script, but must fail toward the pre-fix behaviour rather than throw
+// during a plain import that never intended to invoke the CLI at all).
+function resolveArgvPathForIsMain(argPath) {
+  const lexical = path.resolve(argPath)
+  try {
+    return fs.realpathSync.native(lexical)
+  } catch (e) {
+    return lexical
+  }
+}
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolveArgvPathForIsMain(process.argv[1])
 if (isMain) {
   const out = main()
   process.stdout.write(JSON.stringify(out) + '\n')

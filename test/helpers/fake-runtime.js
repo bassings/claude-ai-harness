@@ -202,6 +202,16 @@ function makeAgentStub(responses, calls) {
 //             to simulate a run with no budget object at all
 // Returns { result, calls, logs, phases }. Throws synchronously (wrapped in
 // the returned rejected promise) if the script fails the static pre-check.
+//
+// HARN-OPT-2 PR2 (AC-QA-8, AC-OPS-1): a workflow script may now let an
+// exception escape past its own start/terminal ledger wrapping (this is
+// exactly the case those ACs pin: the original error must still reach the
+// caller). Before this, a real production run throwing here would leave a
+// test with no way to inspect what agent() calls or log lines happened
+// before the throw -- so a caught rejection carries `calls`/`logs`/`phases`
+// as properties on the error itself, the same data a successful run returns,
+// letting a test assert both "the error propagated" and "exactly one start
+// write and one terminal write happened first" from the one rejection.
 async function runWorkflow(filePath, options = {}) {
   const fn = compile(filePath)
   const calls = []
@@ -217,8 +227,17 @@ async function runWorkflow(filePath, options = {}) {
   const phaseStub = (title) => phases.push(title)
   const logStub = (msg) => logs.push(msg)
 
-  const result = await fn(agentStub, parallelStub, pipelineStub, phaseStub, logStub, options.args, options.budget)
-  return { result, calls, logs, phases }
+  try {
+    const result = await fn(agentStub, parallelStub, pipelineStub, phaseStub, logStub, options.args, options.budget)
+    return { result, calls, logs, phases }
+  } catch (e) {
+    if (e && typeof e === 'object') {
+      e.calls = calls
+      e.logs = logs
+      e.phases = phases
+    }
+    throw e
+  }
 }
 
 // L6: makeAgentStub used to be exported too, but no test file ever imports

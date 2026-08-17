@@ -11,13 +11,14 @@ const path = require('node:path')
 const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
-const { APPEND_SCRIPT, LEDGER_REL, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos } = require('./helpers/temp-repo.js')
+const { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos } = require('./helpers/temp-repo.js')
 const {
   makeHostileTempRepo,
   makeHomeLikeHostileTempRepo,
   makeSpacyTempRepo,
   makeSymlinkAncestorTempRepo,
   makeInRepoSymlinkSpec,
+  makeSymlinkedScriptInvocation,
 } = require('./helpers/hostile-repo.js')
 
 const APPEND_MODULE_URL = pathToFileURL(APPEND_SCRIPT).href
@@ -497,6 +498,409 @@ test('ledger-append: findings_truncated is absent/null when no finding arrays we
   assert.ok(entry.findings_truncated === null || entry.findings_truncated === undefined)
 })
 
+// ---- Review round-1 M3: a single non-conforming ac_id anywhere in
+// ac_verdicts/findings used to fail schema validation for the WHOLE entry
+// (write_ok:false, the whole line refused), recreating exactly the
+// start-only orphan class this PR exists to count and name correctly --
+// and mislabelling its cause (the code comment for that counter says "an
+// exception escaped run() or the process was killed", not "a lens emitted
+// a free-text ac_id"). Reachable from untrusted input: /review-cycle runs
+// lenses over an attacker-authored diff, and a prompt-injected ac_id value
+// deletes that run's entire audit record while every lens still reports
+// normally. Fixed by sanitizing non-conforming ac_id values BEFORE
+// validateEntry runs: findings[].ac_id (nullable in the schema) is nulled;
+// ac_verdicts entries (ac_id is NOT nullable there -- the pair is
+// meaningless without it) are dropped entirely. Both counted in one named
+// field so the loss is visible and distinguishable from a real
+// start-only/terminal-only orphan. ----
+
+// Review round-2 M-3: the round-1 fix DROPPED a malformed ac_verdicts entry
+// entirely, permanently losing the PASS/FAIL verdict from the only durable
+// copy with no way to recover which criterion it was about -- exactly the
+// AC-DATA-4 recoverability requirement `spec_raw` already satisfies for
+// `spec`, unmet here. If a lens spells an id cleanly on PASS but adds a
+// qualifier on FAIL ("AC-DATA-16 (deferred)" is exactly this shape), every
+// FAIL vanishes and neverFailingAcs reads the criterion as never-failing on
+// incomplete evidence. Fixed: the entry is RETAINED (never dropped), with
+// ac_id nulled and the rejected value preserved verbatim in ac_id_raw,
+// mirroring spec/spec_raw exactly.
+test('ledger-append: an ac_verdicts entry with a free-text (non-conforming) ac_id is RETAINED (never dropped) with ac_id nulled and the original value preserved in ac_id_raw -- the verdict is not permanently lost (M-3, corrects round-1\'s drop-the-entry design)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [
+      { ac_id: 'AC-SEC-1', verdict: 'PASS' },
+      { ac_id: 'none', verdict: 'FAIL' },
+    ],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to still succeed, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must still be written -- not silently discarded into a start-only orphan')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.ac_verdicts.length, 2, 'the malformed verdict must NOT be dropped -- the FAIL is real data that must survive')
+  assert.deepEqual(entry.ac_verdicts[0], { ac_id: 'AC-SEC-1', verdict: 'PASS' })
+  assert.equal(entry.ac_verdicts[1].ac_id, null, 'the non-conforming ac_id must be nulled, never left in a shape that would fail validation')
+  assert.equal(entry.ac_verdicts[1].ac_id_raw, 'none', 'the rejected value must be recoverable, exactly like spec_raw for spec')
+  assert.equal(entry.ac_verdicts[1].verdict, 'FAIL', 'the verdict itself -- the actually valuable data -- must survive')
+  assert.equal(entry.invalid_ac_ids_dropped, 1, 'the sanitisation must still be counted under its own named field, distinguishable from a real orphan')
+  assert.equal(out.invalid_ac_ids_dropped, 1, 'the CLI result (what writeLedger actually sees) must also carry the count, not just the stored line')
+})
+
+test('ledger-append: a findings[].ac_id that fails the pattern is NULLED with the original value preserved in ac_id_raw -- the finding\'s other fields (lens, disposition) survive (M-3)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: 'optimise-cycle:AC-SEC-1' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings.length, 1, 'the finding itself must survive')
+  assert.equal(entry.findings[0].ac_id, null, 'the non-conforming ac_id must be nulled, not left in a shape that would fail validation')
+  assert.equal(entry.findings[0].ac_id_raw, 'optimise-cycle:AC-SEC-1', 'the rejected value must be recoverable (M-3)')
+  assert.equal(entry.findings[0].lens, 'lens-security', 'the rest of the finding must be intact')
+  assert.equal(entry.invalid_ac_ids_dropped, 1)
+})
+
+// M1 (conductor tick 26 remainder): reproduces the live-tip repro exactly
+// -- {"kind":"review_cycle","outcome":"done","spec":"a.md","run_id":"m1t",
+// "spec_bugs":[{"lens":"orchestrator","location":"a.md:1","claim":"x"}]}
+// returned write_ok:false ("findings[0].lens: ...") and wrote NOTHING,
+// permanently losing the run's outcome/verdicts/ac_verdicts/findings/budget
+// from the only durable, unbacked-up copy. 'orchestrator' is not exotic:
+// this spec's own veto table attributes decisions to the orchestrator, and
+// review-cycle.js passes synthesis.spec_bugs through unmapped, so a model
+// can produce it on any run. Extends the ac_id treatment (M-3, above) to
+// `lens`: nulled, retained bounded in lens_raw, counted under its own named
+// field, and -- the point of this fix -- the record is WRITTEN.
+test('ledger-append: a findings[].lens value that fails the lens/reviewer pattern is NULLED with the original preserved in lens_raw, and the record IS WRITTEN -- a malformed field costs that field, never the line (M1)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec: 'a.md',
+    run_id: 'm1t',
+    spec_bugs: [{ lens: 'orchestrator', location: 'a.md:1', claim: 'x' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed with the offending field neutralised, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- a malformed field must cost that field, never the whole line')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.findings.length, 1, 'the finding itself must survive')
+  assert.equal(entry.findings[0].lens, null, 'the non-conforming lens value must be nulled, not left in a shape that fails validation')
+  assert.equal(entry.findings[0].lens_raw, 'orchestrator', 'the rejected value must be recoverable, mirroring ac_id_raw')
+  assert.equal(entry.findings[0].disposition, 'spec_bug', 'the rest of the finding must survive')
+  assert.equal(entry.invalid_finding_fields_dropped, 1, 'the sanitisation must be counted under its own named field, distinguishable from a real orphan')
+  assert.equal(out.invalid_finding_fields_dropped, 1, 'the CLI result (what writeLedger actually sees) must also carry the count, not just the stored line')
+})
+
+// Round-7 review F2 (total-loss class, again): a findings descriptor that
+// OMITS `lens` entirely (not merely a wrong-typed value) still produces a
+// `lens` KEY with value undefined, since computeFindings does
+// `lens: f.lens` unconditionally with no fallback (unlike severity/ac_id,
+// which both default to a real value). That undefined value fails the
+// type check exactly like a wrong-typed one, degradeEntry's neutraliser
+// used to write that SAME undefined straight into lens_raw
+// (truncateBytes/redactRawField both pass undefined through unchanged BY
+// DESIGN, for the "field genuinely not supplied" case), and a property
+// whose value is undefined then fails ITS OWN re-validation on the
+// second pass -- refusing the whole record over one INCOMPLETE (not even
+// malformed) finding descriptor. The exact total-loss class this whole
+// mechanism exists to close, reopened by the fix meant to close it.
+test('ledger-append: a findings descriptor that OMITS "lens" entirely (not merely malformed) still writes -- lens is nulled, lens_raw is left ABSENT (never undefined), and the record is NOT refused (round-7 F2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ location: 'a.md:1', claim: 'x' }], // no `lens` key at all
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed despite the omitted lens, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- an INCOMPLETE descriptor must cost that field, never the whole line')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.findings.length, 1)
+  assert.equal(entry.findings[0].lens, null, 'lens must be nulled, matching the malformed-value case')
+  assert.equal('lens_raw' in entry.findings[0], false, 'lens_raw must be ABSENT (nothing to retain), never written as literal undefined -- which would itself fail schema validation')
+})
+
+for (const field of ['open_findings', 'spec_bugs', 'rejected_findings']) {
+  test(`ledger-append: a non-conforming lens in ${field} is neutralised, not fatal to the write (M1, same treatment across all three descriptor arrays)`, () => {
+    const repo = makeTempRepo()
+    const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', [field]: [{ lens: 'orchestrator', location: 'a.md:1', claim: 'x' }] })
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, true, `${field}: expected the write to succeed, got: ${out.write_error}`)
+    assert.equal(readLedgerLines(repo).length, 1, `${field}: the record must be written`)
+  })
+}
+
+test('ledger-append: a well-formed findings[].lens value is left completely untouched -- never nulled, never counted (M1, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'x' }] })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].lens, 'lens-security')
+  assert.equal(entry.findings[0].lens_raw, undefined, 'lens_raw must not appear at all when nothing was sanitised')
+  assert.equal(entry.invalid_finding_fields_dropped, 0)
+})
+
+// M1: severity is the same defect class as lens -- an enum-constrained
+// field inside the same descriptor element that used to fail the WHOLE
+// entry. Same treatment, same loop, same counter.
+test('ledger-append: a findings[].severity value outside the enum is NULLED with the original preserved in severity_raw, and the record IS WRITTEN (M1, same defect class as lens)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'x', severity: 'Urgent' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed, got: ${out.write_error}`)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].severity, null)
+  assert.equal(entry.findings[0].severity_raw, 'Urgent')
+  assert.equal(entry.invalid_finding_fields_dropped, 1)
+})
+
+test('ledger-append: invalid_finding_fields_dropped is a real zero (not null) when a findings array was supplied and every lens/severity was well-formed (M1, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'x', severity: 'High' }] })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.invalid_finding_fields_dropped, 0)
+})
+
+test('ledger-append: invalid_finding_fields_dropped is absent/null when no findings array was supplied at all (tdd_task has no findings concept) (M1)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.invalid_finding_fields_dropped === null || entry.invalid_finding_fields_dropped === undefined)
+})
+
+test('ledger-append: invalid_ac_ids_dropped is a real zero (not null) when ac_verdicts/findings were supplied and every ac_id was well-formed (M3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: 'AC-SEC-1', verdict: 'PASS' }],
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: 'AC-SEC-2' }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.invalid_ac_ids_dropped, 0)
+})
+
+test('ledger-append: invalid_ac_ids_dropped is absent/null when neither ac_verdicts nor a findings array was supplied at all (tdd_task has no ac-id concept)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.invalid_ac_ids_dropped === null || entry.invalid_ac_ids_dropped === undefined)
+})
+
+test('ledger-append: a null ac_id in findings (the ordinary "no AC" case) is left completely alone -- never counted as a drop, never touched (M3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x' }], // no ac_id at all
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].ac_id, null)
+  assert.equal(entry.invalid_ac_ids_dropped, 0, 'a genuinely absent ac_id is not an invalid one -- must not be counted as a drop')
+})
+
+// Round-4 review M3 (writer half): an ac_verdicts entry ALWAYS concerns a
+// specific criterion -- unlike findings.ac_id, there is no legitimate
+// "verdict not about any AC" case -- so an explicit `ac_id: null` supplied
+// by the caller (never touched by the string-pattern sanitiser above,
+// since it is already null, not a non-conforming string) reached
+// validateEntry silently uncounted: write_ok:true with
+// invalid_ac_ids_dropped:0, and the reader's aggregateRework then drops the
+// verdict with no trace at all. On main the same payload was refused
+// outright (main required ac_verdicts.ac_id as a plain pattern-matching
+// string, so an explicit null failed schema validation), so this branch's
+// own nullable-ac_id design (M-3, round 2) reopened a silent-loss route
+// main did not have. Counted here, at the one place both routes (a
+// rejected string, or an explicit null) converge.
+test('ledger-append: an ac_verdicts entry with ac_id EXPLICITLY null (never sanitised -- supplied that way, not produced by the string-pattern check) is counted under invalid_ac_ids_dropped, never left silently at zero (round-4 review M3, writer half)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: null, verdict: 'FAIL' }, { ac_id: 'AC-SEC-9', verdict: 'PASS' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts.length, 2, 'the FAIL verdict itself must still survive on the line')
+  assert.equal(entry.invalid_ac_ids_dropped, 1, 'an explicit null ac_id must be counted, never silently reported as zero sanitisations')
+  assert.equal(out.invalid_ac_ids_dropped, 1, 'the CLI result must also carry the count')
+})
+
+// Round-7 review, instruction 3: the identical gap as the ac_id one above,
+// for `verdict` -- also schema-nullable on purpose, so collectErrors never
+// flags an explicit `verdict: null` as an error, and it never touches
+// degradeEntry. The reader's F1 fix already treats this correctly as
+// non-evidence regardless of whether the writer counts it, but the count
+// itself was silently staying at zero, which is exactly how the round-6
+// defect went unnoticed in the first place.
+test('ledger-append: an ac_verdicts entry with verdict EXPLICITLY null (never sanitised -- supplied that way, no verdict_raw at all) is counted under invalid_record_values_dropped, never left silently at zero (round-7, instruction 3)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: 'AC-DATA-9', verdict: null }, { ac_id: 'AC-SEC-9', verdict: 'PASS' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts.length, 2, 'the entry itself must still survive on the line')
+  assert.equal('verdict_raw' in entry.ac_verdicts[0], false, 'nothing to retain -- the caller supplied null directly, not a rejected string')
+  assert.equal(entry.invalid_record_values_dropped, 1, 'an explicit null verdict must be counted, never silently reported as zero')
+  assert.equal(out.invalid_record_values_dropped, 1, 'the CLI result must also carry the count')
+})
+
+// Round-7 review F3 (total-loss class, again): an ac_verdicts item missing
+// `ac_id` ENTIRELY (not merely malformed) used to be classified structural
+// -- a `required` error is not naturally "one value is wrong", it is "no
+// value was ever supplied" -- and refused the WHOLE record. review-cycle.js
+// builds exactly this shape whenever a lens's own reported item omits
+// `id` (JSON.stringify drops the key, producing ac_id:undefined, which
+// `required` catches the same way `required` catches a wholly-absent
+// key). Fixed by treating a `required` error nested inside an array item
+// as an item-level drop (the whole item removed from ITS array) rather
+// than a record-level structural refusal -- a genuinely top-level
+// required field (schema_version, run_id, ...) is unaffected and still
+// refuses exactly as before.
+test('ledger-append: an ac_verdicts item missing "ac_id" entirely (not merely malformed -- the shape review-cycle.js produces when a lens report omits "id") is DROPPED from the array, and the record IS WRITTEN, never refused (round-7 F3)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ verdict: 'PASS' }, { ac_id: 'AC-SEC-9', verdict: 'FAIL' }], // first item has no ac_id key at all
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed with the incomplete item dropped, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- an incomplete item must cost that item, never the whole line')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.ac_verdicts.length, 1, 'the incomplete item must be dropped; the complete one survives')
+  assert.deepEqual(entry.ac_verdicts[0], { ac_id: 'AC-SEC-9', verdict: 'FAIL' })
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+test('ledger-append: TWO ac_verdicts items each missing "ac_id" are BOTH dropped correctly, without an index-shift bug (round-7 F3, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ verdict: 'PASS' }, { ac_id: 'AC-SEC-9', verdict: 'FAIL' }, { verdict: 'UNVERIFIABLE' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts.length, 1, 'both incomplete items must be dropped, without the first drop shifting which item the second drop removes')
+  assert.deepEqual(entry.ac_verdicts[0], { ac_id: 'AC-SEC-9', verdict: 'FAIL' })
+  assert.equal(entry.invalid_record_values_dropped, 2)
+})
+
+test('ledger-append: a findings item missing "id" (not reachable from computeFindings, which always sets it -- defensive, proves the mechanism generalises) is DROPPED from the array (round-7 F3)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = { schema_version: 2, run_id: 'r', ts: 't', repo: 'r', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null, findings: [{ lens: 'lens-qa', severity: 'Low', ac_id: null, disposition: 'open' }] }
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, true, `expected degradeEntry to succeed, got: ${JSON.stringify(result.errors)}`)
+  assert.equal(entry.findings.length, 0, 'the incomplete item must be dropped')
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+test('ledger-append: a genuinely top-level required field missing entirely (kind, which is NOT internally overwritten by main() the way run_id/ts/repo/write_ok/schema_version are) is STILL refused outright -- round-7 F3 must not weaken the top-level structural precedent', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, outcome: 'done', ac_verdicts: [{ verdict: 'PASS' }] }) // `kind` omitted entirely
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a top-level required field missing must still refuse the whole record')
+  assert.ok(/kind: required property missing/.test(out.write_error), `got: ${out.write_error}`)
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
+test('ledger-append: an explicitly-null ac_id in FINDINGS (not ac_verdicts) is left completely alone -- findings legitimately have no-AC-attached, unlike ac_verdicts, so this must not be counted (round-4 review M3, not over-broad)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: null }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].ac_id, null)
+  assert.equal(entry.invalid_ac_ids_dropped, 0, 'an explicit null ac_id on a FINDING is the ordinary no-AC case, not an invalid one')
+})
+
+// Round-4 review L1: ac_id_raw (and this PR's own new lens_raw/severity_raw,
+// which ride the identical retention mechanism -- fixed together, not one
+// at a time) persisted lens-supplied free text VERBATIM, bypassing the
+// redaction round-1's L4 fix already applies to spec_raw one field over.
+// The sanitiser ran AFTER redactPaths' free-text pass, so *_raw fields were
+// never in scope for it. Fixed by running the same redactPaths/
+// relativiseAgainstRoot pipeline spec_raw uses, at the point each raw value
+// is created, before truncation (so a path is made safe BEFORE it is cut
+// down, never the reverse -- cutting an unsafe absolute path first could
+// leave a recognisable partial account name inside the 32-byte bound).
+test('ledger-append: ac_id_raw redacts an absolute path outside the repo the same way spec_raw does -- an account name in a non-conforming ac_id never reaches the ledger verbatim (round-4 review L1)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: '/Users/someoperator/.ssh/id_rsa', verdict: 'FAIL' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts[0].ac_id, null)
+  assert.equal(entry.ac_verdicts[0].ac_id_raw, '<redacted-path>', `an out-of-repo absolute path must be redacted, not retained verbatim, got: ${entry.ac_verdicts[0].ac_id_raw}`)
+})
+
+test('ledger-append: ac_id_raw relativises an absolute path that lives INSIDE the repo root, rather than redacting it away entirely (round-4 review L1, mirrors spec_raw\'s H2 recoverability)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    ac_verdicts: [{ ac_id: `${repo}/specs/a.md`, verdict: 'FAIL' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts[0].ac_id_raw, 'specs/a.md', 'an in-repo path is recoverable, not merely redacted away -- the whole point of retaining it at all')
+})
+
+test('ledger-append: lens_raw and severity_raw are redacted the same way ac_id_raw is (round-4 review L1, fixed together not one at a time)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: '/Users/someoperator/.aws/credentials', location: 'x', claim: 'y', severity: '/Users/someoperator/.aws/credentials2' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings[0].lens_raw, '<redacted-path>', `got: ${entry.findings[0].lens_raw}`)
+  assert.equal(entry.findings[0].severity_raw, '<redacted-path>', `got: ${entry.findings[0].severity_raw}`)
+})
+
 // H3 round 2: at the OLD 2048-byte cap, a realistic review round (roughly
 // 10-12 findings across a full lens roster) degraded to a ~221-byte
 // envelope-only record -- the ledger kept LEAST data for the BUSIEST
@@ -629,6 +1033,74 @@ test('ledger-append: when trigger_counts/verdicts alone are large enough to leav
   assert.ok(entry.findings_truncated > 20 - 15, `findings_truncated must exceed the ordinary MAX_FINDINGS-only truncation (5 for 20 submitted): got ${entry.findings_truncated}`)
 })
 
+// ---- Review round-2, new harness-level finding: during review itself a
+// lens wrote two TEST-FIXTURE records into the LIVE ledger, because
+// ledger-append.mjs resolves the MAIN checkout via --git-common-dir
+// (AC-DATA-1) regardless of which worktree a lens is probing from --
+// lenses are specified read-only, but the writer has no way to know it is
+// being run BY a lens rather than by a real workflow. HARNESS_LEDGER_
+// READONLY is a mechanical circuit breaker: when set to a truthy value in
+// the environment, the script performs NO write at all -- not even a
+// gitignore check or a stat -- and returns a clean write_ok:false, no
+// crash, no partial write. This is prompt-enforced at the lens boundary
+// (review-cycle.js instructs every lens to export it before probing), not
+// fully mechanical: a lens that ignores its own instructions, or any OTHER
+// caller that does not set it, is not stopped by this alone. Documented as
+// such, not oversold. ----
+
+function runAppendWithEnv(cwd, payload, envOverrides) {
+  return spawnSync('node', [APPEND_SCRIPT], { cwd, input: JSON.stringify(payload), encoding: 'utf8', env: { ...process.env, ...envOverrides } })
+}
+
+test('ledger-append: HARNESS_LEDGER_READONLY=1 performs NO write at all and returns a clean write_ok:false, never a crash (new harness-level guard)', () => {
+  const repo = makeTempRepo()
+  const res = runAppendWithEnv(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' }, { HARNESS_LEDGER_READONLY: '1' })
+  assert.equal(res.status, 0, `must exit 0, never crash. stderr: ${res.stderr}`)
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false)
+  assert.equal(out.write_error, 'ledger is read-only in this context')
+  assert.equal(readLedgerLines(repo).length, 0, 'no line may be written, not even a partial one')
+})
+
+test('ledger-append: HARNESS_LEDGER_READONLY unset (the ordinary case) writes exactly as before -- the guard must not fire when the env var is absent (not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppendWithEnv(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' }, {})
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(readLedgerLines(repo).length, 1)
+})
+
+test('ledger-append: HARNESS_LEDGER_READONLY="" (empty string) and "0" and "false" do NOT trigger read-only mode -- only a genuinely truthy value does, matching shell convention for an unset-or-falsy env var', () => {
+  const repo = makeTempRepo()
+  for (const falsy of ['', '0', 'false']) {
+    const res = runAppendWithEnv(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' }, { HARNESS_LEDGER_READONLY: falsy })
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, true, `HARNESS_LEDGER_READONLY=${JSON.stringify(falsy)} must NOT trigger read-only mode, got: ${out.write_error}`)
+  }
+})
+
+test('ledger-append: HARNESS_LEDGER_READONLY does not touch the filesystem in any way -- a sha256 manifest of the whole repo tree is unchanged before and after (the same technique AC-SEC-2\'s own hostile-write test uses)', () => {
+  const crypto = require('node:crypto')
+  const repo = makeTempRepo()
+  function manifest() {
+    const out = {}
+    function walk(dir) {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === '.git') continue
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) walk(full)
+        else out[path.relative(repo, full)] = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex')
+      }
+    }
+    walk(repo)
+    return out
+  }
+  const before = manifest()
+  runAppendWithEnv(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' }, { HARNESS_LEDGER_READONLY: '1' })
+  const after = manifest()
+  assert.deepEqual(after, before, 'HARNESS_LEDGER_READONLY must create or modify NOTHING in the repo tree')
+})
+
 test('ledger-append: a payload so large that even dropping every finding cannot rescue it (trigger_counts/verdicts alone hugely exceed the cap) still degrades to the minimal valid record as a last resort, rather than failing the write (H3 round 2, last-resort collapse)', () => {
   const repo = makeTempRepo()
   const many = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-security', location: `f${i}.js:1`, claim: `finding ${i}` }))
@@ -758,7 +1230,22 @@ test('ledger-append: a real ledger line contains no personal identifier -- not t
   assert.equal(entry.repo, path.basename(repo), 'repo identity is a bare dir name, not an absolute path')
 })
 
-test('ledger-append: an absolute spec path UNDER the repo root is relativised (spec/plan_key), never rejected -- the RAW absolute form is retained separately, in spec_raw only (H2, AC-SEC-3, round 5 H-B)', () => {
+// Review round-1 L4 (also a spec bug: AC-SEC-1's headline sentence and its
+// enumerated test cases disagreed -- the headline forbids ANY absolute
+// path or account name in a ledger line; the five enumerated cases only
+// ever exercised plan_key/spec, which spec_raw is not). This test's
+// ORIGINAL assertion (spec_raw retains the caller's absolute form
+// VERBATIM) is exactly the leak: for an in-repo absolute spec on a real
+// checkout, that string is `/Volumes/.../repos/<repo>/specs/....md`,
+// carrying the local account name. Fixed by relativising spec_raw the
+// same lexical, root-matching way `spec` is -- WITHOUT the fuller
+// canonicalPlanKey pipeline's './'/'../'-collapsing step, so spec_raw is
+// never merely re-derived FROM the same canonicalisation it exists to
+// insure against (see the dedicated recoverability test below for the
+// non-vacuous proof of that). Out-of-repo specs are UNCHANGED: spec_raw is
+// still withheld entirely (AC-SEC-1 cases c/d), never merely relativised
+// against nothing.
+test('ledger-append: an absolute spec path UNDER the repo root is relativised (spec/plan_key), never rejected -- spec_raw is ALSO relativised (no leading "/", no absolute prefix, no account name), not retained verbatim (H2, AC-SEC-3, L4 -- supersedes the original round-5 H-B "verbatim" expectation)', () => {
   const repo = makeTempRepo()
   const absoluteSpec = path.join(repo, 'specs', 'optimise-cycle.md')
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec })
@@ -767,11 +1254,38 @@ test('ledger-append: an absolute spec path UNDER the repo root is relativised (s
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.spec, 'specs/optimise-cycle.md', 'spec must be relativised against the repo root')
   assert.equal(entry.plan_key, 'specs/optimise-cycle.md', 'plan_key must never be the absolute form either')
-  // Round 5 (H-B): spec_raw is the ONE field allowed to carry the caller's
-  // absolute form verbatim -- this is deliberate (AC-DATA-4 recoverability),
-  // not a regression of H2/AC-SEC-3, which govern spec/plan_key and the
-  // OUTPUT boundary (the reader never emits spec_raw -- see optimise-read.mjs).
-  assert.equal(entry.spec_raw, absoluteSpec, 'spec_raw must retain the caller\'s original absolute string verbatim')
+  assert.equal(entry.spec_raw, 'specs/optimise-cycle.md', 'spec_raw must ALSO be relativised against the repo root, never the caller\'s absolute string verbatim (L4)')
+  assert.ok(!entry.spec_raw.startsWith('/'), 'spec_raw must never carry a leading "/" for an in-repo absolute spec')
+  assert.notEqual(entry.spec_raw, absoluteSpec, 'spec_raw must not equal the absolute form the caller supplied')
+})
+
+// L4's own stated proof requirement: "an absolute in-repo spec asserting
+// no account name and no leading /", against a real checkout nested under
+// a home-like path (a literal "home" segment plus the real `whoami`
+// output) -- the same technique optimise-read.test.js's leak-freedom
+// fixtures already use, so this cannot pass by coincidence of this
+// machine's own TMPDIR shape.
+test('ledger-append: spec_raw for an absolute in-repo spec leaks neither the local account name nor any path segment above the repo root, on a real checkout nested under a home-like path (L4)', () => {
+  const whoami = sh('whoami', SUITE_TMPDIR).trim()
+  const homeLikeRoot = path.join(SUITE_TMPDIR, 'home', whoami, 'repo-' + Math.random().toString(36).slice(2))
+  fs.mkdirSync(homeLikeRoot, { recursive: true })
+  trackTempDir(path.join(SUITE_TMPDIR, 'home'))
+  sh('git init -q -b main', homeLikeRoot)
+  sh('git config user.email test@example.com', homeLikeRoot)
+  sh('git config user.name Test', homeLikeRoot)
+  fs.writeFileSync(path.join(homeLikeRoot, 'README.md'), 'seed\n')
+  sh('git add README.md && git commit -q -m seed', homeLikeRoot)
+  assert.ok(/\/home\//.test(homeLikeRoot) && homeLikeRoot.includes(whoami), 'sanity: the fixture root must genuinely be home-shaped')
+
+  const absoluteSpec = path.join(homeLikeRoot, 'specs', 'a.md')
+  const res = runAppend(homeLikeRoot, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const line = readLedgerLines(homeLikeRoot)[0]
+  assert.ok(!line.includes('/home/'), `spec_raw (or any field) must not leak /home/, got: ${line}`)
+  assert.ok(!line.includes(whoami), `spec_raw (or any field) must not leak the account name, got: ${line}`)
+  const entry = JSON.parse(line)
+  assert.equal(entry.spec_raw, 'specs/a.md')
 })
 
 test('ledger-append: a task string containing an embedded absolute path has that path relativised/redacted, never left absolute, in the line (H2, AC-SEC-3)', () => {
@@ -842,7 +1356,17 @@ test('ledger-append: an absolute path riding an element of lenses_run/lenses_ski
   assertNoAbsolutePaths(line, 'lenses_run/lenses_skipped with an embedded absolute path')
 })
 
-test('ledger-append: a hostile payload cannot smuggle a canary secret or an absolute path through trigger_counts, verdicts or rounds -- each is constrained to its declared value type/enum, so the write is rejected rather than writing the secret verbatim (H2 round 2, AC-SEC-3)', () => {
+// Round-5 H1 (§12 reframe) supersedes this test's ORIGINAL assertion
+// (write_ok:false, zero lines written) the same way round-4 superseded the
+// equivalent M6 "lens" test: refusing the WHOLE entry over one hostile
+// dict value was exactly the defect class H1 exists to close -- three
+// rounds of "sanitise the named fields" (ac_id, then lens/severity, then
+// this round's verdicts/ac_verdicts.verdict/lenses_run) proved an
+// allowlist can never catch every sibling. The general mechanism now
+// drops each OFFENDING KEY from its dict (there is no natural per-key raw
+// sibling the way ac_id_raw/lens_raw work for a fixed object shape), the
+// secret never reaches the ledger either way, and the record survives.
+test('ledger-append: a hostile payload cannot smuggle a canary secret or an absolute path through trigger_counts, verdicts or rounds -- each offending KEY is dropped from its dict and counted, the secret never reaches the ledger, and the record is WRITTEN (H2 round 2 superseded by round-5 H1)', () => {
   const repo = makeTempRepo()
   const canary = '/etc/shadow-canary-secret-XYZZY'
   const res = runAppend(repo, {
@@ -854,8 +1378,362 @@ test('ledger-append: a hostile payload cannot smuggle a canary secret or an abso
     rounds: { test_attempts: canary },
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.equal(out.write_ok, false, 'a value of the wrong declared type inside trigger_counts/verdicts/rounds must fail validation, not write the payload verbatim')
-  assert.equal(readLedgerLines(repo).length, 0, 'a rejected write must not append any line at all')
+  assert.equal(out.write_ok, true, `expected the write to succeed with the three hostile dict entries dropped, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- a malformed value must cost that value, never the line')
+  assert.ok(!lines[0].includes(canary), 'the canary secret must never reach the ledger, dropped or not')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.trigger_counts['lens-security'], undefined, 'the offending trigger_counts key must be dropped, not written with the wrong type')
+  assert.equal(entry.verdicts['lens-security'], undefined, 'the offending verdicts key must be dropped')
+  assert.equal(entry.rounds.test_attempts, undefined, 'the offending rounds key must be dropped')
+  assert.equal(entry.invalid_record_values_dropped, 3, 'all three drops must be counted under the general mechanism\'s own counter')
+})
+
+// Round-5 H1: reproduces the coordinator's own live-tip repro exactly.
+// `verdicts: {"lens-data": "CLEAN (with caveats)"}` -> write_ok:false,
+// nothing written. `ac_verdicts: [{ac_id:"AC-QA-1", verdict:"PARTIAL"}]`
+// -> write_ok:false, nothing written. This is the THIRD time this exact
+// defect class was found: round-2 M-3 (ac_id), round-4 M1 (lens/severity),
+// now verdicts/ac_verdicts.verdict/lenses_run -- the general mechanism
+// closes the CLASS, not just these three fields (see the table test
+// below).
+test('ledger-append: verdicts.<lens> outside the CLEAN/FINDINGS/BLOCKED enum is DROPPED from the dict, counted, and the record IS WRITTEN (round-5 H1, exact coordinator repro)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    verdicts: { 'lens-data': 'CLEAN (with caveats)' },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written -- a malformed field must cost that field, never the line')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.verdicts['lens-data'], undefined, 'the non-conforming verdicts entry must be dropped, not written with an out-of-enum value')
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+// Round-6 review L1/M1: degraded_raw.raw was redacted (round-5's own
+// fix), but degraded_raw.path was not -- and the caller-controlled
+// segment of a generic drop's path is exactly a DICT KEY (verdicts.
+// <lens-name>), which can itself be a hostile absolute path. M1: the
+// naive fix (running the shared redactPaths over the already-JOINED path
+// string) would still leak, because pathPartsToPrefix joins a dict key
+// onto its parent with a bare '.' ('verdicts./etc/shadow'), and
+// ABSOLUTE_PATH_RE only recognises an absolute path anchored at
+// start-of-string or after whitespace/quote/paren -- not after a plain
+// '.'. Fixed by redacting each pathPart SEGMENT independently (where a
+// hostile value starts at position 0 and always matches) before joining,
+// never by widening the shared regex (which this spec's own history
+// shows breaks ordinary relative paths when done carelessly).
+test('ledger-append: degraded_raw.path redacts a hostile absolute-path DICT KEY, not just degraded_raw.raw -- and does so even though the path is JOINED with a bare "." separator the shared redaction regex does not anchor on (round-6 L1/M1)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    // The VALUE must also be non-conforming, or nothing is dropped at all
+    // and there is no degraded_raw entry to check: dict KEYS are not
+    // schema-constrained by anything in this file (only dict VALUES are,
+    // since round-2 H2's own fix) -- a hostile key paired with a
+    // perfectly valid value reaches the ledger untouched regardless of
+    // this fix. That is a real, separate, PRE-EXISTING gap (latent since
+    // round 2, not introduced or closed here); recorded as a caveat, not
+    // fixed, since it was not what L1/M1 named and fixing it is a genuine
+    // scope decision (validate/redact dict KEYS themselves) beyond this
+    // round's ask.
+    verdicts: { '/Users/someoperator/.ssh/id_rsa': 'MAYBE' },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const lines = readLedgerLines(repo)
+  assert.ok(!lines[0].includes('someoperator'), `the account name must never reach the ledger via degraded_raw.path, got: ${lines[0]}`)
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.degraded_raw.length, 1)
+  assert.equal(entry.degraded_raw[0].path, 'verdicts.<redacted-path>', `the hostile dict-key segment must be redacted even though it is joined with a bare "." separator, got: ${entry.degraded_raw[0].path}`)
+})
+
+test('ledger-append: degraded_raw.path is bounded the same way degraded_raw.raw already is (round-6 L1, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const hostileKey = 'a'.repeat(200)
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', verdicts: { [hostileKey]: 'MAYBE' } })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.degraded_raw[0].path.length <= 32, `degraded_raw.path must be bounded, got length ${entry.degraded_raw[0].path.length}`)
+})
+
+test('ledger-append: ac_verdicts[].verdict outside PASS/FAIL/UNVERIFIABLE is NULLED with the original preserved in verdict_raw, and the record IS WRITTEN (round-5 H1, exact coordinator repro)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    run_id: 'm1t',
+    ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PARTIAL' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, 'the record must be written')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.ac_verdicts[0].ac_id, 'AC-QA-1', 'the ac_id itself must survive untouched')
+  assert.equal(entry.ac_verdicts[0].verdict, null, 'the non-conforming verdict must be nulled, not left in a shape that fails validation')
+  assert.equal(entry.ac_verdicts[0].verdict_raw, 'PARTIAL', 'the rejected value must be recoverable, mirroring ac_id_raw')
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+// These two drive degradeEntry DIRECTLY rather than through the real CLI.
+// Discovered while writing the end-to-end form: main()'s OWN pre-existing
+// free-text pass (relativiseAgainstRoot/redactPaths, applied to
+// lenses_run/lenses_skipped before this validator ever runs) calls
+// String(value) on every element, so a numeric element arrives at
+// collectErrors ALREADY coerced to "12345" -- the TYPE check can never
+// actually fire from a real payload for this specific field. Not
+// something this fix introduced or should paper over: recorded here, and
+// the direct-degradeEntry form still proves the mechanism itself handles
+// a genuinely wrong-typed element correctly, which the schema declares as
+// a possibility regardless of what upstream coercion happens to do today.
+test('ledger-append: a wrong-typed lenses_run[] element is dropped from the array (not the record), counted, and the rest of the array survives (round-5 H1)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ lenses_run: ['lens-security', 12345, 'lens-qa'] })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, true, `expected degradeEntry to succeed, got: ${JSON.stringify(result.errors)}`)
+  assert.deepEqual(entry.lenses_run, ['lens-security', 'lens-qa'], 'the bad element must be dropped, the rest of the array must survive in order')
+  assert.equal(entry.invalid_record_values_dropped, 1)
+})
+
+test('ledger-append: TWO wrong-typed elements in the SAME primitive array are both dropped correctly, without an index-shift bug (round-5 H1, not vacuous)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ lenses_run: ['a', 111, 'b', 222, 'c'] })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, true, `expected degradeEntry to succeed, got: ${JSON.stringify(result.errors)}`)
+  assert.deepEqual(entry.lenses_run, ['a', 'b', 'c'], 'both bad elements must be dropped, and dropping the earlier one must not shift which element the later drop removes')
+  assert.equal(entry.invalid_record_values_dropped, 2)
+})
+
+// ---- Round-5 H1: the malformed-value table. This is the guard against a
+// FOURTH recurrence -- a table naming only `verdict` (this round's own
+// repro field) would be the identical allowlist mistake in test form, one
+// level up. Drives degradeEntry DIRECTLY (not through the CLI) so every
+// value-typed shape the schema declares is covered, including fields no
+// real caller payload can reach today (spec/plan_key, always internally
+// overwritten by main() before this point) -- the point is proving the
+// MECHANISM covers the whole schema, not just what is reachable this
+// week. Every row here expects ok:true (the record degrades and writes);
+// the separate "boundary" and "structural" test groups below cover the
+// two ways a write can still legitimately be refused. ----
+
+function baseValidEntry(overrides = {}) {
+  return { schema_version: 2, run_id: 'r1', ts: '2026-01-01T00:00:00.000Z', repo: 'demo', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null, ...overrides }
+}
+
+const MALFORMED_VALUE_TABLE = [
+  {
+    name: 'verdicts.<lens> (dict, enum)',
+    mutate: (e) => { e.verdicts = { 'lens-security': 'MAYBE' } },
+    check: (e) => { assert.equal(e.verdicts['lens-security'], undefined) },
+  },
+  {
+    name: 'trigger_counts.<key> (dict, type integer)',
+    mutate: (e) => { e.trigger_counts = { 'lens-security': 'nope' } },
+    check: (e) => { assert.equal(e.trigger_counts['lens-security'], undefined) },
+  },
+  {
+    name: 'rounds.<key> (nullable dict, type integer)',
+    mutate: (e) => { e.rounds = { test_attempts: 'nope' } },
+    check: (e) => { assert.equal(e.rounds.test_attempts, undefined) },
+  },
+  {
+    name: 'findings[].lens (object-array item, pattern, sibling raw)',
+    mutate: (e) => { e.findings = [{ id: 'x', lens: 'bad-lens-name', severity: 'Low', ac_id: null, disposition: 'open' }] },
+    check: (e) => { assert.equal(e.findings[0].lens, null); assert.equal(e.findings[0].lens_raw, 'bad-lens-name') },
+    // Pre-existing dedicated counter (round-4 M1), not the general one --
+    // ac_id/lens/severity within findings kept their OWN counter names on
+    // purpose (see degradeEntry's own comment), so this row proves the
+    // reframe did not silently fold them into the new general counter.
+    expectCounter: 'invalid_finding_fields_dropped',
+  },
+  {
+    name: 'findings[].severity (object-array item, enum, sibling raw)',
+    mutate: (e) => { e.findings = [{ id: 'x', lens: 'lens-qa', severity: 'Urgent', ac_id: null, disposition: 'open' }] },
+    check: (e) => { assert.equal(e.findings[0].severity, null); assert.equal(e.findings[0].severity_raw, 'Urgent') },
+    expectCounter: 'invalid_finding_fields_dropped',
+  },
+  {
+    name: 'findings[].ac_id (object-array item, pattern, sibling raw)',
+    mutate: (e) => { e.findings = [{ id: 'x', lens: 'lens-qa', severity: 'Low', ac_id: 'none', disposition: 'open' }] },
+    check: (e) => { assert.equal(e.findings[0].ac_id, null); assert.equal(e.findings[0].ac_id_raw, 'none') },
+    expectCounter: 'invalid_ac_ids_dropped',
+  },
+  {
+    name: 'ac_verdicts[].ac_id (object-array item, pattern, sibling raw)',
+    mutate: (e) => { e.ac_verdicts = [{ ac_id: 'bad', verdict: 'PASS' }] },
+    check: (e) => { assert.equal(e.ac_verdicts[0].ac_id, null); assert.equal(e.ac_verdicts[0].ac_id_raw, 'bad') },
+    expectCounter: 'invalid_ac_ids_dropped',
+  },
+  {
+    name: 'ac_verdicts[].verdict (object-array item, enum, sibling raw -- round-5 H1\'s own repro field)',
+    mutate: (e) => { e.ac_verdicts = [{ ac_id: 'AC-QA-1', verdict: 'PARTIAL' }] },
+    check: (e) => { assert.equal(e.ac_verdicts[0].verdict, null); assert.equal(e.ac_verdicts[0].verdict_raw, 'PARTIAL') },
+  },
+  {
+    name: 'lenses_run[i] (primitive array item, type string)',
+    mutate: (e) => { e.lenses_run = ['ok', 999] },
+    check: (e) => { assert.deepEqual(e.lenses_run, ['ok']) },
+  },
+  {
+    name: 'lenses_skipped[i] (primitive array item, type string)',
+    mutate: (e) => { e.lenses_skipped = ['ok', 999] },
+    check: (e) => { assert.deepEqual(e.lenses_skipped, ['ok']) },
+  },
+  {
+    name: 'task (nullable top-level scalar, no enum/pattern)',
+    mutate: (e) => { e.task = 42 },
+    check: (e) => { assert.equal('task' in e, false) },
+  },
+  {
+    name: 'round_key (nullable top-level scalar)',
+    mutate: (e) => { e.round_key = 42 },
+    check: (e) => { assert.equal('round_key' in e, false) },
+  },
+  {
+    name: 'event (nullable top-level scalar)',
+    mutate: (e) => { e.event = 42 },
+    check: (e) => { assert.equal('event' in e, false) },
+  },
+  {
+    name: 'event_key on a kind that does NOT require it (type mismatch only)',
+    mutate: (e) => { e.event_key = 42 },
+    check: (e) => { assert.equal('event_key' in e, false) },
+  },
+  {
+    name: 'degraded (nullable boolean)',
+    mutate: (e) => { e.degraded = 'yes' },
+    check: (e) => { assert.equal('degraded' in e, false) },
+  },
+  {
+    name: 'budget_spent (nullable number)',
+    mutate: (e) => { e.budget_spent = 'lots' },
+    check: (e) => { assert.equal('budget_spent' in e, false) },
+  },
+  {
+    name: 'spec (nullable string) -- defensive: pre-processed before this point in the real write path, tested here so the SCHEMA-driven mechanism covers it regardless of reachability',
+    mutate: (e) => { e.spec = 42 },
+    check: (e) => { assert.equal('spec' in e, false) },
+  },
+  {
+    name: 'plan_key (nullable string) -- defensive, same reason as spec',
+    mutate: (e) => { e.plan_key = 42 },
+    check: (e) => { assert.equal('plan_key' in e, false) },
+  },
+  {
+    // The remaining ['integer','null']-typed counters (spec_bug_count,
+    // rejected_finding_count, findings_truncated, invalid_ac_ids_dropped,
+    // invalid_finding_fields_dropped, invalid_record_values_dropped) share
+    // this EXACT constraint shape and are always internally overwritten by
+    // main() before a caller value could reach them -- one representative
+    // is deliberate scoping (round-2's own L-8 precedent: "not a
+    // repo-wide rename, out of proportion"), not an oversight; the
+    // mechanism itself is per-shape, not per-field-name, so this one row
+    // stands for all six.
+    name: 'findings_truncated (nullable integer) -- representative of every ["integer","null"] counter field',
+    mutate: (e) => { e.findings_truncated = 'lots' },
+    check: (e) => { assert.equal('findings_truncated' in e, false) },
+  },
+]
+
+for (const row of MALFORMED_VALUE_TABLE) {
+  test(`ledger-append: malformed-value table -- ${row.name} is neutralised and counted, the record IS WRITTEN, never refused (round-5 H1)`, async () => {
+    const { degradeEntry } = await import(APPEND_MODULE_URL)
+    const entry = baseValidEntry()
+    row.mutate(entry)
+    const result = degradeEntry(entry)
+    assert.equal(result.ok, true, `expected degradeEntry to succeed for ${row.name}, got errors: ${JSON.stringify(result.errors)}`)
+    row.check(entry)
+    // Every neutralisation must be counted under EXACTLY one of the three
+    // counters -- never left invisible, never double-counted across two.
+    // ac_id (either array) and findings[].lens/severity route to their
+    // own dedicated pre-existing counters (invalid_ac_ids_dropped /
+    // invalid_finding_fields_dropped); everything else routes to the
+    // general mechanism's own counter. Each row asserts its OWN expected
+    // counter via row.expectCounter, defaulting to the general one.
+    const counterField = row.expectCounter || 'invalid_record_values_dropped'
+    assert.equal(entry[counterField], 1, `expected exactly one neutralisation counted under ${counterField} for ${row.name}, entry: ${JSON.stringify(entry)}`)
+  })
+}
+
+// ---- Round-5 H1: the boundary group. A value error on a field that is
+// ALSO (conditionally) required is neutralised by DELETION like any other
+// generic field, but deletion then correctly resurfaces as a
+// required-property-missing error on re-validation -- genuinely
+// structural, so the write is refused. This is the self-limiting
+// behaviour the coordinator's spec names explicitly ("Only if the record
+// still fails on something STRUCTURAL... may the write be refused"), not
+// a special-cased exclusion list of "never touch these fields". ----
+
+test('ledger-append: a malformed `kind` (unconditionally required) is neutralised by deletion, which then correctly fails as required-missing on re-validation -- the write IS refused, for the right reason (round-5 H1 boundary)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ kind: 'not-a-real-kind' })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /kind: required property missing/.test(e)), `expected the FINAL refusal reason to name kind as missing (post-deletion), got: ${JSON.stringify(result.errors)}`)
+})
+
+test('ledger-append: a malformed `outcome` on a kind that REQUIRES it (review_cycle) is neutralised by deletion, which then correctly fails as required-missing -- the write IS refused (round-5 H1 boundary)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ kind: 'review_cycle', outcome: 'not-a-real-outcome' })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /outcome: required when/.test(e)), `got: ${JSON.stringify(result.errors)}`)
+})
+
+test('ledger-append: the SAME malformed `outcome` on a kind that does NOT require it (conduct_plan_event) is neutralised cleanly and the write SUCCEEDS -- proves the mechanism is schema-driven, not hardcoded per field name (round-5 H1 boundary, not vacuous)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ kind: 'conduct_plan_event', outcome: 'not-a-real-outcome', event_key: 'specs/a.md:T1:ci_wait_started:1' })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, true, `expected the write to succeed, got: ${JSON.stringify(result.errors)}`)
+  assert.equal('outcome' in entry, false, 'outcome must have been deleted, not left in an invalid shape')
+})
+
+test('ledger-append: a malformed `event_key` on conduct_plan_event (which REQUIRES it) is neutralised by deletion, which then correctly fails as required-when-missing -- the write IS refused (round-5 H1 boundary)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ kind: 'conduct_plan_event' })
+  delete entry.outcome
+  entry.event_key = 42
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /event_key: required when/.test(e)), `got: ${JSON.stringify(result.errors)}`)
+})
+
+// ---- Round-5 H1: the structural group. These fail BEFORE any
+// neutralisation is even attempted -- the FINDING-1/M-2 precedent,
+// unchanged by this reframe, and matching main's own behaviour. ----
+
+test('ledger-append: a genuinely missing required field (schema_version absent from the start) is refused outright, no degrade attempted (round-5 H1, structural precedent unchanged)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry()
+  delete entry.schema_version
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /schema_version: required property missing/.test(e)))
+})
+
+test('ledger-append: an unknown top-level property is refused outright, no degrade attempted (round-5 H1, structural precedent unchanged, AC-SEC-2)', async () => {
+  const { degradeEntry } = await import(APPEND_MODULE_URL)
+  const entry = baseValidEntry({ evidence: 'a secret quoted source line' })
+  const result = degradeEntry(entry)
+  assert.equal(result.ok, false)
+  assert.ok(result.errors.some((e) => /evidence: not an allowed property/.test(e)))
+})
+
+test('ledger-append: findings:[null] (a non-object array element) is refused outright, no degrade attempted (round-5 H1, FINDING-1/M-2 precedent unchanged)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', findings: [null] })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a null array element has no field to neutralise -- must still refuse, matching main')
+  assert.equal(readLedgerLines(repo).length, 0)
 })
 
 test('ledger-append: an origin remote that is a bare local filesystem path (not a recognised host form) is never used as repo identity -- it falls back to the toplevel basename instead (H2 round 2, AC-SEC-3)', () => {
@@ -939,6 +1817,47 @@ test('ledger-append: a real empty array of spec_bugs/rejected_findings yields a 
   assert.equal(entry.rejected_finding_count, 0)
 })
 
+// Coordinator FINDING 1 (confirmed pre-existing on BOTH main and this
+// branch's tip, from a non-symlinked path -- verified directly via `git
+// show main:workflows/lib/ledger-append.mjs`, not inferred): a null element
+// in open_findings/spec_bugs/rejected_findings crashed computeFindings()
+// with an unhandled TypeError (f.lens on null) BEFORE validateEntry ever
+// ran -- Node exits non-zero, nothing written, not even a parseable
+// write_ok:false. Different code path from the M-2 findings/ac_verdicts
+// sanitiser (which already degrades cleanly): those arrays are consumed
+// AFTER computeFindings has already built entry.findings. Fixed by
+// null-guarding inside computeFindings's map, consistent with M-2's own
+// pattern: a malformed element becomes `null` in the entries array instead
+// of crashing, which flows through to entry.findings and is caught by
+// validateEntry's existing findings.items.type:'object' check -- the SAME
+// clean write_ok:false degrade, applied once so all three descriptor
+// arrays (they share this one function) get it consistently rather than
+// three separate special cases.
+for (const field of ['open_findings', 'spec_bugs', 'rejected_findings']) {
+  test(`ledger-append: a null element in ${field} degrades to a clean write_ok:false, never crashes the writer (FINDING 1)`, () => {
+    const repo = makeTempRepo()
+    const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', [field]: [null] })
+    assert.equal(res.status, 0, `${field}: the writer must always exit 0, even on a malformed descriptor array; got status ${res.status}, stderr: ${res.stderr}`)
+    assert.ok(res.stdout.trim().length > 0, `${field}: expected one line of JSON on stdout, got empty output (stderr: ${res.stderr})`)
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, false, `${field}: a null descriptor element must degrade to write_ok:false, not crash silently or succeed with garbage`)
+    assert.equal(readLedgerLines(repo).length, 0, `${field}: a rejected write must not leave a partial or malformed line on disk`)
+  })
+}
+
+test('ledger-append: a null element alongside otherwise-valid descriptors in open_findings still degrades the WHOLE entry to write_ok:false, never silently drops just the bad one and keeps the rest (FINDING 1, consistency with M-2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'a real one' }, null],
+  })
+  assert.equal(res.status, 0)
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a mix of one valid and one null descriptor must still reject the whole entry, matching the M-2 findings/ac_verdicts precedent')
+})
+
 test('ledger-append: finding ids are stable across two separate invocations with identical descriptors (AC-QA-11)', () => {
   const repoA = makeTempRepo()
   const repoB = makeTempRepo()
@@ -1000,6 +1919,58 @@ test('ledger-append module: importing it for its exports does not itself write a
   const before = readLedgerLines(repo).length
   await import(APPEND_MODULE_URL)
   assert.equal(readLedgerLines(repo).length, before, 'import must not run main() as a side effect')
+})
+
+// Coordinator FINDING 2: fixed by comparing REALPATHS of import.meta.url
+// and process.argv[1] (Node's ESM loader resolves the former through
+// symlinks; the latter needs an explicit realpath to match). Must not
+// weaken the property the two tests above already prove -- asserted here
+// directly, in a genuinely FRESH subprocess (so a bug in the fix cannot
+// be masked by this test file's own argv[1], which is node's test runner,
+// never ledger-append.mjs, in every scenario above): a plain ESM `import`
+// of the module, with no CLI invocation at all, must produce NO stdout
+// (main()'s JSON line) and must exit 0 without writing anything.
+test('ledger-append module: a fresh subprocess that ONLY imports the module (never invokes it as `node ledger-append.mjs`) prints nothing and writes nothing -- the realpath fix for FINDING 2 must not make import() itself look like a CLI invocation', () => {
+  const repo = makeTempRepo()
+  const probeDir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'import-probe-'))
+  trackTempDir(probeDir)
+  const probeScript = path.join(probeDir, 'probe.mjs')
+  fs.writeFileSync(
+    probeScript,
+    `import(${JSON.stringify(APPEND_MODULE_URL)}).then((mod) => {\n` +
+      `  if (typeof mod.main !== 'function') { console.error('main export missing'); process.exit(2) }\n` +
+      `  console.log('IMPORT_SURVIVED_NO_CLI')\n` +
+      `})\n`
+  )
+  const res = spawnSync('node', [probeScript], { cwd: repo, encoding: 'utf8' })
+  assert.equal(res.status, 0, `probe subprocess must exit 0, got status ${res.status}, stderr: ${res.stderr}`)
+  assert.equal(res.stdout.trim(), 'IMPORT_SURVIVED_NO_CLI', `import must not have printed a ledger JSON line as a side effect, got: ${res.stdout}`)
+  assert.equal(readLedgerLines(repo).length, 0, 'a plain import must never write a ledger line')
+})
+
+// Coordinator FINDING 2 (confirmed pre-existing on main too, from a
+// non-symlinked control -- the same identical file, same payload, wrote
+// write_ok:true from a real path and silently no-op'd through a symlinked
+// one): `import.meta.url` resolves symlinks (Node's ESM loader always
+// reports the REAL target path); `process.argv[1]` does not, without an
+// explicit realpath call. `isMain` compared them directly, so invoking
+// `node <symlinked-path-to-ledger-append.mjs> append` made `isMain` read
+// false: exit 0, zero bytes of output, no file written, no error --
+// success-shaped silence. This is exactly the C1 failure class (silent
+// total loss) and is live on main today: `~/.claude/workflows/lib/...`
+// sits behind macOS's /tmp -> /private/tmp and $TMPDIR's
+// /var/folders -> /private/var/folders ancestry, so any symlinked home,
+// volume or install ancestor disables ALL ledger writing with no signal.
+test('ledger-append: invoking the writer through a SYMLINKED path to the script itself still performs a real write and reports write_ok:true (FINDING 2)', () => {
+  const repo = makeTempRepo()
+  const symlinkedScript = makeSymlinkedScriptInvocation()
+  const res = spawnSync('node', [symlinkedScript], { cwd: repo, input: JSON.stringify({ schema_version: 1, kind: 'review_cycle', outcome: 'done' }), encoding: 'utf8' })
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}, stderr: ${res.stderr}`)
+  assert.ok(res.stdout.trim().length > 0, `expected one line of JSON on stdout through the symlinked invocation, got EMPTY output -- this is the silent no-op FINDING 2 describes (stderr: ${res.stderr})`)
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected a real write through the symlinked path, got: ${JSON.stringify(out)}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1, `expected exactly one real ledger line written through the symlinked invocation, got ${lines.length}`)
 })
 
 test('ledger-append module: findingId is stable for the same lens+location+claim', async () => {
@@ -1064,11 +2035,25 @@ test('ledger-append module: LEDGER_ENTRY_SCHEMA never declares an "evidence", "l
   assert.ok(!props.includes('report'))
 })
 
-test('ledger-append module: findings schema entries only carry lens, severity, ac id and disposition (AC-SEC-2)', async () => {
+// Review round-2 M-3: ac_id_raw added (bounded, AC-DATA-4-style
+// recoverability for a rejected ac_id) -- still no evidence/location/claim
+// field, the AC-SEC-2 exclusion this test guards is unaffected.
+// M1 (round 4 remainder): lens_raw/severity_raw added, same pattern, for
+// the same recoverability reason -- see the M1 tests above.
+test('ledger-append module: findings schema entries only carry lens (plus its bounded raw form), severity (plus its bounded raw form), ac id (plus its bounded raw form), and disposition (AC-SEC-2, M-3, M1)', async () => {
   const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
   const findingProps = Object.keys(LEDGER_ENTRY_SCHEMA.properties.findings.items.properties)
-  assert.deepEqual(findingProps.sort(), ['ac_id', 'disposition', 'id', 'lens', 'severity'])
+  assert.deepEqual(findingProps.sort(), ['ac_id', 'ac_id_raw', 'disposition', 'id', 'lens', 'lens_raw', 'severity', 'severity_raw'])
   assert.equal(LEDGER_ENTRY_SCHEMA.properties.findings.items.additionalProperties, false)
+})
+
+// M1: lens and severity are now nullable, mirroring ac_id -- a rejected
+// value is retained via *_raw, never dropping the whole finding.
+test('ledger-append module: LEDGER_ENTRY_SCHEMA declares findings.lens and findings.severity as nullable (M1, mirrors ac_id)', async () => {
+  const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
+  const props = LEDGER_ENTRY_SCHEMA.properties.findings.items.properties
+  assert.deepEqual(props.lens.type.slice().sort(), ['null', 'string'])
+  assert.deepEqual(props.severity.type.slice().sort(), ['null', 'string'])
 })
 
 // L4: outcome must not be unconditionally required -- it is not a
@@ -1087,14 +2072,22 @@ test('ledger-append module: outcome is required only for tdd_task/review_cycle/p
 // "which ACs never fail" had no data source. ac_verdicts carries {ac_id,
 // verdict} pairs ONLY (AC-SEC-2: no evidence text), same exclusion
 // discipline as `findings`.
-test('ledger-append module: LEDGER_ENTRY_SCHEMA declares ac_verdicts as a bounded array of {ac_id, verdict} pairs only, no evidence (H4, AC-SEC-2)', async () => {
+// Review round-2 M-3: ac_id_raw added (bounded recoverability for a
+// rejected ac_id, AC-DATA-4's pattern) -- still no evidence field, and
+// ac_id is now nullable (a rejected id is retained via ac_id_raw, never
+// dropping the whole {ac_id, verdict} pair).
+// Round-5 H1: verdict_raw added, same pattern -- verdict is now nullable
+// too (see the H1 tests below).
+test('ledger-append module: LEDGER_ENTRY_SCHEMA declares ac_verdicts as a bounded array of {ac_id, ac_id_raw, verdict, verdict_raw} entries only, no evidence, with ac_id and verdict both nullable (H4, AC-SEC-2, M-3, H1)', async () => {
   const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
   const acVerdictsSchema = LEDGER_ENTRY_SCHEMA.properties.ac_verdicts
   assert.ok(acVerdictsSchema, 'expected an ac_verdicts property on the schema')
   assert.equal(acVerdictsSchema.type, 'array')
   const itemProps = Object.keys(acVerdictsSchema.items.properties)
-  assert.deepEqual(itemProps.sort(), ['ac_id', 'verdict'], 'ac_verdicts items must carry only ac_id and verdict, never evidence')
+  assert.deepEqual(itemProps.sort(), ['ac_id', 'ac_id_raw', 'verdict', 'verdict_raw'], 'ac_verdicts items must carry only ac_id/ac_id_raw/verdict/verdict_raw, never evidence')
   assert.equal(acVerdictsSchema.items.additionalProperties, false)
+  assert.deepEqual(acVerdictsSchema.items.properties.ac_id.type.sort(), ['null', 'string'], 'ac_id must be nullable so a rejected value is retained, not dropped (M-3)')
+  assert.deepEqual(acVerdictsSchema.items.properties.verdict.type.sort(), ['null', 'string'], 'verdict must be nullable so a rejected value is retained, not dropped (H1)')
   assert.deepEqual(acVerdictsSchema.items.properties.verdict.enum.sort(), ['FAIL', 'PASS', 'UNVERIFIABLE'])
 })
 
@@ -1116,6 +2109,35 @@ test('ledger-append: ac_verdicts pairs survive to the written line verbatim (H4)
     { ac_id: 'AC-SEC-3', verdict: 'FAIL' },
     { ac_id: 'AC-QA-9', verdict: 'PASS' },
   ])
+})
+
+// Round-6 review M2: ac_verdicts was bounded at MAX_AC_VERDICTS with no
+// counter recording how many were dropped, unlike findings/
+// findings_truncated -- a surplus of AC verdicts silently vanished with
+// nothing on the line saying so.
+test('ledger-append: ac_verdicts_truncated is a real, measured count when more than MAX_AC_VERDICTS entries are supplied (round-6 M2)', () => {
+  const repo = makeTempRepo()
+  const acVerdicts = Array.from({ length: 205 }, (_, i) => ({ ac_id: `AC-QA-${i + 1}`, verdict: 'PASS' }))
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', ac_verdicts: acVerdicts })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts.length, 200, 'the bound itself is unchanged')
+  assert.equal(entry.ac_verdicts_truncated, 5, 'the surplus must be counted, not silently dropped')
+})
+
+test('ledger-append: ac_verdicts_truncated is a real zero (not null) when ac_verdicts was supplied and nothing was dropped (round-6 M2, not vacuous)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PASS' }] })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts_truncated, 0)
+})
+
+test('ledger-append: ac_verdicts_truncated is absent/null when ac_verdicts was not supplied at all (round-6 M2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(entry.ac_verdicts_truncated === null || entry.ac_verdicts_truncated === undefined)
 })
 
 test('ledger-append: an ac_verdicts entry carrying an "evidence" key is rejected outright, not silently stripped (H4, AC-SEC-2)', () => {
@@ -1169,30 +2191,86 @@ test('ledger-append: open, spec_bug and rejected findings all coexist in the sam
   assert.ok(byDisposition.open && byDisposition.spec_bug && byDisposition.rejected)
 })
 
-test('ledger-append: a finding\'s "lens" field is constrained to the roster pattern, so routing a secret through it is rejected rather than written verbatim (M6)', () => {
+// M1 supersedes this M6 test's ORIGINAL zero-tolerance assertion
+// (write_ok:false, zero lines written) the same way round-2 M-3 superseded
+// it for ac_id (see that superseding test's own comment, immediately
+// below): rejecting the whole entry over one bad lens value is exactly the
+// defect M1 fixes -- it destroyed the run's outcome/verdicts/findings/
+// budget over one free-text field. The secret-exfiltration guarantee M6
+// actually cares about (never write the secret verbatim) is preserved by
+// lens_raw's bound, not by refusing the write.
+test('ledger-append: a finding\'s "lens" field is constrained to the roster pattern -- a secret routed through it is NULLED, the finding survives, and lens_raw retains only a BOUNDED prefix that excludes the actual secret-shaped payload (M1 supersedes M6\'s zero-tolerance verbatim claim with a considered, bounded one, mirroring ac_id\'s M-3 treatment)', () => {
   const repo = makeTempRepo()
+  const hostileLens = 'not a real lens, just filler prose to push the secret past the bound sk-live-CANARY-9999'
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: 'secret sk-live-CANARY-9999 seen at ... process.env.API_KEY', location: 'x', claim: 'y' }],
+    spec_bugs: [{ lens: hostileLens, location: 'x', claim: 'y' }],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.equal(out.write_ok, false, 'a lens field that is not a real roster identifier must be rejected, not written')
-  assert.equal(readLedgerLines(repo).length, 0)
+  assert.equal(out.write_ok, true, `expected the write to succeed with the hostile lens sanitised, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1)
+  assert.ok(!lines[0].includes('sk-live-CANARY-9999'), 'the actual secret-shaped payload must never reach the ledger, bounded or not')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.findings[0].lens, null)
+  assert.ok(entry.findings[0].lens_raw.length <= 32, `lens_raw must be bounded, got length ${entry.findings[0].lens_raw.length}`)
+  assert.equal(entry.findings[0].claim, undefined, 'sanity: claim was never a declared field to begin with (AC-SEC-2 evidence exclusion, unrelated to this fix)')
+  assert.equal(entry.invalid_finding_fields_dropped, 1)
 })
 
-test('ledger-append: a finding\'s "ac_id" field is constrained to the AC-<LENS>-<n> pattern, so a quoted source line routed through it is rejected rather than written verbatim (M6)', () => {
+// Review round-1 M3, corrected by round-2 M-3: the ORIGINAL M6 assertion
+// (write_ok:false, zero lines written) was exactly the defect that
+// destroyed a whole record's telemetry over one bad ac_id (round-1 M3,
+// fixed). Round-1's own fix then NULLED the value with no retention,
+// which round-2 M-3 identified as a DIFFERENT defect: a dropped ac_id is
+// permanently unrecoverable, unlike spec_raw's insurance for spec. Round-2
+// retains a BOUNDED raw copy (ac_id_raw, 32 bytes) for exactly this reason
+// -- but ac_id was deliberately kept free of ANY free text (AC-SEC-2,
+// "no free text, ever") specifically to prevent secret/source-line
+// smuggling through this field, which is what M6 tests. These two
+// requirements are in real tension: any bound long enough to recover a
+// realistic citation ("optimise-cycle:AC-SEC-1", 23 bytes) is long enough
+// to retain SOME prefix of a longer hostile string. The 32-byte bound is
+// chosen so realistic citation forms survive whole while the ACTUAL
+// secret-shaped payload in this hostile fixture (deliberately placed at
+// the end of the string, the realistic position for an injection payload
+// following descriptive prose) is cut off before it is reached -- proven
+// below, not assumed. This is a considered, bounded exposure, not the
+// zero-tolerance guarantee the original M6 test claimed; recorded as such
+// in docs/harn-opt-2-mutation-proofs.md.
+test('ledger-append: a finding\'s "ac_id" field is constrained to the AC-<LENS>-<n> pattern -- a quoted source line routed through it is NULLED, the finding survives, and ac_id_raw retains only a BOUNDED prefix that excludes the actual secret-shaped payload (M-3 supersedes M6\'s zero-tolerance verbatim claim with a considered, bounded one)', () => {
+  const repo = makeTempRepo()
+  const hostileAcId = 'AC-X-1 quoted source: const key = 0xdeadbeef'
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec_bugs: [{ lens: 'lens-qa', location: 'x', claim: 'y', ac_id: hostileAcId }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, `expected the write to succeed with the hostile ac_id sanitized, got: ${out.write_error}`)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 1)
+  assert.ok(!lines[0].includes('0xdeadbeef'), 'the actual secret-shaped payload must never reach the ledger, bounded or not')
+  const entry = JSON.parse(lines[0])
+  assert.equal(entry.findings[0].ac_id, null)
+  assert.ok(entry.findings[0].ac_id_raw.length <= 32, `ac_id_raw must be bounded, got length ${entry.findings[0].ac_id_raw.length}`)
+  assert.equal(entry.findings[0].claim, undefined, 'sanity: claim was never a declared field to begin with (AC-SEC-2 evidence exclusion, unrelated to this fix)')
+  assert.equal(entry.invalid_ac_ids_dropped, 1)
+})
+
+test('ledger-append: ac_id_raw preserves a realistic short citation form WHOLE (not visibly truncated) -- the 32-byte bound must not defeat the recoverability M-3 exists to provide for the common case (not vacuous)', () => {
   const repo = makeTempRepo()
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: 'lens-qa', location: 'x', claim: 'y', ac_id: 'AC-X-1 quoted source: const key = 0xdeadbeef' }],
+    ac_verdicts: [{ ac_id: 'optimise-cycle:AC-SEC-1', verdict: 'PASS' }],
   })
-  const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.equal(out.write_ok, false, 'an ac_id field that is not a real AC-<LENS>-<n> identifier must be rejected, not written')
-  assert.equal(readLedgerLines(repo).length, 0)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.ac_verdicts[0].ac_id_raw, 'optimise-cycle:AC-SEC-1', 'a realistic cross-spec citation must survive whole, not cut short')
 })
 
 test('ledger-append: a genuine lens name and a genuine AC id both pass through normally (M6, not vacuous)', () => {
@@ -1634,10 +2712,12 @@ test('ledger-append: an absolute spec path authored INSIDE a worktree is recorde
     assert.equal(entry.spec, 'specs/a.md', 'must relativise against the WORKTREE\'s own root, not fall back to the redaction placeholder just because it is not under the main checkout root')
     assert.notEqual(entry.spec, '<redacted-path>', 'must never be the redaction placeholder for a path genuinely inside the current working tree')
     assert.equal(entry.plan_key, 'specs/a.md')
-    // Round 5 (H-B): spec_raw retains the worktree-absolute form verbatim,
-    // deliberately (AC-DATA-4) -- spec/plan_key staying relative is what
-    // H2/AC-SEC-3 actually require.
-    assert.equal(entry.spec_raw, absoluteSpecInWorktree)
+    // L4: spec_raw is ALSO relativised against the worktree's own root --
+    // the original round-5 H-B expectation (verbatim absolute retention)
+    // is exactly the leak L4 fixes; see the dedicated L4 test for the
+    // full non-vacuous proof.
+    assert.equal(entry.spec_raw, 'specs/a.md')
+    assert.ok(!entry.spec_raw.startsWith('/'))
 
     // The SAME plan, run from the main checkout with an equivalent relative
     // spec, must land under the identical plan_key -- proving the split is
@@ -1922,6 +3002,57 @@ test('ledger-append (round 5, H-B, AC-DATA-4): plan_key is independently re-deri
   assert.equal(canonicalPlanKey(entry.spec_raw, repo), expectedCanonical, 'a canonicaliser defect must be correctable by re-running canonicalPlanKey against the RETAINED RAW field alone -- checked against the SAME hardcoded literal, not against entry.plan_key')
 })
 
+// L4's companion case: the SAME recoverability-insurance property, but for
+// an ABSOLUTE in-repo spec -- proving the L4 fix (relativise spec_raw)
+// does not collapse it back into "just re-derived from plan_key" (which
+// would silently reintroduce H-B's original vacuous-recoverability
+// defect, this time via the relativisation step instead of the
+// truncation step). spec_raw must still differ from plan_key here: only
+// the absolute PREFIX is stripped, the awkward "../" survives untouched.
+test('ledger-append (L4): spec_raw for an ABSOLUTE in-repo spec is relativised but NOT fully canonicalised -- it still differs from plan_key when the raw form has something to collapse, so recoverability insurance survives the L4 fix (not vacuous)', async () => {
+  const repo = makeTempRepo()
+  // Plain string concatenation, NOT path.join -- path.join would silently
+  // normalise away the "../" before it ever reached the writer, defeating
+  // the whole point of this fixture.
+  const absoluteRawSpec = repo + '/specs/../Specs/Awkward.md'
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteRawSpec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  const expectedRelativised = 'specs/../Specs/Awkward.md'
+  const expectedCanonical = 'Specs/Awkward.md'
+  assert.equal(entry.spec_raw, expectedRelativised, 'spec_raw must be relativised (root prefix stripped) but NOT "../"-collapsed')
+  assert.ok(!entry.spec_raw.startsWith('/'), 'spec_raw must never carry the absolute prefix')
+  assert.equal(entry.plan_key, expectedCanonical)
+  assert.notEqual(entry.spec_raw, entry.plan_key, 'spec_raw must still differ from plan_key -- the L4 relativisation fix must not ALSO fully canonicalise it, or a canonicaliser defect in the "../"-collapsing step becomes unrecoverable again')
+  const { canonicalPlanKey } = await import(APPEND_MODULE_URL)
+  assert.equal(canonicalPlanKey(entry.spec_raw, repo), expectedCanonical, 'a canonicaliser defect must still be correctable by re-running canonicalPlanKey against the retained (now-relativised) raw field')
+})
+
+// Review round-2 L-3: the L4 fix's fallback (`matchedRoot !== undefined ? ...
+// : specRawInput`) fell OPEN -- if the root-matching in main() ever
+// diverges from canonicalPlanKey's own matching (a candidate root added,
+// trimmed or filtered in only one of the two places), the else branch
+// writes the CALLER'S ABSOLUTE PATH VERBATIM into spec_raw, reopening the
+// exact account-name leak L4 just closed, through a side door. The branch
+// is PROVABLY UNREACHABLE today (confirmed by the review): this code path
+// only runs when canonicalPlanKey already matched the identical string
+// against the identical candidate list, so the two matching computations
+// cannot currently disagree -- there is no live payload that exercises the
+// fixed branch through the normal write path. Guarded here as a static
+// assertion on the source text itself (the same technique this suite
+// already uses for provably-dead defensive code elsewhere), so a future
+// edit that reintroduces the fail-OPEN default is caught even though no
+// behavioural fixture can reach it.
+test('ledger-append (L-3): the spec_raw root-match fallback fails CLOSED (withholds the value) rather than falling open to the verbatim absolute string, guarding against a future divergence between this matching logic and canonicalPlanKey\'s own', () => {
+  const source = fs.readFileSync(APPEND_SCRIPT, 'utf8')
+  const lines = source.split('\n')
+  const target = lines.find((l) => l.includes('payload.spec_raw = matchedRoot !== undefined ?'))
+  assert.ok(target, 'expected to find the spec_raw root-match fallback line')
+  assert.ok(!/:\s*specRawInput\s*$/.test(target.trim()), `the fallback must NEVER be the verbatim absolute string; found: ${target.trim()}`)
+  assert.ok(/:\s*undefined\s*$/.test(target.trim()), `the fallback must fail closed (undefined), found: ${target.trim()}`)
+})
+
 test('ledger-append: a genuinely well-formed repo-relative spec is unaffected -- plan_key equals the spec as-is, and it is not the out-of-repo marker (not vacuous)', () => {
   const repo = makeTempRepo()
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/ordinary.md' })
@@ -2031,6 +3162,55 @@ test('ledger-append: all nine of AC-QA-3\'s hostile spec inputs, driven through 
   const lines = readLedgerLines(repo)
   assert.ok(lines.length >= 1, 'at least the string-shaped hostile inputs must have written successfully')
   for (const line of lines) assert.doesNotThrow(() => JSON.parse(line), `every written line must be valid JSON: ${line}`)
+})
+
+// ---- Review round-2 M-2: the round-1 M3 ac_id sanitiser (moved AHEAD of
+// validateEntry) removed the type check validateEntry used to provide for
+// free, so a null ELEMENT inside findings/ac_verdicts crashed the script
+// (TypeError reading .ac_id of null) instead of degrading to the clean
+// write_ok:false main() already produced for this exact input. This is
+// AC-QA-3's own hostile-input spirit ("Feeding ledger-append.mjs... never
+// an unhandled exception, never a crash") applied to array ELEMENTS, which
+// the spec's own scope only ever covered for `spec` values -- confirmed as
+// a spec bug by the review. A crash here means writeLedger's own agent
+// step gets no parseable result and falls into its failure branch,
+// manufacturing exactly the orphan class this PR exists to eliminate. ----
+
+// `findings`/`ac_verdicts` supplied DIRECTLY (the already-computed shape,
+// as the review's own reproduction used), not via spec_bugs/rejected_
+// findings/open_findings -- those raw-input fields route through
+// computeFindings() first, which has its OWN, separate, PRE-EXISTING
+// null-element crash on `main` too (confirmed: `open_findings:[null]`
+// throws identically on both trees at computeFindings' `f.lens` access).
+// That is a real bug, but not a regression this PR introduced and not
+// something the review flagged -- out of scope for this round, noted for
+// the coordinator rather than silently fixed.
+test('ledger-append: a null element in findings or ac_verdicts degrades to a clean write_ok:false (matching main\'s pre-existing behaviour for this exact input), never a script crash (M-2, regression against main introduced by round-1 M3)', () => {
+  const repo = makeTempRepo()
+  const cases = [
+    { name: 'findings:[null]', payload: { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', findings: [null] } },
+    { name: 'ac_verdicts:[null]', payload: { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', ac_verdicts: [null] } },
+  ]
+  for (const c of cases) {
+    const res = runAppend(repo, c.payload)
+    assert.equal(res.status, 0, `${c.name}: process must exit 0, never crash. stderr: ${res.stderr}`)
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(typeof out.write_ok, 'boolean', `${c.name}: write_ok must be a real boolean, got ${JSON.stringify(out)}`)
+  }
+})
+
+// main's own behaviour for this exact payload was captured directly via
+// `git show main:workflows/lib/ledger-append.mjs` and recorded in
+// docs/harn-opt-2-mutation-proofs.md (write_ok:false, the schema-validation
+// reason quoted verbatim) -- this test pins the CURRENT writer to that same
+// observable outcome without a git subprocess in the suite itself.
+test('ledger-append: the current writer\'s behaviour for a null findings element matches main\'s (write_ok:false, schema-validation reason) -- see docs/harn-opt-2-mutation-proofs.md for the direct main comparison (M-2)', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', findings: [null] })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false, 'a null finding element carries no ac_id at all -- it must still fail schema validation exactly as it did before the sanitiser existed, not be silently accepted')
+  assert.match(out.write_error, /schema validation/, `expected a schema-validation refusal, got: ${out.write_error}`)
+  assert.equal(readLedgerLines(repo).length, 0, 'a refused write must not create a ledger line')
 })
 
 test('ledger-append module: canonicalPlanKey keeps distinct inputs distinct -- two specs sharing a basename under different directories, and a spec containing the bucket-key delimiter "|" (AC-QA-2)', async () => {

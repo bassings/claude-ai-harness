@@ -19,12 +19,16 @@ criteria** against the built change, and reports anything it finds outside them.
 
 The contract between them is the AC ID. A review finding with no AC behind it is
 a **spec bug**: it means the planning lens missed something. Every workflow
-run, conducted or invoked directly, appends two lines to
+run, conducted or invoked directly, appends a `started` line before work
+begins and a terminal line after, paired by `run_id`, to
 `.claude/harness-ledger.jsonl` (untracked; see
-`workflows/lib/ledger-append.mjs`), recording spec bugs, rejected findings
-and rounds to clean as structured data: that ledger is how the harness
-improves rather than merely runs, read on a weekly cadence (never per-PR)
-by `/optimise-cycle` (`skills/optimise-cycle/`), which proposes measured,
+`workflows/lib/ledger-append.mjs`) -- a run that never completes the pair
+(the process killed, or a write refused) is counted separately as a
+start-only or terminal-only orphan, never mistaken for a healthy run; see
+README.md's "Run ledger" section for the mechanism. Each line records spec
+bugs, rejected findings and rounds to clean as structured data: that ledger
+is how the harness improves rather than merely runs, read on a weekly cadence
+(never per-PR) by `/optimise-cycle` (`skills/optimise-cycle/`), which proposes measured,
 cited changes -- it never applies one itself. Retained indefinitely with no rotation;
 delete with `rm .claude/harness-ledger.jsonl`; export format is the file
 itself (newline-delimited JSON) -- see README.md's "Run ledger" section

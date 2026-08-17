@@ -24,6 +24,27 @@ const requestedWindow = typeof opts.window === 'number' && opts.window > 0 ? opt
 // helper trio is duplicated across the three PR1 workflows).
 const MIN_RECORDS_FOR_PROPOSALS = 5
 
+// Owner decision, round-3 coordinator triage (Scott's own design correction,
+// not a review finding): the wall-clock suppression gate below (see
+// isUnmeasuredSegmentMotivated) previously fired on PRESENCE -- >=1
+// unmeasured run anywhere in a segment's window suppressed EVERY proposal
+// motivated by that segment. Since a routine, correctly-handled aborted run
+// is exactly what produces an unmeasured run (AC-QA-8's exception guard),
+// one ordinary crash in an otherwise healthy window (measured: 9 healthy
+// runs + 1 routine abort => unmeasuredRuns=1) permanently disabled the
+// entire wall-clock proposal lane -- the analysis this whole programme
+// exists to produce (whether more concurrent agents would help). Gating on
+// PROPORTION instead: only suppress when the unmeasured/aborted share of
+// the segment's window meets or exceeds this threshold. The boundary is
+// INCLUSIVE (>=), not exclusive (>): chosen to match the old gate's own
+// inclusive count (>=1) and to err toward caution, since a false
+// suppression only delays an analysis a future cycle can still produce,
+// while a false pass could ship a proposal built on a window that turns
+// out to be mostly unmeasured. Not configurable (AC-SIMP-2, amended by the
+// owner to forbid new USER-FACING settings): a single named internal
+// constant, the same discipline as MIN_RECORDS_FOR_PROPOSALS above.
+const UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD = 0.2
+
 // The optimiser's own report artefact: the ONE file any of its agent steps
 // may create or modify (AC-SEC-9), written into the CURRENT repo (the one
 // /optimise-cycle was invoked in), documented in README.md. Not
@@ -483,6 +504,62 @@ function segmentUnmeasuredRuns(segment) {
   const v = wallClockTotals[`${prefix}UnmeasuredRuns`]
   return typeof v === 'number' ? v : 0
 }
+function segmentMeasuredRuns(segment) {
+  const prefix = WALL_CLOCK_SEGMENT_FIELD_PREFIX[segment]
+  if (!prefix) return 0
+  const v = wallClockTotals[`${prefix}MeasuredRuns`]
+  return typeof v === 'number' ? v : 0
+}
+// The window's total attempts for a segment: measured + unmeasured (the
+// latter already counts an aborted pair a second time, see H1's own
+// comment further up this file -- deliberate, so this total is "every
+// attempt the window saw", not merely "every attempt with a usable
+// duration".
+function segmentTotalRuns(segment) {
+  return segmentMeasuredRuns(segment) + segmentUnmeasuredRuns(segment)
+}
+// Round-4 review M5: whether the reader's totals object actually carries
+// the measured/unmeasured fields a segment's share needs -- the render
+// loop further down needs the two flags SEPARATELY (measuredFieldPresent/
+// unmeasuredFieldPresent, matching H-1's own convention), the gate needs
+// only their AND. Single definition site for all three: `undefined` when
+// the reader's totals object never carried the field at all (a stale or
+// partial installed optimise-read.mjs), distinguishable from a genuine 0.
+// Before this fix, the gate re-derived presence independently (inline
+// `!== undefined` at the render site only) and a stale reader's own
+// absence silently coerced into a share of 0 via the `typeof v ===
+// 'number' ? v : 0` defaults above -- the one brake this PR added
+// released in exactly the run its own report labels unavailable.
+function segmentMeasuredFieldPresent(segment) {
+  const prefix = WALL_CLOCK_SEGMENT_FIELD_PREFIX[segment]
+  return !!prefix && wallClockTotals[`${prefix}MeasuredRuns`] !== undefined
+}
+function segmentUnmeasuredFieldPresent(segment) {
+  const prefix = WALL_CLOCK_SEGMENT_FIELD_PREFIX[segment]
+  return !!prefix && wallClockTotals[`${prefix}UnmeasuredRuns`] !== undefined
+}
+function segmentFieldsPresent(segment) {
+  return segmentMeasuredFieldPresent(segment) && segmentUnmeasuredFieldPresent(segment)
+}
+// A segment with zero total attempts has nothing to be uncertain ABOUT --
+// share is 0, not NaN/undefined, so the gate below never suppresses on a
+// segment nobody has touched yet. Round-4 review M5: null, distinct from a
+// real 0, when the reader's totals genuinely lack the fields -- "field
+// absent" must never be read as "share 0".
+function segmentUnmeasuredShare(segment) {
+  if (!segmentFieldsPresent(segment)) return null
+  const total = segmentTotalRuns(segment)
+  return total > 0 ? segmentUnmeasuredRuns(segment) / total : 0
+}
+// Round-4 review M5: the single place "does this segment's measurement
+// quality justify suppression" is decided -- an unavailable share (null)
+// suppresses exactly like a share at or above the threshold; the gate,
+// the drop-reason detail and the render's own `suppressed` flag all route
+// through this one function so the three cannot disagree.
+function isSegmentSuppressed(segment) {
+  const share = segmentUnmeasuredShare(segment)
+  return share === null || share >= UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD
+}
 // Round-3 F4: the typed `target.segment` tag alone made this gate
 // agent-tag-dependent -- a proposal genuinely motivated by a null segment
 // but drafted without setting the tag (the prompt only asks for it "if
@@ -498,7 +575,7 @@ function motivatingSegments(p) {
   return [...new Set([...tagged, ...mentioned])]
 }
 function isUnmeasuredSegmentMotivated(p) {
-  return motivatingSegments(p).some((seg) => segmentUnmeasuredRuns(seg) >= 1)
+  return motivatingSegments(p).some(isSegmentSuppressed)
 }
 const droppedUnmeasuredSegment = proposals.filter(isUnmeasuredSegmentMotivated)
 proposals = proposals.filter((p) => !isUnmeasuredSegmentMotivated(p))
@@ -617,11 +694,37 @@ const reportMarkdown = buildReport({
   // free text, or both -- report every segment that actually motivated the
   // drop (has >=1 unmeasured run), not just whatever target.segment says
   // (which may be unset for a free-text-caught proposal).
+  // Round-4 review M5: a segment can be suppressed for TWO different
+  // reasons now -- a real, computed unmeasured share at or above the
+  // threshold, or the reader's totals lacking the fields entirely. Naming
+  // both with the same "N unmeasured runs" phrasing would fabricate a
+  // count of 0 for the second case, which is exactly the false-clean
+  // signal this fix exists to close one layer up (the gate).
   droppedUnmeasuredSegmentDetails: droppedUnmeasuredSegment.flatMap((p) =>
     motivatingSegments(p)
-      .filter((seg) => segmentUnmeasuredRuns(seg) >= 1)
-      .map((seg) => ({ segment: seg, unmeasuredRuns: segmentUnmeasuredRuns(seg) }))
+      .filter(isSegmentSuppressed)
+      .map((seg) => segmentFieldsPresent(seg)
+        ? { segment: seg, unmeasuredRuns: segmentUnmeasuredRuns(seg), reason: 'unmeasured_share' }
+        : { segment: seg, unmeasuredRuns: null, reason: 'reader_field_unavailable' })
   ),
+  // Owner decision: the ratio must always print, whether or not the gate
+  // fires for anything this cycle -- an operator must be able to see how
+  // close to the brake every segment is, not only the segment(s) that
+  // happened to suppress a proposal.
+  segmentUnmeasuredRatios: WALL_CLOCK_SEGMENTS.map((seg) => ({
+    segment: seg,
+    unmeasuredRuns: segmentUnmeasuredRuns(seg),
+    totalRuns: segmentTotalRuns(seg),
+    // undefined when the reader's totals object never carried this
+    // segment's fields at all (a stale installed optimise-read.mjs) --
+    // distinguishable from a genuine 0/0, matching H-1's own convention.
+    // Round-4 review M5: routed through the same presence check the gate
+    // uses (segmentMeasuredFieldPresent/segmentUnmeasuredFieldPresent),
+    // rather than a second inline computation of the same thing.
+    measuredFieldPresent: segmentMeasuredFieldPresent(seg),
+    unmeasuredFieldPresent: segmentUnmeasuredFieldPresent(seg),
+    suppressed: isSegmentSuppressed(seg),
+  })),
   droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
   ranked,
   insufficientDataProposals,
@@ -735,7 +838,22 @@ function buildReport(d) {
     if (entry.uninstrumented) {
       lines.push(`- ${label}: **uninstrumented** (no ledger file found -- not "no activity"; the harness has never written a ledger here)`)
     } else {
-      lines.push(`- ${label}: ${entry.recordCount} record(s) in window${entry.skippedCount ? `, ${entry.skippedCount} skipped` : ''}`)
+      // Review round-2 M-6: skippedCount previously rendered only when
+      // truthy (a clean repo showed NO line at all, not a real zero), and
+      // schemaVersionsSeen/truncatedFinalLine -- both already computed by
+      // the reader and both AC-OPS-3's own named data-quality signals --
+      // never reached the report at all. All three now always render, per
+      // the same "a missing line means the check stopped running" rule
+      // the exclusion counters above already follow. truncatedFinalLine is
+      // a real corruption signal (an interrupted append mid-write), stated
+      // positively (true/false) so it cannot be mistaken for absence.
+      const schemaMix = entry.schemaVersionsSeen && Object.keys(entry.schemaVersionsSeen).length
+        ? Object.entries(entry.schemaVersionsSeen).map(([v, n]) => `${v}: ${n}`).join(', ')
+        : 'none'
+      lines.push(
+        `- ${label}: ${entry.recordCount} record(s) in window, skipped=${entry.skippedCount ?? 0}, ` +
+        `schema_version mix: {${schemaMix}}, truncated final line: ${entry.truncatedFinalLine ? 'true' : 'false'}`
+      )
     }
   }
   lines.push('Instrumented invocation routes: conducted runs and every direct invocation of the harness\'s other workflows write the ledger identically (AC-ARCH-4); conduct-plan wait/PR events are conductor-only.')
@@ -746,12 +864,64 @@ function buildReport(d) {
   // reader) never reached the report. Always rendered, with a real zero
   // when clean, per the standing rule that a missing line means the check
   // stopped running, not that nothing is wrong.
+  // Review round-2 H-1 (High): `?? 0` cannot tell "the reader computed a
+  // real zero" apart from "this field does not exist on the object at
+  // all" -- the latter is the NORMAL post-merge state whenever the
+  // installed mirror at ~/.claude/workflows/lib/optimise-read.mjs (which
+  // the ledger lane prefers, see the scope prompt below) is stale or a
+  // field gets renamed, and it is worse than the pre-PR2 state, where the
+  // operator at least saw a single combined `unmeasured=6`. `undefined` now
+  // renders an explicit, unmissable marker instead of a confident 0.
+  // Defined here (before its first use, a few lines below) rather than
+  // relying on function-declaration hoisting past a `const` it closes
+  // over, which is a temporal-dead-zone ReferenceError, not a hoist.
+  const UNAVAILABLE_STALE_READER = 'unavailable (installed optimise-read.mjs predates this field)'
+  function fmtCountOrUnavailable(value) {
+    return value === undefined ? UNAVAILABLE_STALE_READER : String(value)
+  }
   const wallTotalsForExclusions = (d.wallClock && d.wallClock.totals) || {}
   lines.push(
     `Excluded from attribution (never silently dropped): unattributable runs=${wallTotalsForExclusions.unattributableRuns ?? 0}, ` +
     `degraded-unattributed runs=${wallTotalsForExclusions.degradedUnattributedRuns ?? 0}, ` +
     `unattributable ci_wait/human_wait observations=${wallTotalsForExclusions.unattributableWaits ?? 0}, ` +
     `unattributable rework records=${(d.rework && d.rework.unattributableCount) ?? 0}.`
+  )
+  // Review round-2 M-3 (rendering half): invalid_ac_ids_dropped was
+  // computed by the writer and summed by the reader (rework.
+  // invalidAcIdsDropped), but reached no report a human reads -- this is
+  // round-1 H2's own shape (a counter reaching nothing an operator sees)
+  // reintroduced one field over. `undefined` (a stale installed reader
+  // that predates the field) renders the same explicit marker H-1 defined
+  // above, rather than a confident 0.
+  lines.push(`invalid_ac_ids_dropped (sanitised, non-conforming AC ids from lens findings/verdicts): ${fmtCountOrUnavailable(d.rework && d.rework.invalidAcIdsDropped)}.`)
+  // Round-6 review, instruction 4: invalid_record_values_dropped (the
+  // round-5 H1 general degrade mechanism's own counter -- verdicts.<lens>,
+  // ac_verdicts[].verdict, lenses_run[]/lenses_skipped[] entries, and any
+  // future field it comes to cover) was written to every line and read by
+  // NOTHING -- the exact "a counter reaching nothing a human sees" shape
+  // the invalid_ac_ids_dropped comment above already names, for a
+  // different counter. A silent neutralisation is how the H1 regression
+  // stayed invisible in the first place.
+  lines.push(`invalid_record_values_dropped (sanitised, non-conforming values elsewhere -- verdicts/ac_verdicts.verdict/lenses_run entries): ${fmtCountOrUnavailable(d.rework && d.rework.invalidRecordValuesDropped)}.`)
+  // Review round-1 H2: the two orphan classes AC-OPS-2 exists to separate
+  // -- a start-only orphan and a terminal-only orphan (the START write
+  // itself failed) -- were computed by optimise-read.mjs and reached no
+  // report a human reads. Always rendered, with real zeros when clean, so a
+  // fix landed for one class never reads as progress on the other, and a
+  // missing line means the check stopped running, never that nothing is
+  // wrong. M1 (round 4 remainder): a start-only orphan's causes are named
+  // accurately at optimise-read.mjs's own comment on this counter -- an
+  // exception escaping run() no longer produces one (PR2's try/finally
+  // always attempts a terminal write).
+  function formatByKind(byKind) {
+    const entries = Object.entries(byKind || {})
+    return entries.length ? entries.map(([k, n]) => `${k}: ${n}`).join(', ') : 'none'
+  }
+  lines.push(
+    `Orphaned agent-compute runs (never silently collapsed into one number): start-only=${fmtCountOrUnavailable(wallTotalsForExclusions.agentComputeStartOnlyRuns)} ` +
+    `(by kind: ${formatByKind(wallTotalsForExclusions.agentComputeStartOnlyByKind)}), ` +
+    `terminal-only=${fmtCountOrUnavailable(wallTotalsForExclusions.agentComputeTerminalOnlyRuns)} ` +
+    `(by kind: ${formatByKind(wallTotalsForExclusions.agentComputeTerminalOnlyByKind)}).`
   )
   lines.push('')
 
@@ -764,9 +934,16 @@ function buildReport(d) {
     if (!planKeys.length) lines.push('No wall-clock data in window.')
     for (const key of planKeys) {
       const b = byPlan[key]
+      // Review round-2 L-4: agentComputeAbortedSeconds/N were computed
+      // per-plan but rendered nowhere -- this is the ACTIONABLE half of
+      // H1's own fix (the repo-wide Totals aborted count says HOW MANY
+      // runs crashed; this per-plan figure is what says WHICH plan is
+      // crashing). Rendered only when non-zero, matching the existing
+      // unterminated_waits convention on this same line.
       lines.push(
         `- ${key}: ci_wait=${b.ciWaitSeconds}s (n=${b.ciWaitN}), human_wait=${b.humanWaitSeconds}s (n=${b.humanWaitN}), ` +
         `agent_compute=${b.agentComputeSeconds}s (n=${b.agentComputeN})` +
+        (b.agentComputeAbortedN ? `, aborted=${b.agentComputeAbortedSeconds}s (n=${b.agentComputeAbortedN})` : '') +
         (b.unterminatedWaits ? `, unterminated_waits: ${b.unterminatedWaits}` : '')
       )
     }
@@ -775,10 +952,19 @@ function buildReport(d) {
     // render here, not just whether the total is null -- an operator
     // reading the persisted report (not the raw JSON return) previously
     // had no way to see how many runs were unmeasured for a segment.
+    // Review round-1 H1: a well-formed start+terminal pair whose terminal
+    // outcome is not 'done' (a crash the exception guard turns into a pair
+    // instead of an orphan, or a deliberate BLOCKED/ABORTED return) is
+    // real elapsed time but never a completion -- excluded from
+    // agent_compute's measured/unmeasured counts above, and rendered here
+    // under its own name so a workflow crashing on every run is visible in
+    // the same line an operator already reads, not silently absent.
     lines.push(
       `Totals: ci_wait=${fmtSeconds(t.ciWaitSeconds)} (measured n=${t.ciWaitMeasuredRuns ?? 0}, unmeasured n=${t.ciWaitUnmeasuredRuns ?? 0}), ` +
       `human_wait=${fmtSeconds(t.humanWaitSeconds)} (measured n=${t.humanWaitMeasuredRuns ?? 0}, unmeasured n=${t.humanWaitUnmeasuredRuns ?? 0}), ` +
-      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}).`
+      `agent_compute=${fmtSeconds(t.agentComputeSeconds)} (measured n=${t.agentComputeMeasuredRuns ?? 0}, unmeasured n=${t.agentComputeUnmeasuredRuns ?? 0}, aborted n=${fmtCountOrUnavailable(t.agentComputeAbortedPairs)}` +
+      (t.agentComputeAbortedSeconds ? ` [${fmtSeconds(t.agentComputeAbortedSeconds)}]` : '') +
+      `).`
     )
     if (t.unterminatedWaits) lines.push(`unterminated_waits: ${t.unterminatedWaits}`)
     if (d.wallClock.source) lines.push(`Sources: ci_wait=${d.wallClock.source.ci_wait}, human_wait=${d.wallClock.source.human_wait}, agent_compute=${d.wallClock.source.agent_compute}.`)
@@ -805,7 +991,25 @@ function buildReport(d) {
   lines.push('## Never-failing acceptance criteria (source: ledger)')
   if (d.neverFailingAcs && d.neverFailingAcs.length) {
     for (const a of d.neverFailingAcs) {
-      lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${a.insufficient_data ? ' (insufficient data)' : `, never_failed=${a.never_failed}`}`)
+      // Round-4 review M3: unattributed_fail_in_window is a DIFFERENT
+      // reason for never_failed:null than insufficient_data -- a
+      // sanitised/null-ac_id FAIL sits somewhere in a window with plenty
+      // of runs, it is simply not attributable to this specific criterion.
+      // Rendered distinctly so an operator does not read "insufficient
+      // data" (implying a small window) for a defect that is actually
+      // about lost attribution.
+      // Round-6 H1: unattributed_verdict_in_entry is a THIRD distinct
+      // reason -- this specific ac_id's own verdict values were
+      // neutralised (see invalid_record_values_dropped), not merely an
+      // unattributed ac_id somewhere else in the window.
+      const reasonSuffix = a.insufficient_data
+        ? ' (insufficient data)'
+        : a.unattributed_fail_in_window
+          ? ' (unattributed FAIL in window -- see invalid_ac_ids_dropped)'
+          : a.unattributed_verdict_in_entry
+            ? ' (unattributed verdict for this criterion -- see invalid_record_values_dropped)'
+            : `, never_failed=${a.never_failed}`
+      lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}`)
     }
   } else {
     lines.push('None recorded.')
@@ -863,14 +1067,45 @@ function buildReport(d) {
   for (const p of d.insufficientDataProposals) lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
   lines.push('')
   lines.push('## Filtering')
+  // Owner decision, round-3 coordinator triage: the suppression gate now
+  // fires on the unmeasured/aborted SHARE of a segment's window, not mere
+  // presence -- an operator must be able to see how close to the brake
+  // every segment is, whether or not the gate actually dropped anything
+  // this cycle, so this renders unconditionally for all three wall-clock
+  // segments (never only the ones that caused a drop).
+  const thresholdPct = Math.round(UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD * 100)
+  for (const entry of d.segmentUnmeasuredRatios || []) {
+    if (!entry.measuredFieldPresent || !entry.unmeasuredFieldPresent) {
+      lines.push(`${entry.segment}: ${UNAVAILABLE_STALE_READER}`)
+      continue
+    }
+    // Round-4 review L7: Math.round could round the DISPLAYED percentage
+    // up past the threshold while the GATE's own exact-ratio comparison
+    // (unrounded, in isSegmentSuppressed) says "below it" -- e.g. 8/41 =
+    // 19.512%, rounds to 20%, prints "(20%) -- below the 20% suppression
+    // threshold", a self-contradicting line that reads exactly like the
+    // gate silently failing. Math.floor never rounds a sub-threshold ratio
+    // up to the threshold's own display value, so the printed percentage
+    // and the gate's verdict can never disagree.
+    const pct = entry.totalRuns > 0 ? Math.floor((entry.unmeasuredRuns / entry.totalRuns) * 100) : 0
+    const verdict = entry.suppressed
+      ? `at/above the ${thresholdPct}% suppression threshold: wall-clock proposals citing this segment are suppressed`
+      : `below the ${thresholdPct}% suppression threshold`
+    lines.push(`${entry.segment}: ${entry.unmeasuredRuns}/${entry.totalRuns} runs unmeasured (${pct}%) -- ${verdict}`)
+  }
   // Round-2 L2: name the specific segment(s) and their exact unmeasured-run
   // count that caused a drop, not just a bare count of dropped proposals --
   // an operator reading this line could not previously tell WHICH segment
   // blocked a proposal, or how badly unmeasured it was, without parsing
   // the raw JSON return.
+  // Round-4 review M5: a suppression can now be a real, computed count OR
+  // "the reader field is unavailable" -- rendered distinctly, never a
+  // fabricated 0.
   const unmeasuredSegmentBySegment = {}
-  for (const entry of d.droppedUnmeasuredSegmentDetails || []) unmeasuredSegmentBySegment[entry.segment] = entry.unmeasuredRuns
-  const unmeasuredSegmentDetail = Object.entries(unmeasuredSegmentBySegment).map(([seg, n]) => `${seg} (${n} unmeasured runs)`).join(', ')
+  for (const entry of d.droppedUnmeasuredSegmentDetails || []) {
+    unmeasuredSegmentBySegment[entry.segment] = entry.reason === 'reader_field_unavailable' ? 'reader field unavailable' : `${entry.unmeasuredRuns} unmeasured runs`
+  }
+  const unmeasuredSegmentDetail = Object.entries(unmeasuredSegmentBySegment).map(([seg, detail]) => `${seg} (${detail})`).join(', ')
   lines.push(
     `Drafted: ${d.draftedCount}. Dropped (no resolvable citation): ${d.droppedNoCitationCount}. ` +
     `Dropped (always-on security lens removal, never permitted): ${d.droppedAlwaysOnSecurityCount}. ` +

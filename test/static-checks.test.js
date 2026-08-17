@@ -206,6 +206,31 @@ test('static: README.md names the step that refreshes the installed ~/.claude/wo
   assert.ok(/schemaVersionsSeen/.test(readme), 'README.md must state that a stale mirror is also detectable from the report\'s per-repo schema_version mix')
 })
 
+// Review round-1 H3: PR2's entire fix lives in three TOP-LEVEL workflow
+// scripts (tdd-task.js, review-cycle.js, plan-cycle.js), which the
+// installed mirror ALSO copies (`~/.claude/workflows/*.js`, not just
+// `workflows/lib/`) -- but the AC-OPS-4 section above only ever documented
+// re-syncing workflows/lib/. An operator following it exactly would get a
+// clean exit 0 while the live top-level copies kept crashing without
+// terminal records. Also: PR2 bumps no SCHEMA_VERSION and adds no ledger
+// field, so the schemaVersionsSeen-based staleness signal above does NOT
+// detect a stale top-level workflow script -- that must be stated
+// honestly, not implied to be covered.
+test('static: README.md\'s AC-OPS-4 section ALSO covers the whole workflows/ tree (not just workflows/lib/), names the three top-level workflow scripts explicitly, and states that the schema_version staleness signal does not detect a stale top-level script (H3)', () => {
+  const readme = readAll('README.md')
+  assert.ok(/cp -r claude-ai-harness\/workflows\/\. ~\/\.claude\/workflows\//.test(readme), 'README.md must give a whole-tree re-sync command covering the top-level workflow scripts too')
+  assert.ok(/diff -rq claude-ai-harness\/workflows ~\/\.claude\/workflows\b/.test(readme), 'README.md must give a whole-tree verification command')
+  for (const f of ['tdd-task.js', 'review-cycle.js', 'plan-cycle.js']) {
+    assert.ok(readme.includes(f), `README.md must name ${f} explicitly in the AC-OPS-4 section`)
+  }
+  const opsIdx = readme.indexOf('AC-OPS-4')
+  const section = readme.slice(opsIdx, opsIdx + 3000)
+  assert.ok(
+    /does not|never|not detect|no signal/i.test(section) && /schema_version|SCHEMA_VERSION/.test(section),
+    'README.md must state honestly that the schema_version-based staleness signal does not cover a stale TOP-LEVEL workflow script (PR2 bumped no schema version)'
+  )
+})
+
 test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, ledgerWritePrompt, writeLedger) is byte-identical across all three workflow files. Workflow scripts cannot import, so this trio is necessarily duplicated three times; without a guard pinning them, a fix landed in one or two copies fails silently in the third -- the same failure class as C1.', () => {
   function extractBlock(fileName) {
     const contents = readAll('workflows', fileName)
@@ -221,4 +246,116 @@ test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, le
   assert.ok(tdd.length > 500, 'sanity: the extracted block should be substantial, not an empty match')
   assert.equal(review, tdd, 'review-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
   assert.equal(plan, tdd, 'plan-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
+})
+
+// HARN-OPT-2 PR2 (AC-ARCH-9): the start/terminal exception-guard block PR 2
+// added (an exception escaping run() must still reach the single terminal
+// writeLedger( call, then re-throw) is a SECOND necessarily-triplicated
+// block, mirroring L5 above -- without a guard pinning it, a fix landed in
+// one or two copies fails silently in the third, exactly the C1 failure
+// class this file already guards against for the run-ledger helper trio.
+test('static: PR2 -- the exception-guard block wrapping `await run()` (the try/catch that produces a terminal write even when run() throws, then re-throws the original error) is byte-identical across all three workflow files (AC-ARCH-9)', () => {
+  function extractGuardBlock(fileName) {
+    const contents = readAll('workflows', fileName)
+    const lines = contents.split('\n')
+    const start = lines.findIndex((l) => l.startsWith('// PR 2 (AC-QA-8, AC-ARCH-9): an exception escaping run() must still'))
+    const end = lines.findIndex((l, i) => i > start && l.trim() === '} // end PR 2 exception guard')
+    assert.ok(start >= 0 && end > start, `${fileName}: could not locate the PR2 exception-guard block markers`)
+    return lines.slice(start, end + 1).join('\n')
+  }
+  const tdd = extractGuardBlock('tdd-task.js')
+  const review = extractGuardBlock('review-cycle.js')
+  const plan = extractGuardBlock('plan-cycle.js')
+  assert.ok(tdd.length > 300, 'sanity: the extracted block should be substantial, not an empty match')
+  assert.equal(review, tdd, 'review-cycle.js\'s PR2 exception-guard block has drifted from tdd-task.js\'s')
+  assert.equal(plan, tdd, 'plan-cycle.js\'s PR2 exception-guard block has drifted from tdd-task.js\'s')
+})
+
+// The re-throw itself sits after the (per-file-diverging) telemetry-build
+// and terminal writeLedger( call, so it cannot live inside the block above
+// -- pinned separately, as its own one-line-plus-return byte-identical pair.
+test('static: PR2 -- the re-throw line (`if (threw) throw runError`) immediately preceding the final `return { ...result, telemetry }` is byte-identical across all three workflow files (AC-ARCH-9). Round-1 review M2: gated on `threw` (whether the catch fired), not on `runError`\'s truthiness -- a falsy thrown value must still re-throw.', () => {
+  const REQUIRED = 'if (threw) throw runError\nreturn { ...result, telemetry }'
+  for (const f of ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js']) {
+    const contents = readAll(...f.split('/'))
+    assert.ok(contents.includes(REQUIRED), `${f} must contain the exact re-throw-then-return pair:\n${REQUIRED}`)
+  }
+})
+
+// AC-QA-9: "a static test that fails when a new return is added inside
+// run() without a matching pairing test, so the enumeration cannot go
+// stale". Every terminating `return` inside each workflow's run() is
+// written as `return {` (an object literal), consistently, everywhere in
+// this codebase -- confirmed by grep. Pinning the COUNT of that pattern
+// inside run()'s own body means adding a new terminating return silently
+// changes the count and fails this test, forcing whoever adds it to also
+// come here and to tdd-task.test.js/review-cycle.test.js/plan-cycle.test.js
+// (each of which has one test per return path, named by case) rather than
+// leaving the new path unpaired with a ledger-write assertion.
+// Review round-1 L1: the pin only counted the `return {` (object-literal)
+// FORM of a terminating return -- a new return written any other way
+// (`return EARLY` where EARLY is a variable, an escape-hatch object built
+// on an earlier line and returned bare, etc.) changed nothing this test
+// could see. CONFIRMED by two independent mutations (both left this test
+// green before the fix): a `return escapeHatch` where `escapeHatch` was a
+// variable holding an object literal, and a bare `return EARLY` referring
+// to a pre-declared local. Fixed by ALSO counting every bare `return\b`
+// occurrence in the same body and asserting the two counts are equal -- a
+// return written in any form the object-literal regex does not match now
+// makes the two counts diverge and fails this test by name, rather than
+// silently passing because the narrower pattern happened not to match.
+// Strips string/template-literal CONTENT and `//` line comments before
+// counting `return` occurrences, so a prompt string that instructs the
+// LLM to "return X" (this codebase's agent() prompts do this constantly --
+// "Return only what the script printed", "return ac_verdicts", etc.) is
+// never mistaken for a real terminating return statement. Trusted-input
+// only (this repo's own three workflow files, not arbitrary/hostile
+// source), so a lightweight non-nested-template-aware regex is adequate --
+// this codebase's template literals never nest backticks.
+function stripStringsAndComments(source) {
+  // Comments are stripped FIRST, before any string-stripping: an apostrophe
+  // inside a `//` comment (this codebase's comments use plenty of them --
+  // "it's", "doesn't", "lens's") is an ordinary character until the quote
+  // regexes below run, and if a comment survives past that point its
+  // apostrophe pairs unpredictably with a REAL quote elsewhere in the file,
+  // desynchronising every string match after it and silently swallowing
+  // real code (including a real `return`) into what the regex believes is
+  // string content. Confirmed no `//` occurs inside genuine string content
+  // in any of the three files' run() bodies (checked by grep), so a naive
+  // per-line strip is safe here.
+  return source
+    .split('\n').map((line) => line.replace(/\/\/.*$/, '')).join('\n')
+    .replace(/`(?:[^`\\]|\\.)*`/gs, '``')
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+}
+
+test('static: AC-QA-9 -- the number of terminating `return` statements (any form) inside each workflow\'s run() function is pinned, so a new return path added without a matching pairing test fails this check instead of silently going unpaired (L1: widened past the object-literal-only `return {` form)', () => {
+  function countReturnsInRun(fileName) {
+    const contents = readAll('workflows', fileName)
+    const lines = contents.split('\n')
+    const start = lines.findIndex((l) => l.trim() === 'async function run() {')
+    const end = lines.findIndex((l, i) => i > start && l.trim() === '} // end run()')
+    assert.ok(start >= 0 && end > start, `${fileName}: could not locate the run() function markers`)
+    const rawBody = lines.slice(start, end + 1).join('\n')
+    const codeOnlyBody = stripStringsAndComments(rawBody)
+    const anyForm = (codeOnlyBody.match(/\breturn\b/g) || []).length
+    const objectLiteralForm = (rawBody.match(/return\s*\{/g) || []).length
+    assert.equal(
+      anyForm, objectLiteralForm,
+      `${fileName}: found ${anyForm} real \`return\` statement(s) (strings/comments excluded) but only ${objectLiteralForm} are the object-literal \`return {\` form -- ` +
+      `a return written in some other form (a bare variable, an escape hatch) was added without this guard being able to see it`
+    )
+    return objectLiteralForm
+  }
+  // tdd-task.js: 4 ABORTED, 3 BLOCKED (2 max-attempts exhaustions + the
+  // hashes-changed short-circuit), 1 DONE -- see the 8-case table in
+  // tdd-task.test.js's "every terminating return" test.
+  assert.equal(countReturnsInRun('tdd-task.js'), 8, 'tdd-task.js run() must have exactly 8 terminating returns; if you added one, add its pairing test too')
+  // review-cycle.js: the no-op (no changes found), the every-lens-failed
+  // abort, and the main synthesis return.
+  assert.equal(countReturnsInRun('review-cycle.js'), 3, 'review-cycle.js run() must have exactly 3 terminating returns; if you added one, add its pairing test too')
+  // plan-cycle.js: the scope-agent-failed abort, the every-lens-failed
+  // abort, and the main synthesis return.
+  assert.equal(countReturnsInRun('plan-cycle.js'), 3, 'plan-cycle.js run() must have exactly 3 terminating returns; if you added one, add its pairing test too')
 })
