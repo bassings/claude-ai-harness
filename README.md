@@ -326,6 +326,49 @@ runtime statically rejects any `import` before execution, so the schema,
 validation and the write itself live in this one real-Node script instead,
 invoked via Bash from each workflow's final step).
 
+**Malformed values degrade, they never destroy the line**: `ledger-append.mjs`'s
+`degradeEntry` validates the whole entry once; when every error it finds is
+value-level (a `findings[].lens`/`severity`/`ac_id` or `ac_verdicts[].verdict`
+failing its pattern/enum, a bad `verdicts.<lens>`/`trigger_counts.<key>` dict
+entry, a malformed `lenses_run[]` element, or an array item missing a required
+field entirely), each is neutralised in place rather than the whole write
+being refused. This is a general, schema-driven mechanism, not a per-field
+allowlist: earlier rounds sanitised `ac_id`, then separately `lens`/`severity`,
+each time only the field that round's review happened to name, and the next
+round always found the next sibling; `degradeEntry` instead neutralises any
+value-level violation the schema declares, present or future. A known sibling
+field retains a bounded (32-byte), path-redacted raw form
+(`ac_id_raw`/`lens_raw`/`severity_raw`/`verdict_raw`); anything else lands in
+a bounded `degraded_raw` array (`{path, raw}`, redacted the same way, capped
+at 10 entries). Every neutralisation is counted: `invalid_ac_ids_dropped` and
+`invalid_finding_fields_dropped` for their own named fields,
+`invalid_record_values_dropped` for everything else -- rendered in the
+optimiser's report both as its own summary line and, per criterion, as the
+reason a `never_failed` claim was degraded to unknown rather than a confident
+true or false. A record is still refused outright when a STRUCTURAL error
+remains: a required TOP-LEVEL field absent, an unknown top-level key, or the
+entry (or an array element) not being an object at all.
+
+**`HARNESS_LEDGER_READONLY`**: a lens that needs to run or probe
+`ledger-append.mjs` itself (a mutation experiment during planning or review)
+is instructed to set this on the SAME command line as the writer invocation --
+when truthy, the writer returns `write_ok:false` before touching stdin, git or
+the filesystem at all, so a lens's own probing can never land a test record in
+the operator's real, unbacked-up ledger. This is enforced at the lens-prompt
+boundary, not fully mechanical: a lens that ignores the instruction, or a
+caller other than a lens, is not stopped by it.
+
+**Terminal write and orphans**: a run normally leaves exactly the two lines
+described above, paired by `run_id`. When that pairing does not complete, the
+optimiser counts two separate orphan classes, broken down by workflow kind: a
+start-only orphan (the process was killed before the terminal write ran, or
+the terminal write's own payload was refused for a reason the degrade
+mechanism above does not cover) and a terminal-only orphan (the start write
+itself failed). An exception escaping a workflow's `run()` does not, by
+itself, produce a start-only orphan: the exception guard's `try/finally`
+always attempts a terminal write, landing as a paired `aborted` record
+instead.
+
 **Retention**: kept indefinitely as an ordinary untracked file; nothing in
 this repo prunes or rotates it. Because the ledger is gitignored, `git clean
 -xdf` deletes it too -- `-x` explicitly targets ignored files by design, and
