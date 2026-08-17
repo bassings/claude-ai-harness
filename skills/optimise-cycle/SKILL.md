@@ -180,8 +180,11 @@ plugin, run it namespaced: `/claude-ai-harness:optimise-cycle`.
 write, and the write is refused entirely if that check fails, mirroring
 `ledger-append.mjs`'s own discipline exactly (`workflows/lib/
 optimise-report-ignore.mjs`; review round-1 finding M1 closed the gap
-where this claim was made but not actually true). It states, every run, in
-this order:
+where this claim was made but not actually true). **Retention (F12, round-7
+review)**: a second artefact derived from the ledger, not removed by
+deleting the ledger itself -- overwritten on every cycle run, otherwise
+kept indefinitely; delete it with `rm .claude/optimise-cycle-report.md`.
+It states, every run, in this order:
 
 1. **Sample completeness**: ledger record count against the minimum,
    window truncation, and per-repo detail -- an **uninstrumented** repo is

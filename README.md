@@ -70,32 +70,121 @@ Then in any project:
 
 ### Keeping the installed mirror in sync (AC-OPS-4)
 
-The manual-copy install above puts a **copy** of `workflows/lib/` (and any
-plugin install does the same, at its own plugin-managed path) at
-`~/.claude/workflows/lib/`. That installed copy, not this repo, is what
+The manual-copy install above puts a **copy** of the whole `workflows/`
+tree -- both the top-level workflow scripts (`tdd-task.js`, `review-cycle.js`,
+`plan-cycle.js`, `optimise-cycle.js`) and `workflows/lib/` (and any plugin
+install does the same, at its own plugin-managed path) -- at
+`~/.claude/workflows/`. That installed copy, not this repo, is what
 actually executes for a delivery repo -- a fix landed here can be green in
 this repo's own test suite while the installed mirror keeps running the old
-code, silently. Every change to `workflows/lib/ledger-append.mjs` or
-`workflows/lib/optimise-read.mjs` must be re-synced after merging:
+code, silently. Review round 1 of PR 2 (HARN-OPT-2) found this section had
+only ever documented re-syncing `workflows/lib/`, while PR 2's entire fix
+(the start/terminal exception guard) lives in the three TOP-LEVEL workflow
+scripts -- an operator following only the `workflows/lib/` steps below would
+get a clean exit 0 while the live top-level copies kept crashing without
+terminal records.
+
+**Re-sync the whole tree** after merging any change under `workflows/`,
+whether it touched a top-level script or `workflows/lib/`:
 
 ```bash
-cp -r claude-ai-harness/workflows/lib/. ~/.claude/workflows/lib/
+cp -r claude-ai-harness/workflows/. ~/.claude/workflows/
 ```
 
 Confirm the installed copy actually matches this repo (exits 0, no output,
 when they agree; lists the differing files otherwise):
 
 ```bash
+diff -rq claude-ai-harness/workflows ~/.claude/workflows
+```
+
+If you only touched `workflows/lib/` (e.g. `ledger-append.mjs` or
+`optimise-read.mjs`) and want a narrower command, the equivalent pair
+scoped to that directory still works:
+
+```bash
+cp -r claude-ai-harness/workflows/lib/. ~/.claude/workflows/lib/
 diff -rq claude-ai-harness/workflows/lib ~/.claude/workflows/lib
 ```
 
-A stale mirror is also detectable from the optimiser's own report without
-running either command by hand: `workflows/lib/ledger-append.mjs`'s
-`SCHEMA_VERSION` was bumped (1 to 2) by the plan-identity canonicalisation
-change, and `optimise-read.mjs ledger`'s `perRepo[].schemaVersionsSeen`
-reports the schema-version mix actually seen per repo -- a stale installed
-writer still emitting `schema_version: 1` shows up there in the next report
-instead of continuing silently.
+**Always re-sync the whole tree, never an enumerated subset.** Review
+round 2 of PR 2 found the previous revision of this section named "the four
+files this PR touched" -- a list that was already stale by the time review
+round 2 alone landed a further six commits touching all six files under
+`workflows/` (the three top-level scripts, `ledger-append.mjs`,
+`optimise-read.mjs`, `optimise-cycle.js`). Any hand-maintained per-PR
+enumeration goes stale the moment a later round adds one more touched file;
+the whole-tree `cp -r`/`diff -rq` pair above is the one command pair that is
+correct regardless of which files a given PR touched, so it is the only
+form documented here.
+
+A stale `workflows/lib/` mirror is *sometimes* detectable from the
+optimiser's own report without running either command by hand:
+`workflows/lib/ledger-append.mjs`'s `SCHEMA_VERSION` was bumped (1 to 2) by
+PR 1's plan-identity canonicalisation change, and `optimise-read.mjs
+ledger`'s `perRepo[].schemaVersionsSeen` reports the schema-version mix
+actually seen per repo -- a stale installed writer still emitting
+`schema_version: 1` shows up there in the next report instead of continuing
+silently. **This signal does not cover every staleness class.** PR 2's
+exception-guard fix, and review round 2's `invalid_ac_ids_dropped`/
+`ac_id_raw` fields, both bumped no `SCHEMA_VERSION` (they are additive and
+optional, by design, so an older writer or reader omitting them is not
+itself an error) -- a stale `tdd-task.js`/`review-cycle.js`/`plan-cycle.js`,
+or a stale `optimise-read.mjs` reading a newer ledger, produces no
+`schemaVersionsSeen` difference at all. What covers THAT gap is the
+report's own rendering, not the schema version: a genuinely stale or absent
+reader field renders as an explicit "unavailable (installed
+optimise-read.mjs predates this field)" marker rather than a confident
+zero (review round 2, H-1) -- so the report tells you when it cannot see a
+signal, even though `schemaVersionsSeen` cannot. **The `diff -rq` command
+above is still the only check that proves the installed tree is byte-for-byte
+current** -- the report's markers are a second line of defence for when that
+check was skipped, not a replacement for it.
+
+### Sync ordering matters: never let the reader lag behind the writer (AC-OPS-11)
+
+If `workflows/lib/` and the three top-level scripts are ever synced
+separately rather than as one `cp -r`, sync them in this order: **the
+reader (`optimise-read.mjs`) first, the writer (the top-level scripts) last**
+-- never the other way round, and never leave them split for longer than the
+one command it takes to finish the sync.
+
+Verified directly against this repo: an installed reader from before this
+PR (`git show main:workflows/lib/optimise-read.mjs`) has no concept of a
+crashed run at all, because on `main` the top-level scripts have no
+exception guard -- a crash there can only ever leave an *unpaired* start
+record (correctly counted as unmeasured). This PR's exception guard makes a
+crash produce a real, *paired* terminal record (`outcome: 'aborted'`) for
+the first time. Fed that same pair, the OLD reader has no `outcome`-aware
+branch at all: it counts any complete pair as a plain measured run,
+indistinguishable from a real success --
+
+```
+OLD reader:  agentComputeSeconds: 5, agentComputeMeasuredRuns: 1   (the crash reads as a healthy 5-second run)
+NEW reader:  agentComputeSeconds: null, agentComputeMeasuredRuns: 0, agentComputeAbortedPairs: 1, agentComputeAbortedSeconds: 5
+```
+
+That is the failure this section warns against: **a NEWER writer paired
+with an OLDER reader silently converts a crashed run into an
+apparently-healthy one**, because the writer's new capability (a guaranteed
+terminal record even on crash) reaches a reader that has no idea that
+capability, or the `aborted` outcome it produces, exists yet. A newer
+reader paired with an older writer is comparatively safe: the older writer
+simply never produces the fields the newer reader looks for, and those
+fields render as the explicit "unavailable" marker above rather than a
+wrong number.
+
+**Rollback drill, executed against this repo's own tree** (not merely
+described): populating a scratch "installed mirror" from `main`, then
+applying only `workflows/lib/optimise-read.mjs` forward (the exact partial
+sync this section warns against) still leaves `diff -rq` reporting five
+further differing files -- the three top-level scripts and the other two
+`workflows/lib/` files. `diff -rq` cannot see the outcome-classification
+regression above directly (it compares files, not aggregation behaviour),
+but it reliably flags that *some* file in the tree is out of sync whenever
+a partial sync is attempted, which is why the "always re-sync/verify the
+whole tree" rule above is the actual mitigation: a partial sync is only
+possible by skipping the verification step, never by passing it.
 
 ## Usage
 
@@ -237,6 +326,49 @@ runtime statically rejects any `import` before execution, so the schema,
 validation and the write itself live in this one real-Node script instead,
 invoked via Bash from each workflow's final step).
 
+**Malformed values degrade, they never destroy the line**: `ledger-append.mjs`'s
+`degradeEntry` validates the whole entry once; when every error it finds is
+value-level (a `findings[].lens`/`severity`/`ac_id` or `ac_verdicts[].verdict`
+failing its pattern/enum, a bad `verdicts.<lens>`/`trigger_counts.<key>` dict
+entry, a malformed `lenses_run[]` element, or an array item missing a required
+field entirely), each is neutralised in place rather than the whole write
+being refused. This is a general, schema-driven mechanism, not a per-field
+allowlist: earlier rounds sanitised `ac_id`, then separately `lens`/`severity`,
+each time only the field that round's review happened to name, and the next
+round always found the next sibling; `degradeEntry` instead neutralises any
+value-level violation the schema declares, present or future. A known sibling
+field retains a bounded (32-byte), path-redacted raw form
+(`ac_id_raw`/`lens_raw`/`severity_raw`/`verdict_raw`); anything else lands in
+a bounded `degraded_raw` array (`{path, raw}`, redacted the same way, capped
+at 10 entries). Every neutralisation is counted: `invalid_ac_ids_dropped` and
+`invalid_finding_fields_dropped` for their own named fields,
+`invalid_record_values_dropped` for everything else -- rendered in the
+optimiser's report both as its own summary line and, per criterion, as the
+reason a `never_failed` claim was degraded to unknown rather than a confident
+true or false. A record is still refused outright when a STRUCTURAL error
+remains: a required TOP-LEVEL field absent, an unknown top-level key, or the
+entry (or an array element) not being an object at all.
+
+**`HARNESS_LEDGER_READONLY`**: a lens that needs to run or probe
+`ledger-append.mjs` itself (a mutation experiment during planning or review)
+is instructed to set this on the SAME command line as the writer invocation --
+when truthy, the writer returns `write_ok:false` before touching stdin, git or
+the filesystem at all, so a lens's own probing can never land a test record in
+the operator's real, unbacked-up ledger. This is enforced at the lens-prompt
+boundary, not fully mechanical: a lens that ignores the instruction, or a
+caller other than a lens, is not stopped by it.
+
+**Terminal write and orphans**: a run normally leaves exactly the two lines
+described above, paired by `run_id`. When that pairing does not complete, the
+optimiser counts two separate orphan classes, broken down by workflow kind: a
+start-only orphan (the process was killed before the terminal write ran, or
+the terminal write's own payload was refused for a reason the degrade
+mechanism above does not cover) and a terminal-only orphan (the start write
+itself failed). An exception escaping a workflow's `run()` does not, by
+itself, produce a start-only orphan: the exception guard's `try/finally`
+always attempts a terminal write, landing as a paired `aborted` record
+instead.
+
 **Retention**: kept indefinitely as an ordinary untracked file; nothing in
 this repo prunes or rotates it. Because the ledger is gitignored, `git clean
 -xdf` deletes it too -- `-x` explicitly targets ignored files by design, and
@@ -292,13 +424,17 @@ symlinks, since it is matched against the writer's own already-resolved
 (not merely an ancestor) resolves correctly via the `PWD`-inode-match
 candidate. Only the specific combination — an absolute spec, built from a
 symlinked path, submitted from somewhere other than that exact symlinked
-directory — hits the marker. The ledger's `spec_raw` field (AC-DATA-4: the
-caller's original spec string, retained verbatim alongside the derived
-`plan_key`, so a canonicaliser defect is correctable without replaying the
-original caller) keeps the original string recoverable regardless, though
-retained only when a canonical key was actually derived — a genuinely
-out-of-repo or `..`-escaping spec is never retained raw, matching
-`spec`/`plan_key`'s own redaction (AC-SEC-1).
+directory — hits the marker. The ledger's `spec_raw` field (AC-DATA-4)
+keeps the caller's original spec string recoverable regardless, though
+**not verbatim**: an absolute spec found to live inside the repo root has
+only that in-repo prefix stripped (never the `./`/`..`-collapsing step
+`plan_key` itself performs), so `spec_raw` and `plan_key` can legitimately
+differ for the same record — `spec_raw` is the writer's insurance against
+a canonicaliser defect, correctable without replaying the original
+caller, not a byte-identical copy of what the caller sent. Retained only
+when a canonical key was actually derived — a genuinely out-of-repo or
+`..`-escaping spec is never retained raw, matching `spec`/`plan_key`'s own
+redaction (AC-SEC-1).
 
 ## Delivery optimiser
 
@@ -320,7 +456,16 @@ cycle was invoked in — gitignored via `.git/info/exclude` and verified with
 `git check-ignore -q` before every write (the write is refused if that
 check fails), mirroring `ledger-append.mjs`'s own discipline exactly via
 `workflows/lib/optimise-report-ignore.mjs`, and the **only** file any of
-its steps may create or modify. Every proposal carries
+its steps may create or modify.
+
+**Retention (F12, round-7 review)**: the report is a SECOND artefact
+derived from the ledger (plan keys, run ids, per-plan seconds, orphan
+counts) — deleting the ledger alone does not remove it. Overwritten in
+place on every cycle run, otherwise kept indefinitely; nothing in this
+repo prunes or rotates it. **Delete it** with `rm
+.claude/optimise-cycle-report.md` — the next scheduled cycle recreates it.
+
+Every proposal carries
 the measurement that motivated it and the measurement that would confirm or
 refute it after adoption, and cites a real ledger `run_id` or `gh` run id
 present in what it actually read; an uncited proposal is dropped
