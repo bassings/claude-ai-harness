@@ -289,6 +289,34 @@ if (scope.custom_rules !== null) {
         `Aborting the review rather than proceeding with an unvalidated override.`
       )
     }
+    // An EMPTY array is the silent-lens-loss case in a different costume, and
+    // it survived the first cut of this validation. Measured: an override of
+    // {"data": []} REPLACES the default data globs rather than extending them,
+    // so a changed .sql migration triggers ['lens-security','lens-qa'] where
+    // the defaults give ['lens-security','lens-qa','lens-data'] -- the lens is
+    // gone and the log still says "repo-tuned". That is exactly what this
+    // whole mechanism exists to prevent.
+    //
+    // It is rejected rather than merely logged because an empty array is
+    // indistinguishable from a transcription failure (an agent returning
+    // {"data": []} instead of the real list), and there is no documented way
+    // to disable a lens deliberately -- omitting the key inherits the
+    // defaults, so an empty array is not the supported spelling of anything.
+    if (value.length === 0) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" is an empty array, which would ` +
+        `REPLACE the harness defaults for that key and silently stop the corresponding lens triggering on any ` +
+        `path. Omit the key entirely to inherit the defaults. Aborting rather than reviewing with a lens ` +
+        `disabled by what may be a transcription failure.`
+      )
+    }
+    if (value.some(v => v.trim() === '')) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" array contains an empty glob ` +
+        `string, which matches nothing and is almost certainly not what was meant. Aborting rather than ` +
+        `proceeding with an override that silently covers less than it appears to.`
+      )
+    }
   }
 }
 

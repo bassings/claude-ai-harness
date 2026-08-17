@@ -73,6 +73,19 @@ An unvalidated object reaches `matches()` today, where a non-array value would
 throw an unrelated error deep in glob compilation, or a stray key would be
 silently ignored.
 
+**Amended during review of this change**, after the first cut of the validation
+accepted two inputs it should not have. An **empty array** is the silent
+lens-loss case in a different costume: measured, `{"data": []}` REPLACES the
+default data globs rather than extending them, so a changed `.sql` migration
+triggered `['lens-security','lens-qa']` where the defaults give
+`['lens-security','lens-qa','lens-data']` -- the lens was gone and the log
+still reported `repo-tuned`. It is rejected rather than logged because an empty
+array is indistinguishable from a transcription failure, and there is no
+supported way to disable a lens deliberately (omitting the key inherits the
+defaults, so an empty array is not the spelling of anything). An **empty-string
+glob** is rejected for the same reason in miniature: it matches nothing, so the
+override silently covers less than it appears to.
+
 **AC-SEC-4**: No content from `custom_rules` is interpolated into any later
 agent prompt. The overrides are matched by regex in the sandbox; a repo's
 override file is attacker-influenceable on a public repo, so its strings must

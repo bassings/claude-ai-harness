@@ -775,6 +775,46 @@ test('review-cycle.js: custom_rules with an array containing a non-string aborts
   )
 })
 
+// Found by the conductor's own edge probe during review of this PR, after the
+// first cut of the validation above accepted it. An EMPTY array is the
+// silent-lens-loss case in a different costume: measured, an override of
+// {"data": []} REPLACES the default data globs, so a changed .sql migration
+// triggered ['lens-security','lens-qa'] where the defaults give
+// ['lens-security','lens-qa','lens-data'] -- the lens was gone and the log
+// still said "repo-tuned". Rejected rather than logged, because an empty array
+// is indistinguishable from a transcription failure and there is no supported
+// way to disable a lens (omitting the key inherits the defaults).
+test('review-cycle.js: custom_rules with an EMPTY array aborts, rather than silently replacing the defaults and dropping that lens (AC-SEC-3)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: [] } } }),
+      }),
+    (err) => {
+      assert.match(err.message, /HarnessTriggersShapeInvalid/)
+      assert.match(err.message, /"data"/)
+      assert.match(err.message, /empty array/, 'the reason must name the empty array, not just say the shape is wrong')
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: custom_rules with an empty-string glob aborts, since it matches nothing and covers less than it appears to (AC-SEC-3)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: ['**/*.sql', '   '] } } }),
+      }),
+    (err) => {
+      assert.match(err.message, /HarnessTriggersShapeInvalid/)
+      assert.match(err.message, /empty glob/)
+      return true
+    }
+  )
+})
+
 // The accepted shape, enumerated positively per the semantic-test rule (not
 // just "doesn't throw" -- it must actually change triggering, proving the
 // value was used, not merely tolerated): all four known keys, each an array
