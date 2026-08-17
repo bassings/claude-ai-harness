@@ -479,6 +479,249 @@ heuristic derived from git history, not a verified per-PR attribution).
 (ledger lines per repo; default 2000)}` — never a hardcoded path or repo
 name; the repos it reads always come from `args` or its documented default.
 
+### Weekly scheduled run (HARN-OPT-2 T3)
+
+The weekly cadence above runs as a local launchd job
+(`com.local.optimise-cycle-weekly`, Mondays 07:41 local), driven by
+`bin/optimise-cycle-weekly.sh` in this repo. That script loops over the
+configured delivery repos, invokes `claude -p "/optimise-cycle ..."`
+headlessly against each (read-only, never applying a proposal, same as
+every other invocation of the cycle), and appends one redacted transcript
+per repo to `~/.claude/logs/optimise-cycle-weekly.log`.
+
+**PASS/FAIL is decided from the report artefact and this script's own
+observations, never from what the model said.** A repo passes only if,
+after the run: `<repo>/.claude/optimise-cycle-report.md` exists; its mtime
+is at or after the timestamp captured immediately before that repo's run
+started (this is what catches a stale report left over from a previous
+week -- the one failure mode a status-only check cannot see, since a
+leftover file looks identical to a fresh one to anything that only asks
+"does it exist"); and it is non-empty with at least a markdown heading and
+a section heading. The model's free-text reply is still appended to the
+log as diagnostic context, but the verdict never depends on it: a run that
+exits 0 and says nothing is a PASS if the artefact is genuinely fresh, and
+a run that exits 0 and says the right words is a FAIL if the artefact is
+stale, missing or empty. Each repo gets one `RESULT PASS`/`RESULT FAIL`
+line naming the reason; the script exits non-zero if any repo failed.
+
+A configured repo path that does not exist on disk is a **configuration
+FAIL** (`RESULT FAIL ... reason="configured repo path does not exist"`),
+distinct from a path that exists and genuinely is not a git repo
+(`SKIP ... (not a git repo)`) -- and a linked git **worktree** (whose
+`.git` is a file, not a directory) is processed exactly like an ordinary
+checkout, never skipped, since this harness runs from worktrees routinely.
+
+The header line carries `version=$SCRIPT_VERSION`, bumped whenever this
+script's behaviour changes materially, so the log shows which copy of the
+script actually produced a given run -- the same drift class AC-OPS-4
+already covers for `workflows/`, extended to this file.
+
+Covered by `test/weekly-runner.test.js`, which drives the real script
+against real temp git repos with a stub `claude` on PATH -- no test run ever
+makes a real model call.
+
+**Two guards this script previously shipped were removed, not fixed a
+third time (T3 subtraction round, specs/harn-opt-2.md conductor log ticks
+46-48).** Both looked like real containment and were proven, by execution,
+unable to fail in the way they claimed to -- and the owner's ruling on
+that finding was to cut them rather than patch either again:
+
+- **There is no per-run verdict nonce.** An earlier version had every
+  script-written log line carry `run=<hex>`, meant to stop the model
+  forging this script's own `RESULT PASS`. It did not work: the header
+  carrying the nonce was written to the log **before** `claude -p` ran, at
+  a path the model can read, so a forger only had to grep its own log for
+  the genuine nonce and echo it back -- proven with a real stub. A
+  hardcoded guessed nonce also shipped the test suite green, so the guard
+  was not load-bearing against a guesser either. The real containment
+  against a compromised or malicious model reply is, and always was, that
+  the verdict never trusts the model's stdout at all (see PASS/FAIL above)
+  -- the nonce added nothing to that.
+- **There is no `<repo>/.claude/` read-only postcondition.** An earlier
+  version also asserted, after the run, that nothing under the analysed
+  repo's `.claude/` other than the report itself had a newer mtime than
+  the run's own start. It was defeated by `touch`-back-dating a written
+  file, missed any write outside `.claude/` entirely (a stub writing
+  `.git/hooks/post-checkout` passed clean), and missed every deletion (no
+  forward mtime to see). Measured against a real delivery repo whose
+  `.claude/` held 50,120 files from orphaned worktrees (778 MB): the
+  per-file walk cost ~94s and its reason-string join was quadratic,
+  extrapolating to ~44 minutes and a single ~3.6 MB log line -- it would
+  have wedged this job for tens of minutes after `claude` had already
+  returned, guarding against a mutation a `touch -d` already defeated.
+
+**The real per-repo timeout is ~600s by default, not `timeout 3600`.** The
+optimiser runs as a background workflow inside `claude -p`, so the actual
+governing budget is `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`. The script sets
+it explicitly to 1,200,000ms (20 minutes -- 2.3x the worst measured real
+run, 515s on 2026-08-16) and aligns the outer `timeout` to match (ceiling +
+60s grace, `-k 60` to force a kill if claude ignores the polite one). Lowered
+from the earlier 1,800,000ms in the T3 subtraction round: now that a
+ceiling hit produces a self-diagnosing FAIL naming the cause (below),
+binding low costs one lost weekly report, while binding high costs up to
+31 minutes of unattended execution producing nothing. If a run hits the
+ceiling, the FAIL reason carries the CLI's own message verbatim
+(`Background tasks still running after Ns; terminating`), which also
+reveals whether the configured ceiling was actually honoured -- this is
+anchored to that specific message, not a bare grep for the ceiling
+variable's name, which used to false-positive on any transcript merely
+mentioning it (this README does, right here).
+
+**Permission constraints on the unattended job -- defence in depth, not a
+boundary.** `claude -p` runs here with `--disallowedTools` denying the
+destructive and outward-facing operations this read-only job never needs:
+`Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`, `Bash(git commit:*)`,
+`Bash(git reset:*)`, `Bash(gh pr merge:*)`, `Bash(gh pr create:*)`,
+`Bash(gh issue create:*)`, `Bash(gh release create:*)`,
+`Bash(gh workflow run:*)`, `Bash(curl:*)`, `Bash(wget:*)`, alongside
+`--settings '{"disableAllHooks": true}'` (see the plan-guard note below).
+Both are real: verified empirically, end to end, against a throwaway repo
+with both flags applied, a well-formed report was still produced (exit 0),
+and every one of the listed tools genuinely refused when invoked directly.
+**They are not a sandbox, and nothing here claims they are one.** The same
+real run showed `Write`, `Edit`, `mv` and `python3 -c` all succeed under
+this exact flag set -- `--disallowedTools` denies only its literal
+enumerated targets, and `--settings` **merges** with (does not replace)
+the global `defaultMode: auto`, so a tool not on the list is still
+reachable. The actual containment for this job is the prompt's own
+read-only instruction plus the fact that the verdict never trusts what the
+model says (PASS/FAIL above); these flags are real, additional defence in
+depth behind that, not a second, independent boundary. `--permission-mode
+plan` was considered and rejected: plan mode would prevent the optimiser
+writing the report this script's own verdict depends on, silently trading
+a permission problem for a job that runs and produces nothing.
+`test/static-checks.test.js` pins the exact deny tokens and the
+`disableAllHooks` blob in the script text, so neither can be quietly
+dropped -- deleting either previously left the whole weekly-runner test
+suite green, since every test there drives a stub `claude`, never the real
+flags.
+
+**The plan-guard Stop hook is the one measured mutation source, and
+`disableAllHooks` genuinely stops it.** Measured 2026-08-16: the
+globally-installed conductor plan-guard Stop hook touched
+`.claude/active-plan` in both delivery repos during the real run, as a
+side effect of the background workflow the optimiser launches -- nothing
+this script does, but a mutation of the analysed repo all the same.
+`--settings '{"disableAllHooks": true}'` stops that hook firing for this
+one invocation (verified empirically: `.claude/active-plan`'s mtime was
+unchanged after a real run against a repo with the identical hook wired
+and an open-task plan active). There is no postcondition checking this
+after the fact any more (see the subtraction-round note above for why).
+
+**Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
+and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` synced from this
+repo's `bin/`** after merging any change to them, the same discipline as
+the `workflows/` mirror above (AC-OPS-4):
+
+```bash
+cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
+cp claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
+chmod +x ~/.claude/bin/optimise-cycle-weekly.sh
+diff -q claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
+diff -q claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
+```
+
+As of this change, that sync has not yet happened: `~/.claude/bin/optimise-cycle-weekly.sh`
+is still the pre-existing, unreviewed version this PR replaces, and re-syncing
+it is a merge-time step, not something this branch does to a path outside
+the repo.
+
+`OPTIMISE_WEEKLY_REPOS` (newline-separated repo list) and
+`OPTIMISE_WEEKLY_LOG` (log file path) are read by the script but exist only
+as a test seam for `test/weekly-runner.test.js`; they are never operator
+configuration and neither is documented as a knob to set.
+
+**The delivery repo list is real operator configuration, not this file's
+hardcoded content.** When `OPTIMISE_WEEKLY_REPOS` is unset, the script
+reads `$HOME/.claude/optimise-weekly-repos` -- one repo path per line,
+blank lines ignored, never tracked in this or any repo. Set it up once:
+
+```bash
+mkdir -p ~/.claude
+cat > ~/.claude/optimise-weekly-repos <<'EOF'
+/path/to/your/first/delivery/repo
+/path/to/your/second/delivery/repo
+EOF
+```
+
+If the file does not exist, the script still runs cleanly with an empty
+repo list (a clean start/done log, exit 0, nothing to do) rather than
+crashing or falling back to any hardcoded path -- this public repo carries
+no private repo names or account paths in its own tracked files
+(`test/static-checks.test.js` guards `bin/` for exactly that).
+
+#### Installing and rolling back the launchd job
+
+`bin/com.local.optimise-cycle-weekly.plist` in this repo is a **template**:
+every `/Users/YOUR_USERNAME` path in it is a placeholder (launchd plists
+are not shell-expanded, so `$HOME`/`~` do not work inside one) -- replace
+all three with your own `$HOME` before installing, since a plist naming an
+account path is not something this public repo carries verbatim for its
+maintainer's own machine (the same class of leak the transcript redaction
+above, and AC-SEC-3, both exist to prevent).
+
+```bash
+sed "s#/Users/YOUR_USERNAME#$HOME#g" claude-ai-harness/bin/com.local.optimise-cycle-weekly.plist \
+  > ~/Library/LaunchAgents/com.local.optimise-cycle-weekly.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.optimise-cycle-weekly.plist
+```
+
+**Rollback.** A code revert in this repo (or in git history generally)
+does **not** stop a scheduled launchd job by itself -- launchd reads the
+installed plist independently of this repo's state, so the job keeps
+firing weekly until the plist is explicitly removed from launchd. To
+disable it:
+
+```bash
+launchctl bootout gui/$(id -u)/com.local.optimise-cycle-weekly
+rm ~/Library/LaunchAgents/com.local.optimise-cycle-weekly.plist
+```
+
+To reinstate it later, re-run the two-line `sed`/`bootstrap` install above.
+
+#### Log retention
+
+The log is appended to indefinitely; nothing in this repo rotates or
+prunes it. Measured: ~640 bytes per run (two repos), roughly 33 KB/year at
+the weekly cadence -- rotation is deliberately **not** implemented, since
+it would risk truncating the only place a real run's `RESULT` lines live,
+for a growth rate too small to justify the risk. **Delete it** with
+`rm ~/.claude/logs/optimise-cycle-weekly.log` -- the next scheduled run
+recreates it automatically. The transcript portion of each entry is
+redacted (`bin/redact-transcript.mjs`, reusing `workflows/lib/ledger-append.mjs`'s
+`redactPaths`) and every line this script itself writes uses the repo's
+basename rather than its absolute filesystem path, so the log carries no
+`/Users/`, `/Volumes/`, `/home/` path or account name -- the same standard
+the ledger and report already hold themselves to (AC-SEC-3 in
+`specs/optimise-cycle.md`).
+
+**Two redaction fixes landed in the T3 subtraction round (conductor log
+tick 46), against a real leaked line**, not a synthetic one: an archived
+2026-08-16 log line naming a real delivery repo's report path, fed through
+the redactor as it shipped, came through **completely unchanged**, because
+Claude formats a path in backticks by default and `ABSOLUTE_PATH_RE`'s
+prefix class did not recognise one.
+
+- `ABSOLUTE_PATH_RE` (`workflows/lib/ledger-append.mjs`) now also anchors
+  on a backtick, `` = ``, `[`, `<` or `,` immediately before a path, and on
+  `:` when not immediately followed by `//` (so a `https://`/`http://` URL
+  in ordinary prose is never mistaken for a path and mangled -- proven
+  both ways in `test/ledger-append.test.js`).
+- `bin/redact-transcript.mjs` adds a second, belt-and-braces pass **after**
+  the regex: a plain literal-substring replacement of this process's own
+  `os.homedir()` and `os.userInfo().username`. This catches every form a
+  regex over free-text prose can miss, including a bare `$(whoami)` leak
+  with no path shape at all to anchor on (proven separately, in a stub
+  that printed the account name with no surrounding path).
+
+Separately: the redaction-failure fallback message (when
+`redact-transcript.mjs` is missing or fails) now names the script by its
+**relative** path (`bin/redact-transcript.mjs`), not `$REDACT_SCRIPT`'s
+absolute one -- the earlier form put this operator's own account path into
+the very fallback message that exists to protect against exactly that
+leak, and that branch was live: the installed mirror had no
+`redact-transcript.mjs` at all until this PR added the sync step above.
+
 ## Tests
 
 This repo's own tests need only Node (no `npm install`, no dependency

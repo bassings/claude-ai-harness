@@ -851,7 +851,22 @@ const TRUNCATABLE_FIELDS = ['task', 'spec', 'spec_raw', 'round_key', 'event', 'e
 // lexical resolution in main(), below) -- it is used only for genuinely
 // free-text fields (task, round_key, event, event_key) where a shape-based
 // scan over prose is the best available tool, matching main's own scope.
-const ABSOLUTE_PATH_RE = /(^|[\s'"(])([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+//
+// T3 subtraction round (specs/harn-opt-2.md conductor log tick 46): the
+// prefix class above missed a path wrapped in backticks -- Claude's default
+// way of formatting one -- and the REAL 2026-08-16 leaked log line proved
+// it: fed through unchanged. Widened to also anchor on a backtick, `=`,
+// `[`, `<` or `,` immediately before the path, which is the shape a
+// formatted or templated leak actually takes (`` `/path` ``, `key=/path`,
+// `[/path]`, `<file:///path>`, a comma-separated list entry). `:` is
+// included too, but ONLY when not immediately followed by `//` -- an
+// unguarded `:` would treat every `https://`/`http://` URL's scheme
+// separator as a path boundary and mangle the URL into the redaction
+// marker, which is exactly the "matched inside ordinary, safe text"
+// regression class the comment above already names twice. Proven both
+// ways in test/ledger-append.test.js: a colon-prefixed path redacts, a
+// GitHub-style https URL survives untouched.
+const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
 
 // The fixed marker for a path that cannot be safely recorded: an absolute
 // path outside the repo root, or (HARN-OPT-2 PR1, AC-SEC-1 case d) a

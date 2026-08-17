@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template launchd job for bin/optimise-cycle-weekly.sh (HARN-OPT-2 T3).
+
+  This is a TEMPLATE: every /Users/YOUR_USERNAME path below is a
+  placeholder -- replace all three with your own $HOME before installing
+  (launchd plists are not shell-expanded, so $HOME/~ do not work here).
+  See README.md's "Weekly scheduled run" section for the install and
+  rollback commands.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.optimise-cycle-weekly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/.claude/bin/optimise-cycle-weekly.sh</string>
+    </array>
+
+    <!-- Mondays at 07:41 local. Off-the-hour deliberately: :00 is the busiest
+         minute on every scheduler, and nothing here needs a precise time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>41</integer>
+    </dict>
+
+    <!-- If the machine was asleep at the scheduled time, launchd coalesces
+         the missed firing and runs once on wake rather than silently
+         skipping the week (man 5 launchd.plist). -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.claude/logs/optimise-cycle-weekly.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.claude/logs/optimise-cycle-weekly.err</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
