@@ -15,6 +15,7 @@ const SCOPE_OK = {
   new_dependency_entries: false,
   new_modules: false,
   custom_rules: null,
+  harness_triggers_file_exists: false,
 }
 
 const SECURITY_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] }
@@ -620,3 +621,237 @@ for (const falsyValue of [null, undefined, 0, '']) {
     )
   })
 }
+
+// specs/custom-rules-fail-closed.md: .claude/harness-triggers.json is
+// transcribed by an LLM step into custom_rules. If it fails to arrive for
+// one run, the merge at :227 (Object.assign({}, DEFAULT_RULES,
+// scope.custom_rules || {})) silently falls back to harness defaults with
+// no error -- a review conducted with the wrong lens roster and no sign of
+// it. These tests pin the fail-closed fix: a required boolean
+// harness_triggers_file_exists, a contradiction check (file exists +
+// custom_rules null = abort), shape validation of custom_rules before use,
+// and the rule source surfaced in the log and the ledger.
+
+// AC-SEC-1: both custom_rules and harness_triggers_file_exists are on the
+// scope schema's `required` list, matching the M6 precedent above (asserting
+// the declared schema object directly, not merely a fixture's behaviour).
+test('review-cycle.js: the scope agent() call declares custom_rules and harness_triggers_file_exists as REQUIRED on its schema (AC-SEC-1)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const scopeCall = calls.find((c) => c.opts.label === 'scope:diff')
+  assert.ok(scopeCall, 'expected a scope:diff call')
+  assert.deepEqual(
+    scopeCall.opts.schema.required.slice().sort(),
+    ['base', 'custom_rules', 'files', 'harness_triggers_file_exists', 'head_sha', 'new_dependency_entries', 'new_modules']
+  )
+  assert.deepEqual(scopeCall.opts.schema.properties.harness_triggers_file_exists.type, 'boolean')
+  assert.deepEqual(scopeCall.opts.schema.properties.custom_rules.type, ['object', 'null'], 'custom_rules keeps its loose type -- shape validation happens in the workflow, not the schema')
+})
+
+// AC-SEC-1 behavioural half: a scope response genuinely OMITTING the new
+// required field (not merely set to a falsy value) must be rejected by the
+// runtime's own structured-output enforcement -- confirmed here via the same
+// schema-validating fake-runtime stub every other schema test in this file
+// relies on.
+test('review-cycle.js: a scope response with harness_triggers_file_exists omitted entirely fails structured-output validation (AC-SEC-1)', async () => {
+  const { harness_triggers_file_exists, ...scopeWithoutField } = SCOPE_OK
+  await assert.rejects(
+    () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': scopeWithoutField }) }),
+    /does not match its declared schema/
+  )
+})
+
+// AC-SEC-2 / AC-QA-1: the contradiction that catches a transcription
+// failure -- the override file is there (the agent saw it) and its contents
+// did not arrive. Deleting this guard (i.e. going back to `scope.custom_rules
+// || {}`) must fail this test.
+test('review-cycle.js: aborts naming a transcription failure when harness_triggers_file_exists is true and custom_rules is null (AC-SEC-2, AC-QA-1)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: null } }),
+      }),
+    (err) => {
+      assert.match(err.message, /HarnessTriggersTranscriptionFailed/, 'the error must be named, not a generic message')
+      assert.match(err.message, /custom_rules/)
+      return true
+    }
+  )
+})
+
+// AC-OPS-3: the abort message must say what the operator should do next, not
+// merely that something went wrong.
+test('review-cycle.js: the transcription-failure abort message tells the operator to re-run and what a recurrence means (AC-OPS-3)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: null } }),
+      }),
+    (err) => {
+      assert.match(err.message, /re-run/i)
+      assert.match(err.message, /override file is not being read/i)
+      return true
+    }
+  )
+})
+
+// AC-QA-2: the guard must not over-trigger. Both non-failure combinations
+// still work: file absent (proceeds on defaults) and file present with a
+// VALID custom_rules (proceeds on the merged rules, which actually changes
+// lens triggering).
+test('review-cycle.js: file absent + custom_rules null proceeds on harness defaults, no abort (AC-QA-2)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: false, custom_rules: null } }),
+  })
+  assert.equal(result.telemetry.outcome, 'done')
+})
+
+test('review-cycle.js: file present + valid custom_rules proceeds on the merged rules, actually changing which lenses trigger (AC-QA-2)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        harness_triggers_file_exists: true,
+        custom_rules: { ui: ['**/*.foo'] },
+        files: [{ path: 'src/x.foo', status: 'M' }],
+      },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-design'), 'the custom ui glob (which does not match any DEFAULT_RULES.ui pattern) must have triggered lens-design')
+  assert.equal(result.telemetry.outcome, 'done')
+})
+
+// AC-SEC-3 / AC-QA-3: custom_rules is shape-validated before it reaches
+// matches() / glob compilation. Per rejection class, per the semantic-test
+// rule -- not just the one malformed case the code happens to check first:
+// an unknown key, a non-array value, and an array containing a non-string.
+test('review-cycle.js: custom_rules with an unrecognised key aborts naming the offending key (AC-SEC-3, AC-QA-3)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { bogus: ['**/*.js'] } } }),
+      }),
+    (err) => {
+      assert.match(err.message, /HarnessTriggersShapeInvalid/)
+      assert.match(err.message, /bogus/)
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: custom_rules with a non-array value aborts naming the offending key (AC-SEC-3, AC-QA-3)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { ui: 'not-an-array' } } }),
+      }),
+    (err) => {
+      assert.match(err.message, /HarnessTriggersShapeInvalid/)
+      assert.match(err.message, /"ui"/)
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: custom_rules with an array containing a non-string aborts naming the offending key (AC-SEC-3, AC-QA-3)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: ['**/*.sql', 42] } } }),
+      }),
+    (err) => {
+      assert.match(err.message, /HarnessTriggersShapeInvalid/)
+      assert.match(err.message, /"data"/)
+      return true
+    }
+  )
+})
+
+// The accepted shape, enumerated positively per the semantic-test rule (not
+// just "doesn't throw" -- it must actually change triggering, proving the
+// value was used, not merely tolerated): all four known keys, each an array
+// of strings.
+test('review-cycle.js: custom_rules with all four known keys, each a valid array of strings, is accepted and used (AC-SEC-3)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        harness_triggers_file_exists: true,
+        custom_rules: { ui: ['**/*.foo'], data: ['**/*.bar'], architecture: ['**/*.baz'], operability: ['**/*.qux'] },
+        files: [{ path: 'scripts/x.qux', status: 'M' }],
+      },
+      'lens-operability': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-operability'), 'the custom operability glob must have triggered lens-operability')
+  assert.equal(result.telemetry.outcome, 'done')
+})
+
+// AC-SEC-4: custom_rules content (a glob string) must never reach a later
+// agent prompt -- it is matched by regex in the sandbox only.
+test('review-cycle.js: no content from custom_rules is interpolated into any later agent prompt (AC-SEC-4)', async () => {
+  const marker = 'UNIQUE_MARKER_zzq93_never_in_a_prompt'
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { ui: [`**/${marker}/**`] } },
+    }),
+  })
+  for (const call of calls) {
+    assert.ok(!call.prompt.includes(marker), `custom_rules content leaked into the prompt for label "${call.opts.label}"`)
+  }
+})
+
+// AC-OPS-1 / AC-QA-4: the log line states which rule source was used and,
+// when repo-tuned, the count of overridden keys -- asserting only that SOME
+// log line exists would pass with the source omitted.
+test('review-cycle.js: the log states the rule source is repo-tuned with the count of overridden keys (AC-OPS-1, AC-QA-4)', async () => {
+  const { logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { ui: ['**/*.foo'], data: ['**/*.bar'] } },
+    }),
+  })
+  const line = logs.find((l) => l.includes('Rule source'))
+  assert.ok(line, `expected a log line naming the rule source, got ${JSON.stringify(logs)}`)
+  assert.match(line, /repo-tuned/)
+  assert.match(line, /2/, 'must report the count of overridden keys (2: ui, data)')
+})
+
+test('review-cycle.js: the log states the rule source is harness defaults when no override is in force (AC-OPS-1, AC-QA-4)', async () => {
+  const { logs } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const line = logs.find((l) => l.includes('Rule source'))
+  assert.ok(line, `expected a log line naming the rule source, got ${JSON.stringify(logs)}`)
+  assert.match(line, /harness defaults/)
+})
+
+// AC-OPS-2: the rule source is recorded in the run ledger, both in the
+// workflow's own telemetry and in the terminal payload sent to
+// ledger-append.mjs.
+test('review-cycle.js: telemetry.rule_source and rule_source_overridden_keys are repo-tuned/1 and reach the ledger payload (AC-OPS-2)', async () => {
+  const { result, calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { ui: ['**/*.foo'] } } }),
+  })
+  assert.equal(result.telemetry.rule_source, 'repo-tuned')
+  assert.equal(result.telemetry.rule_source_overridden_keys, 1)
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.rule_source, 'repo-tuned')
+  assert.equal(payload.rule_source_overridden_keys, 1)
+})
+
+test('review-cycle.js: telemetry.rule_source is "harness defaults" with a null overridden-key count when no override applies (AC-OPS-2)', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.equal(result.telemetry.rule_source, 'harness defaults')
+  assert.equal(result.telemetry.rule_source_overridden_keys, null)
+})

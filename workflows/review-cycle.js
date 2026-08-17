@@ -66,6 +66,13 @@ let acVerdicts = []
 // openFindingsRaw/acVerdicts: set as soon as lensReports exists, so a late
 // throw still leaves an accurate trail.
 let lensesRunRaw = []
+// specs/custom-rules-fail-closed.md AC-OPS-1/2: which rule source actually
+// governed lens triggering ('repo-tuned' or 'harness defaults'), and -- when
+// repo-tuned -- how many keys the override changed. Set once scope.custom_rules
+// has been validated (below), read after run() resolves, same accumulator
+// pattern as triggerCounts/lensesRunRaw above.
+let ruleSource = null
+let ruleSourceOverriddenKeys = null
 
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
@@ -199,7 +206,9 @@ const scope = await agent(
   `1. Determine the base ref: ${opts.base ? `use "${opts.base}".` : 'the repository default branch (usually main or master; check `git remote show origin` or local branch names).'}\n` +
   `2. Run \`git diff --name-status <base>...HEAD\` and return every changed file path with its status letter, plus the base ref you used and the exact output of \`git rev-parse HEAD\` as head_sha.\n` +
   `3. Report whether any dependency manifest (package.json, requirements*.txt, pyproject.toml, go.mod, Cargo.toml, Gemfile, or equivalent) gained a NEW entry (a new package, not a version bump), and whether the diff ADDS a new module or package (a new source file outside tests, or a new package directory).\n` +
-  `4. If a file .claude/harness-triggers.json exists at the repo root, return its parsed JSON as custom_rules; otherwise null.\n` +
+  `4. Check whether a file .claude/harness-triggers.json exists at the repo root and report that as ` +
+  `harness_triggers_file_exists (true/false). If it exists, return its parsed JSON as custom_rules; if it does not ` +
+  `exist, custom_rules must be null.\n` +
   `Raw data only.`,
   {
     label: 'scope:diff',
@@ -207,14 +216,23 @@ const scope = await agent(
     effort: 'low',
     schema: {
       type: 'object',
-      required: ['base', 'head_sha', 'files', 'new_dependency_entries', 'new_modules'],
+      required: ['base', 'head_sha', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists'],
       properties: {
         base: { type: 'string' },
         head_sha: { type: 'string' },
         files: { type: 'array', items: { type: 'object', required: ['path', 'status'], properties: { path: { type: 'string' }, status: { type: 'string' } } } },
         new_dependency_entries: { type: 'boolean' },
         new_modules: { type: 'boolean' },
+        // AC-SEC-1: type stays loose (contents are shape-validated in the
+        // workflow itself, below, not by this schema) -- but `required` now
+        // catches an OMITTED field, which the runtime's structured-output
+        // enforcement rejects before the workflow ever sees it.
         custom_rules: { type: ['object', 'null'] },
+        // AC-SEC-1/AC-SEC-2: a second, independent answer that can
+        // CONTRADICT custom_rules -- true + custom_rules:null is exactly the
+        // transcription failure this whole spec exists to catch (a
+        // single-field report has no way to be self-inconsistent).
+        harness_triggers_file_exists: { type: 'boolean' },
       },
     },
   }
@@ -224,6 +242,61 @@ if (!scope || !scope.files.length) return { report: 'No changes found between th
 headSha = scope.head_sha
 
 const base = scope.base
+
+// specs/custom-rules-fail-closed.md AC-SEC-2: the contradiction that catches
+// a transcription failure. The scope step has no filesystem access of its
+// own to double-check itself, so this compares its two independent answers:
+// if the file was reported to exist but its parsed contents did not arrive,
+// that is a transcription failure in the scope step, not evidence the file
+// has no overrides. Proceeding on defaults here would silently review with
+// the wrong lens roster and no sign of it (the measured blast radius this
+// spec exists to close) -- fail closed instead.
+if (scope.harness_triggers_file_exists === true && scope.custom_rules === null) {
+  throw new Error(
+    'HarnessTriggersTranscriptionFailed: .claude/harness-triggers.json exists at the repo root ' +
+    '(harness_triggers_file_exists is true) but custom_rules did not arrive (it is null) -- a transcription ' +
+    'failure in the scope step, not evidence the override file is empty. Aborting the review rather than ' +
+    'silently falling back to harness defaults, which would review with the wrong lens roster and no sign of ' +
+    'it. Re-run the review; if this recurs, the override file is not being read.'
+  )
+}
+
+// AC-SEC-3: shape-validate custom_rules before it is merged into the trigger
+// rules and reaches matches()/glob compilation. Unvalidated, a non-array
+// value throws an unrelated error deep in glob compilation and a stray key
+// is silently ignored -- neither of which names what is actually wrong with
+// the repo's override file.
+const CUSTOM_RULE_KEYS = ['ui', 'data', 'architecture', 'operability']
+if (scope.custom_rules !== null) {
+  for (const key of Object.keys(scope.custom_rules)) {
+    if (!CUSTOM_RULE_KEYS.includes(key)) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json has an unrecognised key "${key}" -- only ` +
+        `${CUSTOM_RULE_KEYS.join(', ')} are accepted. Aborting the review rather than proceeding with an ` +
+        `unvalidated override.`
+      )
+    }
+    const value = scope.custom_rules[key]
+    if (!Array.isArray(value)) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" must be an array of glob strings, ` +
+        `got ${typeof value}. Aborting the review rather than proceeding with an unvalidated override.`
+      )
+    }
+    if (value.some(v => typeof v !== 'string')) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" array contains a non-string glob. ` +
+        `Aborting the review rather than proceeding with an unvalidated override.`
+      )
+    }
+  }
+}
+
+// AC-OPS-1/AC-OPS-2: which rule source governed lens triggering, for the log
+// line below and the run ledger.
+ruleSource = scope.custom_rules ? 'repo-tuned' : 'harness defaults'
+ruleSourceOverriddenKeys = scope.custom_rules ? Object.keys(scope.custom_rules).length : null
+
 const rules = Object.assign({}, DEFAULT_RULES, scope.custom_rules || {})
 const paths = scope.files.map(f => f.path)
 
@@ -286,7 +359,12 @@ if (opts.adversarial) lenses.push('reviewer-verification')
 
 const ALL = ['lens-security', 'lens-qa', 'lens-design', 'lens-accessibility', 'lens-data', 'lens-architecture', 'lens-operability', 'lens-product']
 const skipped = ALL.filter(l => !lenses.includes(l))
-log(`Reviewing ${paths.length} changed files against ${base} at ${scope.head_sha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}.`)
+// AC-OPS-1/AC-QA-4: names which rule source governed the trigger match above
+// (repo-tuned, with the count of overridden keys, or harness defaults) so an
+// operator reading the run output can tell which applied without inspecting
+// the repo.
+const ruleSourceText = ruleSource === 'repo-tuned' ? `repo-tuned (${ruleSourceOverriddenKeys} overridden keys)` : 'harness defaults'
+log(`Reviewing ${paths.length} changed files against ${base} at ${scope.head_sha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}. Rule source: ${ruleSourceText}.`)
 
 // ---- Phase 2: lenses in parallel, each in its own worktree ----
 const REVIEW_SCHEMA = {
@@ -490,6 +568,14 @@ const telemetry = {
   // -- unlike spec_bugs/rejected_findings/open_findings -- it needs no
   // further processing by ledger-append.mjs and rides in telemetry proper.
   ac_verdicts: acVerdicts,
+  // AC-OPS-2: which rule source governed lens triggering on this run, so a
+  // later reader of this ledger can report how often overrides are in force
+  // and detect a repo whose tuning silently stopped arriving across runs.
+  // null on a run that never reached the scope validation (e.g. the scope
+  // agent itself failed), distinguishable from a genuine "harness defaults"
+  // measurement.
+  rule_source: ruleSource,
+  rule_source_overridden_keys: ruleSourceOverriddenKeys,
 }
 // spec_bugs/rejected_findings ride along as raw descriptors for
 // ledger-append.mjs to hash into finding ids; they are NOT part of the
