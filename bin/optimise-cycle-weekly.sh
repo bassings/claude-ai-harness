@@ -27,12 +27,6 @@
 #   distinguishes them: a missing path is a configuration FAIL, a worktree
 #   (whose .git is a FILE) is processed normally, and only a path that
 #   exists and genuinely isn't a repo is SKIPped.
-#   Group 3 -- the model's own stdout and this script's verdict lines used
-#   to share one file and one format, so a stub/model printing its own
-#   "RESULT PASS ..." landed indistinguishable from a real verdict. Every
-#   line this script itself writes now carries a per-run nonce (NONCE,
-#   below) that is never passed into the model's prompt, so a forged line
-#   can never carry it.
 #   Group 4 -- the unattended `claude -p` invocation had no permission
 #   constraint at all. --disallowedTools below denies the destructive and
 #   outward-facing operations the read-only optimiser never needs;
@@ -48,10 +42,7 @@
 #   the 2026-08-16 run. --settings '{"disableAllHooks": true}' stops the
 #   hook firing for this invocation (verified empirically: active-plan's
 #   mtime was unchanged after a real run against a repo with the identical
-#   hook wired and an open-task plan active). verdict_repo also asserts
-#   this as a postcondition, independent of whether the flag holds: nothing
-#   under $repo/.claude/ other than the report itself may have a newer
-#   mtime than this run's own start.
+#   hook wired and an open-task plan active).
 #   Group 6 -- the optimiser runs as a BACKGROUND workflow inside
 #   `claude -p`, so the real governing budget is
 #   CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (~600s unstated default), not the
@@ -72,6 +63,69 @@
 #   repo path; a leading UTF-8 BOM on an otherwise well-formed report no
 #   longer reads as "no heading".
 #
+# SUBTRACTION ROUND (T3 review round 2, circuit-breaker escalated and
+# ruled -- specs/harn-opt-2.md conductor log ticks 46-48): review round 2
+# proved two of round 1's own guards cannot fail in the way they claimed to,
+# which is worse than no guard -- both are REMOVED here rather than patched
+# a third time:
+#   - The per-run verdict nonce (former Group 3) is GONE. It was meant to
+#     stop the model forging this script's own RESULT lines, but the header
+#     carrying `run=$NONCE` was written to a fixed, world-readable log path
+#     BEFORE `claude -p` ran, so a forger only had to `grep` its own log for
+#     the genuine nonce and echo it back -- proven live. A hardcoded guessed
+#     nonce also shipped the suite green, so the guard was not load-bearing
+#     against a guesser either. No replacement guard: the real containment
+#     for a compromised/malicious model reply is that verdict_repo below
+#     never trusts the model's stdout at all (D1), which the nonce was never
+#     actually adding to.
+#   - The `<repo>/.claude/` postcondition walk (former part of Group 5) is
+#     GONE. It was defeated by back-dating a written file's mtime with
+#     `touch`, missed any write outside `.claude/` entirely (a stub writing
+#     `.git/hooks/post-checkout` passed clean), and missed every deletion
+#     (no forward mtime to see). Measured against a real delivery repo whose
+#     `.claude/` held 50,120 orphaned-worktree files (778 MB): the per-file
+#     walk cost ~94s and its reason-string join was QUADRATIC, extrapolating
+#     to ~44 minutes and a ~3.6 MB single log line -- it would have wedged
+#     this job long after `claude` returned, for a check that a `touch -d`
+#     already defeated. --settings '{"disableAllHooks": true}' (kept, below)
+#     is real defence in depth against the ONE measured mutation source (the
+#     plan-guard Stop hook); it is not a general read-only boundary, and
+#     nothing here claims it is one.
+#
+# Round-2 fixes to what SURVIVED review round 2 (same conductor log ticks):
+#   - `--disallowedTools` and `--settings disableAllHooks` are KEPT: both
+#     genuinely block their literal targets (proven by real `claude -p`
+#     runs), which is real defence in depth. What was false is the CLAIM
+#     that they bound the job, not the controls themselves: under the
+#     shipped flag set, a real run against a throwaway repo showed `Write`,
+#     `Edit`, `mv` and `python3 -c` all succeed, and `--settings` MERGES
+#     with the global `defaultMode: auto` rather than replacing it. This is
+#     defence in depth behind the PROMPT's read-only instruction, not a
+#     boundary -- test/static-checks.test.js pins the exact deny tokens and
+#     the disableAllHooks blob so neither can be quietly dropped.
+#   - The background-wait ceiling detector no longer greps for the bare
+#     `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` variable NAME, which false-
+#     positived on any transcript merely mentioning it (this repo's own
+#     README now does). It anchors to the CLI's real message and captures
+#     the observed wait into the FAIL reason.
+#   - The ceiling is lowered from 1,800,000ms to 1,200,000ms (20 minutes):
+#     now that hitting it produces a self-diagnosing FAIL naming the cause,
+#     binding low costs one lost weekly report while binding high costs up
+#     to 31 minutes of unattended execution producing nothing. 1200s is
+#     2.3x the worst measured real run (515s).
+#   - A FAIL now prints one line to stderr before exiting, so the plist's
+#     already-wired StandardErrorPath channel (0 bytes since 11 Aug) turns
+#     non-empty exactly when there is something to see.
+#   - The default repo list no longer hardcodes this operator's private
+#     repo names and volume layout in a public repo. It is read from
+#     $HOME/.claude/optimise-weekly-repos (one path per line, never tracked
+#     anywhere), promoting the existing test-seam env var to real operator
+#     configuration.
+#   - The internal start_epoch validity check inside verdict_repo (former
+#     Group 8) is gone: it duplicated the caller's own check below, which
+#     already `continue`s past a repo before verdict_repo is ever called
+#     for it, so the internal branch could never fire.
+#
 # Two environment variables exist ONLY as a test seam, read by
 # test/weekly-runner.test.js, and are never operator-facing configuration:
 # OPTIMISE_WEEKLY_REPOS (newline-separated repo list) and
@@ -87,12 +141,12 @@ set -u
 # default.
 export PATH="$PATH:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# Group 7 (drift marker): bumped whenever this script's behaviour changes
-# materially. Printed on the run's own header line (below) so the log
-# shows which copy of the script actually ran -- the installed mirror at
-# ~/.claude/bin/ can otherwise drift silently out of sync with this repo
-# (the same class AC-OPS-4 already covers for workflows/).
-SCRIPT_VERSION="2026-08-17.1"
+# Drift marker: bumped whenever this script's behaviour changes materially.
+# Printed on the run's own header line (below) so the log shows which copy
+# of the script actually ran -- the installed mirror at ~/.claude/bin/ can
+# otherwise drift silently out of sync with this repo (the same class
+# AC-OPS-4 already covers for workflows/).
+SCRIPT_VERSION="2026-08-17.2"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REDACT_SCRIPT="$SCRIPT_DIR/redact-transcript.mjs"
@@ -100,81 +154,74 @@ REDACT_SCRIPT="$SCRIPT_DIR/redact-transcript.mjs"
 LOG="${OPTIMISE_WEEKLY_LOG:-$HOME/.claude/logs/optimise-cycle-weekly.log}"
 REPORT_REL=".claude/optimise-cycle-report.md"
 
-# Group 6: state the real budget explicitly rather than inheriting whatever
-# the CLI's own unstated default happens to be (measured: SaidOfYou used
-# 85.8% of that unstated ~600s default on 2026-08-16; the 11 Aug run
-# actually hit it). 30 minutes gives real headroom over both measured real
-# runs (515s, 311s). The outer `timeout` is aligned to it (ceiling + a 60s
-# grace period for claude's own shutdown), with -k 60 forcing a hard kill
-# if it ignores the polite one.
-CEILING_MS=1800000
+# Subtraction round: the real budget is stated explicitly and lowered to
+# 1200s (20 minutes) -- 2.3x the worst measured real run (515s,
+# 2026-08-16), now that a ceiling hit produces a self-diagnosing FAIL
+# naming the cause instead of an unexplained stale/missing report. The
+# outer `timeout` is aligned to it (ceiling + a 60s grace period for
+# claude's own shutdown), with -k 60 forcing a hard kill if it ignores the
+# polite one.
+CEILING_MS=1200000
 export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CEILING_MS"
 CEILING_S=$(( CEILING_MS / 1000 ))
 TIMEOUT_S=$(( CEILING_S + 60 ))
 
-# Group 3: a per-run nonce, generated here and NEVER embedded in the claude
-# prompt below, so a verdict line this script itself writes is
-# distinguishable from anything the model's own stdout could print into the
-# same log (the transcript and the verdicts share one file). The pattern
-# mirrors optimise-cycle.js's own per-run <UNTRUSTED-DATA-<nonce>> nonce.
-nonce_source() {
-  od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'
+# Trims leading/trailing whitespace from $1 and appends it to the REPOS
+# array unless the trimmed result is empty. Shared by both REPOS sources
+# below so a blank line means the same thing in either one.
+add_repo_line() {
+  local line="$1" trimmed
+  trimmed="${line#"${line%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+  [ -n "$trimmed" ] && REPOS+=("$trimmed")
 }
-NONCE="$(nonce_source)"
-if [ -z "$NONCE" ]; then
-  NONCE="fallback${RANDOM}${RANDOM}$$"
-fi
 
 REPOS=()
 if [ -n "${OPTIMISE_WEEKLY_REPOS:-}" ]; then
   while IFS= read -r line; do
-    # Group 8: trim surrounding whitespace before deciding whether a line
-    # names a real repo -- a whitespace-only line must never become a
-    # "repo" path consisting only of spaces.
-    trimmed="${line#"${line%%[![:space:]]*}"}"
-    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
-    [ -n "$trimmed" ] && REPOS+=("$trimmed")
+    add_repo_line "$line"
   done <<< "$OPTIMISE_WEEKLY_REPOS"
 else
-  REPOS=(
-    /Volumes/Storage/home/scott.b/repos/SaidOfYou
-    /Volumes/Storage/home/scott.b/repos/CouchPotatoServer
-  )
+  # Subtraction round: the delivery repo list is operator configuration,
+  # never this public repo's own hardcoded content. One path per line,
+  # blank lines ignored. This file is never tracked anywhere -- it lives
+  # purely under the operator's own $HOME.
+  REPOS_CONFIG="$HOME/.claude/optimise-weekly-repos"
+  if [ -f "$REPOS_CONFIG" ]; then
+    while IFS= read -r line; do
+      add_repo_line "$line"
+    done < "$REPOS_CONFIG"
+  fi
 fi
 
 mkdir -p "$(dirname "$LOG")"
 
 # Per-repo verdict, decided entirely from the report artefact, claude's exit
 # code, and this script's own observations of the repo -- never from what
-# claude said. Echoes one RESULT line (carrying $NONCE, Group 3) and
-# returns 0 for PASS, 1 for FAIL.
+# claude said. Echoes one RESULT line and returns 0 for PASS, 1 for FAIL.
 verdict_repo() {
   local repo="$1"
   local repo_label="$2"
   local claude_exit="$3"
   local start_epoch="$4"
   local ceiling_hit="$5"
+  local ceiling_message="$6"
   local report_path="$repo/$REPORT_REL"
   local reasons=()
   local mtime first_line
-  local start_epoch_valid=0
-  [[ "$start_epoch" =~ ^[0-9]+$ ]] && start_epoch_valid=1
-
-  # Group 8: a malformed start_epoch must never leave the staleness check
-  # silently skipped -- `[ "$mtime" -lt "" ]` errors and reads as false in
-  # an elif, i.e. fails OPEN. Refuse explicitly instead.
-  if [ "$start_epoch_valid" -eq 0 ]; then
-    reasons+=("invalid start_epoch \"$start_epoch\" -- the staleness check cannot run")
-  fi
 
   if [ "$claude_exit" -ne 0 ]; then
     reasons+=("claude exited $claude_exit")
   fi
 
-  # Group 6: name the real cause when the background-wait ceiling was hit,
-  # rather than leaving an operator to infer it from a stale/missing report.
+  # Subtraction round: anchored to the CLI's own message (captured below,
+  # at the call site) rather than a bare grep for the ceiling variable's
+  # NAME, which false-positived on any transcript merely mentioning it --
+  # this repo's own README does. The captured message states the observed
+  # wait in seconds, which also reveals whether the configured ceiling was
+  # actually honoured.
   if [ "$ceiling_hit" = "1" ]; then
-    reasons+=("background wait ceiling reached before completion (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS -- see transcript above)")
+    reasons+=("background wait ceiling reached before completion ($ceiling_message)")
   fi
 
   if [ ! -f "$report_path" ]; then
@@ -183,7 +230,7 @@ verdict_repo() {
     mtime=$(stat -f %m "$report_path" 2>/dev/null || stat -c %Y "$report_path" 2>/dev/null || echo "")
     if [ -z "$mtime" ]; then
       reasons+=("could not read the report file's mtime")
-    elif [ "$start_epoch_valid" -eq 1 ] && [ "$mtime" -lt "$start_epoch" ]; then
+    elif [ "$mtime" -lt "$start_epoch" ]; then
       reasons+=("stale report: mtime=$mtime predates this run's start=$start_epoch (not rewritten this run)")
     fi
 
@@ -203,30 +250,8 @@ verdict_repo() {
     fi
   fi
 
-  # Group 5: the optimiser is read-only w.r.t. the repo it analyses; nothing
-  # under $repo/.claude/ other than the report itself may have been touched
-  # during this run (measured: the conductor plan-guard hook wrote
-  # .claude/active-plan during two real runs, 2026-08-16).
-  if [ "$start_epoch_valid" -eq 1 ] && [ -d "$repo/.claude" ]; then
-    local stray=() f fmtime
-    while IFS= read -r f; do
-      [ "$f" = "$report_path" ] && continue
-      fmtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "")
-      if [ -n "$fmtime" ] && [ "$fmtime" -ge "$start_epoch" ]; then
-        stray+=("${f#"$repo"/}")
-      fi
-    done < <(find "$repo/.claude" -type f 2>/dev/null)
-    if [ ${#stray[@]} -gt 0 ]; then
-      local joined_stray="" sf
-      for sf in "${stray[@]}"; do
-        if [ -z "$joined_stray" ]; then joined_stray="$sf"; else joined_stray="$joined_stray, $sf"; fi
-      done
-      reasons+=("repo mutated during this run under .claude/: $joined_stray")
-    fi
-  fi
-
   if [ ${#reasons[@]} -eq 0 ]; then
-    echo "RESULT PASS run=$NONCE $repo_label report=$REPORT_REL mtime=$mtime"
+    echo "RESULT PASS $repo_label report=$REPORT_REL mtime=$mtime"
     return 0
   fi
 
@@ -234,11 +259,11 @@ verdict_repo() {
   for r in "${reasons[@]}"; do
     if [ -z "$joined" ]; then joined="$r"; else joined="$joined; $r"; fi
   done
-  echo "RESULT FAIL run=$NONCE $repo_label reason=\"$joined\""
+  echo "RESULT FAIL $repo_label reason=\"$joined\""
   return 1
 }
 
-echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting run=$NONCE version=$SCRIPT_VERSION ===" >> "$LOG"
+echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting version=$SCRIPT_VERSION ===" >> "$LOG"
 overall_fail=0
 # Group 8: bash 3.2's `set -u` treats "${REPOS[@]}" on a genuinely empty
 # array as an unbound-variable error; the ${arr[@]+"${arr[@]}"} idiom below
@@ -250,7 +275,7 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # FAIL, not a silent skip -- distinct from a path that exists and is
   # deliberately not a repo (SKIP, below).
   if [ ! -e "$repo" ]; then
-    echo "RESULT FAIL run=$NONCE $repo_label reason=\"configured repo path does not exist\"" >> "$LOG"
+    echo "RESULT FAIL $repo_label reason=\"configured repo path does not exist\"" >> "$LOG"
     overall_fail=1
     continue
   fi
@@ -259,20 +284,20 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # own .git is a FILE, not a directory) the same as an ordinary checkout,
   # so a worktree is processed normally rather than skipped.
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
-    echo "SKIP $repo_label (not a git repo) run=$NONCE" >> "$LOG"
+    echo "SKIP $repo_label (not a git repo)" >> "$LOG"
     continue
   fi
 
   echo "--- $repo_label ---" >> "$LOG"
   if ! cd "$repo"; then
-    echo "RESULT FAIL run=$NONCE $repo_label reason=\"cd into repo failed\"" >> "$LOG"
+    echo "RESULT FAIL $repo_label reason=\"cd into repo failed\"" >> "$LOG"
     overall_fail=1
     continue
   fi
 
   start_epoch=$(date +%s)
   if ! [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
-    echo "RESULT FAIL run=$NONCE $repo_label reason=\"could not capture a valid run start time (start_epoch)\"" >> "$LOG"
+    echo "RESULT FAIL $repo_label reason=\"could not capture a valid run start time (start_epoch)\"" >> "$LOG"
     overall_fail=1
     continue
   fi
@@ -281,20 +306,25 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # capture the transcript as diagnostic context only -- verdict_repo above
   # is what actually decides PASS/FAIL.
   #
-  # Group 4: --disallowedTools denies the destructive and outward-facing
-  # operations this read-only job never needs (rm, sudo, git push/commit/
-  # reset, gh pr/issue/release/workflow write commands, curl/wget --
-  # verified empirically that a real run still produces a report with these
-  # denied). --permission-mode plan was considered and rejected: it would
-  # block the optimiser from writing the very report this script's verdict
-  # depends on.
+  # Group 4 -- defence in depth, not a boundary (subtraction round): a real
+  # `claude -p` run under exactly this flag set still succeeded at `Write`,
+  # `Edit`, `mv` and `python3 -c` writing outside the repo, since these
+  # flags deny only their LITERAL enumerated targets and `--settings`
+  # merges with (does not replace) the global defaultMode: auto. They still
+  # genuinely block their listed targets (rm, sudo, git push/commit/reset,
+  # gh pr/issue/release/workflow write commands, curl/wget), which is real
+  # value; --permission-mode plan was considered and rejected, since plan
+  # mode would block the optimiser writing the very report this script's
+  # verdict depends on.
   #
-  # Group 5: --settings disables all hooks for this one invocation, so the
-  # globally-installed conductor plan-guard Stop hook cannot touch this
-  # repo's .claude/active-plan as a side effect of the background workflow
-  # this prompt launches (verified empirically). The postcondition check
-  # inside verdict_repo above still runs regardless, in case a future hook
-  # or plugin is not stoppable this way.
+  # Group 5 -- disables all hooks for this one invocation, so the globally-
+  # installed conductor plan-guard Stop hook cannot touch this repo's
+  # .claude/active-plan as a side effect of the background workflow this
+  # prompt launches (verified empirically). This is the one measured
+  # mutation source; it is not a general read-only guarantee, and nothing
+  # here checks for one after the fact (see the subtraction-round note at
+  # the top of this file for why that check was removed rather than fixed
+  # again).
   transcript_file="$(mktemp "${TMPDIR:-/tmp}/optimise-weekly-transcript.XXXXXX")"
   timeout -k 60 "$TIMEOUT_S" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
     --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" \
@@ -302,8 +332,13 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     > "$transcript_file" 2>&1
   claude_exit=$?
 
+  # Subtraction round: anchored to the CLI's OWN message rather than a bare
+  # grep for the ceiling variable's name (which false-positived on any
+  # transcript merely mentioning it), and captures the observed wait so the
+  # FAIL reason states what actually happened, not just that it happened.
   ceiling_hit=0
-  if grep -q "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" "$transcript_file" 2>/dev/null; then
+  ceiling_message=""
+  if ceiling_message=$(grep -Eo 'Background tasks still running after [0-9]+s; terminating' "$transcript_file" 2>/dev/null | head -n1) && [ -n "$ceiling_message" ]; then
     ceiling_hit=1
   fi
 
@@ -312,20 +347,30 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # (measured, 2026-08-16 log). If redaction itself fails for any reason,
   # never fall back to appending the raw transcript: log a labelled
   # placeholder instead, so a redaction failure is visible, not a silent
-  # privacy leak.
+  # privacy leak. The relative script name is used in the placeholder, not
+  # $REDACT_SCRIPT's absolute path, so the fallback message itself never
+  # leaks the account path it exists to protect.
   if [ -f "$REDACT_SCRIPT" ] && node "$REDACT_SCRIPT" "$repo" < "$transcript_file" >> "$LOG" 2>/dev/null; then
     :
   else
-    echo "[transcript omitted: redaction step failed or is unavailable -- see $REDACT_SCRIPT]" >> "$LOG"
+    echo "[transcript omitted: redaction step failed or is unavailable -- see bin/redact-transcript.mjs]" >> "$LOG"
   fi
   rm -f "$transcript_file"
 
-  echo "exit=$claude_exit run=$NONCE $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"
+  echo "exit=$claude_exit $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"
 
-  if ! verdict_repo "$repo" "$repo_label" "$claude_exit" "$start_epoch" "$ceiling_hit" >> "$LOG"; then
+  if ! verdict_repo "$repo" "$repo_label" "$claude_exit" "$start_epoch" "$ceiling_hit" "$ceiling_message" >> "$LOG"; then
     overall_fail=1
   fi
 done
-echo "=== done run=$NONCE $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG"
+echo "=== done $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG"
+
+# One line on stderr when anything failed, so the plist's already-wired
+# StandardErrorPath channel (0 bytes since 11 Aug) turns non-empty exactly
+# when there is something an operator needs to see, without them having to
+# tail the log speculatively every week.
+if [ "$overall_fail" -ne 0 ]; then
+  echo "weekly optimise-cycle FAILED -- see $LOG" >&2
+fi
 
 exit "$overall_fail"

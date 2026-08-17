@@ -108,6 +108,32 @@ test('static: no new file under workflows/, skills/ or docs/ hardcodes an absolu
   }
 })
 
+// Subtraction round item 9 (specs/harn-opt-2.md conductor log tick 46): the
+// same operator-path-leak class AC-ARCH-9 already guards for workflows/,
+// skills/ and docs/ was found live under bin/ -- bin/optimise-cycle-weekly.sh
+// hardcoded two private repo names and this operator's volume layout in a
+// tracked file in a PUBLIC repo, while the sibling plist three files away
+// was already sanitised and guarded. The default repo list now comes from
+// $HOME/.claude/optimise-weekly-repos (never tracked anywhere) instead, and
+// this extends the leak check to bin/ so it can never regress silently.
+// bin/com.local.optimise-cycle-weekly.plist is exempt from the /Users/
+// clause specifically -- it deliberately CONTAINS the literal placeholder
+// segment "/Users/YOUR_USERNAME" (asserted by its own test below), which
+// would otherwise trip this same guard on a placeholder, not a leak.
+test('static: no file under bin/ hardcodes an absolute /Users/ or /Volumes/ path, a real /home/<name> path, or a private target repo name (subtraction round item 9, mirrors AC-ARCH-9 for bin/)', () => {
+  const targets = walk(path.join(ROOT, 'bin'))
+  for (const f of targets) {
+    const isPlistTemplate = path.basename(f) === 'com.local.optimise-cycle-weekly.plist'
+    const contents = fs.readFileSync(f, 'utf8')
+    if (!isPlistTemplate) {
+      assert.ok(!/\/Users\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Users/ path`)
+    }
+    assert.ok(!/\/Volumes\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Volumes/ path`)
+    assert.ok(!/\/home\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /home/<name> path`)
+    assert.ok(!/said.?of.?you|couchpotato/i.test(contents), `${f} names a private target repo`)
+  }
+})
+
 test('static: the ledger envelope field list appears in exactly one file (AC-ARCH-5). It lives in workflows/lib/ledger-append.mjs, not a separate ledger.mjs: workflow scripts cannot import anything, so the envelope owner must be the real-Node script they invoke via Bash, not a module they pull in.', () => {
   const all = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'skills'))]
   const definitionSites = all.filter((f) => {
@@ -391,6 +417,55 @@ test('static: README.md documents the launchd rollback for com.local.optimise-cy
   assert.match(readme, /launchctl bootout gui\/\$\(id -u\)\/com\.local\.optimise-cycle-weekly/, 'README.md must give the exact launchctl bootout command')
   assert.match(readme, /launchctl bootstrap gui\/\$\(id -u\)/, 'README.md must give the exact launchctl bootstrap install command')
   assert.match(readme, /does\s*\*{0,2}not\*{0,2}\s*stop.{0,40}(scheduled|launchd)|(scheduled|launchd).{0,60}\*{0,2}not\*{0,2}.{0,20}stop/i, 'README.md must state plainly that a code revert alone does not stop the scheduled launchd job')
+})
+
+// Subtraction round item 3 (specs/harn-opt-2.md conductor log tick 46):
+// review round 2 proved --disallowedTools and --settings disableAllHooks
+// are real defence in depth (they block their literal enumerated targets),
+// but PREVIOUSLY had no guard at all pinning them in place -- deleting
+// BOTH flag lines from the script left the full weekly-runner suite
+// green (50/50), because every test drives a stub `claude`, not the real
+// CLI, so nothing in the suite ever observes which flags were actually
+// passed. Mirrors the existing README/plist static checks above: this
+// closes that coverage gap mechanically, so a future edit cannot silently
+// drop either control without a red test naming exactly which token
+// vanished.
+test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh contains every required --disallowedTools deny token and the --settings disableAllHooks blob (subtraction round item 3) -- deleting either previously shipped the suite green, since every test drives a stub `claude`, never the real flags', () => {
+  const script = readAll('bin', 'optimise-cycle-weekly.sh')
+  const lines = script.split('\n')
+  // Scoped to the ACTUAL invocation block, not the whole file: a whole-file
+  // .includes() check was tried first and was itself vacuous -- this
+  // script's own header comments quote the exact `--settings
+  // '{"disableAllHooks": true}'` string while narrating history, so a
+  // whole-file check kept passing even after the real call site's flag
+  // line was deleted (confirmed by deliberately deleting it and watching
+  // this test wrongly stay green, before this fix).
+  const start = lines.findIndex((l) => l.includes('claude -p '))
+  const end = lines.findIndex((l, i) => i > start && l.includes('2>&1'))
+  assert.ok(start >= 0 && end > start, 'could not locate the claude -p invocation block in bin/optimise-cycle-weekly.sh')
+  const callSite = lines.slice(start, end + 1).join('\n')
+  const requiredDenyTokens = [
+    'Bash(rm:*)',
+    'Bash(sudo:*)',
+    'Bash(git push:*)',
+    'Bash(git commit:*)',
+    'Bash(git reset:*)',
+    'Bash(gh pr merge:*)',
+    'Bash(gh pr create:*)',
+    'Bash(gh issue create:*)',
+    'Bash(gh release create:*)',
+    'Bash(gh workflow run:*)',
+    'Bash(curl:*)',
+    'Bash(wget:*)',
+  ]
+  assert.ok(callSite.includes('--disallowedTools'), 'the claude -p call site must pass --disallowedTools')
+  for (const token of requiredDenyTokens) {
+    assert.ok(callSite.includes(token), `the claude -p call site must deny ${token}`)
+  }
+  assert.ok(
+    callSite.includes('--settings \'{"disableAllHooks": true}\''),
+    'the claude -p call site must pass --settings \'{"disableAllHooks": true}\''
+  )
 })
 
 test('static: bin/com.local.optimise-cycle-weekly.plist is tracked in the repo and is a valid plist containing no real account path (it is a template -- every path is a /Users/YOUR_USERNAME placeholder, since this repo is public)', () => {
