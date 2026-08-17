@@ -359,3 +359,44 @@ test('static: AC-QA-9 -- the number of terminating `return` statements (any form
   // abort, and the main synthesis return.
   assert.equal(countReturnsInRun('plan-cycle.js'), 3, 'plan-cycle.js run() must have exactly 3 terminating returns; if you added one, add its pairing test too')
 })
+
+// HARN-OPT-2 T3 (Group 7 drift marker, mirroring AC-OPS-4's workflows/
+// pattern above at the same-file lines 201-232): bin/optimise-cycle-weekly.sh
+// and bin/redact-transcript.mjs are ALSO synced to an installed mirror
+// (~/.claude/bin/) outside version control, and without a guard pinning the
+// exact re-sync commands, a fix landed in the repo can silently never reach
+// the copy launchd actually runs.
+test('static: README.md names the exact re-sync commands for bin/optimise-cycle-weekly.sh AND bin/redact-transcript.mjs, and gives a diff command that confirms the installed copies match the repo (T3 Group 7, mirrors AC-OPS-4)', () => {
+  const readme = readAll('README.md')
+  assert.ok(
+    /cp claude-ai-harness\/bin\/optimise-cycle-weekly\.sh ~\/\.claude\/bin\/optimise-cycle-weekly\.sh/.test(readme),
+    'README.md must give the exact re-sync command for bin/optimise-cycle-weekly.sh'
+  )
+  assert.ok(
+    /cp claude-ai-harness\/bin\/redact-transcript\.mjs ~\/\.claude\/bin\/redact-transcript\.mjs/.test(readme),
+    'README.md must give the exact re-sync command for bin/redact-transcript.mjs -- verdict_repo silently falls back to an unredacted transcript if this file is missing from the installed mirror'
+  )
+  assert.ok(
+    /diff -q claude-ai-harness\/bin\/optimise-cycle-weekly\.sh ~\/\.claude\/bin\/optimise-cycle-weekly\.sh/.test(readme),
+    'README.md must give an exact command that confirms the installed optimise-cycle-weekly.sh matches the repo'
+  )
+  assert.ok(
+    /diff -q claude-ai-harness\/bin\/redact-transcript\.mjs ~\/\.claude\/bin\/redact-transcript\.mjs/.test(readme),
+    'README.md must give an exact command that confirms the installed redact-transcript.mjs matches the repo'
+  )
+})
+
+test('static: README.md documents the launchd rollback for com.local.optimise-cycle-weekly -- the exact launchctl bootout/bootstrap pair, and states plainly that a code revert alone does not stop the scheduled job (T3 Group 7, mirrors AC-OPS-11\'s slug-only-mode rollback requirement)', () => {
+  const readme = readAll('README.md')
+  assert.match(readme, /launchctl bootout gui\/\$\(id -u\)\/com\.local\.optimise-cycle-weekly/, 'README.md must give the exact launchctl bootout command')
+  assert.match(readme, /launchctl bootstrap gui\/\$\(id -u\)/, 'README.md must give the exact launchctl bootstrap install command')
+  assert.match(readme, /does\s*\*{0,2}not\*{0,2}\s*stop.{0,40}(scheduled|launchd)|(scheduled|launchd).{0,60}\*{0,2}not\*{0,2}.{0,20}stop/i, 'README.md must state plainly that a code revert alone does not stop the scheduled launchd job')
+})
+
+test('static: bin/com.local.optimise-cycle-weekly.plist is tracked in the repo and is a valid plist containing no real account path (it is a template -- every path is a /Users/YOUR_USERNAME placeholder, since this repo is public)', () => {
+  const plistPath = path.join(ROOT, 'bin', 'com.local.optimise-cycle-weekly.plist')
+  assert.ok(fs.existsSync(plistPath), 'bin/com.local.optimise-cycle-weekly.plist must exist and be tracked -- a code revert cannot stop a scheduled job that only exists outside version control')
+  const plist = fs.readFileSync(plistPath, 'utf8')
+  assert.ok(!/\/Volumes\/|\/home\/scott\.b|scott\.b/.test(plist), 'the tracked plist must never contain a real, non-placeholder account path')
+  assert.match(plist, /YOUR_USERNAME/, 'the tracked plist must use a placeholder path, not a real one, since this repo is public')
+})

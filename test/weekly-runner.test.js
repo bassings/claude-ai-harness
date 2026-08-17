@@ -551,3 +551,14 @@ test('weekly runner (Group 8): an invalid start_epoch (a `date +%s` failure) FAI
   assert.match(logContents, trustedResultRegex(nonce, 'FAIL', label(repo)), logContents)
   assert.match(logContents, /start_epoch|start time/i, logContents)
 })
+
+// --- Group 7: drift marker --------------------------------------------------
+
+test('weekly runner (Group 7): the run header names a script version, so the log shows which copy of the script actually ran (drift detection)', () => {
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo])
+  assert.equal(status, 0, logContents)
+  const header = logContents.split('\n')[0]
+  assert.match(header, /version=\S+/, `the starting header must carry a version= marker:\n${header}`)
+})

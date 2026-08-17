@@ -87,6 +87,13 @@ set -u
 # default.
 export PATH="$PATH:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+# Group 7 (drift marker): bumped whenever this script's behaviour changes
+# materially. Printed on the run's own header line (below) so the log
+# shows which copy of the script actually ran -- the installed mirror at
+# ~/.claude/bin/ can otherwise drift silently out of sync with this repo
+# (the same class AC-OPS-4 already covers for workflows/).
+SCRIPT_VERSION="2026-08-17.1"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REDACT_SCRIPT="$SCRIPT_DIR/redact-transcript.mjs"
 
@@ -231,7 +238,7 @@ verdict_repo() {
   return 1
 }
 
-echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting run=$NONCE ===" >> "$LOG"
+echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting run=$NONCE version=$SCRIPT_VERSION ===" >> "$LOG"
 overall_fail=0
 # Group 8: bash 3.2's `set -u` treats "${REPOS[@]}" on a genuinely empty
 # array as an unbound-variable error; the ${arr[@]+"${arr[@]}"} idiom below
