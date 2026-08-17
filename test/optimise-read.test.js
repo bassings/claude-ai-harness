@@ -154,9 +154,9 @@ test('optimise-read: aggregateRework produces byte-identical, hand-computable co
   const keyA = 'demo|specs/a.md|AC-QA-1'
   const keyB = 'demo|specs/b.md|AC-QA-1'
   assert.notEqual(keyA, keyB)
-  assert.deepEqual(result.acVerdicts.get(keyA), { repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 2, fail: 0, unverifiable: 0, n: 2 })
-  assert.deepEqual(result.acVerdicts.get(keyB), { repo: 'demo', spec: 'specs/b.md', ac_id: 'AC-QA-1', pass: 0, fail: 1, unverifiable: 0, n: 1 })
-  assert.deepEqual(result.acVerdicts.get('demo|specs/a.md|AC-SEC-1'), { repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-SEC-1', pass: 0, fail: 1, unverifiable: 0, n: 1 })
+  assert.deepEqual(result.acVerdicts.get(keyA), { repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 2, fail: 0, unverifiable: 0, n: 2, unattributedVerdicts: 0 })
+  assert.deepEqual(result.acVerdicts.get(keyB), { repo: 'demo', spec: 'specs/b.md', ac_id: 'AC-QA-1', pass: 0, fail: 1, unverifiable: 0, n: 1, unattributedVerdicts: 0 })
+  assert.deepEqual(result.acVerdicts.get('demo|specs/a.md|AC-SEC-1'), { repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-SEC-1', pass: 0, fail: 1, unverifiable: 0, n: 1, unattributedVerdicts: 0 })
 })
 
 test('optimise-read: aggregateRework called twice on the identical fixture produces byte-identical JSON output (AC-QA-21)', () => {
@@ -594,6 +594,20 @@ test('optimise-read CLI: the ledger command\'s output includes proposalOutcomes,
   assert.equal(out.proposalOutcomes['abc123'].rejectedCount, 1)
 })
 
+// Review round-2 M-3: aggregateRework's invalidAcIdsDropped total was
+// computed (previous test file section) but the CLI's `ledger` command
+// explicitly whitelists which rework fields reach its JSON output --
+// dropped at exactly that boundary, so it never reached optimise-cycle.js
+// at all despite being computed correctly one function away.
+test('optimise-read CLI: the ledger command\'s output includes rework.invalidAcIdsDropped, computed from a real record whose ac_id was sanitised by the writer (M-3)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', ac_verdicts: [{ ac_id: 'none', verdict: 'FAIL' }] })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.rework.invalidAcIdsDropped, 1)
+})
+
 test('optimise-read CLI: the ledger command\'s output includes a citationPool of real run_ids from the window', () => {
   const repo = makeTempRepo()
   runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
@@ -717,6 +731,31 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <root>` reads a real led
   assert.equal(statBefore.mtimeMs, statAfter.mtimeMs, 'the ledger mtime must be unchanged (no write touched it)')
 })
 
+// Round-7 review F6: every taint-mechanism test up to this point calls
+// mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets:
+// rework.unattributedFailBuckets }) DIRECTLY -- the test supplies the
+// wiring production is supposed to provide on its own. neverFailingAcs's
+// own default (`unattributedFailBuckets = new Set()`) means a caller that
+// forgets to pass it through gets silent, untainted output with the full
+// suite green. This drives the REAL CLI end to end (real writer, real
+// reader, no test-supplied wiring) to prove the production call site
+// itself (optimise-read.mjs's own `ledger` command) actually connects
+// aggregateRework's output to neverFailingAcs's input.
+test('optimise-read CLI: `node optimise-read.mjs ledger <root>` wires the unattributed-FAIL taint end to end, with NO test-supplied unattributedFailBuckets -- proves the PRODUCTION call site, not just the function (round-7 F6)', () => {
+  const repo = makeTempRepo()
+  for (let i = 0; i < 5; i++) {
+    runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PASS' }] })
+  }
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', ac_verdicts: [{ ac_id: 'not-a-real-ac-id-so-it-fails-the-pattern', verdict: 'FAIL' }] })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  const entry = out.neverFailingAcs.find((a) => a.ac_id === 'AC-QA-1')
+  assert.ok(entry, `expected an AC-QA-1 entry, got: ${JSON.stringify(out.neverFailingAcs)}`)
+  assert.equal(entry.never_failed, null, 'the production CLI path must wire the taint, not just the direct function call')
+  assert.equal(entry.unattributed_fail_in_window, true)
+})
+
 // ---- Review round-3 F5 (AC-QA-17, the untested PRIMARY production path): the two-repo ledger CLI invocation ----
 //
 // Every prior CLI test used exactly one root; the two-repo path is exactly
@@ -797,6 +836,56 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combine
   assert.equal(out.windowDroppedCount, 0)
   const perRepoSum = out.perRepo.reduce((acc, e) => acc + e.recordCount, 0)
   assert.equal(perRepoSum, out.n, 'with no window truncation, perRepo\'s summed counts must equal n exactly -- no starvation, no divergence')
+})
+
+// Round-4 review L8 (AC-QA-20): the AC states a 0.5s wall-clock bound over
+// a 2000-record ledger, but the ONLY thing enforcing it was a structural
+// guard (test/optimise-static.test.js: the per-record loops contain no fs
+// call) -- real, but it proves an O(1)-per-record SHAPE, not a wall-clock
+// NUMBER; an algorithmic regression that stayed fs-free but went quadratic
+// in record count would pass every existing check. This is the timing
+// assertion itself, generous (2s, not 0.5s) so it cannot flake under
+// parallel suite load the way a tight bound would -- both lenses measured
+// one to two orders of magnitude inside 0.5s (3.9-6.6ms via the exported
+// functions, 43-50ms via the real CLI), so 2s leaves ample headroom while
+// still catching a genuine quadratic-blowup regression.
+test('optimise-read CLI: aggregating a real 2000-record ledger through the CLI stays well under a generous 2s wall-clock ceiling, three consecutive runs (L8, AC-QA-20)', () => {
+  const repo = makeTempRepo()
+  const ledgerPath = path.join(repo, LEDGER_REL)
+  fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
+  const lines = []
+  for (let i = 0; i < 2000; i++) {
+    lines.push(JSON.stringify({
+      schema_version: 2, run_id: `r${i}`, ts: `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+      repo: 'demo', kind: 'review_cycle', outcome: 'done', spec: `specs/${i % 20}.md`, plan_key: `specs/${i % 20}.md`,
+      lenses_run: ['lens-security', 'lens-qa'], lenses_skipped: [],
+      findings: [{ id: `f${i}`, lens: 'lens-qa', severity: 'Low', ac_id: `AC-QA-${(i % 5) + 1}`, disposition: 'open' }],
+      ac_verdicts: [{ ac_id: `AC-QA-${(i % 5) + 1}`, verdict: i % 7 === 0 ? 'FAIL' : 'PASS' }],
+      write_ok: true, write_error: null,
+    }))
+  }
+  fs.writeFileSync(ledgerPath, lines.join('\n') + '\n')
+  const elapsedMs = []
+  for (let run = 0; run < 3; run++) {
+    const before = Date.now()
+    const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+    elapsedMs.push(Date.now() - before)
+    assert.equal(res.status, 0, res.stderr)
+    const out = JSON.parse(res.stdout.trim())
+    assert.equal(out.n, 2000, 'sanity: the real fixture must actually reach aggregation, not be windowed/skipped away')
+  }
+  // Round-7 review F13: AC-QA-20 states the bound as 0.5s ("current
+  // measured: 0.05s"), but this test enforced 2s -- a round-4 L8 anti-
+  // flake relaxation that, measured at the pinned tip, left roughly 40x
+  // headroom rather than the AC's own ~10x. Tightened to the AC's actual
+  // number (still ~10x headroom over the ~45ms baseline measured in
+  // round-7's own review), asserted against the MEDIAN of the three runs
+  // rather than each individually, so one slow-scheduled run on a loaded
+  // CI box cannot flake the whole guard while a genuine quadratic
+  // regression (which would move every run, not just one) still trips it.
+  const sorted = [...elapsedMs].sort((a, b) => a - b)
+  const median = sorted[1]
+  assert.ok(median < 500, `expected the median of 3 runs under 500ms (AC-QA-20's own stated bound), got ${elapsedMs.join(', ')}ms (median ${median}ms)`)
 })
 
 test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal targets from stdin and returns a stable id per target, in order', () => {
@@ -1108,6 +1197,265 @@ test('optimise-read CLI: a real ledger mixing hand-seeded pre-PR1-shaped lines (
   assert.equal(sharedBuckets[0].agentComputeN, 2, 'BOTH the pre-PR1 pair and the post-PR1 pair must be measured inside the one collapsed bucket -- neither silently dropped')
 })
 
+// ---- HARN-OPT-2 PR2 (AC-DATA-10): agent_compute pairing purity. Only a
+// run_id shared by EXACTLY one 'started' record and EXACTLY one terminal
+// (non-'started') record may ever produce a measured duration. Today two
+// 'started' records sharing a run_id have their timestamps subtracted
+// anyway (the pairing loop only checked pair.length, never each record's
+// own outcome), fabricating a duration for an attempt that never actually
+// finished. ----
+
+test('optimise-read: aggregateWallClock reproduces the AC-DATA-10 bug exactly as measured -- two started records one hour apart, sharing a run_id, must NOT report agentComputeSeconds=3600/measuredRuns=1; the fixed behaviour is 0 measured, 1 unmeasured, seconds null', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'two-starts', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'two-starts', ts: '2026-08-01T01:00:00.000Z' }, // +3600s
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.notEqual(result.totals.agentComputeSeconds, 3600, 'two started records must never be treated as a measured start/terminal pair')
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, null)
+})
+
+test('optimise-read: aggregateWallClock treats two TERMINAL records (no started at all) sharing a run_id the same way -- 0 measured, 1 unmeasured, no fabricated duration (AC-DATA-10)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'two-terminals', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'aborted', spec: 'specs/a.md', run_id: 'two-terminals', ts: '2026-08-01T00:30:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, null)
+})
+
+test('optimise-read: aggregateWallClock treats three or more records sharing one run_id (1 started + 2 terminal) the same way -- 0 measured, 1 unmeasured (AC-DATA-10)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'three-way', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'three-way', ts: '2026-08-01T00:05:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'three-way', ts: '2026-08-01T00:10:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, null)
+})
+
+// ---- HARN-OPT-2 PR2 review round 1, H1 (AC-QA-12's third clause): "aborted
+// pairs are counted under their own name and never contribute to any
+// completed-run duration statistic." The version of this test that shipped
+// in review round 1 encoded the OPPOSITE reading (asserted a crashed pair
+// as `agentComputeMeasuredRuns: 1` / `agentComputeSeconds: 180`), which is
+// exactly finding H1: the exception-guard fix (PR2's own terminal-write
+// change) turns a crash from an orphan (correctly unmeasured) into a
+// well-formed pair, and the OLD version of this test asserted that pair
+// should read as a healthy completion. Confirmed by execution against the
+// review's own repro (40 minutes apart): pre-fix this returned
+// `{agentComputeSeconds: 2400, agentComputeMeasuredRuns: 1,
+// agentComputeUnmeasuredRuns: 0}` -- byte-identical in SHAPE to a genuine
+// completion, and `isUnmeasuredSegmentMotivated` (optimise-cycle.js) reads
+// agentComputeUnmeasuredRuns to decide whether a proposal citing
+// agent_compute is built on unmeasurable data. A workflow crashing on
+// EVERY run would report as a fully measured, healthy repo. ----
+
+test('optimise-read: a start/terminal pair whose terminal outcome is aborted (not done) is EXCLUDED from agentComputeSeconds/agentComputeMeasuredRuns, STILL counts toward agentComputeUnmeasuredRuns (so the proposal-safety gate stays armed), and is reported under its own agentComputeAbortedPairs/agentComputeAbortedSeconds names -- reproducing the review\'s exact 40-minute repro (H1, AC-QA-12)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'aborted-pair', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'aborted', spec: 'specs/a.md', run_id: 'aborted-pair', ts: '2026-08-01T00:40:00.000Z' }, // 40 minutes later
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 0, 'a crashed run must never read as a measured completion')
+  assert.equal(result.totals.agentComputeSeconds, null, 'no fabricated duration must reach the completed-run statistic')
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1, 'the crash must still keep the segment "unmeasured" -- this is what keeps the proposal-safety gate armed')
+  assert.equal(result.totals.agentComputeAbortedPairs, 1, 'the crash must be named and counted under its own counter')
+  assert.equal(result.totals.agentComputeAbortedSeconds, 2400, 'the elapsed time IS known (a real number, not null) -- it is a crash duration, reported under its own name, never a work duration')
+  // The record itself, unmodified, must still say aborted -- nothing in the
+  // aggregate pipeline claims or implies this was a completion.
+  assert.equal(records[1].outcome, 'aborted', 'aggregateWallClock must never mutate the input record\'s outcome field')
+})
+
+// Review round-2 M-4: round-1's H1 fix gated on `outcome !== 'done'`,
+// which is wrong -- `blocked` (a legitimate terminating verdict,
+// tdd-task.js's OUTCOME_BY_VERDICT) and `no-op` (review-cycle.js's
+// ordinary "no changes found" case, __outcome: 'no-op') are both healthy
+// COMPLETIONS with real, meaningful durations, not crashes. Only `aborted`
+// is the outcome the exception guard actually produces for a genuine
+// crash. Negating `done` misclassified every blocked/no-op run as a crash,
+// excluding its real duration from agent_compute and rendering it as
+// `aborted n=` in the report -- the mirror-image defect of H1 (the false
+// clean; this is the false alarm), reachable for any repo whose review
+// cycles usually find no changes.
+test('optimise-read: a start/terminal pair whose terminal outcome is blocked is a LEGITIMATE COMPLETION -- measured, its duration counted, never classified as an aborted crash (M-4, corrects round-1\'s `outcome !== "done"` over-negation)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'blocked-pair', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'blocked', spec: 'specs/a.md', run_id: 'blocked-pair', ts: '2026-08-01T00:05:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1, 'a blocked run completed and took real, meaningful time -- it must count as measured')
+  assert.equal(result.totals.agentComputeSeconds, 300)
+  assert.equal(result.totals.agentComputeAbortedPairs, 0, 'blocked is not a crash and must never be counted as one')
+})
+
+test('optimise-read: a start/terminal pair whose terminal outcome is no-op (review-cycle\'s ordinary "no changes found" case) is a LEGITIMATE COMPLETION, never classified as an aborted crash (M-4)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'noop-pair', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'review_cycle', repo: 'demo', outcome: 'no-op', spec: 'specs/a.md', run_id: 'noop-pair', ts: '2026-08-01T00:00:10.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1, 'a no-op run (nothing to review) still completed and its real duration must count as measured, not be discarded as a crash')
+  assert.equal(result.totals.agentComputeSeconds, 10)
+  assert.equal(result.totals.agentComputeAbortedPairs, 0)
+})
+
+test('optimise-read: only outcome "aborted" is classified as a crash -- the exhaustive enumeration proof (done, blocked, no-op all measured; aborted alone excluded) (M-4)', () => {
+  const outcomes = ['done', 'blocked', 'no-op', 'aborted']
+  for (const outcome of outcomes) {
+    const records = [
+      { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: `run-${outcome}`, ts: '2026-08-01T00:00:00.000Z' },
+      { kind: 'tdd_task', repo: 'demo', outcome, spec: 'specs/a.md', run_id: `run-${outcome}`, ts: '2026-08-01T00:01:00.000Z' },
+    ]
+    const result = mod.aggregateWallClock(records)
+    if (outcome === 'aborted') {
+      assert.equal(result.totals.agentComputeMeasuredRuns, 0, `${outcome} must be excluded from measured`)
+      assert.equal(result.totals.agentComputeAbortedPairs, 1, `${outcome} must be counted as aborted`)
+    } else {
+      assert.equal(result.totals.agentComputeMeasuredRuns, 1, `${outcome} must be counted as measured`)
+      assert.equal(result.totals.agentComputeAbortedPairs, 0, `${outcome} must NOT be counted as aborted`)
+    }
+  }
+})
+
+test('optimise-read: a per-plan bucket also carries its own agentComputeAbortedN, so an operator can see WHICH plan is crashing, not just a repo-wide total (H1)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/crashy.md', run_id: 'ab-1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'aborted', spec: 'specs/crashy.md', run_id: 'ab-1', ts: '2026-08-01T00:01:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  const bucket = result.byPlan.get('demo|specs/crashy.md')
+  assert.ok(bucket, 'the crashed pair must still attribute to its real plan identity')
+  assert.equal(bucket.agentComputeAbortedN, 1)
+  assert.equal(bucket.agentComputeN, 0, 'a crashed pair must never count toward the same plan\'s completed-run count')
+})
+
+test('optimise-read: a genuine DONE pair is unaffected by the H1 fix -- still measured, seconds attributed, agentComputeAbortedPairs stays 0 (not vacuous)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'genuine-done', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'genuine-done', ts: '2026-08-01T00:03:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeSeconds, 180)
+  assert.equal(result.totals.agentComputeAbortedPairs, 0)
+  assert.equal(result.totals.agentComputeAbortedSeconds, 0)
+})
+
+test('optimise-read: aggregateWallClock still measures the genuine case -- exactly one started and one terminal record sharing a run_id (not vacuous: proves the AC-DATA-10 fix does not also break the ordinary pair)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'clean-pair', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'clean-pair', ts: '2026-08-01T00:02:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeMeasuredRuns, 1)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 0)
+  assert.equal(result.totals.agentComputeSeconds, 120)
+})
+
+// ---- HARN-OPT-2 PR2 (AC-OPS-2): the two orphan classes -- a lone 'started'
+// record (M1, round 4 remainder: the process was killed before the
+// terminal write, or the terminal write's own payload was refused -- an
+// exception escaping run() no longer causes this, since PR2's try/finally
+// always attempts a terminal write) versus a lone terminal record (the
+// START write itself failed) -- are different defects with different
+// fixes, and must be counted and named SEPARATELY, in addition to the
+// combined agentComputeUnmeasuredRuns total, so fixing one can never read
+// as progress on the other. ----
+
+test('optimise-read: aggregateWallClock counts a lone started record as a start-only orphan (agentComputeStartOnlyRuns), broken down by kind, distinct from a lone terminal record (AC-OPS-2)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'lone-start', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeStartOnlyRuns, 1)
+  assert.equal(result.totals.agentComputeTerminalOnlyRuns, 0)
+  assert.equal(result.totals.agentComputeStartOnlyByKind.tdd_task, 1)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1, 'the new named counter is IN ADDITION to the existing total, never a replacement for it')
+})
+
+test('optimise-read: aggregateWallClock counts a lone terminal record (a failed START write) as a terminal-only orphan (agentComputeTerminalOnlyRuns), broken down by kind, distinct from a lone started record (AC-OPS-2)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'lone-terminal', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeStartOnlyRuns, 0)
+  assert.equal(result.totals.agentComputeTerminalOnlyRuns, 1)
+  assert.equal(result.totals.agentComputeTerminalOnlyByKind.review_cycle, 1)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1)
+})
+
+test('optimise-read: a malformed pairing (two started, no terminal) is counted in the combined unmeasured total but is NEITHER a start-only NOR a terminal-only orphan -- those two counters name a specific single-record shape, not every unmeasured shape (AC-OPS-2, AC-DATA-10 boundary)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'two-starts', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'two-starts', ts: '2026-08-01T01:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.totals.agentComputeUnmeasuredRuns, 1, 'still counted in the combined total -- never silently dropped')
+  assert.equal(result.totals.agentComputeStartOnlyRuns, 0, 'two started records is not the single-lone-started shape the named counter guards')
+  assert.equal(result.totals.agentComputeTerminalOnlyRuns, 0)
+})
+
+// ---- Review round-1 M4: an orphan whose plan identity is unattributable
+// (out-of-repo/redaction marker) or fully degraded was counted in NEITHER
+// orphan class, because the orphan classification sat AFTER the two
+// identity `continue`s -- so AC-OPS-2's "in addition to
+// agentComputeUnmeasuredRuns" promise was untrue for these runs. Fixed by
+// classifying the orphan SHAPE (which needs no plan identity at all)
+// before the identity continues, leaving byPlan bucketing exactly where it
+// was: these orphans still cannot attribute to a plan bucket, but they DO
+// now count in the global start-only/terminal-only totals. ----
+
+test('optimise-read: a lone started record whose plan identity is unattributable (out-of-repo) still counts as a start-only orphan in the global total, even though it creates no byPlan bucket (M4)', () => {
+  const records = [
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '/etc/outside.md', run_id: 'unattrib-start', ts: '2026-08-01T00:00:00.000Z' },
+  ]
+  const result = mod.aggregateWallClock(records, { root: '/repo' })
+  assert.equal(result.byPlan.size, 0, 'sanity: this really is the unattributable-identity path, no byPlan bucket created')
+  assert.equal(result.totals.unattributableRuns, 1, 'sanity: still counted under the existing unattributable total too')
+  assert.equal(result.totals.agentComputeStartOnlyRuns, 1, 'an orphan is an orphan regardless of whether its plan identity is known (M4)')
+  assert.equal(result.totals.agentComputeStartOnlyByKind.tdd_task, 1)
+})
+
+test('optimise-read: a lone terminal record that is fully degraded (no spec/plan_key survives at all) still counts as a terminal-only orphan in the global total (M4)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', run_id: 'degraded-terminal', ts: '2026-08-01T00:00:00.000Z', outcome: 'done', degraded: true },
+  ]
+  const result = mod.aggregateWallClock(records)
+  assert.equal(result.byPlan.size, 0)
+  assert.equal(result.totals.degradedUnattributedRuns, 1, 'sanity: still counted under the existing degraded total too')
+  assert.equal(result.totals.agentComputeTerminalOnlyRuns, 1, 'a degraded orphan is still an orphan (M4)')
+  assert.equal(result.totals.agentComputeTerminalOnlyByKind.review_cycle, 1)
+})
+
+// AC-OPS-2's own worked example: "Against a copy of the current live ledger
+// it must report startOnly=4 and terminalOnly=2 rather than a single
+// unmeasured count of 6." seedNineRecordFixture (above) reproduces that
+// exact live-ledger shape: rec0/rec4/rec5/rec6 are lone 'started'
+// review_cycle records (4 start-only orphans); rec1 (review_cycle) and r1
+// (tdd_task) are lone terminal records with no matching start (2
+// terminal-only orphans, the "failed start write" class); rec7's
+// started/done pair is the one genuinely measured run.
+test('optimise-read CLI: `ledger <root>` over a fixture reproducing the real 9-record ledger reports startOnly=4 and terminalOnly=2, broken down by kind, rather than a single combined unmeasured count of 6 (AC-OPS-2, the spec\'s own worked example)', () => {
+  const repo = makeTempRepo()
+  seedNineRecordFixture(repo)
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.wallClock.totals.agentComputeUnmeasuredRuns, 6, 'sanity: the combined total must still be 6, unchanged by adding the named breakdown')
+  assert.equal(out.wallClock.totals.agentComputeStartOnlyRuns, 4, `expected startOnly=4 per the spec's own worked example, got ${out.wallClock.totals.agentComputeStartOnlyRuns}`)
+  assert.equal(out.wallClock.totals.agentComputeTerminalOnlyRuns, 2, `expected terminalOnly=2 per the spec's own worked example, got ${out.wallClock.totals.agentComputeTerminalOnlyRuns}`)
+  assert.equal(out.wallClock.totals.agentComputeStartOnlyByKind.review_cycle, 4, 'all 4 start-only orphans in this fixture are review_cycle records (rec0, rec4, rec5, rec6)')
+  assert.equal(out.wallClock.totals.agentComputeTerminalOnlyByKind.review_cycle, 1, 'rec1 is the review_cycle terminal-only orphan')
+  assert.equal(out.wallClock.totals.agentComputeTerminalOnlyByKind.tdd_task, 1, 'r1 is the tdd_task terminal-only orphan')
+})
+
 // ---- Review round-1 H2: the ci_wait/human_wait path lacked the
 // REDACTED_PATH_MARKER guard the agent_compute path already had, so two
 // DIFFERENT out-of-repo plans merged into one bucket literally named
@@ -1131,9 +1479,9 @@ test('optimise-read: aggregateWallClock never merges two DIFFERENT out-of-repo c
 
 // ---- Review round-1 M3: pair plan-identity selection must be
 // order-independent and must prefer a REAL spec over the no-spec sentinel,
-// restoring main's `pair.find(p => p.spec)?.spec` semantics. AC-QA-13. ----
+// restoring main's `pair.find(p => p.spec)?.spec` semantics. harn-opt-2:AC-QA-13. ----
 
-test('optimise-read: a pair where one record has no spec and the other carries a real spec attributes to the REAL spec, regardless of which record comes first in file order (M3, AC-QA-13)', () => {
+test('optimise-read: a pair where one record has no spec and the other carries a real spec attributes to the REAL spec, regardless of which record comes first in file order (M3, harn-opt-2:AC-QA-13)', () => {
   const noSpecRecord = { kind: 'tdd_task', repo: 'demo', outcome: 'started', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' }
   const realSpecRecord = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' }
   const forward = mod.aggregateWallClock([noSpecRecord, realSpecRecord])
@@ -1143,11 +1491,102 @@ test('optimise-read: a pair where one record has no spec and the other carries a
   assert.equal(
     JSON.stringify([...forward.byPlan.entries()]),
     JSON.stringify([...reversed.byPlan.entries()]),
-    'forward and reversed order must produce byte-identical aggregate output (AC-QA-13)'
+    'forward and reversed order must produce byte-identical aggregate output (harn-opt-2:AC-QA-13)'
   )
 })
 
-test('optimise-read: three records sharing one run_id (forward, reversed, and shuffled), only one of which carries a real spec, all attribute to the real spec and produce byte-identical aggregates (M3, AC-QA-13, shuffled)', () => {
+// HARN-OPT-2 PR2 (harn-opt-2:AC-QA-13): the new start-only/terminal-only orphan
+// classification (AC-OPS-2) must be exactly as order-independent as every
+// other aggregate here -- pairing is by run_id, keyed via a Map, never by
+// file position or adjacency, so shuffling which orphan/pair comes first
+// must never change the counts.
+//
+// Review round-1 M1: the FIRST version of this test used only ONE kind per
+// orphan class, so its own `agentComputeStartOnlyByKind`/
+// `agentComputeTerminalOnlyByKind` objects each held exactly one key --
+// no ordering could ever differ, so the byte-identity assertion below could
+// never fail regardless of whether the implementation serialised those maps
+// in a fixed order or in raw record-encounter order. CONFIRMED by
+// orchestrator execution: two start-only orphans of DIFFERENT kinds
+// (tdd_task, review_cycle) sharing one plan produced
+// `{"tdd_task":1,"review_cycle":1}` forward and
+// `{"review_cycle":1,"tdd_task":1}` reversed -- not byte-identical. Fixed
+// by giving EACH orphan class two different kinds, so the guard can now
+// actually distinguish "always the same order" from "coincidentally only
+// one entry".
+test('optimise-read: a mixed set of paired runs and both orphan classes -- with TWO DIFFERENT KINDS in EACH orphan class, so the byKind maps have something to reorder -- produces byte-identical aggregate output regardless of record order (harn-opt-2:AC-QA-13, AC-OPS-2, M1)', () => {
+  const paired1 = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'p1', ts: '2026-08-01T00:00:00.000Z' }
+  const paired2 = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'p1', ts: '2026-08-01T00:01:00.000Z' }
+  const startOnlyA = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'orphan-start-1', ts: '2026-08-01T00:00:00.000Z' }
+  const startOnlyB = { kind: 'plan_cycle', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'orphan-start-2', ts: '2026-08-01T00:00:00.000Z' }
+  const terminalOnlyA = { kind: 'plan_cycle', repo: 'demo', outcome: 'blocked', spec: 'specs/a.md', run_id: 'orphan-terminal-1', ts: '2026-08-01T00:00:00.000Z' }
+  const terminalOnlyB = { kind: 'review_cycle', repo: 'demo', outcome: 'aborted', spec: 'specs/a.md', run_id: 'orphan-terminal-2', ts: '2026-08-01T00:00:00.000Z' }
+  const all = [paired1, paired2, startOnlyA, startOnlyB, terminalOnlyA, terminalOnlyB]
+  const orderings = [
+    all,
+    [...all].reverse(),
+    [startOnlyB, terminalOnlyA, paired1, startOnlyA, paired2, terminalOnlyB],
+    [terminalOnlyB, startOnlyA, terminalOnlyA, paired2, startOnlyB, paired1],
+  ]
+  const results = orderings.map((records) => JSON.stringify(mod.aggregateWallClock(records).totals))
+  for (const r of results) assert.equal(r, results[0], 'every ordering must produce byte-identical totals')
+  const totals = JSON.parse(results[0])
+  assert.equal(totals.agentComputeMeasuredRuns, 1)
+  assert.equal(totals.agentComputeStartOnlyRuns, 2)
+  assert.equal(totals.agentComputeTerminalOnlyRuns, 2)
+  assert.equal(totals.agentComputeStartOnlyByKind.review_cycle, 1)
+  assert.equal(totals.agentComputeStartOnlyByKind.plan_cycle, 1)
+  assert.equal(totals.agentComputeTerminalOnlyByKind.plan_cycle, 1)
+  assert.equal(totals.agentComputeTerminalOnlyByKind.review_cycle, 1)
+})
+
+// harn-opt-2:AC-QA-13's own literal wording: "a fixture interleaving two concurrent
+// runs' start/terminal lines, then the same lines reversed and shuffled,
+// produces byte-identical aggregate output." No test in the suite exercised
+// this literally (two genuine PAIRS, interleaved) before review round 1.
+test('optimise-read: two concurrent runs\' start/terminal lines, interleaved, then reversed, then shuffled, produce byte-identical aggregate output (harn-opt-2:AC-QA-13, literal wording)', () => {
+  const runAStart = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:00:00.000Z' }
+  const runBStart = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:05.000Z' }
+  const runAEnd = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:02:00.000Z' } // 120s
+  const runBEnd = { kind: 'review_cycle', repo: 'demo', outcome: 'done', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:35.000Z' } // 30s
+  const orderings = [
+    [runAStart, runBStart, runAEnd, runBEnd], // interleaved
+    [runBEnd, runAEnd, runBStart, runAStart], // reversed
+    [runAEnd, runBStart, runAStart, runBEnd], // shuffled
+  ]
+  const results = orderings.map((records) => JSON.stringify(mod.aggregateWallClock(records).totals))
+  for (const r of results) assert.equal(r, results[0], 'every ordering must produce byte-identical totals')
+  const totals = JSON.parse(results[0])
+  assert.equal(totals.agentComputeMeasuredRuns, 2)
+  assert.equal(totals.agentComputeSeconds, 150)
+})
+
+// Review round-2 L-7: harn-opt-2:AC-QA-13's byte-identity was proven only for
+// `.totals` -- `byPlan` (a Map) follows record-ENCOUNTER order, not a
+// sorted key order, and every harn-opt-2:AC-QA-13 test up to this one only ever
+// stringified `.totals`, so a differently-ordered `byPlan` (e.g. from a
+// multi-repo aggregate or a resumed read) was never caught. Sorted by key
+// before being returned.
+test('optimise-read: aggregateWallClock\'s FULL aggregate (byPlan included, not just totals) is byte-identical regardless of record order -- byPlan is sorted by key, not left in record-encounter order (L-7)', () => {
+  const runAStart = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:00:00.000Z' }
+  const runBStart = { kind: 'review_cycle', repo: 'demo', outcome: 'started', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:05.000Z' }
+  const runAEnd = { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: 'specs/a.md', run_id: 'concurrent-a', ts: '2026-08-01T00:02:00.000Z' }
+  const runBEnd = { kind: 'review_cycle', repo: 'demo', outcome: 'done', spec: 'specs/b.md', run_id: 'concurrent-b', ts: '2026-08-01T00:00:35.000Z' }
+  const orderings = [
+    [runAStart, runBStart, runAEnd, runBEnd],
+    [runBEnd, runAEnd, runBStart, runAStart],
+    [runAEnd, runBStart, runAStart, runBEnd],
+  ]
+  const results = orderings.map((records) => {
+    const { byPlan } = mod.aggregateWallClock(records)
+    return JSON.stringify([...byPlan.entries()])
+  })
+  for (const r of results) assert.equal(r, results[0], 'byPlan itself (key order included) must be byte-identical regardless of record order')
+  const keys = JSON.parse(results[0]).map(([k]) => k)
+  assert.deepEqual(keys, [...keys].sort(), 'byPlan must be returned in sorted key order, not record-encounter order')
+})
+
+test('optimise-read: three records sharing one run_id (forward, reversed, and shuffled), only one of which carries a real spec, all attribute to the real spec and produce byte-identical aggregates (M3, harn-opt-2:AC-QA-13, shuffled)', () => {
   const a = { kind: 'tdd_task', repo: 'demo', outcome: 'started', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' } // no spec
   const b = { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: 'specs/real.md', run_id: 'r1', ts: '2026-08-01T00:00:30.000Z' }
   const c = { kind: 'tdd_task', repo: 'demo', outcome: 'done', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' } // no spec
@@ -1336,6 +1775,325 @@ test('optimise-read: aggregateRework excludes an out-of-repo spec from acVerdict
   assert.equal(result.unattributableCount, 1)
 })
 
+// ---- Review round-2 M-3, read side: ledger-append.mjs now writes
+// ac_verdicts entries with a NULLED ac_id (never dropped) when the
+// original was non-conforming, retaining ac_id_raw instead. aggregateRework
+// keys its acVerdicts map by `${repo}|${plan}|${v.ac_id}` -- an unguarded
+// null ac_id would stringify to the literal "null" and merge EVERY
+// sanitised verdict from every plan into one fake "null" AC bucket,
+// exactly the "different plans merge" bug class this whole spec exists to
+// close, one field over. Guarded by excluding null-ac_id verdicts from
+// bucketing; the per-record invalid_ac_ids_dropped counter (already
+// computed by the writer, covering both findings and ac_verdicts) is
+// summed across the window and exposed on the return so
+// optimise-cycle.js can render it. ----
+
+test('optimise-read: aggregateRework never merges verdicts with a NULLED ac_id (a sanitised, non-conforming id) into one fake "null" AC bucket -- two DIFFERENT plans\' sanitised verdicts must never collide (M-3, read-side guard)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'none', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'also-bad', verdict: 'PASS' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const result = mod.aggregateRework(records)
+  for (const [, entry] of result.acVerdicts.entries()) {
+    assert.notEqual(entry.ac_id, null, 'a null ac_id must never reach a real bucket')
+  }
+  assert.equal(result.acVerdicts.size, 0, 'both sanitised verdicts must be excluded from acVerdicts entirely, never merged into one shared bucket')
+})
+
+test('optimise-read: aggregateRework still buckets a WELL-FORMED ac_verdicts entry normally when it shares a record with a sanitised (nulled) one -- the guard must not over-exclude (M-3, not vacuous)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-SEC-1', verdict: 'PASS' }, { ac_id: null, ac_id_raw: 'none', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.acVerdicts.size, 1)
+  const entry = [...result.acVerdicts.values()][0]
+  assert.equal(entry.ac_id, 'AC-SEC-1')
+  assert.equal(entry.pass, 1)
+})
+
+test('optimise-read: aggregateRework sums invalid_ac_ids_dropped across the window and returns it, a real zero when clean (M-3)', () => {
+  const clean = mod.aggregateRework([{ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-SEC-1', verdict: 'PASS' }], invalid_ac_ids_dropped: 0 }])
+  assert.equal(clean.invalidAcIdsDropped, 0)
+  const dirty = mod.aggregateRework([
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', invalid_ac_ids_dropped: 2 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', invalid_ac_ids_dropped: 1 },
+  ])
+  assert.equal(dirty.invalidAcIdsDropped, 3, 'must sum across every review_cycle record in the window')
+})
+
+// ---- Round-4 review M3: a FAILED criterion silently inverts to
+// never_failed:true when the failing verdict's ac_id was sanitised (round-
+// 2 M-3's own ac_id_raw retention) or supplied explicitly null. Both
+// routes reach the exact same silent `continue` in aggregateRework: the
+// FAIL is on disk (ac_id_raw, or just the bare FAIL verdict) but never
+// enters any acVerdicts bucket, so a key with only PASS entries for the
+// same (repo, plan) window reports a confident never_failed:true while the
+// FAIL sits unread two lines away. This is precisely what neverFailingAcs
+// feeds to the retire-the-guard proposal lane -- an inverted conclusion
+// here means proposing to delete a check that DOES fail. Fixed minimally
+// and safely (the review's own "or, minimally" option, chosen over
+// re-attribution by ac_id_raw pattern-matching: re-attribution would let a
+// hostile ac_id/ac_id_raw string ending in a real AC id redirect its own
+// FAIL onto an unrelated criterion, a second injection route into
+// telemetry): aggregateRework now tracks which (repo, plan) windows saw an
+// unattributed FAIL, and neverFailingAcs degrades every ac_id in that
+// window to never_failed:null with unattributed_fail_in_window:true,
+// rather than computing from the (incomplete) pass/fail counts it can see. ----
+
+test('optimise-read: neverFailingAcs never reports never_failed:true when an unattributed FAIL verdict (a sanitised, non-conforming ac_id) exists in the same repo+plan window -- a dropped FAIL row must degrade the claim to unknown, never invert it to true (M3, lens-data route, mirrors the review\'s own fixture)', () => {
+  const passRecords = Array.from({ length: 5 }, () => ({
+    kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done',
+    ac_verdicts: [{ ac_id: 'AC-DATA-1', verdict: 'PASS' }],
+  }))
+  const failRecords = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const rework = mod.aggregateRework([...passRecords, ...failRecords])
+  const never = mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  assert.equal(never.length, 1, 'sanity: the 2 unattributed FAILs must not have created a second bucket')
+  const entry = never[0]
+  assert.equal(entry.ac_id, 'AC-DATA-1')
+  assert.equal(entry.n, 5, 'sanity: the 2 unattributed FAILs must not have entered this bucket by any other route')
+  assert.equal(entry.never_failed, null, 'a hidden FAIL must never be reported as a confident never_failed:true')
+  assert.equal(entry.unattributed_fail_in_window, true, 'the degradation reason must be distinguishable from insufficient_data')
+})
+
+test('optimise-read: an EXPLICITLY-null ac_id FAIL (never sanitised -- supplied that way, no ac_id_raw at all) taints the bucket the same way a sanitised one does (M3, lens-security route)', () => {
+  const records = [
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-SEC-9', verdict: 'PASS' }] })),
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, verdict: 'FAIL' }] },
+  ]
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  const entry = never.find((e) => e.ac_id === 'AC-SEC-9')
+  assert.equal(entry.never_failed, null)
+  assert.equal(entry.unattributed_fail_in_window, true)
+})
+
+test('optimise-read: neverFailingAcs does NOT taint a bucket when the unattributed verdict was a PASS or UNVERIFIABLE, not a FAIL -- only a hidden FAIL is the inversion risk (M3, not vacuous)', () => {
+  const records = [
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-1', verdict: 'PASS' }] })),
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'PASS' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  const entry = never.find((e) => e.ac_id === 'AC-DATA-1')
+  assert.equal(entry.never_failed, true, 'an unattributed PASS carries no inversion risk and must not suppress a genuine never_failed:true')
+  assert.equal(entry.unattributed_fail_in_window, false)
+})
+
+test('optimise-read: an unattributed FAIL in one plan\'s window does not taint a DIFFERENT plan\'s never_failed claim (M3, not over-broad)', () => {
+  const records = [
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-1', verdict: 'PASS' }] })),
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-2', verdict: 'PASS' }] })),
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1', verdict: 'FAIL' }], invalid_ac_ids_dropped: 1 },
+  ]
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  const tainted = never.find((e) => e.ac_id === 'AC-DATA-1')
+  const clean = never.find((e) => e.ac_id === 'AC-DATA-2')
+  assert.equal(tainted.never_failed, null)
+  assert.equal(clean.never_failed, true, 'a different plan\'s bucket must never be tainted by another plan\'s unattributed FAIL')
+})
+
+test('optimise-read: neverFailingAcs called with no unattributedFailBuckets option at all (every pre-M3 call site) behaves exactly as before -- backward compatible, no default taint (M3)', () => {
+  const records = Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-1', verdict: 'PASS' }] }))
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5 })
+  assert.equal(never[0].never_failed, true)
+  assert.equal(never[0].unattributed_fail_in_window, false)
+})
+
+// ---- Round-6 review H1 (§12 reframe, read-side half), corrected AGAIN in
+// round 7 -- read the round-7 fix comments in optimise-read.mjs itself
+// before touching this table. Round-6's guard (and this exact table)
+// asked a SHAPE question: "is the value null AND does a *_raw sibling
+// happen to be present?" The round-6 coordinator verification used
+// exactly that shape ({verdict:null, verdict_raw:'FAILED'}) and reported
+// the bug fixed; it was not -- a BARE `verdict:null` with NO sibling at
+// all (schema-legal, a caller can supply it directly, never touches
+// degradeEntry) sailed straight past the guard and reproduced the
+// IDENTICAL inversion. That is the fourth recurrence of "the fixture
+// agrees with the code" on this PR, and this time it was in the
+// verification, not just the implementation.
+//
+// THE STANDING RULE, so a fifth recurrence does not happen: an "is this
+// evidence?" test must enumerate the VALID values and assert that
+// EVERYTHING ELSE is not evidence. It must NEVER match on the shape a
+// particular fix happens to produce. Concretely, every neutralisable
+// field below is driven through THREE rows -- (a) null WITH the *_raw
+// sibling present (degradeEntry's own shape), (b) a BARE null with NO
+// sibling at all, and (c) an arbitrary junk value that is not null at
+// all -- all asserting NOT evidence. If a future change to this table
+// removes case (b) or (c) and keeps only (a), that IS this exact mistake
+// recurring: do not approve it. ----
+
+const VERDICT_NOT_EVIDENCE_TABLE = [
+  { label: 'null + verdict_raw present (degradeEntry\'s own shape -- what round-6\'s fix AND its own verification tested)', verdict: null, verdict_raw: 'FAILED' },
+  { label: 'BARE null, NO verdict_raw at all (schema-legal, never touches degradeEntry -- the shape round-6 missed, reproduced verbatim by the coordinator against the round-6 tip)', verdict: null },
+  { label: 'arbitrary junk string, not null, not a known verdict (a hand-edited or pre-degradeEntry ledger line)', verdict: 'MAYBE' },
+]
+
+for (const row of VERDICT_NOT_EVIDENCE_TABLE) {
+  test(`optimise-read: NEUTRALISED-VALUE TABLE -- ac_verdicts[].verdict, ${row.label}: does not count toward n, does not move pass/fail, taints never_failed to null (round-7 F1)`, () => {
+    const acVerdict = { ac_id: 'AC-DATA-9', verdict: row.verdict }
+    if ('verdict_raw' in row) acVerdict.verdict_raw = row.verdict_raw
+    const records = Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ...acVerdict }] }))
+    const rework = mod.aggregateRework(records)
+    const entry = [...rework.acVerdicts.values()].find((e) => e.ac_id === 'AC-DATA-9')
+    assert.ok(entry, `${row.label}: the ac_id must still be VISIBLE in the report`)
+    assert.equal(entry.n, 0, `${row.label}: must not count toward n`)
+    assert.equal(entry.pass, 0, `${row.label}: must not move pass`)
+    assert.equal(entry.fail, 0, `${row.label}: must not move fail`)
+    const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+    const nf = never.find((a) => a.ac_id === 'AC-DATA-9')
+    assert.equal(nf.never_failed, null, `${row.label}: must NEVER report true on zero real evidence`)
+    assert.equal(nf.unattributed_verdict_in_entry, true, `${row.label}: must trip the taint signal independently`)
+  })
+}
+
+const LENS_NOT_EVIDENCE_TABLE = [
+  { label: 'null + lens_raw present (degradeEntry\'s own shape)', lens: null, lens_raw: 'orchestrator' },
+  { label: 'BARE null, NO lens_raw at all (a genuinely omitted `lens` field, round-7 F2\'s own shape)', lens: null },
+  { label: 'arbitrary junk string not matching the lens/reviewer pattern', lens: 'not-a-real-lens-name' },
+]
+
+for (const row of LENS_NOT_EVIDENCE_TABLE) {
+  test(`optimise-read: NEUTRALISED-VALUE TABLE -- findings[].lens, ${row.label}: excluded from lensDispositionCounts, never creates a bucket (round-7 F1)`, () => {
+    const finding = { id: 'f1', severity: 'Low', ac_id: null, disposition: 'open', lens: row.lens }
+    if ('lens_raw' in row) finding.lens_raw = row.lens_raw
+    const records = [{ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [finding] }]
+    const rework = mod.aggregateRework(records)
+    assert.equal(Object.keys(rework.lensDispositionCounts).length, 0, `${row.label}: must not create ANY disposition bucket, real or fake`)
+  })
+}
+
+test('optimise-read: NEUTRALISED-VALUE TABLE -- findings[].lens: two DIFFERENT non-evidence lenses (one neutralised-with-sibling, one bare-null) never merge into one fake shared bucket, and a genuine lens alongside them is still counted normally (round-7, not over-broad)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [{ id: 'f1', lens: null, lens_raw: 'orchestrator', severity: 'Low', ac_id: null, disposition: 'open' }] },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [{ id: 'f2', lens: null, severity: 'Low', ac_id: null, disposition: 'spec_bug' }] }, // bare null, no sibling
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [{ id: 'f3', lens: 'lens-security', severity: 'Low', ac_id: null, disposition: 'rejected' }] },
+  ]
+  const rework = mod.aggregateRework(records)
+  assert.equal(rework.lensDispositionCounts['null'], undefined, 'two DIFFERENT non-evidence lenses must never merge into one fake "null" bucket')
+  assert.deepEqual(rework.lensDispositionCounts['lens-security'], { fixed: 0, rejected: 1, spec_bug: 0, open: 0 }, 'the one genuine lens must still be counted normally -- the guard must not over-exclude')
+  assert.equal(Object.keys(rework.lensDispositionCounts).length, 1, 'only the genuine lens should appear at all')
+})
+
+const AC_ID_NOT_EVIDENCE_TABLE = [
+  { label: 'null + ac_id_raw present (degradeEntry\'s own shape)', ac_id: null, ac_id_raw: 'optimise-cycle:AC-DATA-1' },
+  { label: 'BARE null, NO ac_id_raw at all (round-4 M3\'s own explicit-null shape)', ac_id: null },
+]
+
+for (const row of AC_ID_NOT_EVIDENCE_TABLE) {
+  test(`optimise-read: NEUTRALISED-VALUE TABLE -- ac_verdicts[].ac_id, ${row.label}: excluded from bucketing (pre-existing round-4 M3 mechanism, already value-based -- re-verified under round-7's own table discipline)`, () => {
+    const verdict = { verdict: 'FAIL', ac_id: row.ac_id }
+    if ('ac_id_raw' in row) verdict.ac_id_raw = row.ac_id_raw
+    const records = Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ...verdict }] }))
+    const rework = mod.aggregateRework(records)
+    assert.equal(rework.acVerdicts.size, 0, `${row.label}: must never create a bucket keyed on the literal string "null"`)
+  })
+}
+
+test('optimise-read: NEUTRALISED-VALUE TABLE -- findings[].severity, neutralised: has NO current read-side consumer, so there is nothing to taint -- stated and proven directly, not silently skipped (round-6 instruction 3)', () => {
+  const records = [{ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', findings: [{ id: 'f1', lens: 'lens-security', severity: null, severity_raw: 'Urgent', ac_id: null, disposition: 'open' }] }]
+  const rework = mod.aggregateRework(records)
+  // The only conclusion aggregateRework draws from a finding is its
+  // disposition (bumpDisposition, by lens) -- severity never reaches any
+  // aggregate today. Proven, not assumed: the genuine lens's disposition
+  // count is unaffected by severity being neutralised alongside it.
+  assert.deepEqual(rework.lensDispositionCounts['lens-security'], { fixed: 0, rejected: 0, spec_bug: 0, open: 1 })
+})
+
+test('optimise-read: NEUTRALISED-VALUE TABLE -- invalid_record_values_dropped is summed across the window and returned, mirroring invalidAcIdsDropped exactly (round-6 instruction 4)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', invalid_record_values_dropped: 2 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', invalid_record_values_dropped: 1 },
+  ]
+  const rework = mod.aggregateRework(records)
+  assert.equal(rework.invalidRecordValuesDropped, 3)
+})
+
+// ---- Round-6: the NON-neutralised control. The fix must not degenerate
+// into tainting everything -- a genuine FAIL must still report
+// never_failed:false, and a genuine all-PASS window must still report
+// true. Run in the SAME file, immediately after the neutralised table, so
+// a reader sees both halves of the proof together. ----
+
+test('optimise-read: NON-neutralised control -- a genuine FAIL verdict (not null, no *_raw sibling involved) still reports never_failed:false, exactly as before (round-6, proves the fix does not over-taint)', () => {
+  const records = Array.from({ length: 5 }, (_, i) => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-10', verdict: i === 2 ? 'FAIL' : 'PASS' }] }))
+  const rework = mod.aggregateRework(records)
+  const entry = [...rework.acVerdicts.values()].find((e) => e.ac_id === 'AC-DATA-10')
+  assert.equal(entry.n, 5)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+  const nf = never.find((a) => a.ac_id === 'AC-DATA-10')
+  assert.equal(nf.never_failed, false, 'a genuine, real FAIL must still be reported as a real FAIL')
+  assert.equal(nf.unattributed_verdict_in_entry, false)
+})
+
+test('optimise-read: NON-neutralised control -- a genuine all-PASS window (n meeting the minimum, no neutralised verdicts anywhere) still reports never_failed:true (round-6, proves the fix does not over-taint)', () => {
+  const records = Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-11', verdict: 'PASS' }] }))
+  const rework = mod.aggregateRework(records)
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+  const nf = never.find((a) => a.ac_id === 'AC-DATA-11')
+  assert.equal(nf.never_failed, true, 'a genuinely well-supported never-failing criterion must still be reported as such -- the fix must not blind the report entirely')
+  assert.equal(nf.unattributed_verdict_in_entry, false)
+})
+
+test('optimise-read: NON-neutralised control -- a MIX of real verdicts and one neutralised verdict for the SAME ac_id still taints never_failed to null (not diluted into a false confidence by the real evidence sitting alongside it)', () => {
+  const records = [
+    ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-12', verdict: 'PASS' }] })),
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-DATA-12', verdict: null, verdict_raw: 'FAILED' }] },
+  ]
+  const rework = mod.aggregateRework(records)
+  const entry = [...rework.acVerdicts.values()].find((e) => e.ac_id === 'AC-DATA-12')
+  assert.equal(entry.n, 5, 'the 5 real PASS verdicts must still count -- the neutralised one must not subtract from n, only fail to ADD to it')
+  const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+  const nf = never.find((a) => a.ac_id === 'AC-DATA-12')
+  assert.equal(nf.never_failed, null, 'one neutralised verdict alongside five real PASSes must still taint the claim -- real evidence does not vouch for the unknown sitting next to it')
+})
+
+// Round-7 review F4: DUAL corruption (an unattributed ac_id AND a
+// non-evidence verdict on the SAME entry) used to produce NO taint at
+// all -- more corruption yielding MORE confidence than a single-field
+// defect, since the taint check tested `v.verdict === 'FAIL'` literally
+// and neither null nor an arbitrary junk string is the literal string
+// 'FAIL'. Reproduces the review's own two shapes: both explicitly null,
+// and the realistic writer output for a model-supplied combined field
+// like {ac_id:'AC-QA-8 (partial)', verdict:'PARTIAL'} (degradeEntry
+// neutralises BOTH independently, in one pass, to {ac_id:null,
+// verdict:null}).
+test('optimise-read: NEUTRALISED-VALUE TABLE -- DUAL corruption (ac_id AND verdict both non-evidence on the same entry) still taints the (repo,plan) window -- must not produce MORE confidence than a single-field defect (round-7 F4)', () => {
+  const dualCorrupt = [
+    { ac_id: null, verdict: null }, // both explicitly null, no *_raw at all
+    { ac_id: null, ac_id_raw: 'AC-QA-8 (partial)', verdict: null, verdict_raw: 'PARTIAL' }, // degradeEntry's own realistic shape
+  ]
+  for (const badVerdict of dualCorrupt) {
+    const records = [
+      ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-QA-1', verdict: 'PASS' }] })),
+      { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ...badVerdict }] },
+    ]
+    const rework = mod.aggregateRework(records)
+    const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+    const nf = never.find((a) => a.ac_id === 'AC-QA-1')
+    assert.equal(nf.never_failed, null, `dual-corrupt shape ${JSON.stringify(badVerdict)} must still taint the window, not report a confident true`)
+  }
+})
+
+test('optimise-read: NON-neutralised control -- an unattributed ac_id whose verdict is a genuine PASS or UNVERIFIABLE (not a hidden FAIL) does NOT taint the window -- round-7 F4 must not over-taint (not vacuous)', () => {
+  for (const cleanVerdict of ['PASS', 'UNVERIFIABLE']) {
+    const records = [
+      ...Array.from({ length: 5 }, () => ({ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: 'AC-QA-2', verdict: 'PASS' }] })),
+      { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', ac_verdicts: [{ ac_id: null, ac_id_raw: 'bogus', verdict: cleanVerdict }] },
+    ]
+    const rework = mod.aggregateRework(records)
+    const never = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 5, unattributedFailBuckets: rework.unattributedFailBuckets })
+    const nf = never.find((a) => a.ac_id === 'AC-QA-2')
+    assert.equal(nf.never_failed, true, `an unattributed ac_id with a genuine ${cleanVerdict} carries no inversion risk and must not taint the window`)
+  }
+})
+
 test('optimise-read: aggregateWallClock excludes a fully-degraded pair (both records marked degraded:true, no spec survives) from byPlan -- counted under a named degraded-run total, never silently folded into the no-spec bucket (AC-QA-7)', () => {
   const records = [
     { kind: 'tdd_task', repo: 'demo', run_id: 'deg-1', ts: '2026-08-01T00:00:00.000Z', degraded: true },
@@ -1347,8 +2105,12 @@ test('optimise-read: aggregateWallClock excludes a fully-degraded pair (both rec
 })
 
 test('optimise-read: aggregateWallClock still attributes a pair where only ONE side degraded -- the surviving side\'s plan identity is real and must not be discarded just because its partner degraded (AC-QA-7, not vacuous)', () => {
+  // HARN-OPT-2 PR2 (AC-DATA-10): the start record must carry outcome
+  // 'started' like every other pair fixture in this file (and like every
+  // real start record the writer actually emits) -- a genuine start/terminal
+  // pair is now identified by outcome, not merely by record count.
   const records = [
-    { kind: 'tdd_task', repo: 'demo', run_id: 'partial-1', spec: 'specs/a.md', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', run_id: 'partial-1', spec: 'specs/a.md', outcome: 'started', ts: '2026-08-01T00:00:00.000Z' },
     { kind: 'tdd_task', repo: 'demo', run_id: 'partial-1', ts: '2026-08-01T00:01:00.000Z', outcome: 'done', degraded: true },
   ]
   const result = mod.aggregateWallClock(records)
