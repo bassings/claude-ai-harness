@@ -2926,6 +2926,50 @@ test('ledger-append (round-2): redactRelativeEscapes is no longer exported -- th
   assert.equal(mod.redactRelativeEscapes, undefined)
 })
 
+// ---- T3 subtraction round (specs/harn-opt-2.md conductor log tick 46):
+// ABSOLUTE_PATH_RE's prefix class widened to also anchor on a backtick,
+// `=`, `[`, `<` or a bare `,`, plus `:` guarded against `://` -- proven
+// directly against redactPaths, both that the new forms redact AND that
+// the guard against `://` genuinely holds (a URL scheme is not "matched
+// inside ordinary, safe text" and mangled, the exact regression class
+// this same regex has already caused twice, per its own comment). ----
+
+test('ledger-append module: redactPaths widened prefix class -- a backtick-wrapped path (Claude\'s default way of formatting one; the REAL 2026-08-16 leaked line\'s shape) is redacted, where the pre-subtraction-round regex left it completely unchanged', async () => {
+  const { redactPaths, REDACTED_PATH_MARKER } = await import(APPEND_MODULE_URL)
+  const line = '`/some/other/place/report.md` -- 3 ranked proposals.'
+  const out = redactPaths(line, '/repo')
+  assert.ok(!out.includes('/some/other/place'), `backtick-wrapped absolute path outside root must be redacted, got: ${out}`)
+  assert.ok(out.includes(REDACTED_PATH_MARKER), `expected the redaction marker in the output, got: ${out}`)
+})
+
+test('ledger-append module: redactPaths widened prefix class -- a backtick-wrapped path INSIDE the given root is relativised (recoverable), not just redacted to the marker', async () => {
+  const { redactPaths } = await import(APPEND_MODULE_URL)
+  const line = '`/repo/.claude/optimise-cycle-report.md` -- 3 ranked proposals.'
+  const out = redactPaths(line, '/repo')
+  assert.ok(!out.includes('/repo/.claude'), `the absolute form must not survive, got: ${out}`)
+  assert.match(out, /`\.claude\/optimise-cycle-report\.md/, `expected a relativised, still-legible in-repo path, got: ${out}`)
+})
+
+test('ledger-append module: redactPaths widened prefix class also fires on `=`, `[`, `<` and a bare `,` immediately before an absolute path', async () => {
+  const { redactPaths, REDACTED_PATH_MARKER } = await import(APPEND_MODULE_URL)
+  for (const line of ['path=/some/other/place', '[/some/other/place]', '</some/other/place>', 'a, /some/other/place, b']) {
+    const out = redactPaths(line, '/repo')
+    assert.ok(!out.includes('/some/other/place'), `expected "/some/other/place" to be redacted in ${JSON.stringify(line)}, got: ${JSON.stringify(out)}`)
+    assert.ok(out.includes(REDACTED_PATH_MARKER), `expected the redaction marker for ${JSON.stringify(line)}, got: ${JSON.stringify(out)}`)
+  }
+})
+
+test('ledger-append module: redactPaths\' `:` boundary is guarded against `://` -- a colon-prefixed path DOES redact (e.g. "Path:/some/place"), but a GitHub-style https URL survives completely untouched, never mangled into the redaction marker', async () => {
+  const { redactPaths, REDACTED_PATH_MARKER } = await import(APPEND_MODULE_URL)
+  const colonPrefixed = redactPaths('Path:/some/other/place', '/repo')
+  assert.ok(!colonPrefixed.includes('/some/other/place'), `a colon-prefixed absolute path must redact, got: ${colonPrefixed}`)
+  assert.ok(colonPrefixed.includes(REDACTED_PATH_MARKER), `expected the redaction marker, got: ${colonPrefixed}`)
+  const url = 'see https://github.com/example/repo for details'
+  assert.equal(redactPaths(url, '/repo'), url, 'a https:// URL in ordinary prose must survive completely untouched -- the exact "matched inside safe text" regression class this regex has already caused twice')
+  const urlHttp = 'see http://example.com/path for details'
+  assert.equal(redactPaths(urlHttp, '/repo'), urlHttp, 'a http:// URL in ordinary prose must also survive completely untouched')
+})
+
 // ---- Review round-1 L5: the no-spec sentinel must be structurally
 // unproducible from a real spec path, not merely an implausible one.
 // canonicalPlanKey never emits a trailing "/" (a trailing-slash segment is
