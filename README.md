@@ -479,6 +479,54 @@ heuristic derived from git history, not a verified per-PR attribution).
 (ledger lines per repo; default 2000)}` — never a hardcoded path or repo
 name; the repos it reads always come from `args` or its documented default.
 
+### Weekly scheduled run (HARN-OPT-2 T3)
+
+The weekly cadence above runs as a local launchd job
+(`com.local.optimise-cycle-weekly`, Mondays 07:41 local), driven by
+`bin/optimise-cycle-weekly.sh` in this repo. That script loops over the
+configured delivery repos, invokes `claude -p "/optimise-cycle ..."`
+headlessly against each (read-only, never applying a proposal, same as
+every other invocation of the cycle), and appends one transcript per repo
+to `~/.claude/logs/optimise-cycle-weekly.log`.
+
+**PASS/FAIL is decided from the report artefact, never from what the model
+said.** A repo passes only if, after the run, `<repo>/.claude/optimise-cycle-report.md`
+exists, its mtime is at or after the timestamp captured immediately before
+that repo's run started (this is what catches a stale report left over from
+a previous week -- the one failure mode a status-only check cannot see, since
+a leftover file looks identical to a fresh one to anything that only asks
+"does it exist"), and it is non-empty with at least a markdown heading and a
+section heading. The model's free-text reply is still appended to the log
+as diagnostic context, but the verdict never depends on it: a run that exits
+0 and says nothing is a PASS if the artefact is genuinely fresh, and a run
+that exits 0 and says the right words is a FAIL if the artefact is stale,
+missing or empty. Each repo gets one `RESULT PASS`/`RESULT FAIL` line naming
+the reason; the script exits non-zero if any repo failed, and a non-git
+directory in the repo list is skipped rather than counted as a failure.
+Covered by `test/weekly-runner.test.js`, which drives the real script
+against real temp git repos with a stub `claude` on PATH -- no test run ever
+makes a real model call.
+
+**Keep `~/.claude/bin/optimise-cycle-weekly.sh` synced from this repo's
+`bin/optimise-cycle-weekly.sh`** after merging any change to it, the same
+discipline as the `workflows/` mirror above (AC-OPS-4):
+
+```bash
+cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
+chmod +x ~/.claude/bin/optimise-cycle-weekly.sh
+diff -q claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
+```
+
+As of this change, that sync has not yet happened: `~/.claude/bin/optimise-cycle-weekly.sh`
+is still the pre-existing, unreviewed version this PR replaces, and re-syncing
+it is a merge-time step, not something this branch does to a path outside
+the repo.
+
+`OPTIMISE_WEEKLY_REPOS` (newline-separated repo list) and
+`OPTIMISE_WEEKLY_LOG` (log file path) are read by the script but exist only
+as a test seam for `test/weekly-runner.test.js`; they are never operator
+configuration and neither is documented as a knob to set.
+
 ## Tests
 
 This repo's own tests need only Node (no `npm install`, no dependency
