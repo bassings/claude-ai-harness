@@ -24,6 +24,15 @@ const specPath = opts.spec
 // Set as soon as lensReports exists, so a late throw still leaves an
 // accurate trail (see review-cycle.js for the identical pattern).
 let lensesRunRaw = []
+// 2026-08-18 (H1): plan-cycle is where the shared-checkout mis-review actually
+// happened, and it is the MORE exposed of the two cycles -- its lenses run
+// WITHOUT worktree isolation, directly in the shared main checkout, whereas
+// review-cycle's have been isolated since 2026-08-07. The drift guard was
+// added to review-cycle first, which was already the better-protected one.
+// Same asymmetric comparison here: only a REPORTED sha that DIFFERS counts;
+// a missing one means "not reported", never "did not move".
+let planHeadSha = null
+let synthesisHeadSha = null
 
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
@@ -186,15 +195,17 @@ const scope = await agent(
   `- architecture: does it add a module, package, dependency, service boundary, or touch the app's core wiring (event bus, plugin loader, API layer, dependency manifests)?\n` +
   `- operability: does it change production behaviour, logging, containers, CI or operational scripts?\n` +
   `- user_facing: will a user see or feel this change?\n` +
-  `Also return a two-sentence summary of what the spec asks for, and the list of repo paths it will most likely touch.`,
+  `Also return a two-sentence summary of what the spec asks for, and the list of repo paths it will most likely touch.\n` +
+  `Finally, run \`git rev-parse HEAD\` and return its exact output as head_sha.`,
   {
     label: 'scope:spec',
     phase: 'Scope',
     effort: 'low',
     schema: {
       type: 'object',
-      required: ['summary', 'ui', 'data', 'architecture', 'operability', 'user_facing', 'likely_paths'],
+      required: ['summary', 'ui', 'data', 'architecture', 'operability', 'user_facing', 'likely_paths', 'head_sha'],
       properties: {
+        head_sha: { type: 'string' },
         summary: { type: 'string' },
         ui: { type: 'boolean' },
         data: { type: 'boolean' },
@@ -207,6 +218,7 @@ const scope = await agent(
   }
 )
 if (!scope) return { report: 'Scope agent failed; no plan produced.', __outcome: 'aborted' }
+planHeadSha = typeof scope.head_sha === 'string' ? scope.head_sha : null
 
 // ---- deterministic lens triggering (AGENT-HARNESS.md roster; simplicity is planning-only and always on) ----
 let lenses = ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product']
@@ -283,15 +295,29 @@ const synthesis = await agent(
   `of the file byte-for-byte. Also add a "### Vetoed at planning" subsection listing the drops and reasons, if any.\n` +
   `4. Return a markdown summary: a per-lens table (verdict, criteria count, could_not_check), the veto list, any lens ` +
   `findings about the spec itself (BLOCKED lenses prominently), and the final AC count.\n` +
-  `Return only the markdown summary.`,
-  { label: 'synthesis:write-back', phase: 'Synthesis' }
+  `Return only the markdown summary as "summary".\n` +
+  `Also run \`git rev-parse HEAD\` in the repo NOW, at write-back time, and return its exact output as ` +
+  `head_sha_at_synthesis. Several agent sessions share these checkouts: planning lenses here run WITHOUT worktree ` +
+  `isolation, directly in the shared main checkout, so if another session switches branches mid-run these criteria ` +
+  `would be written about a different tree than the spec names. Report what git says now, even if it differs.`,
+  { label: 'synthesis:write-back', phase: 'Synthesis',
+    schema: { type: 'object', required: ['summary'], properties: {
+      summary: { type: 'string' },
+      head_sha_at_synthesis: { type: ['string', 'null'] },
+    } } }
 )
 
 // M1: outcome was computed purely from lens verdicts, so a run whose
 // synthesis:write-back agent failed or returned nothing usable (undefined,
 // or an empty/non-string summary) was still recorded as "done" -- see
 // review-cycle.js for the identical fix and its rationale.
-const reportOk = typeof synthesis === 'string' && synthesis.length > 0
+// Adding a schema to synthesis:write-back turned its result from a bare string
+// into an object, so consumers read .summary. Deliberately NOT tolerant of both
+// shapes: a fallback accepting a bare string would keep working if the schema
+// were later dropped, which is exactly how head_sha_at_synthesis would go
+// missing with nothing failing.
+synthesisHeadSha = synthesis && typeof synthesis.head_sha_at_synthesis === 'string' ? synthesis.head_sha_at_synthesis : null
+const reportOk = synthesis && typeof synthesis.summary === 'string' && synthesis.summary.length > 0
 const outcome = !reportOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
 
 return {
@@ -299,7 +325,7 @@ return {
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: reportOk ? synthesis : '',
+  report: reportOk ? synthesis.summary : '',
   __outcome: outcome,
 }
 
@@ -358,6 +384,17 @@ const terminalWrite = await writeLedger(terminalEntry)
 // value so the caller -- a conductor, or a human reading the result -- can
 // tell that this run produced no telemetry, on the FIRST run rather than the
 // sixth day.
+// 2026-08-18 (H1): did the tree move under this PLANNING run? Asymmetric, the
+// same way review-cycle's is: only a REPORTED sha that DIFFERS counts. A
+// missing sha means the agent did not answer, which is not evidence of
+// stability. This matters more here than in review-cycle, because planning
+// lenses run WITHOUT worktree isolation in the shared main checkout.
+const checkoutMoved = Boolean(planHeadSha && synthesisHeadSha && synthesisHeadSha !== planHeadSha)
+if (checkoutMoved) {
+  result.checkout_moved = true
+  result.checkout_moved_detail = `scoped at ${planHeadSha}, synthesis found ${synthesisHeadSha} -- the working tree moved mid-plan, so these acceptance criteria may describe a different tree than the spec names. Re-run once the checkout is stable.`
+  log(`CHECKOUT MOVED MID-PLAN: scoped ${planHeadSha}, synthesis ${synthesisHeadSha}. Another session may share this checkout. Treat these criteria as unverified until re-run.`)
+}
 const ledgerFailed = !startWrite.write_ok || !terminalWrite.write_ok
 if (ledgerFailed) {
   // Assigned onto `result` rather than branching the final return, so the
