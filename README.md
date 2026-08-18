@@ -704,6 +704,21 @@ rm ~/Library/LaunchAgents/com.local.optimise-cycle-weekly.plist
 
 To reinstate it later, re-run the two-line `sed`/`bootstrap` install above.
 
+**This rollback has been executed, not merely documented** (2026-08-18, per
+CLAUDE.md §11: a documented rollback nobody has run is an assumption). The
+sequence run, and observed: the job resolved under `launchctl print`;
+`bootout` exited 0; `launchctl print` then reported `Bad request`, confirming
+the job was genuinely gone rather than idle; `bootstrap` exited 0; and
+`launchctl print` resolved it again, pointing at the synced
+`~/.claude/bin/optimise-cycle-weekly.sh`. The plist file itself was left in
+place, so only the launchd registration was cycled.
+
+One thing that surfaced while doing it, worth knowing before anyone
+diagnoses a missed run: **`launchctl`'s `runs` counter resets on reboot.**
+After the 2026-08-18 restart it read `runs = 0`, `last exit code = (never
+exited)` for a job that had genuinely run on 2026-08-17. `launchctl` is not a
+durable record of whether the weekly job has been firing; the log file is.
+
 #### Log retention
 
 The log is appended to indefinitely; nothing in this repo rotates or
