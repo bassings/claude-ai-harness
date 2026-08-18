@@ -178,10 +178,14 @@ export function windowRecords(records, maxLines = DEFAULT_LEDGER_WINDOW_LINES) {
 // windowRecords' tail slice means "the most recent runs" rather than
 // "whichever root was listed last".
 //
-// Decorate-sort-undecorate with an explicit original-index tiebreak, rather
-// than leaning on Array.prototype.sort's stability: records sharing a
-// timestamp keep the order they were read in, which for a single root is
-// its append order.
+// Array.prototype.sort has been stable by specification since ES2019, so
+// records sharing a timestamp keep the order they were read in, which for a
+// single root is its append order. An earlier version decorated each record
+// with its original index and tie-broke on that, described as not leaning on
+// that guarantee -- but the decoration was untestable: changing the tiebreak
+// to `return 0` left the whole suite green, because the language already
+// promised what it was re-implementing. Removed rather than kept as
+// decoration; what remains is load-bearing (see the equality branch below).
 //
 // A record whose `ts` is missing or unparseable sorts as OLDEST. The ledger
 // envelope only requires `ts` to be a non-empty string, so a non-ISO value
@@ -189,15 +193,33 @@ export function windowRecords(records, maxLines = DEFAULT_LEDGER_WINDOW_LINES) {
 // never displace a record with a known, recent time. It is dropped first
 // rather than silently outranking real data.
 export function sortRecordsByTime(records) {
-  const decorated = records.map((record, index) => {
+  const timeOf = (record) => {
     const parsed = typeof record.ts === 'string' ? Date.parse(record.ts) : Number.NaN
-    return { record, index, time: Number.isFinite(parsed) ? parsed : -Infinity }
+    return Number.isFinite(parsed) ? parsed : -Infinity
+  }
+  // The equality branch guards a real hazard that this runtime happens to
+  // tolerate, and the distinction is stated rather than glossed. Two records
+  // with an unusable ts both key to -Infinity, and `-Infinity - -Infinity` is
+  // NaN: an inconsistent comparator, for which the specification leaves the
+  // resulting order implementation-defined. Returning 0 for equal keys is
+  // what makes the stable-sort guarantee apply to them.
+  //
+  // MEASURED, and not what the first version of this comment claimed:
+  // replacing this branch with a plain `ta - tb` leaves the suite at 125/125
+  // green, because V8 treats a NaN comparator result as 0. So on this engine
+  // the branch is unobservable and no test here can prove it load-bearing.
+  // It stays because the guarantee it relies on is the language's, not
+  // V8's, and a different engine may order those records differently -- but
+  // it is defensive rather than proven, and calling it proven would be the
+  // exact false claim this file's other comments warn about.
+  //
+  // Copy first, so the caller's array is never reordered.
+  return records.slice().sort((a, b) => {
+    const ta = timeOf(a)
+    const tb = timeOf(b)
+    if (ta === tb) return 0
+    return ta < tb ? -1 : 1
   })
-  decorated.sort((a, b) => {
-    if (a.time !== b.time) return a.time < b.time ? -1 : 1
-    return a.index - b.index
-  })
-  return decorated.map((d) => d.record)
 }
 
 function bumpDisposition(counts, lens, disposition) {

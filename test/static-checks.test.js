@@ -67,14 +67,23 @@ const PR1_SUBJECT_ANCHOR = '(PR 1 of HARN-OPT-1) (#1)'
 
 test('static: PR1\'s merge commit (resolved by subject, not by hash) introduced no file whose path matches "optimise-cycle" (AC-SIMP-7, checked against the historical commit rather than the live tree, which now legitimately contains PR 2\'s optimiser files)', () => {
   const exec = require('node:child_process').execFileSync
-  const candidates = exec('git', ['log', '--all', '--format=%H\t%s'], { cwd: ROOT, encoding: 'utf8' })
+  // --branches --remotes, deliberately NOT --all. --all includes
+  // refs/original/, so during a filter-branch backup window BOTH the
+  // rewritten and the original commit carry this subject and the
+  // exactly-one assertion below hard-fails -- in precisely the operation this
+  // resolution was written to survive. Note the symmetry: refs/original
+  // previously kept a broken hash-pinned guard silently GREEN, and would now
+  // keep a correct subject-pinned guard RED.
+  const candidates = exec('git', ['log', '--branches', '--remotes', '--format=%H\t%s'], { cwd: ROOT, encoding: 'utf8' })
     .split('\n')
     .filter((l) => l.includes(PR1_SUBJECT_ANCHOR))
   assert.strictEqual(
     candidates.length,
     1,
     `expected exactly one commit whose subject contains ${JSON.stringify(PR1_SUBJECT_ANCHOR)}; found ${candidates.length}. ` +
-      'If history was rewritten or the subject changed, re-derive the anchor rather than pinning a hash.'
+      'If the count is 0, history was rewritten or the subject changed: re-derive the anchor rather than pinning a hash. ' +
+      'If the count is above 1, the likeliest cause is leftover history-rewrite backup refs (refs/original/) or a stale ' +
+      'remote branch carrying the pre-rewrite commit; expire those rather than changing the anchor.'
   )
   const sha = candidates[0].split('\t')[0]
   const files = exec('git', ['show', '--name-only', '--format=', sha], { cwd: ROOT, encoding: 'utf8' })
@@ -561,32 +570,55 @@ test('static: every test file that invokes git loads the git-environment scrub, 
   walk(testDir)
   assert.ok(files.length > 10, `sanity: expected to find many test files under ${testDir}, found ${files.length}`)
 
-  // Strip block and line comments so prose about git does not register.
+  // Two source views, deliberately different.
+  //
+  // DETECTION runs on comment-stripped source and must see every spelling of
+  // a git call. Backtick is in the quote classes because sh(`git init`) is
+  // this repo's DOMINANT idiom -- 21 such call sites in ledger-append.test.js
+  // alone -- and the previous version, written to be alias-agnostic, matched
+  // only ' and ". It would have certified a new file using the surrounding
+  // idiom as clean. That was the fourth spelling this guard was blind to.
+  //
+  // COMPLIANCE has two forms, and neither can be satisfied by a mention:
+  //
+  //   scrubGitEnv CALLED -- checked against source with STRING CONTENTS
+  //     removed, so naming the call inside a message cannot count as making
+  //     it. Requiring helpers/git-env.js is NOT sufficient on its own: that
+  //     module defines scrubGitEnv and never calls it at load, so importing
+  //     it protects nothing.
+  //   temp-repo.js / hostile-repo.js REQUIRED -- those do scrub at load, so
+  //     the import is a real code path. Matched only where no quote character
+  //     precedes require on the line, which excludes one named inside a
+  //     string while still accepting a destructure wrapped across lines,
+  //     where the require sits after a closing brace.
+  //
+  // Belt and braces: this test's own failure message deliberately does NOT
+  // spell the call with its parentheses, so it cannot satisfy the detector
+  // even if the string-stripper is imperfect. An earlier version matched its
+  // own message and exempted its own file, and relying on one mechanism to
+  // prevent that recurring is how it happened the first time.
   const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+  const stripStringContents = (src) => src.replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/g, '$1$1')
 
   const offenders = []
   for (const file of files) {
     const src = stripComments(fs.readFileSync(file, 'utf8'))
-    // Any function, however named or destructured, receiving 'git' as its
-    // first argument; plus git invoked through a shell string.
-    const invokesGit = /[\w.$]+\(\s*['"]git['"]\s*,/.test(src) || /['"]git\s+[a-z][a-z-]*/.test(src)
+    const invokesGit =
+      /[\w.$]+\(\s*['"`][^'"`]*\bgit['"`]\s*[,)]/.test(src) ||
+      /['"`]git\s+[a-z][a-z-]*/.test(src)
     if (!invokesGit) continue
-    // Anchored to an actual require STATEMENT at the start of a line, not a
-    // mention of one anywhere in the source. The first version tested the
-    // whole file and matched this very test's own failure message, which
-    // helpfully spells out `require('./helpers/git-env.js')` -- so the guard
-    // exempted the one file it was written after, and deleting that file's
-    // real import left the suite green. Proven by mutation, not by reading.
-    const loadsScrub = src
+
+    const callsScrub = /\bscrubGitEnv\s*\(/.test(stripStringContents(src))
+    const requiresScrubbingHelper = src
       .split('\n')
-      .some((line) => /^\s*(?:(?:const|let|var)\s+[^=]*=\s*)?require\(\s*['"][^'"]*(?:git-env|temp-repo|hostile-repo)[^'"]*['"]\s*\)/.test(line))
-    if (!loadsScrub) offenders.push(path.relative(ROOT, file))
+      .some((line) => /^[^'"`]*\brequire\(\s*['"`][^'"`]*(?:temp-repo|hostile-repo)[^'"`]*['"`]\s*\)/.test(line))
+    if (!callsScrub && !requiresScrubbingHelper) offenders.push(path.relative(ROOT, file))
   }
 
   assert.deepEqual(
     offenders,
     [],
     `these files invoke git but never load the git-environment scrub, so a run under an exported GIT_DIR would resolve to the wrong repository: ${offenders.join(', ')}. ` +
-      "Add require('./helpers/git-env.js').scrubGitEnv() (path relative to the file), or import a helper that does."
+      'Fix: call scrubGitEnv from test/helpers/git-env.js at the top of the file, or require test/helpers/temp-repo.js, which does it at load.'
   )
 })
