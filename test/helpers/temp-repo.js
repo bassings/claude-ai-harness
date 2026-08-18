@@ -26,9 +26,12 @@ const os = require('node:os')
 const { execFileSync, spawnSync } = require('node:child_process')
 const { scrubGitEnv, sanitizedGitEnv } = require('./git-env.js')
 
-// At module load, so every call site in the suite is covered -- including
-// the ones that never import this helper and the child processes that
-// inherit this env. See git-env.js for why cwd does not protect you.
+// At module load, so every call site IN THIS PROCESS is covered, including
+// the child processes that inherit this env. Not suite-wide: node --test
+// gives each test file its own process, so a file that imports neither this
+// helper nor git-env.js directly is unprotected regardless of this line.
+// The enforcement guard in test/static-checks.test.js is what catches that.
+// See git-env.js for why cwd does not protect you.
 scrubGitEnv()
 
 const APPEND_SCRIPT = path.join(__dirname, '..', '..', 'workflows', 'lib', 'ledger-append.mjs')

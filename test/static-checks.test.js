@@ -530,7 +530,24 @@ test('static: bin/com.local.optimise-cycle-weekly.plist is tracked in the repo a
 //
 // The scrub is per-PROCESS and node --test runs each test file in its own
 // process, so importing it transitively (via helpers/temp-repo.js, which
-// scrubs at load) counts -- that is a real code path, not a loophole.
+// scrubs at load) counts -- that is a real code path, not a loophole. That
+// per-file boundary is also why this guard matters at all: a new test file
+// that shells out to git and forgets the import is unprotected the moment it
+// exists, and no other file's scrub helps it.
+//
+// KNOWN LIMIT, stated rather than implied. This is a text scan, so it cannot
+// structurally tell DESCRIBING a require from APPLYING one -- which is
+// exactly how its first version exempted its own file by matching its own
+// error message. Anchoring to a statement at the start of a line mitigates
+// that; it does not eliminate it. A string literal containing a line-start
+// require for one of these modules would still read as compliance. Closing
+// it properly needs an AST walk, where a string constant simply is not an
+// import node and the confusion cannot arise (the point was made by the
+// sibling repo whose equivalent guard is AST-based and, tested by planting,
+// does not have this defect). Node exposes no parser in its standard library
+// and this repo has no dependencies, so that is not a proportionate trade
+// here for a contrived residual case. Revisit if this guard is ever wrong
+// again, and prove it by planting rather than by reading.
 test('static: every test file that invokes git loads the git-environment scrub, so a suite run under an exported GIT_DIR cannot verify or corrupt the wrong repository (alias-agnostic scan)', () => {
   const testDir = path.join(ROOT, 'test')
   const files = []

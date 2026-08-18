@@ -18,8 +18,25 @@
 //
 //   scrubGitEnv()      removes the variables from this process's own env at
 //                      module load, so every inherited child spawn and every
-//                      direct git call in the suite is clean by default,
-//                      including call sites that never heard of this module.
+//                      direct git call IN THIS PROCESS is clean by default.
+//
+//                      Read that boundary literally. node --test runs each
+//                      test FILE in its own process, so the scrub is
+//                      per-file, NOT suite-wide. A file that never imports
+//                      this module (directly, or via temp-repo.js /
+//                      hostile-repo.js, which import it) is alone and
+//                      unprotected -- another file having scrubbed buys it
+//                      nothing. Any NEW test file that shells out to git and
+//                      forgets the import is unprotected from the moment it
+//                      is created. The only thing standing between that and
+//                      a corrupted checkout is the enforcement guard in
+//                      test/static-checks.test.js, which fails the suite
+//                      when a git-invoking file does not load this one.
+//
+//                      This paragraph exists because the first version of
+//                      this comment said "every direct git call in the
+//                      suite", which reads as a suite-wide guarantee and is
+//                      not one.
 //   sanitizedGitEnv()  builds an explicit clean env for a call site that
 //                      constructs its own (`{ ...process.env, FOO: 'bar' }`
 //                      copied before the scrub, or an env assembled from
