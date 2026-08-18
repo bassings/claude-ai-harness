@@ -57,8 +57,35 @@ function readBudgetSpent() {
 // isolation option, so it executes in the reviewed checkout -- a repo-local
 // workflows/lib/ledger-append.mjs planted by the diff under review must
 // never be the one that runs, in any repo except this harness's own.
+// Pure-JS UTF-8 base64. No Node globals, no btoa: the workflow runtime
+// provides neither (measured 2026-08-18: typeof Buffer and typeof btoa are
+// both "undefined"). Replaces Buffer.from(...).toString('base64'), whose
+// ReferenceError silently stopped all ledger telemetry for six days.
+const B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+function toBase64(input) {
+  const bytes = []
+  for (const ch of String(input)) {
+    const cp = ch.codePointAt(0)
+    if (cp < 0x80) bytes.push(cp)
+    else if (cp < 0x800) bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 63))
+    else if (cp < 0x10000) bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63))
+    else bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63))
+  }
+  let out = ''
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i]
+    const b1 = i + 1 < bytes.length ? bytes[i + 1] : undefined
+    const b2 = i + 2 < bytes.length ? bytes[i + 2] : undefined
+    out += B64_ALPHABET[b0 >> 2]
+    out += B64_ALPHABET[((b0 & 3) << 4) | (b1 === undefined ? 0 : b1 >> 4)]
+    out += b1 === undefined ? '=' : B64_ALPHABET[((b1 & 15) << 2) | (b2 === undefined ? 0 : b2 >> 6)]
+    out += b2 === undefined ? '=' : B64_ALPHABET[b2 & 63]
+  }
+  return out
+}
+
 function ledgerWritePrompt(payload) {
-  const payloadBase64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')
+  const payloadBase64 = toBase64(JSON.stringify(payload))
   return (
     `Append one line to the harness run ledger. Never let this step fail the caller's run: catch every error ` +
     `yourself and report it in your structured output instead of throwing or retrying.\n\n` +
@@ -341,6 +368,21 @@ const telemetry = {
 }
 const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
-await writeLedger(terminalEntry)
+const terminalWrite = await writeLedger(terminalEntry)
+// 2026-08-18: give write_ok:false a CONSUMER -- see plan-cycle.js for the
+// full rationale. It was computed, logged and returned to nobody, so the
+// ledger stopped recording on 2026-08-12 and nothing noticed for six days.
+// AC-QA-7 still holds: this reports, it never throws. What AC-QA-7 does not
+// say is that the failure may be indistinguishable from success.
+const ledgerFailed = !startWrite.write_ok || !terminalWrite.write_ok
+if (ledgerFailed) {
+  // Assigned onto `result` rather than branching the final return, so the
+  // `if (threw) throw runError` / `return { ...result, telemetry }` pair stays
+  // byte-identical across all three workflows (AC-ARCH-9).
+  result.ledger_write_failed = true
+  result.ledger_write_error = startWrite.write_error || terminalWrite.write_error || 'unknown'
+  const why = startWrite.write_error || terminalWrite.write_error || 'unknown'
+  log(`TELEMETRY NOT RECORDED for this run: ${redactLogText(String(why))}. The run itself is unaffected, but this run leaves no telemetry.`)
+}
 if (threw) throw runError
 return { ...result, telemetry }
