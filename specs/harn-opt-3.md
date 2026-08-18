@@ -21,7 +21,24 @@ weekly optimiser whose rollback has actually been executed.
 three questions: get coding agents to need fewer loops, make the pipeline
 faster without eroding quality, and run more agents concurrently. HARN-OPT-2
 answered none of them. It made the thing that would answer them trustworthy,
-which was necessary and is now done.
+which was necessary.
+
+> **CORRECTED 2026-08-18, after this document's acceptance criteria were
+> drafted.** The sentence above originally ended "and is now done". It was
+> not. The instrument was not recording *at all*: `ledgerWritePrompt` called
+> `Buffer.from(...)`, and `Buffer` does not exist in the dynamic-workflow
+> runtime (measured: `typeof Buffer` and `typeof btoa` are both `undefined`).
+> The `ReferenceError` fired while evaluating the argument to `agent()`,
+> inside `writeLedger`'s catch-everything block, so no agent was ever created,
+> nothing reached the journal, and nothing errored. All three cycle workflows
+> stopped writing telemetry on **2026-08-12**, through nineteen commits and
+> three merged PRs, and nothing noticed.
+>
+> Fixed in `d3d51b7` and proven end to end. **The 74 criteria below were
+> drafted against the premise that the instrument worked and only the delivery
+> repos lacked data. That premise was false for all three repos**, so re-read
+> them against this before building. T1 in particular is now a smaller task
+> than it was scoped as.
 
 The measured position today:
 
@@ -32,8 +49,14 @@ The measured position today:
   and the weekly report correctly says `uninstrumented` for both.
 - **Said of You's CI is unmeasured per job.** `CI::CI` collapses six jobs into
   one number, so the critical path (e2e 210-229s running in parallel with
-  CodeQL 225-236s) is invisible. Its remediation plan is blocked with ~610 of
-  ~625 purchased Actions minutes spent.
+  CodeQL 225-236s) is invisible.
+  **Do not reason from the Actions-budget figure.** An earlier draft cited
+  "~610 of ~625 purchased minutes spent" from
+  `docs/plans/2026-08-10-audit-remediation.md:2` as a live constraint. That
+  line is from 10-11 August and the blocked state is **disproved**: a full CI
+  gate succeeded on PR #412's head `4a006d5` at `2026-08-17T20:28:29Z`, so
+  runners were starting. The actual balance is **unknown and unreadable by any
+  agent** -- both billing endpoints 404. It is an owner action, not a premise.
 - **Couch Potato produced no telemetry for ten days** and nothing warned. That
   cause is fixed (PR #260); the effect, an empty ledger, is not.
 
@@ -55,6 +78,36 @@ lens loss, qualifies. A defect that is merely untidy does not.
 not a task here.
 
 ---
+
+## Constraints established by other sessions
+
+Measured by the `saidofyou-dc` session and verified where noted. These are not
+tasks; they are things any task here must not break.
+
+- **`ci.yml`'s missing `push: branches: [main]` trigger is deliberate and
+  load-bearing.** `ci.yml:3-17` documents why: it depends on
+  `strict_required_status_checks_policy: true` in the `main-protection` ruleset
+  (id 17651307, seven required checks, verified true 2026-08-18). If that policy
+  is ever turned off, the post-merge run stops being redundant and the trigger
+  must return, or a PR can go green against a stale base. **Preserve that
+  comment verbatim**; a decomposition change would reflow it away without
+  noticing. Surface any ruleset change rather than adjusting it.
+- **Said of You runs production out of this repo under the OLD project name.**
+  `docker-compose.yml` is the live stack and `docker-compose.yml:8` reads
+  `name: REDACTED-PROJECT-NAME`. Running containers are `REDACTED-PROJECT-NAME`,
+  `-auth`, `-db-1`, `-cloudflared-1`; only staging moved to
+  `REDACTED-STAGING-NAME`. **`REDACTED-PROJECT-NAME_pgdata` is the production
+  database volume.** Never `docker compose up` against `docker-compose.yml`,
+  and never "tidy" anything named `REDACTED-PROJECT-NAME`. The
+  `REDACTED-ROLLBACK-TAG` tags on both services are the n-1 rollback path
+  and must not be swept.
+- **`.stryker-tmp` exists holding only `app-incremental.json`.** Deleting it
+  loses roughly 7,000 reused mutant results and turns the next mutation run
+  from minutes into very long. It is not rubbish; it will not look broken.
+- **Sonar baseline, current as of 2026-08-18T03:18:27Z**: 82.1% coverage, 0
+  bugs, 0 vulnerabilities, 0 hotspots, 1.1% duplication over 20,589 lines, 430
+  code smells. Useful as T2's before-figure; it was six days stale until
+  2026-08-18.
 
 ## Tasks
 
@@ -170,6 +223,43 @@ question. T3 and T4 are independent of both and can run in parallel.
 - **AC-SIMP-13:** *(amended)* The two vetoed criteria ship no code: the diff contains no lane-failure-reason field on any schema or record in `workflows/optimise-cycle.js`, and no change to the `ac_verdicts` key construction at `workflows/lib/optimise-read.mjs:311`. If either ships anyway, the owning lens has supplied a criterion naming the observed wrong output it prevents.
 - **AC-SIMP-14:** *(amended to per-PR)* Excluding `test/`, docs and specs, each PR in this plan touches at most six files: `git diff --name-only <base>...HEAD | grep -v '^test/\|\.md$' | wc -l` <= 6. The whole-plan bound was raised to a per-PR bound because the surviving criteria necessarily span `ledger-append.mjs`, `optimise-read.mjs`, `optimise-cycle.js`, `review-cycle.js`, `plan-cycle.js`, a shared trigger loader, the weekly runner and a sweep script.
 
+### Cross-session provenance
+
+Added 2026-08-18 from a three-session incident, refined by the peer session
+whose corrections make it checkable rather than a platitude.
+
+**AC-OPS-10:** A finding passed between sessions, or written to the ledger,
+separates **what was measured and by what command** from **what is inferred
+from it**. Worked example: the volume hit 131 MiB free with three watchdog
+resets. Three sessions held true measurements and offered three different
+wrong causes -- Docker build cache (~45 GB), worktree accretion (0.8 GB), and
+finally the real one, a claude-mem sparse-file pathology (~170 GB) found by
+`sudo fs_usage`. Nobody reported a false measurement; each attached a causal
+story to a true one, and **the inference travelled with the same authority as
+the evidence**.
+
+**AC-OPS-11:** The provenance marker attaches to the **claim**, not the work
+item. An action can be correct while the reason given for it is wrong: the
+Docker purge was independently requested, cleared 27 GB of never-purged build
+cache and reduced 50 tags to n and n-1 per service. Correct work, wrong causal
+story bolted on. If the ledger marks the work rather than the claim, a later
+reader who finds the claim false may revert something that was fine -- worse
+than the original error, because it is confident and downstream.
+
+**AC-OPS-12:** Where the decisive measurement is one this session **cannot
+take**, that is stated *before* a cause is offered, not after. Both sessions
+above hit their wall after naming a mechanism.
+
+**AC-OPS-13:** For every failure path, name the **consumer** of its signal. If
+there is none, the path is not instrumented no matter how carefully it
+reports. Two worked examples from 2026-08-18: a healthcheck recorded 290
+consecutive failures nobody looked at, and `writeLedger` returned
+`write_ok: false` to nobody at all for six days. This is the criterion the
+ledger outage would have been caught by, and it is checkable in review.
+
+Do NOT let these collapse into "be slower to conclude" or "be slower to clean
+up". Neither is the lesson.
+
 ### Vetoed at planning
 
 Recorded so they are not silently reconsidered, and so a review lens does not
@@ -212,6 +302,49 @@ Recorded so they are not silently reconsidered:
   #260 took four review rounds because each push triggers a fresh review that
   opens a new blocking thread. The findings were good; the loop only
   terminates when a push happens to draw no comment.
+
+## Re-read against 2026-08-18, after the ledger fix
+
+The 74 criteria above were drafted while the instrument was silently not
+recording. Re-read after `d3d51b7`; this section records what changed, so a
+builder does not work from the pre-fix framing.
+
+**T1 is now smaller than scoped.** It was written as "instrument the delivery
+repos", on the premise that the harness worked and only they lacked data. The
+real cause of at least part of the gap was that **no** repo was recording. The
+writer, the reader and the CLI were all sound; only the agent call that
+invokes them was broken. So T1's remaining work is to run cycles and confirm
+records land, not to build instrumentation.
+
+**Still true and still worth the criteria they generated:**
+
+- `windowRecords` (`optimise-read.mjs:165-169`) slices the array **tail**, not
+  by timestamp, and `combinedRecords` is built by concatenating per-repo
+  arrays. So with more than one instrumented repo and more than
+  `DEFAULT_LEDGER_WINDOW_LINES` (2000) records, one repo's newest records are
+  dropped while `perRepo` still reports them as in-window. Verified unchanged
+  today. Latent only because the delivery repos are empty -- **which is exactly
+  what T1 removes**, so T1 activates it. This is the highest-priority item in
+  T3 and should land before or with T1.
+- `plan-cycle.js` still does not read `.claude/harness-triggers.json` at all
+  (`grep -c` returns 0), so planning-side triggering is not repo-tunable.
+- Ledger dictionary **keys** are still unconstrained (`grep -c propertyNames`
+  returns 0); only values are validated.
+
+**Withdrawn or answered by the fix:**
+
+- The claim that Couch Potato still carries tracked repo-local workflow forks
+  was a **false alarm with an important cause**: the lens read a shared working
+  tree that a peer session had checked out on a different branch, predating the
+  merge that removed them. On `master` they are gone. **A lens reviewing a
+  shared checkout can review the wrong branch entirely and report it with full
+  confidence** -- that is a harness defect worth more than the criterion it
+  produced, and it has no criterion yet.
+- The carried-forward F15 (AC ids colliding in `ac_verdicts`) was refuted by
+  measurement, independently, by five lenses: `optimise-read.mjs:311` already
+  keys on `repo|planKey|ac_id` and a test already pins it. The owning lens
+  withdrew its own criterion on its own evidence, which is the harness working
+  as intended.
 
 ## Spec gaps found at review
 
