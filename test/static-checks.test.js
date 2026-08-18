@@ -29,26 +29,46 @@ function walk(dir, out = []) {
 // permanent, in-scope deliverables, a live-tree scan of this kind can never
 // pass again -- it would forever fail as written, for a reason with no
 // bearing on either PR's correctness. AC-SIMP-7 is a claim about the PR 1
-// DIFF specifically, which is now historical and immutable (PR 1
-// squash-merged as d7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9): checking it
-// against that commit's own file list, rather than the live tree, keeps the
-// guard meaningful and lets it stay true forever, exactly like checking any
-// other already-merged commit's shape. This also incidentally fixes a
+// DIFF specifically: checking it against that commit's own file list, rather
+// than the live tree, keeps the guard meaningful and lets it stay true
+// forever, exactly like checking any other already-merged commit's shape.
+//
+// The commit is resolved by its SUBJECT, not by its hash. An earlier revision
+// pinned d7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9 and called it "immutable
+// historical". It was not: on 2026-08-18 a git filter-branch run (purging a
+// credential fingerprint from this public repo's history) renamed every
+// commit, and this test began failing with "fatal: Not a valid object name"
+// -- but only once the filter-branch backup refs were expired, because until
+// then refs/original still made the old object reachable and the suite stayed
+// green over a guard that was already broken. A commit hash is immutable only
+// as long as nobody rewrites history, which is exactly the circumstance under
+// which you most want your guards to still work. The subject survives a
+// rewrite; the hash does not. Resolution asserts EXACTLY ONE match, so an
+// ambiguous or missing anchor fails by name rather than silently checking
+// some other commit. This also incidentally fixes a
 // latent path-based bug in the original form: it matched the FULL absolute
 // path, so running the suite from a checkout whose own directory name
 // happens to contain "optimise-cycle" (e.g. a worktree named
 // t2-optimise-cycle, as PR 2's own build happened in) made it fail
 // regardless of repo contents -- git's own file list is always
 // repo-relative, so that failure mode cannot recur here.
-test('static: PR1\'s merge commit (d7eb2cc) introduced no file whose path matches "optimise-cycle" (AC-SIMP-7, checked against the immutable historical commit rather than the live tree, which now legitimately contains PR 2\'s optimiser files)', () => {
-  const out = require('node:child_process').execFileSync(
-    'git',
-    ['show', '--stat', '--format=', 'd7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9'],
-    { cwd: ROOT, encoding: 'utf8' }
-  )
-  const files = out
+const PR1_SUBJECT_ANCHOR = '(PR 1 of HARN-OPT-1) (#1)'
+
+test('static: PR1\'s merge commit (resolved by subject, not by hash) introduced no file whose path matches "optimise-cycle" (AC-SIMP-7, checked against the historical commit rather than the live tree, which now legitimately contains PR 2\'s optimiser files)', () => {
+  const exec = require('node:child_process').execFileSync
+  const candidates = exec('git', ['log', '--all', '--format=%H\t%s'], { cwd: ROOT, encoding: 'utf8' })
     .split('\n')
-    .map((l) => l.split('|')[0].trim())
+    .filter((l) => l.includes(PR1_SUBJECT_ANCHOR))
+  assert.strictEqual(
+    candidates.length,
+    1,
+    `expected exactly one commit whose subject contains ${JSON.stringify(PR1_SUBJECT_ANCHOR)}; found ${candidates.length}. ` +
+      'If history was rewritten or the subject changed, re-derive the anchor rather than pinning a hash.'
+  )
+  const sha = candidates[0].split('\t')[0]
+  const files = exec('git', ['show', '--name-only', '--format=', sha], { cwd: ROOT, encoding: 'utf8' })
+    .split('\n')
+    .map((l) => l.trim())
     .filter(Boolean)
   assert.ok(files.length > 10, 'sanity: expected PR1\'s merge commit to list many changed files')
   assert.ok(!files.some((f) => /optimise-cycle/.test(f)), `PR1's merge commit must not have introduced an optimise-cycle path; found: ${files.filter((f) => /optimise-cycle/.test(f))}`)
