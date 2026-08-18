@@ -308,3 +308,24 @@ for (const falsyValue of [null, undefined, 0, '']) {
     )
   })
 }
+
+// 2026-08-18: the ledger stopped recording for six days and nothing noticed.
+// The write failure was correctly caught, correctly logged, and correctly
+// returned as write_ok:false -- to NO CONSUMER. AC-QA-7 says a ledger write
+// failure must never FAIL the run; it does not say the failure must be
+// indistinguishable from success. These pin the consumer, so the next silent
+// outage is loud on the first run rather than on the sixth day.
+test('plan-cycle.js: a failed ledger write surfaces in the workflow RETURN VALUE, not only in a log line nobody re-reads', async () => {
+  const failing = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: false, write_error: 'ReferenceError: Buffer is not defined' }
+  const { result } = await runWorkflow(WF, {
+    args: { spec: 'specs/x.md' },
+    agent: baseAgent({ 'ledger:write': failing }),
+  })
+  assert.equal(result.ledger_write_failed, true, 'the caller must be able to tell telemetry did not land')
+  assert.match(String(result.ledger_write_error), /Buffer is not defined/, 'and must carry WHY, not just that it failed')
+})
+
+test('plan-cycle.js: a SUCCESSFUL ledger write does not raise the failure flag (the signal must not cry wolf)', async () => {
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/x.md' }, agent: baseAgent() })
+  assert.notEqual(result.ledger_write_failed, true, 'a healthy run must not report a ledger failure')
+})

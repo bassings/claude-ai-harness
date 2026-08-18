@@ -95,6 +95,31 @@ const REJECTIONS = [
   { name: 'Math.random()', re: /\bMath\.random\s*\(/ },
   { name: 'a bare reference to Date (bracket access or aliasing can reach Date.now() without matching the literal call forms above)', re: /\bDate\b/ },
   { name: 'Math.random accessed without an immediate call (aliasing through a variable can reach it without matching the literal call form above)', re: /\bMath\.random\b/ },
+  // Added 2026-08-18, after this double's permissiveness let a production
+  // outage ship green. `ledgerWritePrompt` called `Buffer.from(...)` to
+  // base64-encode the ledger payload. `Buffer` is a NODE global, absent from
+  // the dynamic-workflow runtime -- measured: `typeof Buffer` is "undefined"
+  // there, and `btoa` is too. So the call threw ReferenceError while
+  // evaluating the argument to agent(), inside writeLedger's own try, which
+  // swallowed it by design. No agent was ever created, so nothing appeared in
+  // the journal and no agent errored. All three cycle workflows stopped
+  // writing telemetry and nothing noticed for six days.
+  //
+  // The suite passed throughout, because THIS FILE runs under Node where
+  // `Buffer` exists. A double more permissive than production does not merely
+  // fail to catch a bug, it certifies it. These are the globals the runtime
+  // does not provide; add to this list rather than working around it.
+  { name: 'Buffer (a Node global; the workflow runtime has no Node API access -- typeof Buffer is "undefined" there)', re: /\bBuffer\s*[.(]|\bnew\s+Buffer\b/ },
+  { name: 'process (a Node global, absent from the workflow runtime)', re: /\bprocess\.[A-Za-z_$]/ },
+  { name: 'require() (workflow scripts are self-contained; no module loading of any kind)', re: /\brequire\s*\(/ },
+  { name: '__dirname/__filename (Node module globals, absent from the workflow runtime)', re: /\b__(dirname|filename)\b/ },
+  // These match USE, not mention. The first cut used /\bBuffer\b/ and
+  // /\bprocess\s*\./, and the second immediately failed optimise-cycle.js on
+  // the word "process." inside its own prose description ("pipelines or
+  // process. Read-only"). A guard that fires on legitimate input is as bad as
+  // one that never fires: it trains everyone to route around the check.
+  // stripLineComments only removes `//` comments, so prose inside STRING
+  // literals is still scanned, which is why mention-matching is not safe.
 ]
 
 function stripLineComments(source) {
