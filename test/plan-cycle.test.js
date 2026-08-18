@@ -9,6 +9,7 @@ const WF = path.join(__dirname, '..', 'workflows', 'plan-cycle.js')
 const LEDGER_OK = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
 
 const SCOPE_OK = {
+  head_sha: 'abc1234567890def',
   summary: 'adds a widget',
   ui: false,
   data: false,
@@ -27,7 +28,7 @@ function baseAgent(overrides = {}) {
     'lens-qa': LENS_CLEAN,
     'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] },
     'lens-product': LENS_CLEAN,
-    'synthesis:write-back': '### Summary\n4 criteria',
+    'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def' },
     'ledger:write': LEDGER_OK,
     ...overrides,
   }
@@ -122,8 +123,8 @@ test('plan-cycle.js: outcome is aborted (not done) when the synthesis:write-back
   assert.equal(result.report, '', 'an aborted run must not carry a stale or partial report string')
 })
 
-test('plan-cycle.js: outcome is aborted (not done) when synthesis:write-back returns an empty string (M1)', async () => {
-  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'synthesis:write-back': '' }) })
+test('plan-cycle.js: outcome is aborted (not done) when synthesis:write-back returns an empty summary (M1)', async () => {
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'synthesis:write-back': { summary: '' } }) })
   assert.equal(result.telemetry.outcome, 'aborted')
 })
 
@@ -328,4 +329,30 @@ test('plan-cycle.js: a failed ledger write surfaces in the workflow RETURN VALUE
 test('plan-cycle.js: a SUCCESSFUL ledger write does not raise the failure flag (the signal must not cry wolf)', async () => {
   const { result } = await runWorkflow(WF, { args: { spec: 'specs/x.md' }, agent: baseAgent() })
   assert.notEqual(result.ledger_write_failed, true, 'a healthy run must not report a ledger failure')
+})
+
+// 2026-08-18 (H1): the shared-checkout mis-review HAPPENED here, in planning,
+// not in review. A planning lens emitted confident, line-cited criteria about
+// a branch nobody asked about, because another session had the shared main
+// checkout on its own branch. The drift guard went into review-cycle first --
+// the cycle whose lenses already run in ISOLATED WORKTREES. Planning's do not
+// (plan-cycle.js:229, "planning is read-only, no isolation needed"), so this
+// is the more exposed of the two and got the guard second.
+test('plan-cycle.js: a HEAD that moves mid-plan is surfaced, not silently written into the spec', async () => {
+  const moved = { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'ffffffffffffffff' }
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'synthesis:write-back': moved }) })
+  assert.equal(result.checkout_moved, true, 'the caller must learn the tree moved under the plan')
+  assert.match(String(result.checkout_moved_detail), /abc1234567890def/, 'and must name the sha it scoped')
+  assert.match(String(result.checkout_moved_detail), /ffffffffffffffff/, 'and the sha it ended on')
+})
+
+test('plan-cycle.js: a stable HEAD does not raise the moved-checkout flag (must not cry wolf)', async () => {
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
+  assert.notEqual(result.checkout_moved, true, 'an unmoved checkout must not report a move')
+})
+
+test('plan-cycle.js: a synthesis omitting head_sha_at_synthesis does not fabricate a verdict either way', async () => {
+  const noSha = { summary: '### Summary\n4 criteria' }
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent({ 'synthesis:write-back': noSha }) })
+  assert.notEqual(result.checkout_moved, true, 'absent evidence must not be read as a move')
 })

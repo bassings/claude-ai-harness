@@ -110,12 +110,12 @@ test('seam: plan_cycle terminal payload, captured from a real run with a non-emp
   const { calls } = await runWorkflow(WF, {
     args: { spec: 'specs/foo.md' },
     agent: {
-      'scope:spec': { summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'] },
+      'scope:spec': { head_sha: 'abc1234567890def', summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'] },
       'lens-security': LENS_CLEAN,
       'lens-qa': LENS_CLEAN,
       'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] },
       'lens-product': LENS_CLEAN,
-      'synthesis:write-back': '### Summary\n4 criteria',
+      'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def' },
       'ledger:write': LEDGER_OK,
     },
   })
@@ -312,7 +312,7 @@ test('seam: plan_cycle\'s THROW-path terminal payload, when the throw happens at
     await runWorkflow(WF, {
       args: { spec: 'specs/seam-throw.md' },
       agent: {
-        'scope:spec': { summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'] },
+        'scope:spec': { head_sha: 'abc1234567890def', summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'] },
         'lens-security': LENS_CLEAN,
         'lens-qa': LENS_CLEAN,
         'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] },
