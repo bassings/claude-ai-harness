@@ -115,6 +115,12 @@ const specPath = opts.spec || null
 // pre-existing, publicly-documented return shape (AC-ARCH-10).
 const triggerCounts = {}
 let headSha = null
+// 2026-08-18: the sha git reports at SYNTHESIS time, so a checkout that moved
+// mid-run is detectable. Several agent sessions share these checkouts; a
+// planning lens once reported confidently on repo-local forks that had been
+// merged away hours earlier, because it read a tree another session had
+// switched to its own branch. Null means "not reported", never "did not move".
+let synthesisHeadSha = null
 // Raw finding descriptors ({lens, location, claim, severity?, ac_id?}), or
 // null when the synthesis response was malformed. Passed to
 // ledger-append.mjs as opaque data: workflow scripts have no node:crypto,
@@ -670,15 +676,22 @@ const synthesis = await agent(
   `Do not soften findings and do not invent any. If a lens returned BLOCKED, say so prominently. ` +
   `Also return spec_bugs (findings with no AC behind them) and rejected_findings (findings investigated and shown to be ` +
   `false alarms) as structured arrays, each item carrying lens, location and claim, so capture is mechanical rather than ` +
-  `left in the prose. Return only the markdown report as "report".`,
+  `left in the prose. Also run \`git rev-parse HEAD\` in the repo NOW, at synthesis time, and return its exact output as ` +
+  `head_sha_at_synthesis. This is not the sha you were told about: several agent sessions share these checkouts, and if ` +
+  `another one switches branches mid-run the review would silently be about a different tree than it reports on. Report ` +
+  `what git says now, even if it differs from anything above. Return only the markdown report as "report".`,
   {
     label: 'synthesis',
     phase: 'Synthesis',
     schema: {
       type: 'object',
       required: ['report', 'spec_bugs', 'rejected_findings'],
+        // Optional: absent means "not reported", which must never be read as
+        // "did not move" -- absent evidence is not evidence (see the guard below).
+
       properties: {
         report: { type: 'string' },
+        head_sha_at_synthesis: { type: ['string', 'null'] },
         spec_bugs: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
         rejected_findings: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
       },
@@ -694,6 +707,7 @@ const synthesis = await agent(
 // carried through to the ledger payload, where ledger-append.mjs computes
 // ids and dispositions (AC-QA-11 -- mechanical, just in real-Node script
 // code instead of a sandboxed one).
+synthesisHeadSha = synthesis && typeof synthesis.head_sha_at_synthesis === 'string' ? synthesis.head_sha_at_synthesis : null
 specBugsRaw = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_bugs : null
 rejectedFindingsRaw = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
 specBugCount = specBugsRaw ? specBugsRaw.length : null
@@ -784,6 +798,16 @@ const terminalWrite = await writeLedger(terminalEntry)
 // ledger stopped recording on 2026-08-12 and nothing noticed for six days.
 // AC-QA-7 still holds: this reports, it never throws. What AC-QA-7 does not
 // say is that the failure may be indistinguishable from success.
+// 2026-08-18: did the tree move under this review? Only a REPORTED sha that
+// DIFFERS counts. A missing sha means the synthesis agent did not answer, which
+// is not evidence of stability -- reading absence as "unmoved" is exactly the
+// shape that has recurred through this repo's history.
+const checkoutMoved = Boolean(headSha && synthesisHeadSha && synthesisHeadSha !== headSha)
+if (checkoutMoved) {
+  result.checkout_moved = true
+  result.checkout_moved_detail = `scoped at ${headSha}, synthesis found ${synthesisHeadSha} -- the working tree moved mid-review, so these findings may be about a different tree than they name. Re-run from an isolated worktree.`
+  log(`CHECKOUT MOVED MID-REVIEW: scoped ${headSha}, synthesis ${synthesisHeadSha}. Another session may share this checkout. Treat these findings as unverified until re-run.`)
+}
 const ledgerFailed = !startWrite.write_ok || !terminalWrite.write_ok
 if (ledgerFailed) {
   // Assigned onto `result` rather than branching the final return, so the
