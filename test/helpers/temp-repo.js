@@ -60,6 +60,40 @@ function sh(cmd, cwd) {
   return execFileSync('/bin/sh', ['-c', cmd], { cwd, encoding: 'utf8', env: sanitizedGitEnv() })
 }
 
+// Defence in depth against a git environment variable that outranks cwd
+// (git-env.js). The scrub in that module should make this unreachable; this
+// assertion is what makes a FUTURE unsanitised call site fail by name
+// instead of silently committing fixtures into a real repository.
+//
+// Takes the ALREADY-RESOLVED git dir rather than running git itself, so it
+// can be driven directly in a test with any value, including the escape it
+// exists to catch. That matters: while the sanitising layers work this
+// assertion can never fire through makeTempRepo(), so a test exercising it
+// only end-to-end proves nothing about it. Measured -- deleting the whole
+// assertion left the suite at 684/684 green, which is what an untested
+// second layer and real defence in depth both look like from a green run.
+// (The same measurement, on the same class of guard, was made independently
+// in a sibling repo the day this was written.)
+//
+// Neither side is realpath'd through `dir/.git`: in exactly the case this
+// catches, that path was never created, because git re-initialised the repo
+// GIT_DIR named instead. realpathSync would then throw ENOENT and the
+// assertion would report a missing file rather than the escape, losing the
+// actionable message on the one path that needs it. Compare containment
+// under `dir`, which always exists by this point, and tolerate a resolved
+// path that does not exist at all.
+function assertGitContextWithin(dir, resolvedGitDir) {
+  const expectedRoot = fs.realpathSync(dir)
+  const resolvedReal = fs.existsSync(resolvedGitDir) ? fs.realpathSync(resolvedGitDir) : resolvedGitDir
+  if (resolvedReal !== expectedRoot && !resolvedReal.startsWith(expectedRoot + path.sep)) {
+    throw new Error(
+      `temp-repo.js: makeTempRepo's git context escaped its own directory -- git resolved ${resolvedGitDir}, expected something under ${expectedRoot}. ` +
+        'A git environment variable (GIT_DIR and friends) is overriding cwd, so fixture commands would land in that repository instead. ' +
+        'Sanitise the environment at the offending call site via helpers/git-env.js.'
+    )
+  }
+}
+
 function makeTempRepo() {
   const dir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'repo-'))
   if (!fs.existsSync(dir)) {
@@ -70,29 +104,7 @@ function makeTempRepo() {
   if (!fs.existsSync(dir)) {
     throw new Error(`temp-repo.js: makeTempRepo's directory vanished during git init (${dir}) -- something removed it mid-setup`)
   }
-  // Defence in depth against a git environment variable that outranks cwd
-  // (git-env.js). The scrub above should make this unreachable; this
-  // assertion is what makes a FUTURE unsanitised call site fail by name here
-  // instead of silently committing fixtures into a real repository. It is
-  // deliberately a resolved-identity check rather than a `.git` existence
-  // check, because GIT_DIR can point anywhere while a stray `.git` still
-  // exists locally.
-  //
-  // Neither side is realpath'd through `dir/.git` itself: in exactly the
-  // case this catches, that path was never created (git re-initialised the
-  // repo GIT_DIR named instead), so realpathSync would throw ENOENT and the
-  // assertion would report a missing file rather than the escape. Compare
-  // containment under `dir`, which always exists by this point.
-  const resolvedGitDir = sh('git rev-parse --absolute-git-dir', dir).trim()
-  const expectedRoot = fs.realpathSync(dir)
-  const resolvedReal = fs.existsSync(resolvedGitDir) ? fs.realpathSync(resolvedGitDir) : resolvedGitDir
-  if (!resolvedReal.startsWith(expectedRoot + path.sep)) {
-    throw new Error(
-      `temp-repo.js: makeTempRepo's git context escaped its own directory -- git resolved ${resolvedGitDir}, expected something under ${expectedRoot}. ` +
-        'A git environment variable (GIT_DIR and friends) is overriding cwd, so fixture commands would land in that repository instead. ' +
-        'Sanitise the environment at the offending call site via helpers/git-env.js.'
-    )
-  }
+  assertGitContextWithin(dir, sh('git rev-parse --absolute-git-dir', dir).trim())
   sh('git config user.email test@example.com', dir)
   sh('git config user.name Test', dir)
   fs.writeFileSync(path.join(dir, 'README.md'), 'seed\n')
@@ -126,4 +138,4 @@ function cleanupTempRepos() {
   }
 }
 
-module.exports = { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, sanitizedGitEnv, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos }
+module.exports = { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, sanitizedGitEnv, assertGitContextWithin, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos }

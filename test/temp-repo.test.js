@@ -12,7 +12,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
-const { makeTempRepo, cleanupTempRepos } = require('./helpers/temp-repo.js')
+const { makeTempRepo, cleanupTempRepos, assertGitContextWithin, SUITE_TMPDIR, trackTempDir } = require('./helpers/temp-repo.js')
 
 test.after(cleanupTempRepos)
 
@@ -229,4 +229,57 @@ test('temp-repo.js: sh() and runAppend() sanitise per call, so a GIT_DIR set AFT
   assert.ok(out.hasOwnGitDir, 'sh() must sanitise per call, not rely on the load-time scrub having already run')
   assert.ok(out.ledgerWrittenHere, 'runAppend() must sanitise per call -- ledger-append.mjs shells out to git and writes .git/info/exclude')
   assert.deepEqual(snapshotRepo(victim), before, 'the repo named by the late-set GIT_DIR must be untouched')
+})
+
+// The assertion inside makeTempRepo() cannot fire while the sanitising
+// layers work, so no end-to-end test can prove it. Measured: deleting it
+// entirely left the suite at 684/684 green -- indistinguishable from real
+// defence in depth. Driven directly here instead, in both directions, so it
+// can neither be silently removed nor tightened into rejecting correct
+// fixtures.
+test('temp-repo.js: assertGitContextWithin() rejects a git dir outside the fixture directory, names where git actually pointed, and does not depend on that path existing', () => {
+  const dir = makeTempRepo()
+  const elsewhere = makeTempRepo()
+
+  // The escape it exists to catch: git resolved a real repo somewhere else.
+  assert.throws(
+    () => assertGitContextWithin(dir, path.join(elsewhere, '.git')),
+    (err) => {
+      assert.match(err.message, /escaped its own directory/)
+      assert.ok(err.message.includes(path.join(elsewhere, '.git')), 'the message must name where git actually pointed, not merely that something was wrong')
+      assert.match(err.message, /GIT_DIR/, 'the message must name the cause')
+      assert.match(err.message, /git-env\.js/, 'the message must name the fix')
+      return true
+    }
+  )
+
+  // The ENOENT trap: in the real escape, dir/.git was never created and the
+  // resolved path may itself be gone. It must still produce the named error
+  // rather than dying inside realpathSync.
+  assert.throws(
+    () => assertGitContextWithin(dir, '/definitely/not/a/real/path/.git'),
+    /escaped its own directory/,
+    'a non-existent resolved path must still yield the named diagnosis, not an ENOENT from realpathSync'
+  )
+})
+
+test('temp-repo.js: assertGitContextWithin() accepts a correct fixture, including through a symlinked directory, so it cannot pass by rejecting everything', () => {
+  const dir = makeTempRepo()
+
+  // The ordinary correct case.
+  assert.doesNotThrow(() => assertGitContextWithin(dir, path.join(dir, '.git')))
+
+  // The same repo reached through a symlink, which is what macOS gives for
+  // TMPDIR (/var -> /private/var) and what hostile-repo.js builds
+  // deliberately. A containment check that compared raw strings rather than
+  // realpaths would false-positive here, and a guard that cries wolf on
+  // correct code gets deleted by the next person in a hurry.
+  const linkParent = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'symlink-parent-'))
+  trackTempDir(linkParent)
+  const linked = path.join(linkParent, 'via-symlink')
+  fs.symlinkSync(dir, linked)
+  assert.doesNotThrow(
+    () => assertGitContextWithin(linked, path.join(dir, '.git')),
+    'a fixture reached through a symlink must not be reported as an escape'
+  )
 })

@@ -3,6 +3,17 @@
 // against the diff, not by an agent lens).
 const test = require('node:test')
 const assert = require('node:assert/strict')
+// This file shells out to git directly and does NOT build temp repos, so it
+// never loads test/helpers/temp-repo.js and would not otherwise get that
+// module's load-time git-environment scrub. node --test runs each test FILE
+// in its own process, so the scrub is per-file, not per-suite. Without this
+// import, a suite run from a context that exports GIT_DIR (a git hook
+// invoked from a linked worktree) would point the git calls below at a
+// different repository and the guards would silently verify the wrong tree
+// -- a false green, which is the one outcome these static checks exist to
+// prevent. See test/helpers/git-env.js.
+require('./helpers/git-env.js').scrubGitEnv()
+
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -494,4 +505,71 @@ test('static: bin/com.local.optimise-cycle-weekly.plist is tracked in the repo a
   const plist = fs.readFileSync(plistPath, 'utf8')
   assert.ok(!/\/Volumes\/|\/home\/scott\.b|scott\.b/.test(plist), 'the tracked plist must never contain a real, non-placeholder account path')
   assert.match(plist, /YOUR_USERNAME/, 'the tracked plist must use a placeholder path, not a real one, since this repo is public')
+})
+
+// §9: the rule "a test file that invokes git must load the git-environment
+// scrub" is enforceable, so it is enforced rather than written down.
+//
+// Two lessons are baked into HOW this scans, both learned the hard way and
+// both within an hour of each other:
+//
+// 1. ALIAS-AGNOSTIC. The ad-hoc scan that first checked this matched the
+//    literal identifier `execFileSync('git'` and reported static-checks.js
+//    as having zero git calls -- while that very file did
+//    `const exec = require('node:child_process').execFileSync` and then
+//    `exec('git', ...)`. The file was unprotected and the scan said it was
+//    fine. A guard that looks for one spelling of a call reports CLEAN on
+//    the code that motivated it. (Independently hit the same day in a
+//    sibling repo, where `import subprocess as sp` hid 17 of 20 call sites
+//    from an equivalent check.) So: match `<anything>('git',` regardless of
+//    what the function is called.
+// 2. NO FALSE POSITIVES. Comments and prose mention git commands constantly
+//    in this repo, so they are stripped before scanning. A guard that cries
+//    wolf on correct code gets deleted by the next person in a hurry, which
+//    is a worse outcome than not having the guard.
+//
+// The scrub is per-PROCESS and node --test runs each test file in its own
+// process, so importing it transitively (via helpers/temp-repo.js, which
+// scrubs at load) counts -- that is a real code path, not a loophole.
+test('static: every test file that invokes git loads the git-environment scrub, so a suite run under an exported GIT_DIR cannot verify or corrupt the wrong repository (alias-agnostic scan)', () => {
+  const testDir = path.join(ROOT, 'test')
+  const files = []
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name)
+      if (entry.isDirectory()) walk(p)
+      else if (entry.name.endsWith('.js')) files.push(p)
+    }
+  }
+  walk(testDir)
+  assert.ok(files.length > 10, `sanity: expected to find many test files under ${testDir}, found ${files.length}`)
+
+  // Strip block and line comments so prose about git does not register.
+  const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+
+  const offenders = []
+  for (const file of files) {
+    const src = stripComments(fs.readFileSync(file, 'utf8'))
+    // Any function, however named or destructured, receiving 'git' as its
+    // first argument; plus git invoked through a shell string.
+    const invokesGit = /[\w.$]+\(\s*['"]git['"]\s*,/.test(src) || /['"]git\s+[a-z][a-z-]*/.test(src)
+    if (!invokesGit) continue
+    // Anchored to an actual require STATEMENT at the start of a line, not a
+    // mention of one anywhere in the source. The first version tested the
+    // whole file and matched this very test's own failure message, which
+    // helpfully spells out `require('./helpers/git-env.js')` -- so the guard
+    // exempted the one file it was written after, and deleting that file's
+    // real import left the suite green. Proven by mutation, not by reading.
+    const loadsScrub = src
+      .split('\n')
+      .some((line) => /^\s*(?:(?:const|let|var)\s+[^=]*=\s*)?require\(\s*['"][^'"]*(?:git-env|temp-repo|hostile-repo)[^'"]*['"]\s*\)/.test(line))
+    if (!loadsScrub) offenders.push(path.relative(ROOT, file))
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `these files invoke git but never load the git-environment scrub, so a run under an exported GIT_DIR would resolve to the wrong repository: ${offenders.join(', ')}. ` +
+      "Add require('./helpers/git-env.js').scrubGitEnv() (path relative to the file), or import a helper that does."
+  )
 })
