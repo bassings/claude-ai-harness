@@ -107,10 +107,27 @@ a public repo. Measured against the real compiler with a 61-character filename:
 added `**a`, and a 30-character glob does not return. The workflow wedges
 inside the sandbox with no error, no verdict and no terminal ledger line,
 leaving the run's `started` record a permanent orphan, which is strictly worse
-than the abort this design deliberately chose. Bound the input (glob length,
-`**` count per glob, glob count per key) rather than rewriting glob
+than the abort this design deliberately chose. Bound the input rather than rewriting glob
 compilation, and prove the bound by timing: the measured pathological glob must
 be rejected in microseconds rather than compiled.
+
+**Amended again after the first cut of this bound shipped a hole.** Counting
+`**` was not enough: `*?*?*?*?*?*?b` is 13 characters, contains **zero** `**`,
+passed every bound, and took 676ms, growing about 10x per `*?` pair. The
+blowup comes from adjacent variable-length quantifiers, and `*` with `?`
+produces them as readily as `**` does. The bound therefore counts **every
+wildcard**, `*` and `?` together.
+
+The cap is 6, chosen by measurement rather than preference. Cost of one glob
+against a 200-character non-matching path, by total wildcard count: 6 -> 8ms,
+7 -> 445ms, 9 -> 17,375ms. Real globs need at most 4 (`**/templates/**`), and
+the harness's own `DEFAULT_RULES` need at most 3, so 6 sits below the cliff
+and above ordinary use. The previous limit of four `**` was eight wildcards,
+measured at 449ms **per glob** -- and that is per glob, times up to
+`MAX_GLOBS_PER_KEY` globs, times every changed path, so the original bound
+constrained per-glob shape without bounding the total and did not compose. A
+test must also assert a real four-wildcard glob is still accepted, so the
+bound cannot be tightened into rejecting ordinary overrides.
 
 **AC-SEC-6** *(added after review round 2)*: `?` is handled as a glob
 metacharacter, not passed through to the regex engine. Unescaped it either

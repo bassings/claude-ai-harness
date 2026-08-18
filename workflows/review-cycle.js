@@ -35,7 +35,20 @@ const DEFAULT_RULES = {
 // value, before any regex is ever compiled: glob length, "**" occurrences per
 // glob, and glob count per key.
 const MAX_GLOB_LENGTH = 200
-const MAX_GLOB_DOUBLESTAR = 4 // this repo's own real DEFAULT_RULES globs use at most 1
+// Measured, not guessed. Cost of one glob against a 200-char non-matching
+// path, by TOTAL wildcard count: 6 -> 8ms, 7 -> 445ms, 9 -> 17,375ms. Real
+// globs in use here need at most 4 ("**/templates/**"); DEFAULT_RULES needs
+// at most 3. So 6 is safely under the cliff and generous against real use.
+//
+// Counting "**" alone was NOT enough, and this is a hole the first cut of
+// this fix shipped: "*?*?*?*?*?*?b" is 13 chars, contains ZERO "**", passed
+// every bound, and took 676ms -- growing about 10x per "*?" pair. The
+// blowup comes from adjacent variable-length quantifiers, which "*" and "?"
+// produce just as readily as "**". Count every wildcard.
+const MAX_GLOB_WILDCARDS = 6
+// Kept as a separate, tighter statement of intent: 3 "**" is already 6 "*"
+// characters, so this can never be the looser of the two bounds.
+const MAX_GLOB_DOUBLESTAR = 3
 const MAX_GLOBS_PER_KEY = 50 // this repo's own real DEFAULT_RULES entries use at most ~11; generous headroom
 
 // Item 3 [MEDIUM]: an attacker-authored custom_rules key or glob string was
@@ -418,6 +431,15 @@ if (scope.custom_rules !== null) {
           `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" contains a glob that is too long: ` +
           `${g.length} characters, over the limit of ${MAX_GLOB_LENGTH}: ${neutralise(g)}. Long globs compile to regexes whose ` +
           `backtracking cost grows exponentially. Aborting the review.`
+        )
+      }
+      const wildcards = (g.match(/[*?]/g) || []).length
+      if (wildcards > MAX_GLOB_WILDCARDS) {
+        throw new Error(
+          `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" contains a glob with too many ` +
+          `wildcards: ${wildcards} ("*" and "?" combined), more than the limit of ${MAX_GLOB_WILDCARDS}: ` +
+          `${neutralise(g)}. Adjacent variable-length wildcards make regex matching cost grow about 10x each; ` +
+          `measured, 7 wildcards costs 445ms per path and 9 costs 17 seconds. Aborting the review.`
         )
       }
       const doubleStars = g.split('**').length - 1

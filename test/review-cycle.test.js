@@ -935,19 +935,58 @@ test('review-cycle.js: a glob of 201 chars aborts naming the key and the length 
   )
 })
 
-test('review-cycle.js: a glob with exactly 4 "**" segments is accepted (item 1, ReDoS "**" bound, upper boundary)', async () => {
-  // The exact 12-char, 4-occurrence glob measured in the security review at 4.7ms.
-  const glob = '**a**a**a**b'
+// The upper boundary moved from 4 "**" to 3, and the reason is a measurement,
+// not a preference. Cost of ONE glob against a 200-char non-matching path, by
+// total wildcard count: 6 -> 8ms, 7 -> 445ms, 9 -> 17,375ms. Four "**" is
+// eight wildcards, measured at 449ms per glob -- and that is per glob, times
+// up to MAX_GLOBS_PER_KEY globs, times every changed path. The original bound
+// limited per-glob shape without bounding the total, so it did not compose.
+test('review-cycle.js: a glob with exactly 3 "**" segments (6 wildcards, the measured safe limit) is accepted (item 1, upper boundary)', async () => {
+  const glob = '**a**a**b'
   const { result } = await runWorkflow(WF, {
     args: {},
     agent: baseAgent({
       'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: [glob] } },
     }),
   })
-  assert.equal(result.telemetry.outcome, 'done', 'a glob with exactly 4 "**" segments must still be accepted')
+  assert.equal(result.telemetry.outcome, 'done', 'a glob at the measured safe wildcard limit must still be accepted')
 })
 
-test('review-cycle.js: a glob with 5 "**" segments aborts naming the key (item 1, ReDoS "**" bound)', async () => {
+// The hole the FIRST cut of this fix shipped, and the reason the bound now
+// counts every wildcard rather than only "**". This glob is 13 characters,
+// contains ZERO "**", passed every bound that existed, and took 676ms --
+// growing about 10x per "*?" pair. The blowup comes from adjacent
+// variable-length quantifiers, which "*" and "?" produce as readily as "**".
+test('review-cycle.js: a glob with no "**" at all but many "*?" pairs is rejected -- counting "**" alone missed this (item 1, wildcard bound)', async () => {
+  const glob = '*?*?*?*?*?*?b'
+  assert.equal(glob.split('**').length - 1, 0, 'the fixture must contain no "**" at all, or it does not test the hole')
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: [glob] } } }),
+      }),
+    (err) => {
+      assert.match(err.message, /HarnessTriggersShapeInvalid/)
+      assert.match(err.message, /"data"/)
+      assert.match(err.message, /wildcard/i, 'the reason must name the wildcard count, not some other bound')
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: a real-world glob using 4 wildcards is still accepted, so the wildcard bound does not break ordinary overrides (item 1, no over-triggering)', async () => {
+  // "**/templates/**" is the widest glob any real ruleset here uses.
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { ui: ['**/templates/**'] } },
+    }),
+  })
+  assert.equal(result.telemetry.outcome, 'done', 'a four-wildcard glob is ordinary use and must not be rejected')
+})
+
+test('review-cycle.js: a glob with 5 "**" segments aborts naming the key (item 1, ReDoS bound)', async () => {
   // The exact 15-char, 5-occurrence glob measured in the security review at 58ms --
   // already noticeable, and the review measured roughly 9x growth per added "**a".
   const glob = '**a**a**a**a**b'
