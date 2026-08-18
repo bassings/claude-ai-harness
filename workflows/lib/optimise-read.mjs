@@ -157,15 +157,47 @@ export function parseLedgerContent(raw) {
   return { records, skipped, schemaVersionsSeen, truncatedFinalLine }
 }
 
-// Bounds how many records proceed to aggregation (AC-ARCH-14): keeps only
-// the most recent `maxLines` records (by array order, which is file order,
-// which is append order -- the ledger is append-only). This windowing
-// happens here, in script code, BEFORE any of this content is placed into
-// an agent prompt string.
+// Bounds how many records proceed to aggregation (AC-ARCH-14): keeps the
+// LAST `maxLines` records by array order. This windowing happens here, in
+// script code, BEFORE any of this content is placed into an agent prompt
+// string.
+//
+// Array order equals time order only for records read from a SINGLE ledger
+// file, which is append-only. It does NOT hold across files: a caller that
+// concatenates several roots produces a repo-major array, and slicing its
+// tail then selects by argument position rather than by time. Supplying
+// time-ordered input is the caller's responsibility -- see
+// sortRecordsByTime, which runLedgerCommand applies before calling this.
 export function windowRecords(records, maxLines = DEFAULT_LEDGER_WINDOW_LINES) {
   if (records.length <= maxLines) return { windowed: records, truncated: false, droppedCount: 0 }
   const droppedCount = records.length - maxLines
   return { windowed: records.slice(droppedCount), truncated: true, droppedCount }
+}
+
+// Puts records from any number of roots into one true time order, so that
+// windowRecords' tail slice means "the most recent runs" rather than
+// "whichever root was listed last".
+//
+// Decorate-sort-undecorate with an explicit original-index tiebreak, rather
+// than leaning on Array.prototype.sort's stability: records sharing a
+// timestamp keep the order they were read in, which for a single root is
+// its append order.
+//
+// A record whose `ts` is missing or unparseable sorts as OLDEST. The ledger
+// envelope only requires `ts` to be a non-empty string, so a non-ISO value
+// is reachable; treating it as oldest means the least trustworthy input can
+// never displace a record with a known, recent time. It is dropped first
+// rather than silently outranking real data.
+export function sortRecordsByTime(records) {
+  const decorated = records.map((record, index) => {
+    const parsed = typeof record.ts === 'string' ? Date.parse(record.ts) : Number.NaN
+    return { record, index, time: Number.isFinite(parsed) ? parsed : -Infinity }
+  })
+  decorated.sort((a, b) => {
+    if (a.time !== b.time) return a.time < b.time ? -1 : 1
+    return a.index - b.index
+  })
+  return decorated.map((d) => d.record)
 }
 
 function bumpDisposition(counts, lens, disposition) {
@@ -1106,7 +1138,13 @@ function runLedgerCommand(roots, window) {
     combinedRecords = combinedRecords.concat(records)
     combinedSkipped = combinedSkipped.concat(skipped)
   }
-  const { windowed, truncated, droppedCount } = windowRecords(combinedRecords, window)
+  // combinedRecords is repo-major: root 0's records, then root 1's, and so
+  // on, time-ordered only WITHIN each root. windowRecords keeps the tail, so
+  // without this sort the window is selected by argument position: the
+  // last-listed root's OLDEST records outrank the first-listed root's
+  // NEWEST. Every downstream aggregate, and citationPool's
+  // "most-recent-first" contract, assume the window means recent runs.
+  const { windowed, truncated, droppedCount } = windowRecords(sortRecordsByTime(combinedRecords), window)
   // HARN-OPT-2 PR1: plan-identity canonicalisation of an absolute historical
   // spec value needs the actual analysis root as a lexical string to strip.
   // Simplification, stated here rather than hidden: when MULTIPLE roots are
