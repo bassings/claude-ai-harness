@@ -1203,3 +1203,34 @@ test('review-cycle.js: the symmetric contradiction check also catches an empty o
     /HarnessTriggersContradiction/
   )
 })
+
+// 2026-08-18: a planning lens reported that CouchPotatoServer still carried
+// repo-local workflow forks. It did not -- they had been merged away hours
+// earlier. The lens had read the shared MAIN CHECKOUT, which another agent
+// session had checked out on its own branch, predating that merge. The finding
+// was confident, specific, cited line counts, and was about the wrong branch.
+//
+// Several agents share these checkouts. If HEAD moves between the scope step
+// and synthesis, the review reviewed something other than what it reports on,
+// and nothing anywhere says so. These pin the detection.
+test('review-cycle.js: a HEAD that moves mid-run (a shared checkout switched by another session) is surfaced, not silently reviewed', async () => {
+  const movedSynthesis = { ...SYNTHESIS_OK, head_sha_at_synthesis: 'ffffffffffffffff' }
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ synthesis: movedSynthesis }),
+  })
+  assert.equal(result.checkout_moved, true, 'the caller must learn the tree moved under the review')
+  assert.match(String(result.checkout_moved_detail), /abcdef1234567890/, 'and must name the sha it scoped')
+  assert.match(String(result.checkout_moved_detail), /ffffffffffffffff/, 'and the sha it ended on')
+})
+
+test('review-cycle.js: a stable HEAD does not raise the moved-checkout flag (the signal must not cry wolf)', async () => {
+  const stable = { ...SYNTHESIS_OK, head_sha_at_synthesis: 'abcdef1234567890' }
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent({ synthesis: stable }) })
+  assert.notEqual(result.checkout_moved, true, 'an unmoved checkout must not report a move')
+})
+
+test('review-cycle.js: a synthesis that omits head_sha_at_synthesis does not fabricate a verdict either way', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.notEqual(result.checkout_moved, true, 'absent evidence must not be read as a move')
+})
