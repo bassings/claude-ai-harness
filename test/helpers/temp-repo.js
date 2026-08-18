@@ -24,6 +24,12 @@ const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
 const { execFileSync, spawnSync } = require('node:child_process')
+const { scrubGitEnv, sanitizedGitEnv } = require('./git-env.js')
+
+// At module load, so every call site in the suite is covered -- including
+// the ones that never import this helper and the child processes that
+// inherit this env. See git-env.js for why cwd does not protect you.
+scrubGitEnv()
 
 const APPEND_SCRIPT = path.join(__dirname, '..', '..', 'workflows', 'lib', 'ledger-append.mjs')
 const LEDGER_REL = '.claude/harness-ledger.jsonl'
@@ -51,7 +57,7 @@ process.on('exit', () => {
 const created = []
 
 function sh(cmd, cwd) {
-  return execFileSync('/bin/sh', ['-c', cmd], { cwd, encoding: 'utf8' })
+  return execFileSync('/bin/sh', ['-c', cmd], { cwd, encoding: 'utf8', env: sanitizedGitEnv() })
 }
 
 function makeTempRepo() {
@@ -64,6 +70,29 @@ function makeTempRepo() {
   if (!fs.existsSync(dir)) {
     throw new Error(`temp-repo.js: makeTempRepo's directory vanished during git init (${dir}) -- something removed it mid-setup`)
   }
+  // Defence in depth against a git environment variable that outranks cwd
+  // (git-env.js). The scrub above should make this unreachable; this
+  // assertion is what makes a FUTURE unsanitised call site fail by name here
+  // instead of silently committing fixtures into a real repository. It is
+  // deliberately a resolved-identity check rather than a `.git` existence
+  // check, because GIT_DIR can point anywhere while a stray `.git` still
+  // exists locally.
+  //
+  // Neither side is realpath'd through `dir/.git` itself: in exactly the
+  // case this catches, that path was never created (git re-initialised the
+  // repo GIT_DIR named instead), so realpathSync would throw ENOENT and the
+  // assertion would report a missing file rather than the escape. Compare
+  // containment under `dir`, which always exists by this point.
+  const resolvedGitDir = sh('git rev-parse --absolute-git-dir', dir).trim()
+  const expectedRoot = fs.realpathSync(dir)
+  const resolvedReal = fs.existsSync(resolvedGitDir) ? fs.realpathSync(resolvedGitDir) : resolvedGitDir
+  if (!resolvedReal.startsWith(expectedRoot + path.sep)) {
+    throw new Error(
+      `temp-repo.js: makeTempRepo's git context escaped its own directory -- git resolved ${resolvedGitDir}, expected something under ${expectedRoot}. ` +
+        'A git environment variable (GIT_DIR and friends) is overriding cwd, so fixture commands would land in that repository instead. ' +
+        'Sanitise the environment at the offending call site via helpers/git-env.js.'
+    )
+  }
   sh('git config user.email test@example.com', dir)
   sh('git config user.name Test', dir)
   fs.writeFileSync(path.join(dir, 'README.md'), 'seed\n')
@@ -72,7 +101,10 @@ function makeTempRepo() {
 }
 
 function runAppend(cwd, payload) {
-  return spawnSync('node', [APPEND_SCRIPT], { cwd, input: JSON.stringify(payload), encoding: 'utf8' })
+  // ledger-append.mjs shells out to git itself, including a write via
+  // ensureGitignored(), so this spawn needs the same sanitising as a direct
+  // git call -- the script-spawn case, not just the git-spawn case.
+  return spawnSync('node', [APPEND_SCRIPT], { cwd, input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv() })
 }
 
 function readLedgerLines(repoRoot) {
@@ -94,4 +126,4 @@ function cleanupTempRepos() {
   }
 }
 
-module.exports = { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos }
+module.exports = { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, sanitizedGitEnv, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos }
