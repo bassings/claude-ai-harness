@@ -18,13 +18,88 @@ const DEFAULT_RULES = {
   operability: ['Dockerfile*', 'docker-*.yml', 'compose*.yml', '.github/workflows/**', 'scripts/**', 'Procfile', 'helm/**', 'terraform/**', '**/*logging*', '**/*logger*'],
 }
 
+// Security review round 2 of specs/custom-rules-fail-closed.md, item 1
+// [HIGH]: globToRe expands every "**" to ".*", producing an unanchored
+// alternation with no backtracking bound. Both the override file's globs and
+// the changed filenames they are matched against are attacker-controlled on
+// a public repo (the override file and the filename both live in a
+// contributor's own branch). Measured against this exact compiler, with one
+// changed filename 61 chars long: "**a**a**a**a**b" (5 occurrences of "**",
+// 15 chars) took 58ms; "**a**a**a**a**a**a**b" (7 occurrences, 21 chars) took
+// 5060ms -- roughly 9x per added "**a". A ~30-char glob does not return, and
+// the workflow wedges with no error, no verdict, and no terminal ledger line.
+//
+// Do NOT try to make globToRe itself backtracking-proof -- rewriting glob
+// compilation is a much larger change with its own risk. Bound the input
+// instead, in the validation loop that already walks every custom_rules
+// value, before any regex is ever compiled: glob length, "**" occurrences per
+// glob, and glob count per key.
+const MAX_GLOB_LENGTH = 200
+// Measured, not guessed. Cost of one glob against a 200-char non-matching
+// path, by TOTAL wildcard count: 6 -> 8ms, 7 -> 445ms, 9 -> 17,375ms. Real
+// globs in use here need at most 4 ("**/templates/**"); DEFAULT_RULES needs
+// at most 3. So 6 is safely under the cliff and generous against real use.
+//
+// Counting "**" alone was NOT enough, and this is a hole the first cut of
+// this fix shipped: "*?*?*?*?*?*?b" is 13 chars, contains ZERO "**", passed
+// every bound, and took 676ms -- growing about 10x per "*?" pair. The
+// blowup comes from adjacent variable-length quantifiers, which "*" and "?"
+// produce just as readily as "**". Count every wildcard.
+const MAX_GLOB_WILDCARDS = 6
+// Kept as a separate, tighter statement of intent: 3 "**" is already 6 "*"
+// characters, so this can never be the looser of the two bounds.
+const MAX_GLOB_DOUBLESTAR = 3
+const MAX_GLOBS_PER_KEY = 50 // this repo's own real DEFAULT_RULES entries use at most ~11; generous headroom
+
+// Item 3 [MEDIUM]: an attacker-authored custom_rules key or glob string was
+// previously interpolated verbatim into a thrown Error's message, and from
+// there into the operator-visible log line (redactLogText only truncates at
+// 500 chars and redacts absolute paths, not general injection -- and the
+// re-thrown error itself is neither truncated nor redacted at all). Before
+// this change no custom_rules string was rendered anywhere; this change
+// creates that channel, so every message built from untrusted custom_rules
+// content goes through this first: collapsing whitespace strips a crafted
+// newline from faking a second log line or a second sentence, truncating to
+// ~60 chars bounds how much attacker text ever reaches an operator, and
+// JSON.stringify quotes and escapes the result so a literal double-quote in
+// the input cannot break out of the surrounding sentence.
+function neutralise(text) {
+  const collapsed = String(text).replace(/\s+/g, ' ').trim()
+  const truncated = collapsed.length > 60 ? collapsed.slice(0, 60) + '…' : collapsed
+  return JSON.stringify(truncated)
+}
+
 function globToRe(g) {
   let s = g.replace(/[.+^${}()|[\]\\]/g, '\\$&')
   s = s.replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*').replace(/\u0001/g, '.*')
+  // Item 2 [MEDIUM]: "?" was previously left unescaped by the class above, so
+  // it either threw ("Nothing to repeat" for a bare "?", an error naming
+  // neither the file nor the key) or, for globs that did compile, survived as
+  // a regex quantifier -- the inverse of glob semantics: src/v?/** matched
+  // src/v/x but NOT src/v1/x. Map it to "exactly one non-separator character"
+  // instead, which is what a glob author expects. No other step in this
+  // function touches "?", so it is safe to apply last.
+  s = s.replace(/\?/g, '[^/]')
   return new RegExp('^' + s + '$')
 }
 function matches(paths, globs) {
-  const res = (globs || []).map(globToRe)
+  const res = (globs || []).map(g => {
+    try {
+      return globToRe(g)
+    } catch (e) {
+      // Defence in depth: after the length/"**"-count bounds above and the
+      // "?" fix, no shape-valid custom_rules glob is known to reach this
+      // catch (every remaining regex metacharacter is escaped before this
+      // point) -- but a construction failure here must still name the
+      // offending glob and abort, rather than surfacing as an unrelated
+      // SyntaxError deep in glob compilation.
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json has a glob that failed to compile as a regex: ` +
+        `${neutralise(g)} (${e && e.message ? e.message : String(e)}). Aborting the review rather than proceeding ` +
+        `with an unvalidated override.`
+      )
+    }
+  })
   return paths.filter(p => res.some(r => r.test(p)))
 }
 
@@ -66,6 +141,13 @@ let acVerdicts = []
 // openFindingsRaw/acVerdicts: set as soon as lensReports exists, so a late
 // throw still leaves an accurate trail.
 let lensesRunRaw = []
+// specs/custom-rules-fail-closed.md AC-OPS-1/2: which rule source actually
+// governed lens triggering ('repo-tuned' or 'harness defaults'), and -- when
+// repo-tuned -- how many keys the override changed. Set once scope.custom_rules
+// has been validated (below), read after run() resolves, same accumulator
+// pattern as triggerCounts/lensesRunRaw above.
+let ruleSource = null
+let ruleSourceOverriddenKeys = null
 
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
@@ -199,7 +281,9 @@ const scope = await agent(
   `1. Determine the base ref: ${opts.base ? `use "${opts.base}".` : 'the repository default branch (usually main or master; check `git remote show origin` or local branch names).'}\n` +
   `2. Run \`git diff --name-status <base>...HEAD\` and return every changed file path with its status letter, plus the base ref you used and the exact output of \`git rev-parse HEAD\` as head_sha.\n` +
   `3. Report whether any dependency manifest (package.json, requirements*.txt, pyproject.toml, go.mod, Cargo.toml, Gemfile, or equivalent) gained a NEW entry (a new package, not a version bump), and whether the diff ADDS a new module or package (a new source file outside tests, or a new package directory).\n` +
-  `4. If a file .claude/harness-triggers.json exists at the repo root, return its parsed JSON as custom_rules; otherwise null.\n` +
+  `4. Check whether a file .claude/harness-triggers.json exists at the repo root and report that as ` +
+  `harness_triggers_file_exists (true/false). If it exists, return its parsed JSON as custom_rules; if it does not ` +
+  `exist, custom_rules must be null.\n` +
   `Raw data only.`,
   {
     label: 'scope:diff',
@@ -207,14 +291,23 @@ const scope = await agent(
     effort: 'low',
     schema: {
       type: 'object',
-      required: ['base', 'head_sha', 'files', 'new_dependency_entries', 'new_modules'],
+      required: ['base', 'head_sha', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists'],
       properties: {
         base: { type: 'string' },
         head_sha: { type: 'string' },
         files: { type: 'array', items: { type: 'object', required: ['path', 'status'], properties: { path: { type: 'string' }, status: { type: 'string' } } } },
         new_dependency_entries: { type: 'boolean' },
         new_modules: { type: 'boolean' },
+        // AC-SEC-1: type stays loose (contents are shape-validated in the
+        // workflow itself, below, not by this schema) -- but `required` now
+        // catches an OMITTED field, which the runtime's structured-output
+        // enforcement rejects before the workflow ever sees it.
         custom_rules: { type: ['object', 'null'] },
+        // AC-SEC-1/AC-SEC-2: a second, independent answer that can
+        // CONTRADICT custom_rules -- true + custom_rules:null is exactly the
+        // transcription failure this whole spec exists to catch (a
+        // single-field report has no way to be self-inconsistent).
+        harness_triggers_file_exists: { type: 'boolean' },
       },
     },
   }
@@ -224,6 +317,155 @@ if (!scope || !scope.files.length) return { report: 'No changes found between th
 headSha = scope.head_sha
 
 const base = scope.base
+
+// specs/custom-rules-fail-closed.md AC-SEC-2: the contradiction that catches
+// a transcription failure. The scope step has no filesystem access of its
+// own to double-check itself, so this compares its two independent answers:
+// if the file was reported to exist but its parsed contents did not arrive,
+// that is a transcription failure in the scope step, not evidence the file
+// has no overrides. Proceeding on defaults here would silently review with
+// the wrong lens roster and no sign of it (the measured blast radius this
+// spec exists to close) -- fail closed instead.
+if (scope.harness_triggers_file_exists === true && scope.custom_rules === null) {
+  throw new Error(
+    'HarnessTriggersTranscriptionFailed: .claude/harness-triggers.json exists at the repo root ' +
+    '(harness_triggers_file_exists is true) but custom_rules did not arrive (it is null) -- a transcription ' +
+    'failure in the scope step, not evidence the override file is empty. Aborting the review rather than ' +
+    'silently falling back to harness defaults, which would review with the wrong lens roster and no sign of ' +
+    'it. Re-run the review; if this recurs, the override file is not being read.'
+  )
+}
+
+// Item 4, from the security review: the contradiction check was one-directional.
+// The design's whole insight is that two independent answers can contradict, so
+// treating only one direction as a failure leaves the other silent. A scope step
+// that reports no override file while delivering custom_rules has misread
+// something, and applying those rules would narrow the lens roster on the word
+// of an answer the other field contradicts -- while the log cheerfully reports
+// "repo-tuned" for a repo with no tuning.
+if (scope.harness_triggers_file_exists === false && scope.custom_rules !== null) {
+  throw new Error(
+    'HarnessTriggersContradiction: the scope step reported no .claude/harness-triggers.json at the repo root ' +
+    '(harness_triggers_file_exists is false) yet delivered custom_rules anyway -- the two answers contradict, so ' +
+    'one of them is wrong and there is no way to tell which. Aborting rather than narrowing the lens roster on the ' +
+    'strength of an override the same step says does not exist. Re-run the review; if this recurs, the scope step ' +
+    'is misreading the repo root.'
+  )
+}
+
+// AC-SEC-3: shape-validate custom_rules before it is merged into the trigger
+// rules and reaches matches()/glob compilation. Unvalidated, a non-array
+// value throws an unrelated error deep in glob compilation and a stray key
+// is silently ignored -- neither of which names what is actually wrong with
+// the repo's override file.
+const CUSTOM_RULE_KEYS = ['ui', 'data', 'architecture', 'operability']
+if (scope.custom_rules !== null) {
+  for (const key of Object.keys(scope.custom_rules)) {
+    if (!CUSTOM_RULE_KEYS.includes(key)) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json has an unrecognised key ${neutralise(key)} -- only ` +
+        `${CUSTOM_RULE_KEYS.join(', ')} are accepted. Aborting the review rather than proceeding with an ` +
+        `unvalidated override.`
+      )
+    }
+    const value = scope.custom_rules[key]
+    if (!Array.isArray(value)) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" must be an array of glob strings, ` +
+        `got ${typeof value}. Aborting the review rather than proceeding with an unvalidated override.`
+      )
+    }
+    if (value.some(v => typeof v !== 'string')) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" array contains a non-string glob. ` +
+        `Aborting the review rather than proceeding with an unvalidated override.`
+      )
+    }
+    // An EMPTY array is the silent-lens-loss case in a different costume, and
+    // it survived the first cut of this validation. Measured: an override of
+    // {"data": []} REPLACES the default data globs rather than extending them,
+    // so a changed .sql migration triggers ['lens-security','lens-qa'] where
+    // the defaults give ['lens-security','lens-qa','lens-data'] -- the lens is
+    // gone and the log still says "repo-tuned". That is exactly what this
+    // whole mechanism exists to prevent.
+    //
+    // It is rejected rather than merely logged because an empty array is
+    // indistinguishable from a transcription failure (an agent returning
+    // {"data": []} instead of the real list), and there is no documented way
+    // to disable a lens deliberately -- omitting the key inherits the
+    // defaults, so an empty array is not the supported spelling of anything.
+    if (value.length === 0) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" is an empty array, which would ` +
+        `REPLACE the harness defaults for that key and silently stop the corresponding lens triggering on any ` +
+        `path. Omit the key entirely to inherit the defaults. Aborting rather than reviewing with a lens ` +
+        `disabled by what may be a transcription failure.`
+      )
+    }
+    // Item 1 [HIGH], from the security review of this PR. globToRe expands
+    // every "**" to ".*", producing an unanchored alternation with no
+    // backtracking bound, so a crafted glob makes matches() run effectively
+    // forever. Measured against the real compiler with a 61-char filename:
+    // 12 chars 4.7ms, 15 chars 58ms, 18 chars 586ms, 21 chars 5060ms -- about
+    // 9x per added "**a", and a 30-char glob does not return. Both halves are
+    // attacker-controlled on a public repo (the override file and the filename
+    // both live in a contributor's branch), and the workflow wedges inside the
+    // sandbox with no error, no verdict and no terminal ledger line, leaving
+    // the run's started record a permanent orphan. That is strictly worse than
+    // an abort, which at least says what happened.
+    //
+    // The input is bounded rather than globToRe made backtracking-proof:
+    // rewriting glob compilation is a much larger change carrying its own
+    // risk, and these bounds are far above anything a real override needs
+    // (the harness's own DEFAULT_RULES use at most one "**" per glob).
+    if (value.length > MAX_GLOBS_PER_KEY) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" has too many globs: ${value.length}, ` +
+        `more than the limit of ${MAX_GLOBS_PER_KEY}. Each glob is compiled to a regex and matched against every changed path, so ` +
+        `an unbounded list is a denial-of-service surface. Aborting the review.`
+      )
+    }
+    for (const g of value) {
+      if (g.length > MAX_GLOB_LENGTH) {
+        throw new Error(
+          `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" contains a glob that is too long: ` +
+          `${g.length} characters, over the limit of ${MAX_GLOB_LENGTH}: ${neutralise(g)}. Long globs compile to regexes whose ` +
+          `backtracking cost grows exponentially. Aborting the review.`
+        )
+      }
+      const wildcards = (g.match(/[*?]/g) || []).length
+      if (wildcards > MAX_GLOB_WILDCARDS) {
+        throw new Error(
+          `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" contains a glob with too many ` +
+          `wildcards: ${wildcards} ("*" and "?" combined), more than the limit of ${MAX_GLOB_WILDCARDS}: ` +
+          `${neutralise(g)}. Adjacent variable-length wildcards make regex matching cost grow about 10x each; ` +
+          `measured, 7 wildcards costs 445ms per path and 9 costs 17 seconds. Aborting the review.`
+        )
+      }
+      const doubleStars = g.split('**').length - 1
+      if (doubleStars > MAX_GLOB_DOUBLESTAR) {
+        throw new Error(
+          `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" contains a glob with too many "**" ` +
+          `segments: ${doubleStars}, over the limit of ${MAX_GLOB_DOUBLESTAR}: ${neutralise(g)}. Each "**" becomes ".*", and ` +
+          `stacking them makes matching cost grow about 9x per segment. Aborting the review.`
+        )
+      }
+    }
+    if (value.some(v => v.trim() === '')) {
+      throw new Error(
+        `HarnessTriggersShapeInvalid: .claude/harness-triggers.json's "${key}" array contains an empty glob ` +
+        `string, which matches nothing and is almost certainly not what was meant. Aborting rather than ` +
+        `proceeding with an override that silently covers less than it appears to.`
+      )
+    }
+  }
+}
+
+// AC-OPS-1/AC-OPS-2: which rule source governed lens triggering, for the log
+// line below and the run ledger.
+ruleSource = scope.custom_rules ? 'repo-tuned' : 'harness defaults'
+ruleSourceOverriddenKeys = scope.custom_rules ? Object.keys(scope.custom_rules).length : null
+
 const rules = Object.assign({}, DEFAULT_RULES, scope.custom_rules || {})
 const paths = scope.files.map(f => f.path)
 
@@ -286,7 +528,12 @@ if (opts.adversarial) lenses.push('reviewer-verification')
 
 const ALL = ['lens-security', 'lens-qa', 'lens-design', 'lens-accessibility', 'lens-data', 'lens-architecture', 'lens-operability', 'lens-product']
 const skipped = ALL.filter(l => !lenses.includes(l))
-log(`Reviewing ${paths.length} changed files against ${base} at ${scope.head_sha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}.`)
+// AC-OPS-1/AC-QA-4: names which rule source governed the trigger match above
+// (repo-tuned, with the count of overridden keys, or harness defaults) so an
+// operator reading the run output can tell which applied without inspecting
+// the repo.
+const ruleSourceText = ruleSource === 'repo-tuned' ? `repo-tuned (${ruleSourceOverriddenKeys} overridden keys)` : 'harness defaults'
+log(`Reviewing ${paths.length} changed files against ${base} at ${scope.head_sha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}. Rule source: ${ruleSourceText}.`)
 
 // ---- Phase 2: lenses in parallel, each in its own worktree ----
 const REVIEW_SCHEMA = {
@@ -490,6 +737,14 @@ const telemetry = {
   // -- unlike spec_bugs/rejected_findings/open_findings -- it needs no
   // further processing by ledger-append.mjs and rides in telemetry proper.
   ac_verdicts: acVerdicts,
+  // AC-OPS-2: which rule source governed lens triggering on this run, so a
+  // later reader of this ledger can report how often overrides are in force
+  // and detect a repo whose tuning silently stopped arriving across runs.
+  // null on a run that never reached the scope validation (e.g. the scope
+  // agent itself failed), distinguishable from a genuine "harness defaults"
+  // measurement.
+  rule_source: ruleSource,
+  rule_source_overridden_keys: ruleSourceOverriddenKeys,
 }
 // spec_bugs/rejected_findings ride along as raw descriptors for
 // ledger-append.mjs to hash into finding ids; they are NOT part of the

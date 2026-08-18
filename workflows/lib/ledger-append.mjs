@@ -175,6 +175,15 @@ export const LEDGER_ENTRY_SCHEMA = {
     // object must itself satisfy it.
     trigger_counts: { type: 'object', additionalProperties: { type: 'integer' } },
     verdicts: { type: 'object', additionalProperties: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] } },
+    // specs/custom-rules-fail-closed.md AC-OPS-2: review_cycle only -- which
+    // rule source (the harness defaults, or a repo's .claude/harness-triggers.json
+    // override) governed lens triggering on this run, and how many keys the
+    // override changed. Additive and optional, like invalid_ac_ids_dropped/
+    // ac_id_raw before it (see README's AC-OPS-4 section): an older writer or
+    // reader omitting these fields is not itself an error, so no SCHEMA_VERSION
+    // bump.
+    rule_source: { type: ['string', 'null'], enum: ['repo-tuned', 'harness defaults'] },
+    rule_source_overridden_keys: { type: ['integer', 'null'] },
     findings: {
       type: 'array',
       items: {

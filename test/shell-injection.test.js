@@ -55,6 +55,7 @@ function runReviewCycleAndGetTerminalPrompt(hostileClaim) {
         new_dependency_entries: false,
         new_modules: false,
         custom_rules: null,
+        harness_triggers_file_exists: false,
       },
       'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
       'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },

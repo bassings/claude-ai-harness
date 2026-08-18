@@ -267,6 +267,31 @@ repo root; any key you supply replaces the default list for that key:
 runs at planning (and only at planning: its veto is spent before anything is
 built, the only point where cutting scope is free).
 
+**This override fails closed, not silently.** `.claude/harness-triggers.json`
+is read and transcribed by an LLM step, not by the workflow script itself
+(dynamic-workflow scripts have no filesystem access), so a transcription
+failure is a real risk: the file exists but its contents do not arrive. If
+that happens, `review-cycle.js` **aborts the review** rather than silently
+falling back to the harness defaults -- a review conducted with the wrong
+lens roster and no visible sign of it is worse than one that stops and says
+so. Two related failure modes, both intended:
+
+- **A malformed override file blocks every review** until it is fixed: only
+  the four known keys (`ui`, `data`, `architecture`, `operability`) are
+  accepted, and each value must be an array of glob strings. An unknown key,
+  a non-array value, or a non-string glob aborts the run, naming the
+  offending key.
+- **A transcription failure blocks the review too**, even when the file
+  itself is well-formed: if the scope step reports the file exists but its
+  parsed contents came back `null`, that contradiction is treated as the scope
+  step having dropped the data, not as the file being empty.
+
+Either way the abort message says what to do: re-run; if it keeps happening,
+the override file is not being read. The run's log line and its ledger entry
+both record which rule source actually governed the run (`repo-tuned`, with
+the count of overridden keys, or `harness defaults`), so a silently-dropped
+override is visible after the fact too, not only when it aborts.
+
 ## Loop conducting: long plans that cannot stall
 
 Executing a multi-PR plan across CI waits has a failure mode the harness

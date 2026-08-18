@@ -3308,6 +3308,24 @@ test('ledger-append module: SCHEMA_VERSION is bumped past 1 -- the plan_key fiel
   assert.notEqual(SCHEMA_VERSION, 1)
 })
 
+// specs/custom-rules-fail-closed.md AC-OPS-2: review-cycle.js now sends
+// rule_source/rule_source_overridden_keys in its terminal ledger payload --
+// additive and optional (mirrors invalid_ac_ids_dropped/ac_id_raw's own
+// precedent, see README's AC-OPS-4 section), so this does NOT bump
+// SCHEMA_VERSION. The honest-data shape (both the repo-tuned and the
+// harness-defaults case) must validate cleanly, and an out-of-enum value
+// must be rejected.
+test('ledger-append module: LEDGER_ENTRY_SCHEMA accepts rule_source/rule_source_overridden_keys on a review_cycle entry, and rejects an out-of-enum rule_source (custom-rules-fail-closed AC-OPS-2)', async () => {
+  const { validateEntry, SCHEMA_VERSION } = await import(APPEND_MODULE_URL)
+  const base = { schema_version: SCHEMA_VERSION, run_id: 'r', ts: 't', repo: 'r', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null }
+  assert.deepEqual(validateEntry({ ...base, rule_source: 'repo-tuned', rule_source_overridden_keys: 2 }), [])
+  assert.deepEqual(validateEntry({ ...base, rule_source: 'harness defaults', rule_source_overridden_keys: null }), [])
+  assert.ok(
+    validateEntry({ ...base, rule_source: 'bogus-value', rule_source_overridden_keys: null }).length > 0,
+    'a rule_source value outside the repo-tuned/harness-defaults enum must be rejected'
+  )
+})
+
 // AC-QA-20: plan-identity canonicalisation must add no per-write git
 // subprocess beyond what the writer already invoked -- resolving the
 // current working tree's own root (needed to relativise a worktree-
