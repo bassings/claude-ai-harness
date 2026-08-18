@@ -294,8 +294,11 @@ Recorded so they are not silently reconsidered:
 
 ## Owner actions, not tasks here
 
-- **Rotate the plaintext `GEMINI_API_KEY`** in `~/.claude/settings.json`
-  (details deliberately not restated; see AC-SEC-9).
+- **Rotate the plaintext `GEMINI_API_KEY`** (the operator knows the file; it is
+  deliberately not named here)
+  (details deliberately not restated here; see AC-SEC-9. Stating a live key's
+  location, prefix, length and file mode on a public branch narrows the search
+  for anyone who finds it, which is what the original wording did.)
 - **Triage five open Dependabot PRs on Couch Potato** per §3a, with a recorded
   decision each.
 - **Decide on Couch Potato's `required_conversation_resolution`.** Merging
