@@ -1,0 +1,28 @@
+#!/bin/sh
+# Pre-push gate: the full test suite (~31s). Bypass in an emergency with
+# `git push --no-verify`.
+#
+# This repo has no dependencies, no build and no lint step, so the suite IS
+# the gate; there is no faster subset worth carving out.
+#
+# DELIBERATELY does not unset GIT_DIR and friends.
+#
+# git exports those into every hook subprocess when the push comes from a
+# linked worktree, and a suite that shells out to git with an inherited
+# environment then operates on THIS repository instead of its fixtures. A
+# sibling repo unsets them here for exactly that reason, which is a correct
+# fix for a suite that cannot defend itself.
+#
+# This suite can: test/helpers/git-env.js strips git's whole GIT_* namespace
+# at load and per call, and test/temp-repo.test.js proves it. Unsetting them
+# here as well would mean the one path where the variables are genuinely
+# exported never exercises that defence, so the guard would be tested only by
+# simulation and never by the real trigger. Leaving them set makes every push
+# from a worktree an end-to-end test of the thing most likely to break.
+#
+# If this hook ever fails with fixture repos behaving like this one, that is
+# the scrub having regressed, and it is the finding, not the obstacle.
+set -e
+
+echo "pre-push: running the test suite"
+node --test test/*.test.js

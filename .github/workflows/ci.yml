@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The suite resolves a historical commit by subject across
+          # --branches --remotes (test/static-checks.test.js). A shallow clone
+          # has no such commit and the guard fails for a reason unrelated to
+          # the change under test.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No install step: this repo has no dependencies and no lockfile.
+      # If that ever changes, this comment is the thing that should have.
+      - name: Test
+        run: node --test test/*.test.js
+
+      # The suite defends itself against git's environment rather than
+      # relying on the caller to clean it (test/helpers/git-env.js). Running
+      # it once with the variables deliberately set proves that holds in CI
+      # too, on a different OS from where it was developed, and costs one
+      # extra 30-second job step rather than a separate workflow.
+      - name: Test again with a hostile git environment
+        env:
+          GIT_DIR: ${{ github.workspace }}/.git
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: user.email
+          GIT_CONFIG_VALUE_0: injected@ci.invalid
+        run: node --test test/*.test.js
