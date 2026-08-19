@@ -180,6 +180,29 @@ genuinely stale or absent reader field renders as an explicit "unavailable"
 marker rather than a confident zero. The markers are a second line of defence
 for when the checks above were skipped, never a replacement for them.
 
+## Setup: activate the local gate
+
+The pre-push gate lives in `.githooks/pre-push` and runs the full suite before
+anything leaves your machine. **It is inert until you point git at it**, and it
+fails silently: git ignores an unset `core.hooksPath` without a word, so a push
+succeeds and looks gated. Measured -- with the hook present, executable and
+unconditionally `exit 1`, `git push` returned 0 and the hook never printed.
+
+```bash
+sh bin/setup-hooks.sh
+```
+
+That sets `core.hooksPath` to the **relative** path `.githooks` and verifies it
+took effect. Relative matters: an absolute path is resolved against each linked
+worktree, so a worktree would run the main checkout's copy of the hook,
+including a stale copy from a branch predating it.
+
+Because this is per-clone local config that no repository can set for you, CI
+is the backstop rather than the belt: `.github/workflows/ci.yml` runs the same
+suite on every push and pull request, plus a weekly scheduled secret-scanning
+sweep over all history. Treat the hook as the fast local signal and CI as the
+one that actually gates.
+
 ## Usage
 
 **Planning** (once per spec, before implementation):

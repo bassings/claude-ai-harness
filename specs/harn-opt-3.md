@@ -7,7 +7,8 @@
 
 **Status:** draft
 **Lenses run:** conductor scoping only, from measured state. Full planning
-cycle NOT yet run: do that before T2 or T3 is built.
+cycle NOT yet run: do that before T3 is built. (T2 has since been dropped
+on measurement and T1 parked; see Tasks.)
 **Skipped so far:** everything. This document is a scope, not a plan.
 
 ## Problem
@@ -111,15 +112,163 @@ tasks; they are things any task here must not break.
 
 ## Tasks
 
-- [ ] T1: Instrument the delivery repos so the optimiser has data — state: queued
-- [ ] T2: Per-job CI decomposition for Said of You — state: queued (needs: T1)
+- [ ] T1: Instrument the delivery repos so the optimiser has data — state: **PARKED 2026-08-19**
+- [~] T2: Per-job CI decomposition for Said of You — state: **DROPPED 2026-08-19, on measurement** (not done; deliberately not built)
 - [ ] T3: The correctness debt that can cause a wrong conclusion — state: queued
 - [ ] T4: Mechanise the housekeeping that keeps recurring — state: queued
 
-Ordering rationale: T1 is cheapest and unblocks the most. T2 is the original
-question. T3 and T4 are independent of both and can run in parallel.
+Ordering rationale: T3 and T4 are independent of each other and can run in
+parallel; neither depends on T1 or T2, so both remain deliverable with the
+spine of the plan stood down.
+
+**That is true of the tasks and false of the objective, and the distinction
+matters more than the schedule.** This plan is titled "turn a hardened harness
+into measured delivery improvement" and its Problem section opens "none of
+that has yet changed how fast anything ships". T1 and T2 were the only two
+tasks pointed at that. T3 is correctness debt and T4 is housekeeping; both are
+harness-internal, which is precisely what this spec's own "Not in scope"
+section resists. **HARN-OPT-3 can no longer deliver its stated benefit.**
+
+The simplicity veto should be revisited rather than left standing. At
+planning, `lens-simplicity` observed that eleven of thirteen original criteria
+were harness hardening the Not in scope section resists, and the recorded
+counter-argument that defeated the veto was `lens-product`'s "lane yield
+argues for T2 early too". T2 has now been dropped on measurement, so that
+counter-argument has been withdrawn and the veto was never re-run against
+what remains.
+
+**Recommendation, for the operator rather than the next agent: close
+HARN-OPT-3 and re-raise T3 and T4 as their own small spec under an honest
+title.** Keeping them under a delivery-improvement banner means every future
+plan and review cycle is spent on harness internals while the register says
+delivery is being improved. That is the failure the optimiser exists to name,
+and here it is naming its own plan. The earlier rationale ("T1 is cheapest and
+unblocks the most, T2 is the original question") no longer holds and is
+replaced rather than left to mislead whoever picks up T3 next.
+
+Checkbox convention, stated because the conductor reads these: `[ ]` is
+outstanding, `[x]` is delivered, and `[~]` is closed WITHOUT being built.
+T2 is `[~]` -- ticking it `[x]` would tell the conductor work shipped that
+never existed. **T1 is parked, not queued**, so the no-stall invariant must
+not wait on it; if a conducted run treats a parked task as outstanding, park
+it out of the task list entirely rather than leaving the loop to block.
+
+### T2 dropped, and why the evidence is against it
+
+T2 existed to find which CI job to cut. Measured 2026-08-19 against real
+GitHub Actions history, before any of it was built:
+
+| | Said of You | Couch Potato |
+|---|---|---|
+| CI duration, median | 3.9 min | 8.4 min |
+| CI duration, p90 | 4.1 min | 9.2 min |
+| CI cost per PR (two workflows run per PR) | ~7.8 min | ~9.6 min |
+
+Commands: `gh run list --limit 200 --json name,conclusion,createdAt,updatedAt`
+per repo, durations from `updatedAt - createdAt`, cycle time from
+`gh pr list --state merged --limit 60` plus each PR's first commit date via
+`repos/{owner}/{repo}/pulls/{n}/commits`.
+
+**The share figure first stated here was 7%, and it was wrong to lean on it.**
+It divided CI by a denominator that the very next section then disqualifies,
+and the working was not shown. Both are corrected here rather than quietly
+adjusted, because an unreproducible number gets the task re-proposed.
+
+Two CI workflows run per pull request (CI and CodeQL), so CI costs about
+7.8 minutes of wall clock per PR at the medians above. Against the Said of You
+sample of 60 merged PRs:
+
+| Denominator | CI share |
+|---|---|
+| All cycle time, 118h (includes dependency PRs) | 6.6% |
+| Authored PRs only, 74h | 10.5% |
+| The **median authored PR**, 18 min | **43%** |
+
+The last row is the honest one, and it does not support the original
+argument: on the basis this document itself goes on to endorse, CI is not a
+rounding error in a pull request, it is most of the clock.
+
+**T2 is dropped anyway, on absolute time rather than share.** Eliminating CI
+entirely would save 7.8 minutes per PR, about 7.8 hours across the whole
+60-PR sample, and per-job decomposition recovers only a fraction of that
+because the jobs run in parallel already. Spending a task to reclaim part of
+eight minutes on an eighteen-minute pull request is not a good trade while
+anything else is open. That is a proportionality judgment, stated as one,
+rather than a measurement that closes the question -- and it is the reason
+to prefer it over the share argument, which pointed the other way once the
+denominator was chosen honestly.
+
+Recorded as a deletion, per the licence to propose demotions and removals.
+
+### T1 parked, and the honest reason
+
+T1 was to instrument the delivery repos so the optimiser had data. The same
+measurement removed its motivating premise.
+
+Decomposing the same 60 merged PRs per repo:
+
+| | Said of You | Couch Potato |
+|---|---|---|
+| Total cycle time | 118h | 1285h |
+| Dependency PRs | 37% of it | 50% of it |
+| Authored PR, median end-to-end | 18 min | 307 min |
+| Review comments per PR, median | 1 | 14 |
+
+The dependency share is not a process cost: the operator states those PRs sat
+because an agent had not yet been assigned to review them, which makes them an
+outlier of attention rather than a bottleneck. Removing them leaves a median
+authored PR of 18 minutes in Said of You, with the aggregate dominated by a
+handful of large changes (top 3 PRs are 70% of the remainder there, 49% in
+Couch Potato). Large changes taking longer is not a finding.
+
+So there is no demonstrated delivery-speed problem for T1's data to explain.
+It is parked rather than dropped, because one real gap remains and is stated
+plainly: **every measurement above starts at the first commit**, so the spec,
+plan-cycle, RED-test, review and fix-round time is invisible to all of it, and
+that is exactly the phase the ledger would cover. The condition for
+un-parking is therefore a felt slowness the PR data cannot see, named by the
+operator, not a schedule.
+
+**AC-OPS-3 is explicitly NOT parked with T1.** The park would otherwise take a
+live defect down with it: the weekly launchd job exits 0 in silence when its
+repo list is missing or empty, and two tests currently pin that as correct. A
+weekly job doing nothing is then indistinguishable from one that is working --
+same empty `StandardErrorPath`, same exit 0, no `RESULT` line to grep -- and
+the only way to notice is an operator wondering why no report has appeared.
+AC-SIMP-5 already records that T1 "provably needs" this fixed. It moves to T4
+(housekeeping), which is not parked, and is the one piece of T1 that survives
+the park.
+
+The Couch Potato divergence (14x the review comments, 19x the wait) is
+recorded as an observation, not a target. It is uncontrolled for churn, and
+the same review comments were the source of nearly all of the day's real
+defect findings, so "fewer review comments" is a dangerous thing to optimise
+toward on this evidence.
 
 ---
+
+## Criteria orphaned by the T1 park and T2 drop (recorded 2026-08-20)
+
+Nineteen of the criteria below are conditioned on T1 or T2 and keep their
+original "After T1..." / "After T2..." wording. They are **unreachable**, not
+failed, and are recorded here rather than edited in place so the original
+contract stays readable.
+
+This follows the convention the "Vetoed at planning" section already states
+verbatim: *recorded so they are not silently reconsidered, and so a review
+lens does not mark a phantom criterion PASS*. Round-2 review found that the
+convention existed in this file and had not been applied to its own park.
+
+- **Conditioned on T1 (parked):** AC-PROD-1, AC-PROD-2, AC-PROD-3, AC-PROD-5,
+  AC-QA-4, AC-QA-5, AC-QA-6, AC-SEC-1, AC-SEC-2, AC-ARCH-3, AC-OPS-6,
+  AC-SIMP-5
+- **Conditioned on T2 (dropped):** AC-PROD-4, AC-SEC-6, AC-SEC-7, AC-ARCH-4,
+  AC-SIMP-4
+- **Conditioned on either:** AC-DATA-2's T1 half, AC-OPS-9
+
+A review lens encountering any of these should return UNVERIFIABLE citing this
+section, never PASS and never FAIL. If T1 is un-parked, this list is the set
+to re-read first.
 
 ## Acceptance criteria
 
@@ -226,9 +375,13 @@ question. T3 and T4 are independent of both and can run in parallel.
 ### Cross-session provenance
 
 Added 2026-08-18 from a three-session incident, refined by the peer session
+
+Renumbered 2026-08-19 from AC-OPS-10..13: those ids were already in use
+above, so review could not resolve a verdict citing one. Caught by the
+uniqueness guard in test/static-checks.test.js, not by reading.
 whose corrections make it checkable rather than a platitude.
 
-**AC-OPS-10:** A finding passed between sessions, or written to the ledger,
+**AC-OPS-14:** A finding passed between sessions, or written to the ledger,
 separates **what was measured and by what command** from **what is inferred
 from it**. Worked example: the volume hit 131 MiB free with three watchdog
 resets. Three sessions held true measurements and offered three different
@@ -238,7 +391,7 @@ finally the real one, a claude-mem sparse-file pathology (~170 GB) found by
 story to a true one, and **the inference travelled with the same authority as
 the evidence**.
 
-**AC-OPS-11:** The provenance marker attaches to the **claim**, not the work
+**AC-OPS-15:** The provenance marker attaches to the **claim**, not the work
 item. An action can be correct while the reason given for it is wrong: the
 Docker purge was independently requested, cleared 27 GB of never-purged build
 cache and reduced 50 tags to n and n-1 per service. Correct work, wrong causal
@@ -246,11 +399,11 @@ story bolted on. If the ledger marks the work rather than the claim, a later
 reader who finds the claim false may revert something that was fine -- worse
 than the original error, because it is confident and downstream.
 
-**AC-OPS-12:** Where the decisive measurement is one this session **cannot
+**AC-OPS-16:** Where the decisive measurement is one this session **cannot
 take**, that is stated *before* a cause is offered, not after. Both sessions
 above hit their wall after naming a mechanism.
 
-**AC-OPS-13:** For every failure path, name the **consumer** of its signal. If
+**AC-OPS-17:** For every failure path, name the **consumer** of its signal. If
 there is none, the path is not instrumented no matter how carefully it
 reports. Two worked examples from 2026-08-18: a healthcheck recorded 290
 consecutive failures nobody looked at, and `writeLedger` returned
@@ -351,4 +504,20 @@ records land, not to build instrumentation.
 
 ## Spec gaps found at review
 
-<Populated by the review cycle. Empty is a claim, not a default.>
+Populated by review round 2, 2026-08-20.
+
+- **The CI workflow and pre-push hook shipped under this plan with no
+  acceptance criterion, no task and no entry here.** `.github/workflows/ci.yml`
+  and `.githooks/pre-push` are this repo's first CI and first hook; nothing in
+  T1 to T4 covers a gate. The work is justified by the standing standards
+  (§3 secret scanning wherever CI exists, §4 a local gate mirroring CI) and by
+  this repo having already had a credential fingerprint reach its public
+  history -- **the defect is the missing contract, not the code.** Recorded
+  rather than retrofitted with a criterion after the fact, because a criterion
+  written to match what was built verifies nothing.
+- **The whole git-environment hardening (PR #7 and PR #8) has no acceptance
+  criterion in any spec either.** Round-1 review found the window fix owned by
+  AC-DATA-2 and nothing covering the rest. Same shape, same treatment.
+- Both are evidence for the conclusion recorded against the task list: this
+  plan is accumulating harness work it never scoped, under a title about
+  delivery.

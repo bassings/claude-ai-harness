@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # M1 from review: gitleaks-action passes --log-opts for push and
+  # pull_request events, so on those triggers it scans a COMMIT RANGE and
+  # never walks all refs. Only an event supplying no log-opts falls through to
+  # gitleaks' own default of --full-history --all. Without a scheduled
+  # trigger the history sweep simply does not exist, and this repo has already
+  # had a credential fingerprint reach its public history. The weekly run is
+  # the sweep; the PR run is the gate.
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# L8: without this, every superseded push leaves its jobs running to
+# completion. main is excluded so a merge is never cancelled by the next one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '26']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The suite resolves a historical commit by subject across
+          # --branches --remotes (test/static-checks.test.js). A shallow clone
+          # has no such commit and the guard fails for a reason unrelated to
+          # the change under test.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          # This repo declared no supported range, and successive pins here
+          # claimed to match the development runtime while sitting two majors
+          # below it (v26.7.0 locally against a pin of 22, then 24). Rather
+          # than assert a match that is not one, the range is now explicit and
+          # both ends are tested: the oldest version supported and the one
+          # development actually happens on. A matrix costs a second 30-second
+          # job on a repo with no dependencies to install.
+          node-version: ${{ matrix.node }}
+
+      # An unmatched glob is passed through literally by sh and `node --test`
+      # then exits 0 having run nothing, so every enforcement site would go
+      # green on an empty suite. Fail loudly instead. Same guard as
+      # .githooks/pre-push.
+      - name: Assert the suite glob matches
+        run: |
+          count=$(ls test/*.test.js 2>/dev/null | wc -l | tr -d ' ')
+          echo "matched ${count} test files"
+          [ "${count:-0}" -ge 10 ]
+
+      # No install step: this repo has no dependencies and no lockfile.
+      # If that ever changes, this comment is the thing that should have.
+      - name: Test
+        run: node --test test/*.test.js
+
+      # The suite defends itself against git's environment rather than relying
+      # on the caller to clean it (test/helpers/git-env.js). Running it once
+      # with the hostile variables deliberately set proves that holds on a
+      # different OS from the one it was written on.
+      #
+      # This is the ONLY place that run happens. The pre-push hook strips them
+      # instead: with the scrub neutered, a hostile run leaves fixture commits
+      # and an executable hook in the real repository, which is acceptable on
+      # a runner that is discarded and not on a developer's machine.
+      #
+      # GIT_DIR points at a scratch repo rather than the workspace, so a
+      # regression cannot be masked by the escape target happening to be the
+      # repo the suite already expects to be in.
+      - name: Test again under a hostile git environment
+        env:
+          GIT_TEMPLATE_DIR: ${{ runner.temp }}/evil-template
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: user.email
+          GIT_CONFIG_VALUE_0: injected@ci.invalid
+          GIT_CONFIG_PARAMETERS: "'user.name=injected-ci'"
+        run: |
+          mkdir -p "${{ runner.temp }}/decoy" "${{ runner.temp }}/evil-template/hooks"
+          printf '#!/bin/sh\necho CI_INJECTED_HOOK_RAN >&2\nexit 1\n' > "${{ runner.temp }}/evil-template/hooks/pre-commit"
+          chmod +x "${{ runner.temp }}/evil-template/hooks/pre-commit"
+          git init -q "${{ runner.temp }}/decoy"
+          GIT_DIR="${{ runner.temp }}/decoy/.git" node --test test/*.test.js
+
+  secrets:
+    # This repo is public and has already had a credential's fingerprint
+    # reach its history, requiring a filter-branch rewrite. Standard 3 asks
+    # for secret scanning wherever CI exists; CI now exists.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Needed by the SCHEDULED run, which is the only trigger on which
+          # gitleaks walks all refs (--full-history --all). On push and
+          # pull_request the action supplies its own --log-opts range and
+          # reads far less than this fetches; the depth is not wasted, it is
+          # simply unused by two of the four triggers.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+      - uses: github/codeql-action/analyze@v3

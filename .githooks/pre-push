@@ -1,0 +1,50 @@
+#!/bin/sh
+# Pre-push gate: the full test suite (~31s). Bypass in an emergency with
+# `git push --no-verify`.
+#
+# This repo has no dependencies, no build and no lint step, so the suite IS
+# the gate; there is no faster subset worth carving out.
+set -e
+
+# Strip git's own GIT_* namespace before running anything, keeping only the
+# identity variables, which change what a commit RECORDS rather than where it
+# LANDS. Mirrors the allowlist in test/helpers/git-env.js.
+#
+# An earlier version of this hook left them set on purpose, reasoning that the
+# hook is the one path where git really exports them, so leaving them would
+# make every worktree push an end-to-end test of the scrub. Review refuted
+# that by execution, and the refutation is worth keeping: with the scrub
+# neutered, a suite run under this hook's inherited environment left the real
+# repository holding fixture commits on its checked-out branch, a dirtied
+# working tree, an appended .git/info/exclude, and an executable
+# .git/hooks/pre-commit planted by the suite's own GIT_TEMPLATE_DIR fixture,
+# which then fired on every later commit. The hook reported failure only
+# after all of that had happened.
+#
+# So the earlier rationale described a red test and delivered a landmine: a
+# test whose failure mode is destroying the operator's repository is not a
+# test. The hostile-environment run belongs somewhere disposable and it has
+# one -- .github/workflows/ci.yml runs the suite a second time with GIT_DIR,
+# GIT_TEMPLATE_DIR and GIT_CONFIG_* set, on a runner that is thrown away.
+for _var in $(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p'); do
+  case "$_var" in
+    GIT_AUTHOR_NAME|GIT_AUTHOR_EMAIL|GIT_AUTHOR_DATE) ;;
+    GIT_COMMITTER_NAME|GIT_COMMITTER_EMAIL|GIT_COMMITTER_DATE) ;;
+    *) unset "$_var" ;;
+  esac
+done
+
+# An unmatched glob is passed through literally by sh, and `node --test` then
+# reports a clean run of zero tests and exits 0. Measured: in a directory with
+# no matches, `sh -c 'set -e; node --test test/*.test.js'` exits 0 having
+# asserted nothing. Renaming test/, moving to .test.mjs, or any restructure
+# that misses this glob would leave the gate green. Fail loudly instead.
+_count=$(ls test/*.test.js 2>/dev/null | wc -l | tr -d ' ')
+if [ "${_count:-0}" -lt 10 ]; then
+  echo "pre-push: expected at least 10 files matching test/*.test.js, found ${_count:-0}." >&2
+  echo "pre-push: the suite glob matches (almost) nothing -- refusing to report success on an empty run." >&2
+  exit 1
+fi
+
+echo "pre-push: running the test suite (${_count} files)"
+node --test test/*.test.js
