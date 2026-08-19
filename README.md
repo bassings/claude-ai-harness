@@ -61,130 +61,124 @@ cp -r claude-ai-harness/hooks/. ~/.claude/hooks/
 cp claude-ai-harness/AGENT-HARNESS.md ~/.claude/
 ```
 
-Then in any project:
+Then **start a new Claude Code session** -- the workflow scripts are read
+when a session starts, so an install performed inside an already-open session
+is invisible to it (see the next section) -- and in any project:
 
 ```
 /plan-cycle {"spec": "specs/MY-FEATURE.md"}
 /review-cycle
 ```
 
-### Keeping the installed mirror in sync (AC-OPS-4)
+### Making a change live: copying the files is not deploying them (AC-OPS-4)
 
-The manual-copy install above puts a **copy** of the whole `workflows/`
-tree -- both the top-level workflow scripts (`tdd-task.js`, `review-cycle.js`,
-`plan-cycle.js`, `optimise-cycle.js`) and `workflows/lib/` (and any plugin
-install does the same, at its own plugin-managed path) -- at
-`~/.claude/workflows/`. That installed copy, not this repo, is what
-actually executes for a delivery repo -- a fix landed here can be green in
-this repo's own test suite while the installed mirror keeps running the old
-code, silently. Review round 1 of PR 2 (HARN-OPT-2) found this section had
-only ever documented re-syncing `workflows/lib/`, while PR 2's entire fix
-(the start/terminal exception guard) lives in the three TOP-LEVEL workflow
-scripts -- an operator following only the `workflows/lib/` steps below would
-get a clean exit 0 while the live top-level copies kept crashing without
-terminal records.
+`cp -r` distributes **source**. It does not deploy. The two halves of
+`workflows/` reach a running session by different routes, they go live at
+different moments, and the gap between them is the failure mode this section
+exists to prevent.
 
-**Re-sync the whole tree** after merging any change under `workflows/`,
-whether it touched a top-level script or `workflows/lib/`:
+**The top-level workflow scripts** -- `plan-cycle.js`, `review-cycle.js`,
+`tdd-task.js`, `optimise-cycle.js` -- are captured when a Claude Code session
+starts. Both the list of names and each script's contents. Invoking
+`/plan-cycle` or `Workflow({name: "plan-cycle"})` runs that capture, not the
+file on disk. Measured in this repo on 2026-08-18, with zero agents spawned:
 
-```bash
-cp -r claude-ai-harness/workflows/. ~/.claude/workflows/
-```
+- A workflow file written into `~/.claude/workflows/` mid-session and
+  invoked by name returns `Workflow "registry-probe" not found. Available:
+  deep-research, optimise-cycle, plan-cycle, review-cycle, tdd-task` -- the
+  name list is fixed at session start.
+- `throw new Error('PROBE-FRESH-READ-MARKER')` inserted as the first
+  statement of the installed `plan-cycle.js`, then invoked by name, **did not
+  throw**. The run failed with `plan-cycle requires args.spec`, which is the
+  pre-edit code path. The invocation reported its script as a session-local
+  snapshot at `workflows/scripts/plan-cycle-wf_<runid>.js`, 21753 bytes
+  against the edited file's 21797, and that snapshot did not contain the
+  marker.
 
-Confirm the installed copy actually matches this repo (exits 0, no output,
-when they agree; lists the differing files otherwise):
+**`workflows/lib/*.mjs`** -- `ledger-append.mjs`, `optimise-read.mjs`,
+`redact-transcript.mjs` -- are not part of that capture. A workflow script has
+no filesystem access, so it instructs an agent to shell out to
+`node ~/.claude/workflows/lib/<file>.mjs` (see the resolution order in
+`plan-cycle.js:100-106`, global mirror first). `node` reads the file when the
+process starts, so a copied `.mjs` is live on the very next run, in the same
+session.
 
-```bash
-diff -rq claude-ai-harness/workflows ~/.claude/workflows
-```
+Nothing detects this for you. The `schema_version` staleness signal described
+further down does **not** detect a stale top-level workflow script: that fix
+class bumps no `SCHEMA_VERSION` and adds no ledger field, so a session running
+last week's `plan-cycle.js` produces a ledger indistinguishable from a current
+one. The restart is the control; there is no alarm behind it.
 
-If you only touched `workflows/lib/` (e.g. `ledger-append.mjs` or
-`optimise-read.mjs`) and want a narrower command, the equivalent pair
-scoped to that directory still works:
+So there are two rules, and they are not the same rule:
+
+| What you changed | What makes it live |
+|---|---|
+| `workflows/lib/*.mjs` | `cp -r`. Live on the next run of the current session. |
+| A top-level workflow script | `cp -r`, **then restart the session**. Or invoke it as `Workflow({scriptPath: "~/.claude/workflows/<name>.js"})`, which reads the file at invocation time (measured: the same probe file that failed to resolve by name ran successfully via `scriptPath`). |
+
+If you changed only `workflows/lib/` and want the narrower command, the pair
+scoped to that directory is the one partial copy that is fully effective,
+because nothing about `lib/` is snapshotted:
 
 ```bash
 cp -r claude-ai-harness/workflows/lib/. ~/.claude/workflows/lib/
 diff -rq claude-ai-harness/workflows/lib ~/.claude/workflows/lib
 ```
 
-**Always re-sync the whole tree, never an enumerated subset.** Review
-round 2 of PR 2 found the previous revision of this section named "the four
-files this PR touched" -- a list that was already stale by the time review
-round 2 alone landed a further six commits touching all six files under
-`workflows/` (the three top-level scripts, `ledger-append.mjs`,
-`optimise-read.mjs`, `optimise-cycle.js`). Any hand-maintained per-PR
-enumeration goes stale the moment a later round adds one more touched file;
-the whole-tree `cp -r`/`diff -rq` pair above is the one command pair that is
-correct regardless of which files a given PR touched, so it is the only
-form documented here.
+It is not a substitute for the whole-tree copy after any other change, and it
+is deliberately the *only* subset documented here: an earlier revision of this
+section named "the four files this PR touched", a list already stale by the
+time that same review landed six further commits touching all six files under
+`workflows/`. Any hand-maintained per-PR enumeration goes stale the moment a
+later round adds one more file.
 
-A stale `workflows/lib/` mirror is *sometimes* detectable from the
-optimiser's own report without running either command by hand:
-`workflows/lib/ledger-append.mjs`'s `SCHEMA_VERSION` was bumped (1 to 2) by
-PR 1's plan-identity canonicalisation change, and `optimise-read.mjs
-ledger`'s `perRepo[].schemaVersionsSeen` reports the schema-version mix
-actually seen per repo -- a stale installed writer still emitting
-`schema_version: 1` shows up there in the next report instead of continuing
-silently. **This signal does not cover every staleness class.** PR 2's
-exception-guard fix, and review round 2's `invalid_ac_ids_dropped`/
-`ac_id_raw` fields, both bumped no `SCHEMA_VERSION` (they are additive and
-optional, by design, so an older writer or reader omitting them is not
-itself an error) -- a stale `tdd-task.js`/`review-cycle.js`/`plan-cycle.js`,
-or a stale `optimise-read.mjs` reading a newer ledger, produces no
-`schemaVersionsSeen` difference at all. What covers THAT gap is the
-report's own rendering, not the schema version: a genuinely stale or absent
-reader field renders as an explicit "unavailable (installed
-optimise-read.mjs predates this field)" marker rather than a confident
-zero (review round 2, H-1) -- so the report tells you when it cannot see a
-signal, even though `schemaVersionsSeen` cannot. **The `diff -rq` command
-above is still the only check that proves the installed tree is byte-for-byte
-current** -- the report's markers are a second line of defence for when that
-check was skipped, not a replacement for it.
+**The whole-tree copy, then, opens a skew window rather than closing one.**
 
-### Sync ordering matters: never let the reader lag behind the writer (AC-OPS-11)
-
-If `workflows/lib/` and the three top-level scripts are ever synced
-separately rather than as one `cp -r`, sync them in this order: **the
-reader (`optimise-read.mjs`) first, the writer (the top-level scripts) last**
--- never the other way round, and never leave them split for longer than the
-one command it takes to finish the sync.
-
-Verified directly against this repo: an installed reader from before this
-PR (`git show main:workflows/lib/optimise-read.mjs`) has no concept of a
-crashed run at all, because on `main` the top-level scripts have no
-exception guard -- a crash there can only ever leave an *unpaired* start
-record (correctly counted as unmeasured). This PR's exception guard makes a
-crash produce a real, *paired* terminal record (`outcome: 'aborted'`) for
-the first time. Fed that same pair, the OLD reader has no `outcome`-aware
-branch at all: it counts any complete pair as a plain measured run,
-indistinguishable from a real success --
-
-```
-OLD reader:  agentComputeSeconds: 5, agentComputeMeasuredRuns: 1   (the crash reads as a healthy 5-second run)
-NEW reader:  agentComputeSeconds: null, agentComputeMeasuredRuns: 0, agentComputeAbortedPairs: 1, agentComputeAbortedSeconds: 5
+```bash
+cp -r claude-ai-harness/workflows/. ~/.claude/workflows/
+diff -rq claude-ai-harness/workflows ~/.claude/workflows   # exits 0 when the SOURCE is current
 ```
 
-That is the failure this section warns against: **a NEWER writer paired
-with an OLDER reader silently converts a crashed run into an
-apparently-healthy one**, because the writer's new capability (a guaranteed
-terminal record even on crash) reaches a reader that has no idea that
-capability, or the `aborted` outcome it produces, exists yet. A newer
-reader paired with an older writer is comparatively safe: the older writer
-simply never produces the fields the newer reader looks for, and those
-fields render as the explicit "unavailable" marker above rather than a
-wrong number.
+After that pair passes, the libs are new and the top-level scripts running in
+any already-open session are still old. `diff -rq` reports success, because it
+compares files and the files do agree. It cannot see that the session is not
+running them. **`diff -rq` proves the source is current; it does not prove the
+code is live.** Treat it as necessary and not sufficient, and close the window
+by restarting the session -- that is the only action that promotes a top-level
+script, and it is one action rather than an ordering discipline.
 
-**Rollback drill, executed against this repo's own tree** (not merely
-described): populating a scratch "installed mirror" from `main`, then
-applying only `workflows/lib/optimise-read.mjs` forward (the exact partial
-sync this section warns against) still leaves `diff -rq` reporting five
-further differing files -- the three top-level scripts and the other two
-`workflows/lib/` files. `diff -rq` cannot see the outcome-classification
-regression above directly (it compares files, not aggregation behaviour),
-but it reliably flags that *some* file in the tree is out of sync whenever
-a partial sync is attempted, which is why the "always re-sync/verify the
-whole tree" rule above is the actual mitigation: a partial sync is only
-possible by skipping the verification step, never by passing it.
+This supersedes an earlier revision of this section, which prescribed syncing
+`optimise-read.mjs` (the reader) before the top-level scripts (the writer) so
+the reader would never lag. Under the mechanism measured above that ordering
+cannot be honoured mid-session: the reader goes live immediately and the
+writer cannot go live at all until restart, so every mid-session sync produces
+newer-reader-with-older-writer regardless of the order the files were copied
+in. That direction is the comparatively safe one -- an older writer simply
+never emits the fields a newer reader looks for, and those render as the
+explicit "unavailable (installed optimise-read.mjs predates this field)"
+marker rather than a wrong number. The dangerous direction, a newer writer
+against an older reader, is now reachable only by copying the top-level
+scripts and restarting **without** copying `lib/`, which the whole-tree `cp -r`
+above does not do.
+
+### Detecting a stale install without running the commands (AC-OPS-11)
+
+A stale `workflows/lib/` mirror is *sometimes* visible in the optimiser's own
+report: `ledger-append.mjs`'s `SCHEMA_VERSION` was bumped (1 to 2) by the
+plan-identity canonicalisation change, and `optimise-read.mjs ledger`'s
+`perRepo[].schemaVersionsSeen` reports the schema-version mix actually seen
+per repo, so a stale installed writer still emitting `schema_version: 1`
+surfaces there instead of failing silently.
+
+**This signal does not cover every staleness class**, and it covers none of
+the session-snapshot class above. Additive, optional fields
+(the start/terminal exception guard, `invalid_ac_ids_dropped`, `ac_id_raw`)
+bump no `SCHEMA_VERSION` by design, so a stale top-level script or a stale
+`optimise-read.mjs` reading a newer ledger produces no `schemaVersionsSeen`
+difference at all. What covers that gap is the report's own rendering: a
+genuinely stale or absent reader field renders as an explicit "unavailable"
+marker rather than a confident zero. The markers are a second line of defence
+for when the checks above were skipped, never a replacement for them.
 
 ## Usage
 
@@ -634,9 +628,12 @@ and an open-task plan active). There is no postcondition checking this
 after the fact any more (see the subtraction-round note above for why).
 
 **Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
-and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` synced from this
-repo's `bin/`** after merging any change to them, the same discipline as
-the `workflows/` mirror above (AC-OPS-4):
+and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
+repo's `bin/`** after merging any change to them. Unlike the top-level
+workflow scripts above, copying these genuinely does deploy them: launchd
+spawns a fresh shell process per run, which reads the file at exec, so there
+is no snapshot and no restart step. The `diff -q` pair is therefore a
+sufficient check here, not merely a necessary one:
 
 ```bash
 cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
@@ -646,10 +643,12 @@ diff -q claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cy
 diff -q claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
 ```
 
-As of this change, that sync has not yet happened: `~/.claude/bin/optimise-cycle-weekly.sh`
-is still the pre-existing, unreviewed version this PR replaces, and re-syncing
-it is a merge-time step, not something this branch does to a path outside
-the repo.
+Copying is a merge-time step, not something a branch does to a path outside
+the repo, so a freshly merged change is live only once someone runs the
+commands above. Run the two `diff -q` lines to find out; they are the check,
+and this paragraph deliberately states no point-in-time claim about whether
+the copy has happened, because such a claim goes stale the moment either
+side moves.
 
 `OPTIMISE_WEEKLY_REPOS` (newline-separated repo list) and
 `OPTIMISE_WEEKLY_LOG` (log file path) are read by the script but exist only
@@ -760,7 +759,8 @@ Separately: the redaction-failure fallback message (when
 absolute one -- the earlier form put this operator's own account path into
 the very fallback message that exists to protect against exactly that
 leak, and that branch was live: the installed mirror had no
-`redact-transcript.mjs` at all until this PR added the sync step above.
+`redact-transcript.mjs` at all until the copy step documented above was
+added.
 
 ## Tests
 
