@@ -750,8 +750,14 @@ test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id 
     // while every other spec contributes zero forever. Measured: harn-opt-3
     // alone supplied 70 of the old global 81, so the old `> 50` floor could
     // never fire for the two blind files.
-    if (/AC-[A-Z]+-\d+/.test(src) && defs.length === 0) {
-      problems.push(`${file}: contains AC ids but the definition scan found none -- the pattern is blind to this file's spelling`)
+    // A spec with ids in prose but no definitions is EITHER blind to a
+    // spelling (the failure this catches) OR legitimately deferring its
+    // criteria to /plan-cycle. Those are indistinguishable by inspection, so
+    // the file has to say which, and only an explicit declaration exempts it.
+    // Silence is read as the failure, not as the exemption.
+    const declaresNone = /<!--\s*no-acceptance-criteria\b/.test(src)
+    if (/AC-[A-Z]+-\d+/.test(src) && defs.length === 0 && !declaresNone) {
+      problems.push(`${file}: contains AC ids but the definition scan found none -- either the pattern is blind to this file's spelling, or the spec defines no criteria and must say so with an HTML comment marker`)
     }
     const counts = new Map()
     for (const id of defs) counts.set(id, (counts.get(id) || 0) + 1)

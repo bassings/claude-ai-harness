@@ -1,5 +1,14 @@
 # HARN-OPT-3: turn a hardened harness into measured delivery improvement
 
+> **CLOSED 2026-08-20.** Its two delivery-facing tasks are gone: T2 dropped on
+> measurement, T1 parked for want of a demonstrated problem. What remained was
+> harness-internal, which this spec's own "Not in scope" section resists, and
+> keeping it here would spend future plan and review cycles on tooling under a
+> delivery banner. T3 and T4 continue as **`specs/harn-fix-1.md`**, which makes
+> no delivery claim. Nothing below is deleted: the criteria, the vetoes and the
+> measurements stay readable, and the orphaned-criteria section records which
+> are unreachable. Do not run further plan or review cycles against this file.
+
 > Planning output of the multi-lens harness (`~/.claude/AGENT-HARNESS.md`).
 > Acceptance criteria below are the contract the review cycle verifies against.
 > A review finding with no AC behind it is a **spec bug**: record it in
