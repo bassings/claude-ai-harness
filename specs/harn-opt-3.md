@@ -7,7 +7,8 @@
 
 **Status:** draft
 **Lenses run:** conductor scoping only, from measured state. Full planning
-cycle NOT yet run: do that before T2 or T3 is built.
+cycle NOT yet run: do that before T3 is built. (T2 has since been dropped
+on measurement and T1 parked; see Tasks.)
 **Skipped so far:** everything. This document is a scope, not a plan.
 
 ## Problem
@@ -111,13 +112,71 @@ tasks; they are things any task here must not break.
 
 ## Tasks
 
-- [ ] T1: Instrument the delivery repos so the optimiser has data — state: queued
-- [ ] T2: Per-job CI decomposition for Said of You — state: queued (needs: T1)
+- [ ] T1: Instrument the delivery repos so the optimiser has data — state: **PARKED 2026-08-19**
+- [x] T2: Per-job CI decomposition for Said of You — state: **DROPPED 2026-08-19, on measurement**
 - [ ] T3: The correctness debt that can cause a wrong conclusion — state: queued
 - [ ] T4: Mechanise the housekeeping that keeps recurring — state: queued
 
-Ordering rationale: T1 is cheapest and unblocks the most. T2 is the original
-question. T3 and T4 are independent of both and can run in parallel.
+Ordering rationale: T3 and T4 are independent and can run in parallel. T1 and
+T2 were the spine of this plan and both are now stood down; the measurement
+that did it is below, so it is not re-argued from intuition later.
+
+### T2 dropped, and why the evidence is against it
+
+T2 existed to find which CI job to cut. Measured 2026-08-19 against real
+GitHub Actions history, before any of it was built:
+
+| | Said of You | Couch Potato |
+|---|---|---|
+| CI duration, median | 3.9 min | 8.4 min |
+| CI duration, p90 | 4.1 min | 9.2 min |
+| CI as a share of total PR cycle time | ~7% | smaller still |
+
+Commands: `gh run list --limit 200 --json name,conclusion,createdAt,updatedAt`
+per repo, durations from `updatedAt - createdAt`, cycle time from
+`gh pr list --state merged --limit 60` plus each PR's first commit date via
+`repos/{owner}/{repo}/pulls/{n}/commits`.
+
+Decomposing a four-minute job cannot recover meaningful time. The whole of CI
+is at most 7% of cycle time, so even eliminating it entirely would not be
+felt. **Building T2 would have been waste**, and the optimiser's purpose is to
+say so before the effort is spent rather than after. Recorded as a deletion,
+per the licence to propose demotions and removals.
+
+### T1 parked, and the honest reason
+
+T1 was to instrument the delivery repos so the optimiser had data. The same
+measurement removed its motivating premise.
+
+Decomposing the same 60 merged PRs per repo:
+
+| | Said of You | Couch Potato |
+|---|---|---|
+| Total cycle time | 118h | 1285h |
+| Dependency PRs | 37% of it | 50% of it |
+| Authored PR, median end-to-end | 18 min | 307 min |
+| Review comments per PR, median | 1 | 14 |
+
+The dependency share is not a process cost: the operator states those PRs sat
+because an agent had not yet been assigned to review them, which makes them an
+outlier of attention rather than a bottleneck. Removing them leaves a median
+authored PR of 18 minutes in Said of You, with the aggregate dominated by a
+handful of large changes (top 3 PRs are 70% of the remainder there, 49% in
+Couch Potato). Large changes taking longer is not a finding.
+
+So there is no demonstrated delivery-speed problem for T1's data to explain.
+It is parked rather than dropped, because one real gap remains and is stated
+plainly: **every measurement above starts at the first commit**, so the spec,
+plan-cycle, RED-test, review and fix-round time is invisible to all of it, and
+that is exactly the phase the ledger would cover. The condition for
+un-parking is therefore a felt slowness the PR data cannot see, named by the
+operator, not a schedule.
+
+The Couch Potato divergence (14x the review comments, 19x the wait) is
+recorded as an observation, not a target. It is uncontrolled for churn, and
+the same review comments were the source of nearly all of the day's real
+defect findings, so "fewer review comments" is a dangerous thing to optimise
+toward on this evidence.
 
 ---
 
