@@ -13,6 +13,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { makeTempRepo, cleanupTempRepos, assertGitContextWithin, SUITE_TMPDIR, trackTempDir } = require('./helpers/temp-repo.js')
+const gitEnv = require('./helpers/git-env.js')
 
 test.after(cleanupTempRepos)
 
@@ -282,4 +283,143 @@ test('temp-repo.js: assertGitContextWithin() accepts a correct fixture, includin
     () => assertGitContextWithin(linked, path.join(dir, '.git')),
     'a fixture reached through a symlink must not be reported as an escape'
   )
+})
+
+// ---- the denylist was incomplete, and the gap is not theoretical ----
+//
+// GIT_ENV_VARS listed six variables. Review of the previous change raised
+// that it had never been enumerated against git's real export set, as an
+// absence of evidence rather than a finding. Measured afterwards, two
+// escapes are real and one is severe:
+//
+//   GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n inject
+//   arbitrary config into EVERY git command. Proven directly:
+//     env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.email \
+//         GIT_CONFIG_VALUE_0=injected@evil.test git config --get user.email
+//     -> injected@evil.test
+//
+//   GIT_TEMPLATE_DIR makes `git init` copy that directory's hooks into every
+//   new repository, and they RUN. Proven directly: a pre-commit hook planted
+//   in a template dir printed from a fixture's own commit. That is arbitrary
+//   code execution in every throwaway repo this suite creates, triggered by
+//   an environment variable, which is a different class from "the list is
+//   missing a name".
+//
+// A denylist cannot be finished: the next git release may add another.
+//
+// The two tests immediately below do NOT establish that. They name
+// GIT_TEMPLATE_DIR and GIT_CONFIG_COUNT, so they pin those two escapes and
+// nothing more -- this comment originally claimed they pinned the property,
+// and review disproved it with three mutations that all stayed green. They
+// are kept as regression anchors for the two measured escapes. The property
+// itself is guarded further down, by a variable git has never defined, which
+// no list of real names can satisfy.
+
+function runWithGitEnv(extraEnv, body) {
+  const script = `
+    const path = require('node:path');
+    const fs = require('node:fs');
+    const { execFileSync } = require('node:child_process');
+    const { makeTempRepo } = require(${JSON.stringify(path.join(__dirname, 'helpers', 'temp-repo.js'))});
+    ${body}
+  `
+  return spawnSync(process.execPath, ['-e', script], {
+    encoding: 'utf8',
+    env: { ...process.env, ...extraEnv },
+  })
+}
+
+test('temp-repo.js: GIT_TEMPLATE_DIR in the environment cannot install hooks into a fixture repo -- git init copies a template\'s hooks and they execute, so this is code execution, not just a config leak', () => {
+  const templateDir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'evil-template-'))
+  trackTempDir(templateDir)
+  fs.mkdirSync(path.join(templateDir, 'hooks'), { recursive: true })
+  const hook = path.join(templateDir, 'hooks', 'pre-commit')
+  fs.writeFileSync(hook, '#!/bin/sh\necho INJECTED_HOOK_RAN >&2\n')
+  fs.chmodSync(hook, 0o755)
+
+  const res = runWithGitEnv({ GIT_TEMPLATE_DIR: templateDir }, `
+    const dir = makeTempRepo();
+    process.stdout.write(JSON.stringify({
+      hookInstalled: fs.existsSync(path.join(dir, '.git', 'hooks', 'pre-commit')),
+    }));
+  `)
+  assert.equal(res.status, 0, `child failed: ${res.stderr}`)
+  assert.equal(
+    JSON.parse(res.stdout.trim()).hookInstalled,
+    false,
+    'GIT_TEMPLATE_DIR must not reach git init: an installed pre-commit hook runs on the fixture\'s own seed commit'
+  )
+  assert.ok(!res.stderr.includes('INJECTED_HOOK_RAN'), 'the planted hook must never have executed')
+})
+
+test('temp-repo.js: GIT_CONFIG_COUNT/KEY/VALUE in the environment cannot inject config into a fixture repo\'s git commands', () => {
+  const res = runWithGitEnv(
+    { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'user.email', GIT_CONFIG_VALUE_0: 'injected@evil.test' },
+    `
+    const dir = makeTempRepo();
+    const email = execFileSync('git', ['config', '--get', 'user.email'], { cwd: dir, encoding: 'utf8' }).trim();
+    process.stdout.write(JSON.stringify({ email }));
+  `
+  )
+  assert.equal(res.status, 0, `child failed: ${res.stderr}`)
+  assert.equal(
+    JSON.parse(res.stdout.trim()).email,
+    'test@example.com',
+    'the fixture\'s own configured identity must win; an env-injected value means GIT_CONFIG_* reached the command'
+  )
+})
+
+// The two tests above name GIT_TEMPLATE_DIR and GIT_CONFIG_COUNT, so they
+// pin those two variables and NOT the namespace property the change exists
+// to establish. Review proved that by mutation: replacing the namespace
+// filter with a denylist of exactly the names these tests exercise left the
+// suite 689/689 green, as did adding GIT_CONFIG_PARAMETERS to the allowlist
+// (after which a fixture's user.email came back as the injected value), as
+// did emptying the allowlist entirely. Three mutations, three directions,
+// nothing failed. The comment above claimed these tests pin the property;
+// measured, they did not.
+//
+// A property test cannot use a real variable name, because any name list can
+// be extended to cover it. It has to use a name git has never defined, so
+// only a rule over the whole GIT_* namespace can pass.
+
+test('git-env: the rule is the GIT_* NAMESPACE, not a list of names -- a variable git has never defined is stripped, which no allowlist or denylist of real names can satisfy', () => {
+  const invented = 'GIT_NOT_A_REAL_VARIABLE_47B3F9'
+  assert.ok(
+    gitEnv.gitEnvKeysToStrip({ [invented]: 'x' }).includes(invented),
+    'an unknown GIT_* variable must be stripped on the strength of its namespace alone; if this fails the implementation has regressed to matching names'
+  )
+  // Whatever git adds next is covered the day it ships. These are real
+  // variables absent from the original six-name denylist, kept as regression
+  // anchors for the specific escapes that were measured.
+  for (const real of ['GIT_TEMPLATE_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_GLOBAL', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES']) {
+    assert.ok(gitEnv.gitEnvKeysToStrip({ [real]: 'x' }).includes(real), `${real} must be stripped`)
+  }
+})
+
+test('git-env: the allowlist is real -- commit identity survives, so the rule is not "strip everything beginning with GIT_"', () => {
+  const identity = {
+    GIT_AUTHOR_NAME: 'a', GIT_AUTHOR_EMAIL: 'a@b', GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
+    GIT_COMMITTER_NAME: 'c', GIT_COMMITTER_EMAIL: 'c@d', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
+  }
+  assert.deepEqual(
+    gitEnv.gitEnvKeysToStrip(identity),
+    [],
+    'author and committer identity change what a commit RECORDS, not where it LANDS, and must survive; emptying the allowlist would break this'
+  )
+  assert.deepEqual(
+    gitEnv.gitEnvKeysToStrip({ PATH: '/bin', HOME: '/home/x', GITHUB_TOKEN: 't' }),
+    [],
+    'variables outside git\'s namespace must be left alone -- GITHUB_TOKEN in particular does not begin with GIT_ plus an underscore boundary by accident'
+  )
+})
+
+test('git-env: GIT_CONFIG_PARAMETERS cannot inject config into a fixture -- git itself exports this one into subprocesses whenever the invoking command used -c, so it is reachable through exactly the hook path this defence is for', () => {
+  const res = runWithGitEnv({ GIT_CONFIG_PARAMETERS: "'user.email=pwned@evil.test'" }, `
+    const dir = makeTempRepo();
+    const email = execFileSync('git', ['config', '--get', 'user.email'], { cwd: dir, encoding: 'utf8' }).trim();
+    process.stdout.write(JSON.stringify({ email }));
+  `)
+  assert.equal(res.status, 0, `child failed: ${res.stderr}`)
+  assert.equal(JSON.parse(res.stdout.trim()).email, 'test@example.com', 'the fixture\'s own identity must win')
 })

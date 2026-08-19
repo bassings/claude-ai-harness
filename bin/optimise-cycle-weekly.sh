@@ -227,7 +227,26 @@ verdict_repo() {
   if [ ! -f "$report_path" ]; then
     reasons+=("report file missing at $REPORT_REL")
   else
-    mtime=$(stat -f %m "$report_path" 2>/dev/null || stat -c %Y "$report_path" 2>/dev/null || echo "")
+    # GNU first, then BSD, and VALIDATE rather than trusting exit status.
+    #
+    # The previous form was `stat -f %m ... || stat -c %Y ...`, which is
+    # macOS-correct and silently wrong on Linux: GNU stat's -f means "file
+    # system status", not "format", so it SUCCEEDS and prints a block of
+    # filesystem information. Exit 0 meant the `||` fallback never ran and
+    # `[ "$mtime" -lt ... ]` then failed with "integer expression expected",
+    # printing that block to stderr on every clean pass. Found by this repo's
+    # first ever CI run, on both node versions; it had never been executed
+    # anywhere but macOS.
+    #
+    # A fallback chained on exit status cannot protect against a command that
+    # succeeds with the wrong output, so the result is checked for shape.
+    mtime=$(stat -c %Y "$report_path" 2>/dev/null || true)
+    case "$mtime" in
+      ''|*[!0-9]*) mtime=$(stat -f %m "$report_path" 2>/dev/null || true) ;;
+    esac
+    case "$mtime" in
+      ''|*[!0-9]*) mtime="" ;;
+    esac
     if [ -z "$mtime" ]; then
       reasons+=("could not read the report file's mtime")
     elif [ "$mtime" -lt "$start_epoch" ]; then
