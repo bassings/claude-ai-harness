@@ -622,3 +622,91 @@ test('static: every test file that invokes git loads the git-environment scrub, 
       'Fix: call scrubGitEnv from test/helpers/git-env.js at the top of the file, or require test/helpers/temp-repo.js, which does it at load.'
   )
 })
+
+// M9 from review: both artefacts added by the CI commit had no coverage at
+// all -- nothing pinned the hook's content, mode or command, and nothing read
+// ci.yml. They are the gate; an unguarded gate is the thing this repo exists
+// to object to.
+test('static: the pre-push hook is executable, strips git\'s GIT_* namespace before running anything, refuses an empty test glob, and runs the suite', () => {
+  const hookPath = path.join(ROOT, '.githooks', 'pre-push')
+  assert.ok(fs.existsSync(hookPath), '.githooks/pre-push must exist')
+  assert.ok(fs.statSync(hookPath).mode & 0o111, 'the hook must be executable, or git silently ignores it and the gate is not a gate')
+  const hook = fs.readFileSync(hookPath, 'utf8')
+
+  assert.match(hook, /unset "?\$_var"?/, 'the hook must unset the git environment before running the suite')
+  assert.match(hook, /GIT_\[A-Za-z0-9_\]\*/, 'the strip must cover the whole GIT_* namespace, not a list of names')
+  assert.match(hook, /GIT_AUTHOR_NAME/, 'commit identity must be preserved, matching helpers/git-env.js')
+  assert.match(hook, /node --test test\/\*\.test\.js/, 'the hook must run the suite')
+
+  // An earlier revision deliberately LEFT the hostile variables set, so that
+  // a worktree push would exercise the scrub end to end. Review proved by
+  // execution that a scrub regression then leaves fixture commits, a dirtied
+  // tree, a mutated .git/info/exclude and an executable planted hook in the
+  // operator's real repository, all before the hook reports failure. A test
+  // whose failure mode is destroying the repository is not a test.
+  assert.ok(
+    !/DELIBERATELY does not unset/.test(hook),
+    'the hook must not reinstate the leave-it-hostile rationale; the disposable place for that run is CI'
+  )
+})
+
+test('static: the pre-push hook and CI both refuse to report success when the test glob matches nothing', () => {
+  // Measured: `sh -c 'set -e; node --test test/*.test.js'` in a directory
+  // with no matches exits 0 having run zero assertions, because sh passes an
+  // unmatched glob through literally. That command string was the entire
+  // body of the hook and of both CI run steps.
+  for (const rel of ['.githooks/pre-push', '.github/workflows/ci.yml']) {
+    const src = readAll(rel)
+    assert.match(src, /ls test\/\*\.test\.js/, `${rel} must count the files the glob matches`)
+    assert.match(src, /-lt 10|-ge 10/, `${rel} must assert a floor on that count`)
+  }
+})
+
+test('static: CI runs the suite, runs it again under a hostile git environment including the code-execution variable, bounds every job, and scans for secrets', () => {
+  const ci = readAll('.github/workflows/ci.yml')
+  assert.match(ci, /node --test test\/\*\.test\.js/, 'CI must run the suite')
+  assert.match(ci, /fetch-depth: 0/, 'CI must fetch full history: static checks resolve a historical commit by subject')
+  assert.match(ci, /timeout-minutes:/, 'jobs must be bounded, or a hang presents as "still running" for six hours')
+  assert.match(ci, /GIT_TEMPLATE_DIR:/, 'the hostile step must include GIT_TEMPLATE_DIR -- the escape that installs an executable hook')
+  assert.match(ci, /GIT_CONFIG_PARAMETERS:/, 'the hostile step must include GIT_CONFIG_PARAMETERS, which git exports into subprocesses itself')
+  assert.match(ci, /gitleaks/, 'CI must scan for secrets: this repo is public and has already required a history rewrite')
+})
+
+// M7 from review: seven AC identifiers looked duplicated and two genuinely
+// were. The id is the join key between the planning cycle, the review cycle
+// and the ledger's ac_verdicts, so a duplicate silently merges two unrelated
+// criteria and a verdict citing one cannot be resolved.
+test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id is the join key between planning, review and the ledger', () => {
+  const specsDir = path.join(ROOT, 'specs')
+  const files = fs.readdirSync(specsDir).filter((f) => f.endsWith('.md'))
+  assert.ok(files.length > 0, 'sanity: expected spec files under specs/')
+
+  const problems = []
+  let totalDefs = 0
+  for (const file of files) {
+    const src = fs.readFileSync(path.join(specsDir, file), 'utf8')
+    // A DEFINITION is the bolded id followed immediately by a colon. BOTH
+    // spellings are in use across these specs and both must be matched:
+    //   **AC-PROD-1:** ...   colon inside the bold  (harn-opt-3.md)
+    //   **AC-SEC-1**: ...    colon outside          (custom-rules-fail-closed.md)
+    //
+    // This pattern went wrong twice while being written, in both directions.
+    // Matching the bare id counted a prose MENTION as a definition -- specs
+    // discuss criteria they have vetoed or amended -- which reported five
+    // false duplicates, and a mechanical rename on the back of that renamed
+    // references inside a changelog, leaving the text citing ids that no
+    // longer existed. Matching only the colon-inside form then found ZERO
+    // definitions in a file full of them, which is the worse failure: a
+    // guard that cannot fire reports no duplicates forever.
+    const defs = [...src.matchAll(/\*\*(AC-[A-Z]+-\d+)(?::\*\*|\*\*:)/g)].map((m) => m[1])
+    totalDefs += defs.length
+    const counts = new Map()
+    for (const id of defs) counts.set(id, (counts.get(id) || 0) + 1)
+    for (const [id, n] of counts) if (n > 1) problems.push(`${file}: ${id} defined ${n} times`)
+  }
+  assert.ok(
+    totalDefs > 50,
+    `sanity: expected the scan to find many AC definitions across specs/, found ${totalDefs} -- a pattern that matches nothing reports no duplicates forever`
+  )
+  assert.deepEqual(problems, [], `duplicate acceptance-criterion definitions: ${problems.join('; ')}`)
+})

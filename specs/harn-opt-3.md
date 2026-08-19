@@ -113,13 +113,22 @@ tasks; they are things any task here must not break.
 ## Tasks
 
 - [ ] T1: Instrument the delivery repos so the optimiser has data — state: **PARKED 2026-08-19**
-- [x] T2: Per-job CI decomposition for Said of You — state: **DROPPED 2026-08-19, on measurement**
+- [~] T2: Per-job CI decomposition for Said of You — state: **DROPPED 2026-08-19, on measurement** (not done; deliberately not built)
 - [ ] T3: The correctness debt that can cause a wrong conclusion — state: queued
 - [ ] T4: Mechanise the housekeeping that keeps recurring — state: queued
 
-Ordering rationale: T3 and T4 are independent and can run in parallel. T1 and
-T2 were the spine of this plan and both are now stood down; the measurement
-that did it is below, so it is not re-argued from intuition later.
+Ordering rationale: T3 and T4 are independent of each other and can run in
+parallel; neither depends on T1 or T2, so both remain deliverable with the
+spine of the plan stood down. The earlier rationale ("T1 is cheapest and
+unblocks the most, T2 is the original question") no longer holds and is
+replaced rather than left to mislead whoever picks up T3 next.
+
+Checkbox convention, stated because the conductor reads these: `[ ]` is
+outstanding, `[x]` is delivered, and `[~]` is closed WITHOUT being built.
+T2 is `[~]` -- ticking it `[x]` would tell the conductor work shipped that
+never existed. **T1 is parked, not queued**, so the no-stall invariant must
+not wait on it; if a conducted run treats a parked task as outstanding, park
+it out of the task list entirely rather than leaving the loop to block.
 
 ### T2 dropped, and why the evidence is against it
 
@@ -130,18 +139,43 @@ GitHub Actions history, before any of it was built:
 |---|---|---|
 | CI duration, median | 3.9 min | 8.4 min |
 | CI duration, p90 | 4.1 min | 9.2 min |
-| CI as a share of total PR cycle time | ~7% | smaller still |
+| CI cost per PR (two workflows run per PR) | ~7.8 min | ~9.6 min |
 
 Commands: `gh run list --limit 200 --json name,conclusion,createdAt,updatedAt`
 per repo, durations from `updatedAt - createdAt`, cycle time from
 `gh pr list --state merged --limit 60` plus each PR's first commit date via
 `repos/{owner}/{repo}/pulls/{n}/commits`.
 
-Decomposing a four-minute job cannot recover meaningful time. The whole of CI
-is at most 7% of cycle time, so even eliminating it entirely would not be
-felt. **Building T2 would have been waste**, and the optimiser's purpose is to
-say so before the effort is spent rather than after. Recorded as a deletion,
-per the licence to propose demotions and removals.
+**The share figure first stated here was 7%, and it was wrong to lean on it.**
+It divided CI by a denominator that the very next section then disqualifies,
+and the working was not shown. Both are corrected here rather than quietly
+adjusted, because an unreproducible number gets the task re-proposed.
+
+Two CI workflows run per pull request (CI and CodeQL), so CI costs about
+7.8 minutes of wall clock per PR at the medians above. Against the Said of You
+sample of 60 merged PRs:
+
+| Denominator | CI share |
+|---|---|
+| All cycle time, 118h (includes dependency PRs) | 6.6% |
+| Authored PRs only, 74h | 10.5% |
+| The **median authored PR**, 18 min | **43%** |
+
+The last row is the honest one, and it does not support the original
+argument: on the basis this document itself goes on to endorse, CI is not a
+rounding error in a pull request, it is most of the clock.
+
+**T2 is dropped anyway, on absolute time rather than share.** Eliminating CI
+entirely would save 7.8 minutes per PR, about 7.8 hours across the whole
+60-PR sample, and per-job decomposition recovers only a fraction of that
+because the jobs run in parallel already. Spending a task to reclaim part of
+eight minutes on an eighteen-minute pull request is not a good trade while
+anything else is open. That is a proportionality judgment, stated as one,
+rather than a measurement that closes the question -- and it is the reason
+to prefer it over the share argument, which pointed the other way once the
+denominator was chosen honestly.
+
+Recorded as a deletion, per the licence to propose demotions and removals.
 
 ### T1 parked, and the honest reason
 
@@ -285,9 +319,13 @@ toward on this evidence.
 ### Cross-session provenance
 
 Added 2026-08-18 from a three-session incident, refined by the peer session
+
+Renumbered 2026-08-19 from AC-OPS-10..13: those ids were already in use
+above, so review could not resolve a verdict citing one. Caught by the
+uniqueness guard in test/static-checks.test.js, not by reading.
 whose corrections make it checkable rather than a platitude.
 
-**AC-OPS-10:** A finding passed between sessions, or written to the ledger,
+**AC-OPS-14:** A finding passed between sessions, or written to the ledger,
 separates **what was measured and by what command** from **what is inferred
 from it**. Worked example: the volume hit 131 MiB free with three watchdog
 resets. Three sessions held true measurements and offered three different
@@ -297,7 +335,7 @@ finally the real one, a claude-mem sparse-file pathology (~170 GB) found by
 story to a true one, and **the inference travelled with the same authority as
 the evidence**.
 
-**AC-OPS-11:** The provenance marker attaches to the **claim**, not the work
+**AC-OPS-15:** The provenance marker attaches to the **claim**, not the work
 item. An action can be correct while the reason given for it is wrong: the
 Docker purge was independently requested, cleared 27 GB of never-purged build
 cache and reduced 50 tags to n and n-1 per service. Correct work, wrong causal
@@ -305,11 +343,11 @@ story bolted on. If the ledger marks the work rather than the claim, a later
 reader who finds the claim false may revert something that was fine -- worse
 than the original error, because it is confident and downstream.
 
-**AC-OPS-12:** Where the decisive measurement is one this session **cannot
+**AC-OPS-16:** Where the decisive measurement is one this session **cannot
 take**, that is stated *before* a cause is offered, not after. Both sessions
 above hit their wall after naming a mechanism.
 
-**AC-OPS-13:** For every failure path, name the **consumer** of its signal. If
+**AC-OPS-17:** For every failure path, name the **consumer** of its signal. If
 there is none, the path is not instrumented no matter how carefully it
 reports. Two worked examples from 2026-08-18: a healthcheck recorded 290
 consecutive failures nobody looked at, and `writeLedger` returned
