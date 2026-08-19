@@ -119,7 +119,30 @@ tasks; they are things any task here must not break.
 
 Ordering rationale: T3 and T4 are independent of each other and can run in
 parallel; neither depends on T1 or T2, so both remain deliverable with the
-spine of the plan stood down. The earlier rationale ("T1 is cheapest and
+spine of the plan stood down.
+
+**That is true of the tasks and false of the objective, and the distinction
+matters more than the schedule.** This plan is titled "turn a hardened harness
+into measured delivery improvement" and its Problem section opens "none of
+that has yet changed how fast anything ships". T1 and T2 were the only two
+tasks pointed at that. T3 is correctness debt and T4 is housekeeping; both are
+harness-internal, which is precisely what this spec's own "Not in scope"
+section resists. **HARN-OPT-3 can no longer deliver its stated benefit.**
+
+The simplicity veto should be revisited rather than left standing. At
+planning, `lens-simplicity` observed that eleven of thirteen original criteria
+were harness hardening the Not in scope section resists, and the recorded
+counter-argument that defeated the veto was `lens-product`'s "lane yield
+argues for T2 early too". T2 has now been dropped on measurement, so that
+counter-argument has been withdrawn and the veto was never re-run against
+what remains.
+
+**Recommendation, for the operator rather than the next agent: close
+HARN-OPT-3 and re-raise T3 and T4 as their own small spec under an honest
+title.** Keeping them under a delivery-improvement banner means every future
+plan and review cycle is spent on harness internals while the register says
+delivery is being improved. That is the failure the optimiser exists to name,
+and here it is naming its own plan. The earlier rationale ("T1 is cheapest and
 unblocks the most, T2 is the original question") no longer holds and is
 replaced rather than left to mislead whoever picks up T3 next.
 
@@ -206,6 +229,16 @@ that is exactly the phase the ledger would cover. The condition for
 un-parking is therefore a felt slowness the PR data cannot see, named by the
 operator, not a schedule.
 
+**AC-OPS-3 is explicitly NOT parked with T1.** The park would otherwise take a
+live defect down with it: the weekly launchd job exits 0 in silence when its
+repo list is missing or empty, and two tests currently pin that as correct. A
+weekly job doing nothing is then indistinguishable from one that is working --
+same empty `StandardErrorPath`, same exit 0, no `RESULT` line to grep -- and
+the only way to notice is an operator wondering why no report has appeared.
+AC-SIMP-5 already records that T1 "provably needs" this fixed. It moves to T4
+(housekeeping), which is not parked, and is the one piece of T1 that survives
+the park.
+
 The Couch Potato divergence (14x the review comments, 19x the wait) is
 recorded as an observation, not a target. It is uncontrolled for churn, and
 the same review comments were the source of nearly all of the day's real
@@ -213,6 +246,29 @@ defect findings, so "fewer review comments" is a dangerous thing to optimise
 toward on this evidence.
 
 ---
+
+## Criteria orphaned by the T1 park and T2 drop (recorded 2026-08-20)
+
+Nineteen of the criteria below are conditioned on T1 or T2 and keep their
+original "After T1..." / "After T2..." wording. They are **unreachable**, not
+failed, and are recorded here rather than edited in place so the original
+contract stays readable.
+
+This follows the convention the "Vetoed at planning" section already states
+verbatim: *recorded so they are not silently reconsidered, and so a review
+lens does not mark a phantom criterion PASS*. Round-2 review found that the
+convention existed in this file and had not been applied to its own park.
+
+- **Conditioned on T1 (parked):** AC-PROD-1, AC-PROD-2, AC-PROD-3, AC-PROD-5,
+  AC-QA-4, AC-QA-5, AC-QA-6, AC-SEC-1, AC-SEC-2, AC-ARCH-3, AC-OPS-6,
+  AC-SIMP-5
+- **Conditioned on T2 (dropped):** AC-PROD-4, AC-SEC-6, AC-SEC-7, AC-ARCH-4,
+  AC-SIMP-4
+- **Conditioned on either:** AC-DATA-2's T1 half, AC-OPS-9
+
+A review lens encountering any of these should return UNVERIFIABLE citing this
+section, never PASS and never FAIL. If T1 is un-parked, this list is the set
+to re-read first.
 
 ## Acceptance criteria
 
@@ -448,4 +504,20 @@ records land, not to build instrumentation.
 
 ## Spec gaps found at review
 
-<Populated by the review cycle. Empty is a claim, not a default.>
+Populated by review round 2, 2026-08-20.
+
+- **The CI workflow and pre-push hook shipped under this plan with no
+  acceptance criterion, no task and no entry here.** `.github/workflows/ci.yml`
+  and `.githooks/pre-push` are this repo's first CI and first hook; nothing in
+  T1 to T4 covers a gate. The work is justified by the standing standards
+  (§3 secret scanning wherever CI exists, §4 a local gate mirroring CI) and by
+  this repo having already had a credential fingerprint reach its public
+  history -- **the defect is the missing contract, not the code.** Recorded
+  rather than retrofitted with a criterion after the fact, because a criterion
+  written to match what was built verifies nothing.
+- **The whole git-environment hardening (PR #7 and PR #8) has no acceptance
+  criterion in any spec either.** Round-1 review found the window fix owned by
+  AC-DATA-2 and nothing covering the rest. Same shape, same treatment.
+- Both are evidence for the conclusion recorded against the task list: this
+  plan is accumulating harness work it never scoped, under a title about
+  delivery.
