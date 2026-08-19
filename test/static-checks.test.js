@@ -3,6 +3,17 @@
 // against the diff, not by an agent lens).
 const test = require('node:test')
 const assert = require('node:assert/strict')
+// This file shells out to git directly and does NOT build temp repos, so it
+// never loads test/helpers/temp-repo.js and would not otherwise get that
+// module's load-time git-environment scrub. node --test runs each test FILE
+// in its own process, so the scrub is per-file, not per-suite. Without this
+// import, a suite run from a context that exports GIT_DIR (a git hook
+// invoked from a linked worktree) would point the git calls below at a
+// different repository and the guards would silently verify the wrong tree
+// -- a false green, which is the one outcome these static checks exist to
+// prevent. See test/helpers/git-env.js.
+require('./helpers/git-env.js').scrubGitEnv()
+
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -29,26 +40,55 @@ function walk(dir, out = []) {
 // permanent, in-scope deliverables, a live-tree scan of this kind can never
 // pass again -- it would forever fail as written, for a reason with no
 // bearing on either PR's correctness. AC-SIMP-7 is a claim about the PR 1
-// DIFF specifically, which is now historical and immutable (PR 1
-// squash-merged as d7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9): checking it
-// against that commit's own file list, rather than the live tree, keeps the
-// guard meaningful and lets it stay true forever, exactly like checking any
-// other already-merged commit's shape. This also incidentally fixes a
+// DIFF specifically: checking it against that commit's own file list, rather
+// than the live tree, keeps the guard meaningful and lets it stay true
+// forever, exactly like checking any other already-merged commit's shape.
+//
+// The commit is resolved by its SUBJECT, not by its hash. An earlier revision
+// pinned d7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9 and called it "immutable
+// historical". It was not: on 2026-08-18 a git filter-branch run (purging a
+// credential fingerprint from this public repo's history) renamed every
+// commit, and this test began failing with "fatal: Not a valid object name"
+// -- but only once the filter-branch backup refs were expired, because until
+// then refs/original still made the old object reachable and the suite stayed
+// green over a guard that was already broken. A commit hash is immutable only
+// as long as nobody rewrites history, which is exactly the circumstance under
+// which you most want your guards to still work. The subject survives a
+// rewrite; the hash does not. Resolution asserts EXACTLY ONE match, so an
+// ambiguous or missing anchor fails by name rather than silently checking
+// some other commit. This also incidentally fixes a
 // latent path-based bug in the original form: it matched the FULL absolute
 // path, so running the suite from a checkout whose own directory name
 // happens to contain "optimise-cycle" (e.g. a worktree named
 // t2-optimise-cycle, as PR 2's own build happened in) made it fail
 // regardless of repo contents -- git's own file list is always
 // repo-relative, so that failure mode cannot recur here.
-test('static: PR1\'s merge commit (d7eb2cc) introduced no file whose path matches "optimise-cycle" (AC-SIMP-7, checked against the immutable historical commit rather than the live tree, which now legitimately contains PR 2\'s optimiser files)', () => {
-  const out = require('node:child_process').execFileSync(
-    'git',
-    ['show', '--stat', '--format=', 'd7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9'],
-    { cwd: ROOT, encoding: 'utf8' }
-  )
-  const files = out
+const PR1_SUBJECT_ANCHOR = '(PR 1 of HARN-OPT-1) (#1)'
+
+test('static: PR1\'s merge commit (resolved by subject, not by hash) introduced no file whose path matches "optimise-cycle" (AC-SIMP-7, checked against the historical commit rather than the live tree, which now legitimately contains PR 2\'s optimiser files)', () => {
+  const exec = require('node:child_process').execFileSync
+  // --branches --remotes, deliberately NOT --all. --all includes
+  // refs/original/, so during a filter-branch backup window BOTH the
+  // rewritten and the original commit carry this subject and the
+  // exactly-one assertion below hard-fails -- in precisely the operation this
+  // resolution was written to survive. Note the symmetry: refs/original
+  // previously kept a broken hash-pinned guard silently GREEN, and would now
+  // keep a correct subject-pinned guard RED.
+  const candidates = exec('git', ['log', '--branches', '--remotes', '--format=%H\t%s'], { cwd: ROOT, encoding: 'utf8' })
     .split('\n')
-    .map((l) => l.split('|')[0].trim())
+    .filter((l) => l.includes(PR1_SUBJECT_ANCHOR))
+  assert.strictEqual(
+    candidates.length,
+    1,
+    `expected exactly one commit whose subject contains ${JSON.stringify(PR1_SUBJECT_ANCHOR)}; found ${candidates.length}. ` +
+      'If the count is 0, history was rewritten or the subject changed: re-derive the anchor rather than pinning a hash. ' +
+      'If the count is above 1, the likeliest cause is leftover history-rewrite backup refs (refs/original/) or a stale ' +
+      'remote branch carrying the pre-rewrite commit; expire those rather than changing the anchor.'
+  )
+  const sha = candidates[0].split('\t')[0]
+  const files = exec('git', ['show', '--name-only', '--format=', sha], { cwd: ROOT, encoding: 'utf8' })
+    .split('\n')
+    .map((l) => l.trim())
     .filter(Boolean)
   assert.ok(files.length > 10, 'sanity: expected PR1\'s merge commit to list many changed files')
   assert.ok(!files.some((f) => /optimise-cycle/.test(f)), `PR1's merge commit must not have introduced an optimise-cycle path; found: ${files.filter((f) => /optimise-cycle/.test(f))}`)
@@ -474,4 +514,111 @@ test('static: bin/com.local.optimise-cycle-weekly.plist is tracked in the repo a
   const plist = fs.readFileSync(plistPath, 'utf8')
   assert.ok(!/\/Volumes\/|\/home\/scott\.b|scott\.b/.test(plist), 'the tracked plist must never contain a real, non-placeholder account path')
   assert.match(plist, /YOUR_USERNAME/, 'the tracked plist must use a placeholder path, not a real one, since this repo is public')
+})
+
+// §9: the rule "a test file that invokes git must load the git-environment
+// scrub" is enforceable, so it is enforced rather than written down.
+//
+// Two lessons are baked into HOW this scans, both learned the hard way and
+// both within an hour of each other:
+//
+// 1. ALIAS-AGNOSTIC. The ad-hoc scan that first checked this matched the
+//    literal identifier `execFileSync('git'` and reported static-checks.js
+//    as having zero git calls -- while that very file did
+//    `const exec = require('node:child_process').execFileSync` and then
+//    `exec('git', ...)`. The file was unprotected and the scan said it was
+//    fine. A guard that looks for one spelling of a call reports CLEAN on
+//    the code that motivated it. (Independently hit the same day in a
+//    sibling repo, where `import subprocess as sp` hid 17 of 20 call sites
+//    from an equivalent check.) So: match `<anything>('git',` regardless of
+//    what the function is called.
+// 2. NO FALSE POSITIVES. Comments and prose mention git commands constantly
+//    in this repo, so they are stripped before scanning. A guard that cries
+//    wolf on correct code gets deleted by the next person in a hurry, which
+//    is a worse outcome than not having the guard.
+//
+// The scrub is per-PROCESS and node --test runs each test file in its own
+// process, so importing it transitively (via helpers/temp-repo.js, which
+// scrubs at load) counts -- that is a real code path, not a loophole. That
+// per-file boundary is also why this guard matters at all: a new test file
+// that shells out to git and forgets the import is unprotected the moment it
+// exists, and no other file's scrub helps it.
+//
+// KNOWN LIMIT, stated rather than implied. This is a text scan, so it cannot
+// structurally tell DESCRIBING a require from APPLYING one -- which is
+// exactly how its first version exempted its own file by matching its own
+// error message. Anchoring to a statement at the start of a line mitigates
+// that; it does not eliminate it. A string literal containing a line-start
+// require for one of these modules would still read as compliance. Closing
+// it properly needs an AST walk, where a string constant simply is not an
+// import node and the confusion cannot arise (the point was made by the
+// sibling repo whose equivalent guard is AST-based and, tested by planting,
+// does not have this defect). Node exposes no parser in its standard library
+// and this repo has no dependencies, so that is not a proportionate trade
+// here for a contrived residual case. Revisit if this guard is ever wrong
+// again, and prove it by planting rather than by reading.
+test('static: every test file that invokes git loads the git-environment scrub, so a suite run under an exported GIT_DIR cannot verify or corrupt the wrong repository (alias-agnostic scan)', () => {
+  const testDir = path.join(ROOT, 'test')
+  const files = []
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name)
+      if (entry.isDirectory()) walk(p)
+      else if (entry.name.endsWith('.js')) files.push(p)
+    }
+  }
+  walk(testDir)
+  assert.ok(files.length > 10, `sanity: expected to find many test files under ${testDir}, found ${files.length}`)
+
+  // Two source views, deliberately different.
+  //
+  // DETECTION runs on comment-stripped source and must see every spelling of
+  // a git call. Backtick is in the quote classes because sh(`git init`) is
+  // this repo's DOMINANT idiom -- 21 such call sites in ledger-append.test.js
+  // alone -- and the previous version, written to be alias-agnostic, matched
+  // only ' and ". It would have certified a new file using the surrounding
+  // idiom as clean. That was the fourth spelling this guard was blind to.
+  //
+  // COMPLIANCE has two forms, and neither can be satisfied by a mention:
+  //
+  //   scrubGitEnv CALLED -- checked against source with STRING CONTENTS
+  //     removed, so naming the call inside a message cannot count as making
+  //     it. Requiring helpers/git-env.js is NOT sufficient on its own: that
+  //     module defines scrubGitEnv and never calls it at load, so importing
+  //     it protects nothing.
+  //   temp-repo.js / hostile-repo.js REQUIRED -- those do scrub at load, so
+  //     the import is a real code path. Matched only where no quote character
+  //     precedes require on the line, which excludes one named inside a
+  //     string while still accepting a destructure wrapped across lines,
+  //     where the require sits after a closing brace.
+  //
+  // Belt and braces: this test's own failure message deliberately does NOT
+  // spell the call with its parentheses, so it cannot satisfy the detector
+  // even if the string-stripper is imperfect. An earlier version matched its
+  // own message and exempted its own file, and relying on one mechanism to
+  // prevent that recurring is how it happened the first time.
+  const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+  const stripStringContents = (src) => src.replace(/(['"`])(?:\\.|(?!\1)[\s\S])*?\1/g, '$1$1')
+
+  const offenders = []
+  for (const file of files) {
+    const src = stripComments(fs.readFileSync(file, 'utf8'))
+    const invokesGit =
+      /[\w.$]+\(\s*['"`][^'"`]*\bgit['"`]\s*[,)]/.test(src) ||
+      /['"`]git\s+[a-z][a-z-]*/.test(src)
+    if (!invokesGit) continue
+
+    const callsScrub = /\bscrubGitEnv\s*\(/.test(stripStringContents(src))
+    const requiresScrubbingHelper = src
+      .split('\n')
+      .some((line) => /^[^'"`]*\brequire\(\s*['"`][^'"`]*(?:temp-repo|hostile-repo)[^'"`]*['"`]\s*\)/.test(line))
+    if (!callsScrub && !requiresScrubbingHelper) offenders.push(path.relative(ROOT, file))
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `these files invoke git but never load the git-environment scrub, so a run under an exported GIT_DIR would resolve to the wrong repository: ${offenders.join(', ')}. ` +
+      'Fix: call scrubGitEnv from test/helpers/git-env.js at the top of the file, or require test/helpers/temp-repo.js, which does it at load.'
+  )
 })

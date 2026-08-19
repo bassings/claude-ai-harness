@@ -2142,3 +2142,114 @@ test('optimise-read module: canonicalPlanKey and the marker/sentinel constants a
   assert.ok(!/path\.normalize/.test(contents), 'optimise-read.mjs must not run its own path.normalize on a spec value -- canonicalPlanKey is the single definition site')
   assert.ok(!/function\s+canonicalPlanKey/.test(contents.replace(/import[^\n]*canonicalPlanKey[^\n]*/, '')), 'optimise-read.mjs must not declare a second canonicalPlanKey of its own')
 })
+
+// ---- window selection must be by recency, not by argument order ----
+//
+// Round-3 F5 established that a small --window starves the FIRST-listed
+// repo, and made the loss detectable by comparing perRepo's summed
+// recordCount against the windowed n. That reconciliation signal is real and
+// stays. What it does not establish is that the RIGHT records were kept.
+//
+// combinedRecords is built by concatenating each root's records in root
+// order, so the array is repo-major and only time-ordered WITHIN a repo.
+// windowRecords keeps the array TAIL. The two facts together mean the window
+// is selected by argument position rather than by time: whichever repo is
+// listed last wins, and its OLDEST records outrank the first-listed repo's
+// NEWEST ones. citationPool has the same positional assumption -- it walks
+// the array backwards and calls that "most-recent-first".
+//
+// F5's own fixture could not catch this, because it appended repoA's records
+// before repoB's, so the first-listed repo genuinely WAS the oldest and
+// position happened to agree with time. This fixture breaks that agreement:
+// the first-listed repo holds the newest records. That is not a contrived
+// case -- it is what an alphabetical or config-file-ordered root list gives
+// you the moment one repo is busier than another, which is precisely the
+// multi-repo shape T1 instruments the delivery repos for.
+test('optimise-read CLI: the --window keeps the globally most RECENT records across roots, not merely the tail of the concatenated array -- the first-listed root\'s newest records must outrank a later-listed root\'s oldest', () => {
+  const repoA = makeTempRepo()
+  const repoB = makeTempRepo()
+
+  const write = (repo, records) => {
+    const p = path.join(repo, '.claude', 'harness-ledger.jsonl')
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, records.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8')
+  }
+  const rec = (id, ts) => ({ schema_version: 2, run_id: id, ts, repo: 'fixture/repo', kind: 'tdd_task', outcome: 'done' })
+
+  // repoA is listed FIRST and holds the three NEWEST records.
+  write(repoA, [
+    rec('A-newest-1', '2026-08-18T10:00:00.000Z'),
+    rec('A-newest-2', '2026-08-18T11:00:00.000Z'),
+    rec('A-newest-3', '2026-08-18T12:00:00.000Z'),
+  ])
+  // repoB is listed SECOND and holds five OLDER records.
+  write(repoB, [
+    rec('B-old-1', '2026-08-10T01:00:00.000Z'),
+    rec('B-old-2', '2026-08-10T02:00:00.000Z'),
+    rec('B-old-3', '2026-08-10T03:00:00.000Z'),
+    rec('B-old-4', '2026-08-10T04:00:00.000Z'),
+    rec('B-old-5', '2026-08-10T05:00:00.000Z'),
+  ])
+
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repoA, repoB, '--window=4'], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+
+  assert.equal(out.n, 4, 'window=4 over 8 combined records')
+  assert.equal(out.windowTruncated, true)
+  assert.equal(out.windowDroppedCount, 4)
+
+  // The four surviving records must be the four newest BY TIMESTAMP:
+  // A's three, plus B's single newest. Under tail-slicing they would instead
+  // be B-old-2..B-old-5, discarding every one of the newest three.
+  const kept = new Set(out.citationPool)
+  for (const id of ['A-newest-1', 'A-newest-2', 'A-newest-3']) {
+    assert.ok(kept.has(id), `${id} is among the four newest records by timestamp and must survive a window of 4; kept=${JSON.stringify(out.citationPool)}`)
+  }
+  assert.ok(kept.has('B-old-5'), 'B-old-5 is the fourth-newest record and must survive')
+  for (const id of ['B-old-1', 'B-old-2', 'B-old-3', 'B-old-4']) {
+    assert.ok(!kept.has(id), `${id} is older than four other records and must be dropped by a window of 4; kept=${JSON.stringify(out.citationPool)}`)
+  }
+
+  // citationPool documents itself as most-recent-first; with the window
+  // selected by time that ordering must actually hold.
+  assert.deepEqual(
+    out.citationPool,
+    ['A-newest-3', 'A-newest-2', 'A-newest-1', 'B-old-5'],
+    'citationPool must be ordered most-recent-first by timestamp, across roots'
+  )
+})
+
+// The ledger envelope requires `ts` to be a non-empty string and nothing
+// more (ledger-append.mjs's schema: `{ type: 'string', minLength: 1 }`), so a
+// non-ISO value is reachable from a hand-edited file, a future writer, or a
+// hostile repo. sortRecordsByTime deliberately treats such a record as the
+// OLDEST rather than the newest: an unusable timestamp must never displace a
+// record whose time is known and recent. Tested directly rather than only
+// through the CLI, because the rule is a decision, and a decision nobody has
+// watched fail is not guarded.
+test('optimise-read: sortRecordsByTime treats a missing or unparseable ts as OLDEST, never newest, and keeps equal-timestamp records in their original read order', () => {
+  const records = [
+    { run_id: 'no-ts' },
+    { run_id: 'newest', ts: '2026-08-18T12:00:00.000Z' },
+    { run_id: 'garbage-ts', ts: 'not-a-timestamp' },
+    { run_id: 'tie-a', ts: '2026-08-11T00:00:00.000Z' },
+    { run_id: 'oldest', ts: '2026-08-10T00:00:00.000Z' },
+    { run_id: 'tie-b', ts: '2026-08-11T00:00:00.000Z' },
+    { run_id: 'empty-ts', ts: '' },
+  ]
+  const sorted = mod.sortRecordsByTime(records).map((r) => r.run_id)
+
+  // The three unusable-ts records lead (oldest), in their original order.
+  assert.deepEqual(sorted.slice(0, 3), ['no-ts', 'garbage-ts', 'empty-ts'], 'records with no usable ts sort oldest, preserving read order among themselves')
+  // Then real timestamps ascending, with the tie broken by read order.
+  assert.deepEqual(sorted.slice(3), ['oldest', 'tie-a', 'tie-b', 'newest'])
+
+  // The property that matters: an unusable ts must never survive a window
+  // that a real, recent record loses.
+  const { windowed } = mod.windowRecords(mod.sortRecordsByTime(records), 2)
+  assert.deepEqual(windowed.map((r) => r.run_id), ['tie-b', 'newest'], 'a 2-record window keeps the two genuinely newest, not the untimestamped ones')
+
+  // Non-mutating: the caller's array is untouched.
+  assert.equal(records[0].run_id, 'no-ts', 'sortRecordsByTime must not reorder the caller\'s array in place')
+})
