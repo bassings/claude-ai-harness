@@ -157,15 +157,69 @@ export function parseLedgerContent(raw) {
   return { records, skipped, schemaVersionsSeen, truncatedFinalLine }
 }
 
-// Bounds how many records proceed to aggregation (AC-ARCH-14): keeps only
-// the most recent `maxLines` records (by array order, which is file order,
-// which is append order -- the ledger is append-only). This windowing
-// happens here, in script code, BEFORE any of this content is placed into
-// an agent prompt string.
+// Bounds how many records proceed to aggregation (AC-ARCH-14): keeps the
+// LAST `maxLines` records by array order. This windowing happens here, in
+// script code, BEFORE any of this content is placed into an agent prompt
+// string.
+//
+// Array order equals time order only for records read from a SINGLE ledger
+// file, which is append-only. It does NOT hold across files: a caller that
+// concatenates several roots produces a repo-major array, and slicing its
+// tail then selects by argument position rather than by time. Supplying
+// time-ordered input is the caller's responsibility -- see
+// sortRecordsByTime, which runLedgerCommand applies before calling this.
 export function windowRecords(records, maxLines = DEFAULT_LEDGER_WINDOW_LINES) {
   if (records.length <= maxLines) return { windowed: records, truncated: false, droppedCount: 0 }
   const droppedCount = records.length - maxLines
   return { windowed: records.slice(droppedCount), truncated: true, droppedCount }
+}
+
+// Puts records from any number of roots into one true time order, so that
+// windowRecords' tail slice means "the most recent runs" rather than
+// "whichever root was listed last".
+//
+// Array.prototype.sort has been stable by specification since ES2019, so
+// records sharing a timestamp keep the order they were read in, which for a
+// single root is its append order. An earlier version decorated each record
+// with its original index and tie-broke on that, described as not leaning on
+// that guarantee -- but the decoration was untestable: changing the tiebreak
+// to `return 0` left the whole suite green, because the language already
+// promised what it was re-implementing. Removed rather than kept as
+// decoration; what remains is load-bearing (see the equality branch below).
+//
+// A record whose `ts` is missing or unparseable sorts as OLDEST. The ledger
+// envelope only requires `ts` to be a non-empty string, so a non-ISO value
+// is reachable; treating it as oldest means the least trustworthy input can
+// never displace a record with a known, recent time. It is dropped first
+// rather than silently outranking real data.
+export function sortRecordsByTime(records) {
+  const timeOf = (record) => {
+    const parsed = typeof record.ts === 'string' ? Date.parse(record.ts) : Number.NaN
+    return Number.isFinite(parsed) ? parsed : -Infinity
+  }
+  // The equality branch guards a real hazard that this runtime happens to
+  // tolerate, and the distinction is stated rather than glossed. Two records
+  // with an unusable ts both key to -Infinity, and `-Infinity - -Infinity` is
+  // NaN: an inconsistent comparator, for which the specification leaves the
+  // resulting order implementation-defined. Returning 0 for equal keys is
+  // what makes the stable-sort guarantee apply to them.
+  //
+  // MEASURED, and not what the first version of this comment claimed:
+  // replacing this branch with a plain `ta - tb` leaves the suite at 125/125
+  // green, because V8 treats a NaN comparator result as 0. So on this engine
+  // the branch is unobservable and no test here can prove it load-bearing.
+  // It stays because the guarantee it relies on is the language's, not
+  // V8's, and a different engine may order those records differently -- but
+  // it is defensive rather than proven, and calling it proven would be the
+  // exact false claim this file's other comments warn about.
+  //
+  // Copy first, so the caller's array is never reordered.
+  return records.slice().sort((a, b) => {
+    const ta = timeOf(a)
+    const tb = timeOf(b)
+    if (ta === tb) return 0
+    return ta < tb ? -1 : 1
+  })
 }
 
 function bumpDisposition(counts, lens, disposition) {
@@ -1106,7 +1160,13 @@ function runLedgerCommand(roots, window) {
     combinedRecords = combinedRecords.concat(records)
     combinedSkipped = combinedSkipped.concat(skipped)
   }
-  const { windowed, truncated, droppedCount } = windowRecords(combinedRecords, window)
+  // combinedRecords is repo-major: root 0's records, then root 1's, and so
+  // on, time-ordered only WITHIN each root. windowRecords keeps the tail, so
+  // without this sort the window is selected by argument position: the
+  // last-listed root's OLDEST records outrank the first-listed root's
+  // NEWEST. Every downstream aggregate, and citationPool's
+  // "most-recent-first" contract, assume the window means recent runs.
+  const { windowed, truncated, droppedCount } = windowRecords(sortRecordsByTime(combinedRecords), window)
   // HARN-OPT-2 PR1: plan-identity canonicalisation of an absolute historical
   // spec value needs the actual analysis root as a lexical string to strip.
   // Simplification, stated here rather than hidden: when MULTIPLE roots are
