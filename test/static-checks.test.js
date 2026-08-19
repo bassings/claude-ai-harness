@@ -13,9 +13,11 @@ const assert = require('node:assert/strict')
 // -- a false green, which is the one outcome these static checks exist to
 // prevent. See test/helpers/git-env.js.
 require('./helpers/git-env.js').scrubGitEnv()
+const { sanitizedGitEnv } = require('./helpers/git-env.js')
 
 const fs = require('node:fs')
 const path = require('node:path')
+const { spawnSync } = require('node:child_process')
 
 const ROOT = path.join(__dirname, '..')
 
@@ -662,14 +664,46 @@ test('static: the pre-push hook and CI both refuse to report success when the te
   }
 })
 
-test('static: CI runs the suite, runs it again under a hostile git environment including the code-execution variable, bounds every job, and scans for secrets', () => {
+test('static: every CI guarantee is asserted by COUNT or by structure, because presence-anywhere let four separate regressions through', () => {
   const ci = readAll('.github/workflows/ci.yml')
+  const count = (re) => (ci.match(re) || []).length
+
+  // Review defeated the previous version of every assertion below by
+  // deleting the thing while leaving a comment, or by deleting one of
+  // several occurrences. Each is now pinned to a count.
+
+  // (a) Deleting the gitleaks step left the word "gitleaks" in a comment and
+  //     the suite stayed green. Pin the `uses:` line, not the word.
+  assert.equal(count(/^\s*-?\s*uses:\s*gitleaks\/gitleaks-action@/gm), 1,
+    'exactly one gitleaks-action step must exist: this repo is public and has already required a history rewrite')
+
+  // (b) Deleting timeout-minutes from two of three jobs stayed green,
+  //     because one occurrence satisfied the regex.
+  assert.equal(count(/^\s*timeout-minutes:/gm), count(/^\s*runs-on:/gm),
+    'every job must be bounded, or a hang presents as "still running" for six hours')
+
+  // (c) Deleting GIT_DIR from the hostile step stayed green: nothing
+  //     asserted it. Without it the escape target is the workspace the suite
+  //     already expects, so a scrub regression is masked.
+  assert.match(ci, /GIT_DIR=/, 'the hostile step must point GIT_DIR at a scratch repo, not the workspace')
+  for (const v of ['GIT_TEMPLATE_DIR', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS']) {
+    assert.match(ci, new RegExp(`${v}:`), `the hostile step must set ${v}`)
+  }
+
+  // (d) Deleting fetch-depth from the test job stayed green because the
+  //     secrets job's copy satisfied a file-level regex. Both need it, for
+  //     different reasons.
+  assert.equal(count(/^\s*fetch-depth:\s*0\s*$/gm), 2,
+    'both the test job (subject-anchored commit resolution) and the secrets job (scheduled history sweep) need full history')
+
+  // M1: on push and pull_request, gitleaks-action supplies its own
+  // --log-opts range and never walks all refs. Only a trigger it passes no
+  // log-opts for reaches gitleaks' --full-history --all default, so without
+  // a scheduled run the history sweep does not exist at all.
+  assert.match(ci, /^\s*schedule:/m, 'a scheduled trigger is the only one on which gitleaks walks all history')
+  assert.match(ci, /cron:/, 'the scheduled trigger needs a cron expression')
+
   assert.match(ci, /node --test test\/\*\.test\.js/, 'CI must run the suite')
-  assert.match(ci, /fetch-depth: 0/, 'CI must fetch full history: static checks resolve a historical commit by subject')
-  assert.match(ci, /timeout-minutes:/, 'jobs must be bounded, or a hang presents as "still running" for six hours')
-  assert.match(ci, /GIT_TEMPLATE_DIR:/, 'the hostile step must include GIT_TEMPLATE_DIR -- the escape that installs an executable hook')
-  assert.match(ci, /GIT_CONFIG_PARAMETERS:/, 'the hostile step must include GIT_CONFIG_PARAMETERS, which git exports into subprocesses itself')
-  assert.match(ci, /gitleaks/, 'CI must scan for secrets: this repo is public and has already required a history rewrite')
 })
 
 // M7 from review: seven AC identifiers looked duplicated and two genuinely
@@ -685,28 +719,187 @@ test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id 
   let totalDefs = 0
   for (const file of files) {
     const src = fs.readFileSync(path.join(specsDir, file), 'utf8')
-    // A DEFINITION is the bolded id followed immediately by a colon. BOTH
-    // spellings are in use across these specs and both must be matched:
-    //   **AC-PROD-1:** ...   colon inside the bold  (harn-opt-3.md)
-    //   **AC-SEC-1**: ...    colon outside          (custom-rules-fail-closed.md)
+    // A DEFINITION is an id at the START OF A LINE, optionally after a list
+    // marker, optionally bolded, followed by a colon. THREE spellings are in
+    // use across these specs and all three must match, or the guard is blind
+    // to whole files:
+    //   - **AC-PROD-1:** ...   colon inside the bold   harn-opt-3.md
+    //   **AC-SEC-1**: ...      colon outside           custom-rules-fail-closed.md
+    //   - AC-SEC-1: ...        unbolded                harn-opt-2.md, optimise-cycle.md
     //
-    // This pattern went wrong twice while being written, in both directions.
-    // Matching the bare id counted a prose MENTION as a definition -- specs
-    // discuss criteria they have vetoed or amended -- which reported five
-    // false duplicates, and a mechanical rename on the back of that renamed
-    // references inside a changelog, leaving the text citing ids that no
-    // longer existed. Matching only the colon-inside form then found ZERO
-    // definitions in a file full of them, which is the worse failure: a
-    // guard that cannot fire reports no duplicates forever.
-    const defs = [...src.matchAll(/\*\*(AC-[A-Z]+-\d+)(?::\*\*|\*\*:)/g)].map((m) => m[1])
+    // This pattern has now been wrong THREE times, in three different
+    // directions, and the history is kept because each failure looked
+    // correct:
+    //   1. Matching the bare id counted prose MENTIONS as definitions. Specs
+    //      discuss criteria they have vetoed, so it reported five false
+    //      duplicates, and a mechanical rename on the back of that renamed
+    //      references inside a changelog.
+    //   2. Requiring bold found 81 of 245 definitions -- ZERO in the two
+    //      largest specs -- while reporting no duplicates, exactly the
+    //      "guard that cannot fire" this file warns about elsewhere.
+    //   3. The pattern review proposed to fix (2) was anchored and unbolded
+    //      but required the colon AFTER the closing bold, so it found 103 and
+    //      61 in the files that had been blind and ZERO in the file that had
+    //      been working. Taking a suggested fix literally would have moved
+    //      the blindness rather than removed it.
+    // Line anchoring is what keeps prose mentions out; the alternation is
+    // what keeps every file in.
+    const defs = [...src.matchAll(/^(?:[-*]\s+)?(?:\*\*)?(AC-[A-Z]+-\d+)(?::\*\*|\*\*:|:)\s/gm)].map((m) => m[1])
     totalDefs += defs.length
+    // PER-FILE anti-vacuity: a global floor is satisfied by one large file
+    // while every other spec contributes zero forever. Measured: harn-opt-3
+    // alone supplied 70 of the old global 81, so the old `> 50` floor could
+    // never fire for the two blind files.
+    if (/AC-[A-Z]+-\d+/.test(src) && defs.length === 0) {
+      problems.push(`${file}: contains AC ids but the definition scan found none -- the pattern is blind to this file's spelling`)
+    }
     const counts = new Map()
     for (const id of defs) counts.set(id, (counts.get(id) || 0) + 1)
     for (const [id, n] of counts) if (n > 1) problems.push(`${file}: ${id} defined ${n} times`)
   }
   assert.ok(
-    totalDefs > 50,
-    `sanity: expected the scan to find many AC definitions across specs/, found ${totalDefs} -- a pattern that matches nothing reports no duplicates forever`
+    totalDefs > 200,
+    `sanity: expected the scan to find many AC definitions across specs/, found ${totalDefs} -- a pattern that matches nothing reports no duplicates forever. The per-file check above is the real anti-vacuity guard; this is a coarse backstop, set just under the 245 currently present.`
   )
   assert.deepEqual(problems, [], `duplicate acceptance-criterion definitions: ${problems.join('; ')}`)
+})
+
+// H2 from review round 2: the assertions above match TEXT in the hook, and
+// nothing anywhere executed it. Both proven defeatable: inserting one line,
+// `GIT_*) ;;` before the unset arm, left every asserted string intact and the
+// suite 32/32 green while GIT_TEMPLATE_DIR reached the suite -- which is
+// arbitrary code execution, since git init copies that directory's hooks into
+// every fixture repo and runs them. Changing the empty-glob `exit 1` to
+// `exit 0` was equally invisible, because the assertion only required the
+// string `-lt 10` to appear somewhere in the file.
+//
+// So the hook is executed here, with a stub `node` on PATH standing in for
+// the suite, and the assertions are about observed behaviour rather than
+// about the source that produces it.
+
+function runPrePushHook({ cwd, env = {}, stubNode = true }) {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'hookrun-'))
+  const bin = path.join(dir, 'bin')
+  fs.mkdirSync(bin)
+  if (stubNode) {
+    // Stands in for `node --test ...`: prints the GIT_* environment it was
+    // handed, so the test can assert what actually survived the scrub.
+    const stub = path.join(bin, 'node')
+    fs.writeFileSync(stub, '#!/bin/sh\nenv | grep "^GIT_" | sort\nexit 0\n')
+    fs.chmodSync(stub, 0o755)
+  }
+  const res = spawnSync('sh', [path.join(ROOT, '.githooks', 'pre-push')], {
+    cwd,
+    encoding: 'utf8',
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ...env },
+  })
+  fs.rmSync(dir, { recursive: true, force: true })
+  return res
+}
+
+test('static: EXECUTING the pre-push hook strips every GIT_* variable except commit identity -- observed from inside the process it launches, not matched in its source', () => {
+  const res = runPrePushHook({
+    cwd: ROOT,
+    env: {
+      GIT_TEMPLATE_DIR: '/tmp/evil-template',
+      GIT_PAGER: 'cat',
+      GIT_NOT_A_REAL_VAR_47B3F9: 'x',
+      GIT_CONFIG_COUNT: '1',
+      GIT_AUTHOR_NAME: 'keepme',
+      GIT_COMMITTER_EMAIL: 'keep@me',
+    },
+  })
+  assert.equal(res.status, 0, `hook exited ${res.status}: ${res.stderr}`)
+  const survived = res.stdout.split('\n').map((l) => l.split('=')[0]).filter((k) => k.startsWith('GIT_'))
+
+  for (const gone of ['GIT_TEMPLATE_DIR', 'GIT_PAGER', 'GIT_NOT_A_REAL_VAR_47B3F9', 'GIT_CONFIG_COUNT']) {
+    assert.ok(!survived.includes(gone), `${gone} reached the suite; the hook's scrub did not run. Survivors: ${survived.join(', ')}`)
+  }
+  // Not "strip everything": identity must pass through, or the strip is
+  // over-broad and the test would pass for the wrong reason.
+  assert.ok(survived.includes('GIT_AUTHOR_NAME'), 'commit identity must survive the strip')
+  assert.ok(survived.includes('GIT_COMMITTER_EMAIL'), 'commit identity must survive the strip')
+})
+
+test('static: EXECUTING the pre-push hook in a directory where the test glob matches nothing exits non-zero, where the unguarded command exits 0', () => {
+  const empty = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'emptyrepo-'))
+  try {
+    const guarded = runPrePushHook({ cwd: empty, stubNode: false })
+    assert.notEqual(guarded.status, 0, 'the hook must refuse to report success when the suite glob matches nothing')
+    assert.match(guarded.stderr, /refusing to report success/, 'and must say why')
+
+    // The control is the point: this is what the hook did before the floor,
+    // and what it would silently return to if the floor were removed.
+    const unguarded = spawnSync('sh', ['-c', 'set -e; node --test test/*.test.js'], { cwd: empty, encoding: 'utf8' })
+    assert.equal(unguarded.status, 0, 'sanity: the unguarded form exits 0 on an empty glob -- if this ever fails, the floor is no longer load-bearing and this test is measuring nothing')
+  } finally {
+    fs.rmSync(empty, { recursive: true, force: true })
+  }
+})
+
+// H1 from review round 2: a committed hook is inert in every fresh clone,
+// because core.hooksPath is LOCAL config that no repository can set. Worse,
+// it fails silently -- git ignores an unset hooksPath without a word, so the
+// push succeeds and looks gated. The gate existed on exactly one machine.
+//
+// The previous test asserted the executable bit with the message "or git
+// silently ignores it and the gate is not a gate". The condition that
+// actually makes git silently ignore it is the unset one, which was
+// unguarded. This executes the remedy end to end instead: a scratch repo with
+// the hook present but hooksPath unset must NOT be gated, and running
+// bin/setup-hooks.sh must gate it.
+test('static: bin/setup-hooks.sh is what makes the committed hook fire -- proven by a push that is NOT blocked before running it and IS blocked after', () => {
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'hookssetup-'))
+  const repo = path.join(root, 'repo')
+  const remote = path.join(root, 'remote.git')
+  const git = (args, cwd) => spawnSync('git', args, { cwd, encoding: 'utf8', env: sanitizedGitEnv() })
+  try {
+    fs.mkdirSync(repo)
+    git(['init', '-q', '-b', 'main'], repo)
+    git(['init', '-q', '--bare', remote], root)
+    git(['config', 'user.email', 't@example.com'], repo)
+    git(['config', 'user.name', 'T'], repo)
+    git(['remote', 'add', 'origin', remote], repo)
+
+    // The repo's own artefacts, copied in: a hook that always refuses, and
+    // the real setup script under test.
+    fs.mkdirSync(path.join(repo, '.githooks'))
+    const hook = path.join(repo, '.githooks', 'pre-push')
+    fs.writeFileSync(hook, '#!/bin/sh\necho GATE_RAN >&2\nexit 1\n')
+    fs.chmodSync(hook, 0o755)
+    fs.mkdirSync(path.join(repo, 'bin'))
+    fs.copyFileSync(path.join(ROOT, 'bin', 'setup-hooks.sh'), path.join(repo, 'bin', 'setup-hooks.sh'))
+
+    fs.writeFileSync(path.join(repo, 'f.txt'), 'x\n')
+    git(['add', '-A'], repo)
+    git(['commit', '-qm', 'seed'], repo)
+
+    // BEFORE: hooksPath unset. The hook exists, is executable, and refuses --
+    // and the push still succeeds, silently.
+    const before = git(['push', '-q', 'origin', 'main'], repo)
+    assert.equal(before.status, 0, 'sanity: without core.hooksPath the committed hook must be ignored; if this fails the premise has changed')
+    assert.ok(!/GATE_RAN/.test(before.stderr), 'the hook must not have run before setup')
+
+    // AFTER: run the real script.
+    const setup = spawnSync('sh', ['bin/setup-hooks.sh'], { cwd: repo, encoding: 'utf8', env: sanitizedGitEnv() })
+    assert.equal(setup.status, 0, `setup-hooks.sh failed: ${setup.stderr}`)
+    assert.equal(git(['config', '--get', 'core.hooksPath'], repo).stdout.trim(), '.githooks',
+      'the path must be RELATIVE: an absolute one is resolved against each linked worktree, which would run the main checkout\'s copy')
+
+    fs.writeFileSync(path.join(repo, 'f.txt'), 'y\n')
+    git(['commit', '-qam', 'second'], repo)
+    const after = git(['push', 'origin', 'main'], repo)
+    assert.notEqual(after.status, 0, 'after setup the hook must gate the push')
+    assert.match(after.stderr, /GATE_RAN/, 'and it must be this hook that ran')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('static: README documents how to activate the gate, and says plainly that CI is the backstop because no repository can set core.hooksPath for a clone', () => {
+  const readme = readAll('README.md')
+  assert.match(readme, /bin\/setup-hooks\.sh/, 'README must name the setup script')
+  assert.match(readme, /core\.hooksPath/, 'README must name the config that makes the hook fire')
+  assert.match(readme, /silent|silently/i, 'README must state that an unset hooksPath fails silently, which is why this is easy to miss')
+  assert.match(readme, /backstop|CI is the/i, 'README must state that CI, not the hook, is what actually gates for everyone else')
 })

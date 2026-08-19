@@ -4,14 +4,34 @@ on:
   push:
     branches: [main]
   pull_request:
+  # M1 from review: gitleaks-action passes --log-opts for push and
+  # pull_request events, so on those triggers it scans a COMMIT RANGE and
+  # never walks all refs. Only an event supplying no log-opts falls through to
+  # gitleaks' own default of --full-history --all. Without a scheduled
+  # trigger the history sweep simply does not exist, and this repo has already
+  # had a credential fingerprint reach its public history. The weekly run is
+  # the sweep; the PR run is the gate.
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# L8: without this, every superseded push leaves its jobs running to
+# completion. main is excluded so a merge is never cancelled by the next one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '26']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,9 +43,14 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # Matches the development runtime's major line rather than pinning
-          # two majors behind it untested.
-          node-version: '24'
+          # This repo declared no supported range, and successive pins here
+          # claimed to match the development runtime while sitting two majors
+          # below it (v26.7.0 locally against a pin of 22, then 24). Rather
+          # than assert a match that is not one, the range is now explicit and
+          # both ends are tested: the oldest version supported and the one
+          # development actually happens on. A matrix costs a second 30-second
+          # job on a repo with no dependencies to install.
+          node-version: ${{ matrix.node }}
 
       # An unmatched glob is passed through literally by sh and `node --test`
       # then exits 0 having run nothing, so every enforcement site would go
@@ -78,9 +103,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # gitleaks walks each commit's own diff rather than the final tree,
-          # so removing a secret in a later commit does not clear the finding.
-          # Full history is the point.
+          # Needed by the SCHEDULED run, which is the only trigger on which
+          # gitleaks walks all refs (--full-history --all). On push and
+          # pull_request the action supplies its own --log-opts range and
+          # reads far less than this fetches; the depth is not wasted, it is
+          # simply unused by two of the four triggers.
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
         env:
