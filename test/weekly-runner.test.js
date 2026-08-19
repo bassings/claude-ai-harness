@@ -715,3 +715,60 @@ test('weekly runner (subtraction round, item 9): no $HOME/.claude/optimise-weekl
   assert.ok(!logContents.includes('RESULT'), 'no config file must produce no verdict lines')
   assert.ok(!logContents.includes('SKIP'), 'no config file must produce no skip lines')
 })
+
+// Found by this repo's FIRST EVER CI run, on both node versions, in a script
+// that had only ever executed on macOS.
+//
+// `stat -f %m` is BSD's "format" flag. On GNU/Linux `-f` means "file system
+// status": it SUCCEEDS, exit 0, printing a block of filesystem information.
+// The old form was `stat -f %m ... || stat -c %Y ...`, so the `||` fallback
+// never ran, `[ "$mtime" -lt "$start_epoch" ]` failed with "integer
+// expression expected", and that block went to stderr on every clean pass --
+// tripping the "a fully passing run prints nothing to stderr" guarantee.
+//
+// A fallback chained on EXIT STATUS cannot protect against a command that
+// succeeds with the wrong OUTPUT. That is the defect, and it is why the fix
+// validates the shape of the result rather than trusting `||`.
+//
+// This test does not depend on the platform it runs on: it puts a stub `stat`
+// on PATH that behaves like GNU's (accepts -f, exits 0, prints a filesystem
+// block; accepts -c %Y, prints an epoch), so a regression to BSD-first is
+// caught on macOS too, where the real bug is invisible.
+test('weekly runner: a GNU-behaving stat (where -f SUCCEEDS with filesystem info) does not leak that block to stderr -- the mtime read validates its result rather than chaining on exit status', () => {
+  const stubDir = fs.mkdtempSync(path.join(RUN_TMPDIR, 'gnustat-'))
+  try {
+    const stub = path.join(stubDir, 'stat')
+    fs.writeFileSync(
+      stub,
+      [
+        '#!/bin/sh',
+        '# Emulates GNU stat: -f is "file system status" and SUCCEEDS.',
+        'case "$1" in',
+        '  -f) echo "  File: \\"$2\\""; echo "    ID: deadbeef Namelen: 255 Type: ext2/ext3"; exit 0 ;;',
+        '  -c) shift; fmt="$1"; shift; if [ "$fmt" = "%Y" ]; then date +%s; exit 0; fi; exit 1 ;;',
+        'esac',
+        'exit 1',
+      ].join('\n') + '\n'
+    )
+    fs.chmodSync(stub, 0o755)
+
+    const repo = makeTempRepo()
+    setMarker(repo, 'pass')
+    const res = runWeeklyScript([repo], { extraPath: stubDir })
+
+    // Without a clean pass the mtime branch is never reached and this test
+    // measures nothing -- it silently passed for that reason on first write.
+    assert.equal(res.status, 0, `expected a clean pass so the mtime branch executes; log:\n${res.logContents}`)
+
+    assert.ok(
+      !/integer expression expected/.test(res.stderr),
+      `the mtime read must not feed non-numeric output into a numeric comparison; stderr was:\n${res.stderr}`
+    )
+    assert.ok(
+      !/Namelen|Block size|filesystem/i.test(res.stderr),
+      `filesystem information must never reach stderr; stderr was:\n${res.stderr}`
+    )
+  } finally {
+    fs.rmSync(stubDir, { recursive: true, force: true })
+  }
+})
