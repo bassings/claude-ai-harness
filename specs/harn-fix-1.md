@@ -106,13 +106,31 @@ ledger, git history, Actions history, or the report's own freshness. The
 signal is an obligation with no corresponding trace, and the honest output is
 "documented, never observed", not a failure.
 
-**Two traps this must avoid**, both learned the hard way here:
-- It must not report clean when it is blind. The AC-uniqueness guard in
-  `test/static-checks.test.js` covered 81 of 245 definitions and reported no
-  problems, twice, in two different directions. A per-source floor is the
-  minimum.
-- "No trace" and "not looked" must be distinguishable in the output, or the
-  detector reproduces the exact class it exists to find.
+**Three traps this must avoid**, each measured rather than imagined:
+
+- **Blind and silent.** It must not report clean when it never looked. The
+  AC-uniqueness guard in `test/static-checks.test.js` covered 81 of 245
+  definitions and reported no problems, twice, in two different directions.
+  A per-source floor is the minimum.
+- **No trace versus not looked.** These must be distinguishable in the
+  output. Rendering absence of evidence as evidence of absence reproduces the
+  exact class the detector exists to find.
+- **A coverage metric that moves the WRONG WAY under the failure it detects.**
+  Measured by the CouchPotatoServer session on its own AST guard: it collected
+  config entry names and group names into two sets, and nothing asserted the
+  sets stay distinct. One plausible line folding groups into entries turned the
+  guard into a tautology -- and because conflation makes the sweep find MORE,
+  every "did I find enough" counter got *happier* while the guard stopped being
+  able to fail. Ten passed, with the defect present.
+
+  **This defeats the first trap's remedy**, which is why it is recorded
+  separately rather than merged into it. A floor asserts a MINIMUM count; this
+  failure mode INCREASES the count, so no floor can see it. The defence is an
+  invariant on the shape of what was collected -- here, that the two sets
+  remain disjoint -- not a threshold on how much was collected. Any detector
+  that reports "how many obligations I checked" needs one, because the
+  cheapest way to inflate that number is to stop distinguishing between the
+  things being counted.
 
 ## Affected files
 
