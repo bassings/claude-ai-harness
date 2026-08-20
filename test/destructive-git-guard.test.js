@@ -1,10 +1,14 @@
 // PreToolUse hook (hooks/destructive-git-guard.py) refusing a Bash git
-// command that would discard uncommitted work: `git checkout -- <path>`,
-// `git checkout .`, `git restore <path>` (without `--staged` alone), and
-// `git reset --hard`. Built after an agent ran `git checkout -- <file>` on
-// uncommitted work three times in one session and destroyed its own edits
-// each time, despite docs/harn-opt-2-mutation-proofs.md forbidding it by
-// name -- prose did not prevent it (standard 9: the rule wants a mechanism).
+// command that would discard uncommitted work. The exact set of guarded
+// shapes and the normalisation layer that finds them underneath shell
+// noise (newlines, redirects, git global options, bundled short flags, a
+// preceding `cd`) are documented ONCE, in the hook's own module docstring
+// -- restating the list here drifted stale before (see L3 in the round-2
+// review), so this file points at that copy instead of keeping its own.
+// Built after an agent ran `git checkout -- <file>` on uncommitted work
+// three times in one session and destroyed its own edits each time, despite
+// docs/harn-opt-2-mutation-proofs.md forbidding it by name -- prose did not
+// prevent it (standard 9: the rule wants a mechanism).
 //
 // Driven as a REAL subprocess against a REAL temp git repository, never by
 // asserting on the hook's source text -- a guard that greps rather than
@@ -64,13 +68,6 @@ test('destructive-git-guard: git checkout . is refused when the tree is dirty', 
 test('destructive-git-guard: git checkout . is allowed on a clean tree', () => {
   const dir = makeTempRepo()
   const res = runHook(bashPayload('git checkout .', dir))
-  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
-})
-
-test('destructive-git-guard: git checkout -b <branch> is allowed even on a dirty tree (branch creation, not a restore)', () => {
-  const dir = makeTempRepo()
-  makeDirtyFile(dir)
-  const res = runHook(bashPayload('git checkout -b some-new-branch', dir))
   assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
 })
 
@@ -137,14 +134,6 @@ test('destructive-git-guard: git checkout -- <untracked file> is allowed (nothin
   fs.writeFileSync(path.join(dir, 'scratch-untracked.txt'), 'not tracked\n')
   const res = runHook(bashPayload('git checkout -- scratch-untracked.txt', dir))
   assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
-})
-
-test('destructive-git-guard: git restore --staged (no other flag) alone is allowed regardless of dirt, matching the "without --staged alone" carve-out precisely', () => {
-  const dir = makeTempRepo()
-  makeDirtyFile(dir)
-  sh('git add README.md', dir)
-  const res = runHook(bashPayload('git restore --staged README.md', dir))
-  assert.equal(res.status, 0)
 })
 
 test('destructive-git-guard: git log -- <path> is never intercepted (not checkout/restore/reset), even on a dirty tree', () => {
@@ -361,4 +350,368 @@ test('destructive-git-guard: git diff is never intercepted, even on a dirty tree
   makeDirtyFile(dir)
   const res = runHook(bashPayload('git diff', dir))
   assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Normalisation layer: a newline is a command separator, exactly like
+// `&&`/`;` -- the round-2 review's H1. A multi-line Bash call is the
+// ordinary shape of agent tool use, so a destructive command below the
+// first line must be caught the same way a chained one already is.
+
+test('destructive-git-guard: a destructive command on the SECOND LINE of a multi-line command is still caught (newline as a separator, H1)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('echo hi\ngit checkout -- README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+  assert.match(res.stderr, /README\.md/)
+})
+
+test('destructive-git-guard: a harmless command on the second line of a multi-line command that starts with a refusal is still allowed once the tree is clean', () => {
+  const dir = makeTempRepo()
+  const res = runHook(bashPayload('git status\ngit reset --hard', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git reset --hard on the second line of a multi-line command is refused on a dirty tree (newline, second guarded shape)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git status\ngit reset --hard', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Normalisation layer: git global options between the binary and the
+// subcommand must not hide the subcommand from the matcher (H2).
+
+test('destructive-git-guard: git -C <path> checkout -- <dirty file> is refused (global option between binary and subcommand, H2)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git -C . checkout -- README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git --no-pager checkout -- <dirty file> is refused (global option, H2)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git --no-pager checkout -- README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git -c <k>=<v> checkout -- <dirty file> is refused (global option with its own value, H2)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git -c foo.bar=baz checkout -- README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: an ABSOLUTE path to the git binary is still recognised by basename (H2)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const gitPath = sh('command -v git', dir).trim()
+  const res = runHook(bashPayload(`${gitPath} checkout -- README.md`, dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git -C <other dirty repo> checkout -- <path>, run from a CLEAN cwd, is refused against the -C target, not the payload cwd (H2 + M1)', () => {
+  const cleanDir = makeTempRepo()
+  const otherDir = makeTempRepo()
+  makeDirtyFile(otherDir)
+  const res = runHook(bashPayload(`git -C ${otherDir} checkout -- README.md`, cleanDir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git -C <path> checkout -- <clean file> is allowed (global option does not over-block)', () => {
+  const dir = makeTempRepo()
+  const res = runHook(bashPayload('git -C . checkout -- README.md', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Normalisation layer: bundled short flags (`-fq`) must still be
+// recognised as force (H5).
+
+test('destructive-git-guard: git checkout -fq <branch>, force bundled with an unrelated short flag, is refused on a dirty tree (H5)', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -fq other', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout -fb <new-branch>, force bundled with branch-creation, is refused on a dirty tree (H5, force overrides the -b carve-out even bundled)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -fb newbr', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git switch -fq <branch>, bundled force, is refused on a dirty tree (H5)', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git switch -fq other', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: a bundled short flag that does NOT include force (e.g. a hypothetical -q alone) does not falsely trigger tree-wide scoping on its own', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  const res = runHook(bashPayload('git checkout -q other', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: a pathspec after `--` that LOOKS like a bundled flag cluster (a file literally named -abc) is never shredded by bundle expansion', () => {
+  const dir = makeTempRepo()
+  const fs = require('node:fs')
+  fs.writeFileSync(path.join(dir, '-abc'), 'seed\n')
+  sh('git add -- -abc && git commit -q -m addit', dir)
+  fs.writeFileSync(path.join(dir, '-abc'), 'dirty\n')
+  const res = runHook(bashPayload('git checkout -- -abc', dir))
+  assert.equal(res.status, 2, `expected exit 2 (the file itself is dirty and must still be scoped as a path, not treated as flags), got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Normalisation layer: a shell redirect must not smuggle its target
+// into the pathspec list, and a pathspec git rejects must never become a
+// licence for the destructive command (M2).
+
+test('destructive-git-guard: git checkout -- <dirty file> > /dev/null is refused (redirect target dropped before scoping, M2)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -- README.md > /dev/null', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout -- <clean file> > /dev/null is allowed (redirect target dropped, no false block)', () => {
+  const dir = makeTempRepo()
+  const res = runHook(bashPayload('git checkout -- README.md > /dev/null', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: a pathspec git itself rejects (naming a path OUTSIDE the repository) does not fail the check open when the tree is genuinely dirty elsewhere (M2, narrowed fail-open)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -- /etc/hostname', dir))
+  assert.equal(res.status, 2, `expected exit 2 (retried tree-wide once the named pathspec was rejected), got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: a pathspec git itself rejects is still allowed when the tree is ACTUALLY clean (the tree-wide retry does not itself over-block)', () => {
+  const dir = makeTempRepo()
+  const res = runHook(bashPayload('git checkout -- /etc/hostname', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Normalisation layer: `--pathspec-from-file` reaches the same revert
+// with no non-flag token on the command line at all -- scoped tree-wide (L1).
+
+test('destructive-git-guard: git checkout --pathspec-from-file=<file> is refused on a dirty tree (no non-flag token to scope against, L1)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const fs = require('node:fs')
+  fs.writeFileSync(path.join(dir, 'paths.txt'), 'README.md\n')
+  const res = runHook(bashPayload('git checkout --pathspec-from-file=paths.txt', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout --pathspec-from-file=<file> is allowed on a clean tree', () => {
+  const dir = makeTempRepo()
+  const fs = require('node:fs')
+  fs.writeFileSync(path.join(dir, 'paths.txt'), 'README.md\n')
+  const res = runHook(bashPayload('git checkout --pathspec-from-file=paths.txt', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git restore --pathspec-from-file=<file> is refused on a dirty tree (same hole, restore branch, L1)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const fs = require('node:fs')
+  fs.writeFileSync(path.join(dir, 'paths.txt'), 'README.md\n')
+  const res = runHook(bashPayload('git restore --pathspec-from-file=paths.txt', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Escape hatch, tightened (H4): a genuine env-prefix assignment on the
+// SAME segment still opts out; a textual mention anywhere else in the
+// command -- quoted, commented, or prefixed to a DIFFERENT segment -- must
+// not disarm a refusal it was never meant to cover.
+
+test('destructive-git-guard: the escape hatch as a genuine env-prefix on the SAME segment still allows the command (control, must not regress)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload(`${ESCAPE_VAR}=1 git checkout -- README.md`, dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: the escape hatch variable QUOTED inside an unrelated command does NOT disarm a later destructive segment (H4)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload(`echo "${ESCAPE_VAR}=1" && git checkout -- README.md`, dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: the escape hatch variable mentioned in a trailing shell COMMENT does NOT disarm the command it is appended to (H4)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload(`git checkout -- README.md   # ${ESCAPE_VAR}=1`, dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: the escape hatch, set as an env-prefix on a DIFFERENT segment, does NOT disarm a destructive command on a later segment (H4)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload(`${ESCAPE_VAR}=1 git status && git checkout -- README.md`, dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: the escape hatch variable named inside a grep\'s search text does NOT disarm a destructive command chained after it (H4)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload(`grep -rn "${ESCAPE_VAR}=1" . ; git checkout -- README.md`, dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- `cd` in the same chain (M1): scope against the `cd` target, not the
+// payload cwd. Closes both a bypass (target repo's dirt was invisible) and
+// a false positive (an unrelated repo's dirt caused a refusal for a
+// command that never touched it).
+
+test('destructive-git-guard: cd <other dirty repo> && git checkout -- <path> is refused against the cd TARGET, even though the payload cwd is clean (M1 bypass direction)', () => {
+  const cleanDir = makeTempRepo()
+  const dirtyDir = makeTempRepo()
+  makeDirtyFile(dirtyDir)
+  const res = runHook(bashPayload(`cd ${dirtyDir} && git checkout -- README.md`, cleanDir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: cd /tmp && git checkout -- <path> is ALLOWED when the payload cwd is dirty but /tmp is not what the command touches (M1 false-positive direction)', () => {
+  const dirtyDir = makeTempRepo()
+  makeDirtyFile(dirtyDir)
+  const res = runHook(bashPayload('cd /tmp && git checkout -- README.md', dirtyDir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: cd into a clean RELATIVE subdirectory then a destructive command is allowed (cd target resolved and genuinely clean)', () => {
+  const dir = makeTempRepo()
+  const fs = require('node:fs')
+  fs.mkdirSync(path.join(dir, 'sub'))
+  const res = runHook(bashPayload('cd sub && git status', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: cd "$SOME_VAR" && git checkout -- <path> is refused -- the target cannot be resolved statically, so the guard fails closed rather than judging an unknown directory (M1)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('cd "$SOME_VAR" && git checkout -- README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: cd - && git checkout -- <path> is refused -- "the previous directory" is not statically resolvable either (M1)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('cd - && git checkout -- README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: an unresolvable cd followed by a HARMLESS git command is still allowed (the fail-closed direction only applies to guarded shapes)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('cd "$SOME_VAR" && git status', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Counterweight floor (must all stay ALLOWED): additional shapes named
+// explicitly in the round-2 brief that had no dedicated test yet.
+
+test('destructive-git-guard: git log --oneline is never intercepted, even on a dirty tree', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git log --oneline', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git add <file> is never intercepted, even on a dirty tree', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git add README.md', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git stash is never intercepted, even on a dirty tree', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git stash', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: grep -r checkout . is never intercepted (not a git invocation at all)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('grep -r checkout .', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout -B <branch> is allowed even on a dirty tree (branch creation/reset-to, not a restore)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -B another-branch', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git commit -m "git checkout README.md" is never intercepted (destructive-looking text stays inside its own quoted argument)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  sh('git add README.md', dir)
+  const res = runHook(bashPayload('git commit -m "git checkout README.md"', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Restore's short-flag spellings (L2): implemented (they normalize
+// through the same bundled-flag path as checkout/switch) but previously had
+// no dedicated test of their own.
+
+test('destructive-git-guard: git restore -S <staged dirty file> (short form of --staged) is allowed -- it only unstages', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  sh('git add README.md', dir)
+  const res = runHook(bashPayload('git restore -S README.md', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git restore -W <dirty file> (short form of --worktree) IS refused -- it touches the working tree', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git restore -W README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- M3: the hook's own duplicated GIT_* allowlist must not silently
+// drift from test/helpers/git-env.js's, and a leaked GIT_DIR/GIT_WORK_TREE
+// must still be stripped before the status check that decides refusal.
+
+test('destructive-git-guard: a leaked GIT_DIR/GIT_WORK_TREE pointed at a second, CLEAN repo does not fool the guard into reading that repo instead of the dirty cwd (M3)', () => {
+  const dirtyDir = makeTempRepo()
+  makeDirtyFile(dirtyDir)
+  const cleanDir = makeTempRepo()
+  const res = spawnSync('python3', [HOOK_PATH], {
+    input: JSON.stringify(bashPayload('git checkout -- README.md', dirtyDir)),
+    encoding: 'utf8',
+    // Deliberately NOT sanitizedGitEnv() here: that helper strips GIT_* from
+    // the env it builds, which would prevent this test from ever reaching
+    // the hook's OWN stripping logic. This constructs the leaked-GIT_DIR
+    // environment directly, exactly as a real leaked variable would arrive.
+    env: { ...process.env, GIT_DIR: path.join(cleanDir, '.git'), GIT_WORK_TREE: cleanDir },
+    timeout: 10000,
+  })
+  assert.equal(res.status, 2, `expected exit 2 (the hook must strip GIT_DIR/GIT_WORK_TREE before its own status check), got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: the hook\'s duplicated GIT_ENV_ALLOWLIST is identical to test/helpers/git-env.js\'s GIT_ENV_ALLOWLIST (M3, drift guard on the deliberate duplication)', () => {
+  const { GIT_ENV_ALLOWLIST } = require('./helpers/git-env.js')
+  const pyResult = spawnSync('python3', ['-c',
+    'import importlib.util, json, sys\n' +
+    'spec = importlib.util.spec_from_file_location("hook", sys.argv[1])\n' +
+    'hook = importlib.util.module_from_spec(spec)\n' +
+    'spec.loader.exec_module(hook)\n' +
+    'print(json.dumps(sorted(hook.GIT_ENV_ALLOWLIST)))\n',
+    HOOK_PATH,
+  ], { encoding: 'utf8' })
+  assert.equal(pyResult.status, 0, `failed to introspect the hook's allowlist: ${pyResult.stderr}`)
+  const pyAllowlist = JSON.parse(pyResult.stdout)
+  assert.deepEqual(pyAllowlist, [...GIT_ENV_ALLOWLIST].sort(), 'hooks/destructive-git-guard.py\'s GIT_ENV_ALLOWLIST has drifted from test/helpers/git-env.js\'s -- both must name the same set deliberately, see the duplication comment in the hook')
 })

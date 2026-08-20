@@ -909,3 +909,61 @@ test('static: README documents how to activate the gate, and says plainly that C
   assert.match(readme, /silent|silently/i, 'README must state that an unset hooksPath fails silently, which is why this is easy to miss')
   assert.match(readme, /backstop|CI is the/i, 'README must state that CI, not the hook, is what actually gates for everyone else')
 })
+
+// --- H6 (round-2 destructive-git-guard review): hooks/hooks.json's
+// registration is the wiring that makes a hook run AT ALL, and nothing in
+// test/destructive-git-guard.test.js can see it -- those tests all invoke
+// hooks/destructive-git-guard.py directly by path (runHook() in that file),
+// which is structurally incapable of noticing the registration itself is
+// missing, malformed, or points at a file that does not exist. Measured:
+// deleting the entire PreToolUse block from hooks/hooks.json left all 743
+// pre-existing tests green. This is the standard's own "correct in source,
+// absent from the artefact that runs" class (§11) applied to the wiring
+// rather than the logic, and its failure mode is the exact loss the guard
+// exists to prevent: a silently inert PreToolUse hook.
+//
+// Set-based rather than a fixed list of expected entries, so adding a NEW
+// hook script under hooks/ without wiring it into hooks.json fails this
+// test by name, instead of the omission being invisible until an operator
+// notices the hook never runs.
+test('static: every hooks/*.py script is registered in hooks/hooks.json, and every hooks.json entry names a script that actually exists (H6, registration wiring)', () => {
+  const hooksDir = path.join(ROOT, 'hooks')
+  const pyFiles = new Set(
+    fs.readdirSync(hooksDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.py'))
+      .map((e) => e.name)
+  )
+  assert.ok(pyFiles.size >= 2, `sanity: expected at least the two known hook scripts under hooks/, found ${pyFiles.size}`)
+
+  const raw = readAll('hooks', 'hooks.json')
+  let parsed
+  assert.doesNotThrow(() => { parsed = JSON.parse(raw) }, 'hooks/hooks.json must be valid JSON')
+
+  const registeredNames = new Set()
+  const entries = [] // { event, matcher, scriptPath }
+  for (const [event, matcherGroups] of Object.entries(parsed.hooks || {})) {
+    assert.ok(Array.isArray(matcherGroups), `hooks.json's "${event}" key must be an array of matcher groups`)
+    for (const group of matcherGroups) {
+      for (const hook of group.hooks || []) {
+        assert.ok(Array.isArray(hook.args) && hook.args.length > 0, `every hook command in hooks.json must have a non-empty args array (event=${event})`)
+        const resolved = hook.args[0].replace('${CLAUDE_PLUGIN_ROOT}', ROOT)
+        assert.ok(fs.existsSync(resolved), `hooks.json (event=${event}) points args[0] at ${resolved}, which does not exist`)
+        assert.ok(fs.statSync(resolved).isFile(), `hooks.json (event=${event}) points args[0] at ${resolved}, which is not a file`)
+        entries.push({ event, matcher: group.matcher, scriptPath: resolved })
+        registeredNames.add(path.basename(resolved))
+      }
+    }
+  }
+
+  assert.deepEqual(
+    [...pyFiles].sort(),
+    [...registeredNames].sort(),
+    `hooks/*.py and hooks.json's registered scripts must be the SAME set. hooks/ has: ${[...pyFiles].sort()}; hooks.json registers: ${[...registeredNames].sort()}. ` +
+      'A hook script that exists but is not registered will never run; a registration pointing at a script that no longer exists is dead configuration.'
+  )
+
+  const guardEntry = entries.find((e) => e.scriptPath.endsWith('destructive-git-guard.py'))
+  assert.ok(guardEntry, 'destructive-git-guard.py must be registered in hooks.json')
+  assert.equal(guardEntry.event, 'PreToolUse', 'destructive-git-guard.py must be registered under PreToolUse')
+  assert.equal(guardEntry.matcher, 'Bash', 'destructive-git-guard.py\'s PreToolUse matcher must be "Bash" -- a wrong or missing matcher means it never sees a Bash call at all')
+})

@@ -358,6 +358,8 @@ prevent it, so the rule is now a mechanism:
   e.g. `git checkout HEAD <path>`, is handled the same way), `git checkout
   .`, `git checkout -f`/`--force` and `git switch
   -f`/`--force`/`--discard-changes` (tree-wide, like `git reset --hard`),
+  `git checkout --pathspec-from-file=...`/`git restore --pathspec-from-file=...`
+  (tree-wide: the paths never appear on the command line to scope against),
   `git restore <path>` (unless it is `--staged` alone, which only
   unstages), and `git reset --hard` whenever the working tree, or the named
   paths, actually have something to lose. `git status` decides that on
@@ -369,10 +371,43 @@ prevent it, so the rule is now a mechanism:
   exit code 2 with the reason on stderr (the one PreToolUse exit code Claude
   Code treats as blocking) and names the safe alternative: copy the file to
   a scratch path first, or `git stash`.
+- **Normalisation layer**, between the raw shell string and the matcher
+  above (added after a review found eight distinct spellings of the same
+  guarded commands walking straight past it): a bare newline separates
+  commands exactly like `&&`/`;`, so a destructive call on any line of a
+  multi-line Bash tool call is still caught; a shell redirect (`>`,
+  `2>`, ...) and its target are dropped before anything can be read as a
+  pathspec; `git` is recognised by binary basename, so `/usr/bin/git` and a
+  prefixed form like `git -C <dir> checkout -- <path>` still reach the
+  matcher, and `-C`'s directory becomes the one the safety check actually
+  runs against; a bundled short-flag cluster (`git checkout -fq`) is
+  expanded so `-f` is still seen as force. A `cd <path>` earlier in the same
+  command changes which directory later segments are scoped against, so
+  `cd <dir> && git checkout -- <path>` is judged against `<dir>`, not the
+  tool call's own working directory -- and when that target cannot be
+  resolved without actually running a shell (a variable, `cd -`, a bare
+  `cd`), the guard refuses rather than guessing.
 - **Escape hatch**: for a revert that is genuinely deliberate, set
-  `HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, either inline in the command
+  `HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, either as this hook process's own
+  environment (exported for the session) or as a genuine env-prefix
+  assignment on the SAME command segment as the destructive call
   (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- file`, ordinary shell
-  env-prefix syntax) or exported for the session.
+  env-prefix syntax). This is deliberately not a text search over the whole
+  command: a quoted mention, a code comment, or an assignment that prefixes
+  a different, unrelated segment on the same line must not disarm a refusal
+  it was never meant to cover.
+- **Deliberately out of scope**: this hook does not intercept `git clean`
+  (`-f`/`-x`/`-d` in any combination), `git stash drop`, `git worktree
+  remove --force`, `git branch -D`, or any command reached through a
+  subshell, backtick, here-doc or unbalanced quote the tokenizer cannot
+  parse (all fail open by design -- see the module docstring). All of these
+  can destroy content with no copy anywhere in git; an aggressive `git
+  clean` (force, untracked directories and ignored files together) doing
+  exactly that to a whole `.claude/` directory is recorded in
+  `specs/harn-opt-3.md`'s AC-DATA-5. Untracked files generally are outside
+  this guard's scope: none of the commands it DOES intercept can lose an
+  untracked file, but that is not the same claim as "nothing here can lose
+  one" -- know the boundary before relying on it.
 
 Installing as a plugin wires the hook automatically. For manual installs,
 copy the hook and add to `~/.claude/settings.json`:
@@ -866,7 +901,7 @@ invoking real subagents.
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `skills/optimise-cycle/` | Usage, cadence, report format and the proposal-decision recording protocol for the delivery optimiser |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
-| `hooks/destructive-git-guard.py` | PreToolUse hook refusing a Bash `git checkout --`/`checkout .`/`restore`/`reset --hard` that would discard uncommitted work |
+| `hooks/destructive-git-guard.py` | PreToolUse hook refusing the enumerated `git checkout`/`switch`/`restore`/`reset --hard` shapes (see "Destructive git guard" above) that would discard uncommitted TRACKED work -- not a general destructive-git guard: `git clean`, `stash drop` and similar are explicitly out of scope |
 | `test/` | This repo's own test suite (`node --test test/*.test.js`); see "Tests" above |
 
 ## Cost and proportionality

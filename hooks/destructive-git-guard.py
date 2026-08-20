@@ -13,7 +13,9 @@ Guarded shapes: `git checkout -- <path>`, a bare `git checkout <path>` (no
 own precedence, matched here rather than assumed), `git checkout HEAD
 <path>` (leading ref, trailing paths, no `--`), `git checkout .`, `git
 checkout -f`/`--force` and `git switch -f`/`--force`/`--discard-changes`
-(tree-wide, like `git reset --hard`), `git restore <path>` (unless it is
+(tree-wide, like `git reset --hard`), `git checkout --pathspec-from-file=...`
+and `git restore --pathspec-from-file=...` (tree-wide: the paths are not on
+the command line to scope against), `git restore <path>` (unless it is
 `--staged` alone, which only unstages), and `git reset --hard`. Nothing else
 -- see README.md for the exact list this hook is scoped to and why it
 deliberately does not intercept `git checkout -b` or a bare
@@ -25,9 +27,13 @@ that blocks harmless commands gets disabled, and that is worse than no guard
 (AGENT-HARNESS.md's exit condition makes the same point about noise).
 
 Escape hatch: HARNESS_ALLOW_DESTRUCTIVE_GIT=1, set either as this hook
-process's own environment, or inline in the command using ordinary shell
-env-prefix syntax (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- file`),
-for a revert that is genuinely deliberate. See README.md.
+process's own environment (opts out every segment), or as a genuine
+env-prefix assignment on the SAME segment as the destructive command
+(`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- file`, ordinary shell
+env-prefix syntax). Deliberately NOT a substring search over the raw command
+string: that would let a quoted mention, a code comment, or an assignment
+scoped to an unrelated segment on the same line disarm a command it was
+never meant to cover. See README.md.
 
 Contract: PreToolUse, matcher "Bash" (see hooks/hooks.json). Per Claude
 Code's documented hook contract, exit code 2 is the one exit code that
@@ -36,12 +42,50 @@ any other non-zero exit is silently ignored and the command proceeds -- so
 this hook must exit with exactly 2 to refuse, never 1 or an uncaught
 exception's implicit 1.
 
+Normalisation layer, between the raw shell string and the matcher (the root
+cause a round-2 review found: eight distinct bypasses were eight symptoms of
+this one missing stage, not eight independent holes). Applied per segment,
+in order:
+
+  1. Segment on `&&`, `||`, `;`, `|`, `&` AND a bare newline -- a multi-line
+     Bash call is the ordinary shape of agent tool use, and a destructive
+     command on any line but the first must be caught exactly like one
+     chained with `&&`.
+  2. Drop shell redirection operators (`>`, `>>`, `<`, `<<`, `&>`, `&>>`,
+     with an optional leading fd digit) and the token immediately after
+     each -- a redirect target must never be read as a pathspec.
+  3. Strip a leading run of `VAR=value` env-prefix assignments.
+  4. Strip a leading run of shell keywords and grouping tokens (`if`,
+     `then`, `else`, `elif`, `do`, `done`, `{`, `(`, `)`, `!`, `time`) so the
+     real command head is found underneath a conditional or loop wrapper.
+  5. Recognise `git` by basename (`/usr/bin/git`, not just a literal `git`
+     token), and consume git's own global options between the binary and
+     the subcommand (`-C <path>`, `--git-dir[=]`, `--work-tree[=]`,
+     `-c <kv>`, `--no-pager`, `-p`/`--paginate`, `--exec-path[=]`) so a
+     prefixed invocation still reaches the matcher. `-C <path>` also moves
+     the effective directory the scope check runs against, chained across
+     repeated `-C`s exactly like git itself.
+  6. Expand a bundled short-flag cluster (`-fq` -> `-f`, `-q`) on the
+     tokens preceding any `--` pathspec separator, never on pathspec tokens
+     themselves (a file legitimately named `-abc` must not be shredded).
+
+A `cd <path>` segment updates the effective directory used by every later
+segment in the same command, so `cd <dir> && git ...` is scoped against
+`<dir>` rather than the payload `cwd` -- this closes both a bypass (the
+target repo's dirt was invisible) and a false positive (an unrelated repo's
+dirt caused a refusal for a command that never touched it). When the target
+cannot be resolved statically (a variable, a glob, a bare `cd` with no
+argument, `cd -`), later segments are refused rather than judged against a
+directory that might be wrong -- irrecoverable data loss outranks avoiding a
+false positive here, unlike the resolvable case above.
+
 Parsing is a pragmatic shell tokenizer (shlex with punctuation_chars), not a
-full shell grammar: it splits on unquoted &&, ||, ; and | so a destructive
-command chained after something harmless is still caught, and it never
-mistakes a quoted string that merely CONTAINS destructive-looking text (e.g.
-`git commit -m "git checkout -- foo"`) for a real invocation, because that
-text stays inside its own token instead of becoming a second command. Shapes
+full shell grammar: it splits on unquoted `&&`, `||`, `;`, `|`, `&` and a
+bare newline so a destructive command chained after something harmless (on
+the same line or the next one) is still caught, and it never mistakes a
+quoted string that merely CONTAINS destructive-looking text (e.g. `git
+commit -m "git checkout -- foo"`) for a real invocation, because that text
+stays inside its own token instead of becoming a second command. Shapes
 shlex cannot represent (subshells, backticks, here-docs, unbalanced quotes)
 fall through ALLOWED: this hook only ever blocks a pattern it can positively
 identify, never a command it merely failed to parse.
@@ -54,9 +98,28 @@ import subprocess
 import sys
 
 ESCAPE_VAR = 'HARNESS_ALLOW_DESTRUCTIVE_GIT'
-ESCAPE_INLINE_RE = re.compile(r'(?<![\w])' + re.escape(ESCAPE_VAR) + r'=1(?![\w])')
 
-CONTROL_OPERATORS = ('&&', '||', ';', '|', '&')
+CONTROL_OPERATORS = ('&&', '||', ';', '|', '&', '\n')
+
+# '\n' added to the punctuation set (default is '();<>|&') so a bare newline
+# becomes its own token instead of being swallowed as ordinary whitespace or
+# glued onto an adjacent word -- see split_segments().
+PUNCTUATION_CHARS = '();<>|&\n'
+
+REDIRECT_OPERATORS = ('>', '>>', '<', '<<', '&>', '&>>')
+
+ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+
+# Leading shell keywords/grouping tokens that can sit in front of the real
+# command head. Not an attempt at a full shell grammar (see module
+# docstring) -- just enough to find `git` underneath the common wrappers an
+# agent actually emits (`if ... ; then git ...`, `for f in ...; do git ...`).
+SHELL_KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'done', 'fi', '{', '(', ')', '!', 'time'}
+
+# Git global options that can appear between the binary and the subcommand.
+# Each entry: does it consume a separate following token as its value?
+GIT_GLOBAL_OPTS_WITH_VALUE = ('-C', '--git-dir', '--work-tree', '-c', '--exec-path')
+GIT_GLOBAL_OPTS_NO_VALUE = ('--no-pager', '-p', '--paginate')
 
 # Same allowlist as test/helpers/git-env.js, deliberately duplicated rather
 # than imported: this is a production hook, not test infrastructure, and
@@ -71,6 +134,11 @@ GIT_ENV_ALLOWLIST = {
     'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE',
 }
 
+# A sentinel, not None: `effective cwd is unknown` must be distinguishable
+# from `effective cwd is the current directory`, and must never be handed to
+# subprocess.run(cwd=...) by accident (it deliberately is not a valid path).
+UNRESOLVED_CWD = '\x00destructive-git-guard:unresolved-cwd\x00'
+
 
 def sanitized_git_env():
     env = dict(os.environ)
@@ -80,19 +148,23 @@ def sanitized_git_env():
     return env
 
 
-def escape_hatch_active(command):
-    if os.environ.get(ESCAPE_VAR) == '1':
-        return True
-    return bool(ESCAPE_INLINE_RE.search(command))
-
-
 def split_segments(command):
-    """Tokenise `command`, splitting on unquoted shell control operators.
-    Returns a list of token lists, one per sub-command. Raises ValueError
-    (via shlex) on unparseable input such as unbalanced quotes, which the
-    caller treats as fail-open."""
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    """Tokenise `command`, splitting on unquoted shell control operators,
+    INCLUDING a bare newline (see module docstring: a multi-line Bash call
+    is the ordinary shape of agent tool use, and a destructive command on
+    any line but the first must be caught exactly like one chained with
+    `&&`). Returns a list of token lists, one per sub-command. Raises
+    ValueError (via shlex) on unparseable input such as unbalanced quotes,
+    which the caller treats as fail-open."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=PUNCTUATION_CHARS)
     lexer.whitespace_split = True
+    # shlex's default `whitespace` includes '\n' and would silently consume
+    # it during the whitespace-skip that runs BEFORE punctuation_chars is
+    # ever consulted, so a newline never reaches the lexer as a token no
+    # matter what punctuation_chars says. Removing it from `whitespace`
+    # (leaving space/tab there) is what makes it surface as its own token
+    # via PUNCTUATION_CHARS below, instead of being silently swallowed.
+    lexer.whitespace = ' \t'
     tokens = list(lexer)
     segments = [[]]
     for tok in tokens:
@@ -103,13 +175,165 @@ def split_segments(command):
     return [seg for seg in segments if seg]
 
 
+def strip_redirects(tokens):
+    """Drop a shell redirection operator and the token immediately after it
+    (the redirect target), so `git checkout -- README.md > /dev/null` is
+    scoped identically to the same command without the redirect. Handles an
+    optional leading fd digit (`2> /dev/null`), which shlex tokenises as a
+    separate token from the operator regardless of whether the original
+    command had a space there."""
+    out = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if re.fullmatch(r'\d+', tok) and i + 1 < n and tokens[i + 1] in REDIRECT_OPERATORS:
+            i += 2  # fd digit + operator
+            if i < n:
+                i += 1  # redirect target
+            continue
+        if tok in REDIRECT_OPERATORS:
+            i += 1  # operator
+            if i < n:
+                i += 1  # redirect target
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def strip_env_prefix(tokens):
     """Drop leading `VAR=value` assignments so tokens[0] is the command
     itself, matching ordinary shell env-prefix syntax."""
     i = 0
-    while i < len(tokens) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', tokens[i]):
+    while i < len(tokens) and ENV_ASSIGNMENT_RE.match(tokens[i]):
         i += 1
     return tokens[i:]
+
+
+def leading_env_assignments(tokens):
+    """The leading `VAR=value` tokens of `tokens`, unparsed -- the same
+    leading run strip_env_prefix() consumes, returned instead of dropped, so
+    the escape hatch can inspect exactly the assignments that apply to THIS
+    segment's command (see escape_hatch_active_for_segment)."""
+    i = 0
+    out = []
+    while i < len(tokens) and ENV_ASSIGNMENT_RE.match(tokens[i]):
+        out.append(tokens[i])
+        i += 1
+    return out
+
+
+def escape_hatch_active_for_segment(tokens):
+    """True if HARNESS_ALLOW_DESTRUCTIVE_GIT=1 is a genuine env-prefix
+    assignment on THIS segment (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git
+    checkout -- file`). Deliberately does not search the raw command text:
+    a quoted mention, a code comment, or an assignment prefixed to a
+    DIFFERENT segment on the same line must not disarm this one. The
+    process-environment form (exported for the session) is checked once in
+    evaluate(), not here, since it is not segment-scoped."""
+    for assignment in leading_env_assignments(tokens):
+        name, _, value = assignment.partition('=')
+        if name == ESCAPE_VAR and value == '1':
+            return True
+    return False
+
+
+def strip_shell_keywords(tokens):
+    """Drop a leading run of shell keywords/grouping tokens so the real
+    command head is found underneath a conditional or loop wrapper (`if
+    true; then git checkout -- x; fi` segments to `['then', 'git', ...]`
+    after control-operator splitting; this drops the `then`)."""
+    i = 0
+    while i < len(tokens) and tokens[i] in SHELL_KEYWORDS:
+        i += 1
+    return tokens[i:]
+
+
+def is_git_binary(token):
+    """True for `git`, `/usr/bin/git`, or any other path whose basename is
+    exactly `git` -- an agent's own instructions in this harness prefer
+    absolute paths, and the strict `tokens[0] != 'git'` check that used to
+    live here made the more disciplined invocation the unguarded one."""
+    return os.path.basename(token) == 'git'
+
+
+def join_cwd(base, target):
+    """Resolve `target` against `base`, unless `base` is itself unresolved
+    -- in which case only an ABSOLUTE target can re-establish a known
+    directory (a relative path has no known base to join against)."""
+    if base is UNRESOLVED_CWD:
+        return target if os.path.isabs(target) else UNRESOLVED_CWD
+    return os.path.normpath(os.path.join(base, target))
+
+
+def parse_git_invocation(tokens, cwd):
+    """Given a segment's tokens (already redirect-stripped, env-prefix-
+    stripped and shell-keyword-stripped), return (subcmd, rest,
+    effective_cwd) if `tokens[0]` is a git binary, else None.
+    `effective_cwd` starts as `cwd` and is updated by any `-C <path>`
+    global option encountered (chained, exactly like git itself)."""
+    if not tokens or not is_git_binary(tokens[0]):
+        return None
+    i = 1
+    n = len(tokens)
+    effective_cwd = cwd
+    while i < n:
+        tok = tokens[i]
+        if tok == '-C':
+            if i + 1 >= n:
+                return None  # malformed global option; nothing to guard
+            effective_cwd = join_cwd(effective_cwd, tokens[i + 1])
+            i += 2
+            continue
+        matched = False
+        for opt in GIT_GLOBAL_OPTS_WITH_VALUE:
+            if tok == opt:
+                i += 2
+                matched = True
+                break
+            if tok.startswith(opt + '='):
+                i += 1
+                matched = True
+                break
+        if matched:
+            continue
+        if tok in GIT_GLOBAL_OPTS_NO_VALUE:
+            i += 1
+            continue
+        break
+    if i >= n:
+        return None
+    return tokens[i], tokens[i + 1:], effective_cwd
+
+
+def expand_bundled_short_flags(tokens):
+    """`-fq` -> `-f`, `-q`. Applied only to tokens that are ENTIRELY a
+    single dash followed by letters (so `--force` is untouched: the second
+    character is `-`, not a letter). The caller is responsible for never
+    applying this past a `--` pathspec separator (see normalize_rest)."""
+    out = []
+    for tok in tokens:
+        if re.fullmatch(r'-[A-Za-z]+', tok):
+            out.extend('-' + ch for ch in tok[1:])
+        else:
+            out.append(tok)
+    return out
+
+
+def normalize_rest(rest):
+    """Expand bundled short flags in `rest`, WITHOUT touching anything past
+    a `--` pathspec separator -- a file genuinely named `-abc` must survive
+    untouched. Safe to call unconditionally: only dash-prefixed tokens
+    before `--` are ever rewritten."""
+    if '--' in rest:
+        sep = rest.index('--')
+        return expand_bundled_short_flags(rest[:sep]) + ['--'] + rest[sep + 1:]
+    return expand_bundled_short_flags(rest)
+
+
+def has_pathspec_from_file(rest):
+    return any(t == '--pathspec-from-file' or t.startswith('--pathspec-from-file=') for t in rest)
 
 
 def resolve_as_ref(cwd, arg):
@@ -122,6 +346,8 @@ def resolve_as_ref(cwd, arg):
     this returns False (not a ref), the fail-open direction: it hands the
     argument to the pathspec path, where has_uncommitted_change() still only
     blocks if `git status` itself finds a real uncommitted change in scope."""
+    if cwd is UNRESOLVED_CWD:
+        return False  # never subprocess into a sentinel; caller fails closed on scope instead
     try:
         result = subprocess.run(
             ['git', 'rev-parse', '--verify', '--quiet', '%s^{commit}' % arg],
@@ -133,16 +359,20 @@ def resolve_as_ref(cwd, arg):
     return result.returncode == 0
 
 
-def destructive_scope(tokens, cwd):
-    """Return ('paths', [paths]) or ('tree', None) if `tokens` (one already
-    env-stripped sub-command) is one of the guarded shapes, or None if it is
-    not. `cwd` is needed to resolve an ambiguous checkout argument as a ref
-    vs. a pathspec (see resolve_as_ref)."""
-    if not tokens or tokens[0] != 'git' or len(tokens) < 2:
-        return None
-    subcmd, rest = tokens[1], tokens[2:]
+def destructive_scope(subcmd, rest, cwd):
+    """Return ('paths', [paths]) or ('tree', None) if `subcmd`/`rest` (a
+    git invocation already stripped of global options) is one of the
+    guarded shapes, or None if it is not. `cwd` is needed to resolve an
+    ambiguous checkout argument as a ref vs. a pathspec (see
+    resolve_as_ref)."""
+    rest = normalize_rest(rest)
 
     if subcmd == 'checkout':
+        if has_pathspec_from_file(rest):
+            # The paths are not on the command line at all, so there is
+            # nothing to scope a per-path check against -- treat the whole
+            # tree as at risk, same as a forced checkout.
+            return ('tree', None)
         if '--' in rest:
             paths = rest[rest.index('--') + 1:]
             return ('paths', paths) if paths else None
@@ -177,6 +407,8 @@ def destructive_scope(tokens, cwd):
         return None  # a plain switch git itself refuses if it would overwrite
 
     if subcmd == 'restore':
+        if has_pathspec_from_file(rest):
+            return ('tree', None)
         staged = '--staged' in rest or '-S' in rest
         worktree = '--worktree' in rest or '-W' in rest
         if staged and not worktree:
@@ -198,7 +430,15 @@ def destructive_scope(tokens, cwd):
 def has_uncommitted_change(cwd, scope):
     """True if `git status --porcelain`, scoped per `scope`, shows a TRACKED
     change (staged or unstaged). A purely untracked ('??') entry is not
-    counted: none of the four guarded commands can lose an untracked file."""
+    counted: none of the four guarded commands can lose an untracked file.
+
+    When `scope` names paths and `git status` REJECTS one of them (e.g. a
+    redirect target that survived segmentation and now names a path outside
+    the repository), this does not conclude "clean": it retries scoped to
+    the whole tree instead, so a pathspec git refuses can never become a
+    licence to run the destructive command. The fail-open branch below (a
+    non-zero exit from the TREE-WIDE retry) is reserved for the case it was
+    actually designed for: `cwd` itself is not a usable git repository."""
     kind, arg = scope
     cmd = ['git', 'status', '--porcelain']
     if kind == 'paths':
@@ -211,7 +451,9 @@ def has_uncommitted_change(cwd, scope):
     except (OSError, subprocess.SubprocessError):
         return False  # cannot confirm risk; fail open, see module docstring
     if result.returncode != 0:
-        return False
+        if kind == 'paths':
+            return has_uncommitted_change(cwd, ('tree', None))
+        return False  # cwd itself is not a usable repo; fail open
     for line in result.stdout.splitlines():
         if not line.startswith('??'):
             return True
@@ -227,21 +469,72 @@ REFUSAL = (
     "session."
 )
 
+CD_UNRESOLVED_REFUSAL = (
+    "destructive-git-guard: refused `{cmd}` -- a preceding `cd` in this same "
+    "command targets a directory this hook cannot resolve statically (a "
+    "variable, a command substitution, `cd` with no argument, or `cd -`), "
+    "so it cannot confirm the directory this command will actually run in "
+    "is clean. Re-run with a literal path in the `cd`, or opt in "
+    "explicitly: {var}=1 set inline or exported for the session."
+)
+
+
+def classify_cd(tokens):
+    """If `tokens` (already redirect/env/keyword-stripped) is a `cd`
+    invocation, return ('static', path) when the target is a literal
+    argument safe to resolve, or ('dynamic', None) when it is not (missing
+    argument, `cd -`, or a token containing shell expansion this tokenizer
+    does not evaluate: `$`, backticks). Returns None if this is not a `cd`
+    segment at all."""
+    if not tokens or tokens[0] != 'cd':
+        return None
+    args = tokens[1:]
+    if len(args) != 1:
+        return ('dynamic', None)  # bare `cd` (home dir) or extra args: not modelled
+    target = args[0]
+    if target == '-' or '$' in target or '`' in target:
+        return ('dynamic', None)
+    return ('static', target)
+
 
 def evaluate(command, cwd):
     """Return a refusal message, or None to allow `command`."""
-    if escape_hatch_active(command):
+    if os.environ.get(ESCAPE_VAR) == '1':
         return None
     try:
         segments = split_segments(command)
     except ValueError:
         return None  # unparseable; fail open, see module docstring
-    for tokens in segments:
-        scope = destructive_scope(strip_env_prefix(tokens), cwd)
+
+    effective_cwd = cwd
+    for raw_tokens in segments:
+        tokens = strip_redirects(raw_tokens)
+
+        cd = classify_cd(strip_shell_keywords(strip_env_prefix(tokens)))
+        if cd is not None:
+            kind, target = cd
+            effective_cwd = UNRESOLVED_CWD if kind == 'dynamic' else join_cwd(effective_cwd, target)
+            continue
+
+        if escape_hatch_active_for_segment(tokens):
+            continue
+
+        head = strip_shell_keywords(strip_env_prefix(tokens))
+        parsed = parse_git_invocation(head, effective_cwd)
+        if parsed is None:
+            continue
+        subcmd, rest, segment_cwd = parsed
+
+        scope = destructive_scope(subcmd, rest, segment_cwd)
         if scope is None:
             continue
-        if has_uncommitted_change(cwd, scope):
-            return REFUSAL.format(cmd=' '.join(tokens), var=ESCAPE_VAR)
+
+        display_cmd = ' '.join(head)
+        if effective_cwd is UNRESOLVED_CWD:
+            return CD_UNRESOLVED_REFUSAL.format(cmd=display_cmd, var=ESCAPE_VAR)
+
+        if has_uncommitted_change(segment_cwd, scope):
+            return REFUSAL.format(cmd=display_cmd, var=ESCAPE_VAR)
     return None
 
 
