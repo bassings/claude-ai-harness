@@ -198,3 +198,167 @@ test('destructive-git-guard: the refusal message names a safe alternative (scrat
   assert.match(res.stderr, /stash/i)
   assert.match(res.stderr, new RegExp(ESCAPE_VAR))
 })
+
+// --- Bare pathspec (no `--`): `git checkout <file>` is shorter than
+// `git checkout -- <file>` and is the form an agent is more likely to type.
+// Measured against a real repo (see docs/destructive-git-guard-mutation-proofs.md):
+// git resolves a single checkout argument as a REF if one matches, and as a
+// PATHSPEC only if no ref matches -- these tests pin that precedence.
+
+test('destructive-git-guard: git checkout <dirty file>, bare pathspec with no --, is refused', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+  assert.match(res.stderr, /README\.md/)
+})
+
+test('destructive-git-guard: git checkout <clean file>, bare pathspec with no --, is allowed', () => {
+  const dir = makeTempRepo()
+  const res = runHook(bashPayload('git checkout README.md', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout <dir>/, bare directory pathspec, is refused when a tracked file under it is dirty', () => {
+  const dir = makeTempRepo()
+  const fs = require('node:fs')
+  fs.mkdirSync(path.join(dir, 'src'))
+  fs.writeFileSync(path.join(dir, 'src', 'a.txt'), 'seed\n')
+  sh('git add src/a.txt && git commit -q -m addsrc', dir)
+  fs.writeFileSync(path.join(dir, 'src', 'a.txt'), 'dirty\n')
+  const res = runHook(bashPayload('git checkout src/', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout HEAD <dirty file> (leading ref, trailing path, no --) is refused', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout HEAD README.md', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout HEAD <clean file> (leading ref, trailing path, no --) is allowed', () => {
+  const dir = makeTempRepo()
+  const res = runHook(bashPayload('git checkout HEAD README.md', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: an argument that is BOTH a valid branch name and an existing dirty file is treated as a ref (git\'s own precedence), not a pathspec -- allowed', () => {
+  const dir = makeTempRepo()
+  sh('git branch README.md', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout README.md', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- Forced checkout/switch: `-f`/`--force` (checkout) and
+// `-f`/`--force`/`--discard-changes` (switch) discard uncommitted changes
+// tree-wide, exactly like `git reset --hard`. Measured against a real repo.
+
+test('destructive-git-guard: git checkout -f <branch> is refused on a dirty tree', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -f other', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout --force <branch> is refused on a dirty tree', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout --force other', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: bare git checkout -f (no branch, no path) is refused on a dirty tree', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -f', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git switch -f <branch> is refused on a dirty tree', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git switch -f other', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git switch --force <branch> is refused on a dirty tree', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git switch --force other', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git switch --discard-changes <branch> is refused on a dirty tree', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git switch --discard-changes other', dir))
+  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout -f <branch> is allowed on a clean tree', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  const res = runHook(bashPayload('git checkout -f other', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git switch -f <branch> is allowed on a clean tree', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  const res = runHook(bashPayload('git switch -f other', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+// --- False-positive floor: these must stay ALLOWED. A guard that blocks
+// harmless commands gets disabled, which is worse than the hole it fixes.
+
+test('destructive-git-guard: git checkout -b <branch> is still allowed on a dirty tree (floor, unaffected by the ref/pathspec fix)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -b another-new-branch', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout <existing-branch> is allowed on a dirty tree when the checkout is legal (no divergent content to lose)', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout other', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git switch <branch> (no force) is allowed on a dirty tree when the switch is legal', () => {
+  const dir = makeTempRepo()
+  sh('git branch other', dir)
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git switch other', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git checkout -b <name-that-collides-with-a-dirty-tracked-file> is still allowed (branch creation, not a restore, even when the new branch name collides with an existing dirty path)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -b README.md', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git status is never intercepted, even on a dirty tree', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git status', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard: git diff is never intercepted, even on a dirty tree', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git diff', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})

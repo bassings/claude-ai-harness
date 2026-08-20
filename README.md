@@ -351,17 +351,24 @@ times in one session and destroyed its edits each time, despite
 prevent it, so the rule is now a mechanism:
 
 - **`hooks/destructive-git-guard.py`** is a PreToolUse hook, matched to the
-  `Bash` tool, that refuses `git checkout -- <path>`, `git checkout .`,
+  `Bash` tool, that refuses `git checkout -- <path>`, a bare
+  `git checkout <path>` with no `--` (resolved as a pathspec because it does
+  not resolve as a ref -- git's own precedence for an unqualified argument,
+  matched here rather than assumed; a leading ref followed by trailing paths,
+  e.g. `git checkout HEAD <path>`, is handled the same way), `git checkout
+  .`, `git checkout -f`/`--force` and `git switch
+  -f`/`--force`/`--discard-changes` (tree-wide, like `git reset --hard`),
   `git restore <path>` (unless it is `--staged` alone, which only
   unstages), and `git reset --hard` whenever the working tree, or the named
   paths, actually have something to lose. `git status` decides that on
   every call: a clean tree or clean named paths are let through untouched,
-  including `git checkout -b`, a bare `git checkout <branch>`, and
-  `git restore --staged` -- a guard that blocks harmless commands gets
-  disabled, which is worse than no guard. Refusal is exit code 2 with the
-  reason on stderr (the one PreToolUse exit code Claude Code treats as
-  blocking) and names the safe alternative: copy the file to a scratch path
-  first, or `git stash`.
+  including `git checkout -b`, a bare `git checkout <branch>` that resolves
+  as a ref (git itself refuses the switch if it would actually overwrite
+  uncommitted work), and `git restore --staged` -- a guard that blocks
+  harmless commands gets disabled, which is worse than no guard. Refusal is
+  exit code 2 with the reason on stderr (the one PreToolUse exit code Claude
+  Code treats as blocking) and names the safe alternative: copy the file to
+  a scratch path first, or `git stash`.
 - **Escape hatch**: for a revert that is genuinely deliberate, set
   `HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, either inline in the command
   (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- file`, ordinary shell

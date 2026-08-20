@@ -8,11 +8,16 @@ uncommitted work") and an agent still ran `git checkout -- <file>` on
 uncommitted work three times in one session, destroying its own edits each
 time. Prose did not prevent it. Standard 9 says the rule wants a mechanism.
 
-Guarded shapes: `git checkout -- <path>`, `git checkout .`, `git restore
-<path>` (unless it is `--staged` alone, which only unstages), and `git reset
---hard`. Nothing else -- see README.md for the exact list this hook is
-scoped to and why it deliberately does not intercept `git checkout -b` or a
-bare `git checkout <branch>`.
+Guarded shapes: `git checkout -- <path>`, a bare `git checkout <path>` (no
+`--`, resolved as a pathspec because it does not resolve as a ref -- git's
+own precedence, matched here rather than assumed), `git checkout HEAD
+<path>` (leading ref, trailing paths, no `--`), `git checkout .`, `git
+checkout -f`/`--force` and `git switch -f`/`--force`/`--discard-changes`
+(tree-wide, like `git reset --hard`), `git restore <path>` (unless it is
+`--staged` alone, which only unstages), and `git reset --hard`. Nothing else
+-- see README.md for the exact list this hook is scoped to and why it
+deliberately does not intercept `git checkout -b` or a bare
+`git checkout <branch>` that resolves as a ref.
 
 Refuses ONLY when there is something to lose: a clean working tree, or named
 paths with no uncommitted modification, are let through untouched. A guard
@@ -107,10 +112,32 @@ def strip_env_prefix(tokens):
     return tokens[i:]
 
 
-def destructive_scope(tokens):
+def resolve_as_ref(cwd, arg):
+    """True if `arg` resolves as a commit-ish in the repo at `cwd`, using the
+    SAME cwd and sanitized_git_env() as has_uncommitted_change()'s status
+    check (see module docstring on GIT_* stripping). Mirrors git's own
+    checkout precedence: an argument that resolves as a ref is treated as a
+    ref, even when a same-named file also exists (measured -- see
+    docs/destructive-git-guard-mutation-proofs.md). On a subprocess failure
+    this returns False (not a ref), the fail-open direction: it hands the
+    argument to the pathspec path, where has_uncommitted_change() still only
+    blocks if `git status` itself finds a real uncommitted change in scope."""
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--verify', '--quiet', '%s^{commit}' % arg],
+            cwd=cwd, env=sanitized_git_env(),
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def destructive_scope(tokens, cwd):
     """Return ('paths', [paths]) or ('tree', None) if `tokens` (one already
-    env-stripped sub-command) is one of the four guarded shapes, or None if
-    it is not."""
+    env-stripped sub-command) is one of the guarded shapes, or None if it is
+    not. `cwd` is needed to resolve an ambiguous checkout argument as a ref
+    vs. a pathspec (see resolve_as_ref)."""
     if not tokens or tokens[0] != 'git' or len(tokens) < 2:
         return None
     subcmd, rest = tokens[1], tokens[2:]
@@ -121,7 +148,33 @@ def destructive_scope(tokens):
             return ('paths', paths) if paths else None
         if rest == ['.']:
             return ('paths', ['.'])
-        return None  # e.g. `-b <branch>` or a bare `<branch>`: not a restore
+        # `-f`/`--force` discards uncommitted changes tree-wide regardless of
+        # what else is on the command line -- measured true for a bare
+        # `checkout -f`, `checkout -f <branch>` and even `checkout -f -b
+        # <branch>` (see mutation-proofs doc). Checked before the -b/-B/
+        # --orphan carve-out below because force overrides it.
+        if '-f' in rest or '--force' in rest:
+            return ('tree', None)
+        if '-b' in rest or '-B' in rest or '--orphan' in rest:
+            return None  # branch creation, not a restore
+        non_flags = [t for t in rest if not t.startswith('-')]
+        if not non_flags:
+            return None
+        first, remainder = non_flags[0], non_flags[1:]
+        if resolve_as_ref(cwd, first):
+            # `<ref> <path>...`: git treats everything after a leading ref
+            # as pathspecs, whether or not those path tokens also happen to
+            # resolve as refs (measured: `git checkout HEAD README.md`).
+            return ('paths', remainder) if remainder else None
+        # No leading ref: every non-flag token is a bare pathspec, whether
+        # there is one (`git checkout README.md`) or several
+        # (`git checkout a.txt b.txt`, measured).
+        return ('paths', non_flags)
+
+    if subcmd == 'switch':
+        if '-f' in rest or '--force' in rest or '--discard-changes' in rest:
+            return ('tree', None)
+        return None  # a plain switch git itself refuses if it would overwrite
 
     if subcmd == 'restore':
         staged = '--staged' in rest or '-S' in rest
@@ -184,7 +237,7 @@ def evaluate(command, cwd):
     except ValueError:
         return None  # unparseable; fail open, see module docstring
     for tokens in segments:
-        scope = destructive_scope(strip_env_prefix(tokens))
+        scope = destructive_scope(strip_env_prefix(tokens), cwd)
         if scope is None:
             continue
         if has_uncommitted_change(cwd, scope):
