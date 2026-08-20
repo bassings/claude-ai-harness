@@ -71,6 +71,49 @@ untidy does not.*
    `RESULT` line to grep. This was parked by accident with T1 and does not
    belong there.
 
+### Detector: a documented setup step with no live verification (added 2026-08-20)
+
+**Authorised by the operator to be BUILT, not merely recorded.** Unscheduled;
+it belongs in the optimiser rather than in T3 or T4.
+
+**The class.** An artefact is correct, its documentation is correct, and the
+setup step the documentation describes was never performed. Nothing in the
+repository or on the host can detect it, by construction: the repo is not
+where the gap is. It surfaces only when someone needs the thing and finds it
+absent.
+
+**The motivating case, measured on a production host 2026-08-20 by the
+CouchPotatoServer session** (cited rather than this repo's own instance,
+because it is the one with consequences): `scripts/backup.sh` documented
+itself as "nightly from cron" and `docs/development-process.md` carried the
+`crontab -e` recipe. On the host there was no cron entry, no `cron.d` file
+and no systemd timer, and the newest snapshot was nineteen days old. Correct
+script, correct doc, step never taken, and a human-triggered promotion was
+the only thing that surfaced it.
+
+**This repo has a milder instance**, which is how the shape was recognised:
+`bin/setup-hooks.sh` exists because a committed hook is inert until a clone
+sets `core.hooksPath`, and git ignores an unset value silently. A test proves
+the script works. Nothing verifies that any given clone ever ran it. The
+README's honest answer -- that CI rather than the hook is what actually
+gates -- is a demotion, not a detection.
+
+**What a detector would look for**, stated as a starting point rather than a
+design: a documented recurring or setup obligation (a cron line, a launchd
+plist, a `git config` step, an installed mirror) for which no evidence of
+performance exists in the artefacts the optimiser can already read -- the run
+ledger, git history, Actions history, or the report's own freshness. The
+signal is an obligation with no corresponding trace, and the honest output is
+"documented, never observed", not a failure.
+
+**Two traps this must avoid**, both learned the hard way here:
+- It must not report clean when it is blind. The AC-uniqueness guard in
+  `test/static-checks.test.js` covered 81 of 245 definitions and reported no
+  problems, twice, in two different directions. A per-source floor is the
+  minimum.
+- "No trace" and "not looked" must be distinguishable in the output, or the
+  detector reproduces the exact class it exists to find.
+
 ## Affected files
 
 `workflows/lib/ledger-append.mjs`, `workflows/plan-cycle.js`,
