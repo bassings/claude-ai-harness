@@ -343,6 +343,43 @@ copy the hook and add to `~/.claude/settings.json`:
 }
 ```
 
+## Destructive git guard
+
+An agent ran `git checkout -- <file>` on its own uncommitted work three
+times in one session and destroyed its edits each time, despite
+`docs/harn-opt-2-mutation-proofs.md` forbidding it by name. Prose did not
+prevent it, so the rule is now a mechanism:
+
+- **`hooks/destructive-git-guard.py`** is a PreToolUse hook, matched to the
+  `Bash` tool, that refuses `git checkout -- <path>`, `git checkout .`,
+  `git restore <path>` (unless it is `--staged` alone, which only
+  unstages), and `git reset --hard` whenever the working tree, or the named
+  paths, actually have something to lose. `git status` decides that on
+  every call: a clean tree or clean named paths are let through untouched,
+  including `git checkout -b`, a bare `git checkout <branch>`, and
+  `git restore --staged` -- a guard that blocks harmless commands gets
+  disabled, which is worse than no guard. Refusal is exit code 2 with the
+  reason on stderr (the one PreToolUse exit code Claude Code treats as
+  blocking) and names the safe alternative: copy the file to a scratch path
+  first, or `git stash`.
+- **Escape hatch**: for a revert that is genuinely deliberate, set
+  `HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, either inline in the command
+  (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- file`, ordinary shell
+  env-prefix syntax) or exported for the session.
+
+Installing as a plugin wires the hook automatically. For manual installs,
+copy the hook and add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command",
+      "command": "python3", "args": ["~/.claude/hooks/destructive-git-guard.py"],
+      "timeout": 10 }] }]
+  }
+}
+```
+
 ## Run ledger
 
 Every `tdd-task`, `review-cycle` and `plan-cycle` run -- conducted or
@@ -822,6 +859,7 @@ invoking real subagents.
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `skills/optimise-cycle/` | Usage, cadence, report format and the proposal-decision recording protocol for the delivery optimiser |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
+| `hooks/destructive-git-guard.py` | PreToolUse hook refusing a Bash `git checkout --`/`checkout .`/`restore`/`reset --hard` that would discard uncommitted work |
 | `test/` | This repo's own test suite (`node --test test/*.test.js`); see "Tests" above |
 
 ## Cost and proportionality
