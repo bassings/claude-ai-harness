@@ -967,3 +967,94 @@ test('static: every hooks/*.py script is registered in hooks/hooks.json, and eve
   assert.equal(guardEntry.event, 'PreToolUse', 'destructive-git-guard.py must be registered under PreToolUse')
   assert.equal(guardEntry.matcher, 'Bash', 'destructive-git-guard.py\'s PreToolUse matcher must be "Bash" -- a wrong or missing matcher means it never sees a Bash call at all')
 })
+
+// H3 (review round on fix/destructive-git-guard): commit d447030 added a
+// `Recurrence` field to AGENT-HARNESS.md's FINDINGS template and instructed
+// all nine agents/lens-*.md files to fill it, with no matching property in
+// either lens-output schema the workflow scripts declare (REVIEW_SCHEMA in
+// review-cycle.js, PLAN_SCHEMA in plan-cycle.js), no mention in the lens
+// prompt, no carry into the openFindingsRaw ledger projection, and no
+// mention in the synthesis keep-list -- an instruction with no consumer,
+// the exact shape this repo exists to stop. Fixed by adding `recurrence` to
+// both schemas' findings-item properties and to review-cycle.js's prompt,
+// projection and synthesis instructions. This test is the drift guard that
+// stops a repeat: it fails if EITHER side ever moves without the other --
+// a field documented/instructed with no schema slot (H3's own shape), or a
+// schema property nothing documents or instructs a lens to fill.
+test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s ### FINDINGS template, and every field agents/lens-*.md instruct filling there, has a like-named property in both review-cycle.js\'s REVIEW_SCHEMA and plan-cycle.js\'s PLAN_SCHEMA findings items -- and vice versa: every non-structural findings-item property is named in the template', () => {
+  const doc = readAll('AGENT-HARNESS.md')
+
+  // ---- side A: AGENT-HARNESS.md's ### FINDINGS template ----
+  const findingsHeadingIdx = doc.indexOf('### FINDINGS')
+  assert.ok(findingsHeadingIdx !== -1, 'AGENT-HARNESS.md must have a ### FINDINGS heading')
+  const fenceEnd = doc.indexOf('```', findingsHeadingIdx)
+  assert.ok(fenceEnd !== -1, 'the ### FINDINGS heading must be followed by a fenced example block')
+  const templateBlock = doc.slice(findingsHeadingIdx, fenceEnd)
+  const docFields = new Set()
+  for (const m of templateBlock.matchAll(/^\s{2}([A-Z][A-Za-z]+):\s/gm)) docFields.add(m[1].toLowerCase())
+  assert.ok(docFields.size >= 3, `sanity: expected several colon-labeled fields in the FINDINGS template, found ${[...docFields]}`)
+  assert.ok(docFields.has('recurrence'), 'sanity: the FINDINGS template must still name Recurrence -- this test exists to protect that specific field')
+
+  // ---- side B: agents/lens-*.md's own "fill AGENT-HARNESS.md's `X` field" instructions ----
+  const agentFiles = fs.readdirSync(path.join(ROOT, 'agents')).filter((f) => f.startsWith('lens-') && f.endsWith('.md'))
+  assert.ok(agentFiles.length >= 9, `sanity: expected at least 9 agents/lens-*.md files, found ${agentFiles.length}`)
+  const agentFields = new Set()
+  for (const f of agentFiles) {
+    const text = readAll('agents', f)
+    for (const m of text.matchAll(/fill AGENT-HARNESS\.md's `([A-Za-z]+)` field/g)) agentFields.add(m[1].toLowerCase())
+  }
+  assert.ok(agentFields.has('recurrence'), 'sanity: expected at least one agents/lens-*.md file to instruct filling the Recurrence field')
+
+  // ---- side C: the findings-item properties each workflow schema declares ----
+  function extractBalancedObject(text, openBraceIdx) {
+    let depth = 0
+    for (let i = openBraceIdx; i < text.length; i++) {
+      if (text[i] === '{') depth++
+      else if (text[i] === '}') {
+        depth--
+        if (depth === 0) return text.slice(openBraceIdx, i + 1)
+      }
+    }
+    throw new Error(`unbalanced braces from index ${openBraceIdx}`)
+  }
+  function findingsSchemaProps(fileRel, constName) {
+    const text = readAll(...fileRel.split('/'))
+    const constIdx = text.indexOf(`const ${constName}`)
+    assert.ok(constIdx !== -1, `expected "const ${constName}" in ${fileRel}`)
+    const findingsMatch = /\bfindings:\s*{/.exec(text.slice(constIdx))
+    assert.ok(findingsMatch, `expected a findings: property inside ${constName} in ${fileRel}`)
+    const findingsIdxAbs = constIdx + findingsMatch.index
+    const propsMatch = /properties:\s*{/.exec(text.slice(findingsIdxAbs))
+    assert.ok(propsMatch, `expected findings.items.properties inside ${constName} in ${fileRel}`)
+    const propsBraceIdx = findingsIdxAbs + propsMatch.index + propsMatch[0].length - 1
+    const obj = extractBalancedObject(text, propsBraceIdx)
+    const names = new Set()
+    for (const m of obj.matchAll(/(?:^|[{,])\s*([A-Za-z_]\w*)\s*:\s*{\s*type:/g)) names.add(m[1])
+    assert.ok(names.size >= 3, `sanity: expected several findings properties parsed from ${fileRel}'s ${constName}, found ${[...names]}`)
+    return names
+  }
+  const reviewProps = findingsSchemaProps('workflows/review-cycle.js', 'REVIEW_SCHEMA')
+  const planProps = findingsSchemaProps('workflows/plan-cycle.js', 'PLAN_SCHEMA')
+
+  // Direction 1 (H3 itself): a field documented in the template, or one
+  // agents/*.md are told to fill, must have a schema slot in BOTH workflows
+  // that build a lens-output schema from this contract.
+  for (const field of new Set([...docFields, ...agentFields])) {
+    assert.ok(reviewProps.has(field), `"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but review-cycle.js's REVIEW_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
+    assert.ok(planProps.has(field), `"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but plan-cycle.js's PLAN_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
+  }
+
+  // Direction 2 (vice versa): a schema property that is NOT one of the
+  // structural fields (severity/claim/location come from the one-line
+  // "[SEVERITY] <claim>: <file:line>" header, not a colon-labeled template
+  // row; ac_id is review-mode AC attribution, a separate mechanism from the
+  // FINDINGS template) must be named in the template -- otherwise the
+  // schema invites a value nothing ever told a lens to produce.
+  const STRUCTURAL = new Set(['severity', 'claim', 'location', 'ac_id'])
+  for (const [label, props] of [['REVIEW_SCHEMA', reviewProps], ['PLAN_SCHEMA', planProps]]) {
+    for (const prop of props) {
+      if (STRUCTURAL.has(prop)) continue
+      assert.ok(docFields.has(prop), `${label}'s findings items declare "${prop}", but AGENT-HARNESS.md's FINDINGS template does not name it -- a schema field nothing instructs a lens to fill`)
+    }
+  }
+})
