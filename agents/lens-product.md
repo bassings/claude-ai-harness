@@ -62,3 +62,8 @@ shipped without the part that made it worth doing.
 
 Flag any AC you cannot verify from the outside as `UNVERIFIABLE`, and say what
 would make it verifiable. That is usually a spec bug worth recording.
+
+For every finding, fill AGENT-HARNESS.md's `Recurrence` field: say whether you
+expect the same scope drift elsewhere in the change. Naming the extent now
+saves the round it would otherwise take to rediscover the same drift under a
+new name.
