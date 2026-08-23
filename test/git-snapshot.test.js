@@ -70,6 +70,38 @@ test('git-snapshot AC-QA-1: a real `git checkout -- <file>` destroying uncommitt
 // snapshotted (the mechanism never reads the command).
 // ---------------------------------------------------------------------
 
+// ---------------------------------------------------------------------
+// AC-PROD-1: recovery demonstrated on a command the detector does NOT
+// cover at all (not a bypass spelling of a guarded git shape -- a
+// genuinely different, non-git destructive command), so the increment
+// over the detector is observable, not notional.
+// ---------------------------------------------------------------------
+
+const NON_GIT_DESTRUCTIVE = [
+  ['rm <tracked-file>', 'rm README.md'],
+  ['truncating redirect', ': > README.md'],
+]
+
+for (const [label, command] of NON_GIT_DESTRUCTIVE) {
+  test(`git-snapshot AC-PROD-1: "${label}" (a command hooks/destructive-git-guard.py does not intercept at all) is still snapshotted and recovered`, () => {
+    const dir = makeTempRepo()
+    dirty(dir)
+    const before = fs.readFileSync(path.join(dir, 'README.md'), 'utf8')
+    const detectorPath = path.join(__dirname, '..', 'hooks', 'destructive-git-guard.py')
+    const detectorRes = spawnSync('python3', [detectorPath], { input: JSON.stringify(bashPayload(dir, command)), encoding: 'utf8', env: sanitizedGitEnv(), timeout: 10000 })
+    assert.equal(detectorRes.status, 0, `sanity: the detector must NOT refuse "${label}" -- it is out of its guarded-shape scope entirely`)
+
+    const res = runHook(bashPayload(dir, command))
+    assert.equal(res.status, 0)
+    const refs = snapshotRefs(dir)
+    assert.equal(refs.length, 1)
+
+    execFileSync('/bin/sh', ['-c', command], { cwd: dir, env: sanitizedGitEnv() })
+    const recovered = sh(`git show ${refs[0]}:README.md`, dir)
+    assert.equal(recovered, before, `"${label}": recovered content must be byte-identical`)
+  })
+}
+
 const BYPASS_SPELLINGS = [
   ['env git', 'env git checkout -- README.md'],
   ['command git', 'command git checkout -- README.md'],

@@ -16,9 +16,9 @@ which are explicitly about the source, not the runtime behaviour, and are
 labelled as such).
 
 **Test count.** Before this change: 785/785 (baseline stated in the brief).
-After: 853/853, run three times consecutively with no flakes observed
-(`node --test test/*.test.js`, ~33s per run). Net new: 68 tests -- one new
-file, `test/git-snapshot.test.js` (59 tests, satisfying AC-SIMP-12's "at
+After: 855/855, run three times consecutively with no flakes observed
+(`node --test test/*.test.js`, ~33s per run). Net new: 70 tests -- one new
+file, `test/git-snapshot.test.js` (61 tests, satisfying AC-SIMP-12's "at
 most one new test file"), plus additions/rewrites inside two existing files
 (`test/destructive-git-guard.test.js`, `test/static-checks.test.js`).
 
