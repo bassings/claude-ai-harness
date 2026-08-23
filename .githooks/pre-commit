@@ -1,0 +1,69 @@
+#!/bin/sh
+# Pre-commit: stamps AGENT-HARNESS.md, workflows/plan-cycle.js and
+# workflows/review-cycle.js with a source-commit identity (specs/harn-fix-3.md
+# AC-ARCH-1, AC-ARCH-3), so a `cp`'d consumer install carries the stamp as
+# ordinary file content, with no git remote or history required to read it.
+#
+# WHY THE PARENT, NOT "THIS" COMMIT: a commit cannot embed its own hash -- the
+# hash is computed FROM the tree, which would have to already contain it to
+# be self-referential, which is impossible. This hook stamps `git rev-parse
+# HEAD` as observed AT THE MOMENT IT RUNS, which is BEFORE the new commit
+# object exists -- the one value that is both real and obtainable here. That
+# is what AC-ARCH-1's own test checks: the stamp against `git rev-parse HEAD`
+# captured at commit time, not against the commit the stamp ships inside.
+# This is a documented, accepted imprecision, not an oversight: the stamp
+# names "current as of commit X", one behind the commit that carries it.
+#
+# WHY UNCONDITIONAL: runs on every commit, not only ones that touch these
+# three files. A conditional ("only stamp when these files changed") would
+# need its own correctness proof and its own edge cases (merges, amends,
+# rebases); running unconditionally means the invariant never depends on
+# correctly detecting what changed, matching AC-ARCH-1's "single mechanism,
+# not hand-edited" -- the mechanism has no branch to get wrong. The
+# consequence, accepted rather than hidden: every commit touches these three
+# files' stamp line, even a commit with nothing to do with the harness.
+#
+# WHY NOT sed -i: BSD sed (this repo develops on macOS) and GNU sed take
+# different -i syntax; writing to a temp file and mv'ing over the original
+# works identically on both and is what this repo's own scripts already do
+# elsewhere for portable in-place edits.
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+# NOT `SHA=$(git rev-parse HEAD 2>/dev/null || echo <null-sha>)`: on an unborn
+# branch (the very first commit in a repo), `git rev-parse HEAD` exits
+# non-zero but STILL prints the literal token "HEAD" to stdout before it
+# does (its best-effort echo of the unresolved revision), and command
+# substitution captures that stdout regardless of the exit code. `||` then
+# appends the fallback's output on a second line, leaving SHA as the
+# two-line string "HEAD\n0000...0000" -- which breaks the sed patterns
+# below with "unescaped newline inside substitute pattern" (confirmed:
+# reproduced this exact failure before writing the `if` form below). The
+# fix checks the exit status directly, via the assignment's own success,
+# and DISCARDS whatever the failed command printed rather than trusting it.
+if SHA=$(git rev-parse HEAD 2>/dev/null); then
+  :
+else
+  SHA=0000000000000000000000000000000000000000
+fi
+
+stamp_md() {
+  file="$1"
+  [ -f "$file" ] || return 0
+  sed -E "s/<!-- SOURCE_COMMIT: [0-9a-f]{40} -->/<!-- SOURCE_COMMIT: ${SHA} -->/" "$file" > "$file.stamptmp"
+  mv "$file.stamptmp" "$file"
+  git add "$file"
+}
+
+stamp_js() {
+  file="$1"
+  [ -f "$file" ] || return 0
+  sed -E "s/^const SOURCE_COMMIT = '[0-9a-f]{40}'/const SOURCE_COMMIT = '${SHA}'/" "$file" > "$file.stamptmp"
+  mv "$file.stamptmp" "$file"
+  git add "$file"
+}
+
+stamp_md AGENT-HARNESS.md
+stamp_js workflows/plan-cycle.js
+stamp_js workflows/review-cycle.js

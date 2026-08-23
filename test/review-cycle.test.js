@@ -8,6 +8,24 @@ const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
 
 const LEDGER_OK = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
 
+// specs/harn-fix-3.md AC-QA-1..4: the shape workflows/lib/install-consistency.mjs
+// actually prints (see test/install-consistency.test.js for the real script's
+// own output shape); a consistent, non-blind install is the default fixture so
+// every pre-existing test keeps dispatching lenses unless it deliberately
+// overrides this field.
+const CONSISTENCY_OK = {
+  ok: true,
+  consistent: true,
+  blind: false,
+  checked_dir: '/fake/install',
+  lens_files_checked: 9,
+  missing_in_review_schema: [],
+  missing_in_plan_schema: [],
+  review_only_props: [],
+  plan_only_props: [],
+  error: null,
+}
+
 const SCOPE_OK = {
   base: 'main',
   head_sha: 'abcdef1234567890',
@@ -16,6 +34,7 @@ const SCOPE_OK = {
   new_modules: false,
   custom_rules: null,
   harness_triggers_file_exists: false,
+  consistency: CONSISTENCY_OK,
 }
 
 const SECURITY_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] }
@@ -641,7 +660,7 @@ test('review-cycle.js: the scope agent() call declares custom_rules and harness_
   assert.ok(scopeCall, 'expected a scope:diff call')
   assert.deepEqual(
     scopeCall.opts.schema.required.slice().sort(),
-    ['base', 'custom_rules', 'files', 'harness_triggers_file_exists', 'head_sha', 'new_dependency_entries', 'new_modules']
+    ['base', 'consistency', 'custom_rules', 'files', 'harness_triggers_file_exists', 'head_sha', 'new_dependency_entries', 'new_modules']
   )
   assert.deepEqual(scopeCall.opts.schema.properties.harness_triggers_file_exists.type, 'boolean')
   assert.deepEqual(scopeCall.opts.schema.properties.custom_rules.type, ['object', 'null'], 'custom_rules keeps its loose type -- shape validation happens in the workflow, not the schema')
@@ -1233,4 +1252,82 @@ test('review-cycle.js: a stable HEAD does not raise the moved-checkout flag (the
 test('review-cycle.js: a synthesis that omits head_sha_at_synthesis does not fabricate a verdict either way', async () => {
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   assert.notEqual(result.checkout_moved, true, 'absent evidence must not be read as a move')
+})
+
+// specs/harn-fix-3.md AC-QA-1/AC-QA-2/AC-QA-3/AC-QA-4: the install-consistency
+// preflight, folded into the scope:diff agent() call (never a new one --
+// AC-QA-3).
+const ALL_LENSES_REVIEW = ['lens-security', 'lens-qa', 'lens-design', 'lens-accessibility', 'lens-data', 'lens-architecture', 'lens-operability', 'lens-product', 'reviewer-verification']
+
+test('review-cycle.js: AC-QA-1/AC-QA-2 -- an inconsistent installed harness refuses BEFORE dispatching any lens, EVEN when there would otherwise be zero changed files (checked before the no-op short-circuit), names the mismatched field and both sides, and exits non-zero', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': {
+            ...SCOPE_OK,
+            files: [],
+            consistency: { ...CONSISTENCY_OK, consistent: false, missing_in_plan_schema: ['recurrence'], missing_in_review_schema: [] },
+          },
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /recurrence/, 'the error must name the mismatched field')
+      assert.match(err.message, /PLAN_SCHEMA/, 'the error must name the schema side that is missing it')
+      assert.match(err.message, /REVIEW_SCHEMA/, 'the error must also name the other side')
+      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
+      assert.equal(dispatchedLenses.length, 0, `no lens agent may be dispatched on refusal, by COUNT, got: ${dispatchedLenses.map((c) => c.opts.label)}`)
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: AC-QA-1/AC-QA-2 -- blind:true (the check found nothing to compare) is treated exactly like inconsistent, never as clean, even when consistent:true is also reported', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, consistent: true, blind: true } } }),
+      }),
+    (err) => {
+      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
+      assert.equal(dispatchedLenses.length, 0, 'blind must refuse dispatch exactly like an explicit mismatch')
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: AC-QA-3 -- a consistent, non-blind install dispatches every triggered lens exactly as before, with NO additional agent() call beyond the pre-existing baseline (the check is folded into scope:diff, not a new dispatch)', async () => {
+  const { calls: baselineCalls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const { result, calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'], 'lenses must still dispatch normally')
+  assert.equal(calls.length, baselineCalls.length, 'a consistent install must add no agent() call beyond the pre-existing baseline')
+  assert.deepEqual(calls.map((c) => c.opts.label), baselineCalls.map((c) => c.opts.label))
+})
+
+test('review-cycle.js: AC-QA-1 -- the scope:diff prompt instructs locating install-consistency.mjs via the SAME install-resolution search order the ledger writer already uses, and passing the install root as an explicit argument (never relying on a hardcoded ~/.claude default)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const scopeCall = calls.find((c) => c.opts.label === 'scope:diff')
+  assert.ok(scopeCall, 'expected a scope:diff call')
+  assert.match(scopeCall.prompt, /install-consistency\.mjs/)
+  assert.match(scopeCall.prompt, /~\/\.claude\/workflows\/lib\/install-consistency\.mjs/, 'must name the global mirror install location, same convention as the ledger writer')
+  assert.match(scopeCall.prompt, /claude-ai-harness/, 'must gate the repo-local fallback to this harness\'s own repo, same as the ledger writer')
+  assert.match(scopeCall.prompt, /as its ONE argument/, 'must instruct passing the resolved install root explicitly, not relying on the script\'s own ~/.claude default')
+})
+
+test('review-cycle.js: the scope:diff schema requires "consistency" -- an omitted field is rejected before the workflow ever sees it (AC-QA-1)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const scopeCall = calls.find((c) => c.opts.label === 'scope:diff')
+  assert.ok(scopeCall.opts.schema.required.includes('consistency'))
+})
+
+test('review-cycle.js: AC-QA-1/AC-QA-2 -- a scope response missing the consistency field entirely (an old or misbehaving agent) refuses rather than assuming clean', async () => {
+  const { consistency, ...scopeWithoutConsistency } = SCOPE_OK
+  await assert.rejects(() =>
+    runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({ 'scope:diff': { ...scopeWithoutConsistency, consistency: undefined, __bypassSchemaValidation: true } }),
+    })
+  )
 })

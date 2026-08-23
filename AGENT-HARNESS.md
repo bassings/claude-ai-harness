@@ -1,5 +1,12 @@
 # Multi-lens agent harness
 
+<!-- SOURCE_COMMIT: f09411f277e354d0973a8463f01a72a5de77c17d -->
+<!-- Written by .githooks/pre-commit on every commit (specs/harn-fix-3.md
+     AC-ARCH-1, AC-ARCH-3). Never hand-edit: the value names the commit that
+     was HEAD immediately before this one (a commit cannot embed its own
+     hash), so it lags the containing commit by exactly one. This is a
+     commit identity, not an age -- see workflows/lib/install-consistency.mjs. -->
+
 The default way non-trivial work is planned and reviewed on every project.
 
 One agent carrying six concerns does the first two well. This splits them into

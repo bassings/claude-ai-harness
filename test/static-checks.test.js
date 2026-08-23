@@ -316,6 +316,28 @@ test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, le
   assert.equal(plan, tdd, 'plan-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
 })
 
+// specs/harn-fix-3.md AC-QA-1..4: the install-consistency preflight block
+// (INSTALL_CONSISTENCY_INSTRUCTION, INSTALL_CONSISTENCY_SCHEMA,
+// installConsistencyError) is necessarily duplicated between plan-cycle.js
+// and review-cycle.js -- workflow scripts cannot import, mirroring the L5
+// run-ledger trio above. Without a guard pinning them, a fix (e.g. a wording
+// correction, a new schema field) landed in one copy and not the other fails
+// silently, exactly the class of bug HARN-FIX-3 itself exists to catch.
+test('static: HARN-FIX-3 -- the install-consistency preflight block (INSTALL_CONSISTENCY_INSTRUCTION, INSTALL_CONSISTENCY_SCHEMA, installConsistencyError) is byte-identical between plan-cycle.js and review-cycle.js', () => {
+  function extractBlock(fileName) {
+    const contents = readAll('workflows', fileName)
+    const lines = contents.split('\n')
+    const start = lines.findIndex((l) => l.startsWith('// HARN-FIX-3 install-consistency preflight block'))
+    const end = lines.findIndex((l, i) => i > start && l.trim() === '// ---- end HARN-FIX-3 install-consistency preflight block ----')
+    assert.ok(start >= 0 && end > start, `${fileName}: could not locate the install-consistency preflight block markers`)
+    return lines.slice(start, end + 1).join('\n')
+  }
+  const plan = extractBlock('plan-cycle.js')
+  const review = extractBlock('review-cycle.js')
+  assert.ok(plan.length > 500, 'sanity: the extracted block should be substantial, not an empty match')
+  assert.equal(review, plan, 'review-cycle.js\'s install-consistency preflight block has drifted from plan-cycle.js\'s')
+})
+
 // HARN-OPT-2 PR2 (AC-ARCH-9): the start/terminal exception-guard block PR 2
 // added (an exception escaping run() must still reach the single terminal
 // writeLedger( call, then re-throw) is a SECOND necessarily-triplicated
@@ -981,67 +1003,56 @@ test('static: every hooks/*.py script is registered in hooks/hooks.json, and eve
 // stops a repeat: it fails if EITHER side ever moves without the other --
 // a field documented/instructed with no schema slot (H3's own shape), or a
 // schema property nothing documents or instructs a lens to fill.
-test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s ### FINDINGS template, and every field agents/lens-*.md instruct filling there, has a like-named property in both review-cycle.js\'s REVIEW_SCHEMA and plan-cycle.js\'s PLAN_SCHEMA findings items -- and vice versa: every non-structural findings-item property is named in the template', () => {
-  const doc = readAll('AGENT-HARNESS.md')
+test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s ### FINDINGS template, and every field agents/lens-*.md instruct filling there, has a like-named property in both review-cycle.js\'s REVIEW_SCHEMA and plan-cycle.js\'s PLAN_SCHEMA findings items -- and vice versa: every non-structural findings-item property is named in the template', async () => {
+  // specs/harn-fix-3.md AC-QA-1 (reuse, not reinvent): the field-extraction
+  // regexes below used to be duplicated inline here. They now live ONCE, in
+  // workflows/lib/install-consistency.mjs -- the same runtime script
+  // plan-cycle.js/review-cycle.js instruct an agent to run against an
+  // INSTALLED ~/.claude tree before dispatching any lens (AC-QA-1..4). This
+  // test is the identical comparison run against the REPO's own tree
+  // instead, at review time. One parser, two call sites, so the two checks
+  // can never independently drift into two different, individually-wrong
+  // parsers -- see that module's own header for the three-times-wrong
+  // history this exact pattern has (matching bare ids counted prose
+  // mentions; requiring bold found zero definitions in two files while
+  // reporting no duplicates; a "fix" moved the blindness rather than
+  // removing it).
+  const { pathToFileURL } = require('node:url')
+  const modulePath = path.join(ROOT, 'workflows', 'lib', 'install-consistency.mjs')
+  const { parseFindingsTemplateFields, parseInstructedFields, parseSchemaFindingsProps, STRUCTURAL_FINDINGS_PROPS, checkConsistency } = await import(pathToFileURL(modulePath).href)
 
-  // ---- side A: AGENT-HARNESS.md's ### FINDINGS template ----
-  const findingsHeadingIdx = doc.indexOf('### FINDINGS')
-  assert.ok(findingsHeadingIdx !== -1, 'AGENT-HARNESS.md must have a ### FINDINGS heading')
-  const fenceEnd = doc.indexOf('```', findingsHeadingIdx)
-  assert.ok(fenceEnd !== -1, 'the ### FINDINGS heading must be followed by a fenced example block')
-  const templateBlock = doc.slice(findingsHeadingIdx, fenceEnd)
-  const docFields = new Set()
-  for (const m of templateBlock.matchAll(/^\s{2}([A-Z][A-Za-z]+):\s/gm)) docFields.add(m[1].toLowerCase())
+  const doc = readAll('AGENT-HARNESS.md')
+  const docFields = parseFindingsTemplateFields(doc)
+  assert.ok(docFields, 'AGENT-HARNESS.md must have a ### FINDINGS heading followed by a fenced example block')
   assert.ok(docFields.size >= 3, `sanity: expected several colon-labeled fields in the FINDINGS template, found ${[...docFields]}`)
   assert.ok(docFields.has('recurrence'), 'sanity: the FINDINGS template must still name Recurrence -- this test exists to protect that specific field')
 
-  // ---- side B: agents/lens-*.md's own "fill AGENT-HARNESS.md's `X` field" instructions ----
   const agentFiles = fs.readdirSync(path.join(ROOT, 'agents')).filter((f) => f.startsWith('lens-') && f.endsWith('.md'))
   assert.ok(agentFiles.length >= 9, `sanity: expected at least 9 agents/lens-*.md files, found ${agentFiles.length}`)
-  const agentFields = new Set()
-  for (const f of agentFiles) {
-    const text = readAll('agents', f)
-    for (const m of text.matchAll(/fill AGENT-HARNESS\.md's `([A-Za-z]+)` field/g)) agentFields.add(m[1].toLowerCase())
-  }
+  const agentTexts = agentFiles.map((f) => readAll('agents', f))
+  const agentFields = parseInstructedFields(agentTexts)
   assert.ok(agentFields.has('recurrence'), 'sanity: expected at least one agents/lens-*.md file to instruct filling the Recurrence field')
 
-  // ---- side C: the findings-item properties each workflow schema declares ----
-  function extractBalancedObject(text, openBraceIdx) {
-    let depth = 0
-    for (let i = openBraceIdx; i < text.length; i++) {
-      if (text[i] === '{') depth++
-      else if (text[i] === '}') {
-        depth--
-        if (depth === 0) return text.slice(openBraceIdx, i + 1)
-      }
-    }
-    throw new Error(`unbalanced braces from index ${openBraceIdx}`)
-  }
-  function findingsSchemaProps(fileRel, constName) {
-    const text = readAll(...fileRel.split('/'))
-    const constIdx = text.indexOf(`const ${constName}`)
-    assert.ok(constIdx !== -1, `expected "const ${constName}" in ${fileRel}`)
-    const findingsMatch = /\bfindings:\s*{/.exec(text.slice(constIdx))
-    assert.ok(findingsMatch, `expected a findings: property inside ${constName} in ${fileRel}`)
-    const findingsIdxAbs = constIdx + findingsMatch.index
-    const propsMatch = /properties:\s*{/.exec(text.slice(findingsIdxAbs))
-    assert.ok(propsMatch, `expected findings.items.properties inside ${constName} in ${fileRel}`)
-    const propsBraceIdx = findingsIdxAbs + propsMatch.index + propsMatch[0].length - 1
-    const obj = extractBalancedObject(text, propsBraceIdx)
-    const names = new Set()
-    for (const m of obj.matchAll(/(?:^|[{,])\s*([A-Za-z_]\w*)\s*:\s*{\s*type:/g)) names.add(m[1])
-    assert.ok(names.size >= 3, `sanity: expected several findings properties parsed from ${fileRel}'s ${constName}, found ${[...names]}`)
-    return names
-  }
-  const reviewProps = findingsSchemaProps('workflows/review-cycle.js', 'REVIEW_SCHEMA')
-  const planProps = findingsSchemaProps('workflows/plan-cycle.js', 'PLAN_SCHEMA')
+  const reviewSource = readAll('workflows', 'review-cycle.js')
+  const planSource = readAll('workflows', 'plan-cycle.js')
+  const reviewProps = parseSchemaFindingsProps(reviewSource, 'REVIEW_SCHEMA')
+  const planProps = parseSchemaFindingsProps(planSource, 'PLAN_SCHEMA')
+  assert.ok(reviewProps, 'expected "const REVIEW_SCHEMA" with a findings.items.properties block in workflows/review-cycle.js')
+  assert.ok(planProps, 'expected "const PLAN_SCHEMA" with a findings.items.properties block in workflows/plan-cycle.js')
+  assert.ok(reviewProps.size >= 3, `sanity: expected several findings properties parsed from review-cycle.js's REVIEW_SCHEMA, found ${[...reviewProps]}`)
+  assert.ok(planProps.size >= 3, `sanity: expected several findings properties parsed from plan-cycle.js's PLAN_SCHEMA, found ${[...planProps]}`)
+
+  const result = checkConsistency({ agentHarnessMd: doc, lensFileTexts: agentTexts, planCycleSource: planSource, reviewCycleSource: reviewSource })
+  assert.equal(result.blind, false, `the parser must not be blind against the repo's own tree: ${JSON.stringify(result.blind_reasons)}`)
 
   // Direction 1 (H3 itself): a field documented in the template, or one
   // agents/*.md are told to fill, must have a schema slot in BOTH workflows
   // that build a lens-output schema from this contract.
-  for (const field of new Set([...docFields, ...agentFields])) {
-    assert.ok(reviewProps.has(field), `"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but review-cycle.js's REVIEW_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
-    assert.ok(planProps.has(field), `"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but plan-cycle.js's PLAN_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
+  for (const field of result.missing_in_review_schema) {
+    assert.fail(`"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but review-cycle.js's REVIEW_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
+  }
+  for (const field of result.missing_in_plan_schema) {
+    assert.fail(`"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but plan-cycle.js's PLAN_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
   }
 
   // Direction 2 (vice versa): a schema property that is NOT one of the
@@ -1050,13 +1061,13 @@ test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s
   // row; ac_id is review-mode AC attribution, a separate mechanism from the
   // FINDINGS template) must be named in the template -- otherwise the
   // schema invites a value nothing ever told a lens to produce.
-  const STRUCTURAL = new Set(['severity', 'claim', 'location', 'ac_id'])
-  for (const [label, props] of [['REVIEW_SCHEMA', reviewProps], ['PLAN_SCHEMA', planProps]]) {
-    for (const prop of props) {
-      if (STRUCTURAL.has(prop)) continue
-      assert.ok(docFields.has(prop), `${label}'s findings items declare "${prop}", but AGENT-HARNESS.md's FINDINGS template does not name it -- a schema field nothing instructs a lens to fill`)
-    }
+  for (const prop of result.review_only_props) {
+    assert.fail(`REVIEW_SCHEMA's findings items declare "${prop}", but AGENT-HARNESS.md's FINDINGS template does not name it -- a schema field nothing instructs a lens to fill`)
   }
+  for (const prop of result.plan_only_props) {
+    assert.fail(`PLAN_SCHEMA's findings items declare "${prop}", but AGENT-HARNESS.md's FINDINGS template does not name it -- a schema field nothing instructs a lens to fill`)
+  }
+  assert.ok(result.consistent, 'sanity: no direction-1 or direction-2 mismatch was reported above, so the overall verdict must be consistent')
 })
 
 // --- specs/harn-fix-2.md: AC-OPS-14, AC-PROD-4, AC-SEC-7, AC-QA-19. ---

@@ -85,6 +85,7 @@ test('seam: review_cycle terminal payload, captured from a real run with a non-e
         new_modules: false,
         custom_rules: null,
         harness_triggers_file_exists: false,
+        consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null },
       },
       'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
       'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
@@ -110,7 +111,7 @@ test('seam: plan_cycle terminal payload, captured from a real run with a non-emp
   const { calls } = await runWorkflow(WF, {
     args: { spec: 'specs/foo.md' },
     agent: {
-      'scope:spec': { head_sha: 'abc1234567890def', summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'] },
+      'scope:spec': { head_sha: 'abc1234567890def', summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'], consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null } },
       'lens-security': LENS_CLEAN,
       'lens-qa': LENS_CLEAN,
       'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] },
@@ -288,6 +289,7 @@ test('seam: review_cycle\'s THROW-path terminal payload, when the throw happens 
           new_modules: false,
           custom_rules: null,
           harness_triggers_file_exists: false,
+          consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null },
         },
         'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
         'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
@@ -312,7 +314,7 @@ test('seam: plan_cycle\'s THROW-path terminal payload, when the throw happens at
     await runWorkflow(WF, {
       args: { spec: 'specs/seam-throw.md' },
       agent: {
-        'scope:spec': { head_sha: 'abc1234567890def', summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'] },
+        'scope:spec': { head_sha: 'abc1234567890def', summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'], consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null } },
         'lens-security': LENS_CLEAN,
         'lens-qa': LENS_CLEAN,
         'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] },

@@ -9,6 +9,71 @@ export const meta = {
   ],
 }
 
+// SOURCE_COMMIT: written by .githooks/pre-commit on every commit -- do not
+// hand-edit (specs/harn-fix-3.md AC-ARCH-1, AC-ARCH-3). Names the commit
+// that was HEAD immediately before this one (a commit cannot embed its own
+// hash, so this necessarily lags the containing commit by exactly one; see
+// the hook's own header). A commit identity, not an age: read it with
+// workflows/lib/install-consistency.mjs's parseSourceCommitStamp.
+const SOURCE_COMMIT = 'f09411f277e354d0973a8463f01a72a5de77c17d'
+
+// HARN-FIX-3 install-consistency preflight block (AC-QA-1..4): byte-identical
+// across plan-cycle.js and review-cycle.js, mirroring the L5/PR2 triplicated
+// -block pattern below (the run-ledger helpers) -- a fix landed in one copy
+// and not the other fails silently, exactly the class of bug this whole
+// spec exists to catch. See test/static-checks.test.js's pinning test.
+const INSTALL_CONSISTENCY_INSTRUCTION =
+  `Before anything else, verify the installed harness agrees with itself (specs/harn-fix-3.md AC-QA-1): find this ` +
+  `harness's install-consistency.mjs script, in this exact order, and use the FIRST one that exists: (a) ` +
+  `~/.claude/workflows/lib/install-consistency.mjs (the global mirror install); (b) any installed claude-ai-harness ` +
+  `plugin directory's workflows/lib/install-consistency.mjs; (c) ` +
+  `"$(git rev-parse --show-toplevel)/workflows/lib/install-consistency.mjs" in the current repo, but ONLY if the ` +
+  `current repo is claude-ai-harness itself -- check the basename of \`git rev-parse --show-toplevel\` equals ` +
+  `"claude-ai-harness", or (if that fails) \`git remote get-url origin\` names claude-ai-harness (same rule the ` +
+  `ledger writer uses). Run it with the install root you found it under as its ONE argument (the parent of the ` +
+  `workflows/lib directory it lives in), exactly like: \`node <path-to-install-consistency.mjs> <install-root>\`. ` +
+  `It always exits 0 and prints exactly one line of JSON. Return EXACTLY what it printed as the "consistency" ` +
+  `field -- do not reinterpret, summarise, or recompute any part of it yourself, and do not skip this step even if ` +
+  `you believe you already know the answer: the determination is made by the script, not by you, because a lens ` +
+  `must never be dispatched against an install whose findings schema disagrees with what it is instructed to fill. ` +
+  `If the script could not be found at ANY of (a)/(b)/(c), or failed to run at all (rather than printing its own ` +
+  `{consistent:false,...} JSON), that is itself a partial or broken install and must be treated the same way: return ` +
+  `{ok:false, consistent:false, blind:true, checked_dir:"not found", error:"<what happened>"} as the "consistency" ` +
+  `field yourself -- NEVER omit the field or fabricate {consistent:true, ...} to let the run proceed.\n\n`
+
+const INSTALL_CONSISTENCY_SCHEMA = {
+  type: 'object',
+  required: ['ok', 'consistent', 'blind', 'checked_dir'],
+  properties: {
+    ok: { type: 'boolean' },
+    consistent: { type: 'boolean' },
+    blind: { type: 'boolean' },
+    checked_dir: { type: 'string' },
+    lens_files_checked: { type: ['integer', 'null'] },
+    missing_in_review_schema: { type: 'array', items: { type: 'string' } },
+    missing_in_plan_schema: { type: 'array', items: { type: 'string' } },
+    review_only_props: { type: 'array', items: { type: 'string' } },
+    plan_only_props: { type: 'array', items: { type: 'string' } },
+    error: { type: ['string', 'null'] },
+  },
+}
+
+function installConsistencyError(consistency) {
+  const c = consistency || {}
+  return new Error(
+    `InstallInconsistent: the installed harness's findings schema does not agree with what AGENT-HARNESS.md and ` +
+    `agents/lens-*.md instruct a lens to fill (checked ${c.checked_dir || 'an unreported directory'}). Missing from ` +
+    `review-cycle.js's REVIEW_SCHEMA: ${JSON.stringify(c.missing_in_review_schema || [])}. Missing from ` +
+    `plan-cycle.js's PLAN_SCHEMA: ${JSON.stringify(c.missing_in_plan_schema || [])}. Declared in REVIEW_SCHEMA but ` +
+    `not instructed anywhere: ${JSON.stringify(c.review_only_props || [])}. Declared in PLAN_SCHEMA but not ` +
+    `instructed anywhere: ${JSON.stringify(c.plan_only_props || [])}. ` +
+    `${c.blind ? 'The check found nothing to compare on at least one side (blind), which is treated as inconsistent, never as clean. ' : ''}` +
+    `${c.error ? `Check error: ${c.error}. ` : ''}Refusing to dispatch any lens: an instructed field with no schema ` +
+    `slot is silently dropped (H3's own shape). Re-sync the installed copy from the published repo, then re-run.`
+  )
+}
+// ---- end HARN-FIX-3 install-consistency preflight block ----
+
 // args can arrive as a JSON-encoded string depending on the caller; normalise before use
 let opts = args
 if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts = null } }
@@ -189,6 +254,10 @@ async function run() {
 // ---- Phase 1: scope ----
 phase('Scope')
 const scope = await agent(
+  // specs/harn-fix-3.md AC-QA-1/AC-QA-3: folded into this SAME agent() call
+  // rather than a new one, so a consistent install adds no measurable
+  // startup delay -- see INSTALL_CONSISTENCY_INSTRUCTION below.
+  INSTALL_CONSISTENCY_INSTRUCTION +
   `Read the spec at ${specPath} and skim the repo areas it names. Classify the change surface, returning raw booleans:\n` +
   `- ui: does it touch UI, templates, styles, components or user-facing copy?\n` +
   `- data: does it touch schema, migrations, destructive file or database operations, or personal data?\n` +
@@ -203,7 +272,7 @@ const scope = await agent(
     effort: 'low',
     schema: {
       type: 'object',
-      required: ['summary', 'ui', 'data', 'architecture', 'operability', 'user_facing', 'likely_paths', 'head_sha'],
+      required: ['summary', 'ui', 'data', 'architecture', 'operability', 'user_facing', 'likely_paths', 'head_sha', 'consistency'],
       properties: {
         head_sha: { type: 'string' },
         summary: { type: 'string' },
@@ -213,12 +282,24 @@ const scope = await agent(
         operability: { type: 'boolean' },
         user_facing: { type: 'boolean' },
         likely_paths: { type: 'array', items: { type: 'string' } },
+        consistency: INSTALL_CONSISTENCY_SCHEMA,
       },
     },
   }
 )
 if (!scope) return { report: 'Scope agent failed; no plan produced.', __outcome: 'aborted' }
 planHeadSha = typeof scope.head_sha === 'string' ? scope.head_sha : null
+
+// AC-QA-1/AC-QA-2: refuse before dispatching any lens if the installed
+// harness's findings schema disagrees with what it instructs a lens to
+// fill (H3's own failure shape, reproduced in the field rather than caught
+// in the repo). `blind` (the check found nothing to compare, i.e. it
+// cannot see this install's content at all) is treated exactly like
+// inconsistent -- see workflows/lib/install-consistency.mjs's header for
+// why an empty parse must never be read as "nothing wrong".
+if (!scope.consistency || scope.consistency.blind || scope.consistency.consistent !== true) {
+  throw installConsistencyError(scope.consistency)
+}
 
 // ---- deterministic lens triggering (AGENT-HARNESS.md roster; simplicity is planning-only and always on) ----
 let lenses = ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product']
