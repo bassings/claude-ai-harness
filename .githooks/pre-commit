@@ -51,6 +51,18 @@ fi
 stamp_md() {
   file="$1"
   [ -f "$file" ] || return 0
+  # STOPGAP (2026-08-23, review finding HIGH-1): `git add "$file"` below adds
+  # the WHOLE working-tree file, so an unstaged edit elsewhere in it is swept
+  # into an unrelated commit and pushed to a public remote without ever
+  # appearing in `git diff --cached`. Reproduced: staging only other.txt still
+  # committed a planted token from an unstaged edit in review-cycle.js.
+  # Refuse to touch a file that has unstaged changes; a missing stamp is
+  # visible and harmless, a leaked one is neither. This is a stopgap, not the
+  # designed fix: see specs/harn-fix-3.md.
+  if ! git diff --quiet -- "$file"; then
+    echo "pre-commit: $file has unstaged changes; not stamping it" >&2
+    return 0
+  fi
   sed -E "s/<!-- SOURCE_COMMIT: [0-9a-f]{40} -->/<!-- SOURCE_COMMIT: ${SHA} -->/" "$file" > "$file.stamptmp"
   mv "$file.stamptmp" "$file"
   git add "$file"
@@ -59,6 +71,18 @@ stamp_md() {
 stamp_js() {
   file="$1"
   [ -f "$file" ] || return 0
+  # STOPGAP (2026-08-23, review finding HIGH-1): `git add "$file"` below adds
+  # the WHOLE working-tree file, so an unstaged edit elsewhere in it is swept
+  # into an unrelated commit and pushed to a public remote without ever
+  # appearing in `git diff --cached`. Reproduced: staging only other.txt still
+  # committed a planted token from an unstaged edit in review-cycle.js.
+  # Refuse to touch a file that has unstaged changes; a missing stamp is
+  # visible and harmless, a leaked one is neither. This is a stopgap, not the
+  # designed fix: see specs/harn-fix-3.md.
+  if ! git diff --quiet -- "$file"; then
+    echo "pre-commit: $file has unstaged changes; not stamping it" >&2
+    return 0
+  fi
   sed -E "s/^const SOURCE_COMMIT = '[0-9a-f]{40}'/const SOURCE_COMMIT = '${SHA}'/" "$file" > "$file.stamptmp"
   mv "$file.stamptmp" "$file"
   git add "$file"

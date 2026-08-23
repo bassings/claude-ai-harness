@@ -1,6 +1,6 @@
 # Multi-lens agent harness
 
-<!-- SOURCE_COMMIT: c124bd970be74b348f801ea7cd48f582f56ea7c0 -->
+<!-- SOURCE_COMMIT: 30797700abd5f2546ba9dcd0d2d74492d1937c97 -->
 <!-- Written by .githooks/pre-commit on every commit (specs/harn-fix-3.md
      AC-ARCH-1, AC-ARCH-3). Never hand-edit: the value names the commit that
      was HEAD immediately before this one (a commit cannot embed its own
