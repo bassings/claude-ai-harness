@@ -305,7 +305,7 @@ export const CONSUMER_SUBSET_PATTERNS = [
   'agents/reviewer-*.md',
   'workflows/*.js',
   'workflows/lib/',
-  'hooks/',
+  'hooks/', // except hooks/hooks.json -- see CONSUMER_OPTIONAL_PATTERNS below (L-4)
   // HIGH-2 (round-one review): broadened from 'skills/optimise-cycle/' to
   // the whole directory. README.md's manual-copy install instructs
   // `cp -r claude-ai-harness/skills/. ~/.claude/skills/` -- ALL skills,
@@ -343,7 +343,25 @@ export const CONSUMER_SUBSET_PATTERNS = [
 // "the drift report is noisy and gets ignored, becoming decoration"
 // failure the spec's own risk table names, and the same false-drift shape
 // round-one review's MED-4 found in the (now withdrawn) version stamp.
-export const CONSUMER_OPTIONAL_PATTERNS = ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs']
+//
+// L-4 (harn-fix-3, promoted 2026-08-24 -- measured against a real install,
+// not merely argued). hooks/hooks.json is the plugin manifest: read only
+// when the harness is installed via `/plugin install`. README.md's
+// manual-copy install wires the two PreToolUse hooks through
+// ~/.claude/settings.json directly, with absolute paths, instead of through
+// hooks.json -- confirmed against a real manual install's settings.json,
+// which carried both entries and no reference to hooks.json at all. Left in
+// the REQUIRED set (via the 'hooks/' directory prefix above), this fired on
+// EVERY weekly run for EVERY manual install, forever: not a one-off false
+// positive but a permanent one, which is the same "noisy, gets ignored"
+// failure named above, just reached by a different route. Moved here
+// instead of excluded entirely (unlike the plist) because absence and
+// presence are not symmetric: absence is a legitimate manual install, but
+// if the file IS present the install is a plugin install, and a stale copy
+// of the file that wires PreToolUse hooks is a real problem worth
+// reporting -- the same required-vs-optional split the two bin/ literals
+// above already establish, not a new shape.
+export const CONSUMER_OPTIONAL_PATTERNS = ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs', 'hooks/hooks.json']
 
 function escapeRegExpLiteral(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')

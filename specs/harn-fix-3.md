@@ -103,14 +103,29 @@ blocks harmless work gets switched off. An instructed-but-unsupported field
   exists to catch, sitting inside its own fix. Corrected subset:
   - **Required** (absence from the install is reported as drift):
     `AGENT-HARNESS.md`, `agents/lens-*.md`, `agents/reviewer-*.md`,
-    `workflows/*.js`, `workflows/lib/`, `hooks/`, `skills/` (broadened from
+    `workflows/*.js`, `workflows/lib/`, `hooks/` (except `hooks/hooks.json`,
+    moved to Optional below -- L-4), `skills/` (broadened from
     `skills/optimise-cycle/` to the whole directory).
   - **Optional** (present-if-opted-in: absence from the install is a
     legitimate configuration, never drift; presence with different content
     IS drift): `bin/optimise-cycle-weekly.sh`, `bin/redact-transcript.mjs`.
     The weekly job is opt-in -- a plugin install, or a manual install that
     never set up the launchd job, legitimately has no `bin/` directory at
-    all.
+    all. **`hooks/hooks.json` (L-4, promoted 2026-08-24)**: it is the
+    plugin manifest, read only by a `/plugin install`. `README.md`'s manual
+    install wires the two `PreToolUse` hooks through `~/.claude/settings.json`
+    directly, with absolute paths, instead -- verified against a real
+    operator's manual install, whose `settings.json` genuinely carried both
+    entries and no `hooks.json` at all. Left required, this fired drift on
+    every weekly run for every manual install, forever: not a one-off false
+    positive but a permanent one, which is the exact "the drift report is
+    noisy and gets ignored, becoming decoration" failure this criterion's
+    other entries already guard against, reached by a different route.
+    Optional rather than excluded, because absence and presence are not
+    symmetric here: a manual install legitimately never has the file, but a
+    plugin install does, and a stale copy of the file that wires
+    `PreToolUse` hooks is a real problem worth reporting -- the same split
+    the two `bin/` entries above already establish, not a new shape.
   - **Deliberately excluded**: `bin/com.local.optimise-cycle-weekly.plist`.
     Both `README.md` and the plist's own header comment document it as a
     per-operator TEMPLATE the operator edits before installing (substituting
@@ -125,9 +140,12 @@ blocks harmless work gets switched off. An instructed-but-unsupported field
   REQUIRED pattern. Test: delete one required subset file from the fixture
   install; it is named. An OPTIONAL file absent from the install is never
   reported. Test: an install with no `bin/` directory at all reports no
-  drift over it. A user-owned file that the repo does not ship (`CLAUDE.md`,
-  `agents/implementer.md`) is never reported. Test: both present in the
-  fixture, neither named.
+  drift over it; a fixture install with no `hooks/hooks.json` and everything
+  else current reports no drift at all (L-4). Absence being fine must not
+  make presence unchecked: a fixture with `hooks/hooks.json` present but
+  modified still reports drift (L-4). A user-owned file that the repo does
+  not ship (`CLAUDE.md`, `agents/implementer.md`) is never reported. Test:
+  both present in the fixture, neither named.
 - **AC-OPS-5:** The subset list has exactly one definition in the codebase. Test:
   a static check fails if a second literal copy of it appears.
 
@@ -331,6 +349,13 @@ measurement rather than an impression -- see below. Everything else on this
 list is **parked permanently**: it is not deferred work, and it is not to be
 re-raised at a future review as unmet.
 
+**2026-08-24, post-ship: `L4` also un-parked and built,** the same way `M1`
+was -- not by re-arguing the finding, but by measuring it against a real
+install and finding "permanent, not occasional" underneath "minor". `L5` was
+re-measured in the same session and its parked ruling held. Both are recorded
+below in place, not as a new list, because the finding text is the same
+finding, only its disposition changed.
+
 - **H3:** Every `could-not-check` outcome of the weekly staleness check is
   stderr-silent. Parked under the standing ruling that no-network stays
   stderr-silent: warning weekly about a routine condition trains the
@@ -343,12 +368,36 @@ re-raised at a future review as unmet.
   scope agent that under-reports `doc_fields`/`agent_fields` passes the gate
   trivially. Already documented as structurally unclosable for a
   dynamic-workflow script with no filesystem access of its own.
-- **L4:** `hooks/hooks.json` sits in the REQUIRED subset but is plugin-only,
-  so a manual install reports permanent drift on it and a plugin install
-  reports the whole required set missing.
-- **L5:** The directory-prefix patterns match any file at any depth,
-  including untracked build artefacts (e.g. `__pycache__`), if a caller ever
-  passes a working checkout instead of a fresh clone.
+- **L4: PROMOTED and BUILT 2026-08-24, no longer parked.** Parking this as
+  minor was wrong. It was measured, not merely filed as a theoretical worry:
+  the staleness check's first run against a real operator's `~/.claude`
+  reported `hooks/hooks.json` missing on a genuinely current, correctly
+  configured manual install (`README.md`'s manual install wires the hooks
+  through `~/.claude/settings.json`, verified against that operator's own
+  `settings.json`, which carried both `PreToolUse` entries with absolute
+  paths and no reference to `hooks.json` at all). Since `hooks/hooks.json`
+  never changes on a manual install, this is not an occasional false alarm,
+  it is a **permanent** one, on **every** weekly run, forever -- exactly the
+  "the drift report is noisy and gets ignored, becoming decoration" failure
+  this spec's own risk table names, and it would have smothered the
+  genuine positive (`workflows/lib/install-consistency.mjs` itself missing)
+  sitting right beside it in the same report. Closed by moving
+  `hooks/hooks.json` from `AC-OPS-4`'s Required list to its Optional one
+  (mutation-proved, `docs/install-consistency-mutation-proofs.md`, round
+  eight): absence is a legitimate manual install, never drift; presence
+  with different content is still drift, because that means a plugin
+  install with a stale manifest, a real problem.
+- **L5: still parked, now with a measurement instead of an impression.**
+  The directory-prefix patterns match any file at any depth, including
+  untracked build artefacts (e.g. `__pycache__`), if a caller ever passes a
+  working checkout instead of a fresh clone -- reproduced 2026-08-24:
+  comparing against a working checkout reported `hooks/__pycache__/*.pyc`
+  missing, because the published side walks the filesystem rather than the
+  git tree. Stays parked because it cannot fire in production: the weekly
+  runner's published side is always a fresh `git clone` (see
+  `bin/optimise-cycle-weekly.sh`), which carries no ignored artefacts, so
+  this only affects a local CLI invocation run directly against a working
+  checkout, never the scheduled job.
 - **L6:** `AC-QA-3`'s "adds no measurable delay to startup" clause has no
   measurement and no test; what is actually proven is "no extra `agent()`
   call".

@@ -1203,3 +1203,96 @@ this repo has been bitten by in four consecutive rounds.
 985/985, unchanged from round six: this round adds no tests because it adds no
 behaviour. Run after the edits, with the module confirmed to still parse and
 export its 15 symbols.
+
+## Round eight (2026-08-24): `hooks/hooks.json` moved to `CONSUMER_OPTIONAL_PATTERNS` (L4 promoted)
+
+The staleness check ran for the first time against a real operator's
+`~/.claude`, which was genuinely current and correctly configured as a
+**manual** install (`README.md`'s manual-install section wires the two
+`PreToolUse` hooks through `~/.claude/settings.json` directly, with absolute
+paths -- verified against that operator's own `settings.json`, which carried
+both entries and no reference to `hooks.json` at all). It reported
+`hooks/hooks.json` missing. `L4` (round-two review) had already named this
+exact shape and been parked as minor. It was measured, not re-argued: because
+`hooks/hooks.json` never changes on a manual install, this is not an
+occasional false alarm, it fires on **every** weekly run, forever -- the
+"noisy, gets ignored" failure this spec's own risk table names, capable of
+smothering a genuine positive (e.g. `workflows/lib/install-consistency.mjs`
+itself missing) sitting right beside it in the same report.
+
+Fixed the same way `bin/optimise-cycle-weekly.sh` and
+`bin/redact-transcript.mjs` already are: moved into
+`CONSUMER_OPTIONAL_PATTERNS` rather than excluded. Optional, not excluded,
+because absence and presence are not symmetric here -- a manual install
+legitimately never has the file, but a plugin install does, and a stale copy
+of the file that wires `PreToolUse` hooks is a real problem worth reporting.
+
+### 0. The missing tests (the real deliverable)
+
+Two new dedicated tests in `test/install-consistency.test.js` (unit level)
+and two in `test/weekly-runner.test.js` (end to end, driving the real CLI
+subprocess): a fixture install with no `hooks/hooks.json` and everything
+else current reports no drift; a fixture install with `hooks/hooks.json`
+present but modified still reports drift, named. Two pre-existing assertions
+that hardcoded `hooks/hooks.json` as REQUIRED (`isOptionalConsumerSubsetPath('hooks/hooks.json') === false`,
+and the `CONSUMER_OPTIONAL_PATTERNS` `deepEqual`) were updated in place --
+edited, not deleted, so they still pin the boundary, just on the other side
+of it. Two further pre-existing end-to-end tests in `test/weekly-runner.test.js`
+had used deleting `hooks/hooks.json` as their stand-in for "a REQUIRED file
+absent from the install"; both were repointed at
+`agents/reviewer-verification.md`, a required file untouched elsewhere in
+those two tests, to preserve their original intent.
+
+**RED confirmed for the intended reason** before the fix: of the three
+genuinely new assertions, the `CONSUMER_OPTIONAL_PATTERNS`/`isOptionalConsumerSubsetPath`
+tests failed on the array/boolean not yet containing `hooks/hooks.json`, and
+the new "no drift when absent" unit test failed with
+`missing: ['hooks/hooks.json']` where `[]` was expected -- not on a typo or
+an unrelated exception. The "presence-with-different-content is still drift"
+tests were **not** RED beforehand: that behaviour already held for a
+REQUIRED file, before this change, and continues to hold for an OPTIONAL one
+after it, so they exist as regression guards proven load-bearing by mutation
+2 below, not as RED/GREEN pairs.
+
+### 1. Mutation: move the entry back to the required list
+
+**Mutation**: removed `'hooks/hooks.json'` from `CONSUMER_OPTIONAL_PATTERNS`
+(the one-line array literal), reverting to the pre-fix list.
+
+**Confirmed landed**: `diff -u` against a `cp` snapshot of the fixed file
+showed exactly that one line changed, nothing else.
+
+**Result**: exactly 4 of 107 failed in `test/install-consistency.test.js` +
+`test/weekly-runner.test.js` combined -- the two `CONSUMER_OPTIONAL_PATTERNS`/
+`isOptionalConsumerSubsetPath` definition tests, the new unit-level "no
+drift when absent" test, and its end-to-end sibling driving the real CLI.
+Every other test, including the presence-drift tests, stayed green.
+
+**Reverted**: `cp` from the snapshot, `diff -q` byte-identical, confirmed.
+
+### 2. Mutation: delete the optional-presence comparison
+
+**Mutation**: added `if (isOptionalConsumerSubsetPath(rel)) continue` inside
+`checkStaleness`'s per-file loop, immediately after a successful read and
+before the content comparison -- so an OPTIONAL file that IS present is
+never compared to its published copy at all, simulating a naive
+"optional means unchecked" implementation.
+
+**Confirmed landed**: `diff -u` against the snapshot showed exactly the one
+added line, nothing else.
+
+**Result**: exactly 4 of 107 failed -- the two new dedicated
+`hooks/hooks.json` presence-drift tests (unit and end-to-end), plus **the
+two pre-existing `bin/optimise-cycle-weekly.sh` HIGH-2 presence-drift
+tests**, which is the point: this mutation breaks the whole OPTIONAL
+category's presence check, not merely the one file this round touched, and
+the pre-existing sibling tests catch that regardless.
+
+**Reverted**: `cp` from the snapshot, `diff -q` byte-identical, confirmed.
+
+### Full-suite state after round eight
+
+989/989 (up from 985/985: +2 in `test/install-consistency.test.js`, +2 in
+`test/weekly-runner.test.js`). Run three times consecutively with no flakes,
+after every mutation was reverted and the file confirmed byte-identical to
+the pre-mutation snapshot each time.
