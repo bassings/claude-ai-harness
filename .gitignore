@@ -4,3 +4,9 @@
 # machine: a fresh clone would have offered them for commit.
 .claude/harness-ledger.jsonl
 .claude/optimise-cycle-report.md
+
+# Python bytecode cache. test/destructive-git-guard.test.js's M3 allowlist
+# parity check imports hooks/destructive-git-guard.py as a module (to read
+# its GIT_ENV_ALLOWLIST constant as real data, not scraped source text),
+# which makes CPython write this on every run.
+hooks/__pycache__/

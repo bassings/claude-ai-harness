@@ -91,3 +91,9 @@ Specifically:
 
 Report anything that moves a loss up the recoverability ranking as Critical,
 even if the change is otherwise an improvement.
+
+For every finding, fill AGENT-HARNESS.md's `Recurrence` field: say whether you
+expect the same untested destructive branch, or the same key-collision
+vulnerability, elsewhere in the change. You know the extent of the class
+before the author does; naming it now saves the round it would otherwise take
+to rediscover it.

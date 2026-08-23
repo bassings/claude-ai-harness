@@ -67,3 +67,9 @@ was never checked in dark is the most common regression in this lens.
 Where the project's E2E suite has an a11y project, read what it actually asserts
 before trusting a green run. A test that skips when an element is missing is
 not a guard.
+
+For every finding, fill AGENT-HARNESS.md's `Recurrence` field: say whether you
+expect the same missing-state or missing-markup class elsewhere in the diff
+(a second control with no label, a second flow never checked at phone width).
+You know the extent before the author does; naming it now saves the round it
+would otherwise take to rediscover.

@@ -343,6 +343,248 @@ copy the hook and add to `~/.claude/settings.json`:
 }
 ```
 
+## Destructive git guard
+
+An agent ran `git checkout -- <file>` on its own uncommitted work three
+times in one session and destroyed its edits each time, despite
+`docs/harn-opt-2-mutation-proofs.md` forbidding it by name. Prose did not
+prevent it, so the rule is now a mechanism:
+
+- **`hooks/destructive-git-guard.py`** is a PreToolUse hook, matched to the
+  `Bash` tool, that refuses `git checkout -- <path>`, a bare
+  `git checkout <path>` with no `--` (resolved as a pathspec because it does
+  not resolve as a ref -- git's own precedence for an unqualified argument,
+  matched here rather than assumed; a leading ref followed by trailing paths,
+  e.g. `git checkout HEAD <path>`, is handled the same way), `git checkout
+  .`, `git checkout -f`/`--force` and `git switch
+  -f`/`--force`/`--discard-changes` (tree-wide, like `git reset --hard`),
+  `git checkout --pathspec-from-file=...`/`git restore --pathspec-from-file=...`
+  (tree-wide: the paths never appear on the command line to scope against),
+  `git restore <path>` (unless it is `--staged` alone, which only
+  unstages), and `git reset --hard` whenever the working tree, or the named
+  paths, actually have something to lose. `git status` decides that on
+  every call: a clean tree or clean named paths are let through untouched,
+  including `git checkout -b`, a bare `git checkout <branch>` that resolves
+  as a ref (git itself refuses the switch if it would actually overwrite
+  uncommitted work), and `git restore --staged` -- a guard that blocks
+  harmless commands gets disabled, which is worse than no guard. Refusal is
+  exit code 2 with the reason on stderr (the one PreToolUse exit code Claude
+  Code treats as blocking) and names the safe alternative: copy the file to
+  a scratch path first, or `git stash`.
+- **Normalisation layer**, between the raw shell string and the matcher
+  above (added after a review found eight distinct spellings of the same
+  guarded commands walking straight past it): a bare newline separates
+  commands exactly like `&&`/`;`, so a destructive call on any line of a
+  multi-line Bash tool call is still caught; a shell redirect (`>`,
+  `2>`, ...) and its target are dropped before anything can be read as a
+  pathspec; `git` is recognised by binary basename, so `/usr/bin/git` and a
+  prefixed form like `git -C <dir> checkout -- <path>` still reach the
+  matcher, and `-C`'s directory becomes the one the safety check actually
+  runs against; a bundled short-flag cluster (`git checkout -fq`) is
+  expanded so `-f` is still seen as force. A `cd <path>` earlier in the same
+  command changes which directory later segments are scoped against, so
+  `cd <dir> && git checkout -- <path>` is judged against `<dir>`, not the
+  tool call's own working directory -- and when that target cannot be
+  resolved without actually running a shell (a variable, `cd -`, a bare
+  `cd`), the guard now ALLOWS the rest of the command through (fails open,
+  like every other shape this tokenizer cannot positively identify): the
+  snapshot mechanism below is what actually covers that gap, not a refusal
+  that used to guess wrong as often as it guessed right.
+- **Escape hatch**: for a revert that is genuinely deliberate, set
+  `HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, either as this hook process's own
+  environment (exported for the session) or as a genuine env-prefix
+  assignment on the SAME command segment as the destructive call
+  (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- file`, ordinary shell
+  env-prefix syntax). This is deliberately not a text search over the whole
+  command: a quoted mention, a code comment, or an assignment that prefixes
+  a different, unrelated segment on the same line must not disarm a refusal
+  it was never meant to cover.
+- **Deliberately out of scope**: this hook does not intercept `git clean`
+  (`-f`/`-x`/`-d` in any combination), `git stash drop`, `git worktree
+  remove --force`, `git branch -D`, or any command reached through a
+  subshell, backtick, here-doc or unbalanced quote the tokenizer cannot
+  parse (all fail open by design -- see the module docstring). All of these
+  can destroy content with no copy anywhere in git; an aggressive `git
+  clean` (force, untracked directories and ignored files together) doing
+  exactly that to a whole `.claude/` directory is recorded in
+  `specs/harn-opt-3.md`'s AC-DATA-5. Untracked files generally are outside
+  this guard's scope: none of the commands it DOES intercept can lose an
+  untracked file, but that is not the same claim as "nothing here can lose
+  one" -- know the boundary before relying on it.
+
+**This detector is a best-effort early catch, not a boundary.** It is a
+blocklist over a Turing-complete input language (the set of shell spellings
+that reach the same destructive `git` call is unbounded), and three review
+rounds each closed a batch of bypasses only for the next round to find more
+(see `specs/harn-fix-2.md`'s Problem section for the round-by-round count).
+It makes no completeness claim. Measured-open bypass classes, none of them
+guarded and none of them planned to be (the recovery mechanism below is what
+actually closes this): an `env` or `command` prefix, a command-substitution
+binary path such as `$(which git)`, `eval`, a backtick or subshell, `bash
+-c`, `xargs`, a here-document, and any input the tokenizer cannot parse.
+Writing or quoting a guarded command as inert TEXT -- inside a here-document
+body, a quoted string, or a `grep`/`echo` argument -- is deliberately not
+refused: nothing there executes, and refusing it is exactly the noise
+failure that gets a guard switched off.
+
+Installing as a plugin wires the hook automatically. For manual installs,
+copy the hooks and add to `~/.claude/settings.json` (this repo writes only
+these two files into your own repository once running: a
+`harness-snapshot-failures.log` inside `.git/`, and refs under
+`refs/harness-snapshots/` -- see "Recovering destroyed work" below for what
+each one is and how to remove it):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{ "matcher": "Bash", "hooks": [
+      { "type": "command", "command": "python3",
+        "args": ["~/.claude/hooks/destructive-git-guard.py"], "timeout": 10 },
+      { "type": "command", "command": "python3",
+        "args": ["~/.claude/hooks/git-snapshot.py"], "timeout": 10 }
+    ] }]
+  }
+}
+```
+
+**What is, and is not, protected before you rely on either mechanism:**
+the snapshot mechanism below does NOT cover untracked files, ignored files
+(a gitignored `.env` included), work that was never written to disk, a
+repository a command `cd`s or `git -C`s into (only the Bash tool call's own
+`cwd` is snapshotted), or destruction by a non-Bash tool call (`Write`,
+`Edit`). Tracked, on-disk changes in the payload's own `cwd`, destroyed by
+ANY spelling of ANY command, are what it actually covers.
+
+## Recovering destroyed work
+
+`hooks/git-snapshot.py` is a second, independent PreToolUse hook, matched to
+`Bash`, that snapshots uncommitted TRACKED changes in the repository at the
+Bash call's own `cwd` before the call runs -- so destroyed work is
+recoverable regardless of how the destroying command was spelled, closing
+the gap the detector above cannot close by enumeration. It never reads the
+command text at all: it does not matter whether the command was
+`git checkout -- file`, `env git checkout -- file`, `$(which git) checkout
+-- file`, or `git reset --hard`; the snapshot happens identically either
+way, and it also runs on a genuinely harmless command (there is no way to
+tell in advance which command was about to be destructive).
+
+**Mechanism.** `git stash create` against a PRIVATE COPY of `.git/index`
+(via `GIT_INDEX_FILE`), never the real one -- measured to succeed while
+`.git/index.lock` is held by another process, and to leave the real index
+byte-identical. Untracked and ignored files are excluded (`git stash
+create`'s own behaviour). The resulting commit is anchored by one immutable
+ref per snapshot under `refs/harness-snapshots/`, keyed per checkout (a
+linked worktree gets its own key, since worktrees share one ref store but
+must not resolve to each other's content), before the hook returns. Refs
+older than the 20 most recent per checkout are pruned inline on every call;
+there is no separate pruning job or scheduled task. The hook fails open
+always -- exit 0 in every case -- with a bounded, deduplicated failure trace
+at `.git/harness-snapshot-failures.log` for the three states nothing could
+be snapshotted in: an unresolved merge or rebase in progress, an unborn
+HEAD (no commit yet), and index-lock contention. Twenty successful
+snapshots leave that log's size unchanged; it only grows on failure, is
+capped at 200 lines with the oldest evicted first, and repeated identical
+failures are written once, not once per call.
+
+**Recover a destroyed file, from a cold start with no prior knowledge.**
+List the snapshots for the current repository (timestamp, branch and
+originating worktree path are all in the ref's own creation date and
+commit subject):
+
+```
+git for-each-ref --format='%(refname) %(creatordate:iso-strict) %(contents:subject)' refs/harness-snapshots/
+```
+
+Pick a `<ref>` from that list, then extract a file's pre-destruction content
+into a sibling `.recovered` file -- this is the documented DEFAULT, and it
+never overwrites the original path, even if the current working copy has
+since been edited again and would otherwise conflict:
+
+```
+git show <ref>:<path> > <path>.recovered
+```
+
+Inspect `<path>.recovered`, then `mv` it over `<path>` yourself once you are
+sure -- that move is a separate, conscious step, never automatic. Running
+the extraction command twice is safe: it produces the same file both times.
+For a file that was staged differently from the worktree at snapshot time
+(`git status` showed `MM`), the worktree content is `git show <ref>:<path>`
+as above and the staged content is `git show <ref>^2:<path>`.
+
+**What is NOT recoverable from a snapshot:** untracked files, ignored files
+(a gitignored `.env` included -- deliberately: including them would put an
+agent-authored secret into a ref on every single Bash call), and anything
+never written to disk in the first place.
+
+**Retention.** At most 20 snapshot refs are kept per checkout; older ones
+are deleted (and their commits become unreachable) as a normal side effect
+of the next snapshot in that same checkout, no scheduled job involved.
+
+**Where these refs are, and are not, visible.** `git status`, `git log
+--oneline -1`, `git branch -a`, and a plain `git push`/`git push
+--all`/`git push --tags` to a remote are all unaffected -- snapshot refs
+live outside `refs/heads/*`, `refs/tags/*` and `refs/remotes/*`, and a
+routine push only ever transmits those three. Two things DO show them: any
+all-refs walk (`git log --all`, `git fsck`, an IDE's full history view), and
+`git push --mirror` or an explicit `refs/*:refs/*` refspec, both of which
+DO transmit snapshot refs to a remote.
+
+**Purging content, not just unreferencing it -- required after removing a
+secret from a working tree, or rewriting history to remove one.** Deleting
+the ref alone is not enough: `git show <sha>:.env` still prints the secret
+from the dangling commit until the object itself is gone. Run, in this
+repository, verbatim:
+
+```
+git for-each-ref --format='delete %(refname)' refs/harness-snapshots/ | git update-ref --stdin
+git reflog expire --expire-unreachable=now --all
+git gc --prune=now
+```
+
+**Kill switch.** Set `HARNESS_DISABLE_SNAPSHOT=1` in the Claude Code
+process's own environment (before starting `claude`, not something a Bash
+tool call's own `export` can reach -- see the next paragraph) to stop
+snapshotting entirely: no ref, no object, no file anywhere. It takes effect
+on the very next Bash call, no restart needed, because the hook holds no
+state across invocations. This is a separate variable from the detector's
+own `HARNESS_ALLOW_DESTRUCTIVE_GIT`: silencing the detector's false
+refusals must not silently silence recovery too, so the two are
+independent by design.
+
+**Scope of "exported for the session".** Every PreToolUse hook, this one and
+the detector above, runs as its own fresh subprocess spawned by the Claude
+Code CLI process for each tool call, inheriting THAT process's environment
+-- never the environment of a Bash tool call's own shell. An `export
+FOO=1` an agent runs as part of a Bash tool call's command does not reach
+either hook, on that call or any later one: it lives and dies inside the
+ephemeral shell Claude Code spawns to run that one command. "Exported for
+the session" means set in the shell `claude` itself was started from (or
+via your OS environment more generally), for both `HARNESS_DISABLE_SNAPSHOT`
+and `HARNESS_ALLOW_DESTRUCTIVE_GIT` -- this corrects the detector's escape
+hatch's own wording above, which previously left that ambiguous.
+
+**Cost.** Measured directly (`test/git-snapshot.test.js`'s AC-OPS-13 case):
+a small single-file fixture, dirtied fresh on every call so pruning never
+triggers, costs a median of ~76ms per invocation (7-run sample, on this
+development machine); the test's own ceiling is 400ms, a 5x margin over
+that baseline, so it fails before this drifts into "slow enough to get
+disabled" territory. Separately, the existing detector costs about 22.6ms
+on a benign command and 33.0ms refusing a destructive one; `git stash
+create` alone costs roughly 16.4ms at 200 tracked files and 25-30ms at
+4000-5000 (both figures from `specs/harn-fix-2.md`'s planning measurements,
+not re-verified here). The snapshot hook's own git subprocess calls
+(`rev-parse`, `stash create`, `update-ref` and, only when pruning,
+`for-each-ref`/`update-ref --stdin`/`gc --auto`) are bounded at
+`MAX_GIT_INVOCATIONS` (6) per call in `hooks/git-snapshot.py`, each with its
+own 6-second deadline, strictly under the 10-second timeout `hooks.json`
+registers.
+
+**Uninstall, completely.** Removing the hook registration (delete the
+`git-snapshot.py` entry from `hooks.json` or your `settings.json`) stops
+NEW snapshots but leaves every existing ref and its disk behind -- to
+reclaim that too, run the purge sequence above in every repository you want
+cleaned.
+
 ## Run ledger
 
 Every `tdd-task`, `review-cycle` and `plan-cycle` run -- conducted or
@@ -822,6 +1064,8 @@ invoking real subagents.
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `skills/optimise-cycle/` | Usage, cadence, report format and the proposal-decision recording protocol for the delivery optimiser |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
+| `hooks/destructive-git-guard.py` | PreToolUse hook refusing the enumerated `git checkout`/`switch`/`restore`/`reset --hard` shapes (see "Destructive git guard" above) that would discard uncommitted TRACKED work -- a best-effort early catch, not a boundary: `git clean`, `stash drop` and any spelling it cannot parse are explicitly out of scope |
+| `hooks/git-snapshot.py` | Independent PreToolUse hook snapshotting uncommitted TRACKED changes before every Bash call, so destroyed work is recoverable regardless of how the destroying command was spelled (see "Recovering destroyed work" above) |
 | `test/` | This repo's own test suite (`node --test test/*.test.js`); see "Tests" above |
 
 ## Cost and proportionality
