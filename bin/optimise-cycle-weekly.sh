@@ -146,7 +146,13 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # of the script actually ran -- the installed mirror at ~/.claude/bin/ can
 # otherwise drift silently out of sync with this repo (the same class
 # AC-OPS-4 already covers for workflows/).
-SCRIPT_VERSION="2026-08-17.2"
+# HIGH-2 (round-one review): bumped from 2026-08-17.2, which was still the
+# stamped value after this script grew ~140 lines for the staleness check
+# itself (HARN-FIX-3 T2) -- an installed runner missing that whole feature
+# was indistinguishable in the log from one that had it. Bump this whenever
+# this script's behaviour changes materially; test/static-checks.test.js
+# pins that it has moved past the pre-staleness-check value.
+SCRIPT_VERSION="2026-08-23.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REDACT_SCRIPT="$SCRIPT_DIR/redact-transcript.mjs"
@@ -345,21 +351,25 @@ else
     result_json=$(node "$LIB_SCRIPT" --check-staleness "$STALE_TMPDIR/src" "$CLAUDE_HOME" 2>/dev/null)
     node_status=$?
     if [ "$node_status" -eq 0 ] && [ -n "$result_json" ]; then
-      # Coordinator ruling 2026-08-23 (AC-OPS-1's "reports", read as reaching
-      # a human, not reaching a file): a drifted result and a clean result
-      # were both landing under the SAME "STALENESS ok" token -- the CLI's
-      # own `ok` field means "the check ran without error", which is
-      # defensible as a field name and was wrong as the thing a human scans
-      # first. A three-way token now distinguishes all three outcomes at a
-      # glance; the JSON tail (still parsed by the tests, and by anyone
-      # reading the log directly) is untouched. `"drift":[]` is JSON.stringify's
-      # exact, spaceless serialisation of an empty array -- see
-      # workflows/lib/install-consistency.mjs's checkStaleness()/--check-staleness,
-      # the only place that string is produced.
-      case "$result_json" in
-        *'"ok":false'*) log_staleness could-not-check "$result_json" ;;
-        *'"drift":[]'*) log_staleness ok "$result_json" ;;
-        *)
+      # LOW-2 (round-one review): this used to be TWO independent JSON
+      # decoders in this file -- a glob-substring `case` guessing "ok" vs
+      # "drift" from the RAW field shapes, plus a whole second `node -e`
+      # subprocess re-parsing the same blob just to count two array
+      # lengths. Both are gone: install-consistency.mjs's checkStaleness()
+      # now computes the three-way verdict itself (`status`) and the two
+      # counts (`drifted_count`, `missing_count`) it already has in hand,
+      # so this file's ONLY job is to read three already-decided scalar
+      # fields out of one line of JSON, with ONE extraction style (grep),
+      # never re-deciding what they mean. That also closes MED-8's
+      # follow-through: `status` is "could-not-check" whenever
+      # unmatched_patterns is non-empty (a subset pattern matched zero
+      # published files -- the module's own call, not bash's), so an
+      # install with a blind spot is never reported "ok" here just because
+      # bash never learned to ask.
+      status=$(printf '%s' "$result_json" | grep -oE '"status":"[a-z-]+"' | head -n1 | sed -E 's/.*"([a-z-]+)"$/\1/')
+      case "$status" in
+        ok) log_staleness ok "$result_json" ;;
+        drift)
           log_staleness drift "$result_json"
           # Drift recorded but invisible was the exact defect: the spec's
           # own risk table names "The drift report is noisy and gets
@@ -370,21 +380,16 @@ else
           # written already carries that. Never sets overall_fail: this is
           # about visibility, not about failing the run (AC-OPS-3's warn-
           # only mechanism is deliberate and unchanged).
-          drift_summary=$(printf '%s' "$result_json" | node -e '
-            let raw = ""
-            process.stdin.on("data", (d) => { raw += d })
-            process.stdin.on("end", () => {
-              try {
-                const j = JSON.parse(raw)
-                process.stdout.write((j.drifted || []).length + " drifted, " + (j.missing || []).length + " missing")
-              } catch (e) {
-                process.stdout.write("drift detected")
-              }
-            })
-          ' 2>/dev/null)
-          [ -z "$drift_summary" ] && drift_summary="drift detected"
-          echo "weekly optimise-cycle: consumer install drift ($drift_summary) -- see $LOG" >&2
+          drifted_count=$(printf '%s' "$result_json" | grep -oE '"drifted_count":[0-9]+' | grep -oE '[0-9]+')
+          missing_count=$(printf '%s' "$result_json" | grep -oE '"missing_count":[0-9]+' | grep -oE '[0-9]+')
+          [ -z "$drifted_count" ] && drifted_count="?"
+          [ -z "$missing_count" ] && missing_count="?"
+          echo "weekly optimise-cycle: consumer install drift ($drifted_count drifted, $missing_count missing) -- see $LOG" >&2
           ;;
+        # could-not-check, an unrecognised/absent status (a shape this
+        # runner does not know), or anything else -- fail closed to
+        # could-not-check, never silently "ok".
+        *) log_staleness could-not-check "$result_json" ;;
       esac
     else
       # AC-OPS-3: a git failure (clone succeeded but the comparison itself

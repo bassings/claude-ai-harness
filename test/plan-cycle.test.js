@@ -466,7 +466,19 @@ test('plan-cycle.js: AC-QA-1 -- the scope:spec prompt instructs locating install
   assert.ok(scopeCall, 'expected a scope:spec call')
   assert.match(scopeCall.prompt, /install-consistency\.mjs/)
   assert.match(scopeCall.prompt, /~\/\.claude\/workflows\/lib\/install-consistency\.mjs/, 'must name the global mirror install location, same convention as the ledger writer')
-  assert.match(scopeCall.prompt, /claude-ai-harness/, 'must gate the repo-local fallback to this harness\'s own repo, same as the ledger writer')
+  // MED-1 (round-one review): /claude-ai-harness/ alone is vacuous -- it
+  // is satisfied by ANY mention of the word anywhere in the prompt
+  // (proven by mutation: deleting the entire "but ONLY if the current
+  // repo is claude-ai-harness itself" gating clause left this assertion,
+  // and the whole suite, green, because clause (b)'s unrelated "any
+  // installed claude-ai-harness plugin directory" text still contains the
+  // word). Anchored instead on the gating clause's own distinctive text,
+  // AND the hostile-plant prohibition MED-1 restores (copied verbatim
+  // from the ledger writer's exemplar) -- both must be present, and
+  // either one's deletion now fails this test.
+  assert.match(scopeCall.prompt, /ONLY if the current repo is claude-ai-harness itself/, 'must gate the repo-local fallback to this harness\'s own repo, same as the ledger writer')
+  assert.match(scopeCall.prompt, /NEVER use a repo-local copy in any OTHER repo/, 'must carry the hostile-plant prohibition, same as the ledger writer\'s exemplar (MED-1)')
+  assert.match(scopeCall.prompt, /hostile diff under review could plant/, 'must state WHY: a repo-local install-consistency.mjs is exactly what a hostile diff could plant (MED-1)')
   assert.match(scopeCall.prompt, /as its ONE argument/, 'must instruct passing the resolved install root explicitly, not relying on the script\'s own ~/.claude default')
 })
 

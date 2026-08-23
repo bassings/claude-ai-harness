@@ -360,3 +360,263 @@ After the coordinator's 2026-08-23 drift-visibility follow-up (sections 7-8
 above), re-run three more consecutive times, every mutation there reverted
 and confirmed byte-identical: **927/927, 927/927, 927/927** (one net new
 test: the drift-visibility stderr test).
+
+## Round-one review, 2026-08-23: HIGH-2, MED-7, MED-8 follow-through, LOW-1, LOW-2
+
+The other agent's task 1 changes (stamp withdrawal, `MED-2/3/6/8`
+partial) landed at `b4f3cae`. This section covers what round-one review
+handed to THIS task specifically: `HIGH-2` (the consumer subset omits
+`bin/` and `skills/conduct-plan/`, including the detector itself), `MED-7`
+(the `AC-OPS-5` guard is quote-specific), `MED-8` follow-through (wiring
+`unmatched_patterns` into the weekly runner's log dispatch -- the other
+agent added the field to `checkStaleness()` but deliberately stopped short
+of touching `bin/optimise-cycle-weekly.sh`), `LOW-1` (`--check-staleness`
+can throw) and `LOW-2` (three independent JSON decoders in one bash file).
+`AC-OPS-3`'s no-network stderr silence was explicitly NOT to be changed
+(coordinator ruling, recorded, not revisited here).
+
+## 9. HIGH-2: the corrected consumer subset
+
+**The defect, confirmed**: `CONSUMER_SUBSET_PATTERNS` omitted `bin/` and
+`skills/conduct-plan/` entirely. `bin/optimise-cycle-weekly.sh` -- THIS
+SCRIPT -- and `bin/redact-transcript.mjs` are both consumer-installed per
+`README.md`'s "Weekly scheduled run" section (with their own `diff -q`
+verification commands); `skills/conduct-plan/` is copied by `README.md`'s
+manual-install `cp -r .../skills/. ~/.claude/skills/` step exactly like
+`skills/optimise-cycle/` was. Both were structurally invisible to the
+check this spec ships.
+
+**Fix**: `skills/optimise-cycle/` broadened to `skills/` (the whole
+directory) in `CONSUMER_SUBSET_PATTERNS`. A new, separate
+`CONSUMER_OPTIONAL_PATTERNS` export (`bin/optimise-cycle-weekly.sh`,
+`bin/redact-transcript.mjs`) whose absence from an install is NEVER
+missing/drift (the weekly job is opt-in), but whose presence with
+different content IS drift. `bin/com.local.optimise-cycle-weekly.plist`
+deliberately excluded (a per-operator template, not byte-comparable by
+design -- the same false-drift shape `MED-4` found in the withdrawn
+stamp). `specs/harn-fix-3.md`'s `AC-OPS-4` amended in the same change, per
+the review's own instruction ("changing it changes an acceptance
+criterion... propose the corrected list").
+
+**Proof, by real execution against real end-to-end fixtures**
+(`test/weekly-runner.test.js`), not merely by mutation:
+
+- `weekly runner (HIGH-2): a stale skills/conduct-plan/SKILL.md in the
+  install is detected as drift end to end` -- drives the real script
+  against a real local git clone; `STALENESS drift` names
+  `skills/conduct-plan/SKILL.md`.
+- `weekly runner (HIGH-2): a stale bin/optimise-cycle-weekly.sh in the
+  install is detected as drift end to end -- the detector can now see
+  itself` -- the headline scenario, driven for real: an installed copy of
+  THIS SCRIPT missing the whole staleness feature is now caught by a
+  fresh clone's own comparison.
+- `weekly runner (HIGH-2): an install with NO bin/ directory at all ...
+  reports clean, not drift` -- proves the optional-absence semantics: a
+  plugin install or a manual install that never ran the weekly-job sync
+  step is never penalised for it.
+
+**Mutation, executed**: `checkStaleness()`'s
+`if (!isOptionalConsumerSubsetPath(rel)) missing.push(rel)` replaced with
+an unconditional `missing.push(rel)` (i.e. reverting to "every absent
+published file is missing, optional or not"). `diff` against a `cp`
+snapshot confirmed exactly the one intended line changed. Result: exactly
+2 of 91 tests failed, both and only the HIGH-2 optional-absence tests --
+`install-consistency: checkStaleness (HIGH-2) -- a published install with
+NEITHER optional bin/ file present reports no drift over their absence`
+and `weekly runner (HIGH-2): an install with NO bin/ directory at all ...
+reports clean, not drift`. Reverted: `cp` from the snapshot, `diff`
+confirmed byte-identical, suite back to 91/91 across both files.
+
+## 10. MED-7: the `AC-OPS-5` guard was JS-quoting-specific
+
+See `test/static-checks.test.js`'s rewritten test and its own inline
+comment for the full narrative (this repo's convention keeps that
+narrative next to the code it guards, not duplicated here). Summary:
+
+**Mutation A (proving the OLD single-quoted needle was blind, before any
+fix)**: appended `SUBSET_PATTERNS="AGENT-HARNESS.md agents/lens-*.md
+agents/reviewer-*.md workflows/*.js"` to `bin/optimise-cycle-weekly.sh` --
+the review's own reproduction, in real bash idiom. Against the pre-fix
+needle (`"'agents/lens-*.md'"`, JS-single-quoted): 45/45 static tests
+passed, `AC-OPS-5` included -- the exact false-clean MED-7 describes.
+
+**Fix**: two bare needles (`agents/lens-*.md`, `agents/reviewer-*.md`, no
+quote characters of either's own), requiring both to appear within 100
+characters of EACH OTHER somewhere in the file. A single bare needle alone
+was tried first and rejected: it over-matched `workflows/plan-cycle.js`
+and `workflows/review-cycle.js`'s own H3-guard prose (an unrelated
+concern, `agents/lens-*.md` mentioned in a comment describing what the
+findings-consistency check reads), which the ORIGINAL narrow needle had
+coincidentally never matched. `agents/reviewer-*.md` does not appear
+anywhere in either workflow file, so requiring proximity to it is what
+distinguishes "a genuine pattern-list definition" from "a lone prose
+mention", regardless of quoting style.
+
+**Mutation B (the fix, re-run against the identical bash-idiom
+reproduction)**: `diff` confirmed the same line landed, byte-identical to
+Mutation A. Result: `AC-OPS-5`'s test failed, correctly naming
+`bin/optimise-cycle-weekly.sh` as a second definition site alongside
+`workflows/lib/install-consistency.mjs`:
+
+```
+✖ static: the consumer-subset pattern list (AC-OPS-5, ...) has exactly one definition site ...
+  AssertionError: Expected values to be strictly deep-equal:
+    [
+      'workflows/lib/install-consistency.mjs',
+  +   'bin/optimise-cycle-weekly.sh'
+    ]
+```
+
+**Reverted**: `cp` from a snapshot taken before Mutation B, `diff`
+confirmed byte-identical, `bash -n` syntax-checked, suite back to 45/45.
+
+## 11. MED-8 follow-through: `unmatched_patterns` wired into the weekly runner's dispatch
+
+The other agent added `unmatched_patterns` to `checkStaleness()`'s result
+(round two) but deliberately did not touch `bin/optimise-cycle-weekly.sh`,
+on the grounds that this file's logging behaviour was not its call to
+make. **Decision, this task**: an unmatched pattern forces
+`could-not-check`, overriding what would otherwise be `ok` OR `drift` --
+not merely a louder `ok`. Reasoning: a pattern matching zero published
+files means this run did not actually look at everything the subset
+claims to cover, which is indistinguishable, from the operator's side,
+from a genuine rename/move upstream silently going unwatched -- exactly
+the "found something, therefore looked at everything" shape MED-8 itself
+names, and the same shape `HIGH-2` was. ANY verdict a blind run produces,
+drift included, is untrustworthy, not merely its "ok" case: if the check
+cannot see the whole subset, it should not tell the operator "clean",
+full stop, regardless of what it did manage to compare.
+
+Implemented once, in `install-consistency.mjs`'s `computeStalenessStatus()`
+(`blind || unmatchedPatterns.length > 0` both collapse to
+`'could-not-check'`), NOT re-derived in bash -- this is also LOW-2's fix
+(section 12), so the two findings share one implementation.
+
+**Mutation, executed**: `computeStalenessStatus()`'s
+`if (blind || unmatchedPatterns.length > 0) return 'could-not-check'`
+replaced with `if (blind) return 'could-not-check'`, dropping the
+`unmatchedPatterns` half. `diff` against a `cp` snapshot confirmed exactly
+the one intended line changed. Result: exactly 2 of 91 tests failed --
+both and only the two MED-8-follow-through tests (the unit-level MED-8b
+test and the weekly-runner end-to-end test below). Reverted: `cp` from the
+snapshot, `diff` confirmed byte-identical, suite back to 91/91.
+
+**Proof, end to end** (`test/weekly-runner.test.js`): `weekly runner
+(MED-8 follow-through): a published tree missing a WHOLE subset directory
+(simulating a rename) reports could-not-check end to end, never "ok"` --
+drives the real script against a real published clone with `hooks/`
+removed upstream and an install that otherwise matches it perfectly (zero
+drift, zero missing); asserts `STALENESS could-not-check`, NOT
+`STALENESS ok`, and that `unmatched_patterns` names `hooks/`.
+
+## 12. LOW-1: `--check-staleness` must never throw
+
+**Structural finding, not only a targeted fix**: the round-one review's
+own reproduction (a dangling symlink under `agents/lens-*.md`) no longer
+reaches a crash at all, as a SIDE EFFECT of the other agent's `MED-8`
+refactor -- `listConsumerSubsetFiles` now classifies every directory
+entry via `fs.Dirent.isFile()`/`isDirectory()` from
+`readdirSync(dir, {withFileTypes:true})`, which does NOT follow symlinks
+(unlike the `fs.statSync` the original code used), so a symlink -- dangling
+or not -- is neither `isFile()` nor `isDirectory()` and is silently
+excluded from every candidate list before `checkStaleness` ever tries to
+read it. Verified directly: a published fixture with
+`agents/lens-broken.md` symlinked to a nonexistent target reports
+`published_files_checked` excluding it, no crash, exit 0.
+
+**The remaining unguarded read**: `checkStaleness()`'s
+`fs.readFileSync(path.join(publishedDir, rel))` for the PUBLISHED side
+(the install side was already guarded, for `missing` detection). This is a
+genuine TOCTOU window -- `listConsumerSubsetFiles`'s walk and this read
+are two separate filesystem passes -- reproduced deterministically via
+`chmod 000` rather than a real race.
+
+**Fix**: wrapped in try/catch, matching the tolerance
+`walkDirRecursive` already applies to a directory that vanishes mid-walk.
+On failure the entry is skipped entirely -- added to neither `drifted` nor
+`missing` (its status is genuinely unknown for this run, not silently
+"clean").
+
+**Proof, executed** (root-skipped via the same
+`process.getuid() === 0` guard `test/ledger-append.test.js` already uses):
+
+- `checkStaleness (LOW-1) -- a PUBLISHED file that becomes unreadable
+  between listing and reading is skipped, never thrown` -- `chmod 000` on
+  a published file mid-fixture; `checkStaleness()` returns normally,
+  neither `drifted` nor `missing` names the unreadable file.
+- `CLI --check-staleness (LOW-1) exits 0 with one line of valid JSON even
+  when a published file is unreadable` -- real subprocess, `chmod 000`,
+  asserts `res.status === 0` and `JSON.parse(res.stdout.trim())` does not
+  throw -- the CLI's own documented contract, proven under the exact
+  condition that used to break it.
+- `listConsumerSubsetFiles ... never follows a dangling symlink` -- the
+  structural-fix confirmation, a real `fs.symlinkSync` to a nonexistent
+  target.
+
+Manual reproduction of the review's ORIGINAL evidence (a dangling symlink
+under `agents/lens-*.md`, `--check-staleness` invoked directly) confirmed
+the crash no longer occurs on the current tree: `EXIT=0`, one line of
+valid JSON, `agents/lens-broken.md` absent from every field.
+
+## 13. LOW-2: one JSON-decoding style, not three
+
+**Before**: `bin/optimise-cycle-weekly.sh` decoded the SAME `--check-staleness`
+JSON blob three separate ways -- a `grep -oE` for a stamp field (removed by
+the other agent's stamp withdrawal, so only two remained by the time this
+task started: a glob-substring `case` guessing `ok`/`drift` from raw field
+SHAPES, and a whole second `node -e` subprocess spawned just to
+`JSON.parse` the blob again and sum two array lengths.
+
+**Fix**: `checkStaleness()` now computes and returns the derived values
+bash actually needs -- `status` (`ok`/`drift`/`could-not-check`, folding
+in `MED-8`'s follow-through), `drifted_count`, `missing_count` -- so the
+DECISION about what the fields mean lives in the module that computes
+them, once. `bin/optimise-cycle-weekly.sh`'s job collapses to reading
+three already-decided scalars out of one JSON line, with ONE extraction
+style throughout (`grep -oE` on a flat `"key":value` shape) -- no second
+`node` subprocess, no glob-substring guessing.
+
+**Mutation (proving the consolidated dispatch is load-bearing, not merely
+a refactor)**: `*'"drift":[]'*` (the pattern deciding "clean") had its
+match target replaced with an unmatchable string
+(`*'"drift":[MUTATED-NEVER-MATCHES]'*`), forcing every result through the
+`drift`/fallback branches regardless of actual content.
+
+**Confirmed landed**: `diff` against a `cp` snapshot showed exactly the
+one intended pattern changed.
+
+**Result**: exactly 3 of 44 tests in `test/weekly-runner.test.js` failed
+-- every test requiring a genuinely clean `STALENESS ok` verdict on an
+install with zero drift:
+
+```
+✖ weekly runner (AC-OPS-4): an identical install reports no drift -- STALENESS ok, drift:[]
+✖ weekly runner (HIGH-2): an install with NO bin/ directory at all ... reports clean, not drift
+✖ weekly runner (MED-8 follow-through): ... status is "could-not-check" ...
+```
+
+(The MED-8 follow-through test also failed here, correctly: it asserts
+`!/^STALENESS ok /m.test(logContents)` as a SANITY check that the mutated
+build never claims `ok` either, so its failure on THIS mutation is
+expected, not a false trigger.)
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+`bash -n` syntax-checked and `shellcheck -S warning` clean, suite back to
+44/44 (`test/weekly-runner.test.js` alone) / 936/936 (full suite).
+
+## Full-suite state after round-one review's HIGH-2/MED-7/MED-8/LOW-1/LOW-2
+
+**936/936**, run three consecutive times with no flakiness, after every
+mutation in sections 9-13 above was reverted and confirmed byte-identical
+against its snapshot. (`MED-1`, also handed to this task by the
+coordinator, touches `workflows/plan-cycle.js`/`workflows/review-cycle.js`
+and `workflows/lib/install-consistency.mjs`'s consistency-check side, not
+the staleness check -- its proof is recorded in
+`docs/install-consistency-mutation-proofs.md`'s "Round three" section
+instead, to keep each doc scoped to its own mechanism, per that file's
+existing convention.)
+
+`AC-OPS-3`'s no-network path was explicitly left unchanged per the
+coordinator's ruling (recorded, not re-litigated): a routine condition
+warning weekly on stderr would train the operator to ignore that channel,
+smothering the drift signal that actually matters.

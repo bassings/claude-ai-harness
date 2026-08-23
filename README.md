@@ -807,19 +807,45 @@ script's behaviour changes materially, so the log shows which copy of the
 script actually produced a given run -- the same drift class AC-OPS-4
 already covers for `workflows/`, extended to this file.
 
-**Consumer-install staleness check (`specs/harn-fix-3.md`, AC-OPS-1..5,
-AC-ARCH-2).** Once per invocation -- not once per delivery repo -- this
-script also checks whether the consumer install at `$CLAUDE_HOME` (default
-`~/.claude`) has drifted from published `main`: `AGENT-HARNESS.md`, every
-`agents/lens-*.md` and `agents/reviewer-*.md`, `workflows/*.js`,
-`workflows/lib/`, `hooks/`, and `skills/optimise-cycle/` (the exact
-consumer subset a manual multi-file copy can partially update; a
-user-owned file the repo does not ship, like `CLAUDE.md`, is never
-compared). Warn-only, by design: a stale install is not necessarily
-broken, so this never fails the run, unlike the separate, unconditional,
+**Consumer-install staleness check (`specs/harn-fix-3.md`, AC-OPS-1..5).**
+Once per invocation -- not once per delivery repo -- this script also
+checks whether the consumer install at `$CLAUDE_HOME` (default
+`~/.claude`) has drifted from published `main`. The consumer subset
+(a manual multi-file copy can partially update it) has two halves:
+
+- **Required** -- absence from the install is reported as drift:
+  `AGENT-HARNESS.md`, every `agents/lens-*.md` and `agents/reviewer-*.md`,
+  `workflows/*.js`, `workflows/lib/`, `hooks/`, and `skills/` (the whole
+  directory, not only `skills/optimise-cycle/` -- `skills/conduct-plan/`,
+  which drives every multi-PR plan, is genuinely published and installed
+  the same way).
+- **Optional** -- present-if-opted-in; absence from the install is a
+  legitimate configuration (the weekly job itself is opt-in), never drift,
+  but presence with DIFFERENT content still is: `bin/optimise-cycle-weekly.sh`
+  and `bin/redact-transcript.mjs` (round-one review, HIGH-2 -- this
+  script's own detector was previously excluded from the thing it checks,
+  the same defect class the whole spec exists to close, sitting inside its
+  own fix). `bin/com.local.optimise-cycle-weekly.plist` is deliberately
+  EXCLUDED from both lists: it is a per-operator TEMPLATE (its own header
+  comment says so), edited immediately after copying, so comparing it to
+  the published template would report every genuinely working install as
+  permanently drifted.
+
+A user-owned file the repo does not ship, like `CLAUDE.md`, is never
+compared. Warn-only, by design: a stale install is not necessarily broken,
+so this never fails the run, unlike the separate, unconditional,
 refuse-on-mismatch consistency preflight `workflows/lib/
 install-consistency.mjs` runs inside `plan-cycle.js`/`review-cycle.js`
 (AC-QA-1/2, above).
+
+**A subset pattern matching zero published files also forces
+`could-not-check`** (round-one review MED-8), never a bare `ok`, even when
+every file the comparison DID see matches exactly: a pattern silently
+matching nothing (a renamed or moved subset directory upstream) is the
+same "found something, therefore looked at everything" blindness this
+spec's anti-vacuity discipline exists to catch everywhere else in this
+module, and is reported to the operator identically -- an install cannot
+be called clean over content the check never actually looked at.
 
 The comparison clones published `main` fresh, `--depth 1`, into its own
 `mktemp -d` directory every run, deleted unconditionally on exit -- never a

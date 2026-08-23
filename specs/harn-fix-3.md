@@ -82,13 +82,44 @@ blocks harmless work gets switched off. An instructed-but-unsupported field
 - **AC-OPS-3:** No network, an unreachable remote, or a `git` failure produces
   `could not check` naming the reason, exit 0, and does not fail the weekly run.
   Test: run with a remote URL pointing at a non-existent path.
-- **AC-OPS-4:** The comparison covers exactly the consumer subset
-  (`AGENT-HARNESS.md`, `agents/lens-*.md`, `agents/reviewer-*.md`,
-  `workflows/*.js`, `workflows/lib/`, `hooks/`, `skills/optimise-cycle/`) and
-  reports a published file **absent** from the install as drift. Test: delete
-  one subset file from the fixture install; it is named. A user-owned file that
-  the repo does not ship (`CLAUDE.md`, `agents/implementer.md`) is never
-  reported. Test: both present in the fixture, neither named.
+- **AC-OPS-4:** The comparison covers exactly the consumer subset. **Amended
+  2026-08-23 (round-one review HIGH-2)**: the original enumeration omitted
+  `bin/` and `skills/conduct-plan/` entirely -- both are genuinely published
+  and consumer-installed (`README.md`'s manual install copies the whole
+  `skills/` tree; its separate "Weekly scheduled run" section documents
+  copying `bin/optimise-cycle-weekly.sh` and `bin/redact-transcript.mjs`,
+  with their own `diff -q` verification commands), so the check that this
+  spec ships could itself be arbitrarily stale in an install, and
+  `skills/conduct-plan/` -- which drives every multi-PR plan -- was
+  unwatched entirely. Both are the exact partial-update failure this spec
+  exists to catch, sitting inside its own fix. Corrected subset:
+  - **Required** (absence from the install is reported as drift):
+    `AGENT-HARNESS.md`, `agents/lens-*.md`, `agents/reviewer-*.md`,
+    `workflows/*.js`, `workflows/lib/`, `hooks/`, `skills/` (broadened from
+    `skills/optimise-cycle/` to the whole directory).
+  - **Optional** (present-if-opted-in: absence from the install is a
+    legitimate configuration, never drift; presence with different content
+    IS drift): `bin/optimise-cycle-weekly.sh`, `bin/redact-transcript.mjs`.
+    The weekly job is opt-in -- a plugin install, or a manual install that
+    never set up the launchd job, legitimately has no `bin/` directory at
+    all.
+  - **Deliberately excluded**: `bin/com.local.optimise-cycle-weekly.plist`.
+    Both `README.md` and the plist's own header comment document it as a
+    per-operator TEMPLATE the operator edits before installing (substituting
+    their real `$HOME` for the placeholder path it ships with), so a byte
+    comparison against the published template would report every genuinely
+    working install as permanently drifted -- the same false-drift shape
+    round-one review's MED-4 found in the (withdrawn) version stamp, and
+    exactly the outcome this spec's own risk table warns against ("the drift
+    report is noisy and gets ignored, becoming decoration").
+
+  Reports a published file **absent** from the install as drift, for every
+  REQUIRED pattern. Test: delete one required subset file from the fixture
+  install; it is named. An OPTIONAL file absent from the install is never
+  reported. Test: an install with no `bin/` directory at all reports no
+  drift over it. A user-owned file that the repo does not ship (`CLAUDE.md`,
+  `agents/implementer.md`) is never reported. Test: both present in the
+  fixture, neither named.
 - **AC-OPS-5:** The subset list has exactly one definition in the codebase. Test:
   a static check fails if a second literal copy of it appears.
 

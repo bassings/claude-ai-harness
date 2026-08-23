@@ -395,12 +395,20 @@ function writeTree(files) {
 }
 
 // A minimal but representative "published" tree: one file from each
-// pattern shape in CONSUMER_SUBSET_PATTERNS (a literal name, two single-
-// segment globs, a top-level glob, and three directory prefixes), plus two
-// files a real published repo also ships that are NOT in the subset
-// (test/ and docs/), so a test asserting "never reported" has something
-// real to assert against rather than an absence that could just as easily
-// be an incomplete fixture.
+// pattern shape in CONSUMER_SUBSET_PATTERNS/CONSUMER_OPTIONAL_PATTERNS (a
+// literal name, two single-segment globs, a top-level glob, three
+// directory prefixes, and the two HIGH-2 optional bin/ files), plus files
+// a real published repo also ships that are NOT in the subset (test/,
+// docs/, the templated plist), so a test asserting "never reported" has
+// something real to assert against rather than an absence that could just
+// as easily be an incomplete fixture.
+//
+// HIGH-2 (round-one review): skills/optimise-cycle/ broadened to skills/
+// (README.md's manual install copies the WHOLE directory), so
+// skills/conduct-plan/ is now genuinely in scope and skills/other-skill/
+// is no longer a valid negative control for "not in the subset" --
+// bin/setup-hooks.sh takes over that role (bin/ is NOT fully covered,
+// unlike skills/: only the two literal optional patterns are).
 function publishedSubsetTree(overrides = {}) {
   const files = {
     'AGENT-HARNESS.md': 'harness contract\n',
@@ -414,7 +422,11 @@ function publishedSubsetTree(overrides = {}) {
     'workflows/lib/ledger-append.mjs': 'ledger append\n',
     'hooks/hooks.json': '{}\n',
     'skills/optimise-cycle/SKILL.md': 'optimise-cycle skill\n',
-    'skills/other-skill/SKILL.md': 'NOT in the subset -- only skills/optimise-cycle/\n',
+    'skills/conduct-plan/SKILL.md': 'conduct-plan skill\n',
+    'bin/optimise-cycle-weekly.sh': 'weekly runner\n',
+    'bin/redact-transcript.mjs': 'redact transcript\n',
+    'bin/com.local.optimise-cycle-weekly.plist': 'NOT in the subset -- a per-operator TEMPLATE, deliberately excluded\n',
+    'bin/setup-hooks.sh': 'NOT in the subset -- bin/ is not a directory-prefix pattern, only two literal files in it are\n',
     'test/some.test.js': 'NOT in the subset\n',
     'docs/some-note.md': 'NOT in the subset\n',
     'README.md': 'NOT in the subset\n',
@@ -423,15 +435,20 @@ function publishedSubsetTree(overrides = {}) {
   return writeTree(files)
 }
 
-test('install-consistency: CONSUMER_SUBSET_PATTERNS is exported and matches the exact AC-OPS-4 list', async () => {
+test('install-consistency: CONSUMER_SUBSET_PATTERNS is exported and matches the exact AC-OPS-4 list (HIGH-2: skills/optimise-cycle/ broadened to skills/)', async () => {
   const { CONSUMER_SUBSET_PATTERNS } = await loadModule()
   assert.deepEqual(
     [...CONSUMER_SUBSET_PATTERNS].sort(),
-    ['AGENT-HARNESS.md', 'agents/lens-*.md', 'agents/reviewer-*.md', 'hooks/', 'skills/optimise-cycle/', 'workflows/*.js', 'workflows/lib/'].sort()
+    ['AGENT-HARNESS.md', 'agents/lens-*.md', 'agents/reviewer-*.md', 'hooks/', 'skills/', 'workflows/*.js', 'workflows/lib/'].sort()
   )
 })
 
-test('install-consistency: isConsumerSubsetPath matches every pattern shape (literal, single-segment glob, directory prefix at any depth) and rejects a user-owned file the repo does not ship', async () => {
+test('install-consistency: CONSUMER_OPTIONAL_PATTERNS (HIGH-2) is exported and names exactly the two bin/ files README.md documents as separately synced, excluding the templated plist', async () => {
+  const { CONSUMER_OPTIONAL_PATTERNS } = await loadModule()
+  assert.deepEqual([...CONSUMER_OPTIONAL_PATTERNS].sort(), ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs'].sort())
+})
+
+test('install-consistency: isConsumerSubsetPath matches every pattern shape (literal, single-segment glob, directory prefix at any depth, and the HIGH-2 optional bin/ literals) and rejects a user-owned or deliberately-excluded file', async () => {
   const { isConsumerSubsetPath } = await loadModule()
   assert.equal(isConsumerSubsetPath('AGENT-HARNESS.md'), true)
   assert.equal(isConsumerSubsetPath('agents/lens-security.md'), true)
@@ -440,14 +457,27 @@ test('install-consistency: isConsumerSubsetPath matches every pattern shape (lit
   assert.equal(isConsumerSubsetPath('workflows/lib/install-consistency.mjs'), true, 'a file nested under workflows/lib/ must match the directory-prefix pattern, not just workflows/lib/ itself')
   assert.equal(isConsumerSubsetPath('hooks/hooks.json'), true)
   assert.equal(isConsumerSubsetPath('skills/optimise-cycle/SKILL.md'), true)
+  assert.equal(isConsumerSubsetPath('skills/conduct-plan/SKILL.md'), true, 'HIGH-2: skills/ covers the whole directory, not just optimise-cycle/')
+  assert.equal(isConsumerSubsetPath('bin/optimise-cycle-weekly.sh'), true, 'HIGH-2: an optional pattern is still "in the subset", just not required to be present')
+  assert.equal(isConsumerSubsetPath('bin/redact-transcript.mjs'), true)
   assert.equal(isConsumerSubsetPath('agents/implementer.md'), false, 'implementer.md is user-owned, not published under agents/lens-*.md or agents/reviewer-*.md')
   assert.equal(isConsumerSubsetPath('CLAUDE.md'), false, 'CLAUDE.md is user-owned, never published')
-  assert.equal(isConsumerSubsetPath('skills/other-skill/SKILL.md'), false, 'only skills/optimise-cycle/ is in the subset, not every skill')
+  assert.equal(isConsumerSubsetPath('bin/com.local.optimise-cycle-weekly.plist'), false, 'the plist is deliberately excluded -- it is a per-operator TEMPLATE, never byte-identical to the published copy by design')
+  assert.equal(isConsumerSubsetPath('bin/setup-hooks.sh'), false, 'bin/ is not a directory-prefix pattern -- only the two literal optional files are in scope')
   assert.equal(isConsumerSubsetPath('workflows/lib_notreally/x.js'), false, '"workflows/lib/" must not match a differently-named sibling directory by prefix-string accident')
   assert.equal(isConsumerSubsetPath('test/some.test.js'), false)
 })
 
-test('install-consistency: listConsumerSubsetFiles walks a real tree and returns exactly the subset paths, sorted, excluding everything else', async () => {
+test('install-consistency: isOptionalConsumerSubsetPath (HIGH-2) is true only for the two bin/ literals, false for everything else in the subset', async () => {
+  const { isOptionalConsumerSubsetPath } = await loadModule()
+  assert.equal(isOptionalConsumerSubsetPath('bin/optimise-cycle-weekly.sh'), true)
+  assert.equal(isOptionalConsumerSubsetPath('bin/redact-transcript.mjs'), true)
+  assert.equal(isOptionalConsumerSubsetPath('AGENT-HARNESS.md'), false, 'a REQUIRED pattern must never read as optional')
+  assert.equal(isOptionalConsumerSubsetPath('hooks/hooks.json'), false)
+  assert.equal(isOptionalConsumerSubsetPath('bin/com.local.optimise-cycle-weekly.plist'), false, 'the plist is excluded entirely, not merely optional')
+})
+
+test('install-consistency: listConsumerSubsetFiles walks a real tree and returns exactly the subset paths (required AND optional), sorted, excluding everything else', async () => {
   const { listConsumerSubsetFiles } = await loadModule()
   const dir = publishedSubsetTree()
   const files = listConsumerSubsetFiles(dir)
@@ -458,8 +488,11 @@ test('install-consistency: listConsumerSubsetFiles walks a real tree and returns
       'agents/lens-qa.md',
       'agents/lens-security.md',
       'agents/reviewer-verification.md',
+      'bin/optimise-cycle-weekly.sh',
+      'bin/redact-transcript.mjs',
       'hooks/hooks.json',
       'skills/optimise-cycle/SKILL.md',
+      'skills/conduct-plan/SKILL.md',
       'workflows/lib/install-consistency.mjs',
       'workflows/lib/ledger-append.mjs',
       'workflows/plan-cycle.js',
@@ -493,9 +526,9 @@ test('install-consistency: MED-8 -- listConsumerSubsetFiles and isConsumerSubset
     assert.ok(isConsumerSubsetPath(rel), `listConsumerSubsetFiles returned "${rel}" but isConsumerSubsetPath rejects it -- the two matchers have diverged`)
   }
   // The negative controls the fixture deliberately plants (agents/implementer.md,
-  // skills/other-skill/SKILL.md, test/, docs/, README.md) must be excluded by
-  // BOTH functions identically, not just one.
-  for (const rel of ['agents/implementer.md', 'skills/other-skill/SKILL.md', 'test/some.test.js', 'docs/some-note.md', 'README.md']) {
+  // the templated plist, bin/setup-hooks.sh, test/, docs/, README.md) must
+  // be excluded by BOTH functions identically, not just one.
+  for (const rel of ['agents/implementer.md', 'bin/com.local.optimise-cycle-weekly.plist', 'bin/setup-hooks.sh', 'test/some.test.js', 'docs/some-note.md', 'README.md']) {
     assert.ok(!files.includes(rel), `listConsumerSubsetFiles must not include "${rel}"`)
     assert.ok(!isConsumerSubsetPath(rel), `isConsumerSubsetPath must not accept "${rel}"`)
   }
@@ -503,41 +536,105 @@ test('install-consistency: MED-8 -- listConsumerSubsetFiles and isConsumerSubset
 
 // ---- checkStaleness: the drift comparison itself (AC-OPS-4) ----
 
-test('install-consistency: checkStaleness reports no drift when the install matches the published subset exactly', async () => {
+test('install-consistency: checkStaleness reports no drift when the install matches the published subset exactly, and status:"ok" (LOW-2)', async () => {
   const { checkStaleness } = await loadModule()
   const published = publishedSubsetTree()
   const install = publishedSubsetTree() // byte-identical content, independent directory
   const result = checkStaleness(published, install)
   assert.equal(result.blind, false)
   assert.deepEqual(result.drifted, [])
+  assert.equal(result.drifted_count, 0)
   assert.deepEqual(result.missing, [])
+  assert.equal(result.missing_count, 0)
   assert.deepEqual(result.drift, [])
-  assert.equal(result.published_files_checked, 10)
+  assert.equal(result.published_files_checked, 13)
+  assert.deepEqual(result.unmatched_patterns, [])
+  assert.equal(result.status, 'ok')
 })
 
-test('install-consistency: checkStaleness reports a published file with DIFFERENT content in the install as drifted, naming it', async () => {
+test('install-consistency: checkStaleness reports a published file with DIFFERENT content in the install as drifted, naming it, with status:"drift" and drifted_count:1 (LOW-2)', async () => {
   const { checkStaleness } = await loadModule()
   const published = publishedSubsetTree()
   const install = publishedSubsetTree({ 'agents/lens-security.md': 'a stale, different copy\n' })
   const result = checkStaleness(published, install)
   assert.deepEqual(result.drifted, ['agents/lens-security.md'])
+  assert.equal(result.drifted_count, 1)
   assert.deepEqual(result.missing, [])
+  assert.equal(result.missing_count, 0)
   assert.deepEqual(result.drift, ['agents/lens-security.md'])
+  assert.equal(result.status, 'drift')
 })
 
-test('install-consistency: checkStaleness reports a published file ABSENT from the install as drift, under "missing" (AC-OPS-4\'s explicit case)', async () => {
+test('install-consistency: checkStaleness reports a published REQUIRED file ABSENT from the install as drift, under "missing" (AC-OPS-4\'s explicit case)', async () => {
   const { checkStaleness } = await loadModule()
   const published = publishedSubsetTree()
   const installDir = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
-  // Copy every published file except one.
-  for (const rel of ['AGENT-HARNESS.md', 'agents/lens-qa.md', 'agents/reviewer-verification.md', 'workflows/plan-cycle.js', 'workflows/review-cycle.js', 'workflows/lib/install-consistency.mjs', 'workflows/lib/ledger-append.mjs', 'hooks/hooks.json', 'skills/optimise-cycle/SKILL.md']) {
+  // Copy every published file except one required file (agents/lens-security.md).
+  for (const rel of [
+    'AGENT-HARNESS.md',
+    'agents/lens-qa.md',
+    'agents/reviewer-verification.md',
+    'workflows/plan-cycle.js',
+    'workflows/review-cycle.js',
+    'workflows/lib/install-consistency.mjs',
+    'workflows/lib/ledger-append.mjs',
+    'hooks/hooks.json',
+    'skills/optimise-cycle/SKILL.md',
+    'skills/conduct-plan/SKILL.md',
+    'bin/optimise-cycle-weekly.sh',
+    'bin/redact-transcript.mjs',
+  ]) {
     const dest = path.join(installDir, rel)
     fs.mkdirSync(path.dirname(dest), { recursive: true })
     fs.copyFileSync(path.join(published, rel), dest)
   }
   const result = checkStaleness(published, installDir)
   assert.deepEqual(result.missing, ['agents/lens-security.md'])
+  assert.equal(result.missing_count, 1)
   assert.deepEqual(result.drift, ['agents/lens-security.md'])
+  assert.equal(result.status, 'drift')
+})
+
+// HIGH-2: the two literal bin/ patterns are OPTIONAL -- their absence from
+// an install is a legitimate configuration (the weekly job is opt-in for
+// a plugin install or a manual install that never set up launchd), never
+// drift.
+test('install-consistency: checkStaleness (HIGH-2) -- a published install with NEITHER optional bin/ file present reports no drift over their absence', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const installDir = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
+  for (const rel of [
+    'AGENT-HARNESS.md',
+    'agents/lens-security.md',
+    'agents/lens-qa.md',
+    'agents/reviewer-verification.md',
+    'workflows/plan-cycle.js',
+    'workflows/review-cycle.js',
+    'workflows/lib/install-consistency.mjs',
+    'workflows/lib/ledger-append.mjs',
+    'hooks/hooks.json',
+    'skills/optimise-cycle/SKILL.md',
+    'skills/conduct-plan/SKILL.md',
+    // deliberately NO bin/optimise-cycle-weekly.sh, NO bin/redact-transcript.mjs
+  ]) {
+    const dest = path.join(installDir, rel)
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.copyFileSync(path.join(published, rel), dest)
+  }
+  const result = checkStaleness(published, installDir)
+  assert.deepEqual(result.missing, [], 'an optional file missing from the install must never be reported as missing')
+  assert.deepEqual(result.drift, [])
+  assert.equal(result.status, 'ok')
+})
+
+test('install-consistency: checkStaleness (HIGH-2) -- an optional bin/ file that IS present but has different content IS reported as drifted, unlike a merely absent one', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree({ 'bin/optimise-cycle-weekly.sh': 'a stale, locally-edited copy\n' })
+  const result = checkStaleness(published, install)
+  assert.deepEqual(result.drifted, ['bin/optimise-cycle-weekly.sh'])
+  assert.deepEqual(result.missing, [], 'presence-with-different-content is drift, but it is never ALSO counted as missing')
+  assert.equal(result.status, 'drift')
 })
 
 test('install-consistency: checkStaleness never reports a user-owned file the install has but the repo does not ship (AC-OPS-4\'s other explicit case)', async () => {
@@ -564,7 +661,7 @@ test('install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published 
 // pattern's directory must still name that pattern -- the failure the
 // aggregate-only check cannot see (a renamed or moved subset directory
 // silently stops being compared while everything else still looks fine).
-test('install-consistency: checkStaleness (MED-8b) -- a published tree with content for every pattern EXCEPT one reports that one pattern in unmatched_patterns, while the aggregate blind stays false', async () => {
+test('install-consistency: checkStaleness (MED-8b) -- a published tree with content for every pattern EXCEPT two reports those two in unmatched_patterns, while the aggregate blind stays false, and status is "could-not-check" even though drift/missing are both empty', async () => {
   const { checkStaleness } = await loadModule()
   const dir = writeTree({
     'AGENT-HARNESS.md': 'harness contract\n',
@@ -573,6 +670,8 @@ test('install-consistency: checkStaleness (MED-8b) -- a published tree with cont
     'workflows/review-cycle.js': 'review cycle\n',
     'workflows/lib/ledger-append.mjs': 'ledger append\n',
     'skills/optimise-cycle/SKILL.md': 'optimise-cycle skill\n',
+    'bin/optimise-cycle-weekly.sh': 'weekly runner\n',
+    'bin/redact-transcript.mjs': 'redact transcript\n',
     // no agents/reviewer-*.md, no hooks/ at all
   })
   const install = dir
@@ -582,13 +681,18 @@ test('install-consistency: checkStaleness (MED-8b) -- a published tree with cont
   assert.ok(result.unmatched_patterns.includes('agents/reviewer-*.md'), `expected "agents/reviewer-*.md" in unmatched_patterns, got: ${JSON.stringify(result.unmatched_patterns)}`)
   assert.ok(!result.unmatched_patterns.includes('AGENT-HARNESS.md'), 'a pattern that DID match something must not be listed as unmatched')
   assert.ok(!result.unmatched_patterns.includes('workflows/*.js'), 'a pattern that DID match something must not be listed as unmatched')
+  assert.ok(!result.unmatched_patterns.includes('bin/optimise-cycle-weekly.sh'), 'an OPTIONAL pattern that DID match something must not be listed as unmatched either')
+  assert.deepEqual(result.drifted, [])
+  assert.deepEqual(result.missing, [])
+  assert.equal(result.status, 'could-not-check', 'MED-8 follow-through: an unmatched pattern makes the WHOLE verdict untrustworthy, not only "ok" -- even with zero drift and zero missing found')
 })
 
-test('install-consistency: checkStaleness (MED-8b) -- a published tree with content for every pattern reports an EMPTY unmatched_patterns list (must not cry wolf)', async () => {
+test('install-consistency: checkStaleness (MED-8b) -- a published tree with content for every pattern (required AND optional) reports an EMPTY unmatched_patterns list (must not cry wolf)', async () => {
   const { checkStaleness } = await loadModule()
   const dir = publishedSubsetTree()
   const result = checkStaleness(dir, dir)
   assert.deepEqual(result.unmatched_patterns, [])
+  assert.equal(result.status, 'ok')
 })
 
 test('install-consistency: checkStaleness reads only -- never writes, creates or deletes anything in EITHER directory it is given (AC-OPS-2)', async () => {
@@ -611,9 +715,66 @@ test('install-consistency: checkStaleness reads only -- never writes, creates or
   assert.deepEqual(hashTree(install), beforeInstall)
 })
 
+// ---- LOW-1 (round-one review): --check-staleness must never throw ----
+// The original evidence used a dangling symlink under agents/lens-*.md,
+// which the MED-8 refactor above closed structurally as a side effect
+// (walkDirRecursive/the root-literal branch both classify entries via
+// fs.Dirent's isFile()/isDirectory(), which does NOT follow a symlink --
+// a dangling or valid symlink is neither, so it is silently excluded from
+// candidates before checkStaleness ever tries to read it; verified by a
+// direct fixture below). The remaining unguarded read this closes is the
+// genuine TOCTOU window: listConsumerSubsetFiles's walk and checkStaleness's
+// content read are two separate filesystem passes, so a file present at
+// listing time can become unreadable before the second pass reaches it.
+// chmod 000 reproduces "unreadable" deterministically, without a real race.
+test(
+  'install-consistency: checkStaleness (LOW-1) -- a PUBLISHED file that becomes unreadable between listing and reading is skipped, never thrown, and never silently counted as clean or drifted',
+  { skip: typeof process.getuid === 'function' && process.getuid() === 0 ? 'running as root: permission checks are bypassed, so this failure mode cannot occur' : false },
+  async () => {
+    const { checkStaleness } = await loadModule()
+    const published = publishedSubsetTree()
+    const install = publishedSubsetTree()
+    const unreadable = path.join(published, 'agents', 'lens-security.md')
+    fs.chmodSync(unreadable, 0o000)
+    try {
+      assert.doesNotThrow(() => checkStaleness(published, install))
+      const result = checkStaleness(published, install)
+      assert.ok(!result.drifted.includes('agents/lens-security.md'), 'an unreadable published file must not be reported as drifted -- its content was never actually compared')
+      assert.ok(!result.missing.includes('agents/lens-security.md'), 'it was found during listing, so it must not be reported as missing either -- that would misdiagnose an unrelated cause')
+    } finally {
+      fs.chmodSync(unreadable, 0o644) // restore so cleanup can remove it
+    }
+  }
+)
+
+test('install-consistency: listConsumerSubsetFiles (LOW-1 structural fix, MED-8 refactor) never follows a dangling symlink under a glob directory -- it is silently excluded, not crashed on', async () => {
+  const { listConsumerSubsetFiles } = await loadModule()
+  const dir = publishedSubsetTree()
+  fs.symlinkSync('/nonexistent/target/for/low-1', path.join(dir, 'agents', 'lens-broken.md'))
+  assert.doesNotThrow(() => listConsumerSubsetFiles(dir))
+  const files = listConsumerSubsetFiles(dir)
+  assert.ok(!files.includes('agents/lens-broken.md'), 'a dangling symlink must never appear in the result')
+})
+
+test('install-consistency: CLI --check-staleness (LOW-1) exits 0 with one line of valid JSON even when a published file is unreadable -- its OWN documented contract', {
+  skip: typeof process.getuid === 'function' && process.getuid() === 0 ? 'running as root: permission checks are bypassed, so this failure mode cannot occur' : false,
+}, () => {
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree()
+  const unreadable = path.join(published, 'agents', 'lens-security.md')
+  fs.chmodSync(unreadable, 0o000)
+  try {
+    const res = spawnSync('node', [SCRIPT, '--check-staleness', published, install], { encoding: 'utf8' })
+    assert.equal(res.status, 0, `--check-staleness must always exit 0 per its documented contract; stderr:\n${res.stderr}`)
+    assert.doesNotThrow(() => JSON.parse(res.stdout.trim()), `stdout must be exactly one line of valid JSON, got:\n${res.stdout}`)
+  } finally {
+    fs.chmodSync(unreadable, 0o644)
+  }
+})
+
 // ---- --check-staleness CLI mode (AC-OPS-1..4, real subprocess) ----
 
-test('install-consistency: CLI --check-staleness prints one line of JSON matching checkStaleness()\'s own result, ok:true when files were actually compared', () => {
+test('install-consistency: CLI --check-staleness prints one line of JSON matching checkStaleness()\'s own result, ok:true, status:"drift" (LOW-2) when files were actually compared', () => {
   const published = publishedSubsetTree()
   const install = publishedSubsetTree({ 'agents/lens-security.md': 'drifted\n' })
   const res = spawnSync('node', [SCRIPT, '--check-staleness', published, install], { encoding: 'utf8' })
@@ -621,7 +782,20 @@ test('install-consistency: CLI --check-staleness prints one line of JSON matchin
   const out = JSON.parse(res.stdout.trim())
   assert.equal(out.ok, true)
   assert.deepEqual(out.drifted, ['agents/lens-security.md'])
+  assert.equal(out.drifted_count, 1)
   assert.equal(out.blind, false)
+  assert.equal(out.status, 'drift')
+})
+
+test('install-consistency: CLI --check-staleness reports status:"ok" for a genuinely clean install (LOW-2), the value bin/optimise-cycle-weekly.sh now reads directly rather than re-deriving from raw field shapes', () => {
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree()
+  const res = spawnSync('node', [SCRIPT, '--check-staleness', published, install], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.status, 'ok')
+  assert.equal(out.drifted_count, 0)
+  assert.equal(out.missing_count, 0)
 })
 
 test('install-consistency: CLI --check-staleness reports ok:false (never ok:true) when it is blind -- the anti-vacuity guard applies through the CLI, not only the direct function call', () => {
@@ -645,10 +819,11 @@ test('install-consistency: CLI --check-staleness never touches either directory 
   assert.deepEqual(fs.readdirSync(install, { recursive: true }).sort(), beforeInst)
 })
 
-test('install-consistency: CLI --check-staleness exits 0 with ok:false and an error, never throws, when called with missing arguments', () => {
+test('install-consistency: CLI --check-staleness exits 0 with ok:false, status:"could-not-check" (LOW-2) and an error, never throws, when called with missing arguments', () => {
   const res = spawnSync('node', [SCRIPT, '--check-staleness'], { encoding: 'utf8' })
   assert.equal(res.status, 0, res.stderr)
   const out = JSON.parse(res.stdout.trim())
   assert.equal(out.ok, false)
+  assert.equal(out.status, 'could-not-check', 'status must be present on EVERY exit path, including a usage error, so a caller can dispatch on one field unconditionally')
   assert.match(out.error, /usage/i)
 })

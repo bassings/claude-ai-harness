@@ -821,14 +821,24 @@ test('weekly runner: a GNU-behaving stat (where -f SUCCEEDS with filesystem info
 // real connectivity or the real GitHub repo.
 function makePublishedRepo(overrides = {}) {
   const repo = makeTempRepo()
+  // HIGH-2 (round-one review): includes agents/reviewer-*.md,
+  // skills/conduct-plan/ (skills/optimise-cycle/ broadened to the whole
+  // directory) and the two OPTIONAL bin/ files, so a fixture built from
+  // this helper alone never trips unmatched_patterns/could-not-check as
+  // an accident of an incomplete fixture -- a test that wants to exercise
+  // unmatched_patterns does so deliberately, by omitting one of these.
   const files = {
     'AGENT-HARNESS.md': 'harness contract\n',
     'agents/lens-security.md': 'lens security\n',
+    'agents/reviewer-verification.md': 'reviewer verification\n',
     'workflows/plan-cycle.js': 'plan cycle\n',
     'workflows/review-cycle.js': 'review cycle\n',
     'workflows/lib/install-consistency.mjs': 'the lib file itself\n',
     'hooks/hooks.json': '{}\n',
     'skills/optimise-cycle/SKILL.md': 'optimise-cycle skill\n',
+    'skills/conduct-plan/SKILL.md': 'conduct-plan skill\n',
+    'bin/optimise-cycle-weekly.sh': 'weekly runner\n',
+    'bin/redact-transcript.mjs': 'redact transcript\n',
     ...overrides,
   }
   for (const [rel, content] of Object.entries(files)) {
@@ -855,7 +865,19 @@ function makeInstallDir(files) {
 
 function identicalInstallOf(publishedRepoDir) {
   const files = {}
-  for (const rel of ['AGENT-HARNESS.md', 'agents/lens-security.md', 'workflows/plan-cycle.js', 'workflows/review-cycle.js', 'workflows/lib/install-consistency.mjs', 'hooks/hooks.json', 'skills/optimise-cycle/SKILL.md']) {
+  for (const rel of [
+    'AGENT-HARNESS.md',
+    'agents/lens-security.md',
+    'agents/reviewer-verification.md',
+    'workflows/plan-cycle.js',
+    'workflows/review-cycle.js',
+    'workflows/lib/install-consistency.mjs',
+    'hooks/hooks.json',
+    'skills/optimise-cycle/SKILL.md',
+    'skills/conduct-plan/SKILL.md',
+    'bin/optimise-cycle-weekly.sh',
+    'bin/redact-transcript.mjs',
+  ]) {
     files[rel] = fs.readFileSync(path.join(publishedRepoDir, rel), 'utf8')
   }
   return makeInstallDir(files)
@@ -950,6 +972,86 @@ test('weekly runner (AC-OPS-4): a published file DELETED from the install is nam
   const json = JSON.parse(line.slice(line.indexOf('{')))
   assert.deepEqual(json.missing, ['hooks/hooks.json'])
   assert.ok(!logContents.includes('CLAUDE.md'), 'CLAUDE.md is user-owned and not in the consumer subset -- it must never be named')
+})
+
+// ---- HIGH-2 (round-one review): the corrected subset, driven end to end ----
+// The core defect: bin/optimise-cycle-weekly.sh (this very script) and
+// skills/conduct-plan/ (the multi-PR plan driver) were BOTH omitted from
+// the old subset, so either could be arbitrarily stale in a real install
+// and the weekly log would say "STALENESS ok" over it. These tests drive
+// the REAL script end to end against both, proving the fix closes the
+// exact scenario, not merely a unit-level pattern-matching claim.
+
+test('weekly runner (HIGH-2): a stale skills/conduct-plan/SKILL.md in the install is detected as drift end to end -- conduct-plan drives every multi-PR plan and was previously outside the subset entirely', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'skills', 'conduct-plan', 'SKILL.md'), 'a stale, half-applied copy\n')
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.deepEqual(json.drifted, ['skills/conduct-plan/SKILL.md'])
+})
+
+test('weekly runner (HIGH-2): a stale bin/optimise-cycle-weekly.sh in the install is detected as drift end to end -- the detector can now see itself', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'bin', 'optimise-cycle-weekly.sh'), 'an old copy of this very script, without the staleness check at all\n')
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.deepEqual(json.drifted, ['bin/optimise-cycle-weekly.sh'])
+})
+
+test('weekly runner (HIGH-2): an install with NO bin/ directory at all (a plugin install, or a manual install that never set up the weekly job) reports clean, not drift, over the OPTIONAL bin/ files\' absence', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.rmSync(path.join(install, 'bin'), { recursive: true, force: true })
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS ok /m, logContents)
+  assert.ok(!logContents.includes('"missing":["bin'), `an optional file's absence must never be reported as missing:\n${logContents}`)
+})
+
+// ---- MED-8 follow-through: a subset pattern matching nothing forces could-not-check, never a false "ok" ----
+test('weekly runner (MED-8 follow-through): a published tree missing a WHOLE subset directory (simulating a rename) reports could-not-check end to end, never "ok", even though nothing in the intersection actually drifted', () => {
+  const published = makePublishedRepo()
+  fs.rmSync(path.join(published, 'hooks'), { recursive: true, force: true })
+  sh('git add -A && git commit -q -m "simulate a hooks/ rename upstream"', published)
+  // Built by hand rather than identicalInstallOf() (which would try to
+  // read hooks/hooks.json from published and fail -- it no longer exists
+  // there either, which is the whole point of this fixture).
+  const install = makeInstallDir({
+    'AGENT-HARNESS.md': fs.readFileSync(path.join(published, 'AGENT-HARNESS.md'), 'utf8'),
+    'agents/lens-security.md': fs.readFileSync(path.join(published, 'agents', 'lens-security.md'), 'utf8'),
+    'agents/reviewer-verification.md': fs.readFileSync(path.join(published, 'agents', 'reviewer-verification.md'), 'utf8'),
+    'workflows/plan-cycle.js': fs.readFileSync(path.join(published, 'workflows', 'plan-cycle.js'), 'utf8'),
+    'workflows/review-cycle.js': fs.readFileSync(path.join(published, 'workflows', 'review-cycle.js'), 'utf8'),
+    'workflows/lib/install-consistency.mjs': fs.readFileSync(path.join(published, 'workflows', 'lib', 'install-consistency.mjs'), 'utf8'),
+    'skills/optimise-cycle/SKILL.md': fs.readFileSync(path.join(published, 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8'),
+    'skills/conduct-plan/SKILL.md': fs.readFileSync(path.join(published, 'skills', 'conduct-plan', 'SKILL.md'), 'utf8'),
+    'bin/optimise-cycle-weekly.sh': fs.readFileSync(path.join(published, 'bin', 'optimise-cycle-weekly.sh'), 'utf8'),
+    'bin/redact-transcript.mjs': fs.readFileSync(path.join(published, 'bin', 'redact-transcript.mjs'), 'utf8'),
+    // deliberately NO hooks/ at all -- matches the published repo post-removal
+  })
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS could-not-check /m, `a pattern matching zero published files must force could-not-check, never a bare "ok":\n${logContents}`)
+  assert.ok(!/^STALENESS ok /m.test(logContents), logContents)
+  const line = logContents.match(/^STALENESS could-not-check .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.ok(json.unmatched_patterns.includes('hooks/'), `expected "hooks/" in unmatched_patterns:\n${JSON.stringify(json.unmatched_patterns)}`)
 })
 
 test('weekly runner (AC-OPS-2): the staleness check never writes to the install, INCLUDING on a run that reports drift', () => {

@@ -193,8 +193,44 @@ export const CONSUMER_SUBSET_PATTERNS = [
   'workflows/*.js',
   'workflows/lib/',
   'hooks/',
-  'skills/optimise-cycle/',
+  // HIGH-2 (round-one review): broadened from 'skills/optimise-cycle/' to
+  // the whole directory. README.md's manual-copy install instructs
+  // `cp -r claude-ai-harness/skills/. ~/.claude/skills/` -- ALL skills,
+  // not one -- so the old pattern left skills/conduct-plan/ (which drives
+  // every multi-PR plan) unwatched: a stale or half-copied
+  // skills/conduct-plan/SKILL.md is exactly the partial-update failure
+  // this module's header warns about, and the check reported clean over
+  // it regardless.
+  'skills/',
 ]
+
+// HIGH-2 (round-one review): bin/optimise-cycle-weekly.sh and
+// bin/redact-transcript.mjs are genuinely consumer-relevant and were
+// omitted from CONSUMER_SUBSET_PATTERNS entirely -- the launchd job runs
+// the INSTALLED ~/.claude/bin/optimise-cycle-weekly.sh, not this repo's
+// checkout (README.md's "Weekly scheduled run" section documents copying
+// both, with its own `diff -q` verification commands), so the detector
+// THIS SPEC SHIPS could itself be arbitrarily stale in an install and this
+// check would report clean -- the same defect class the whole spec exists
+// to close, sitting inside its own fix.
+//
+// Listed separately, and OPTIONAL, not required like every pattern above:
+// the weekly job is opt-in (a plugin install, or a manual-copy install
+// that never set up the launchd job, legitimately has no bin/ directory at
+// all), so their ABSENCE from an install is never reported as drift -- only
+// their PRESENCE-with-different-content is (checkStaleness below, and
+// isOptionalConsumerSubsetPath).
+//
+// bin/com.local.optimise-cycle-weekly.plist is deliberately EXCLUDED from
+// both lists: README.md and the plist's own header comment both document
+// it as a TEMPLATE the operator edits before installing (substituting
+// their real $HOME for the literal placeholder path the plist ships with), so a
+// byte comparison against the published template would report every
+// genuinely working install as permanently drifted forever -- the exact
+// "the drift report is noisy and gets ignored, becoming decoration"
+// failure the spec's own risk table names, and the same false-drift shape
+// round-one review's MED-4 found in the (now withdrawn) version stamp.
+export const CONSUMER_OPTIONAL_PATTERNS = ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs']
 
 function escapeRegExpLiteral(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -220,7 +256,15 @@ function matchesPattern(relPath, pattern) {
 }
 
 export function isConsumerSubsetPath(relPath) {
-  return CONSUMER_SUBSET_PATTERNS.some((pattern) => matchesPattern(relPath, pattern))
+  return CONSUMER_SUBSET_PATTERNS.some((pattern) => matchesPattern(relPath, pattern)) || isOptionalConsumerSubsetPath(relPath)
+}
+
+// HIGH-2: separated from isConsumerSubsetPath so checkStaleness can ask
+// "is this specific match one whose ABSENCE from the install is tolerated"
+// -- isConsumerSubsetPath alone only answers "is this path in scope at
+// all", which is not enough to decide missing-vs-not-reported.
+export function isOptionalConsumerSubsetPath(relPath) {
+  return CONSUMER_OPTIONAL_PATTERNS.some((pattern) => matchesPattern(relPath, pattern))
 }
 
 function walkDirRecursive(rootDir, relDir, out) {
@@ -253,7 +297,12 @@ function walkDirRecursive(rootDir, relDir, out) {
 export function listConsumerSubsetFiles(dir) {
   const topLevelDirs = new Set()
   let needsRoot = false
-  for (const pattern of CONSUMER_SUBSET_PATTERNS) {
+  // HIGH-2: walks directories for BOTH the required and optional pattern
+  // lists -- bin/optimise-cycle-weekly.sh and bin/redact-transcript.mjs are
+  // literal patterns with a slash ('bin/...'), so this loop needs to see
+  // them too or the walk never visits bin/ at all and they can never be
+  // found even when present.
+  for (const pattern of [...CONSUMER_SUBSET_PATTERNS, ...CONSUMER_OPTIONAL_PATTERNS]) {
     const bare = pattern.endsWith('/') ? pattern.slice(0, -1) : pattern
     const slashIdx = bare.indexOf('/')
     if (slashIdx === -1) {
@@ -315,6 +364,21 @@ export function listConsumerSubsetFiles(dir) {
 // verdict on a check that never actually looked. `blind:true` makes that a
 // distinct, louder signal than drift:[], and the CLI below refuses to
 // report ok:true on it.
+// MED-8/LOW-2 (round-one review): the three-way human verdict is now
+// computed HERE, once, by the module that holds every input it needs --
+// not re-derived by three different ad hoc parsers in
+// bin/optimise-cycle-weekly.sh (LOW-2's own finding). `blind` and a
+// non-empty `unmatchedPatterns` both collapse to "could-not-check": a
+// pattern matching nothing means this run did not actually look at
+// everything the subset claims to cover, which is the exact "guard that
+// finds nothing and calls it clean" shape this whole spec exists to
+// close (the same shape HIGH-2 itself was), so ANY verdict this run would
+// otherwise report (including "ok") is untrustworthy, not only "drift".
+function computeStalenessStatus({ blind, unmatchedPatterns, drift }) {
+  if (blind || unmatchedPatterns.length > 0) return 'could-not-check'
+  return drift.length === 0 ? 'ok' : 'drift'
+}
+
 export function checkStaleness(publishedDir, installDir) {
   const publishedFiles = listConsumerSubsetFiles(publishedDir)
   const blind = publishedFiles.length === 0
@@ -325,9 +389,9 @@ export function checkStaleness(publishedDir, installDir) {
   // matching anything at all, which is the "found something, therefore
   // looked at everything" gap MED-8 names -- the same shape as
   // checkConsistency()'s per-side (not per-file) blind_reasons above.
-  // Reported here, not acted on: this module never decides how the CALLER
-  // (bin/optimise-cycle-weekly.sh) should log it.
-  const unmatchedPatterns = CONSUMER_SUBSET_PATTERNS.filter((pattern) => !publishedFiles.some((rel) => matchesPattern(rel, pattern))).sort()
+  // Computed over BOTH pattern lists (HIGH-2 added a second list).
+  const ALL_PATTERNS = [...CONSUMER_SUBSET_PATTERNS, ...CONSUMER_OPTIONAL_PATTERNS]
+  const unmatchedPatterns = ALL_PATTERNS.filter((pattern) => !publishedFiles.some((rel) => matchesPattern(rel, pattern))).sort()
   const drifted = []
   const missing = []
   if (!blind) {
@@ -337,22 +401,52 @@ export function checkStaleness(publishedDir, installDir) {
       try {
         installContent = fs.readFileSync(installPath)
       } catch (e) {
-        missing.push(rel)
+        // HIGH-2: an OPTIONAL file (bin/optimise-cycle-weekly.sh,
+        // bin/redact-transcript.mjs) absent from the install is a
+        // legitimate configuration (the weekly job is opt-in), never
+        // drift -- only a REQUIRED file's absence is "missing".
+        if (!isOptionalConsumerSubsetPath(rel)) missing.push(rel)
         continue
       }
-      const publishedContent = fs.readFileSync(path.join(publishedDir, rel))
+      // LOW-1 (round-one review): this used to be a bare, unguarded read.
+      // listConsumerSubsetFiles's walk and this read are two separate
+      // filesystem passes (not atomic), so a file present at listing time
+      // can vanish, become unreadable (permissions), or be replaced by a
+      // directory before this line runs -- proven by a chmod-000 fixture
+      // in test/install-consistency.test.js. Uncaught, this crashed
+      // --check-staleness with exit 1 and no JSON, breaking its own
+      // documented "always exits 0, always one line of JSON" contract.
+      // Caught and skipped here, the same tolerance walkDirRecursive
+      // already applies to a directory that vanishes mid-walk: this ONE
+      // file is silently excluded from both `drifted` and `missing` for
+      // this run (its status is genuinely unknown, not "clean"), rather
+      // than the entire check aborting over one unreadable file.
+      let publishedContent
+      try {
+        publishedContent = fs.readFileSync(path.join(publishedDir, rel))
+      } catch (e) {
+        continue
+      }
       if (!installContent.equals(publishedContent)) drifted.push(rel)
     }
   }
   drifted.sort()
   missing.sort()
+  const drift = [...drifted, ...missing].sort()
+  const status = computeStalenessStatus({ blind, unmatchedPatterns, drift })
   return {
     published_files_checked: publishedFiles.length,
     blind,
     unmatched_patterns: unmatchedPatterns,
     drifted,
+    drifted_count: drifted.length,
     missing,
-    drift: [...drifted, ...missing].sort(),
+    missing_count: missing.length,
+    drift,
+    // LOW-2: the derived human verdict, computed once here rather than
+    // re-derived by bin/optimise-cycle-weekly.sh's own case-statement
+    // pattern matching on the OTHER fields (its previous design).
+    status,
   }
 }
 
@@ -474,7 +568,10 @@ if (isMain) {
     const publishedDir = process.argv[3]
     const installDir = process.argv[4]
     if (!publishedDir || !installDir) {
-      process.stdout.write(JSON.stringify({ ok: false, error: 'usage: install-consistency.mjs --check-staleness <published-dir> <install-dir>' }) + '\n')
+      // LOW-2: `status` is present on EVERY exit path of this mode, usage
+      // error included, so a caller (bash) can always dispatch on one
+      // field without checking `ok` first as a precondition.
+      process.stdout.write(JSON.stringify({ ok: false, status: 'could-not-check', error: 'usage: install-consistency.mjs --check-staleness <published-dir> <install-dir>' }) + '\n')
       process.exit(0)
     }
     const result = checkStaleness(path.resolve(publishedDir), path.resolve(installDir))

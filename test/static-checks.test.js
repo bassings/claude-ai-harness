@@ -191,9 +191,52 @@ test('static: plan-identity canonicalisation (canonicalPlanKey) has exactly one 
   assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/ledger-append.mjs'])
 })
 
-test('static: the consumer-subset pattern list (AC-OPS-5, specs/harn-fix-3.md task 2) has exactly one definition site -- only workflows/lib/install-consistency.mjs declares CONSUMER_SUBSET_PATTERNS; bin/optimise-cycle-weekly.sh (bash, cannot import) drives the whole comparison through that module\'s --check-staleness CLI mode instead of hardcoding a second copy of the pattern list.', () => {
+function allIndicesOf(text, needle) {
+  const out = []
+  let idx = text.indexOf(needle)
+  while (idx !== -1) {
+    out.push(idx)
+    idx = text.indexOf(needle, idx + 1)
+  }
+  return out
+}
+
+// MED-7 (round-one review): the needle used to be "'agents/lens-*.md'",
+// JS-single-quoted -- it could only ever match a JS string literal
+// wrapped in single quotes, so a genuine second definition written the
+// way bash actually writes one (e.g. a double-quoted shell variable
+// assignment: SUBSET_PATTERNS="AGENT-HARNESS.md agents/lens-*.md ...")
+// passed this guard clean. Proven by planting exactly that in
+// bin/optimise-cycle-weekly.sh: 44/44 static tests stayed green, AC-OPS-5
+// included.
+//
+// The fix is two bare needles (no quote characters of their own, so
+// either matches regardless of how the target file quotes or embeds it),
+// requiring BOTH to appear within PROXIMITY characters of EACH OTHER
+// somewhere in the file -- not merely "the file mentions this glob
+// somewhere". A single quote-agnostic needle alone over-matched: this
+// module's own H3-guard prose comments and error-message template
+// mention "agents/lens-*.md" (workflows/plan-cycle.js, workflows/review-
+// cycle.js -- a completely unrelated concern, the findings-schema
+// consistency check, not the consumer subset), which is a false positive
+// a bare single-needle .includes() cannot distinguish from a genuine
+// second pattern-list definition. "agents/reviewer-*.md" never appears
+// anywhere near an "agents/lens-*.md" mention in ordinary prose (nothing
+// in this repo's prose has reason to name both globs back to back), so
+// requiring their PROXIMITY, rather than either alone, is what actually
+// characterises "a list like this one", in any quoting style, while still
+// excluding the unrelated prose.
+test('static: the consumer-subset pattern list (AC-OPS-5, specs/harn-fix-3.md task 2) has exactly one definition site, in ANY quoting style -- only workflows/lib/install-consistency.mjs declares CONSUMER_SUBSET_PATTERNS; bin/optimise-cycle-weekly.sh (bash, cannot import) drives the whole comparison through that module\'s --check-staleness CLI mode instead of hardcoding a second copy of the pattern list.', () => {
   const all = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'bin')), ...walk(path.join(ROOT, 'agents')), ...walk(path.join(ROOT, 'hooks')), ...walk(path.join(ROOT, 'skills'))]
-  const definitionSites = all.filter((f) => fs.readFileSync(f, 'utf8').includes("'agents/lens-*.md'"))
+  const NEEDLE_A = 'agents/lens-*.md' // no surrounding quote characters -- see the MED-7 comment above
+  const NEEDLE_B = 'agents/reviewer-*.md'
+  const PROXIMITY = 100
+  const definitionSites = all.filter((f) => {
+    const text = fs.readFileSync(f, 'utf8')
+    const positionsA = allIndicesOf(text, NEEDLE_A)
+    const positionsB = allIndicesOf(text, NEEDLE_B)
+    return positionsA.some((a) => positionsB.some((b) => Math.abs(a - b) <= PROXIMITY))
+  })
   assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/install-consistency.mjs'])
 })
 
