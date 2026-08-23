@@ -78,5 +78,11 @@ Report these as structural findings against the built change, not as an
 argument that the feature should have been smaller. That decision was made at
 planning and is not reopened here.
 
+For every finding, fill AGENT-HARNESS.md's `Recurrence` field: say whether you
+expect the same shape (the same single-caller abstraction, the same premature
+generality) elsewhere in the diff. You are looking at the whole change with
+the pattern already in hand; naming its extent now saves the round it would
+otherwise take to rediscover the same shape under a new name.
+
 Say plainly when the architecture is fine. Most changes do not need
 architectural comment, and inventing one is how this lens becomes noise.

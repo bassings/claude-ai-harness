@@ -119,9 +119,24 @@ jobs:
     permissions:
       contents: read
       security-events: write
+    # L4: hooks/*.py now shells out to git with argument strings derived
+    # from agent-supplied input, and a single `languages:` entry cannot cover
+    # both JavaScript and Python -- GitHub's own guidance is that a shared
+    # run analyses languages sequentially and fails all of them together if
+    # one fails, so this is a matrix (one job per language) rather than a
+    # comma-separated list. Neither language needs a build-mode: both are
+    # interpreted, and CodeQL's default extraction (no explicit build step
+    # in this job, matching the pre-existing javascript-only setup) already
+    # covers them.
     steps:
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
         with:
-          languages: javascript
+          # One job, both languages, deliberately NOT a matrix. A matrixed job
+          # reports as `codeql (javascript)`/`codeql (python)`, and main's
+          # branch protection requires the literal context `codeql`, so a
+          # matrix here would leave every PR waiting forever on a check that
+          # can no longer be reported. Sequential analysis is the accepted
+          # cost of keeping the required context stable.
+          languages: javascript,python
       - uses: github/codeql-action/analyze@v3

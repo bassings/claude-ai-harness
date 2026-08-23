@@ -106,7 +106,7 @@ ledger, git history, Actions history, or the report's own freshness. The
 signal is an obligation with no corresponding trace, and the honest output is
 "documented, never observed", not a failure.
 
-**Three traps this must avoid**, each measured rather than imagined:
+**Four traps this must avoid**, each measured rather than imagined:
 
 - **Blind and silent.** It must not report clean when it never looked. The
   AC-uniqueness guard in `test/static-checks.test.js` covered 81 of 245
@@ -131,6 +131,25 @@ signal is an obligation with no corresponding trace, and the honest output is
   that reports "how many obligations I checked" needs one, because the
   cheapest way to inflate that number is to stop distinguishing between the
   things being counted.
+
+- **A floor that is non-zero AND permanently unclearable.** Measured on
+  CouchPotatoServer's own Sonar scan: it carries one permanent BLOCKER,
+  `python:S3516`, raised against a `logging.Filter` subclass whose stdlib
+  contract is "return True if the record should be logged" -- so the correct
+  implementation always returns True. It cannot be fixed without breaking
+  that contract, and it cannot be dismissed under the operator's
+  no-dismissal rule (never resolve, dismiss or accept a finding to move a
+  number). A threshold on blocker count is therefore not merely offset by
+  this instance, it is permanently unsatisfiable: the gate is red forever, on
+  a change that introduces nothing new, and a permanently-red gate trains
+  everyone to skim the metric so the next real blocker is missed alongside
+  it. The safe form is a floor on "blockers OTHER THAN the known
+  false-positive instances", which needs the instance list to live somewhere
+  the reader, and this detector, can reach -- a data dependency to design in
+  when the floor is designed, not retrofitted after the first permanent false
+  positive is found. Any obligation-count or coverage floor this detector
+  proposes for its own output inherits the same risk and needs the same
+  design-time answer.
 
 ## Affected files
 

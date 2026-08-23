@@ -71,3 +71,8 @@ the cause nor the item.
 
 Check the rollback story is real, not asserted. If a migration is one-way, that
 is a Critical unless it is deliberate and written down.
+
+For every finding, fill AGENT-HARNESS.md's `Recurrence` field: say whether you
+expect the same silent-failure or missing-rollback shape elsewhere in the
+change. You know the extent of the class before the author does; naming it
+now saves the round it would otherwise take to rediscover it.

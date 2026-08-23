@@ -61,3 +61,8 @@ diff is the weakest form of evidence available to you.
 Then check the states nobody implements: what does this look like with zero
 items, with one, with a thousand, mid-request, and after a failure. A state
 that exists in the design and not in the template is a finding.
+
+For every finding, fill AGENT-HARNESS.md's `Recurrence` field: say whether you
+expect the same missing state, or the same design-system drift, elsewhere in
+the templates this change touches. Naming the extent now saves the round it
+would otherwise take to rediscover the same gap in a sibling component.

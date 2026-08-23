@@ -72,3 +72,10 @@ core of your job and the reason this lens exists:
   a container missing the dependency, a stale cached image.
 
 Report untested behaviour introduced by the change even where no AC covered it.
+
+For every finding, fill AGENT-HARNESS.md's `Recurrence` field: say whether you
+expect more instances of the same class of untested or weakly-asserted
+behaviour elsewhere in the diff. You are looking at the whole change with the
+shape already in hand, so naming its extent now saves the round it would
+otherwise take to rediscover it: the same policy list drifting into a new
+paraphrase every round is a known failure mode this field exists to stop.

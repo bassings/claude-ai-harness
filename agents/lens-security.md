@@ -105,3 +105,9 @@ default that is only safe when a second setting happens to be set.
 You are licensed to return CLEAN, and should when the change is genuinely
 inert. Manufactured findings train people to ignore this lens, which is the
 worst outcome available.
+
+For every finding, fill AGENT-HARNESS.md's `Recurrence` field: say whether you
+expect the same vulnerability class elsewhere in the change (the same
+unescaped sink, the same missing authz check on a sibling route). You know the
+class's extent before the author does; naming it now saves the round it would
+otherwise take to rediscover it.

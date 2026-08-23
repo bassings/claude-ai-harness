@@ -250,7 +250,11 @@ const PLAN_SCHEMA = {
       properties: { examined: { type: 'string' }, verified_by: { type: 'string' }, could_not_check: { type: 'string' } },
     },
     acceptance_criteria: { type: 'array', items: { type: 'object', required: ['id', 'statement'], properties: { id: { type: 'string' }, statement: { type: 'string' }, proof_level: { type: 'string' } } } },
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' } } } },
+    // H3: recurrence was instructed in AGENT-HARNESS.md's FINDINGS template
+    // and in all nine agents/lens-*.md files (including lens-simplicity's
+    // veto write-up, planning-only) with no matching property here -- see
+    // the identical comment and the drift guard test in review-cycle.js.
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, recurrence: { type: ['string', 'null'] } } } },
   },
 }
 
@@ -293,6 +297,10 @@ const synthesis = await agent(
   `3. Edit the spec file at ${specPath}: add or replace a section titled "## Acceptance criteria" containing the surviving ` +
   `AC-<LENS>-<n> lines grouped by lens, each on one line, exactly as the review cycle will verify them. Preserve the rest ` +
   `of the file byte-for-byte. Also add a "### Vetoed at planning" subsection listing the drops and reasons, if any.\n` +
+  `FORMAT, NOT A SUGGESTION: write each criterion as \`- **AC-<LENS>-<n>:** <criterion>\` -- list marker, bolded id, ` +
+  `COLON INSIDE the bold, one space, then the text. test/static-checks.test.js scans specs for exactly this shape (and ` +
+  `two older spellings) to enforce id uniqueness, and a spec written in a fourth spelling fails the pre-push gate as ` +
+  `unreadable rather than passing silently. Do not invent a variant such as \`**AC-X-1** -- text\`.\n` +
   `4. Return a markdown summary: a per-lens table (verdict, criteria count, could_not_check), the veto list, any lens ` +
   `findings about the spec itself (BLOCKED lenses prominently), and the final AC count.\n` +
   `Return only the markdown summary as "summary".\n` +
