@@ -1,12 +1,306 @@
 export const meta = {
   name: 'review-cycle',
   description: 'Multi-lens review of the branch diff per AGENT-HARNESS.md: single-focus lenses in parallel, one synthesised report',
-  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification)}',
+  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one)}',
   phases: [
     { title: 'Scope', detail: 'diff the branch, classify the change surface' },
     { title: 'Lenses', detail: 'triggered lenses review in parallel, isolated worktrees' },
     { title: 'Synthesis', detail: 'dedup, arbitrate by precedence, one report' },
   ],
+}
+
+// HARN-FIX-3 install-consistency preflight block (AC-QA-1..5): byte-identical
+// across plan-cycle.js and review-cycle.js, mirroring the L5/PR2 triplicated
+// -block pattern below (the run-ledger helpers) -- a fix landed in one copy
+// and not the other fails silently, exactly the class of bug this whole
+// spec exists to catch. See test/static-checks.test.js's pinning test.
+//
+// AC-QA-2 (AMENDED, round-two review, specs/harn-fix-3.md): REFUSE ONLY ON
+// PROOF, WARN ON DOUBT. The prose parse of AGENT-HARNESS.md and
+// agents/lens-*.md (install-consistency.mjs's checkConsistency, and the
+// doc_fields/agent_fields it reports) is a HEURISTIC -- it has already been
+// wrong once in this exact codebase (H1: one ordinary documentation edit
+// flipped every install to consistent:false). The IN-PROCESS cross-check
+// below (crossCheckAgainstOwnSchema), comparing the model-reported fields
+// against the LITERAL PLAN_SCHEMA/REVIEW_SCHEMA object this running script
+// holds, is the one RELIABLE half: no fs, no subprocess, no model, nothing
+// left to parse. Only that half's PROVEN mismatch, or a self-contradictory
+// report (M3: the reported fields disagree with the reported verdict, which
+// needs no external parsing to detect), refuses dispatch. Everything else
+// -- the consistency field missing entirely, blind, ok:false, or the
+// script's own prose-derived verdict alone with no in-process proof -- is
+// uncertainty: warn loudly via log() and PROCEED, never halt. See
+// evaluateInstallConsistency() below, the single decision point.
+//
+// ROUND THREE (the override): the escape hatch is an explicit flag on THIS
+// invocation's own args -- `allow_inconsistent_install: true` -- read by this
+// workflow script directly, never from the environment, never persisted, and
+// never relayed through a model.
+//
+// Round two put it in an environment variable and, because a workflow script
+// has no environment access, relayed it here as an escape_hatch_active field on
+// the reported consistency object -- through the scope agent, the model whose
+// report this gate is checking. A gate whose override is asserted by the thing
+// being policed is circular: a fabricating scope agent could claim the hatch
+// was active. That is the same bypass class as MED-2, reintroduced by the fix
+// for M9, so escape_hatch_active is now ignored wherever it appears and is no
+// longer part of the reported schema at all.
+//
+// It may override a PROVEN mismatch, deliberately. "Proven" here means the
+// model's reported field list disagrees with the schema object held in this
+// process. If the model OVER-reports a field that is not really instructed, the
+// cross-check proves a mismatch that does not exist, and with no override that
+// is H1's total lockout returning through a different door. Using it is
+// impossible to miss: every suppression is named in the log AND in the returned
+// report, and says what was suppressed.
+const INSTALL_CONSISTENCY_INSTRUCTION =
+  `Before anything else, verify the installed harness agrees with itself (specs/harn-fix-3.md AC-QA-1): find this ` +
+  `harness's install-consistency.mjs script. If the environment variable CLAUDE_HOME is set (M11: the SAME override ` +
+  `the staleness check already honours), use "$CLAUDE_HOME/workflows/lib/install-consistency.mjs" and treat ` +
+  `$CLAUDE_HOME itself as the install root directly -- this takes priority and skips the search below entirely. ` +
+  `Otherwise, use this exact search order, the FIRST one that exists: (a) ~/.claude/workflows/lib/install-consistency.mjs ` +
+  `(the global mirror install); (b) a claude-ai-harness plugin directory installed under $HOME (wherever Claude Code ` +
+  `installs plugins for this operator) -- NEVER a path inside the repository currently being planned or reviewed, ` +
+  `even one that happens to be named .claude/plugins/ or similar (M2: a repo-local path is exactly what a hostile ` +
+  `diff under review could plant, and there is no way to tell a legitimately-installed plugin apart from a planted ` +
+  `one once the search is allowed to look inside the checkout under review, so the checkout is never a source for ` +
+  `this script, full stop -- there is deliberately no repo-local fallback option at all, even when this repo IS ` +
+  `claude-ai-harness itself). If neither CLAUDE_HOME nor (a) nor (b) resolves to a real file, that is not a security ` +
+  `concern, only an absent install: return ` +
+  `{ok:false, consistent:false, blind:true, checked_dir:"not found", error:"no install-consistency.mjs found outside the working tree"} ` +
+  `as the "consistency" field instead of running anything.\n` +
+  `Run it with the install root you found it under as its ONE argument (the parent of the ` +
+  `workflows/lib directory it lives in), exactly like: \`node <path-to-install-consistency.mjs> <install-root>\`. ` +
+  `It always exits 0 and prints exactly one line of JSON. Return EXACTLY what it printed as the "consistency" ` +
+  `field -- do not reinterpret, summarise, or recompute any part of it yourself, and do not skip this step even if ` +
+  `you believe you already know the answer: the determination is made by the script, not by you. ` +
+  `If the script failed to run at all (rather than printing its own JSON), that is itself a partial or broken ` +
+  `install: return {ok:false, consistent:false, blind:true, checked_dir:"not found", error:"<what happened>"} ` +
+  `as the "consistency" field yourself -- NEVER omit the field or fabricate {consistent:true, ...} to skip this step.\n\n`
+
+const INSTALL_CONSISTENCY_SCHEMA = {
+  type: 'object',
+  required: ['ok', 'consistent', 'blind', 'checked_dir', 'doc_fields', 'agent_fields'],
+  properties: {
+    ok: { type: 'boolean' },
+    consistent: { type: 'boolean' },
+    blind: { type: 'boolean' },
+    checked_dir: { type: 'string' },
+    lens_files_checked: { type: ['integer', 'null'] },
+    // MED-2 (round-one review): required, not merely reported, because the
+    // in-process cross-check below (crossCheckAgainstOwnSchema) needs these
+    // as its OWN input -- the fields the model claims AGENT-HARNESS.md and
+    // agents/lens-*.md instruct, re-verified here against the literal
+    // schema object this process holds, rather than trusted at face value.
+    doc_fields: { type: 'array', items: { type: 'string' } },
+    agent_fields: { type: 'array', items: { type: 'string' } },
+    missing_in_review_schema: { type: 'array', items: { type: 'string' } },
+    missing_in_plan_schema: { type: 'array', items: { type: 'string' } },
+    review_only_props: { type: 'array', items: { type: 'string' } },
+    plan_only_props: { type: 'array', items: { type: 'string' } },
+    // M1 (round three): a schema that has LOST one of the structural findings
+    // properties (severity/claim/location, plus ac_id on the review side).
+    // NOT in `required` above, deliberately: an install carrying a
+    // pre-round-three install-consistency.mjs cannot emit these, and rejecting
+    // its report outright would turn a stale install into a hard stop, which is
+    // the H1 lockout shape AC-QA-2 exists to prevent. Absent reads as [].
+    missing_structural_in_review_schema: { type: 'array', items: { type: 'string' } },
+    missing_structural_in_plan_schema: { type: 'array', items: { type: 'string' } },
+    error: { type: ['string', 'null'] },
+  },
+}
+
+function installConsistencyError(reason) {
+  return new Error(
+    `InstallInconsistent (AC-QA-2, PROVEN by the in-process cross-check -- not a heuristic, not a false positive): ` +
+    `${reason} Refusing to dispatch any lens: an instructed field with no schema slot is silently dropped (H3's own ` +
+    `shape). Re-sync the installed copy from the published repo, then re-run. To override in a genuine emergency ` +
+    `(NOT recommended; named in the log AND in the run's own report when used, never silent): re-run this cycle with ` +
+    `"allow_inconsistent_install": true in its args. It applies to that ONE invocation, is never persisted, and cannot ` +
+    `be set by the scope agent -- an escape_hatch_active field in the reported consistency object is ignored.`
+  )
+}
+
+// MED-2 (round-one review): the refusal must not be decided SOLELY by the
+// "consistent" boolean the scope agent reports -- that is model output, and
+// a fabricated {consistent:true} satisfies the schema undetectably. This
+// recomputes the comparison IN-PROCESS, against the LITERAL schema object
+// this running script already holds (needs no fs, no subprocess, no model),
+// using only the model-reported doc_fields/agent_fields as input. It can
+// only verify the schema THIS FILE declares (PLAN_SCHEMA here, REVIEW_SCHEMA
+// in review-cycle.js): each workflow checks its own running schema, never
+// the other file's -- but that is exactly the schema that matters most for
+// THIS session, and it needs no disk read of plan-cycle.js/review-cycle.js
+// at all, which also closes MED-3 for the schema half of the preflight (the
+// running object IS "the copy that actually executes"; a stale ~/.claude
+// snapshot loaded at session start cannot diverge from itself).
+//
+// AC-QA-2 amendment: returns `certain` alongside `ok`, splitting "nothing
+// was reported to check" (uncertain -- doc_fields/agent_fields both empty,
+// H2's own bucket) from "a reported field is genuinely absent from the
+// running schema" (certain -- the one case that may still refuse).
+function crossCheckAgainstOwnSchema(consistency, ownSchema, ownSchemaName) {
+  const c = consistency || {}
+  const docFields = Array.isArray(c.doc_fields) ? c.doc_fields : []
+  const agentFields = Array.isArray(c.agent_fields) ? c.agent_fields : []
+  const reported = [...new Set([...docFields, ...agentFields])]
+  if (reported.length === 0) {
+    return {
+      ok: false,
+      certain: false,
+      reason: 'doc_fields and agent_fields were both empty (or absent) in the reported consistency object -- nothing to cross-check against the running schema, treated as uncertainty, never as proof of a mismatch',
+    }
+  }
+  const ownProps = new Set(Object.keys(ownSchema.properties.findings.items.properties))
+  const missingFromOwnSchema = reported.filter((f) => !ownProps.has(f))
+  if (missingFromOwnSchema.length) {
+    return {
+      ok: false,
+      certain: true,
+      reason: `field(s) reported as instructed (${JSON.stringify(missingFromOwnSchema)}) are absent from the RUNNING ${ownSchemaName} object in THIS process -- a fabricated or stale "consistent:true" cannot hide this, because it is recomputed here, never trusted from the report`,
+    }
+  }
+  return { ok: true, certain: true, reason: null }
+}
+
+// The one place the override's wording is built, so the log line and the
+// report banner can never say two different things about the same suppression.
+// It NAMES the flag and states WHAT was suppressed: an override whose output
+// only says "an override was used" leaves the next reader unable to tell
+// whether the run's findings are trustworthy.
+function overrideMessage(suppressed) {
+  return (
+    `INSTALL-CONSISTENCY OVERRIDE IN USE: args.allow_inconsistent_install=true SUPPRESSED a refusal that would ` +
+    `otherwise have halted this run before dispatching any lens. SUPPRESSED REFUSAL: ${suppressed}. Lens output from ` +
+    `this run may have been built against a broken or misreported findings schema, and should be read with that in mind.`
+  )
+}
+
+// AC-QA-2 (amended): the single decision point for refuse/warn/proceed.
+// Returns { action, message, override_used }: 'refuse' (halt -- PROVEN,
+// certain), 'warn' (proceed, log loudly -- uncertainty in either direction, or
+// a DELIBERATE override of a proven mismatch), or 'proceed' (silent, AC-QA-3,
+// the pinned call sequence -- no field of this decision may add an agent()
+// dispatch).
+//
+// `allowInconsistentInstall` is the caller's own args flag, passed in as a
+// plain boolean by the ONE call site below. It is never read from the
+// environment and never taken from `consistency` (which is model output).
+// `override_used` is true only when the flag actually turned a refusal into a
+// warning, so the caller can surface that fact in the run's report rather than
+// in a log line that scrolls away.
+function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName, allowInconsistentInstall) {
+  if (!consistency) {
+    return { action: 'warn', message: 'the scope agent returned no "consistency" field at all -- proceeding without verification (uncertain, not halted; AC-QA-2 amendment)' }
+  }
+  const c = consistency
+  // M3: a self-contradictory report (claims BOTH clean and broken) needs no
+  // external parsing to detect -- it is a fact about the report's OWN
+  // structure, so (unlike blind/ok:false) it is treated as PROVEN, not
+  // merely uncertain, and refuses like a genuine cross-check failure.
+  // M1 (round three): the two structural-loss arrays belong here too. They are
+  // the new signal, and without them a fabricated consistent:true paired with a
+  // reported lost property would sail through the one check that needs no
+  // parsing to catch it.
+  const contradictionFields = [
+    ...(Array.isArray(c.missing_in_review_schema) ? c.missing_in_review_schema : []),
+    ...(Array.isArray(c.missing_in_plan_schema) ? c.missing_in_plan_schema : []),
+    ...(Array.isArray(c.review_only_props) ? c.review_only_props : []),
+    ...(Array.isArray(c.plan_only_props) ? c.plan_only_props : []),
+    ...(Array.isArray(c.missing_structural_in_review_schema) ? c.missing_structural_in_review_schema : []),
+    ...(Array.isArray(c.missing_structural_in_plan_schema) ? c.missing_structural_in_plan_schema : []),
+  ]
+  const contradictory = c.consistent === true && (c.blind === true || contradictionFields.length > 0)
+  if (contradictory) {
+    const reason = `the consistency report is self-contradictory (consistent:true alongside blind:${c.blind === true} and mismatch field(s) ${JSON.stringify(contradictionFields)}) -- a report that disagrees with itself cannot be trusted either way`
+    if (allowInconsistentInstall === true) {
+      return { action: 'warn', override_used: true, message: overrideMessage(`PROVEN self-contradiction -- ${reason}`) }
+    }
+    return { action: 'refuse', message: reason }
+  }
+  // ROUND FOUR (the ordering bug): the in-process cross-check runs HERE, BEFORE
+  // the blind and ok:false branches below, and a `certain` failure refuses
+  // first. The previous order returned `warn` for blind at this point, so a
+  // failure of the HEURISTIC half switched off the RELIABLE half -- precisely
+  // backwards from "certainty refuses, uncertainty warns", and the mechanism
+  // ended up holding the proof and declining to use it.
+  //
+  // Reproduced end to end before the reorder, with the exact partial install
+  // this spec exists for: AGENT-HARNESS.md updated to instruct a new `Effort:`
+  // field while workflows/review-cycle.js stayed stale enough that its schema
+  // const no longer parses. The real CLI printed blind:true with
+  // doc_fields:["consequence","effort","evidence","fix","recurrence"], and the
+  // gate dispatched every lens against a schema that has no `effort` slot. One
+  // unparseable file bought silence for every other field.
+  //
+  // This is sound because the cross-check needs NOTHING but the reported field
+  // list and the literal schema object this process already holds: no
+  // filesystem, no subprocess, no parse of anything. Blindness in the script's
+  // OTHER half therefore says nothing about this half's certainty. When there
+  // is genuinely nothing to cross-check (reported fields empty -- the shape a
+  // blind run usually has), crossCheckAgainstOwnSchema returns certain:false
+  // and control falls through to the same blind/ok:false warnings as before,
+  // unchanged.
+  const crossCheck = crossCheckAgainstOwnSchema(c, ownSchema, ownSchemaName)
+  if (!crossCheck.ok && crossCheck.certain) {
+    if (allowInconsistentInstall === true) {
+      return { action: 'warn', override_used: true, message: overrideMessage(`PROVEN mismatch -- ${crossCheck.reason}`) }
+    }
+    return { action: 'refuse', message: crossCheck.reason }
+  }
+  if (c.blind === true) {
+    return { action: 'warn', message: `install-consistency reported blind (nothing could be compared): ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
+  }
+  if (c.ok === false) {
+    return { action: 'warn', message: `install-consistency could not run: ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
+  }
+  if (!crossCheck.ok && !crossCheck.certain) {
+    return { action: 'warn', message: `${crossCheck.reason} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
+  }
+  if (c.consistent !== true) {
+    return {
+      action: 'warn',
+      message:
+        `install-consistency's own (prose-derived) verdict reported a possible mismatch, but the in-process ` +
+        `cross-check against the running ${ownSchemaName} found no proof of one -- proceeding (uncertain, not ` +
+        `halted; AC-QA-2 amendment). Reported: missing_in_review_schema=${JSON.stringify(c.missing_in_review_schema || [])}, ` +
+        `missing_in_plan_schema=${JSON.stringify(c.missing_in_plan_schema || [])}, review_only_props=${JSON.stringify(c.review_only_props || [])}, ` +
+        `plan_only_props=${JSON.stringify(c.plan_only_props || [])}, ` +
+        `missing_structural_in_review_schema=${JSON.stringify(c.missing_structural_in_review_schema || [])}, ` +
+        `missing_structural_in_plan_schema=${JSON.stringify(c.missing_structural_in_plan_schema || [])}`,
+    }
+  }
+  return { action: 'proceed', message: null }
+}
+// ---- end HARN-FIX-3 install-consistency preflight block ----
+
+// Moved to module scope (from its previous position inside run(), just
+// before Phase 2) so the MED-2 cross-check above can read it before the
+// AC-QA-1/AC-QA-2 gate runs, without needing a disk read of this file's own
+// text (MED-3) -- the literal object IS what this session executes.
+const REVIEW_SCHEMA = {
+  type: 'object',
+  required: ['verdict', 'coverage', 'findings'],
+  properties: {
+    verdict: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] },
+    coverage: {
+      type: 'object',
+      required: ['examined', 'verified_by', 'could_not_check'],
+      properties: { examined: { type: 'string' }, verified_by: { type: 'string' }, could_not_check: { type: 'string' } },
+    },
+    ac_verdicts: { type: 'array', items: { type: 'object', required: ['id', 'verdict', 'evidence'], properties: { id: { type: 'string' }, verdict: { type: 'string', enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] }, evidence: { type: 'string' } } } },
+    // H4: ac_id was previously undeclared here, so a schema-following agent
+    // had no field inviting it to attribute an individual finding to an AC
+    // -- finding-to-AC attribution was always null downstream, not because
+    // the aggregation code couldn't carry a value through, but because no
+    // lens was ever told this field existed to fill in.
+    // H3: recurrence was instructed in AGENT-HARNESS.md's FINDINGS template
+    // and in all nine agents/lens-*.md files ("fill AGENT-HARNESS.md's
+    // `Recurrence` field") with no matching property here -- a lens-output
+    // schema that silently dropped a mandatory-by-instruction field. See
+    // test/static-checks.test.js's AGENT-HARNESS.md-field-vs-schema guard.
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'location', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, ac_id: { type: ['string', 'null'] }, recurrence: { type: ['string', 'null'] } } } },
+  },
 }
 
 // ---- default trigger globs; a repo overrides them with .claude/harness-triggers.json ----
@@ -310,6 +604,10 @@ async function run() {
 // ---- Phase 1: scope ----
 phase('Scope')
 const scope = await agent(
+  // specs/harn-fix-3.md AC-QA-1/AC-QA-3: folded into this SAME agent() call
+  // rather than a new one, so a consistent install adds no measurable
+  // startup delay -- see INSTALL_CONSISTENCY_INSTRUCTION above.
+  INSTALL_CONSISTENCY_INSTRUCTION +
   `In the repo at the current working directory:\n` +
   `1. Determine the base ref: ${opts.base ? `use "${opts.base}".` : 'the repository default branch (usually main or master; check `git remote show origin` or local branch names).'}\n` +
   `2. Run \`git diff --name-status <base>...HEAD\` and return every changed file path with its status letter, plus the base ref you used and the exact output of \`git rev-parse HEAD\` as head_sha.\n` +
@@ -324,7 +622,7 @@ const scope = await agent(
     effort: 'low',
     schema: {
       type: 'object',
-      required: ['base', 'head_sha', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists'],
+      required: ['base', 'head_sha', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists', 'consistency'],
       properties: {
         base: { type: 'string' },
         head_sha: { type: 'string' },
@@ -341,10 +639,36 @@ const scope = await agent(
         // transcription failure this whole spec exists to catch (a
         // single-field report has no way to be self-inconsistent).
         harness_triggers_file_exists: { type: 'boolean' },
+        consistency: INSTALL_CONSISTENCY_SCHEMA,
       },
     },
   }
 )
+
+// AC-QA-1/AC-QA-2 (amended, round-two review): refuse ONLY on a PROVEN
+// mismatch (evaluateInstallConsistency's 'refuse' action) -- checked even
+// on a would-be no-op review (placed BEFORE the no-changes short-circuit
+// below), and guarded on `scope` truthy so a totally failed scope agent
+// still falls through to the existing aborted/no-op handling unchanged.
+// Everything uncertain warns and proceeds. See the install-consistency
+// preflight block above for the reasoning and evaluateInstallConsistency().
+// Round three: the override is THIS invocation's own args flag, read here
+// directly, never from the environment and never from scope.consistency (model
+// output). Strict === true, so a mistyped "true" or 1 fails CLOSED.
+let installOverrideNotice = null
+if (scope) {
+  const reviewEval = evaluateInstallConsistency(scope.consistency, REVIEW_SCHEMA, 'REVIEW_SCHEMA', opts.allow_inconsistent_install === true)
+  if (reviewEval.action === 'refuse') {
+    throw installConsistencyError(reviewEval.message)
+  }
+  if (reviewEval.action === 'warn') {
+    log(`WARNING (install-consistency preflight, AC-QA-2 amendment): ${redactLogText(reviewEval.message)}`)
+  }
+  // A log line scrolls away; the report is what gets read and pasted. An
+  // override that suppressed a refusal has to appear in both.
+  if (reviewEval.override_used) installOverrideNotice = reviewEval.message
+}
+
 if (!scope || !scope.files.length) return { report: 'No changes found between the base ref and HEAD. Nothing to review.', __outcome: 'no-op' }
 
 headSha = scope.head_sha
@@ -569,30 +893,6 @@ const ruleSourceText = ruleSource === 'repo-tuned' ? `repo-tuned (${ruleSourceOv
 log(`Reviewing ${paths.length} changed files against ${base} at ${scope.head_sha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}. Rule source: ${ruleSourceText}.`)
 
 // ---- Phase 2: lenses in parallel, each in its own worktree ----
-const REVIEW_SCHEMA = {
-  type: 'object',
-  required: ['verdict', 'coverage', 'findings'],
-  properties: {
-    verdict: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] },
-    coverage: {
-      type: 'object',
-      required: ['examined', 'verified_by', 'could_not_check'],
-      properties: { examined: { type: 'string' }, verified_by: { type: 'string' }, could_not_check: { type: 'string' } },
-    },
-    ac_verdicts: { type: 'array', items: { type: 'object', required: ['id', 'verdict', 'evidence'], properties: { id: { type: 'string' }, verdict: { type: 'string', enum: ['PASS', 'FAIL', 'UNVERIFIABLE'] }, evidence: { type: 'string' } } } },
-    // H4: ac_id was previously undeclared here, so a schema-following agent
-    // had no field inviting it to attribute an individual finding to an AC
-    // -- finding-to-AC attribution was always null downstream, not because
-    // the aggregation code couldn't carry a value through, but because no
-    // lens was ever told this field existed to fill in.
-    // H3: recurrence was instructed in AGENT-HARNESS.md's FINDINGS template
-    // and in all nine agents/lens-*.md files ("fill AGENT-HARNESS.md's
-    // `Recurrence` field") with no matching property here -- a lens-output
-    // schema that silently dropped a mandatory-by-instruction field. See
-    // test/static-checks.test.js's AGENT-HARNESS.md-field-vs-schema guard.
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'location', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, ac_id: { type: ['string', 'null'] }, recurrence: { type: ['string', 'null'] } } } },
-  },
-}
 
 const fileList = paths.slice(0, 120).join('\n')
 const specClause = specPath
@@ -735,7 +1035,7 @@ return {
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: reportOk ? synthesis.report : '',
+  report: reportOk ? (installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) : '',
   __outcome: outcome,
 }
 

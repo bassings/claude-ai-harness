@@ -96,7 +96,7 @@ file on disk. Measured in this repo on 2026-08-18, with zero agents spawned:
   marker.
 
 **`workflows/lib/*.mjs`** -- `ledger-append.mjs`, `optimise-read.mjs`,
-`redact-transcript.mjs` -- are not part of that capture. A workflow script has
+`redact-transcript.mjs`, `install-consistency.mjs` -- are not part of that capture. A workflow script has
 no filesystem access, so it instructs an agent to shell out to
 `node ~/.claude/workflows/lib/<file>.mjs` (see the resolution order in
 `plan-cycle.js:100-106`, global mirror first). `node` reads the file when the
@@ -727,6 +727,105 @@ when a canonical key was actually derived — a genuinely out-of-repo or
 `..`-escaping spec is never retained raw, matching `spec`/`plan_key`'s own
 redaction (AC-SEC-1).
 
+## Install-consistency preflight (`specs/harn-fix-3.md`, AC-QA-1..5)
+
+`workflows/lib/install-consistency.mjs`, invoked at the start of every
+`plan-cycle.js`/`review-cycle.js` run (folded into the existing scope
+`agent()` call, never a separate dispatch -- AC-QA-3), checks that the
+installed `AGENT-HARNESS.md` and `agents/lens-*.md` agree with the findings
+schema (`PLAN_SCHEMA`/`REVIEW_SCHEMA`) the cycle is about to use. This is
+distinct from, and independent of, the consumer-install staleness check
+below (AC-OPS-1..5): the preflight can halt a run over an INTERNALLY
+inconsistent install regardless of what published `main` says (on proof --
+see the next paragraph); the staleness check warns about drift from published
+`main` regardless of internal consistency.
+
+**Certainty refuses; uncertainty warns, never halts (AC-QA-2, amended
+2026-08-23 after round-two review).** Two sources of truth feed the
+decision:
+
+- The **prose parse** of `AGENT-HARNESS.md`/`agents/lens-*.md` is a
+  heuristic. It has been wrong once already: appending an ordinary
+  `### NOTES` section to `AGENT-HARNESS.md`, inside the existing contract
+  fence, used to make every install report `consistent:false` on a routine
+  documentation edit (H1, fixed).
+- The **in-process cross-check** compares the fields the scope agent
+  reports as instructed against the literal `PLAN_SCHEMA`/`REVIEW_SCHEMA`
+  object the running workflow script itself holds -- no filesystem, no
+  subprocess, no model, nothing left to parse. This is the reliable half.
+
+The cycle refuses (no lens dispatched, exits non-zero, names the field and
+both schema sides) only when the in-process cross-check **proves** a
+reported field absent from the running schema, or when the report is
+**self-contradictory** (claims `consistent:true` alongside a reported
+mismatch or `blind:true` -- provable from the report's own shape, no parsing
+needed). Every other condition -- the consistency field missing entirely,
+`blind`, `ok:false`, or the script's own prose-derived verdict alone with no
+in-process proof -- **warns** (one loud log line naming the uncertainty) and
+**proceeds**: lenses still dispatch.
+
+**If a refusal fires and you believe it is wrong** (a false positive from
+the prose-parsing half, not a genuine schema gap), the first line of the
+thrown error tells you which field and which schema side it named. To
+proceed anyway for one run, pass the override on the invocation's own args:
+
+```
+/review-cycle {"allow_inconsistent_install": true}
+/plan-cycle   {"spec": "specs/X.md", "allow_inconsistent_install": true}
+```
+
+It is read directly by the workflow script, applies to that **one**
+invocation, and is never persisted. Using it is impossible to miss: every
+suppression is named in the log **and** prefixed to the run's own report,
+saying which refusal it suppressed and which field that refusal named.
+
+**Why an args flag rather than an environment variable.** The first cut of
+this override was `HARNESS_ALLOW_INCONSISTENT_INSTALL=1`, by analogy with
+`HARNESS_ALLOW_DESTRUCTIVE_GIT` (see "Destructive git guard" above). The
+analogy fails in two ways. There, the variable's prefix sits inline in the
+very command being guarded, so it is visible at the point of use; an
+exported variable here would silently disable the gate for every subsequent
+run in the session with nothing in the invocation showing it. Worse, a
+dynamic-workflow script has no environment access at all, so the variable
+had to be read by `install-consistency.mjs` and **relayed through the scope
+agent** -- the model whose report the gate is checking. A gate whose
+override is asserted by the thing being policed is circular, and it is the
+same bypass class the in-process cross-check exists to close. An
+`escape_hatch_active` field in a reported consistency object is now ignored
+wherever it appears.
+
+There is no persisted, environment or repo-level way to disable the gate.
+
+The script is resolved via `$CLAUDE_HOME` if set (the SAME override the
+staleness check below honours -- AC-QA-4), otherwise `~/.claude/workflows/lib/
+install-consistency.mjs`, otherwise an installed `claude-ai-harness` plugin
+directory under `$HOME`. There is deliberately **no repo-local fallback**:
+a diff under review must never be able to supply the very script whose
+stdout decides whether dispatch proceeds (M2, round-two review -- a
+prose-only prohibition on using a hostile repo-local copy was found
+insufficient; the resolution path itself no longer offers one). If none of
+those resolves, that is an absent install, not a security concern, and is
+treated as uncertainty (warns, proceeds) like any other could-not-check.
+
+Ships as `workflows/lib/install-consistency.mjs`, alongside
+`ledger-append.mjs`, `optimise-read.mjs` and `redact-transcript.mjs` in the
+`workflows/lib/*.mjs` files a `cp -r` of `workflows/lib/` installs -- see
+"Making a change live: copying the files is not deploying them" above for the exact commands; this file
+must go live in the same sync as `plan-cycle.js`/`review-cycle.js`, or the
+very next run finds nothing to check and warns accordingly.
+
+**What this preflight does and does not promise.** It defends against an
+**accidental** partial or stale install, which is the incident that prompted
+it. It does **not** defend against anyone able to set environment variables or
+edit the installed files -- `CLAUDE_HOME` pointed at an empty directory
+degrades it to warn-only, silently, for the whole session. Three routes to
+degrading it have been closed and a fourth will not be, because anyone who can
+set `CLAUDE_HOME` can also edit the files it reads. The full boundary, with the
+measurements behind it, is under **"Threat model"** in `specs/harn-fix-3.md`
+and repeated in the module's own header. It is deliberately not restated in
+detail here: one statement of a security boundary is maintainable, three drift.
+
+
 ## Delivery optimiser
 
 `/optimise-cycle` (`workflows/optimise-cycle.js` + `skills/optimise-cycle/`)
@@ -806,6 +905,83 @@ The header line carries `version=$SCRIPT_VERSION`, bumped whenever this
 script's behaviour changes materially, so the log shows which copy of the
 script actually produced a given run -- the same drift class AC-OPS-4
 already covers for `workflows/`, extended to this file.
+
+**Consumer-install staleness check (`specs/harn-fix-3.md`, AC-OPS-1..5).**
+Once per invocation -- not once per delivery repo -- this script also
+checks whether the consumer install at `$CLAUDE_HOME` (default
+`~/.claude`) has drifted from published `main`. The consumer subset
+(a manual multi-file copy can partially update it) has two halves:
+
+- **Required** -- absence from the install is reported as drift:
+  `AGENT-HARNESS.md`, every `agents/lens-*.md` and `agents/reviewer-*.md`,
+  `workflows/*.js`, `workflows/lib/`, `hooks/`, and `skills/` (the whole
+  directory, not only `skills/optimise-cycle/` -- `skills/conduct-plan/`,
+  which drives every multi-PR plan, is genuinely published and installed
+  the same way).
+- **Optional** -- present-if-opted-in; absence from the install is a
+  legitimate configuration (the weekly job itself is opt-in), never drift,
+  but presence with DIFFERENT content still is: `bin/optimise-cycle-weekly.sh`
+  and `bin/redact-transcript.mjs` (round-one review, HIGH-2 -- this
+  script's own detector was previously excluded from the thing it checks,
+  the same defect class the whole spec exists to close, sitting inside its
+  own fix). `bin/com.local.optimise-cycle-weekly.plist` is deliberately
+  EXCLUDED from both lists: it is a per-operator TEMPLATE (its own header
+  comment says so), edited immediately after copying, so comparing it to
+  the published template would report every genuinely working install as
+  permanently drifted.
+
+A user-owned file the repo does not ship, like `CLAUDE.md`, is never
+compared. Warn-only, by design: a stale install is not necessarily broken,
+so this never fails the run. The separate consistency preflight
+`workflows/lib/install-consistency.mjs` runs inside
+`plan-cycle.js`/`review-cycle.js` (AC-QA-1/2, above) CAN halt a run, but it
+is not unconditional either: it refuses on proof and warns on doubt. This
+sentence previously called it "unconditional, refuse-on-mismatch", which
+described round one's behaviour and contradicted the amended description 130
+lines above it (L-6, round-four review).
+
+**A subset pattern matching zero published files also forces
+`could-not-check`** (round-one review MED-8), never a bare `ok`, even when
+every file the comparison DID see matches exactly: a pattern silently
+matching nothing (a renamed or moved subset directory upstream) is the
+same "found something, therefore looked at everything" blindness this
+spec's anti-vacuity discipline exists to catch everywhere else in this
+module, and is reported to the operator identically -- an install cannot
+be called clean over content the check never actually looked at.
+
+The comparison clones published `main` fresh, `--depth 1`, into its own
+`mktemp -d` directory every run, deleted unconditionally on exit -- never a
+persistent cache refreshed in place. This is a deliberate response to the
+spec's own risk note ("a cache clone accumulates on a volume twice at 99%
+full"): nothing here survives past one run, so there is nothing to
+accumulate, no cache-staleness of its own to track, and two overlapping
+runs (each gets a unique `mktemp` name) can never collide. `$CLAUDE_HOME`
+itself is only ever read, never written -- proven by hashing every file
+under a fixture install before and after a run that reports drift.
+
+No network, an unreachable remote, or any other `git clone` failure
+produces a `could-not-check` line naming the reason and never fails the
+weekly run. The one line every run appends to the log carries a three-way
+status token -- `STALENESS ok ...` (the install matches), `STALENESS drift
+...` (it does not, with the drifted/missing file list in the JSON tail), or
+`STALENESS could-not-check ...` -- rather than collapsing "matches" and
+"does not match" into the same word. An earlier version used `ok` for both,
+because the CLI's own `ok` field means "the check ran without error", not
+"no drift found"; a person scanning the log for problems read `STALENESS
+ok` on a genuinely drifted install and moved on, which is the "recorded but
+invisible" failure the spec's own risk table names ("noisy and gets
+ignored, becoming decoration" -- invisible is worse). On `drift`, this
+script also prints one line to stderr naming the log path and a count of
+drifted-plus-missing files (never the file list -- the log line already
+carries that), mirroring the existing FAIL-summary stderr line below on the
+same already-wired `StandardErrorPath` channel. This is visibility only:
+drift never sets `overall_fail` and never fails the weekly run, exactly
+like `could-not-check`. The run's own header line names `SCRIPT_VERSION`, so
+a log entry states which copy of this SCRIPT ran (a per-commit install
+stamp was tried and withdrawn -- specs/harn-fix-3.md's "Version stamp --
+DROPPED 2026-08-23" -- because the hook that wrote it generated permanent
+false drift and could leak unstaged edits into a commit; full-file
+comparison against published `main` is this check's only staleness signal).
 
 Covered by `test/weekly-runner.test.js`, which drives the real script
 against real temp git repos with a stub `claude` on PATH -- no test run ever
