@@ -68,6 +68,12 @@ in order:
   6. Expand a bundled short-flag cluster (`-fq` -> `-f`, `-q`) on the
      tokens preceding any `--` pathspec separator, never on pathspec tokens
      themselves (a file legitimately named `-abc` must not be shredded).
+  7. Blank here-document BODIES (between a `<<[-]DELIM` marker and its
+     closing delimiter line) before anything else runs, so a
+     destructive-looking LINE inside one -- inert text to the shell, since
+     nothing in a heredoc body executes -- is never read as its own segment
+     (AC-PROD-6; a heredoc body mentioning a guarded command used to be
+     refused although nothing executed).
 
 A `cd <path>` segment updates the effective directory used by every later
 segment in the same command, so `cd <dir> && git ...` is scoped against
@@ -75,9 +81,14 @@ segment in the same command, so `cd <dir> && git ...` is scoped against
 target repo's dirt was invisible) and a false positive (an unrelated repo's
 dirt caused a refusal for a command that never touched it). When the target
 cannot be resolved statically (a variable, a glob, a bare `cd` with no
-argument, `cd -`), later segments are refused rather than judged against a
-directory that might be wrong -- irrecoverable data loss outranks avoiding a
-false positive here, unlike the resolvable case above.
+argument, `cd -`), later segments are simply ALLOWED rather than judged
+against a directory that might be wrong: this hook no longer refuses on an
+unresolvable `cd` (it used to; that traded a real but rare gap for a false
+positive on every ordinary dynamic `cd`, and guessed wrong about as often as
+it guessed right). specs/harn-fix-2.md's recovery mechanism
+(hooks/git-snapshot.py) is what actually covers that gap now, and it does
+not need to resolve the `cd` at all -- it snapshots the Bash payload's own
+`cwd` unconditionally, before the command runs.
 
 Parsing is a pragmatic shell tokenizer (shlex with punctuation_chars), not a
 full shell grammar: it splits on unquoted `&&`, `||`, `;`, `|`, `&` and a
@@ -86,9 +97,12 @@ the same line or the next one) is still caught, and it never mistakes a
 quoted string that merely CONTAINS destructive-looking text (e.g. `git
 commit -m "git checkout -- foo"`) for a real invocation, because that text
 stays inside its own token instead of becoming a second command. Shapes
-shlex cannot represent (subshells, backticks, here-docs, unbalanced quotes)
-fall through ALLOWED: this hook only ever blocks a pattern it can positively
-identify, never a command it merely failed to parse.
+shlex cannot represent (subshells, backticks, unbalanced quotes) fall
+through ALLOWED: this hook only ever blocks a pattern it can positively
+identify, never a command it merely failed to parse. It makes no
+completeness claim -- see README.md's "Destructive git guard" section for
+the measured-open bypass classes and why recovery, not detection, is the
+mechanism this repo actually relies on.
 """
 import json
 import os
@@ -134,10 +148,14 @@ GIT_ENV_ALLOWLIST = {
     'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_DATE',
 }
 
-# A sentinel, not None: `effective cwd is unknown` must be distinguishable
-# from `effective cwd is the current directory`, and must never be handed to
-# subprocess.run(cwd=...) by accident (it deliberately is not a valid path).
-UNRESOLVED_CWD = '\x00destructive-git-guard:unresolved-cwd\x00'
+# A here-document body is inert TEXT to the shell that runs this command --
+# nothing in it executes -- so a destructive-looking LINE inside one must
+# never be treated as its own command segment (AC-PROD-6; round 3 refused
+# exactly this). `split_segments()` has no concept of heredocs (it only
+# knows shlex tokens and control operators), so the body is blanked out of
+# the raw string BEFORE tokenising, leaving the marker and closing
+# delimiter lines untouched.
+HEREDOC_START_RE = re.compile(r'<<-?\s*([\'"]?)(\w+)\1')
 
 
 def sanitized_git_env():
@@ -146,6 +164,34 @@ def sanitized_git_env():
         if key.startswith('GIT_') and key not in GIT_ENV_ALLOWLIST:
             del env[key]
     return env
+
+
+def strip_heredoc_bodies(command):
+    """Blank out here-document BODIES (between a `<<[-]DELIM` marker and its
+    closing delimiter line) so a destructive-looking mention inside one is
+    never seen as its own segment. Marker and closing-delimiter lines, and
+    everything outside a heredoc, are untouched. Fails open (leaves text as
+    -is) past a marker whose closing delimiter cannot be found."""
+    out = []
+    i, n = 0, len(command)
+    while i < n:
+        m = HEREDOC_START_RE.search(command, i)
+        if not m:
+            out.append(command[i:])
+            break
+        line_end = command.find('\n', m.end())
+        if line_end == -1:
+            out.append(command[i:])
+            break
+        out.append(command[i:line_end + 1])
+        closing_re = re.compile(r'(?m)^[ \t]*' + re.escape(m.group(2)) + r'[ \t]*$')
+        closing = closing_re.search(command, line_end + 1)
+        if closing is None:
+            out.append(command[line_end + 1:])
+            break
+        out.append(command[closing.start():closing.end()])
+        i = closing.end()
+    return ''.join(out)
 
 
 def split_segments(command):
@@ -259,11 +305,7 @@ def is_git_binary(token):
 
 
 def join_cwd(base, target):
-    """Resolve `target` against `base`, unless `base` is itself unresolved
-    -- in which case only an ABSOLUTE target can re-establish a known
-    directory (a relative path has no known base to join against)."""
-    if base is UNRESOLVED_CWD:
-        return target if os.path.isabs(target) else UNRESOLVED_CWD
+    """Resolve `target` against `base`."""
     return os.path.normpath(os.path.join(base, target))
 
 
@@ -346,8 +388,6 @@ def resolve_as_ref(cwd, arg):
     this returns False (not a ref), the fail-open direction: it hands the
     argument to the pathspec path, where has_uncommitted_change() still only
     blocks if `git status` itself finds a real uncommitted change in scope."""
-    if cwd is UNRESOLVED_CWD:
-        return False  # never subprocess into a sentinel; caller fails closed on scope instead
     try:
         result = subprocess.run(
             ['git', 'rev-parse', '--verify', '--quiet', '%s^{commit}' % arg],
@@ -466,16 +506,10 @@ REFUSAL = (
     "alternatives: copy the file to a scratch path first, or `git stash` "
     "before retrying. If this revert is deliberate, opt in explicitly: "
     "re-run with {var}=1 set inline (`{var}=1 {cmd}`) or exported for the "
-    "session."
-)
-
-CD_UNRESOLVED_REFUSAL = (
-    "destructive-git-guard: refused `{cmd}` -- a preceding `cd` in this same "
-    "command targets a directory this hook cannot resolve statically (a "
-    "variable, a command substitution, `cd` with no argument, or `cd -`), "
-    "so it cannot confirm the directory this command will actually run in "
-    "is clean. Re-run with a literal path in the `cd`, or opt in "
-    "explicitly: {var}=1 set inline or exported for the session."
+    "session. If work is already lost another way, hooks/git-snapshot.py "
+    "may have a recoverable copy -- list them with: git for-each-ref "
+    "--format='%(refname) %(creatordate:iso-strict) %(contents:subject)' "
+    "refs/harness-snapshots/"
 )
 
 
@@ -502,18 +536,29 @@ def evaluate(command, cwd):
     if os.environ.get(ESCAPE_VAR) == '1':
         return None
     try:
-        segments = split_segments(command)
+        segments = split_segments(strip_heredoc_bodies(command))
     except ValueError:
         return None  # unparseable; fail open, see module docstring
 
     effective_cwd = cwd
+    cwd_known = True
     for raw_tokens in segments:
         tokens = strip_redirects(raw_tokens)
 
         cd = classify_cd(strip_shell_keywords(strip_env_prefix(tokens)))
         if cd is not None:
             kind, target = cd
-            effective_cwd = UNRESOLVED_CWD if kind == 'dynamic' else join_cwd(effective_cwd, target)
+            if kind == 'dynamic':
+                # Cannot resolve statically -- ALLOW rather than guess (see
+                # README.md "Destructive git guard": this used to refuse,
+                # which guessed wrong as often as right; the snapshot hook
+                # is what actually covers this gap now, AC-SIMP-10).
+                cwd_known = False
+            else:
+                effective_cwd = join_cwd(effective_cwd, target)
+            continue
+
+        if not cwd_known:
             continue
 
         if escape_hatch_active_for_segment(tokens):
@@ -530,9 +575,6 @@ def evaluate(command, cwd):
             continue
 
         display_cmd = ' '.join(head)
-        if effective_cwd is UNRESOLVED_CWD:
-            return CD_UNRESOLVED_REFUSAL.format(cmd=display_cmd, var=ESCAPE_VAR)
-
         if has_uncommitted_change(segment_cwd, scope):
             return REFUSAL.format(cmd=display_cmd, var=ESCAPE_VAR)
     return None

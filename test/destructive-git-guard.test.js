@@ -16,6 +16,7 @@
 // test/static-checks.test.js's own preamble on this).
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { makeTempRepo, cleanupTempRepos, sh, sanitizedGitEnv } = require('./helpers/temp-repo.js')
@@ -594,18 +595,24 @@ test('destructive-git-guard: cd into a clean RELATIVE subdirectory then a destru
   assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
 })
 
-test('destructive-git-guard: cd "$SOME_VAR" && git checkout -- <path> is refused -- the target cannot be resolved statically, so the guard fails closed rather than judging an unknown directory (M1)', () => {
+// AC-SIMP-10: the hard refusal on an unresolvable `cd` target is DELETED,
+// not extended -- irrecoverable data loss is now covered by the recovery
+// mechanism (hooks/git-snapshot.py), which does not need to resolve the
+// `cd` at all, so refusing here traded a real but rare gap for a false
+// positive on every ordinary dynamic `cd`. These two cases now fail OPEN.
+
+test('destructive-git-guard: cd "$SOME_VAR" && git checkout -- <path> is now ALLOWED -- the target cannot be resolved statically, so the guard fails open rather than refusing an unknown directory (AC-SIMP-10)', () => {
   const dir = makeTempRepo()
   makeDirtyFile(dir)
   const res = runHook(bashPayload('cd "$SOME_VAR" && git checkout -- README.md', dir))
-  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
 })
 
-test('destructive-git-guard: cd - && git checkout -- <path> is refused -- "the previous directory" is not statically resolvable either (M1)', () => {
+test('destructive-git-guard: cd - && git checkout -- <path> is now ALLOWED -- "the previous directory" is not statically resolvable either, and this no longer refuses (AC-SIMP-10)', () => {
   const dir = makeTempRepo()
   makeDirtyFile(dir)
   const res = runHook(bashPayload('cd - && git checkout -- README.md', dir))
-  assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
 })
 
 test('destructive-git-guard: an unresolvable cd followed by a HARMLESS git command is still allowed (the fail-closed direction only applies to guarded shapes)', () => {
@@ -701,17 +708,85 @@ test('destructive-git-guard: a leaked GIT_DIR/GIT_WORK_TREE pointed at a second,
   assert.equal(res.status, 2, `expected exit 2 (the hook must strip GIT_DIR/GIT_WORK_TREE before its own status check), got ${res.status}; stderr: ${res.stderr}`)
 })
 
-test('destructive-git-guard: the hook\'s duplicated GIT_ENV_ALLOWLIST is identical to test/helpers/git-env.js\'s GIT_ENV_ALLOWLIST (M3, drift guard on the deliberate duplication)', () => {
+// AC-ARCH-3: enumerates hooks/*.py rather than naming a single file, so a
+// SECOND git-invoking hook (hooks/git-snapshot.py) that ever drops its own
+// scrub fails this test by name, not just the one this test used to know
+// about. "Shells out to git" is detected structurally (calls subprocess AND
+// mentions the string 'git'), not by a hand-maintained file list, which is
+// exactly the blindness this test used to have (M3, drift guard on the
+// deliberate duplication).
+test('destructive-git-guard AC-ARCH-3: every hooks/*.py that shells out to git strips the GIT_* namespace to the SAME allowlist as test/helpers/git-env.js', () => {
   const { GIT_ENV_ALLOWLIST } = require('./helpers/git-env.js')
-  const pyResult = spawnSync('python3', ['-c',
-    'import importlib.util, json, sys\n' +
-    'spec = importlib.util.spec_from_file_location("hook", sys.argv[1])\n' +
-    'hook = importlib.util.module_from_spec(spec)\n' +
-    'spec.loader.exec_module(hook)\n' +
-    'print(json.dumps(sorted(hook.GIT_ENV_ALLOWLIST)))\n',
-    HOOK_PATH,
-  ], { encoding: 'utf8' })
-  assert.equal(pyResult.status, 0, `failed to introspect the hook's allowlist: ${pyResult.stderr}`)
-  const pyAllowlist = JSON.parse(pyResult.stdout)
-  assert.deepEqual(pyAllowlist, [...GIT_ENV_ALLOWLIST].sort(), 'hooks/destructive-git-guard.py\'s GIT_ENV_ALLOWLIST has drifted from test/helpers/git-env.js\'s -- both must name the same set deliberately, see the duplication comment in the hook')
+  const hooksDir = path.join(__dirname, '..', 'hooks')
+  const pyFiles = fs.readdirSync(hooksDir).filter((f) => f.endsWith('.py'))
+  assert.ok(pyFiles.length >= 2, `sanity: expected at least 2 hooks/*.py files, found ${pyFiles.length}`)
+
+  const gitInvoking = pyFiles.filter((f) => {
+    const src = fs.readFileSync(path.join(hooksDir, f), 'utf8')
+    return /subprocess\.(run|Popen|check_output|call)/.test(src) && /['"]git['"]/.test(src)
+  })
+  assert.ok(gitInvoking.length >= 2, `sanity: expected at least 2 git-invoking hooks (destructive-git-guard.py, git-snapshot.py), found: ${gitInvoking}`)
+
+  for (const f of gitInvoking) {
+    const pyResult = spawnSync('python3', ['-c',
+      'import importlib.util, json, sys\n' +
+      'spec = importlib.util.spec_from_file_location("hook", sys.argv[1])\n' +
+      'hook = importlib.util.module_from_spec(spec)\n' +
+      'spec.loader.exec_module(hook)\n' +
+      'print(json.dumps(sorted(getattr(hook, "GIT_ENV_ALLOWLIST", None) and hook.GIT_ENV_ALLOWLIST or [])))\n',
+      path.join(hooksDir, f),
+    ], { encoding: 'utf8' })
+    assert.equal(pyResult.status, 0, `failed to introspect ${f}'s allowlist: ${pyResult.stderr}`)
+    const pyAllowlist = JSON.parse(pyResult.stdout)
+    assert.notDeepEqual(pyAllowlist, [], `${f} shells out to git but declares no GIT_ENV_ALLOWLIST at all -- a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE could redirect it to the wrong repository`)
+    assert.deepEqual(pyAllowlist, [...GIT_ENV_ALLOWLIST].sort(), `${f}'s GIT_ENV_ALLOWLIST has drifted from test/helpers/git-env.js's -- both must name the same set deliberately`)
+  }
+})
+
+// --- AC-PROD-3: the refusal message names the route to recovery. ---
+
+test('destructive-git-guard AC-PROD-3: the refusal message names the exact recovery command README documents for hooks/git-snapshot.py', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('git checkout -- README.md', dir))
+  assert.equal(res.status, 2)
+  const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8')
+  const m = readme.match(/^git for-each-ref --format='%\(refname\)[^\n]*refs\/harness-snapshots\/$/m)
+  assert.ok(m, 'README must document the list-snapshots command as its own line')
+  assert.ok(res.stderr.includes(m[0]), `refusal stderr must contain README's exact recovery command.\nstderr: ${res.stderr}\nREADME command: ${m[0]}`)
+})
+
+// --- AC-PROD-6: writing or quoting a guarded command as inert text is not
+// refused (RED at HEAD before the heredoc-body-stripping fix: a here-doc
+// body merely mentioning a guarded command was refused although nothing
+// executes). ---
+
+test('destructive-git-guard AC-PROD-6: a guarded command mentioned inside a here-document BODY is not refused (nothing there executes)', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload("cat <<'DOC'\ngit checkout -- README.md\nDOC\necho done", dir))
+  assert.equal(res.status, 0, `expected exit 0 (heredoc body is inert text), got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard AC-PROD-6: a guarded command mentioned inside a QUOTED string is not refused', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('echo "reminder: never run git checkout -- README.md on dirty work"', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard AC-PROD-6: a guarded command mentioned as a grep argument is not refused', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('grep -r "git checkout -- README.md" docs/ || true', dir))
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}; stderr: ${res.stderr}`)
+})
+
+test('destructive-git-guard AC-PROD-6: a here-document body cannot be used to SMUGGLE a real destructive command past the guard on the marker line itself', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  // The heredoc BODY is stripped, but the command on the marker's OWN line
+  // (before the `<<`) must still be evaluated normally.
+  const res = runHook(bashPayload("git checkout -- README.md <<'DOC'\nharmless text\nDOC", dir))
+  assert.equal(res.status, 2, `a real destructive command on the heredoc's own marker line must still be refused, got ${res.status}`)
 })

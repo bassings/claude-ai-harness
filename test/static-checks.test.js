@@ -1058,3 +1058,101 @@ test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s
     }
   }
 })
+
+// --- specs/harn-fix-2.md: AC-OPS-14, AC-PROD-4, AC-SEC-7, AC-QA-19. ---
+
+test('static AC-OPS-14: hooks.json\'s registered PreToolUse/Bash scripts and README\'s manual-install settings.json snippet register the SAME set, so adding one and not the other fails here', () => {
+  const hooksJson = JSON.parse(readAll('hooks', 'hooks.json'))
+  const registered = new Set()
+  for (const group of hooksJson.hooks.PreToolUse || []) {
+    for (const hook of group.hooks || []) {
+      registered.add(path.basename(hook.args[0]))
+    }
+  }
+  assert.ok(registered.size >= 2, `sanity: expected at least 2 registered PreToolUse scripts, found ${registered.size}`)
+
+  const readme = readAll('README.md')
+  const snippetStart = readme.indexOf('### As a plugin')
+  const snippetSection = readme.slice(snippetStart, readme.indexOf('## Recovering destroyed work'))
+  const named = new Set([...snippetSection.matchAll(/hooks\/([a-z0-9-]+\.py)/g)].map((m) => m[1]))
+
+  for (const script of registered) {
+    assert.ok(named.has(script), `${script} is registered in hooks.json but not named in README's install section`)
+  }
+})
+
+test('static AC-PROD-4: README states what the snapshot mechanism does NOT cover, and what it writes into a reader\'s own repository, before the install snippet', () => {
+  const readme = readAll('README.md')
+  assert.match(readme, /untracked files.*ignored files/is, 'README must name untracked and ignored files as uncovered loss paths')
+  assert.match(readme, /never written to disk/i, 'README must name work never written to disk as an uncovered loss path')
+  assert.match(readme, /`cd`s or `git -C`s into/i, 'README must name a cd/-C target repository as an uncovered loss path')
+  assert.match(readme, /non-Bash tool call/i, 'README must name non-Bash tool calls (Write, Edit) as an uncovered loss path')
+  const guardSectionStart = readme.indexOf('## Destructive git guard')
+  const guardSectionEnd = readme.indexOf('## Recovering destroyed work')
+  const guardSection = readme.slice(guardSectionStart, guardSectionEnd)
+  const installIdx = guardSection.lastIndexOf('Installing as a plugin wires the hook automatically')
+  const writesStatementIdx = guardSection.indexOf('this repo writes only')
+  assert.ok(installIdx !== -1, 'README\'s guard section must contain its own install snippet intro')
+  assert.ok(writesStatementIdx !== -1 && writesStatementIdx < installIdx + 400, 'README must state what the hooks write into the reader\'s own repository, at (or immediately around) the install snippet')
+})
+
+test('static AC-SEC-7: README\'s guard section states the detector is a best-effort early catch (no completeness claim) and names the measured-open bypass classes', () => {
+  const readme = readAll('README.md')
+  assert.match(readme, /best-effort early catch, not a boundary/i)
+  for (const bypass of ['env', 'command', '\\$\\(which git\\)', 'eval', 'subshell', 'bash\\s*-c', 'xargs', 'here-document']) {
+    assert.match(readme, new RegExp(bypass, 'i'), `README's guard section must name the "${bypass}" bypass class`)
+  }
+})
+
+// AC-QA-19: table-driven -- every spelling README documents as covered by
+// the detector is refused on a genuinely dirty file; every spelling it
+// documents as deliberately out of scope is allowed. Fails in BOTH
+// directions, so neither a closed hole nor a stopped guard leaves the
+// documentation stale.
+test('static AC-QA-19: every GUARDED shape is refused and every OUT-OF-SCOPE shape is allowed against a genuinely dirty file', () => {
+  const { makeTempRepo, cleanupTempRepos, sh, sanitizedGitEnv: sge } = require('./helpers/temp-repo.js')
+  const HOOK_PATH = path.join(ROOT, 'hooks', 'destructive-git-guard.py')
+  const fsMod = require('node:fs')
+
+  function runHook(command, dir) {
+    return spawnSync('python3', [HOOK_PATH], {
+      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: dir }),
+      encoding: 'utf8', env: sge(), timeout: 10000,
+    })
+  }
+
+  const GUARDED = [
+    'git checkout -- README.md',
+    'git checkout README.md',
+    'git checkout .',
+    'git checkout -f',
+    'git switch -f other',
+    'git restore README.md',
+    'git reset --hard',
+  ]
+  const OUT_OF_SCOPE = [
+    'git clean -fd',
+    'git stash drop',
+    'git branch -D other',
+    'git checkout -b newbranch',
+  ]
+
+  try {
+    for (const command of GUARDED) {
+      const dir = makeTempRepo()
+      sh('git branch other', dir)
+      fsMod.writeFileSync(path.join(dir, 'README.md'), 'dirty\n')
+      const res = runHook(command, dir)
+      assert.equal(res.status, 2, `GUARDED "${command}" must be refused (exit 2), got ${res.status}; stderr: ${res.stderr}`)
+    }
+    for (const command of OUT_OF_SCOPE) {
+      const dir = makeTempRepo()
+      sh('git branch other', dir)
+      fsMod.writeFileSync(path.join(dir, 'README.md'), 'dirty\n')
+      const res = runHook(command, dir)
+      assert.equal(res.status, 0, `OUT-OF-SCOPE "${command}" must be allowed (exit 0), got ${res.status}; stderr: ${res.stderr}`)
+    }
+  } finally {
+    cleanupTempRepos()
+  }
+})
