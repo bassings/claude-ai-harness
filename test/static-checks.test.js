@@ -191,6 +191,55 @@ test('static: plan-identity canonicalisation (canonicalPlanKey) has exactly one 
   assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/ledger-append.mjs'])
 })
 
+function allIndicesOf(text, needle) {
+  const out = []
+  let idx = text.indexOf(needle)
+  while (idx !== -1) {
+    out.push(idx)
+    idx = text.indexOf(needle, idx + 1)
+  }
+  return out
+}
+
+// MED-7 (round-one review): the needle used to be "'agents/lens-*.md'",
+// JS-single-quoted -- it could only ever match a JS string literal
+// wrapped in single quotes, so a genuine second definition written the
+// way bash actually writes one (e.g. a double-quoted shell variable
+// assignment: SUBSET_PATTERNS="AGENT-HARNESS.md agents/lens-*.md ...")
+// passed this guard clean. Proven by planting exactly that in
+// bin/optimise-cycle-weekly.sh: 44/44 static tests stayed green, AC-OPS-5
+// included.
+//
+// The fix is two bare needles (no quote characters of their own, so
+// either matches regardless of how the target file quotes or embeds it),
+// requiring BOTH to appear within PROXIMITY characters of EACH OTHER
+// somewhere in the file -- not merely "the file mentions this glob
+// somewhere". A single quote-agnostic needle alone over-matched: this
+// module's own H3-guard prose comments and error-message template
+// mention "agents/lens-*.md" (workflows/plan-cycle.js, workflows/review-
+// cycle.js -- a completely unrelated concern, the findings-schema
+// consistency check, not the consumer subset), which is a false positive
+// a bare single-needle .includes() cannot distinguish from a genuine
+// second pattern-list definition. "agents/reviewer-*.md" never appears
+// anywhere near an "agents/lens-*.md" mention in ordinary prose (nothing
+// in this repo's prose has reason to name both globs back to back), so
+// requiring their PROXIMITY, rather than either alone, is what actually
+// characterises "a list like this one", in any quoting style, while still
+// excluding the unrelated prose.
+test('static: the consumer-subset pattern list (AC-OPS-5, specs/harn-fix-3.md task 2) has exactly one definition site, in ANY quoting style -- only workflows/lib/install-consistency.mjs declares CONSUMER_SUBSET_PATTERNS; bin/optimise-cycle-weekly.sh (bash, cannot import) drives the whole comparison through that module\'s --check-staleness CLI mode instead of hardcoding a second copy of the pattern list.', () => {
+  const all = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'bin')), ...walk(path.join(ROOT, 'agents')), ...walk(path.join(ROOT, 'hooks')), ...walk(path.join(ROOT, 'skills'))]
+  const NEEDLE_A = 'agents/lens-*.md' // no surrounding quote characters -- see the MED-7 comment above
+  const NEEDLE_B = 'agents/reviewer-*.md'
+  const PROXIMITY = 100
+  const definitionSites = all.filter((f) => {
+    const text = fs.readFileSync(f, 'utf8')
+    const positionsA = allIndicesOf(text, NEEDLE_A)
+    const positionsB = allIndicesOf(text, NEEDLE_B)
+    return positionsA.some((a) => positionsB.some((b) => Math.abs(a - b) <= PROXIMITY))
+  })
+  assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/install-consistency.mjs'])
+})
+
 test('static: ledger-append.mjs is INVOKED by at least two workflows (AC-SIMP-12, arbitrated: "imported by >=2 files" becomes "invoked by >=2 workflows" for a script workflow scripts can only run via Bash, never import)', () => {
   const invokers = ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js'].filter((f) =>
     readAll(f).includes('ledger-append.mjs')
@@ -314,6 +363,150 @@ test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, le
   assert.ok(tdd.length > 500, 'sanity: the extracted block should be substantial, not an empty match')
   assert.equal(review, tdd, 'review-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
   assert.equal(plan, tdd, 'plan-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
+})
+
+// specs/harn-fix-3.md AC-QA-1..4: the install-consistency preflight block
+// (INSTALL_CONSISTENCY_INSTRUCTION, INSTALL_CONSISTENCY_SCHEMA,
+// installConsistencyError) is necessarily duplicated between plan-cycle.js
+// and review-cycle.js -- workflow scripts cannot import, mirroring the L5
+// run-ledger trio above. Without a guard pinning them, a fix (e.g. a wording
+// correction, a new schema field) landed in one copy and not the other fails
+// silently, exactly the class of bug HARN-FIX-3 itself exists to catch.
+test('static: HARN-FIX-3 -- the install-consistency preflight block (INSTALL_CONSISTENCY_INSTRUCTION, INSTALL_CONSISTENCY_SCHEMA, installConsistencyError) is byte-identical between plan-cycle.js and review-cycle.js', () => {
+  function extractBlock(fileName) {
+    const contents = readAll('workflows', fileName)
+    const lines = contents.split('\n')
+    const start = lines.findIndex((l) => l.startsWith('// HARN-FIX-3 install-consistency preflight block'))
+    const end = lines.findIndex((l, i) => i > start && l.trim() === '// ---- end HARN-FIX-3 install-consistency preflight block ----')
+    assert.ok(start >= 0 && end > start, `${fileName}: could not locate the install-consistency preflight block markers`)
+    return lines.slice(start, end + 1).join('\n')
+  }
+  const plan = extractBlock('plan-cycle.js')
+  const review = extractBlock('review-cycle.js')
+  assert.ok(plan.length > 500, 'sanity: the extracted block should be substantial, not an empty match')
+  assert.equal(review, plan, 'review-cycle.js\'s install-consistency preflight block has drifted from plan-cycle.js\'s')
+})
+
+// specs/harn-fix-3.md AC-ARCH-4: the version stamp (formerly AC-ARCH-1/2/3)
+// was built, reviewed, and withdrawn 2026-08-23 -- not deferred, not
+// softened, REPLACED by a rule that no such mechanism may exist at all.
+// Round-one review found it generated permanent false drift on every
+// commit to main (the hook re-stamped three files unconditionally, so the
+// staleness check above could never see past it) and, separately, that
+// stamp_md/stamp_js staged the WHOLE working-tree file, sweeping unstaged
+// edits into unrelated commits and into this repo's public remote history.
+// This guard is the mechanical enforcement of the withdrawal: it fails if
+// either half of the mechanism ever reappears, in this repo or a fork of
+// it, rather than trusting the withdrawal to stay remembered as prose.
+test('static: AC-ARCH-4 -- no shipped (non-test, non-docs, non-spec) tracked file contains a SOURCE_COMMIT stamp, and .githooks/ contains no pre-commit hook -- the version stamp is withdrawn, not merely unused', () => {
+  const exec = require('node:child_process').execFileSync
+  const tracked = exec('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8' })
+    .split('\n')
+    .filter(Boolean)
+  // Excludes test/, docs/, specs/: those are where the WITHDRAWAL itself
+  // is documented and narrated (this file's own comment above says
+  // "SOURCE_COMMIT" by name, specs/harn-fix-3.md records the withdrawal
+  // history, and docs/*-mutation-proofs.md keep a historical record of the
+  // mutations that were run against the since-deleted mechanism) -- a scan
+  // that also walked those would fail on the very act of documenting the
+  // ban. Everything else tracked in the repo is "shipped": the point of
+  // AC-ARCH-4 is that a consumer's ~/.claude install, or a fork's main,
+  // must never be able to pick this back up.
+  const shipped = tracked.filter((f) => !f.startsWith('test/') && !f.startsWith('docs/') && !f.startsWith('specs/'))
+  assert.ok(shipped.length > 25, `sanity: expected many tracked shipped files, found ${shipped.length}`)
+  const offenders = []
+  for (const rel of shipped) {
+    const full = path.join(ROOT, rel)
+    if (!fs.existsSync(full) || !fs.statSync(full).isFile()) continue
+    let contents
+    try {
+      contents = fs.readFileSync(full, 'utf8')
+    } catch (e) {
+      continue // a binary or unreadable file cannot contain the string meaningfully
+    }
+    if (contents.includes('SOURCE_COMMIT')) offenders.push(rel)
+  }
+  assert.deepEqual(offenders, [], `AC-ARCH-4: SOURCE_COMMIT reappeared in shipped file(s): ${offenders.join(', ')} -- the version stamp is withdrawn, not deferred`)
+
+  const hooksDirExists = fs.existsSync(path.join(ROOT, '.githooks'))
+  assert.ok(hooksDirExists, 'sanity: .githooks/ must exist (it still hosts pre-push)')
+  const hookFiles = fs.readdirSync(path.join(ROOT, '.githooks'))
+  assert.ok(!hookFiles.includes('pre-commit'), 'AC-ARCH-4: .githooks/pre-commit must not exist -- no git hook may rewrite tracked content during a commit')
+})
+
+// M9/round three: the install-consistency override moved from an environment
+// variable (HARNESS_ALLOW_INCONSISTENT_INSTALL, relayed to the workflow
+// THROUGH the scope agent whose report the gate is checking -- circular, and
+// the same bypass class as MED-2) to an explicit per-invocation flag on the
+// cycle's own args, read by the workflow script directly.
+//
+// Enforced mechanically rather than remembered as prose (§9): a reintroduced
+// env var would look entirely plausible in review, and the relay it implies
+// is exactly what round three removed. test/ and docs/ are excluded for the
+// same reason AC-ARCH-4 excludes them -- the removal tests and the mutation
+// proofs must be able to NAME the removed variable.
+// Two guards, because the withdrawal has two halves and each can regress
+// independently. Scope is SHIPPED CODE: test/, docs/ and specs/ are excluded
+// for the same reason AC-ARCH-4 excludes them (the removal tests and the
+// mutation proofs must be able to name what was removed), and so is every .md
+// file -- README.md deliberately names the withdrawn variable so an operator
+// with it in muscle memory finds out it is gone, and banning the string from
+// prose would delete that explanation. Prose cannot re-enable a mechanism;
+// code can.
+function shippedCodeFiles() {
+  const exec = require('node:child_process').execFileSync
+  const files = exec('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8' })
+    .split('\n')
+    .filter(Boolean)
+    .filter((rel) => !rel.startsWith('test/') && !rel.startsWith('docs/') && !rel.startsWith('specs/') && !rel.endsWith('.md'))
+  // ANTI-VACUITY: a scan over an empty list reports no offenders forever.
+  assert.ok(files.length > 15, `sanity: expected many shipped code files, found ${files.length}`)
+  return files
+}
+
+test('static: round three -- no shipped code file names HARNESS_ALLOW_INCONSISTENT_INSTALL: the override is an args flag, not an environment variable that silently disables the gate for a whole session', () => {
+  const offenders = shippedCodeFiles().filter((rel) => {
+    let contents
+    try {
+      contents = fs.readFileSync(path.join(ROOT, rel), 'utf8')
+    } catch (e) {
+      return false
+    }
+    return contents.includes('HARNESS_ALLOW_INCONSISTENT_INSTALL')
+  })
+  assert.deepEqual(offenders, [], `the override must not be readable from the environment again: ${offenders.join(', ')}`)
+})
+
+// The half that actually mattered. A workflow script has no environment
+// access, so the env-var design had to RELAY the override through the scope
+// agent -- the model whose report the gate is checking. A gate whose override
+// is asserted by the thing being policed is circular, and is the same bypass
+// class as MED-2. Bans READING it (`.escape_hatch_active`) and DECLARING it
+// (`escape_hatch_active:`), not merely mentioning it: the preflight block's own
+// comments have to be able to say the field is ignored.
+test('static: round three -- no shipped code file reads or declares escape_hatch_active: an override the scope agent can assert is not an override, it is a bypass', () => {
+  const offenders = shippedCodeFiles().filter((rel) => {
+    let contents
+    try {
+      contents = fs.readFileSync(path.join(ROOT, rel), 'utf8')
+    } catch (e) {
+      return false
+    }
+    return /\.escape_hatch_active|escape_hatch_active\s*:/.test(contents)
+  })
+  assert.deepEqual(offenders, [], `escape_hatch_active must never be read from, or declared in, a model-supplied report again: ${offenders.join(', ')}`)
+})
+
+test('static: round three -- both cycle workflows document the allow_inconsistent_install arg in their meta block, and README documents it as the override without still instructing the withdrawn environment variable', () => {
+  for (const f of ['plan-cycle.js', 'review-cycle.js']) {
+    const src = readAll('workflows', f)
+    assert.match(src, /opts\.allow_inconsistent_install/, `${f} must read the override flag from its own args`)
+    const meta = src.slice(0, src.indexOf('\n}'))
+    assert.ok(meta.includes('allow_inconsistent_install'), `${f}'s meta block must document the flag in whenToUse -- an override nobody can discover is not an escape hatch`)
+  }
+  const readme = readAll('README.md')
+  assert.match(readme, /allow_inconsistent_install/, 'README.md must document the override flag')
+  assert.ok(!/set `?HARNESS_ALLOW_INCONSISTENT_INSTALL/.test(readme), 'README.md must not still INSTRUCT setting the withdrawn environment variable (naming it as withdrawn is the point)')
 })
 
 // HARN-OPT-2 PR2 (AC-ARCH-9): the start/terminal exception-guard block PR 2
@@ -981,67 +1174,86 @@ test('static: every hooks/*.py script is registered in hooks/hooks.json, and eve
 // stops a repeat: it fails if EITHER side ever moves without the other --
 // a field documented/instructed with no schema slot (H3's own shape), or a
 // schema property nothing documents or instructs a lens to fill.
-test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s ### FINDINGS template, and every field agents/lens-*.md instruct filling there, has a like-named property in both review-cycle.js\'s REVIEW_SCHEMA and plan-cycle.js\'s PLAN_SCHEMA findings items -- and vice versa: every non-structural findings-item property is named in the template', () => {
-  const doc = readAll('AGENT-HARNESS.md')
+test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s ### FINDINGS template, and every field agents/lens-*.md instruct filling there, has a like-named property in both review-cycle.js\'s REVIEW_SCHEMA and plan-cycle.js\'s PLAN_SCHEMA findings items -- and vice versa: every non-structural findings-item property is named in the template', async () => {
+  // specs/harn-fix-3.md AC-QA-1 (reuse, not reinvent): the field-extraction
+  // regexes below used to be duplicated inline here. They now live ONCE, in
+  // workflows/lib/install-consistency.mjs -- the same runtime script
+  // plan-cycle.js/review-cycle.js instruct an agent to run against an
+  // INSTALLED ~/.claude tree before dispatching any lens (AC-QA-1..4). This
+  // test is the identical comparison run against the REPO's own tree
+  // instead, at review time. One parser, two call sites, so the two checks
+  // can never independently drift into two different, individually-wrong
+  // parsers -- see that module's own header for the three-times-wrong
+  // history this exact pattern has (matching bare ids counted prose
+  // mentions; requiring bold found zero definitions in two files while
+  // reporting no duplicates; a "fix" moved the blindness rather than
+  // removing it).
+  const { pathToFileURL } = require('node:url')
+  const modulePath = path.join(ROOT, 'workflows', 'lib', 'install-consistency.mjs')
+  const { parseFindingsTemplateFields, parseInstructedFields, parseSchemaFindingsProps, STRUCTURAL_FINDINGS_PROPS, REQUIRED_STRUCTURAL_PROPS, checkConsistency } = await import(pathToFileURL(modulePath).href)
 
-  // ---- side A: AGENT-HARNESS.md's ### FINDINGS template ----
-  const findingsHeadingIdx = doc.indexOf('### FINDINGS')
-  assert.ok(findingsHeadingIdx !== -1, 'AGENT-HARNESS.md must have a ### FINDINGS heading')
-  const fenceEnd = doc.indexOf('```', findingsHeadingIdx)
-  assert.ok(fenceEnd !== -1, 'the ### FINDINGS heading must be followed by a fenced example block')
-  const templateBlock = doc.slice(findingsHeadingIdx, fenceEnd)
-  const docFields = new Set()
-  for (const m of templateBlock.matchAll(/^\s{2}([A-Z][A-Za-z]+):\s/gm)) docFields.add(m[1].toLowerCase())
+  // M1 (round three): the structural floor, pinned. STRUCTURAL_FINDINGS_PROPS
+  // exempts these four names from direction 2 (they come from the one-line
+  // "[SEVERITY] <claim>: <file:line>" header and from review-mode AC
+  // attribution, not from a colon-labeled template row), and that exemption
+  // used to be one-directional: deleting `location` from an installed
+  // REVIEW_SCHEMA reported consistent:true with missing_in_review_schema:[].
+  // REQUIRED_STRUCTURAL_PROPS is the other direction, and it is per-schema
+  // because PLAN_SCHEMA legitimately has no ac_id.
+  //
+  // Two pins, and both are load-bearing in opposite directions. WIDENING a
+  // floor by one word is already loud without this test -- the repo's own
+  // schemas would not declare the new word, so checkConsistency below reports
+  // consistent:false and this test fails by name. NARROWING one (deleting an
+  // entry, silently shrinking what the floor covers) is what this deepEqual
+  // catches: it makes the deletion a visible two-place edit rather than a
+  // one-line coverage loss nothing observes.
+  assert.deepEqual([...REQUIRED_STRUCTURAL_PROPS.REVIEW_SCHEMA].sort(), ['ac_id', 'claim', 'location', 'severity'])
+  assert.deepEqual([...REQUIRED_STRUCTURAL_PROPS.PLAN_SCHEMA].sort(), ['claim', 'location', 'severity'])
+  assert.deepEqual(
+    [...new Set([...REQUIRED_STRUCTURAL_PROPS.REVIEW_SCHEMA, ...REQUIRED_STRUCTURAL_PROPS.PLAN_SCHEMA])].sort(),
+    [...STRUCTURAL_FINDINGS_PROPS].sort(),
+    'the direction-2 exemption set must be DERIVED from the floors, not a third independent literal that can drift from them'
+  )
+
+  const doc = readAll('AGENT-HARNESS.md')
+  const docFields = parseFindingsTemplateFields(doc)
+  assert.ok(docFields, 'AGENT-HARNESS.md must have a ### FINDINGS heading followed by a fenced example block')
   assert.ok(docFields.size >= 3, `sanity: expected several colon-labeled fields in the FINDINGS template, found ${[...docFields]}`)
   assert.ok(docFields.has('recurrence'), 'sanity: the FINDINGS template must still name Recurrence -- this test exists to protect that specific field')
 
-  // ---- side B: agents/lens-*.md's own "fill AGENT-HARNESS.md's `X` field" instructions ----
   const agentFiles = fs.readdirSync(path.join(ROOT, 'agents')).filter((f) => f.startsWith('lens-') && f.endsWith('.md'))
   assert.ok(agentFiles.length >= 9, `sanity: expected at least 9 agents/lens-*.md files, found ${agentFiles.length}`)
-  const agentFields = new Set()
-  for (const f of agentFiles) {
-    const text = readAll('agents', f)
-    for (const m of text.matchAll(/fill AGENT-HARNESS\.md's `([A-Za-z]+)` field/g)) agentFields.add(m[1].toLowerCase())
-  }
+  const agentTexts = agentFiles.map((f) => readAll('agents', f))
+  const agentFields = parseInstructedFields(agentTexts)
   assert.ok(agentFields.has('recurrence'), 'sanity: expected at least one agents/lens-*.md file to instruct filling the Recurrence field')
 
-  // ---- side C: the findings-item properties each workflow schema declares ----
-  function extractBalancedObject(text, openBraceIdx) {
-    let depth = 0
-    for (let i = openBraceIdx; i < text.length; i++) {
-      if (text[i] === '{') depth++
-      else if (text[i] === '}') {
-        depth--
-        if (depth === 0) return text.slice(openBraceIdx, i + 1)
-      }
-    }
-    throw new Error(`unbalanced braces from index ${openBraceIdx}`)
-  }
-  function findingsSchemaProps(fileRel, constName) {
-    const text = readAll(...fileRel.split('/'))
-    const constIdx = text.indexOf(`const ${constName}`)
-    assert.ok(constIdx !== -1, `expected "const ${constName}" in ${fileRel}`)
-    const findingsMatch = /\bfindings:\s*{/.exec(text.slice(constIdx))
-    assert.ok(findingsMatch, `expected a findings: property inside ${constName} in ${fileRel}`)
-    const findingsIdxAbs = constIdx + findingsMatch.index
-    const propsMatch = /properties:\s*{/.exec(text.slice(findingsIdxAbs))
-    assert.ok(propsMatch, `expected findings.items.properties inside ${constName} in ${fileRel}`)
-    const propsBraceIdx = findingsIdxAbs + propsMatch.index + propsMatch[0].length - 1
-    const obj = extractBalancedObject(text, propsBraceIdx)
-    const names = new Set()
-    for (const m of obj.matchAll(/(?:^|[{,])\s*([A-Za-z_]\w*)\s*:\s*{\s*type:/g)) names.add(m[1])
-    assert.ok(names.size >= 3, `sanity: expected several findings properties parsed from ${fileRel}'s ${constName}, found ${[...names]}`)
-    return names
-  }
-  const reviewProps = findingsSchemaProps('workflows/review-cycle.js', 'REVIEW_SCHEMA')
-  const planProps = findingsSchemaProps('workflows/plan-cycle.js', 'PLAN_SCHEMA')
+  const reviewSource = readAll('workflows', 'review-cycle.js')
+  const planSource = readAll('workflows', 'plan-cycle.js')
+  const reviewProps = parseSchemaFindingsProps(reviewSource, 'REVIEW_SCHEMA')
+  const planProps = parseSchemaFindingsProps(planSource, 'PLAN_SCHEMA')
+  assert.ok(reviewProps, 'expected "const REVIEW_SCHEMA" with a findings.items.properties block in workflows/review-cycle.js')
+  assert.ok(planProps, 'expected "const PLAN_SCHEMA" with a findings.items.properties block in workflows/plan-cycle.js')
+  assert.ok(reviewProps.size >= 3, `sanity: expected several findings properties parsed from review-cycle.js's REVIEW_SCHEMA, found ${[...reviewProps]}`)
+  assert.ok(planProps.size >= 3, `sanity: expected several findings properties parsed from plan-cycle.js's PLAN_SCHEMA, found ${[...planProps]}`)
+
+  const result = checkConsistency({ agentHarnessMd: doc, lensFileTexts: agentTexts, planCycleSource: planSource, reviewCycleSource: reviewSource })
+  assert.equal(result.blind, false, `the parser must not be blind against the repo's own tree: ${JSON.stringify(result.blind_reasons)}`)
+
+  // Direction 3 (M1, round three): a schema that has LOST a structural
+  // property. Direction 1 cannot see this -- nothing on the doc side names
+  // these four -- and direction 2 only ever reports EXTRA properties.
+  assert.deepEqual(result.missing_structural_in_review_schema, [], 'REVIEW_SCHEMA\'s findings items have lost a structural property (severity/claim/location/ac_id)')
+  assert.deepEqual(result.missing_structural_in_plan_schema, [], 'PLAN_SCHEMA\'s findings items have lost a structural property (severity/claim/location)')
 
   // Direction 1 (H3 itself): a field documented in the template, or one
   // agents/*.md are told to fill, must have a schema slot in BOTH workflows
   // that build a lens-output schema from this contract.
-  for (const field of new Set([...docFields, ...agentFields])) {
-    assert.ok(reviewProps.has(field), `"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but review-cycle.js's REVIEW_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
-    assert.ok(planProps.has(field), `"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but plan-cycle.js's PLAN_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
+  for (const field of result.missing_in_review_schema) {
+    assert.fail(`"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but review-cycle.js's REVIEW_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
+  }
+  for (const field of result.missing_in_plan_schema) {
+    assert.fail(`"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but plan-cycle.js's PLAN_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
   }
 
   // Direction 2 (vice versa): a schema property that is NOT one of the
@@ -1050,13 +1262,13 @@ test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s
   // row; ac_id is review-mode AC attribution, a separate mechanism from the
   // FINDINGS template) must be named in the template -- otherwise the
   // schema invites a value nothing ever told a lens to produce.
-  const STRUCTURAL = new Set(['severity', 'claim', 'location', 'ac_id'])
-  for (const [label, props] of [['REVIEW_SCHEMA', reviewProps], ['PLAN_SCHEMA', planProps]]) {
-    for (const prop of props) {
-      if (STRUCTURAL.has(prop)) continue
-      assert.ok(docFields.has(prop), `${label}'s findings items declare "${prop}", but AGENT-HARNESS.md's FINDINGS template does not name it -- a schema field nothing instructs a lens to fill`)
-    }
+  for (const prop of result.review_only_props) {
+    assert.fail(`REVIEW_SCHEMA's findings items declare "${prop}", but AGENT-HARNESS.md's FINDINGS template does not name it -- a schema field nothing instructs a lens to fill`)
   }
+  for (const prop of result.plan_only_props) {
+    assert.fail(`PLAN_SCHEMA's findings items declare "${prop}", but AGENT-HARNESS.md's FINDINGS template does not name it -- a schema field nothing instructs a lens to fill`)
+  }
+  assert.ok(result.consistent, 'sanity: no direction-1 or direction-2 mismatch was reported above, so the overall verdict must be consistent')
 })
 
 // --- specs/harn-fix-2.md: AC-OPS-14, AC-PROD-4, AC-SEC-7, AC-QA-19. ---
