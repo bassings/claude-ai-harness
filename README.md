@@ -434,14 +434,21 @@ these two files into your own repository once running: a
 `refs/harness-snapshots/` -- see "Recovering destroyed work" below for what
 each one is and how to remove it):
 
+**Use an ABSOLUTE path, not `~`.** These `args` are passed to `exec`, which
+does not expand a tilde: `python3` then exits **2** on the file it cannot
+open, and exit 2 is precisely the code PreToolUse treats as *block*. A
+mistyped or unexpanded path therefore does not disable the hooks, it refuses
+**every Bash call in the session**. Measured: `python3 "~/.claude/hooks/git-snapshot.py"`
+exits 2. Substitute your own home directory below.
+
 ```json
 {
   "hooks": {
     "PreToolUse": [{ "matcher": "Bash", "hooks": [
       { "type": "command", "command": "python3",
-        "args": ["~/.claude/hooks/destructive-git-guard.py"], "timeout": 10 },
+        "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/destructive-git-guard.py"], "timeout": 10 },
       { "type": "command", "command": "python3",
-        "args": ["~/.claude/hooks/git-snapshot.py"], "timeout": 10 }
+        "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/git-snapshot.py"], "timeout": 10 }
     ] }]
   }
 }
