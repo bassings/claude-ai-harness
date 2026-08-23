@@ -914,20 +914,25 @@ checks whether the consumer install at `$CLAUDE_HOME` (default
 
 - **Required** -- absence from the install is reported as drift:
   `AGENT-HARNESS.md`, every `agents/lens-*.md` and `agents/reviewer-*.md`,
-  `workflows/*.js`, `workflows/lib/`, `hooks/`, and `skills/` (the whole
-  directory, not only `skills/optimise-cycle/` -- `skills/conduct-plan/`,
-  which drives every multi-PR plan, is genuinely published and installed
-  the same way).
+  `workflows/*.js`, `workflows/lib/`, `hooks/` (except `hooks/hooks.json`,
+  see below), and `skills/` (the whole directory, not only
+  `skills/optimise-cycle/` -- `skills/conduct-plan/`, which drives every
+  multi-PR plan, is genuinely published and installed the same way).
 - **Optional** -- present-if-opted-in; absence from the install is a
-  legitimate configuration (the weekly job itself is opt-in), never drift,
-  but presence with DIFFERENT content still is: `bin/optimise-cycle-weekly.sh`
-  and `bin/redact-transcript.mjs` (round-one review, HIGH-2 -- this
-  script's own detector was previously excluded from the thing it checks,
-  the same defect class the whole spec exists to close, sitting inside its
-  own fix). `bin/com.local.optimise-cycle-weekly.plist` is deliberately
-  EXCLUDED from both lists: it is a per-operator TEMPLATE (its own header
-  comment says so), edited immediately after copying, so comparing it to
-  the published template would report every genuinely working install as
+  legitimate configuration, never drift, but presence with DIFFERENT
+  content still is: `bin/optimise-cycle-weekly.sh` and
+  `bin/redact-transcript.mjs` (the weekly job itself is opt-in; round-one
+  review, HIGH-2 -- this script's own detector was previously excluded
+  from the thing it checks, the same defect class the whole spec exists to
+  close, sitting inside its own fix), and `hooks/hooks.json` (the plugin
+  manifest, read only by a `/plugin install` -- a manual install wires the
+  two `PreToolUse` hooks through `~/.claude/settings.json` instead, so its
+  absence there is not drift; measured against a real manual install,
+  where leaving it required fired drift on every weekly run, forever).
+  `bin/com.local.optimise-cycle-weekly.plist` is deliberately EXCLUDED
+  from both lists: it is a per-operator TEMPLATE (its own header comment
+  says so), edited immediately after copying, so comparing it to the
+  published template would report every genuinely working install as
   permanently drifted.
 
 A user-owned file the repo does not ship, like `CLAUDE.md`, is never
