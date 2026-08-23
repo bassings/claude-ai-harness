@@ -936,7 +936,11 @@ test('weekly runner (drift visibility, coordinator ruling 2026-08-23): a run tha
   const published = makePublishedRepo()
   const install = identicalInstallOf(published)
   fs.writeFileSync(path.join(install, 'agents', 'lens-security.md'), 'a stale, locally-edited copy\n')
-  fs.rmSync(path.join(install, 'hooks', 'hooks.json'))
+  // L-4 (harn-fix-3, promoted 2026-08-24): hooks/hooks.json is now OPTIONAL
+  // (the plugin manifest, absent by design on a manual install), so it can
+  // no longer stand in as the REQUIRED-file-absent fixture this test needs
+  // -- agents/reviewer-verification.md (still required) takes its place.
+  fs.rmSync(path.join(install, 'agents', 'reviewer-verification.md'))
   const repo = makeTempRepo()
   setMarker(repo, 'pass')
   const { status, stderr, log, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
@@ -946,7 +950,7 @@ test('weekly runner (drift visibility, coordinator ruling 2026-08-23): a run tha
   assert.ok(stderr.includes(log), `the stderr line must name the actual log path so an operator knows where to look; stderr was:\n${stderr}`)
   assert.match(stderr, /1 drifted, 1 missing/, `the stderr line must carry the exact count (1 drifted + 1 missing here), not merely say "drift happened"; stderr was:\n${stderr}`)
   assert.ok(!/agents\/lens-security\.md/.test(stderr), 'stderr must name a COUNT, never the file list -- the log line already carries that')
-  assert.ok(!/hooks\.json/.test(stderr), 'stderr must name a COUNT, never the file list -- the log line already carries that')
+  assert.ok(!/reviewer-verification\.md/.test(stderr), 'stderr must name a COUNT, never the file list -- the log line already carries that')
 })
 
 test('weekly runner (AC-OPS-1): with ZERO delivery repos configured, the staleness check still runs exactly once', () => {
@@ -961,7 +965,10 @@ test('weekly runner (AC-OPS-1): with ZERO delivery repos configured, the stalene
 test('weekly runner (AC-OPS-4): a published file DELETED from the install is named as drift (missing), and a user-owned file the install has but the repo never shipped is never named', () => {
   const published = makePublishedRepo()
   const install = identicalInstallOf(published)
-  fs.rmSync(path.join(install, 'hooks', 'hooks.json'))
+  // L-4 (harn-fix-3, promoted 2026-08-24): hooks/hooks.json is now OPTIONAL
+  // (see the dedicated L-4 test below), so this REQUIRED-absence fixture
+  // uses agents/reviewer-verification.md instead.
+  fs.rmSync(path.join(install, 'agents', 'reviewer-verification.md'))
   fs.writeFileSync(path.join(install, 'CLAUDE.md'), 'user-owned, never published\n')
   const repo = makeTempRepo()
   setMarker(repo, 'pass')
@@ -970,8 +977,43 @@ test('weekly runner (AC-OPS-4): a published file DELETED from the install is nam
   assert.match(logContents, /^STALENESS drift /m, logContents)
   const line = logContents.match(/^STALENESS drift .*$/m)[0]
   const json = JSON.parse(line.slice(line.indexOf('{')))
-  assert.deepEqual(json.missing, ['hooks/hooks.json'])
+  assert.deepEqual(json.missing, ['agents/reviewer-verification.md'])
   assert.ok(!logContents.includes('CLAUDE.md'), 'CLAUDE.md is user-owned and not in the consumer subset -- it must never be named')
+})
+
+// L-4 (harn-fix-3, promoted 2026-08-24 after being measured against a real
+// install). hooks/hooks.json is the plugin manifest, read only by a
+// `/plugin install`; README.md's manual-copy install wires the two
+// PreToolUse hooks through ~/.claude/settings.json directly instead. Left
+// as REQUIRED, this fired STALENESS drift on every weekly run for every
+// manual install, forever -- verified against a real operator's install,
+// whose settings.json genuinely carried both PreToolUse entries and no
+// hooks.json at all.
+test('weekly runner (L-4, harn-fix-3): a manual install with NO hooks/hooks.json, everything else current, reports STALENESS ok end to end -- the false positive that prompted this fix', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.rmSync(path.join(install, 'hooks', 'hooks.json'))
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS ok /m, logContents)
+  assert.ok(!logContents.includes('"missing":["hooks/hooks.json"]'), `hooks/hooks.json absent from a manual install must never be reported as missing:\n${logContents}`)
+})
+
+test('weekly runner (L-4, harn-fix-3): hooks/hooks.json PRESENT but with DIFFERENT content is still reported as STALENESS drift end to end -- a stale plugin install is a real problem', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'hooks', 'hooks.json'), 'a stale, locally-edited plugin manifest\n')
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.deepEqual(json.drifted, ['hooks/hooks.json'])
+  assert.deepEqual(json.missing, [])
 })
 
 // ---- HIGH-2 (round-one review): the corrected subset, driven end to end ----
