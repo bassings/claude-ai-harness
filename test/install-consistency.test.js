@@ -646,9 +646,9 @@ test('install-consistency: CONSUMER_SUBSET_PATTERNS is exported and matches the 
   )
 })
 
-test('install-consistency: CONSUMER_OPTIONAL_PATTERNS (HIGH-2) is exported and names exactly the two bin/ files README.md documents as separately synced, excluding the templated plist', async () => {
+test('install-consistency: CONSUMER_OPTIONAL_PATTERNS (HIGH-2, L-4) is exported and names exactly the two bin/ files README.md documents as separately synced, plus hooks/hooks.json (the plugin manifest, promoted from L-4), excluding the templated plist', async () => {
   const { CONSUMER_OPTIONAL_PATTERNS } = await loadModule()
-  assert.deepEqual([...CONSUMER_OPTIONAL_PATTERNS].sort(), ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs'].sort())
+  assert.deepEqual([...CONSUMER_OPTIONAL_PATTERNS].sort(), ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs', 'hooks/hooks.json'].sort())
 })
 
 test('install-consistency: isConsumerSubsetPath matches every pattern shape (literal, single-segment glob, directory prefix at any depth, and the HIGH-2 optional bin/ literals) and rejects a user-owned or deliberately-excluded file', async () => {
@@ -671,12 +671,20 @@ test('install-consistency: isConsumerSubsetPath matches every pattern shape (lit
   assert.equal(isConsumerSubsetPath('test/some.test.js'), false)
 })
 
-test('install-consistency: isOptionalConsumerSubsetPath (HIGH-2) is true only for the two bin/ literals, false for everything else in the subset', async () => {
+test('install-consistency: isOptionalConsumerSubsetPath (HIGH-2, L-4) is true for the two bin/ literals and for hooks/hooks.json, false for everything else in the subset', async () => {
   const { isOptionalConsumerSubsetPath } = await loadModule()
   assert.equal(isOptionalConsumerSubsetPath('bin/optimise-cycle-weekly.sh'), true)
   assert.equal(isOptionalConsumerSubsetPath('bin/redact-transcript.mjs'), true)
+  // L-4 (harn-fix-3, promoted 2026-08-24): hooks/hooks.json is the plugin
+  // manifest, used only by a `/plugin install`. A manual install wires
+  // hooks through ~/.claude/settings.json instead (README.md), so its
+  // absence there is not drift -- but presence with different content
+  // still is, because a plugin install with a stale copy IS a real
+  // problem. Same shape as the two bin/ literals above, not excluded like
+  // the templated plist.
+  assert.equal(isOptionalConsumerSubsetPath('hooks/hooks.json'), true)
   assert.equal(isOptionalConsumerSubsetPath('AGENT-HARNESS.md'), false, 'a REQUIRED pattern must never read as optional')
-  assert.equal(isOptionalConsumerSubsetPath('hooks/hooks.json'), false)
+  assert.equal(isOptionalConsumerSubsetPath('hooks/destructive-git-guard.py'), false, 'only hooks/hooks.json is optional -- the rest of hooks/ stays required')
   assert.equal(isOptionalConsumerSubsetPath('bin/com.local.optimise-cycle-weekly.plist'), false, 'the plist is excluded entirely, not merely optional')
 })
 
@@ -836,6 +844,58 @@ test('install-consistency: checkStaleness (HIGH-2) -- an optional bin/ file that
   const install = publishedSubsetTree({ 'bin/optimise-cycle-weekly.sh': 'a stale, locally-edited copy\n' })
   const result = checkStaleness(published, install)
   assert.deepEqual(result.drifted, ['bin/optimise-cycle-weekly.sh'])
+  assert.deepEqual(result.missing, [], 'presence-with-different-content is drift, but it is never ALSO counted as missing')
+  assert.equal(result.status, 'drift')
+})
+
+// L-4 (harn-fix-3, promoted 2026-08-24 after being measured against a real
+// install, not merely argued). hooks/hooks.json is the plugin manifest --
+// used only when the harness is installed via `/plugin install`. README.md's
+// manual-copy install wires the two PreToolUse hooks through
+// ~/.claude/settings.json directly instead, with absolute paths, so
+// hooks/hooks.json is never read on a manual install and its absence there
+// is the OPERATOR'S ACTUAL, CORRECT situation -- not drift. Left in the
+// REQUIRED set, this fired on every weekly run for every manual install,
+// forever: a permanent false positive that would smother the true positive
+// (workflows/lib/install-consistency.mjs itself missing) sitting right
+// beside it in the same report.
+test("install-consistency: checkStaleness (L-4, harn-fix-3) -- a manual install with NO hooks/hooks.json, everything else current, reports no drift -- the operator's real situation", async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const installDir = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
+  for (const rel of [
+    'AGENT-HARNESS.md',
+    'agents/lens-security.md',
+    'agents/lens-qa.md',
+    'agents/reviewer-verification.md',
+    'workflows/plan-cycle.js',
+    'workflows/review-cycle.js',
+    'workflows/lib/install-consistency.mjs',
+    'workflows/lib/ledger-append.mjs',
+    'skills/optimise-cycle/SKILL.md',
+    'skills/conduct-plan/SKILL.md',
+    'bin/optimise-cycle-weekly.sh',
+    'bin/redact-transcript.mjs',
+    // deliberately NO hooks/hooks.json -- a manual install wires hooks
+    // through settings.json instead (README.md's manual-install section),
+    // so hooks.json is never copied and its absence must never be drift.
+  ]) {
+    const dest = path.join(installDir, rel)
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.copyFileSync(path.join(published, rel), dest)
+  }
+  const result = checkStaleness(published, installDir)
+  assert.deepEqual(result.missing, [], 'hooks/hooks.json absent from a manual install must never be reported as missing')
+  assert.deepEqual(result.drift, [])
+  assert.equal(result.status, 'ok')
+})
+
+test('install-consistency: checkStaleness (L-4, harn-fix-3) -- hooks/hooks.json PRESENT but with DIFFERENT content is still reported as drifted -- absence being fine must not make presence unchecked', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree({ 'hooks/hooks.json': 'a stale, locally-edited plugin manifest\n' })
+  const result = checkStaleness(published, install)
+  assert.deepEqual(result.drifted, ['hooks/hooks.json'])
   assert.deepEqual(result.missing, [], 'presence-with-different-content is drift, but it is never ALSO counted as missing')
   assert.equal(result.status, 'drift')
 })
