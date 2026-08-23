@@ -569,3 +569,209 @@ LOW-2 -- recorded in `docs/staleness-check-mutation-proofs.md`, not here;
 MED-1 itself added 0 net new tests, only strengthened two existing ones),
 run three times consecutively with no flakes, both before and after every
 mutation above was reverted.
+
+## Round four (2026-08-23, round-two review, 22 findings): AC-QA-2 amended -- certainty refuses, uncertainty warns
+
+Round-two review (`fix/install-drift` at `a77d026`) found the round-one
+unconditional-refuse form of `AC-QA-2` had reached its worst failure mode:
+`H1` -- an ordinary documentation edit to `AGENT-HARNESS.md` (appending a
+`### NOTES` section inside the existing contract fence) reproducibly
+flipped `consistent:false` for every install carrying the file. `H2` -- a
+could-not-check condition was treated identically to a proven mismatch,
+with no override, and the operator's own `~/.claude` was measured to
+already be in that state. The coordinator's ruling: **certainty refuses,
+uncertainty warns, never halts**. `specs/harn-fix-3.md`'s `AC-QA-2` is
+amended in place (same id, no duplicate) to this rule. Six findings were
+built this round: `H1`, `H2` (the ruling itself, realised as
+`evaluateInstallConsistency`), `M2` (script-resolution security), `M3`
+(self-contradictory reports), `M9` (the escape hatch), `M11` (`CLAUDE_HOME`
+wiring). Sixteen further findings were parked by explicit coordinator
+ruling, recorded in `specs/harn-fix-3.md`'s new "Parked at review" section,
+not here.
+
+Every mutation below was applied to the working file, confirmed landed on
+the intended construct by `diff` against a `cp` snapshot taken before the
+edit, run against the suite, the exact failing set recorded, then restored
+from the snapshot and reconfirmed byte-identical and green before the next
+mutation.
+
+### H1: `parseFindingsTemplateFields`'s boundary
+
+**Guarded by**: `test/install-consistency.test.js`'s two new `H1` tests,
+written FIRST and confirmed RED before the fix (TDD, not mutation --
+recorded here for completeness since it is the load-bearing proof for this
+finding): a fixture `AGENT-HARNESS.md` whose contract fence carries a
+`### NOTES [optional]` section AFTER `### FINDINGS`, still inside the same
+fence. Before the fix: `parseFindingsTemplateFields` returned
+`['effort', 'recurrence']` (the trailing section's row leaked in) and
+`checkConsistency` reported `consistent:false` with
+`missing_in_review_schema: ['effort']` -- the exact round-two review
+reproduction, RED for the right reason. Fixed by bounding the slice at
+`Math.min(fenceEnd, nextHeadingIdx)` instead of `fenceEnd` alone.
+
+**Mutation (post-fix, confirming the guard is load-bearing)**: reverted
+`blockEnd` to `fenceEnd` alone (the pre-fix form).
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the
+intended two-line replacement (the `nextHeadingMatch`/`nextHeadingIdx`
+computation removed, `blockEnd` hardcoded back to `fenceEnd`).
+
+**Result**: exactly 2 of 53 tests failed, both and only the `H1` tests.
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+suite back to 53/53.
+
+### H2 (the AC-QA-2 ruling itself): blind no longer refuses
+
+**Guarded by**: `test/plan-cycle.test.js`'s
+`"AC-QA-1/AC-QA-2 (amended, H2) -- blind:true ... now WARNS and PROCEEDS"`
+test.
+
+**Mutation**: `evaluateInstallConsistency`'s `blind === true` branch --
+
+```js
+if (c.blind === true) {
+  return { action: 'warn', message: `install-consistency reported blind (nothing could be compared): ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
+}
+```
+
+-- replaced with `return { action: 'refuse', message: 'MUTATION: blind now refuses again' }`, reproducing the exact round-one behaviour `H2` found unacceptable.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the
+intended one-branch replacement.
+
+**Result**: exactly 1 of 43 tests failed -- the `H2` blind test, and only
+that one (the other blind-adjacent tests, e.g. `M3`'s blind-plus-contradiction
+case, use `consistent:true` alongside `blind:true`, which the
+self-contradiction branch intercepts BEFORE this mutated branch is ever
+reached, so they were correctly unaffected).
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+suite back to 43/43.
+
+### M2: the repo-local fallback is removed, not merely prohibited in prose
+
+Round-one's `MED-1` fix added a PROSE prohibition ("NEVER use a repo-local
+copy") on top of a search order that still offered a repo-local branch
+(c). Round-two review's `M2` found that insufficient: a review of a
+hostile branch of `claude-ai-harness` itself satisfies the "is this repo
+claude-ai-harness" gate by construction, so branch (c) could still resolve
+to, and execute, code the reviewed diff supplied. Fixed by removing branch
+(c) entirely -- only (a) (`~/.claude`) and (b) (an installed plugin
+directory, explicitly forbidden from resolving inside the reviewed
+checkout) remain, and `$CLAUDE_HOME` (M11) takes priority over both.
+
+**Guarded by**: `test/plan-cycle.test.js`'s/`test/review-cycle.test.js`'s
+rewritten `"AC-QA-1 -- the scope:spec/scope:diff prompt instructs
+locating install-consistency.mjs via (a)/(b) ONLY..."` tests, which assert
+BOTH the absence of the old branch-(c) text (`git rev-parse
+--show-toplevel`) and the presence of the new prohibition language.
+
+**Mutation**: removed the `"there is deliberately no repo-local fallback option at all, even when this repo IS "` clause from `INSTALL_CONSISTENCY_INSTRUCTION`.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the
+intended clause removed (the surrounding template-literal concatenation
+stayed syntactically valid -- confirmed with `node --check` -- because the
+mutation ended the string one clause early rather than breaking the
+literal).
+
+**Result**: exactly 1 of 43 tests failed -- the `M2`/`M11` prompt-content
+test, and only that one.
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+suite back to 43/43.
+
+### M3: self-contradictory reports are PROVEN, not merely uncertain
+
+**Guarded by**: three new `M3` tests per workflow file (contradiction via a
+non-empty mismatch array, contradiction via `blind:true`, and the same
+contradiction with `escape_hatch_active:true` downgrading it to a warning).
+
+**Mutation (`plan-cycle.js`)**: `const contradictory = c.consistent ===
+true && (c.blind === true || contradictionFields.length > 0)` replaced
+with `const contradictory = false`.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the one
+line replaced.
+
+**Result**: exactly 3 of 43 tests failed, all and only the `M3` tests for
+`plan-cycle.js`.
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+suite back to 43/43.
+
+**Mutation (`review-cycle.js`)**: the identical replacement. **Result**:
+exactly 3 of 94 tests failed, all and only the `M3` tests for
+`review-cycle.js`. **Reverted**: `cp` from the snapshot, `diff` confirmed
+byte-identical, suite back to 94/94. Proving the mutation independently on
+BOTH files (rather than relying on the byte-identical static guard alone)
+confirms each compiled workflow script's own `run()` actually reaches and
+uses the shared logic, not only that the two files' TEXT agrees.
+
+### M9: the escape hatch, at both ends
+
+Two mutations, at the two points the mechanism could silently stop
+working: where the environment is READ (`install-consistency.mjs`), and
+where the reported flag is CONSUMED (the workflow gate).
+
+**Mutation A (read side, `workflows/lib/install-consistency.mjs`)**:
+`isEscapeHatchActive()`'s body, `return process.env[ESCAPE_VAR] === '1'`,
+replaced with `return false`.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the one
+line replaced.
+
+**Result**: exactly 2 of 53 tests failed -- both `M9` tests that set
+`HARNESS_ALLOW_INCONSISTENT_INSTALL=1` and expect `escape_hatch_active:true`
+back (the "unset" and "wrong value" negative-control tests correctly
+stayed green, since a permanently-`false` mutation cannot make them
+report `true` and they never expected `true` in the first place).
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+suite back to 53/53.
+
+**Mutation B (consume side, `workflows/plan-cycle.js`)**: the
+`c.escape_hatch_active === true` check inside the crossCheck-certain-failure
+branch of `evaluateInstallConsistency` removed, leaving that branch always
+refuse regardless of the flag.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the
+intended three-line `if` block removed.
+
+**Result**: exactly 1 of 43 tests failed -- the `M9` "escape_hatch_active:true
+WARNS and PROCEEDS" test (the sibling "escape_hatch_active:false still
+refuses" test correctly stayed green, since removing the override check
+cannot break a test that never expected an override to fire).
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+suite back to 43/43.
+
+### M11: `CLAUDE_HOME` priority
+
+**Guarded by**: the same `M2`/`M11` combined prompt-content test above (both
+findings' fixes live in the same paragraph of `INSTALL_CONSISTENCY_INSTRUCTION`,
+so one test covers both, and the mutation below isolates M11 specifically
+from M2 by leaving the repo-local-fallback clause untouched).
+
+**Mutation**: removed the `" -- this takes priority and skips the search below entirely"` clause naming `$CLAUDE_HOME`'s priority.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the
+intended clause removed, `node --check` confirmed the file still parses.
+
+**Result**: exactly 1 of 43 tests failed -- the same `M2`/`M11` prompt test
+(this time failing on the `takes priority and skips the search` assertion
+specifically, confirmed by reading the failure output), nothing else.
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+suite back to 43/43.
+
+## Full-suite state after round four
+
+956/956 (up from round three's 936/936: net +20 -- H1 x2, three new
+`AC-QA-2`-amendment tests per workflow file (x2 = 6), one MED-2/H2
+empty-report rewrite each (net 0, rewritten not added), M9 x4 (2 per
+workflow file) + M9 x4 in `install-consistency.test.js` = 8, M3 x4 per
+workflow file (x2 = 8) -- run three times consecutively with no flakes,
+both before and after every mutation above was reverted, and again after
+the `specs/harn-fix-3.md` and `README.md` documentation edits (which touch
+no test-bearing code).

@@ -96,7 +96,7 @@ file on disk. Measured in this repo on 2026-08-18, with zero agents spawned:
   marker.
 
 **`workflows/lib/*.mjs`** -- `ledger-append.mjs`, `optimise-read.mjs`,
-`redact-transcript.mjs` -- are not part of that capture. A workflow script has
+`redact-transcript.mjs`, `install-consistency.mjs` -- are not part of that capture. A workflow script has
 no filesystem access, so it instructs an agent to shell out to
 `node ~/.claude/workflows/lib/<file>.mjs` (see the resolution order in
 `plan-cycle.js:100-106`, global mirror first). `node` reads the file when the
@@ -726,6 +726,73 @@ caller, not a byte-identical copy of what the caller sent. Retained only
 when a canonical key was actually derived — a genuinely out-of-repo or
 `..`-escaping spec is never retained raw, matching `spec`/`plan_key`'s own
 redaction (AC-SEC-1).
+
+## Install-consistency preflight (`specs/harn-fix-3.md`, AC-QA-1..5)
+
+`workflows/lib/install-consistency.mjs`, invoked at the start of every
+`plan-cycle.js`/`review-cycle.js` run (folded into the existing scope
+`agent()` call, never a separate dispatch -- AC-QA-3), checks that the
+installed `AGENT-HARNESS.md` and `agents/lens-*.md` agree with the findings
+schema (`PLAN_SCHEMA`/`REVIEW_SCHEMA`) the cycle is about to use. This is
+distinct from, and independent of, the consumer-install staleness check
+below (AC-OPS-1..5): the preflight refuses on an INTERNALLY inconsistent
+install regardless of what published `main` says; the staleness check warns
+about drift from published `main` regardless of internal consistency.
+
+**Certainty refuses; uncertainty warns, never halts (AC-QA-2, amended
+2026-08-23 after round-two review).** Two sources of truth feed the
+decision:
+
+- The **prose parse** of `AGENT-HARNESS.md`/`agents/lens-*.md` is a
+  heuristic. It has been wrong once already: appending an ordinary
+  `### NOTES` section to `AGENT-HARNESS.md`, inside the existing contract
+  fence, used to make every install report `consistent:false` on a routine
+  documentation edit (H1, fixed).
+- The **in-process cross-check** compares the fields the scope agent
+  reports as instructed against the literal `PLAN_SCHEMA`/`REVIEW_SCHEMA`
+  object the running workflow script itself holds -- no filesystem, no
+  subprocess, no model, nothing left to parse. This is the reliable half.
+
+The cycle refuses (no lens dispatched, exits non-zero, names the field and
+both schema sides) only when the in-process cross-check **proves** a
+reported field absent from the running schema, or when the report is
+**self-contradictory** (claims `consistent:true` alongside a reported
+mismatch or `blind:true` -- provable from the report's own shape, no parsing
+needed). Every other condition -- the consistency field missing entirely,
+`blind`, `ok:false`, or the script's own prose-derived verdict alone with no
+in-process proof -- **warns** (one loud log line naming the uncertainty) and
+**proceeds**: lenses still dispatch.
+
+**If a refusal fires and you believe it is wrong** (a false positive from
+the prose-parsing half, not a genuine schema gap), the first line of the
+thrown error tells you which field and which schema side it named. To
+proceed anyway for one run: set `HARNESS_ALLOW_INCONSISTENT_INSTALL=1` in
+the environment the scope agent's Bash tool runs in, then re-run -- matching
+`HARNESS_ALLOW_DESTRUCTIVE_GIT`'s naming and shape (see "Destructive git
+guard" above). The override is read once per run by
+`install-consistency.mjs` itself (a real Node process; the dynamic-workflow
+scripts that consume the result have no `process.env` access at all) and
+is never silent: every use is logged loudly, naming the override
+explicitly. There is no persisted or repo-level way to disable the gate -- only this one-shot, one-run environment variable.
+
+The script is resolved via `$CLAUDE_HOME` if set (the SAME override the
+staleness check below honours -- AC-QA-4), otherwise `~/.claude/workflows/lib/
+install-consistency.mjs`, otherwise an installed `claude-ai-harness` plugin
+directory under `$HOME`. There is deliberately **no repo-local fallback**:
+a diff under review must never be able to supply the very script whose
+stdout decides whether dispatch proceeds (M2, round-two review -- a
+prose-only prohibition on using a hostile repo-local copy was found
+insufficient; the resolution path itself no longer offers one). If none of
+those resolves, that is an absent install, not a security concern, and is
+treated as uncertainty (warns, proceeds) like any other could-not-check.
+
+Ships as `workflows/lib/install-consistency.mjs`, alongside
+`ledger-append.mjs`, `optimise-read.mjs` and `redact-transcript.mjs` in the
+`workflows/lib/*.mjs` files a `cp -r` of `workflows/lib/` installs -- see
+"Making a change live: copying the files is not deploying them" above for the exact commands; this file
+must go live in the same sync as `plan-cycle.js`/`review-cycle.js`, or the
+very next run finds nothing to check and warns accordingly.
+
 
 ## Delivery optimiser
 

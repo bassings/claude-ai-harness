@@ -93,6 +93,49 @@ test('install-consistency: parseFindingsTemplateFields returns null (not an empt
   assert.equal(parseFindingsTemplateFields('# Just a title\n\nsome prose\n'), null)
 })
 
+// round-two review H1: this is the real defect, reproduced with a REAL
+// AGENT-HARNESS.md shape -- the whole output contract lives in ONE fenced
+// block, so `### FINDINGS` is a section heading INSIDE that fence, not a
+// fence opener of its own. The original parseFindingsTemplateFields bounded
+// its slice at the fence's CLOSE, which happened to work only because
+// FINDINGS was the last section before the fence closed. Appending an
+// ordinary, legitimate section (`### NOTES [optional]`, one `Effort:` row)
+// AFTER FINDINGS but still INSIDE the same fence makes that trailing
+// section's row misread as a FINDINGS template field -- flipping
+// consistent:false for every install carrying the edited file, triggered
+// by an ordinary documentation edit.
+const AGENT_HARNESS_MD_WITH_TRAILING_SECTION = `# Harness
+
+### FINDINGS
+[SEVERITY] <claim>: <file:line>
+  Recurrence:  <do you expect more?>
+
+### NOTES [optional]
+  Effort:      <how long this lens spent>
+\`\`\`
+
+more prose after the fence, never scanned
+`
+
+test('install-consistency: H1 -- parseFindingsTemplateFields bounds the FINDINGS block at the NEXT ### heading, not only the fence close, so a later section appended INSIDE the same fence is never misread as a FINDINGS field', async () => {
+  const { parseFindingsTemplateFields } = await loadModule()
+  const fields = parseFindingsTemplateFields(AGENT_HARNESS_MD_WITH_TRAILING_SECTION)
+  assert.deepEqual([...fields].sort(), ['recurrence'], `expected only "recurrence"; a trailing ### NOTES section's "Effort:" row must not leak in, got: ${JSON.stringify([...fields])}`)
+})
+
+test('install-consistency: H1 -- a real-shaped consistency check STAYS consistent:true when AGENT-HARNESS.md gains a trailing ### NOTES section inside the same fence (the exact round-two review reproduction)', async () => {
+  const { checkConsistency } = await loadModule()
+  const result = checkConsistency({
+    agentHarnessMd: AGENT_HARNESS_MD_WITH_TRAILING_SECTION,
+    lensFileTexts: [LENS_MD_INSTRUCTS_RECURRENCE],
+    reviewCycleSource: schemaSource('REVIEW_SCHEMA', ['recurrence']),
+    planCycleSource: schemaSource('PLAN_SCHEMA', ['recurrence']),
+  })
+  assert.equal(result.consistent, true, `a routine docs edit (a trailing ### NOTES section) must not flip consistent:false; missing_in_review_schema=${JSON.stringify(result.missing_in_review_schema)}`)
+  assert.deepEqual(result.missing_in_review_schema, [])
+  assert.deepEqual(result.missing_in_plan_schema, [])
+})
+
 test('install-consistency: parseInstructedFields extracts every "fill AGENT-HARNESS.md\'s `X` field" instruction across multiple lens texts, lowercased and deduplicated', async () => {
   const { parseInstructedFields } = await loadModule()
   const fields = parseInstructedFields([LENS_MD_INSTRUCTS_RECURRENCE, LENS_MD_INSTRUCTS_RECURRENCE, 'no instruction here\n'])
@@ -288,6 +331,67 @@ test('install-consistency: main() reports consistent:true for a consistent fixtu
     return fs.statSync(p).isFile() ? fs.readFileSync(p, 'utf8') : null
   })
   assert.deepEqual(after_hashes, before_hashes, 'main() must never modify a file\'s content in the install (AC-SIMP-3)')
+})
+
+// round-two review M9: the escape hatch, read by main() from THIS process's
+// own environment (a real Node process -- the dynamic-workflow scripts
+// that consume this field have no process.env access at all), matching
+// hooks/destructive-git-guard.py's HARNESS_ALLOW_DESTRUCTIVE_GIT in naming
+// and shape.
+test('install-consistency: M9 -- main() reports escape_hatch_active:true when HARNESS_ALLOW_INCONSISTENT_INSTALL=1 is set in the environment', async () => {
+  const { main } = await loadModule()
+  const dir = consistentFixtureDir()
+  const prev = process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+  process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = '1'
+  try {
+    const out = main(dir)
+    assert.equal(out.escape_hatch_active, true)
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+    else process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = prev
+  }
+})
+
+test('install-consistency: M9 -- main() reports escape_hatch_active:false when the variable is unset (must not cry wolf)', async () => {
+  const { main } = await loadModule()
+  const dir = consistentFixtureDir()
+  const prev = process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+  delete process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+  try {
+    const out = main(dir)
+    assert.equal(out.escape_hatch_active, false)
+  } finally {
+    if (prev !== undefined) process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = prev
+  }
+})
+
+test('install-consistency: M9 -- main() reports escape_hatch_active:false when the variable is set to something OTHER than the literal "1" (e.g. "true", "yes") -- exact match only, same discipline as HARNESS_ALLOW_DESTRUCTIVE_GIT', async () => {
+  const { main } = await loadModule()
+  const dir = consistentFixtureDir()
+  const prev = process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+  process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = 'true'
+  try {
+    const out = main(dir)
+    assert.equal(out.escape_hatch_active, false)
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+    else process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = prev
+  }
+})
+
+test('install-consistency: M9 -- escape_hatch_active is reported on the ok:false (missing-required-file) path too, not only the successful check path', async () => {
+  const { main } = await loadModule()
+  const dir = writeFixture({ skipAgentHarness: true, lensFiles: {}, planCycleSource: schemaSource('PLAN_SCHEMA', []), reviewCycleSource: schemaSource('REVIEW_SCHEMA', []) })
+  const prev = process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+  process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = '1'
+  try {
+    const out = main(dir)
+    assert.equal(out.ok, false)
+    assert.equal(out.escape_hatch_active, true)
+  } finally {
+    if (prev === undefined) delete process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+    else process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = prev
+  }
 })
 
 test('install-consistency: main() reports consistent:false and names the field when the installed schema is missing an instructed field (the H3 shape, in an INSTALLED tree)', async () => {

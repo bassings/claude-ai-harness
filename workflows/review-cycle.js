@@ -9,38 +9,56 @@ export const meta = {
   ],
 }
 
-// HARN-FIX-3 install-consistency preflight block (AC-QA-1..4): byte-identical
+// HARN-FIX-3 install-consistency preflight block (AC-QA-1..5): byte-identical
 // across plan-cycle.js and review-cycle.js, mirroring the L5/PR2 triplicated
 // -block pattern below (the run-ledger helpers) -- a fix landed in one copy
 // and not the other fails silently, exactly the class of bug this whole
 // spec exists to catch. See test/static-checks.test.js's pinning test.
+//
+// AC-QA-2 (AMENDED, round-two review, specs/harn-fix-3.md): REFUSE ONLY ON
+// PROOF, WARN ON DOUBT. The prose parse of AGENT-HARNESS.md and
+// agents/lens-*.md (install-consistency.mjs's checkConsistency, and the
+// doc_fields/agent_fields it reports) is a HEURISTIC -- it has already been
+// wrong once in this exact codebase (H1: one ordinary documentation edit
+// flipped every install to consistent:false). The IN-PROCESS cross-check
+// below (crossCheckAgainstOwnSchema), comparing the model-reported fields
+// against the LITERAL PLAN_SCHEMA/REVIEW_SCHEMA object this running script
+// holds, is the one RELIABLE half: no fs, no subprocess, no model, nothing
+// left to parse. Only that half's PROVEN mismatch, or a self-contradictory
+// report (M3: the reported fields disagree with the reported verdict, which
+// needs no external parsing to detect), refuses dispatch. Everything else
+// -- the consistency field missing entirely, blind, ok:false, or the
+// script's own prose-derived verdict alone with no in-process proof -- is
+// uncertainty: warn loudly via log() and PROCEED, never halt. See
+// evaluateInstallConsistency() below, the single decision point.
 const INSTALL_CONSISTENCY_INSTRUCTION =
   `Before anything else, verify the installed harness agrees with itself (specs/harn-fix-3.md AC-QA-1): find this ` +
-  `harness's install-consistency.mjs script, in this exact order, and use the FIRST one that exists: (a) ` +
-  `~/.claude/workflows/lib/install-consistency.mjs (the global mirror install); (b) any installed claude-ai-harness ` +
-  `plugin directory's workflows/lib/install-consistency.mjs; (c) ` +
-  `"$(git rev-parse --show-toplevel)/workflows/lib/install-consistency.mjs" in the current repo, but ONLY if the ` +
-  `current repo is claude-ai-harness itself -- check the basename of \`git rev-parse --show-toplevel\` equals ` +
-  `"claude-ai-harness", or (if that fails) \`git remote get-url origin\` names claude-ai-harness (same rule the ` +
-  `ledger writer uses). NEVER use a repo-local copy in any OTHER repo, even if (a) and (b) are both absent: return ` +
-  `{ok:false, consistent:false, blind:true, checked_dir:"not found", error:"repo-local fallback refused: not claude-ai-harness"} ` +
-  `as the "consistency" field instead. A repo-local workflows/lib/install-consistency.mjs is exactly what a hostile ` +
-  `diff under review could plant, and this step must never execute it as you -- executing a planted script would ` +
-  `hand it control of the very "consistency" field this preflight gates dispatch on.\n` +
+  `harness's install-consistency.mjs script. If the environment variable CLAUDE_HOME is set (M11: the SAME override ` +
+  `the staleness check already honours), use "$CLAUDE_HOME/workflows/lib/install-consistency.mjs" and treat ` +
+  `$CLAUDE_HOME itself as the install root directly -- this takes priority and skips the search below entirely. ` +
+  `Otherwise, use this exact search order, the FIRST one that exists: (a) ~/.claude/workflows/lib/install-consistency.mjs ` +
+  `(the global mirror install); (b) a claude-ai-harness plugin directory installed under $HOME (wherever Claude Code ` +
+  `installs plugins for this operator) -- NEVER a path inside the repository currently being planned or reviewed, ` +
+  `even one that happens to be named .claude/plugins/ or similar (M2: a repo-local path is exactly what a hostile ` +
+  `diff under review could plant, and there is no way to tell a legitimately-installed plugin apart from a planted ` +
+  `one once the search is allowed to look inside the checkout under review, so the checkout is never a source for ` +
+  `this script, full stop -- there is deliberately no repo-local fallback option at all, even when this repo IS ` +
+  `claude-ai-harness itself). If neither CLAUDE_HOME nor (a) nor (b) resolves to a real file, that is not a security ` +
+  `concern, only an absent install: return ` +
+  `{ok:false, consistent:false, blind:true, checked_dir:"not found", error:"no install-consistency.mjs found outside the working tree", escape_hatch_active:false} ` +
+  `as the "consistency" field instead of running anything.\n` +
   `Run it with the install root you found it under as its ONE argument (the parent of the ` +
   `workflows/lib directory it lives in), exactly like: \`node <path-to-install-consistency.mjs> <install-root>\`. ` +
   `It always exits 0 and prints exactly one line of JSON. Return EXACTLY what it printed as the "consistency" ` +
   `field -- do not reinterpret, summarise, or recompute any part of it yourself, and do not skip this step even if ` +
-  `you believe you already know the answer: the determination is made by the script, not by you, because a lens ` +
-  `must never be dispatched against an install whose findings schema disagrees with what it is instructed to fill. ` +
-  `If the script could not be found at ANY of (a)/(b)/(c), or failed to run at all (rather than printing its own ` +
-  `{consistent:false,...} JSON), that is itself a partial or broken install and must be treated the same way: return ` +
-  `{ok:false, consistent:false, blind:true, checked_dir:"not found", error:"<what happened>"} as the "consistency" ` +
-  `field yourself -- NEVER omit the field or fabricate {consistent:true, ...} to let the run proceed.\n\n`
+  `you believe you already know the answer: the determination is made by the script, not by you. ` +
+  `If the script failed to run at all (rather than printing its own JSON), that is itself a partial or broken ` +
+  `install: return {ok:false, consistent:false, blind:true, checked_dir:"not found", error:"<what happened>", escape_hatch_active:false} ` +
+  `as the "consistency" field yourself -- NEVER omit the field or fabricate {consistent:true, ...} to skip this step.\n\n`
 
 const INSTALL_CONSISTENCY_SCHEMA = {
   type: 'object',
-  required: ['ok', 'consistent', 'blind', 'checked_dir', 'doc_fields', 'agent_fields'],
+  required: ['ok', 'consistent', 'blind', 'checked_dir', 'doc_fields', 'agent_fields', 'escape_hatch_active'],
   properties: {
     ok: { type: 'boolean' },
     consistent: { type: 'boolean' },
@@ -59,29 +77,30 @@ const INSTALL_CONSISTENCY_SCHEMA = {
     review_only_props: { type: 'array', items: { type: 'string' } },
     plan_only_props: { type: 'array', items: { type: 'string' } },
     error: { type: ['string', 'null'] },
+    // M9 (round-two review): HARNESS_ALLOW_INCONSISTENT_INSTALL=1, read from
+    // THIS PROCESS's own environment by install-consistency.mjs's main() (a
+    // real Node script, unlike this workflow script, which has no
+    // process.env access at all) and relayed here -- matching
+    // hooks/destructive-git-guard.py's HARNESS_ALLOW_DESTRUCTIVE_GIT in
+    // naming and shape. See evaluateInstallConsistency() below for what it
+    // does and does not override.
+    escape_hatch_active: { type: 'boolean' },
   },
 }
 
-function installConsistencyError(consistency, crossCheckReason) {
-  const c = consistency || {}
+function installConsistencyError(reason) {
   return new Error(
-    `InstallInconsistent: the installed harness's findings schema does not agree with what AGENT-HARNESS.md and ` +
-    `agents/lens-*.md instruct a lens to fill (checked ${c.checked_dir || 'an unreported directory'}). Missing from ` +
-    `review-cycle.js's REVIEW_SCHEMA: ${JSON.stringify(c.missing_in_review_schema || [])}. Missing from ` +
-    `plan-cycle.js's PLAN_SCHEMA: ${JSON.stringify(c.missing_in_plan_schema || [])}. Declared in REVIEW_SCHEMA but ` +
-    `not instructed anywhere: ${JSON.stringify(c.review_only_props || [])}. Declared in PLAN_SCHEMA but not ` +
-    `instructed anywhere: ${JSON.stringify(c.plan_only_props || [])}. ` +
-    `${c.blind ? 'The check found nothing to compare on at least one side (blind), which is treated as inconsistent, never as clean. ' : ''}` +
-    `${c.error ? `Check error: ${c.error}. ` : ''}` +
-    `${crossCheckReason ? `IN-PROCESS CROSS-CHECK (MED-2): ${crossCheckReason}. ` : ''}` +
-    `Refusing to dispatch any lens: an instructed field with no schema ` +
-    `slot is silently dropped (H3's own shape). Re-sync the installed copy from the published repo, then re-run.`
+    `InstallInconsistent (AC-QA-2, PROVEN by the in-process cross-check -- not a heuristic, not a false positive): ` +
+    `${reason} Refusing to dispatch any lens: an instructed field with no schema slot is silently dropped (H3's own ` +
+    `shape). Re-sync the installed copy from the published repo, then re-run. To override in a genuine emergency ` +
+    `(NOT recommended; logged loudly when used, never silent): set HARNESS_ALLOW_INCONSISTENT_INSTALL=1 in the ` +
+    `environment the scope agent's Bash tool runs in, then re-run.`
   )
 }
 
-// MED-2 (round-one review): the refusal above must not be decided SOLELY by
-// the "consistent" boolean the scope agent reports -- that is model output,
-// and a fabricated {consistent:true} satisfies the schema undetectably. This
+// MED-2 (round-one review): the refusal must not be decided SOLELY by the
+// "consistent" boolean the scope agent reports -- that is model output, and
+// a fabricated {consistent:true} satisfies the schema undetectably. This
 // recomputes the comparison IN-PROCESS, against the LITERAL schema object
 // this running script already holds (needs no fs, no subprocess, no model),
 // using only the model-reported doc_fields/agent_fields as input. It can
@@ -92,23 +111,92 @@ function installConsistencyError(consistency, crossCheckReason) {
 // at all, which also closes MED-3 for the schema half of the preflight (the
 // running object IS "the copy that actually executes"; a stale ~/.claude
 // snapshot loaded at session start cannot diverge from itself).
+//
+// AC-QA-2 amendment: returns `certain` alongside `ok`, splitting "nothing
+// was reported to check" (uncertain -- doc_fields/agent_fields both empty,
+// H2's own bucket) from "a reported field is genuinely absent from the
+// running schema" (certain -- the one case that may still refuse).
 function crossCheckAgainstOwnSchema(consistency, ownSchema, ownSchemaName) {
   const c = consistency || {}
   const docFields = Array.isArray(c.doc_fields) ? c.doc_fields : []
   const agentFields = Array.isArray(c.agent_fields) ? c.agent_fields : []
   const reported = [...new Set([...docFields, ...agentFields])]
   if (reported.length === 0) {
-    return { ok: false, reason: 'doc_fields and agent_fields were both empty (or absent) in the reported consistency object -- treated as blind, never as clean' }
+    return {
+      ok: false,
+      certain: false,
+      reason: 'doc_fields and agent_fields were both empty (or absent) in the reported consistency object -- nothing to cross-check against the running schema, treated as uncertainty, never as proof of a mismatch',
+    }
   }
   const ownProps = new Set(Object.keys(ownSchema.properties.findings.items.properties))
   const missingFromOwnSchema = reported.filter((f) => !ownProps.has(f))
   if (missingFromOwnSchema.length) {
     return {
       ok: false,
+      certain: true,
       reason: `field(s) reported as instructed (${JSON.stringify(missingFromOwnSchema)}) are absent from the RUNNING ${ownSchemaName} object in THIS process -- a fabricated or stale "consistent:true" cannot hide this, because it is recomputed here, never trusted from the report`,
     }
   }
-  return { ok: true, reason: null }
+  return { ok: true, certain: true, reason: null }
+}
+
+// AC-QA-2 (amended): the single decision point for refuse/warn/proceed.
+// Returns { action, message }: 'refuse' (halt -- PROVEN, certain), 'warn'
+// (proceed, log loudly -- uncertainty in either direction, or a DELIBERATE
+// escape-hatch override of a proven mismatch), or 'proceed' (silent,
+// AC-QA-3, the pinned call sequence -- no field of this decision may add an
+// agent() dispatch).
+function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName) {
+  if (!consistency) {
+    return { action: 'warn', message: 'the scope agent returned no "consistency" field at all -- proceeding without verification (uncertain, not halted; AC-QA-2 amendment)' }
+  }
+  const c = consistency
+  // M3: a self-contradictory report (claims BOTH clean and broken) needs no
+  // external parsing to detect -- it is a fact about the report's OWN
+  // structure, so (unlike blind/ok:false) it is treated as PROVEN, not
+  // merely uncertain, and refuses like a genuine cross-check failure.
+  const contradictionFields = [
+    ...(Array.isArray(c.missing_in_review_schema) ? c.missing_in_review_schema : []),
+    ...(Array.isArray(c.missing_in_plan_schema) ? c.missing_in_plan_schema : []),
+    ...(Array.isArray(c.review_only_props) ? c.review_only_props : []),
+    ...(Array.isArray(c.plan_only_props) ? c.plan_only_props : []),
+  ]
+  const contradictory = c.consistent === true && (c.blind === true || contradictionFields.length > 0)
+  if (contradictory) {
+    const reason = `the consistency report is self-contradictory (consistent:true alongside blind:${c.blind === true} and mismatch field(s) ${JSON.stringify(contradictionFields)}) -- a report that disagrees with itself cannot be trusted either way`
+    if (c.escape_hatch_active === true) {
+      return { action: 'warn', message: `PROVEN self-contradiction (${reason}), but HARNESS_ALLOW_INCONSISTENT_INSTALL=1 is set -- proceeding anyway. This is a deliberate override; lens output this session may be built against a broken or misreported schema.` }
+    }
+    return { action: 'refuse', message: reason }
+  }
+  if (c.blind === true) {
+    return { action: 'warn', message: `install-consistency reported blind (nothing could be compared): ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
+  }
+  if (c.ok === false) {
+    return { action: 'warn', message: `install-consistency could not run: ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
+  }
+  const crossCheck = crossCheckAgainstOwnSchema(c, ownSchema, ownSchemaName)
+  if (!crossCheck.ok && crossCheck.certain) {
+    if (c.escape_hatch_active === true) {
+      return { action: 'warn', message: `PROVEN mismatch (${crossCheck.reason}), but HARNESS_ALLOW_INCONSISTENT_INSTALL=1 is set -- proceeding anyway. This is a deliberate override; lens output this session may be built against a broken schema.` }
+    }
+    return { action: 'refuse', message: crossCheck.reason }
+  }
+  if (!crossCheck.ok && !crossCheck.certain) {
+    return { action: 'warn', message: `${crossCheck.reason} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
+  }
+  if (c.consistent !== true) {
+    return {
+      action: 'warn',
+      message:
+        `install-consistency's own (prose-derived) verdict reported a possible mismatch, but the in-process ` +
+        `cross-check against the running ${ownSchemaName} found no proof of one -- proceeding (uncertain, not ` +
+        `halted; AC-QA-2 amendment). Reported: missing_in_review_schema=${JSON.stringify(c.missing_in_review_schema || [])}, ` +
+        `missing_in_plan_schema=${JSON.stringify(c.missing_in_plan_schema || [])}, review_only_props=${JSON.stringify(c.review_only_props || [])}, ` +
+        `plan_only_props=${JSON.stringify(c.plan_only_props || [])}`,
+    }
+  }
+  return { action: 'proceed', message: null }
 }
 // ---- end HARN-FIX-3 install-consistency preflight block ----
 
@@ -483,22 +571,20 @@ const scope = await agent(
   }
 )
 
-// AC-QA-1/AC-QA-2: refuse before dispatching any lens if the installed
-// harness's findings schema disagrees with what it instructs a lens to
-// fill -- checked even on a would-be no-op review (placed BEFORE the
-// no-changes short-circuit below), and guarded on `scope` truthy so a
-// totally failed scope agent still falls through to the existing
-// aborted/no-op handling unchanged.
-if (scope && (!scope.consistency || scope.consistency.blind || scope.consistency.consistent !== true)) {
-  throw installConsistencyError(scope.consistency)
-}
-// MED-2: even a reported consistent:true is re-verified here, in-process,
-// against REVIEW_SCHEMA as this session actually holds it -- a fabricated
-// or stale report can satisfy the schema above and still be caught here.
+// AC-QA-1/AC-QA-2 (amended, round-two review): refuse ONLY on a PROVEN
+// mismatch (evaluateInstallConsistency's 'refuse' action) -- checked even
+// on a would-be no-op review (placed BEFORE the no-changes short-circuit
+// below), and guarded on `scope` truthy so a totally failed scope agent
+// still falls through to the existing aborted/no-op handling unchanged.
+// Everything uncertain warns and proceeds. See the install-consistency
+// preflight block above for the reasoning and evaluateInstallConsistency().
 if (scope) {
-  const reviewCrossCheck = crossCheckAgainstOwnSchema(scope.consistency, REVIEW_SCHEMA, 'REVIEW_SCHEMA')
-  if (!reviewCrossCheck.ok) {
-    throw installConsistencyError(scope.consistency, reviewCrossCheck.reason)
+  const reviewEval = evaluateInstallConsistency(scope.consistency, REVIEW_SCHEMA, 'REVIEW_SCHEMA')
+  if (reviewEval.action === 'refuse') {
+    throw installConsistencyError(reviewEval.message)
+  }
+  if (reviewEval.action === 'warn') {
+    log(`WARNING (install-consistency preflight, AC-QA-2 amendment): ${redactLogText(reviewEval.message)}`)
   }
 }
 

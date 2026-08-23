@@ -130,9 +130,34 @@ blocks harmless work gets switched off. An instructed-but-unsupported field
   `agents/lens-*.md` instruct a lens to fill has a matching property in the
   findings schema they are about to use, and vice versa. Test: an install where
   `recurrence` is instructed but absent from the schema is detected.
-- **AC-QA-2:** On mismatch the cycle **refuses**: it does not dispatch lenses,
-  exits non-zero, and names the field and both sides. Test: assert no lens agent
-  was invoked, by counting dispatches, not by reading a message.
+- **AC-QA-2:** (Amended 2026-08-23, round-two review.) The cycle refuses ONLY
+  on a PROVEN mismatch. Round one's unconditional refuse gave the mechanism
+  its teeth and also its worst failure: an ordinary documentation edit to
+  `AGENT-HARNESS.md` (H1) reproducibly flipped `consistent:false` for every
+  install carrying the file, with no override (H2), bricking every
+  plan-cycle and review-cycle everywhere. Two sources of truth, not one --
+  the prose parse of `AGENT-HARNESS.md`/`agents/lens-*.md` is a heuristic
+  (already wrong once, H1); the in-process cross-check
+  (`crossCheckAgainstOwnSchema`, comparing the model-reported instructed
+  fields against the schema object the running workflow script itself
+  holds) is reliable, because it needs no parsing of anything at all.
+  **Certainty refuses; uncertainty warns, never halts.** Refuses (no lens
+  dispatched, exits non-zero, names the field and both sides) only when the
+  in-process cross-check proves a reported field is absent from the running
+  schema, or when the report is self-contradictory (`consistent:true`
+  alongside a reported mismatch or `blind:true` -- provable from the
+  report's own structure, no parsing needed, M3). Every other condition --
+  the consistency field missing, `blind`, `ok:false`, or the script's own
+  prose-derived verdict alone with no in-process proof -- **warns** (one
+  loud log line) **and proceeds**: lenses still dispatch. A documented
+  escape hatch, `HARNESS_ALLOW_INCONSISTENT_INSTALL=1` (M9, matching
+  `hooks/destructive-git-guard.py`'s `HARNESS_ALLOW_DESTRUCTIVE_GIT` in
+  naming and shape), downgrades even a proven refusal to a loud warning for
+  a single run. Test: a proven mismatch, or a self-contradictory report,
+  still refuses -- asserted by counting dispatches, never by reading a
+  message. A blind, could-not-check, missing-field, or unproven-mismatch
+  report dispatches normally with a warning logged. The escape hatch active
+  turns a would-be refusal into a warning, and is inactive by default.
 - **AC-QA-3:** On a consistent install it is silent and adds no measurable
   delay to startup. Test: a consistent fixture dispatches normally.
 - **AC-QA-4:** The check reads the **installed** files it will actually use, not
@@ -192,11 +217,66 @@ file, and `.githooks/` contains no `pre-commit`.
 - **AC-SIMP-3:** Neither mechanism ever copies, moves or deletes a file in the
   install.
 
+## Parked at review (2026-08-23, round-two review, 22 findings)
+
+Six findings were built this round (H1, H2, M2, M3, M9, M11, above). The
+remaining sixteen are recorded here as the coordinator's explicit ruling, per
+the harness's own exit condition (converge on substance, not on silencing
+every comment) -- not deferred silently, and not to be re-raised at a future
+review as unmet unless new evidence changes the ruling.
+
+- **H3:** Every `could-not-check` outcome of the weekly staleness check is
+  stderr-silent. Parked under the standing ruling that no-network stays
+  stderr-silent: warning weekly about a routine condition trains the
+  operator to ignore the channel the real drift signal uses.
+- **L1:** `mktemp -d` failing during the staleness check can write a clone to
+  `/src` at the filesystem root with no cleanup.
+- **L2:** The refusal error interpolates `checked_dir`/`error` raw, leaking an
+  absolute path (account name) into the propagated message.
+- **L3:** The in-process cross-check closes fabrication, not omission -- a
+  scope agent that under-reports `doc_fields`/`agent_fields` passes the gate
+  trivially. Already documented as structurally unclosable for a
+  dynamic-workflow script with no filesystem access of its own.
+- **L4:** `hooks/hooks.json` sits in the REQUIRED subset but is plugin-only,
+  so a manual install reports permanent drift on it and a plugin install
+  reports the whole required set missing.
+- **L5:** The directory-prefix patterns match any file at any depth,
+  including untracked build artefacts (e.g. `__pycache__`), if a caller ever
+  passes a working checkout instead of a fresh clone.
+- **L6:** `AC-QA-3`'s "adds no measurable delay to startup" clause has no
+  measurement and no test; what is actually proven is "no extra `agent()`
+  call".
+- **L7:** `install-consistency.mjs` holds two mechanisms (findings-schema
+  consistency, consumer-subset staleness) that share no code, drawn together
+  by the `AC-SIMP-2` file-count budget rather than by cohesion.
+- **L8:** The weekly runner's one `EXIT` trap is scoped to a single resource;
+  a later second `trap ... EXIT` registration would silently replace it and
+  leak the shallow clone.
+- **M1:** `STRUCTURAL_FINDINGS_PROPS` is an unpinned hard-coded set; widening
+  it (even by one word) silently defeats direction 2 of the consistency
+  check with the suite green.
+- **M4:** `AC-QA-2`'s "names both sides" test assertions match hardcoded
+  boilerplate text rather than the field/value association, so the two
+  sides can be transposed with the suite green.
+- **M5:** The `AC-OPS-5` single-definition guard is a proximity heuristic
+  that three different realistic partial- or spaced-out-copy shapes walk
+  past.
+- **M6:** An unreadable published file during staleness comparison is
+  silently skipped and the run still reports `status:"ok"`.
+- **M7:** The could-not-check reason names the failing step, not the cause
+  (git's and node's stderr are both discarded).
+- **M8:** The consistency preflight leaves no ledger trace on either the
+  pass or the refuse path, so its false-positive/refusal rate cannot be
+  measured externally.
+- **M10:** The never-execute-a-repo-local-script rule now lives in four
+  prose sites across two prompt families (the consistency preflight and the
+  ledger writer), pinned pairwise but not to each other.
+
 ## Risks
 
 | Risk | Recoverability |
 |---|---|
-| The consistency check refuses on a false positive and blocks all review cycles | Cheap to fix, expensive while live; AC-QA-3 exists to bound it |
+| The consistency check refuses on a false positive and blocks all review cycles | Bounded by AC-QA-2's amendment (refuse only on proof, warn on doubt) and the `HARNESS_ALLOW_INCONSISTENT_INSTALL` escape hatch, not by AC-QA-3 (AC-QA-3 is a startup-latency bound and never bounded this risk -- a round-two spec bug, corrected here) |
 | The drift report is noisy and gets ignored, becoming decoration | Cheap, and the likeliest way this ships useless |
 | A cache clone accumulates on a volume twice at 99% | Cheap if bounded at design time |
 

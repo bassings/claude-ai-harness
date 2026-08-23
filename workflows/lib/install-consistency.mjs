@@ -71,12 +71,30 @@ import { fileURLToPath } from 'node:url'
 // ---- side A: AGENT-HARNESS.md's ### FINDINGS template ----
 // Identical extraction to test/static-checks.test.js's pre-existing H3
 // guard (now delegated here, not duplicated -- see the module header).
+//
+// H1 (round-two review): the whole output contract lives in ONE fenced
+// block, and "### FINDINGS" is a section HEADING inside that fence, not a
+// fence-opener of its own. The original cut of this function bounded the
+// slice at the fence's CLOSE, which only ever worked because FINDINGS
+// happened to be the last section before the fence closed. Appending an
+// ordinary, legitimate section AFTER FINDINGS but still inside the same
+// fence (e.g. "### NOTES [optional]" with an "Effort:" row) made that
+// trailing section's colon-labeled row misread as a FINDINGS field --
+// flipping consistent:false for every install carrying the edit, on an
+// ordinary documentation change with no warning anywhere in the repo.
+// Fixed by bounding the slice at whichever comes FIRST: the fence close,
+// or the next "### " heading. Proven by test/install-consistency.test.js's
+// H1 fixture (a trailing ### NOTES section, still inside the fence).
 export function parseFindingsTemplateFields(agentHarnessMdText) {
   const findingsHeadingIdx = agentHarnessMdText.indexOf('### FINDINGS')
   if (findingsHeadingIdx === -1) return null
+  const searchFrom = findingsHeadingIdx + '### FINDINGS'.length
   const fenceEnd = agentHarnessMdText.indexOf('```', findingsHeadingIdx)
   if (fenceEnd === -1) return null
-  const templateBlock = agentHarnessMdText.slice(findingsHeadingIdx, fenceEnd)
+  const nextHeadingMatch = /^###\s/m.exec(agentHarnessMdText.slice(searchFrom))
+  const nextHeadingIdx = nextHeadingMatch ? searchFrom + nextHeadingMatch.index : Infinity
+  const blockEnd = Math.min(fenceEnd, nextHeadingIdx)
+  const templateBlock = agentHarnessMdText.slice(findingsHeadingIdx, blockEnd)
   const fields = new Set()
   for (const m of templateBlock.matchAll(/^\s{2}([A-Z][A-Za-z]+):\s/gm)) fields.add(m[1].toLowerCase())
   return fields
@@ -480,8 +498,24 @@ function listLensFiles(agentsDir) {
   return names.filter((f) => f.startsWith('lens-') && f.endsWith('.md')).sort()
 }
 
+// M9 (round-two review): the escape hatch, matching
+// hooks/destructive-git-guard.py's HARNESS_ALLOW_DESTRUCTIVE_GIT in naming
+// and shape (an env-var read once, real Node, no shell parsing needed since
+// this is not a Bash command guard). Read HERE, in this real Node process
+// (which has process.env), not in the dynamic-workflow script that consumes
+// this field -- that runtime has no process.env access at all (see this
+// file's own header on why workflow scripts cannot do any of this
+// themselves). The WORKFLOW decides what to do with it
+// (evaluateInstallConsistency in plan-cycle.js/review-cycle.js); this
+// script only reports the fact.
+const ESCAPE_VAR = 'HARNESS_ALLOW_INCONSISTENT_INSTALL'
+function isEscapeHatchActive() {
+  return process.env[ESCAPE_VAR] === '1'
+}
+
 export function main(argDir) {
   const dir = resolveInstallDir(argDir)
+  const escapeHatchActive = isEscapeHatchActive()
   const agentHarnessPath = path.join(dir, 'AGENT-HARNESS.md')
   const agentsDir = path.join(dir, 'agents')
   const planPath = path.join(dir, 'workflows', 'plan-cycle.js')
@@ -525,6 +559,7 @@ export function main(argDir) {
       checked_dir: dir,
       lens_files_checked: lensFiles.length,
       error: `required file(s) missing under ${dir}: ${missingRequired.join(', ')}`,
+      escape_hatch_active: escapeHatchActive,
       ...EMPTY_CHECK,
     }
   }
@@ -536,6 +571,7 @@ export function main(argDir) {
     checked_dir: dir,
     lens_files_checked: lensFiles.length,
     error: null,
+    escape_hatch_active: escapeHatchActive,
     ...check,
   }
 }

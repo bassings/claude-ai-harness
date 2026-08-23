@@ -30,6 +30,7 @@ const CONSISTENCY_OK = {
   review_only_props: [],
   plan_only_props: [],
   error: null,
+  escape_hatch_active: false,
 }
 
 const SCOPE_OK = {
@@ -1265,7 +1266,13 @@ test('review-cycle.js: a synthesis that omits head_sha_at_synthesis does not fab
 // AC-QA-3).
 const ALL_LENSES_REVIEW = ['lens-security', 'lens-qa', 'lens-design', 'lens-accessibility', 'lens-data', 'lens-architecture', 'lens-operability', 'lens-product', 'reviewer-verification']
 
-test('review-cycle.js: AC-QA-1/AC-QA-2 -- an inconsistent installed harness refuses BEFORE dispatching any lens, EVEN when there would otherwise be zero changed files (checked before the no-op short-circuit), names the mismatched field and both sides, and exits non-zero', async () => {
+// specs/harn-fix-3.md AC-QA-2 (AMENDED, round-two review): refuse ONLY on a
+// PROVEN mismatch (the in-process cross-check against REVIEW_SCHEMA as this
+// process actually holds it); everything uncertain -- blind, could-not-check,
+// a missing consistency field, or the script's own prose-derived verdict
+// with no in-process proof -- now WARNS and PROCEEDS. Certainty refuses,
+// uncertainty warns, never halts.
+test('review-cycle.js: AC-QA-1/AC-QA-2 (amended) -- a PROVEN mismatch refuses BEFORE dispatching any lens, EVEN when there would otherwise be zero changed files (checked before the no-op short-circuit), names the mismatched field and both sides, and exits non-zero', async () => {
   await assert.rejects(
     () =>
       runWorkflow(WF, {
@@ -1274,14 +1281,21 @@ test('review-cycle.js: AC-QA-1/AC-QA-2 -- an inconsistent installed harness refu
           'scope:diff': {
             ...SCOPE_OK,
             files: [],
-            consistency: { ...CONSISTENCY_OK, consistent: false, missing_in_plan_schema: ['recurrence'], missing_in_review_schema: [] },
+            consistency: {
+              ...CONSISTENCY_OK,
+              consistent: false,
+              doc_fields: ['recurrence', 'effort'],
+              agent_fields: ['effort'],
+              missing_in_plan_schema: ['effort'],
+              missing_in_review_schema: ['effort'],
+            },
           },
         }),
       }),
     (err) => {
-      assert.match(err.message, /recurrence/, 'the error must name the mismatched field')
-      assert.match(err.message, /PLAN_SCHEMA/, 'the error must name the schema side that is missing it')
-      assert.match(err.message, /REVIEW_SCHEMA/, 'the error must also name the other side')
+      assert.match(err.message, /PROVEN by the in-process cross-check/, 'must name the reliable, in-process half as the reason for refusing (AC-QA-2 amendment)')
+      assert.match(err.message, /effort/, 'the error must name the mismatched field')
+      assert.match(err.message, /REVIEW_SCHEMA/, 'the error must name the running schema it checked')
       const dispatchedLenses = err.calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
       assert.equal(dispatchedLenses.length, 0, `no lens agent may be dispatched on refusal, by COUNT, got: ${dispatchedLenses.map((c) => c.opts.label)}`)
       return true
@@ -1289,19 +1303,29 @@ test('review-cycle.js: AC-QA-1/AC-QA-2 -- an inconsistent installed harness refu
   )
 })
 
-test('review-cycle.js: AC-QA-1/AC-QA-2 -- blind:true (the check found nothing to compare) is treated exactly like inconsistent, never as clean, even when consistent:true is also reported', async () => {
-  await assert.rejects(
-    () =>
-      runWorkflow(WF, {
-        args: {},
-        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, consistent: true, blind: true } } }),
-      }),
-    (err) => {
-      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
-      assert.equal(dispatchedLenses.length, 0, 'blind must refuse dispatch exactly like an explicit mismatch')
-      return true
-    }
-  )
+test('review-cycle.js: AC-QA-1/AC-QA-2 (amended, H2) -- blind:true (the check found nothing to compare) now WARNS and PROCEEDS -- lenses still dispatch, one loud log line records the uncertainty', async () => {
+  const { result, calls, logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, consistent: false, blind: true, doc_fields: [], agent_fields: [] } } }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'], 'blind must no longer block dispatch (AC-QA-2 amendment)')
+  const dispatchedLenses = calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
+  assert.ok(dispatchedLenses.length > 0, 'expected lenses to have dispatched')
+  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('blind')), `expected a warning log naming the blind condition, got: ${JSON.stringify(logs)}`)
+})
+
+test('review-cycle.js: AC-QA-1/AC-QA-2 (amended, H2) -- the SCRIPT\'s own prose-derived consistent:false, with NO proof from the in-process cross-check, now WARNS and PROCEEDS instead of refusing', async () => {
+  const { result, logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_plan_schema: ['recurrence'] },
+      },
+    }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
+  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('no proof')), `expected a warning naming the lack of in-process proof, got: ${JSON.stringify(logs)}`)
 })
 
 // round-one review MED-6: the ORIGINAL form of this test compared a run
@@ -1325,25 +1349,17 @@ test('review-cycle.js: AC-QA-3 -- a consistent, non-blind install dispatches EXA
   ])
 })
 
-test('review-cycle.js: AC-QA-1 -- the scope:diff prompt instructs locating install-consistency.mjs via the SAME install-resolution search order the ledger writer already uses, and passing the install root as an explicit argument (never relying on a hardcoded ~/.claude default)', async () => {
+test('review-cycle.js: AC-QA-1 -- the scope:diff prompt instructs locating install-consistency.mjs via (a)/(b) ONLY, with NO repo-local fallback (M2, round-two review), CLAUDE_HOME taking priority (M11), and passing the install root as an explicit argument', async () => {
   const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   const scopeCall = calls.find((c) => c.opts.label === 'scope:diff')
   assert.ok(scopeCall, 'expected a scope:diff call')
   assert.match(scopeCall.prompt, /install-consistency\.mjs/)
   assert.match(scopeCall.prompt, /~\/\.claude\/workflows\/lib\/install-consistency\.mjs/, 'must name the global mirror install location, same convention as the ledger writer')
-  // MED-1 (round-one review): /claude-ai-harness/ alone is vacuous -- it
-  // is satisfied by ANY mention of the word anywhere in the prompt
-  // (proven by mutation: deleting the entire "but ONLY if the current
-  // repo is claude-ai-harness itself" gating clause left this assertion,
-  // and the whole suite, green, because clause (b)'s unrelated "any
-  // installed claude-ai-harness plugin directory" text still contains the
-  // word). Anchored instead on the gating clause's own distinctive text,
-  // AND the hostile-plant prohibition MED-1 restores (copied verbatim
-  // from the ledger writer's exemplar) -- both must be present, and
-  // either one's deletion now fails this test.
-  assert.match(scopeCall.prompt, /ONLY if the current repo is claude-ai-harness itself/, 'must gate the repo-local fallback to this harness\'s own repo, same as the ledger writer')
-  assert.match(scopeCall.prompt, /NEVER use a repo-local copy in any OTHER repo/, 'must carry the hostile-plant prohibition, same as the ledger writer\'s exemplar (MED-1)')
-  assert.match(scopeCall.prompt, /hostile diff under review could plant/, 'must state WHY: a repo-local install-consistency.mjs is exactly what a hostile diff could plant (MED-1)')
+  assert.match(scopeCall.prompt, /CLAUDE_HOME/, 'must name CLAUDE_HOME as an override (M11)')
+  assert.match(scopeCall.prompt, /takes priority and skips the search/, 'must state CLAUDE_HOME is checked FIRST, ahead of the (a)/(b) search')
+  assert.doesNotMatch(scopeCall.prompt, /git rev-parse --show-toplevel/, 'M2: the repo-local resolution branch (c) must be removed entirely, not merely prohibited in prose')
+  assert.match(scopeCall.prompt, /deliberately no repo-local fallback option at all/, 'must state plainly that no repo-local fallback exists at all (M2)')
+  assert.match(scopeCall.prompt, /NEVER a path inside the repository currently being planned or reviewed/, 'must forbid branch (b) resolving to anything inside the reviewed checkout (M2)')
   assert.match(scopeCall.prompt, /as its ONE argument/, 'must instruct passing the resolved install root explicitly, not relying on the script\'s own ~/.claude default')
 })
 
@@ -1353,14 +1369,14 @@ test('review-cycle.js: the scope:diff schema requires "consistency" -- an omitte
   assert.ok(scopeCall.opts.schema.required.includes('consistency'))
 })
 
-test('review-cycle.js: AC-QA-1/AC-QA-2 -- a scope response missing the consistency field entirely (an old or misbehaving agent) refuses rather than assuming clean', async () => {
+test('review-cycle.js: AC-QA-1/AC-QA-2 (amended, H2) -- a scope response missing the consistency field entirely (an old or misbehaving agent) now WARNS and PROCEEDS rather than refusing or silently assuming clean', async () => {
   const { consistency, ...scopeWithoutConsistency } = SCOPE_OK
-  await assert.rejects(() =>
-    runWorkflow(WF, {
-      args: {},
-      agent: baseAgent({ 'scope:diff': { ...scopeWithoutConsistency, consistency: undefined, __bypassSchemaValidation: true } }),
-    })
-  )
+  const { result, logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'scope:diff': { ...scopeWithoutConsistency, consistency: undefined, __bypassSchemaValidation: true } }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
+  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('no "consistency" field')), `expected a warning log, got: ${JSON.stringify(logs)}`)
 })
 
 // round-one review MED-2: the refusal must not be decided SOLELY by the
@@ -1382,7 +1398,7 @@ test('review-cycle.js: MED-2 -- a FABRICATED consistent:true is still refused wh
         }),
       }),
     (err) => {
-      assert.match(err.message, /IN-PROCESS CROSS-CHECK \(MED-2\)/, 'must name the in-process cross-check, not only the (fabricated) model verdict')
+      assert.match(err.message, /PROVEN by the in-process cross-check/, 'must name the reliable, in-process half as the reason for refusing (AC-QA-2 amendment)')
       assert.match(err.message, /made_up_field/, 'must name the offending field')
       assert.match(err.message, /REVIEW_SCHEMA/)
       const dispatchedLenses = err.calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
@@ -1392,15 +1408,15 @@ test('review-cycle.js: MED-2 -- a FABRICATED consistent:true is still refused wh
   )
 })
 
-test('review-cycle.js: MED-2 -- a fabricated consistent:true with EMPTY doc_fields/agent_fields is refused (an empty report is treated as blind by the in-process cross-check too, not only by the model-reported blind flag)', async () => {
-  await assert.rejects(() =>
-    runWorkflow(WF, {
-      args: {},
-      agent: baseAgent({
-        'scope:diff': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, consistent: true, doc_fields: [], agent_fields: [] } },
-      }),
-    })
-  )
+test('review-cycle.js: MED-2/H2 -- a fabricated consistent:true with EMPTY doc_fields/agent_fields now WARNS and PROCEEDS (nothing was reported to cross-check, which is uncertainty, not proof)', async () => {
+  const { result, logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, consistent: true, doc_fields: [], agent_fields: [] } },
+    }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
+  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('nothing to cross-check')), `expected a warning naming the empty report, got: ${JSON.stringify(logs)}`)
 })
 
 test('review-cycle.js: MED-2 -- a GENUINE, real-shaped consistency report (doc_fields/agent_fields naming a field the running REVIEW_SCHEMA DOES declare) still dispatches normally (the cross-check must not cry wolf on honest input)', async () => {
@@ -1410,5 +1426,93 @@ test('review-cycle.js: MED-2 -- a GENUINE, real-shaped consistency report (doc_f
       'scope:diff': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, doc_fields: ['recurrence', 'evidence'], agent_fields: ['recurrence'] } },
     }),
   })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
+})
+
+// round-two review M9: the escape hatch. HARNESS_ALLOW_INCONSISTENT_INSTALL=1
+// is read by install-consistency.mjs's main() (real Node, has process.env)
+// and relayed as consistency.escape_hatch_active; the workflow (no
+// process.env access at all) only ever reads that relayed boolean.
+test('review-cycle.js: M9 -- a PROVEN mismatch with escape_hatch_active:true WARNS and PROCEEDS instead of refusing, and the warning names the override explicitly', async () => {
+  const { result, logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'], escape_hatch_active: true },
+      },
+    }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'], 'the escape hatch must let dispatch proceed')
+  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('HARNESS_ALLOW_INCONSISTENT_INSTALL')), `expected a warning naming the override, got: ${JSON.stringify(logs)}`)
+})
+
+test('review-cycle.js: M9 -- a PROVEN mismatch with escape_hatch_active:false (the default) still refuses -- the escape hatch must not be active by default', async () => {
+  await assert.rejects(() =>
+    runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        'scope:diff': {
+          ...SCOPE_OK,
+          consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'], escape_hatch_active: false },
+        },
+      }),
+    })
+  )
+})
+
+// round-two review M3: a self-contradictory report (consistent:true
+// alongside a non-empty mismatch array, or alongside blind:true) needs no
+// external parsing to detect -- it is a fact about the report's own
+// structure -- so it is treated as PROVEN, refusing exactly like a genuine
+// cross-check failure, never as mere uncertainty.
+test('review-cycle.js: M3 -- a self-contradictory report (consistent:true alongside a non-empty missing_in_review_schema) refuses, by count, naming the contradiction', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': {
+            ...SCOPE_OK,
+            consistency: { ...CONSISTENCY_OK, consistent: true, missing_in_review_schema: ['recurrence'] },
+          },
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /self-contradictory/)
+      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
+      assert.equal(dispatchedLenses.length, 0, 'a self-contradictory report must not reach lens dispatch, by COUNT')
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: M3 -- a self-contradictory report (consistent:true alongside blind:true) also refuses', async () => {
+  await assert.rejects(() =>
+    runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        'scope:diff': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, consistent: true, blind: true } },
+      }),
+    })
+  )
+})
+
+test('review-cycle.js: M3 -- a self-contradictory report with escape_hatch_active:true WARNS and PROCEEDS instead of refusing', async () => {
+  const { result, logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        consistency: { ...CONSISTENCY_OK, consistent: true, missing_in_review_schema: ['recurrence'], escape_hatch_active: true },
+      },
+    }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
+  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('self-contradiction')), `expected a warning naming the override, got: ${JSON.stringify(logs)}`)
+})
+
+test('review-cycle.js: M3 -- a NON-contradictory report (consistent:true, all four mismatch arrays genuinely empty, blind:false) is not flagged as self-contradictory (must not cry wolf)', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
 })
