@@ -112,18 +112,45 @@ blocks harmless work gets switched off. An instructed-but-unsupported field
   report leaves a drifted fixture unreported. Both watched failing, restored,
   documented in `docs/`.
 
-### Version stamp
+### Version stamp -- DROPPED 2026-08-23, after the round-one review
 
-- **AC-ARCH-1:** `AGENT-HARNESS.md` and both workflow scripts carry a
-  source-commit stamp, written by a single mechanism, not hand-edited. Test: the
-  stamp matches `git rev-parse HEAD` at build/commit time.
-- **AC-ARCH-2:** The stamp is reported by the staleness check and by the weekly
-  runner's header, so a log line names which copy actually ran. Precedent:
-  `bin/optimise-cycle-weekly.sh` already emits `SCRIPT_VERSION` for exactly this
-  reason and has a test pinning it.
-- **AC-ARCH-3:** A stamp is a **commit identity, not an age**. The incident that
-  prompted this spec involved files behind an unmerged branch, so "how old" is
-  the wrong question and "which commit" is the right one.
+`AC-ARCH-1`, `AC-ARCH-2` and `AC-ARCH-3` are **withdrawn**. They are not
+deferred and must not be re-raised at review as unmet criteria. Scott chose
+this from options describing the evidence below; he did not read the review
+report itself.
+
+The stamp was built, reviewed, and turned out to be net negative:
+
+- **It generated permanent false drift, defeating the mechanism it was meant to
+  support.** Measured here, not inferred: an install taken one commit back,
+  where the only real change since was to `.githooks/pre-commit` (a file the
+  subset does not even cover), reported drift on all three stamped files. Since
+  the hook rewrites the stamp on *every* commit, every commit to `main` makes
+  every install report drift on those three files, for ever. The spec's own
+  risk table names that outcome: "The drift report is noisy and gets ignored,
+  becoming decoration."
+- **It leaked unstaged work.** `stamp_md`/`stamp_js` rewrote the working-tree
+  copy and `git add`-ed the whole file, so unfinished edits in the three
+  most-edited files in the repo were committed silently and pushed to a public
+  remote, invisible in `git diff --cached`. Reproduced with a planted token
+  before it was patched (`065abe4`, a stopgap now superseded by removal).
+- **It was misleading in two ways that cannot both be fixed cheaply.** A commit
+  cannot embed its own hash, so the stamp necessarily names the *parent*; and
+  under this repo's squash-merge flow the stamp on published `main` names a
+  commit that does not exist in the published repository at all.
+
+Deleting it resolves six of the round-one review's eighteen findings outright
+(HIGH-1, MED-4, MED-5, MED-9, MED-10, MED-11), because the machinery goes away
+rather than being made safer.
+
+Nothing of value is lost. The staleness check's primary and only necessary
+signal is full-file comparison against published `main`, which answers "is this
+install current" directly and more reliably than a self-reported label.
+
+- **AC-ARCH-4:** Replacing the three withdrawn above. No mechanism writes a commit
+identifier into a shipped file, and no git hook rewrites tracked content during
+a commit. Test: a static check fails if `SOURCE_COMMIT` reappears in any shipped
+file, and `.githooks/` contains no `pre-commit`.
 
 ### Simplicity constraints
 
