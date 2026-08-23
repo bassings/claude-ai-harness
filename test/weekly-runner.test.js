@@ -236,6 +236,16 @@ function freshLogPath() {
 // to layer an extra PATH entry ahead of the shared stub (Group 6's ceiling
 // tests, which need their own `claude`/`timeout` shims without disturbing
 // every other test's).
+// HARN-FIX-3 task 2 (AC-OPS-1..5): a guaranteed-nonexistent path, shared by
+// every call below that does not explicitly opt into a real staleness
+// fixture via opts.stalenessRemote. `git clone` against it fails
+// immediately -- no network, no delay -- so every PRE-EXISTING test in this
+// file (which knows nothing about the staleness check and must not be
+// slowed down or made flaky by it) gets a fast, deterministic
+// "could-not-check" for free, exactly like ISOLATED_HOME already does for
+// HOME below.
+const NO_STALENESS_REMOTE = path.join(RUN_TMPDIR, 'no-such-staleness-remote')
+
 function runWeeklyScript(repos, opts = {}) {
   const log = freshLogPath()
   const extraPath = opts.extraPath ? `${opts.extraPath}:` : ''
@@ -244,6 +254,12 @@ function runWeeklyScript(repos, opts = {}) {
     PATH: `${extraPath}${STUB_DIR}:${process.env.PATH}`,
     OPTIMISE_WEEKLY_LOG: log,
     HOME: opts.home || ISOLATED_HOME,
+    OPTIMISE_WEEKLY_STALENESS_REMOTE: opts.stalenessRemote || NO_STALENESS_REMOTE,
+  }
+  if (opts.claudeHome) {
+    env.CLAUDE_HOME = opts.claudeHome
+  } else {
+    delete env.CLAUDE_HOME
   }
   if (opts.rawRepos !== undefined) {
     env.OPTIMISE_WEEKLY_REPOS = opts.rawRepos
@@ -693,8 +709,15 @@ test('weekly runner (subtraction round, item 9): the default repo list is read f
   // OPTIMISE_WEEKLY_REPOS test-seam parsing above (Group 8).
   fs.writeFileSync(path.join(fakeHome, '.claude', 'optimise-weekly-repos'), `\n${repo}\n   \n`)
   const log = freshLogPath()
-  const env = { ...process.env, PATH: `${STUB_DIR}:${process.env.PATH}`, OPTIMISE_WEEKLY_LOG: log, HOME: fakeHome }
+  const env = {
+    ...process.env,
+    PATH: `${STUB_DIR}:${process.env.PATH}`,
+    OPTIMISE_WEEKLY_LOG: log,
+    HOME: fakeHome,
+    OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
+  }
   delete env.OPTIMISE_WEEKLY_REPOS
+  delete env.CLAUDE_HOME
   const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 20000, env })
   const logContents = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
   assert.equal(res.status, 0, logContents)
@@ -707,8 +730,15 @@ test('weekly runner (subtraction round, item 9): no $HOME/.claude/optimise-weekl
   const fakeHome = fs.mkdtempSync(path.join(RUN_TMPDIR, 'fake-home-empty-'))
   trackTempDir(fakeHome)
   const log = freshLogPath()
-  const env = { ...process.env, PATH: `${STUB_DIR}:${process.env.PATH}`, OPTIMISE_WEEKLY_LOG: log, HOME: fakeHome }
+  const env = {
+    ...process.env,
+    PATH: `${STUB_DIR}:${process.env.PATH}`,
+    OPTIMISE_WEEKLY_LOG: log,
+    HOME: fakeHome,
+    OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
+  }
   delete env.OPTIMISE_WEEKLY_REPOS
+  delete env.CLAUDE_HOME
   const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 20000, env })
   const logContents = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
   assert.equal(res.status, 0, logContents)
@@ -771,4 +801,301 @@ test('weekly runner: a GNU-behaving stat (where -f SUCCEEDS with filesystem info
   } finally {
     fs.rmSync(stubDir, { recursive: true, force: true })
   }
+})
+
+// ============================================================================
+// HARN-FIX-3 task 2 of 2: the consumer-install staleness check
+// (AC-OPS-1..5). See workflows/lib/install-consistency.mjs's
+// CONSUMER_SUBSET_PATTERNS/checkStaleness for the comparison logic itself
+// (unit-tested there directly); this file proves the BASH plumbing around
+// it -- once-per-invocation placement, never writing to the install, the
+// no-network path, and the header/report stamp -- by driving the real
+// script end to end, the same discipline every test above already uses.
+// ============================================================================
+
+// A real git repo (makeTempRepo() already seeds README.md + an initial
+// commit) populated with one file per AC-OPS-4 pattern shape, then
+// committed -- this stands in for "published main" as the staleness
+// check's --depth 1 clone source. Entirely local and offline: git clones a
+// local path with no network involved, so these tests never depend on
+// real connectivity or the real GitHub repo.
+function makePublishedRepo(overrides = {}) {
+  const repo = makeTempRepo()
+  // HIGH-2 (round-one review): includes agents/reviewer-*.md,
+  // skills/conduct-plan/ (skills/optimise-cycle/ broadened to the whole
+  // directory) and the two OPTIONAL bin/ files, so a fixture built from
+  // this helper alone never trips unmatched_patterns/could-not-check as
+  // an accident of an incomplete fixture -- a test that wants to exercise
+  // unmatched_patterns does so deliberately, by omitting one of these.
+  const files = {
+    'AGENT-HARNESS.md': 'harness contract\n',
+    'agents/lens-security.md': 'lens security\n',
+    'agents/reviewer-verification.md': 'reviewer verification\n',
+    'workflows/plan-cycle.js': 'plan cycle\n',
+    'workflows/review-cycle.js': 'review cycle\n',
+    'workflows/lib/install-consistency.mjs': 'the lib file itself\n',
+    'hooks/hooks.json': '{}\n',
+    'skills/optimise-cycle/SKILL.md': 'optimise-cycle skill\n',
+    'skills/conduct-plan/SKILL.md': 'conduct-plan skill\n',
+    'bin/optimise-cycle-weekly.sh': 'weekly runner\n',
+    'bin/redact-transcript.mjs': 'redact transcript\n',
+    ...overrides,
+  }
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(repo, rel)
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, content)
+  }
+  sh('git add -A && git commit -q -m "consumer subset files"', repo)
+  return repo
+}
+
+// A plain (non-git) directory standing in for $CLAUDE_HOME -- the
+// staleness check only ever reads it, never expects it to be a repo.
+function makeInstallDir(files) {
+  const dir = fs.mkdtempSync(path.join(RUN_TMPDIR, 'install-'))
+  trackTempDir(dir)
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, content)
+  }
+  return dir
+}
+
+function identicalInstallOf(publishedRepoDir) {
+  const files = {}
+  for (const rel of [
+    'AGENT-HARNESS.md',
+    'agents/lens-security.md',
+    'agents/reviewer-verification.md',
+    'workflows/plan-cycle.js',
+    'workflows/review-cycle.js',
+    'workflows/lib/install-consistency.mjs',
+    'hooks/hooks.json',
+    'skills/optimise-cycle/SKILL.md',
+    'skills/conduct-plan/SKILL.md',
+    'bin/optimise-cycle-weekly.sh',
+    'bin/redact-transcript.mjs',
+  ]) {
+    files[rel] = fs.readFileSync(path.join(publishedRepoDir, rel), 'utf8')
+  }
+  return makeInstallDir(files)
+}
+
+function hashInstallTree(dir) {
+  return fs
+    .readdirSync(dir, { recursive: true })
+    .sort()
+    .map((f) => {
+      const p = path.join(dir, f)
+      return fs.statSync(p).isFile() ? `${f}:${fs.readFileSync(p, 'utf8')}` : `${f}/`
+    })
+}
+
+test('weekly runner (AC-OPS-4): an identical install reports no drift -- STALENESS ok, drift:[]', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /STALENESS ok /, logContents)
+  const line = logContents.match(/^STALENESS ok .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.equal(json.ok, true)
+  assert.deepEqual(json.drift, [])
+})
+
+test('weekly runner (AC-OPS-1/AC-OPS-4): a fixture install with one modified file produces exactly one drift report naming that file, regardless of how many delivery repos are configured', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'agents', 'lens-security.md'), 'a stale, locally-edited copy\n')
+  const repoA = makeTempRepo()
+  const repoB = makeTempRepo()
+  setMarker(repoA, 'pass')
+  setMarker(repoB, 'pass')
+  const { status, logContents } = runWeeklyScript([repoA, repoB], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  const stalenessLines = logContents.match(/^STALENESS /gm) || []
+  assert.equal(stalenessLines.length, 1, `AC-OPS-1: expected exactly ONE staleness report regardless of REPOS count (2 here), got ${stalenessLines.length}:\n${logContents}`)
+  // Coordinator ruling 2026-08-23: a drifted result must use the "drift"
+  // status token, never "ok" -- "ok" collapsed the clean and drifted cases
+  // into the same human-scannable prefix, which is the defect this fix
+  // closes. Assert both that "drift" appears and that "ok" specifically
+  // does NOT (a weaker /STALENESS (ok|drift) / match would not catch a
+  // regression back to always saying "ok").
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  assert.ok(!/^STALENESS ok /m.test(logContents), 'a genuinely drifted install must never be reported under the "ok" token')
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.deepEqual(json.drifted, ['agents/lens-security.md'], 'the drift report must name the one modified file')
+})
+
+test('weekly runner (drift visibility, coordinator ruling 2026-08-23): a run that reports drift ALSO prints one line to stderr naming the log path and a count, never the file list -- "recorded but invisible" (log-only) is the exact defect this closes', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'agents', 'lens-security.md'), 'a stale, locally-edited copy\n')
+  fs.rmSync(path.join(install, 'hooks', 'hooks.json'))
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, stderr, log, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.ok(stderr && stderr.trim().length > 0, `a drifted run must print something to stderr, not only to the log file -- got empty stderr:\n${logContents}`)
+  assert.match(stderr, /drift/i, stderr)
+  assert.ok(stderr.includes(log), `the stderr line must name the actual log path so an operator knows where to look; stderr was:\n${stderr}`)
+  assert.match(stderr, /1 drifted, 1 missing/, `the stderr line must carry the exact count (1 drifted + 1 missing here), not merely say "drift happened"; stderr was:\n${stderr}`)
+  assert.ok(!/agents\/lens-security\.md/.test(stderr), 'stderr must name a COUNT, never the file list -- the log line already carries that')
+  assert.ok(!/hooks\.json/.test(stderr), 'stderr must name a COUNT, never the file list -- the log line already carries that')
+})
+
+test('weekly runner (AC-OPS-1): with ZERO delivery repos configured, the staleness check still runs exactly once', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  const { status, logContents } = runWeeklyScript([], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  const stalenessLines = logContents.match(/^STALENESS /gm) || []
+  assert.equal(stalenessLines.length, 1, `expected exactly one staleness report with zero repos configured, got ${stalenessLines.length}:\n${logContents}`)
+})
+
+test('weekly runner (AC-OPS-4): a published file DELETED from the install is named as drift (missing), and a user-owned file the install has but the repo never shipped is never named', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.rmSync(path.join(install, 'hooks', 'hooks.json'))
+  fs.writeFileSync(path.join(install, 'CLAUDE.md'), 'user-owned, never published\n')
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.deepEqual(json.missing, ['hooks/hooks.json'])
+  assert.ok(!logContents.includes('CLAUDE.md'), 'CLAUDE.md is user-owned and not in the consumer subset -- it must never be named')
+})
+
+// ---- HIGH-2 (round-one review): the corrected subset, driven end to end ----
+// The core defect: bin/optimise-cycle-weekly.sh (this very script) and
+// skills/conduct-plan/ (the multi-PR plan driver) were BOTH omitted from
+// the old subset, so either could be arbitrarily stale in a real install
+// and the weekly log would say "STALENESS ok" over it. These tests drive
+// the REAL script end to end against both, proving the fix closes the
+// exact scenario, not merely a unit-level pattern-matching claim.
+
+test('weekly runner (HIGH-2): a stale skills/conduct-plan/SKILL.md in the install is detected as drift end to end -- conduct-plan drives every multi-PR plan and was previously outside the subset entirely', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'skills', 'conduct-plan', 'SKILL.md'), 'a stale, half-applied copy\n')
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.deepEqual(json.drifted, ['skills/conduct-plan/SKILL.md'])
+})
+
+test('weekly runner (HIGH-2): a stale bin/optimise-cycle-weekly.sh in the install is detected as drift end to end -- the detector can now see itself', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'bin', 'optimise-cycle-weekly.sh'), 'an old copy of this very script, without the staleness check at all\n')
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.deepEqual(json.drifted, ['bin/optimise-cycle-weekly.sh'])
+})
+
+test('weekly runner (HIGH-2): an install with NO bin/ directory at all (a plugin install, or a manual install that never set up the weekly job) reports clean, not drift, over the OPTIONAL bin/ files\' absence', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.rmSync(path.join(install, 'bin'), { recursive: true, force: true })
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS ok /m, logContents)
+  assert.ok(!logContents.includes('"missing":["bin'), `an optional file's absence must never be reported as missing:\n${logContents}`)
+})
+
+// ---- MED-8 follow-through: a subset pattern matching nothing forces could-not-check, never a false "ok" ----
+test('weekly runner (MED-8 follow-through): a published tree missing a WHOLE subset directory (simulating a rename) reports could-not-check end to end, never "ok", even though nothing in the intersection actually drifted', () => {
+  const published = makePublishedRepo()
+  fs.rmSync(path.join(published, 'hooks'), { recursive: true, force: true })
+  sh('git add -A && git commit -q -m "simulate a hooks/ rename upstream"', published)
+  // Built by hand rather than identicalInstallOf() (which would try to
+  // read hooks/hooks.json from published and fail -- it no longer exists
+  // there either, which is the whole point of this fixture).
+  const install = makeInstallDir({
+    'AGENT-HARNESS.md': fs.readFileSync(path.join(published, 'AGENT-HARNESS.md'), 'utf8'),
+    'agents/lens-security.md': fs.readFileSync(path.join(published, 'agents', 'lens-security.md'), 'utf8'),
+    'agents/reviewer-verification.md': fs.readFileSync(path.join(published, 'agents', 'reviewer-verification.md'), 'utf8'),
+    'workflows/plan-cycle.js': fs.readFileSync(path.join(published, 'workflows', 'plan-cycle.js'), 'utf8'),
+    'workflows/review-cycle.js': fs.readFileSync(path.join(published, 'workflows', 'review-cycle.js'), 'utf8'),
+    'workflows/lib/install-consistency.mjs': fs.readFileSync(path.join(published, 'workflows', 'lib', 'install-consistency.mjs'), 'utf8'),
+    'skills/optimise-cycle/SKILL.md': fs.readFileSync(path.join(published, 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8'),
+    'skills/conduct-plan/SKILL.md': fs.readFileSync(path.join(published, 'skills', 'conduct-plan', 'SKILL.md'), 'utf8'),
+    'bin/optimise-cycle-weekly.sh': fs.readFileSync(path.join(published, 'bin', 'optimise-cycle-weekly.sh'), 'utf8'),
+    'bin/redact-transcript.mjs': fs.readFileSync(path.join(published, 'bin', 'redact-transcript.mjs'), 'utf8'),
+    // deliberately NO hooks/ at all -- matches the published repo post-removal
+  })
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /^STALENESS could-not-check /m, `a pattern matching zero published files must force could-not-check, never a bare "ok":\n${logContents}`)
+  assert.ok(!/^STALENESS ok /m.test(logContents), logContents)
+  const line = logContents.match(/^STALENESS could-not-check .*$/m)[0]
+  const json = JSON.parse(line.slice(line.indexOf('{')))
+  assert.ok(json.unmatched_patterns.includes('hooks/'), `expected "hooks/" in unmatched_patterns:\n${JSON.stringify(json.unmatched_patterns)}`)
+})
+
+test('weekly runner (AC-OPS-2): the staleness check never writes to the install, INCLUDING on a run that reports drift', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'agents', 'lens-security.md'), 'drifted on purpose\n')
+  const before = hashInstallTree(install)
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /"drifted":\["agents\/lens-security\.md"\]/, 'sanity: this run must genuinely have reported drift')
+  const after = hashInstallTree(install)
+  assert.deepEqual(after, before, 'AC-OPS-2: no file under the install may change content, and no new file may appear')
+})
+
+test('weekly runner (AC-OPS-3): an unreachable remote path produces "could-not-check", exit 0, and does not fail the weekly run even when a delivery repo also fails', () => {
+  const goneRemote = path.join(RUN_TMPDIR, 'unreachable-staleness-remote-does-not-exist')
+  assert.ok(!fs.existsSync(goneRemote), 'sanity: the remote path must genuinely not exist')
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: goneRemote })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /STALENESS could-not-check /, logContents)
+  assert.match(logContents, resultLineRegex('PASS', label(repo)), 'the delivery-repo run itself must be unaffected by the staleness check failing')
+})
+
+test('weekly runner (AC-OPS-3): an unreachable remote never flips overall exit status even when the ONLY configured repo also fails', () => {
+  const goneRemote = path.join(RUN_TMPDIR, 'unreachable-staleness-remote-does-not-exist-2')
+  const repo = makeTempRepo()
+  setMarker(repo, 'noop') // the delivery repo genuinely fails (missing report)
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: goneRemote })
+  assert.notEqual(status, 0, logContents) // fails because of the REPO, not the staleness check
+  assert.match(logContents, /STALENESS could-not-check \{"error":"git clone of the staleness remote failed"\}/, logContents)
+  assert.match(logContents, resultLineRegex('FAIL', label(repo)), logContents)
+})
+
+test('weekly runner (anti-vacuity, end to end): a "published" remote that clones successfully but has ZERO consumer-subset files is reported could-not-check, never as a clean "no drift" -- the guard that finds nothing and calls that clean is the failure shape this repo has hit before', () => {
+  const emptyPublished = makeTempRepo() // a real, clonable git repo with only README.md -- no subset files at all
+  const install = makeInstallDir({ 'AGENT-HARNESS.md': 'harness\n' })
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: emptyPublished, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.match(logContents, /STALENESS could-not-check /, `a zero-file comparison must never read as "STALENESS ok":\n${logContents}`)
+  assert.ok(!/^STALENESS ok /m.test(logContents), `must not report ok when nothing was actually compared:\n${logContents}`)
 })
