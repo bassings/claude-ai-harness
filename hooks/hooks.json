@@ -12,6 +12,27 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/destructive-git-guard.py"],
+            "timeout": 10,
+            "statusMessage": "Checking for a destructive git restore on uncommitted work"
+          },
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/git-snapshot.py"],
+            "timeout": 10,
+            "statusMessage": "Snapshotting uncommitted tracked changes for recovery"
+          }
+        ]
+      }
     ]
   }
 }

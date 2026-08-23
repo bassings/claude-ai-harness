@@ -92,6 +92,8 @@ AC-<LENS>-<n>: PASS | FAIL | UNVERIFIABLE: <evidence>
   Evidence:    <how you know: command output, code you read>
   Consequence: <concrete, not "could be a problem">
   Fix:         <smallest change that resolves it>
+  Recurrence:  <do you expect more instances of this same class elsewhere in
+                the diff or the codebase? say so, even as a guess>
 ```
 
 `BLOCKED` means you could not do your job: missing context, unrunnable code.
@@ -99,6 +101,18 @@ Say so rather than returning a confident CLEAN.
 
 **The `Could NOT check` field is not optional.** A lens returning CLEAN because
 it never looked is the failure mode this harness exists to prevent.
+
+**Say whether you expect more of the same.** A rule that only fires on
+recurrence cannot fire until round two, which is already the expensive round:
+you, the lens, are looking at the whole diff with the finding already in
+hand, and you know the class's extent before the author does. Naming that
+expectation now lets a second instance get fixed in the SAME round it was
+first spotted, instead of surfacing in a fresh review pass as the same policy
+drifting into a new paraphrase. Worked example, credited to the
+couchpotatoserver-dc session: CouchPotatoServer PR #279 took six review
+rounds to close, four of which were the same policy list drifting into a new
+paraphrase every round -- it closed only once that list was turned into a
+test instead of a prose reminder.
 
 ## Severity
 

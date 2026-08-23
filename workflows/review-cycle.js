@@ -585,7 +585,12 @@ const REVIEW_SCHEMA = {
     // -- finding-to-AC attribution was always null downstream, not because
     // the aggregation code couldn't carry a value through, but because no
     // lens was ever told this field existed to fill in.
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'location', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
+    // H3: recurrence was instructed in AGENT-HARNESS.md's FINDINGS template
+    // and in all nine agents/lens-*.md files ("fill AGENT-HARNESS.md's
+    // `Recurrence` field") with no matching property here -- a lens-output
+    // schema that silently dropped a mandatory-by-instruction field. See
+    // test/static-checks.test.js's AGENT-HARNESS.md-field-vs-schema guard.
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'location', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, ac_id: { type: ['string', 'null'] }, recurrence: { type: ['string', 'null'] } } } },
   },
 }
 
@@ -620,7 +625,8 @@ const lensPrompt = (lens) =>
   `resolves the operator's real, main-checkout ledger regardless of which worktree invokes it (AC-DATA-1), so without ` +
   `this it is not a test double, it is the live ledger. You are read-only: never write to the harness's own ledger.\n\n` +
   `Your final structured output maps the AGENT-HARNESS.md output contract onto the schema fields: verdict, coverage ` +
-  `(could_not_check is mandatory and must be honest, not "nothing"), ac_verdicts, findings (each with file:line in location). ` +
+  `(could_not_check is mandatory and must be honest, not "nothing"), ac_verdicts, findings (each with file:line in location, ` +
+  `and recurrence naming whether you expect more instances of the same class elsewhere in the diff or codebase). ` +
   `You are licensed to return CLEAN with empty findings.`
 
 const reports = await parallel(lenses.map(lens => () =>
@@ -635,7 +641,7 @@ lensesRunRaw = lensReports.map(r => r.lens)
 // dedupes/arbitrates them -- this is the "open" (accepted) side that was
 // previously never recorded at all.
 openFindingsRaw = lensReports.flatMap(r =>
-  (r.findings || []).map(f => ({ lens: r.lens, location: f.location, claim: f.claim, severity: f.severity, ac_id: f.ac_id || null }))
+  (r.findings || []).map(f => ({ lens: r.lens, location: f.location, claim: f.claim, severity: f.severity, ac_id: f.ac_id || null, recurrence: f.recurrence || null }))
 )
 
 // H4: {ac_id, verdict} ONLY -- evidence text is dropped here, before the
@@ -667,7 +673,8 @@ const synthesis = await agent(
   `Produce the single synthesised review report, in markdown:\n` +
   `1. A verdict table: one row per lens with its verdict and its "could not check" statement.\n` +
   `2. Findings merged and deduplicated (same defect from two lenses is one finding credited to both), ordered by severity ` +
-  `(Critical, High, Medium, Low). Keep each finding's location, evidence, consequence and fix.\n` +
+  `(Critical, High, Medium, Low). Keep each finding's location, evidence, consequence, fix and recurrence (whether more ` +
+  `instances of the same class are expected elsewhere).\n` +
   `3. Conflicts between lenses arbitrated by the precedence order: irrecoverable data loss, security, accessibility floor, ` +
   `operability, product and design intent, performance. A tie ABOVE the accessibility line is marked ESCALATE for the human, ` +
   `never resolved silently.\n` +

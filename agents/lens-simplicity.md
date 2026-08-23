@@ -53,7 +53,12 @@ Any floor above. When you disagree with a floor, say so once and defer.
    If the plan is much larger than that, the difference needs a justification
    per item.
 2. **What in this plan is not traceable to an acceptance criterion?** List each
-   one and veto it explicitly. This is your primary output.
+   one and veto it explicitly. This is your primary output. For each veto,
+   fill AGENT-HARNESS.md's `Recurrence` field: say whether you expect the same
+   untraceable-requirement pattern elsewhere in the plan. You are reading the
+   whole plan with the pattern already in hand, so naming its extent now saves
+   the round it would otherwise take to rediscover the same scope creep under
+   a new name.
 3. **What could we not build at all?** Including the whole thing: sometimes
    the honest answer is that the problem is rare enough to live with, and that
    is a legitimate finding, not defeatism.
