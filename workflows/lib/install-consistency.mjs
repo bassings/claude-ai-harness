@@ -177,6 +177,152 @@ export function checkConsistency({ agentHarnessMd, lensFileTexts, planCycleSourc
   }
 }
 
+// ---- AC-OPS-4/AC-OPS-5: the consumer subset (staleness check) ------------
+// specs/harn-fix-3.md, task 2 of 2 (the task 1 handover note at this file's
+// header explains why this lives here rather than a second new lib file).
+// bin/optimise-cycle-weekly.sh is BASH (no import, no fs) so it cannot read
+// this array directly; it never needs to -- the whole comparison, glob
+// matching included, runs in this module via the --check-staleness CLI
+// mode below, and bash only ever sees that mode's JSON output. This array
+// therefore has exactly one definition in the codebase (AC-OPS-5), and
+// test/static-checks.test.js pins that.
+export const CONSUMER_SUBSET_PATTERNS = [
+  'AGENT-HARNESS.md',
+  'agents/lens-*.md',
+  'agents/reviewer-*.md',
+  'workflows/*.js',
+  'workflows/lib/',
+  'hooks/',
+  'skills/optimise-cycle/',
+]
+
+function escapeRegExpLiteral(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// Three pattern shapes, matched against a POSIX-relative path (forward
+// slashes, no leading './'): a directory prefix (trailing '/', matches any
+// file at any depth under it -- 'workflows/lib/' must match
+// 'workflows/lib/install-consistency.mjs', not just the bare directory
+// name itself, and must NOT match a differently-named sibling like
+// 'workflows/lib_notreally/x.js' by bare string-prefix accident, hence the
+// explicit '===' / startsWith(pattern) pair rather than a single
+// startsWith(pattern.slice(0,-1)) check); a single-segment glob ('*' never
+// crosses a '/', so 'agents/lens-*.md' cannot accidentally match something
+// nested a directory deeper); or a plain literal path.
+function matchesPattern(relPath, pattern) {
+  if (pattern.endsWith('/')) return relPath === pattern.slice(0, -1) || relPath.startsWith(pattern)
+  if (pattern.includes('*')) {
+    const re = new RegExp('^' + pattern.split('*').map(escapeRegExpLiteral).join('[^/]*') + '$')
+    return re.test(relPath)
+  }
+  return relPath === pattern
+}
+
+export function isConsumerSubsetPath(relPath) {
+  return CONSUMER_SUBSET_PATTERNS.some((pattern) => matchesPattern(relPath, pattern))
+}
+
+function walkDirRecursive(rootDir, relDir, out) {
+  const absDir = path.join(rootDir, relDir)
+  let entries
+  try {
+    entries = fs.readdirSync(absDir, { withFileTypes: true })
+  } catch (e) {
+    return // absent directory: this pattern simply contributes nothing, never thrown
+  }
+  for (const entry of entries) {
+    const rel = relDir ? `${relDir}/${entry.name}` : entry.name
+    if (entry.isDirectory()) walkDirRecursive(rootDir, rel, out)
+    else if (entry.isFile()) out.add(rel)
+  }
+}
+
+// Pattern-driven, not a whole-tree walk-then-filter: only visits the
+// directories CONSUMER_SUBSET_PATTERNS actually names (agents/, workflows/,
+// workflows/lib/, hooks/, skills/optimise-cycle/), so a real clone's .git/
+// internals, test/, docs/, specs/ and every other unrelated top-level
+// directory are never traversed at all -- both faster and a more literal
+// reading of AC-OPS-4's "exactly the consumer subset" than filtering a
+// full-tree walk down after the fact.
+export function listConsumerSubsetFiles(dir) {
+  const out = new Set()
+  for (const pattern of CONSUMER_SUBSET_PATTERNS) {
+    if (pattern.endsWith('/')) {
+      walkDirRecursive(dir, pattern.slice(0, -1), out)
+    } else if (pattern.includes('*')) {
+      const slashIdx = pattern.lastIndexOf('/')
+      const dirPart = slashIdx === -1 ? '' : pattern.slice(0, slashIdx)
+      const namePattern = slashIdx === -1 ? pattern : pattern.slice(slashIdx + 1)
+      const nameRe = new RegExp('^' + namePattern.split('*').map(escapeRegExpLiteral).join('[^/]*') + '$')
+      let names
+      try {
+        names = fs.readdirSync(path.join(dir, dirPart))
+      } catch (e) {
+        continue
+      }
+      for (const name of names) {
+        if (!nameRe.test(name)) continue
+        const rel = dirPart ? `${dirPart}/${name}` : name
+        if (fs.statSync(path.join(dir, rel)).isFile()) out.add(rel)
+      }
+    } else {
+      const abs = path.join(dir, pattern)
+      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) out.add(pattern)
+    }
+  }
+  return [...out].sort()
+}
+
+// AC-OPS-2/AC-OPS-4: compares the published tree's consumer subset against
+// an install directory. Reads both, writes neither -- every access below is
+// fs.readFileSync/readdirSync/statSync, never a write call. `drifted` is a
+// published file present in the install with DIFFERENT content; `missing`
+// is present in published, absent from the install entirely (AC-OPS-4's
+// explicit "reports a published file absent from the install as drift").
+// An install-only file the repo does not ship (CLAUDE.md,
+// agents/implementer.md) is structurally invisible here: this function
+// only ever iterates the PUBLISHED subset and looks each one up in the
+// install, so a file that exists only on the install side is never
+// examined at all, let alone reported (AC-OPS-4's other explicit case).
+//
+// ANTI-VACUITY (mirrors checkConsistency()'s blind/blind_reasons above,
+// same failure shape, same fix): zero published files found is not
+// evidence of "no drift", it is evidence nothing could be compared -- an
+// empty or wrongly-pointed clone would otherwise report a spotless "clean"
+// verdict on a check that never actually looked. `blind:true` makes that a
+// distinct, louder signal than drift:[], and the CLI below refuses to
+// report ok:true on it.
+export function checkStaleness(publishedDir, installDir) {
+  const publishedFiles = listConsumerSubsetFiles(publishedDir)
+  const blind = publishedFiles.length === 0
+  const drifted = []
+  const missing = []
+  if (!blind) {
+    for (const rel of publishedFiles) {
+      const installPath = path.join(installDir, rel)
+      let installContent
+      try {
+        installContent = fs.readFileSync(installPath)
+      } catch (e) {
+        missing.push(rel)
+        continue
+      }
+      const publishedContent = fs.readFileSync(path.join(publishedDir, rel))
+      if (!installContent.equals(publishedContent)) drifted.push(rel)
+    }
+  }
+  drifted.sort()
+  missing.sort()
+  return {
+    published_files_checked: publishedFiles.length,
+    blind,
+    drifted,
+    missing,
+    drift: [...drifted, ...missing].sort(),
+  }
+}
+
 // ---- the SOURCE_COMMIT stamp (AC-ARCH-1..3): a small, separate concern --
 // this module reads the same three files anyway, so it is a free extra
 // signal, not a new file read. Written by .githooks/pre-commit, never by
@@ -307,6 +453,24 @@ function resolveArgvPathForIsMain(argPath) {
 }
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolveArgvPathForIsMain(process.argv[1])
 if (isMain) {
+  // AC-OPS-1..4: `node install-consistency.mjs --check-staleness <published-dir> <install-dir>`
+  // -- bin/optimise-cycle-weekly.sh's only entry point into this module's
+  // staleness logic. Same contract as the default CLI mode below: exactly
+  // one line of JSON, always exit 0, never throw. `ok:false` covers both a
+  // usage error (missing arguments) and a blind result (AC-OPS's own
+  // anti-vacuity rule) -- bash treats either the same way, "could not
+  // check", never as a clean pass.
+  if (process.argv[2] === '--check-staleness') {
+    const publishedDir = process.argv[3]
+    const installDir = process.argv[4]
+    if (!publishedDir || !installDir) {
+      process.stdout.write(JSON.stringify({ ok: false, error: 'usage: install-consistency.mjs --check-staleness <published-dir> <install-dir>' }) + '\n')
+      process.exit(0)
+    }
+    const result = checkStaleness(path.resolve(publishedDir), path.resolve(installDir))
+    process.stdout.write(JSON.stringify({ ok: !result.blind, error: null, ...result }) + '\n')
+    process.exit(0)
+  }
   const out = main(process.argv[2])
   process.stdout.write(JSON.stringify(out) + '\n')
   process.exit(0)

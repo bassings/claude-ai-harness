@@ -191,6 +191,12 @@ test('static: plan-identity canonicalisation (canonicalPlanKey) has exactly one 
   assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/ledger-append.mjs'])
 })
 
+test('static: the consumer-subset pattern list (AC-OPS-5, specs/harn-fix-3.md task 2) has exactly one definition site -- only workflows/lib/install-consistency.mjs declares CONSUMER_SUBSET_PATTERNS; bin/optimise-cycle-weekly.sh (bash, cannot import) drives the whole comparison through that module\'s --check-staleness CLI mode instead of hardcoding a second copy of the pattern list.', () => {
+  const all = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'bin')), ...walk(path.join(ROOT, 'agents')), ...walk(path.join(ROOT, 'hooks')), ...walk(path.join(ROOT, 'skills'))]
+  const definitionSites = all.filter((f) => fs.readFileSync(f, 'utf8').includes("'agents/lens-*.md'"))
+  assert.deepEqual(definitionSites.map((f) => path.relative(ROOT, f)), ['workflows/lib/install-consistency.mjs'])
+})
+
 test('static: ledger-append.mjs is INVOKED by at least two workflows (AC-SIMP-12, arbitrated: "imported by >=2 files" becomes "invoked by >=2 workflows" for a script workflow scripts can only run via Bash, never import)', () => {
   const invokers = ['workflows/tdd-task.js', 'workflows/review-cycle.js', 'workflows/plan-cycle.js'].filter((f) =>
     readAll(f).includes('ledger-append.mjs')

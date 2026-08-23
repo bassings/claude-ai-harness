@@ -282,8 +282,109 @@ verdict_repo() {
   return 1
 }
 
-echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting version=$SCRIPT_VERSION ===" >> "$LOG"
+# ---- AC-OPS-1..5, AC-ARCH-2, AC-ARCH-3: consumer-install staleness check -
+# specs/harn-fix-3.md, task 2 of 2. Warn-only, per the spec's own mechanism
+# table: a stale install is not necessarily broken, so this section never
+# sets overall_fail and never blocks the REPOS loop below. Distinct from,
+# and independent of, workflows/lib/install-consistency.mjs's OWN preflight
+# inside plan-cycle.js/review-cycle.js (AC-QA-1/2), which refuses on an
+# INTERNALLY inconsistent install regardless of what published main says.
+#
+# CLAUDE_HOME is the SAME override install-consistency.mjs's own
+# resolveInstallDir() reads (see that file's header comment) -- one
+# variable, one meaning, shared by both mechanisms.
+CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+LIB_SCRIPT="$SCRIPT_DIR/../workflows/lib/install-consistency.mjs"
+
+# AC-ARCH-2: the installed harness's own SOURCE_COMMIT stamp, read via
+# install-consistency.mjs's EXISTING main() (which already extracts it as
+# source_commits.agent_harness for every install it checks -- no new
+# extraction logic duplicated here). Captured before the header line below
+# is printed, so the header names which install this run is about to
+# check, mirroring SCRIPT_VERSION's own precedent above for the identical
+# reason. No jq dependency (this script assumes only node/git/timeout/
+# claude on PATH): the field is a flat 40-hex-char string, so a plain
+# grep -Eo extracts it, the same style as the CEILING_LINE detection below.
+INSTALL_SOURCE_COMMIT="unknown"
+if [ -f "$LIB_SCRIPT" ] && command -v node >/dev/null 2>&1; then
+  consistency_json=$(node "$LIB_SCRIPT" "$CLAUDE_HOME" 2>/dev/null) || consistency_json=""
+  extracted=$(printf '%s' "$consistency_json" | grep -oE '"agent_harness":"[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}') || extracted=""
+  [ -n "$extracted" ] && INSTALL_SOURCE_COMMIT="$extracted"
+fi
+
+echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting version=$SCRIPT_VERSION install_source_commit=$INSTALL_SOURCE_COMMIT ===" >> "$LOG"
 overall_fail=0
+
+# AC-ARCH-2: reported here too (the check's own line), not only inherited
+# from the header line above -- both name the same stamp, from the same
+# variable, so they can never independently drift into two different
+# answers.
+log_staleness() {
+  echo "STALENESS $1 install_source_commit=$INSTALL_SOURCE_COMMIT $2" >> "$LOG"
+}
+
+# AC-OPS-2/AC-OPS-3 (spec risk table: "a cache clone accumulates on a
+# volume twice at 99% full"): a fresh --depth 1 clone into its OWN
+# mktemp -d directory every run, removed unconditionally on exit via the
+# trap below -- never a persistent cache refreshed in place. Chosen over a
+# bare-mirror-refreshed-in-place or a shallow-clone-refreshed-via-fetch
+# design specifically because of that risk: nothing here ever survives
+# past this one run, so there is nothing to accumulate and no cache-
+# staleness of its own to track, and two overlapping runs (each gets a
+# unique mktemp name from the OS) can never collide or corrupt a shared
+# clone. The cost -- a fresh shallow clone every run -- is negligible
+# against this repo's size at this script's weekly cadence, and this
+# clone is the ONLY thing this section ever writes to: $CLAUDE_HOME itself
+# is read-only throughout (AC-OPS-2), proven by test/weekly-runner.test.js
+# hashing every file under a fixture install before and after a run that
+# reports drift.
+STALE_TMPDIR=""
+cleanup_stale_tmpdir() {
+  [ -n "$STALE_TMPDIR" ] && rm -rf "$STALE_TMPDIR"
+}
+trap cleanup_stale_tmpdir EXIT
+
+# OPTIMISE_WEEKLY_STALENESS_REMOTE is a test seam, exactly like
+# OPTIMISE_WEEKLY_REPOS/OPTIMISE_WEEKLY_LOG above -- never operator-facing
+# configuration. Unset, it defaults to this repo's real published home.
+STALENESS_REMOTE="${OPTIMISE_WEEKLY_STALENESS_REMOTE:-https://github.com/bassings/claude-ai-harness}"
+
+# AC-OPS-1: this whole section runs EXACTLY ONCE per invocation of this
+# script, here, before the REPOS loop below -- $CLAUDE_HOME is the
+# harness's own consumer install, which has nothing to do with which (or
+# how many) delivery repos REPOS holds, so it must never run once per repo.
+if [ ! -f "$LIB_SCRIPT" ]; then
+  log_staleness could-not-check '{"error":"install-consistency.mjs not found"}'
+elif ! command -v node >/dev/null 2>&1; then
+  log_staleness could-not-check '{"error":"node not found on PATH"}'
+elif ! command -v git >/dev/null 2>&1; then
+  log_staleness could-not-check '{"error":"git not found on PATH"}'
+else
+  STALE_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/optimise-weekly-staleness.XXXXXX")
+  if git clone --depth 1 --quiet "$STALENESS_REMOTE" "$STALE_TMPDIR/src" >/dev/null 2>&1; then
+    result_json=$(node "$LIB_SCRIPT" --check-staleness "$STALE_TMPDIR/src" "$CLAUDE_HOME" 2>/dev/null)
+    node_status=$?
+    if [ "$node_status" -eq 0 ] && [ -n "$result_json" ]; then
+      case "$result_json" in
+        *'"ok":false'*) log_staleness could-not-check "$result_json" ;;
+        *) log_staleness ok "$result_json" ;;
+      esac
+    else
+      # AC-OPS-3: a git failure (clone succeeded but the comparison itself
+      # failed for some other reason) never fails the weekly run.
+      log_staleness could-not-check '{"error":"install-consistency.mjs --check-staleness failed"}'
+    fi
+  else
+    # AC-OPS-3: no network, an unreachable remote, or any other git clone
+    # failure all land here -- this section never touches overall_fail, so
+    # a staleness check that could not run never fails the weekly run.
+    log_staleness could-not-check '{"error":"git clone of the staleness remote failed"}'
+  fi
+  rm -rf "$STALE_TMPDIR"
+  STALE_TMPDIR=""
+fi
+# ---- end AC-OPS-1..5 staleness check ---------------------------------
+
 # Group 8: bash 3.2's `set -u` treats "${REPOS[@]}" on a genuinely empty
 # array as an unbound-variable error; the ${arr[@]+"${arr[@]}"} idiom below
 # expands to nothing (not an error) when REPOS is empty.

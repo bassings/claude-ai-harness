@@ -807,6 +807,40 @@ script's behaviour changes materially, so the log shows which copy of the
 script actually produced a given run -- the same drift class AC-OPS-4
 already covers for `workflows/`, extended to this file.
 
+**Consumer-install staleness check (`specs/harn-fix-3.md`, AC-OPS-1..5,
+AC-ARCH-2).** Once per invocation -- not once per delivery repo -- this
+script also checks whether the consumer install at `$CLAUDE_HOME` (default
+`~/.claude`) has drifted from published `main`: `AGENT-HARNESS.md`, every
+`agents/lens-*.md` and `agents/reviewer-*.md`, `workflows/*.js`,
+`workflows/lib/`, `hooks/`, and `skills/optimise-cycle/` (the exact
+consumer subset a manual multi-file copy can partially update; a
+user-owned file the repo does not ship, like `CLAUDE.md`, is never
+compared). Warn-only, by design: a stale install is not necessarily
+broken, so this never fails the run, unlike the separate, unconditional,
+refuse-on-mismatch consistency preflight `workflows/lib/
+install-consistency.mjs` runs inside `plan-cycle.js`/`review-cycle.js`
+(AC-QA-1/2, above).
+
+The comparison clones published `main` fresh, `--depth 1`, into its own
+`mktemp -d` directory every run, deleted unconditionally on exit -- never a
+persistent cache refreshed in place. This is a deliberate response to the
+spec's own risk note ("a cache clone accumulates on a volume twice at 99%
+full"): nothing here survives past one run, so there is nothing to
+accumulate, no cache-staleness of its own to track, and two overlapping
+runs (each gets a unique `mktemp` name) can never collide. `$CLAUDE_HOME`
+itself is only ever read, never written -- proven by hashing every file
+under a fixture install before and after a run that reports drift.
+
+No network, an unreachable remote, or any other `git clone` failure
+produces a `could-not-check` line naming the reason and never fails the
+weekly run -- the one line every log carries either says `STALENESS ok
+...` with the drifted/missing file list (empty when the install matches),
+or `STALENESS could-not-check ...`. Both the run's own header line and the
+staleness report's line separately name the installed `AGENT-HARNESS.md`'s
+`SOURCE_COMMIT` stamp (`unknown` when unreadable), so a log entry states
+both which copy of this SCRIPT ran and which commit the INSTALL it checked
+claimed to be.
+
 Covered by `test/weekly-runner.test.js`, which drives the real script
 against real temp git repos with a stub `claude` on PATH -- no test run ever
 makes a real model call.

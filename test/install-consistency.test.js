@@ -399,3 +399,230 @@ test('install-consistency: the CLI never touches the fixture directory it reads 
   const after = fs.readdirSync(dir, { recursive: true }).sort()
   assert.deepEqual(after, before)
 })
+
+// ============================================================================
+// HARN-FIX-3 task 2 of 2: the staleness check (AC-OPS-1..5, AC-ARCH-2), a
+// sibling export in this SAME file per the task 1 handover note at the top
+// of this module -- AC-SIMP-2 caps the whole spec at two new non-test files
+// and task 1 (the version stamp + consistency check) already spent both.
+//
+// bin/optimise-cycle-weekly.sh (bash, no import capability, no fs module)
+// drives this via the CLI's --check-staleness mode; the comparison logic
+// itself is tested here directly, at the function level, the same
+// two-layer discipline the consistency-check tests above already use for
+// exactly the same reason (a broken regex/glob fails here with a precise
+// message, not only via an opaque subprocess run).
+// ============================================================================
+
+// A plain directory tree builder, deliberately more general than
+// writeFixture() above (which is shaped for the four consistency-check
+// inputs specifically): the staleness check compares two arbitrary trees
+// of relative paths, so this takes a flat {relPath: content} map instead.
+function writeTree(files) {
+  const dir = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, content)
+  }
+  return dir
+}
+
+// A minimal but representative "published" tree: one file from each
+// pattern shape in CONSUMER_SUBSET_PATTERNS (a literal name, two single-
+// segment globs, a top-level glob, and three directory prefixes), plus two
+// files a real published repo also ships that are NOT in the subset
+// (test/ and docs/), so a test asserting "never reported" has something
+// real to assert against rather than an absence that could just as easily
+// be an incomplete fixture.
+function publishedSubsetTree(overrides = {}) {
+  const files = {
+    'AGENT-HARNESS.md': 'harness contract\n',
+    'agents/lens-security.md': 'lens security\n',
+    'agents/lens-qa.md': 'lens qa\n',
+    'agents/reviewer-verification.md': 'reviewer verification\n',
+    'agents/implementer.md': 'NOT in the subset -- agents/*.md only matches lens-*/reviewer-*\n',
+    'workflows/plan-cycle.js': 'plan cycle\n',
+    'workflows/review-cycle.js': 'review cycle\n',
+    'workflows/lib/install-consistency.mjs': 'the lib file itself\n',
+    'workflows/lib/ledger-append.mjs': 'ledger append\n',
+    'hooks/hooks.json': '{}\n',
+    'skills/optimise-cycle/SKILL.md': 'optimise-cycle skill\n',
+    'skills/other-skill/SKILL.md': 'NOT in the subset -- only skills/optimise-cycle/\n',
+    'test/some.test.js': 'NOT in the subset\n',
+    'docs/some-note.md': 'NOT in the subset\n',
+    'README.md': 'NOT in the subset\n',
+    ...overrides,
+  }
+  return writeTree(files)
+}
+
+test('install-consistency: CONSUMER_SUBSET_PATTERNS is exported and matches the exact AC-OPS-4 list', async () => {
+  const { CONSUMER_SUBSET_PATTERNS } = await loadModule()
+  assert.deepEqual(
+    [...CONSUMER_SUBSET_PATTERNS].sort(),
+    ['AGENT-HARNESS.md', 'agents/lens-*.md', 'agents/reviewer-*.md', 'hooks/', 'skills/optimise-cycle/', 'workflows/*.js', 'workflows/lib/'].sort()
+  )
+})
+
+test('install-consistency: isConsumerSubsetPath matches every pattern shape (literal, single-segment glob, directory prefix at any depth) and rejects a user-owned file the repo does not ship', async () => {
+  const { isConsumerSubsetPath } = await loadModule()
+  assert.equal(isConsumerSubsetPath('AGENT-HARNESS.md'), true)
+  assert.equal(isConsumerSubsetPath('agents/lens-security.md'), true)
+  assert.equal(isConsumerSubsetPath('agents/reviewer-verification.md'), true)
+  assert.equal(isConsumerSubsetPath('workflows/plan-cycle.js'), true)
+  assert.equal(isConsumerSubsetPath('workflows/lib/install-consistency.mjs'), true, 'a file nested under workflows/lib/ must match the directory-prefix pattern, not just workflows/lib/ itself')
+  assert.equal(isConsumerSubsetPath('hooks/hooks.json'), true)
+  assert.equal(isConsumerSubsetPath('skills/optimise-cycle/SKILL.md'), true)
+  assert.equal(isConsumerSubsetPath('agents/implementer.md'), false, 'implementer.md is user-owned, not published under agents/lens-*.md or agents/reviewer-*.md')
+  assert.equal(isConsumerSubsetPath('CLAUDE.md'), false, 'CLAUDE.md is user-owned, never published')
+  assert.equal(isConsumerSubsetPath('skills/other-skill/SKILL.md'), false, 'only skills/optimise-cycle/ is in the subset, not every skill')
+  assert.equal(isConsumerSubsetPath('workflows/lib_notreally/x.js'), false, '"workflows/lib/" must not match a differently-named sibling directory by prefix-string accident')
+  assert.equal(isConsumerSubsetPath('test/some.test.js'), false)
+})
+
+test('install-consistency: listConsumerSubsetFiles walks a real tree and returns exactly the subset paths, sorted, excluding everything else', async () => {
+  const { listConsumerSubsetFiles } = await loadModule()
+  const dir = publishedSubsetTree()
+  const files = listConsumerSubsetFiles(dir)
+  assert.deepEqual(
+    files,
+    [
+      'AGENT-HARNESS.md',
+      'agents/lens-qa.md',
+      'agents/lens-security.md',
+      'agents/reviewer-verification.md',
+      'hooks/hooks.json',
+      'skills/optimise-cycle/SKILL.md',
+      'workflows/lib/install-consistency.mjs',
+      'workflows/lib/ledger-append.mjs',
+      'workflows/plan-cycle.js',
+      'workflows/review-cycle.js',
+    ].sort()
+  )
+})
+
+test('install-consistency: listConsumerSubsetFiles never throws when a pattern directory is absent from the tree entirely', async () => {
+  const { listConsumerSubsetFiles } = await loadModule()
+  const dir = writeTree({ 'AGENT-HARNESS.md': 'x\n' }) // no agents/, workflows/, hooks/, skills/ at all
+  assert.deepEqual(listConsumerSubsetFiles(dir), ['AGENT-HARNESS.md'])
+})
+
+// ---- checkStaleness: the drift comparison itself (AC-OPS-4) ----
+
+test('install-consistency: checkStaleness reports no drift when the install matches the published subset exactly', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree() // byte-identical content, independent directory
+  const result = checkStaleness(published, install)
+  assert.equal(result.blind, false)
+  assert.deepEqual(result.drifted, [])
+  assert.deepEqual(result.missing, [])
+  assert.deepEqual(result.drift, [])
+  assert.equal(result.published_files_checked, 10)
+})
+
+test('install-consistency: checkStaleness reports a published file with DIFFERENT content in the install as drifted, naming it', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree({ 'agents/lens-security.md': 'a stale, different copy\n' })
+  const result = checkStaleness(published, install)
+  assert.deepEqual(result.drifted, ['agents/lens-security.md'])
+  assert.deepEqual(result.missing, [])
+  assert.deepEqual(result.drift, ['agents/lens-security.md'])
+})
+
+test('install-consistency: checkStaleness reports a published file ABSENT from the install as drift, under "missing" (AC-OPS-4\'s explicit case)', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const installDir = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
+  // Copy every published file except one.
+  for (const rel of ['AGENT-HARNESS.md', 'agents/lens-qa.md', 'agents/reviewer-verification.md', 'workflows/plan-cycle.js', 'workflows/review-cycle.js', 'workflows/lib/install-consistency.mjs', 'workflows/lib/ledger-append.mjs', 'hooks/hooks.json', 'skills/optimise-cycle/SKILL.md']) {
+    const dest = path.join(installDir, rel)
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.copyFileSync(path.join(published, rel), dest)
+  }
+  const result = checkStaleness(published, installDir)
+  assert.deepEqual(result.missing, ['agents/lens-security.md'])
+  assert.deepEqual(result.drift, ['agents/lens-security.md'])
+})
+
+test('install-consistency: checkStaleness never reports a user-owned file the install has but the repo does not ship (AC-OPS-4\'s other explicit case)', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree({ 'CLAUDE.md': 'user-owned, never published\n', 'agents/implementer.md': 'user-owned\n' })
+  const result = checkStaleness(published, install)
+  assert.deepEqual(result.drift, [], 'CLAUDE.md and agents/implementer.md exist only in the install and are not in the consumer subset, so they must never appear in drift')
+})
+
+test('install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published tree (zero subset files found) reports blind:true, never "no drift" (the CLAUDE.md-documented failure shape: a guard that finds zero files and calls that clean)', async () => {
+  const { checkStaleness } = await loadModule()
+  const emptyPublished = writeTree({ 'README.md': 'nothing in the subset here\n' })
+  const install = publishedSubsetTree()
+  const result = checkStaleness(emptyPublished, install)
+  assert.equal(result.published_files_checked, 0)
+  assert.equal(result.blind, true)
+  assert.deepEqual(result.drift, [], 'blind must not be disguised as drift either -- it is a distinct, louder signal that nothing could be compared at all')
+})
+
+test('install-consistency: checkStaleness reads only -- never writes, creates or deletes anything in EITHER directory it is given (AC-OPS-2)', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree({ 'agents/lens-security.md': 'drifted on purpose, to prove AC-OPS-2 holds even on a run that reports drift\n' })
+  const hashTree = (dir) =>
+    fs
+      .readdirSync(dir, { recursive: true })
+      .sort()
+      .map((f) => {
+        const p = path.join(dir, f)
+        return fs.statSync(p).isFile() ? fs.readFileSync(p, 'utf8') : null
+      })
+  const beforePublished = hashTree(published)
+  const beforeInstall = hashTree(install)
+  const result = checkStaleness(published, install)
+  assert.ok(result.drifted.length > 0, 'sanity: this run must genuinely have found drift')
+  assert.deepEqual(hashTree(published), beforePublished)
+  assert.deepEqual(hashTree(install), beforeInstall)
+})
+
+// ---- --check-staleness CLI mode (AC-OPS-1..4, real subprocess) ----
+
+test('install-consistency: CLI --check-staleness prints one line of JSON matching checkStaleness()\'s own result, ok:true when files were actually compared', () => {
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree({ 'agents/lens-security.md': 'drifted\n' })
+  const res = spawnSync('node', [SCRIPT, '--check-staleness', published, install], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.ok, true)
+  assert.deepEqual(out.drifted, ['agents/lens-security.md'])
+  assert.equal(out.blind, false)
+})
+
+test('install-consistency: CLI --check-staleness reports ok:false (never ok:true) when it is blind -- the anti-vacuity guard applies through the CLI, not only the direct function call', () => {
+  const emptyPublished = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
+  const install = publishedSubsetTree()
+  const res = spawnSync('node', [SCRIPT, '--check-staleness', emptyPublished, install], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.ok, false)
+  assert.equal(out.blind, true)
+})
+
+test('install-consistency: CLI --check-staleness never touches either directory it is given, proven against a real subprocess run (AC-OPS-2)', () => {
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree({ 'agents/lens-security.md': 'drifted\n' })
+  const beforePub = fs.readdirSync(published, { recursive: true }).sort()
+  const beforeInst = fs.readdirSync(install, { recursive: true }).sort()
+  const res = spawnSync('node', [SCRIPT, '--check-staleness', published, install], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  assert.deepEqual(fs.readdirSync(published, { recursive: true }).sort(), beforePub)
+  assert.deepEqual(fs.readdirSync(install, { recursive: true }).sort(), beforeInst)
+})
+
+test('install-consistency: CLI --check-staleness exits 0 with ok:false and an error, never throws, when called with missing arguments', () => {
+  const res = spawnSync('node', [SCRIPT, '--check-staleness'], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.ok, false)
+  assert.match(out.error, /usage/i)
+})
