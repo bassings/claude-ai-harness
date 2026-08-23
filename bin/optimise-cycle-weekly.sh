@@ -282,7 +282,7 @@ verdict_repo() {
   return 1
 }
 
-# ---- AC-OPS-1..5, AC-ARCH-2, AC-ARCH-3: consumer-install staleness check -
+# ---- AC-OPS-1..5: consumer-install staleness check -
 # specs/harn-fix-3.md, task 2 of 2. Warn-only, per the spec's own mechanism
 # table: a stale install is not necessarily broken, so this section never
 # sets overall_fail and never blocks the REPOS loop below. Distinct from,
@@ -296,31 +296,11 @@ verdict_repo() {
 CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 LIB_SCRIPT="$SCRIPT_DIR/../workflows/lib/install-consistency.mjs"
 
-# AC-ARCH-2: the installed harness's own SOURCE_COMMIT stamp, read via
-# install-consistency.mjs's EXISTING main() (which already extracts it as
-# source_commits.agent_harness for every install it checks -- no new
-# extraction logic duplicated here). Captured before the header line below
-# is printed, so the header names which install this run is about to
-# check, mirroring SCRIPT_VERSION's own precedent above for the identical
-# reason. No jq dependency (this script assumes only node/git/timeout/
-# claude on PATH): the field is a flat 40-hex-char string, so a plain
-# grep -Eo extracts it, the same style as the CEILING_LINE detection below.
-INSTALL_SOURCE_COMMIT="unknown"
-if [ -f "$LIB_SCRIPT" ] && command -v node >/dev/null 2>&1; then
-  consistency_json=$(node "$LIB_SCRIPT" "$CLAUDE_HOME" 2>/dev/null) || consistency_json=""
-  extracted=$(printf '%s' "$consistency_json" | grep -oE '"agent_harness":"[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}') || extracted=""
-  [ -n "$extracted" ] && INSTALL_SOURCE_COMMIT="$extracted"
-fi
-
-echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting version=$SCRIPT_VERSION install_source_commit=$INSTALL_SOURCE_COMMIT ===" >> "$LOG"
+echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting version=$SCRIPT_VERSION ===" >> "$LOG"
 overall_fail=0
 
-# AC-ARCH-2: reported here too (the check's own line), not only inherited
-# from the header line above -- both name the same stamp, from the same
-# variable, so they can never independently drift into two different
-# answers.
 log_staleness() {
-  echo "STALENESS $1 install_source_commit=$INSTALL_SOURCE_COMMIT $2" >> "$LOG"
+  echo "STALENESS $1 $2" >> "$LOG"
 }
 
 # AC-OPS-2/AC-OPS-3 (spec risk table: "a cache clone accumulates on a

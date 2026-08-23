@@ -5,6 +5,25 @@ Scope: `AC-OPS-1` through `AC-OPS-5`, `AC-ARCH-2` from `specs/harn-fix-3.md`.
 `AC-SIMP-3` belong to task 1 and are covered in
 `docs/install-consistency-mutation-proofs.md`, not here.
 
+**Editorial note added by task 1's agent, 2026-08-23, surgical (this
+section only -- nothing else on this page was touched):** round-one review
+found the stamp mechanism this page's sections 7-8 test (`AC-ARCH-2`,
+`AC-ARCH-3`, `SOURCE_COMMIT`) generated permanent false drift and could leak
+unstaged edits into a commit. `specs/harn-fix-3.md` now withdraws
+`AC-ARCH-1`/`AC-ARCH-2`/`AC-ARCH-3` outright (not deferred) in favour of
+`AC-ARCH-4`: no such mechanism may exist at all. The two tests sections 7-8
+describe below (`weekly runner (AC-ARCH-2/AC-ARCH-3)` and
+`weekly runner (AC-ARCH-2)`) and the `INSTALL_SOURCE_COMMIT`/
+`install_source_commit=` fields in `bin/optimise-cycle-weekly.sh` they
+exercised have been deleted from the shipped test suite and script as part
+of that withdrawal. This page's narrative below is left AS WRITTEN -- an
+accurate historical record of what this round's own mutation testing
+observed at the time -- rather than rewritten or deleted, since the defect
+those tests found in their own fixture (section 8) and the mutation
+coverage they proved (section 7) are still true statements about the code
+as it existed then. Treat any reference below to `AC-ARCH-2`, `AC-ARCH-3`,
+or the two named tests as historical, not current.
+
 Per standard §11: every mutation below was actually applied to the working
 file (never "mentally mutated"), confirmed landed on the intended construct
 by `diff` against a `cp` snapshot taken before any mutation began (never

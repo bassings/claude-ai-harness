@@ -344,6 +344,53 @@ test('static: HARN-FIX-3 -- the install-consistency preflight block (INSTALL_CON
   assert.equal(review, plan, 'review-cycle.js\'s install-consistency preflight block has drifted from plan-cycle.js\'s')
 })
 
+// specs/harn-fix-3.md AC-ARCH-4: the version stamp (formerly AC-ARCH-1/2/3)
+// was built, reviewed, and withdrawn 2026-08-23 -- not deferred, not
+// softened, REPLACED by a rule that no such mechanism may exist at all.
+// Round-one review found it generated permanent false drift on every
+// commit to main (the hook re-stamped three files unconditionally, so the
+// staleness check above could never see past it) and, separately, that
+// stamp_md/stamp_js staged the WHOLE working-tree file, sweeping unstaged
+// edits into unrelated commits and into this repo's public remote history.
+// This guard is the mechanical enforcement of the withdrawal: it fails if
+// either half of the mechanism ever reappears, in this repo or a fork of
+// it, rather than trusting the withdrawal to stay remembered as prose.
+test('static: AC-ARCH-4 -- no shipped (non-test, non-docs, non-spec) tracked file contains a SOURCE_COMMIT stamp, and .githooks/ contains no pre-commit hook -- the version stamp is withdrawn, not merely unused', () => {
+  const exec = require('node:child_process').execFileSync
+  const tracked = exec('git', ['ls-files'], { cwd: ROOT, encoding: 'utf8' })
+    .split('\n')
+    .filter(Boolean)
+  // Excludes test/, docs/, specs/: those are where the WITHDRAWAL itself
+  // is documented and narrated (this file's own comment above says
+  // "SOURCE_COMMIT" by name, specs/harn-fix-3.md records the withdrawal
+  // history, and docs/*-mutation-proofs.md keep a historical record of the
+  // mutations that were run against the since-deleted mechanism) -- a scan
+  // that also walked those would fail on the very act of documenting the
+  // ban. Everything else tracked in the repo is "shipped": the point of
+  // AC-ARCH-4 is that a consumer's ~/.claude install, or a fork's main,
+  // must never be able to pick this back up.
+  const shipped = tracked.filter((f) => !f.startsWith('test/') && !f.startsWith('docs/') && !f.startsWith('specs/'))
+  assert.ok(shipped.length > 25, `sanity: expected many tracked shipped files, found ${shipped.length}`)
+  const offenders = []
+  for (const rel of shipped) {
+    const full = path.join(ROOT, rel)
+    if (!fs.existsSync(full) || !fs.statSync(full).isFile()) continue
+    let contents
+    try {
+      contents = fs.readFileSync(full, 'utf8')
+    } catch (e) {
+      continue // a binary or unreadable file cannot contain the string meaningfully
+    }
+    if (contents.includes('SOURCE_COMMIT')) offenders.push(rel)
+  }
+  assert.deepEqual(offenders, [], `AC-ARCH-4: SOURCE_COMMIT reappeared in shipped file(s): ${offenders.join(', ')} -- the version stamp is withdrawn, not deferred`)
+
+  const hooksDirExists = fs.existsSync(path.join(ROOT, '.githooks'))
+  assert.ok(hooksDirExists, 'sanity: .githooks/ must exist (it still hosts pre-push)')
+  const hookFiles = fs.readdirSync(path.join(ROOT, '.githooks'))
+  assert.ok(!hookFiles.includes('pre-commit'), 'AC-ARCH-4: .githooks/pre-commit must not exist -- no git hook may rewrite tracked content during a commit')
+})
+
 // HARN-OPT-2 PR2 (AC-ARCH-9): the start/terminal exception-guard block PR 2
 // added (an exception escaping run() must still reach the single terminal
 // writeLedger( call, then re-throw) is a SECOND necessarily-triplicated

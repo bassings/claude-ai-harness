@@ -9,14 +9,6 @@ export const meta = {
   ],
 }
 
-// SOURCE_COMMIT: written by .githooks/pre-commit on every commit -- do not
-// hand-edit (specs/harn-fix-3.md AC-ARCH-1, AC-ARCH-3). Names the commit
-// that was HEAD immediately before this one (a commit cannot embed its own
-// hash, so this necessarily lags the containing commit by exactly one; see
-// the hook's own header). A commit identity, not an age: read it with
-// workflows/lib/install-consistency.mjs's parseSourceCommitStamp.
-const SOURCE_COMMIT = '065abe4302fe617c66ad72f7959165aa8a8c83ad'
-
 // HARN-FIX-3 install-consistency preflight block (AC-QA-1..4): byte-identical
 // across plan-cycle.js and review-cycle.js, mirroring the L5/PR2 triplicated
 // -block pattern below (the run-ledger helpers) -- a fix landed in one copy
@@ -43,13 +35,20 @@ const INSTALL_CONSISTENCY_INSTRUCTION =
 
 const INSTALL_CONSISTENCY_SCHEMA = {
   type: 'object',
-  required: ['ok', 'consistent', 'blind', 'checked_dir'],
+  required: ['ok', 'consistent', 'blind', 'checked_dir', 'doc_fields', 'agent_fields'],
   properties: {
     ok: { type: 'boolean' },
     consistent: { type: 'boolean' },
     blind: { type: 'boolean' },
     checked_dir: { type: 'string' },
     lens_files_checked: { type: ['integer', 'null'] },
+    // MED-2 (round-one review): required, not merely reported, because the
+    // in-process cross-check below (crossCheckAgainstOwnSchema) needs these
+    // as its OWN input -- the fields the model claims AGENT-HARNESS.md and
+    // agents/lens-*.md instruct, re-verified here against the literal
+    // schema object this process holds, rather than trusted at face value.
+    doc_fields: { type: 'array', items: { type: 'string' } },
+    agent_fields: { type: 'array', items: { type: 'string' } },
     missing_in_review_schema: { type: 'array', items: { type: 'string' } },
     missing_in_plan_schema: { type: 'array', items: { type: 'string' } },
     review_only_props: { type: 'array', items: { type: 'string' } },
@@ -58,7 +57,7 @@ const INSTALL_CONSISTENCY_SCHEMA = {
   },
 }
 
-function installConsistencyError(consistency) {
+function installConsistencyError(consistency, crossCheckReason) {
   const c = consistency || {}
   return new Error(
     `InstallInconsistent: the installed harness's findings schema does not agree with what AGENT-HARNESS.md and ` +
@@ -68,11 +67,68 @@ function installConsistencyError(consistency) {
     `not instructed anywhere: ${JSON.stringify(c.review_only_props || [])}. Declared in PLAN_SCHEMA but not ` +
     `instructed anywhere: ${JSON.stringify(c.plan_only_props || [])}. ` +
     `${c.blind ? 'The check found nothing to compare on at least one side (blind), which is treated as inconsistent, never as clean. ' : ''}` +
-    `${c.error ? `Check error: ${c.error}. ` : ''}Refusing to dispatch any lens: an instructed field with no schema ` +
+    `${c.error ? `Check error: ${c.error}. ` : ''}` +
+    `${crossCheckReason ? `IN-PROCESS CROSS-CHECK (MED-2): ${crossCheckReason}. ` : ''}` +
+    `Refusing to dispatch any lens: an instructed field with no schema ` +
     `slot is silently dropped (H3's own shape). Re-sync the installed copy from the published repo, then re-run.`
   )
 }
+
+// MED-2 (round-one review): the refusal above must not be decided SOLELY by
+// the "consistent" boolean the scope agent reports -- that is model output,
+// and a fabricated {consistent:true} satisfies the schema undetectably. This
+// recomputes the comparison IN-PROCESS, against the LITERAL schema object
+// this running script already holds (needs no fs, no subprocess, no model),
+// using only the model-reported doc_fields/agent_fields as input. It can
+// only verify the schema THIS FILE declares (PLAN_SCHEMA here, REVIEW_SCHEMA
+// in review-cycle.js): each workflow checks its own running schema, never
+// the other file's -- but that is exactly the schema that matters most for
+// THIS session, and it needs no disk read of plan-cycle.js/review-cycle.js
+// at all, which also closes MED-3 for the schema half of the preflight (the
+// running object IS "the copy that actually executes"; a stale ~/.claude
+// snapshot loaded at session start cannot diverge from itself).
+function crossCheckAgainstOwnSchema(consistency, ownSchema, ownSchemaName) {
+  const c = consistency || {}
+  const docFields = Array.isArray(c.doc_fields) ? c.doc_fields : []
+  const agentFields = Array.isArray(c.agent_fields) ? c.agent_fields : []
+  const reported = [...new Set([...docFields, ...agentFields])]
+  if (reported.length === 0) {
+    return { ok: false, reason: 'doc_fields and agent_fields were both empty (or absent) in the reported consistency object -- treated as blind, never as clean' }
+  }
+  const ownProps = new Set(Object.keys(ownSchema.properties.findings.items.properties))
+  const missingFromOwnSchema = reported.filter((f) => !ownProps.has(f))
+  if (missingFromOwnSchema.length) {
+    return {
+      ok: false,
+      reason: `field(s) reported as instructed (${JSON.stringify(missingFromOwnSchema)}) are absent from the RUNNING ${ownSchemaName} object in THIS process -- a fabricated or stale "consistent:true" cannot hide this, because it is recomputed here, never trusted from the report`,
+    }
+  }
+  return { ok: true, reason: null }
+}
 // ---- end HARN-FIX-3 install-consistency preflight block ----
+
+// Moved to module scope (from its previous position inside run(), just
+// before Phase 2) so the MED-2 cross-check above can read it before the
+// AC-QA-1/AC-QA-2 gate runs, without needing a disk read of this file's own
+// text (MED-3) -- the literal object IS what this session executes.
+const PLAN_SCHEMA = {
+  type: 'object',
+  required: ['verdict', 'coverage', 'acceptance_criteria'],
+  properties: {
+    verdict: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] },
+    coverage: {
+      type: 'object',
+      required: ['examined', 'verified_by', 'could_not_check'],
+      properties: { examined: { type: 'string' }, verified_by: { type: 'string' }, could_not_check: { type: 'string' } },
+    },
+    acceptance_criteria: { type: 'array', items: { type: 'object', required: ['id', 'statement'], properties: { id: { type: 'string' }, statement: { type: 'string' }, proof_level: { type: 'string' } } } },
+    // H3: recurrence was instructed in AGENT-HARNESS.md's FINDINGS template
+    // and in all nine agents/lens-*.md files (including lens-simplicity's
+    // veto write-up, planning-only) with no matching property here -- see
+    // the identical comment and the drift guard test in review-cycle.js.
+    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, recurrence: { type: ['string', 'null'] } } } },
+  },
+}
 
 // args can arrive as a JSON-encoded string depending on the caller; normalise before use
 let opts = args
@@ -300,6 +356,13 @@ planHeadSha = typeof scope.head_sha === 'string' ? scope.head_sha : null
 if (!scope.consistency || scope.consistency.blind || scope.consistency.consistent !== true) {
   throw installConsistencyError(scope.consistency)
 }
+// MED-2: even a reported consistent:true is re-verified here, in-process,
+// against PLAN_SCHEMA as this session actually holds it -- a fabricated or
+// stale report can satisfy the schema above and still be caught here.
+const planCrossCheck = crossCheckAgainstOwnSchema(scope.consistency, PLAN_SCHEMA, 'PLAN_SCHEMA')
+if (!planCrossCheck.ok) {
+  throw installConsistencyError(scope.consistency, planCrossCheck.reason)
+}
 
 // ---- deterministic lens triggering (AGENT-HARNESS.md roster; simplicity is planning-only and always on) ----
 let lenses = ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product']
@@ -320,24 +383,6 @@ const skipped = ALL.filter(l => !lenses.includes(l))
 log(`Planning ${specPath}: ${scope.summary} Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}.`)
 
 // ---- Phase 2: lenses in parallel (planning is read-only, no isolation needed) ----
-const PLAN_SCHEMA = {
-  type: 'object',
-  required: ['verdict', 'coverage', 'acceptance_criteria'],
-  properties: {
-    verdict: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] },
-    coverage: {
-      type: 'object',
-      required: ['examined', 'verified_by', 'could_not_check'],
-      properties: { examined: { type: 'string' }, verified_by: { type: 'string' }, could_not_check: { type: 'string' } },
-    },
-    acceptance_criteria: { type: 'array', items: { type: 'object', required: ['id', 'statement'], properties: { id: { type: 'string' }, statement: { type: 'string' }, proof_level: { type: 'string' } } } },
-    // H3: recurrence was instructed in AGENT-HARNESS.md's FINDINGS template
-    // and in all nine agents/lens-*.md files (including lens-simplicity's
-    // veto write-up, planning-only) with no matching property here -- see
-    // the identical comment and the drift guard test in review-cycle.js.
-    findings: { type: 'array', items: { type: 'object', required: ['severity', 'claim', 'evidence', 'consequence', 'fix'], properties: { severity: { type: 'string', enum: ['Critical', 'High', 'Medium', 'Low'] }, claim: { type: 'string' }, location: { type: 'string' }, evidence: { type: 'string' }, consequence: { type: 'string' }, fix: { type: 'string' }, recurrence: { type: ['string', 'null'] } } } },
-  },
-}
 
 const lensPrompt = (lens) =>
   `PLANNING mode. The spec is at ${specPath}. Likely touched paths: ${scope.likely_paths.join(', ') || 'unknown'}.\n` +

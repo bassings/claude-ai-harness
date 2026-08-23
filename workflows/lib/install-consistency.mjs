@@ -238,40 +238,62 @@ function walkDirRecursive(rootDir, relDir, out) {
   }
 }
 
-// Pattern-driven, not a whole-tree walk-then-filter: only visits the
-// directories CONSUMER_SUBSET_PATTERNS actually names (agents/, workflows/,
-// workflows/lib/, hooks/, skills/optimise-cycle/), so a real clone's .git/
-// internals, test/, docs/, specs/ and every other unrelated top-level
-// directory are never traversed at all -- both faster and a more literal
-// reading of AC-OPS-4's "exactly the consumer subset" than filtering a
-// full-tree walk down after the fact.
+// MED-8 (round-one review): this used to rebuild its own inline glob-
+// matching logic in parallel with matchesPattern()/isConsumerSubsetPath()
+// above -- two independent matchers deciding the same question, with
+// nothing keeping them in agreement. Proven divergent on a scratch copy of
+// this module with a pattern substituted: isConsumerSubsetPath() said yes
+// while this function's own inline regex said no for the identical path.
+// Fixed by collapsing to ONE authority: this function now only decides
+// WHICH DIRECTORIES TO WALK (a performance optimisation -- so a real
+// clone's .git/ internals, test/, docs/, specs/ and every other unrelated
+// top-level directory are never traversed), and isConsumerSubsetPath()
+// (via matchesPattern()) is the SOLE decision for what counts as a match,
+// applied as a filter over every candidate the walk finds.
 export function listConsumerSubsetFiles(dir) {
-  const out = new Set()
+  const topLevelDirs = new Set()
+  let needsRoot = false
   for (const pattern of CONSUMER_SUBSET_PATTERNS) {
-    if (pattern.endsWith('/')) {
-      walkDirRecursive(dir, pattern.slice(0, -1), out)
-    } else if (pattern.includes('*')) {
-      const slashIdx = pattern.lastIndexOf('/')
-      const dirPart = slashIdx === -1 ? '' : pattern.slice(0, slashIdx)
-      const namePattern = slashIdx === -1 ? pattern : pattern.slice(slashIdx + 1)
-      const nameRe = new RegExp('^' + namePattern.split('*').map(escapeRegExpLiteral).join('[^/]*') + '$')
-      let names
-      try {
-        names = fs.readdirSync(path.join(dir, dirPart))
-      } catch (e) {
-        continue
-      }
-      for (const name of names) {
-        if (!nameRe.test(name)) continue
-        const rel = dirPart ? `${dirPart}/${name}` : name
-        if (fs.statSync(path.join(dir, rel)).isFile()) out.add(rel)
+    const bare = pattern.endsWith('/') ? pattern.slice(0, -1) : pattern
+    const slashIdx = bare.indexOf('/')
+    if (slashIdx === -1) {
+      if (pattern.endsWith('/')) {
+        // A directory-prefix pattern living directly at the repo root
+        // (e.g. 'hooks/') -- no FURTHER slash in `bare`, but it is still a
+        // directory to walk, not a root-level literal. Bug caught by
+        // test/install-consistency.test.js: the original cut of this fix
+        // read the absence of a second slash as "root-level", which
+        // silently dropped hooks/hooks.json from every result.
+        topLevelDirs.add(bare)
+      } else {
+        // A genuine root-level literal (AGENT-HARNESS.md) or root-level
+        // glob: only the repo root itself needs walking for these, not a
+        // whole subdirectory -- and NOT recursively (walkDirRecursive from
+        // '' would also descend into every OTHER top-level directory,
+        // exactly the unwanted full-tree walk this function exists to
+        // avoid).
+        needsRoot = true
       }
     } else {
-      const abs = path.join(dir, pattern)
-      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) out.add(pattern)
+      topLevelDirs.add(bare.slice(0, slashIdx))
     }
   }
-  return [...out].sort()
+
+  const candidates = new Set()
+  if (needsRoot) {
+    let entries
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch (e) {
+      entries = []
+    }
+    for (const entry of entries) {
+      if (entry.isFile()) candidates.add(entry.name)
+    }
+  }
+  for (const topDir of topLevelDirs) walkDirRecursive(dir, topDir, candidates)
+
+  return [...candidates].filter((rel) => isConsumerSubsetPath(rel)).sort()
 }
 
 // AC-OPS-2/AC-OPS-4: compares the published tree's consumer subset against
@@ -296,6 +318,16 @@ export function listConsumerSubsetFiles(dir) {
 export function checkStaleness(publishedDir, installDir) {
   const publishedFiles = listConsumerSubsetFiles(publishedDir)
   const blind = publishedFiles.length === 0
+  // MED-8(b): per-PATTERN blindness, independent of the aggregate `blind`
+  // above. The aggregate check alone cannot see a renamed or moved subset
+  // directory: other patterns still matching something keeps
+  // publishedFiles non-empty while one whole pattern silently stops
+  // matching anything at all, which is the "found something, therefore
+  // looked at everything" gap MED-8 names -- the same shape as
+  // checkConsistency()'s per-side (not per-file) blind_reasons above.
+  // Reported here, not acted on: this module never decides how the CALLER
+  // (bin/optimise-cycle-weekly.sh) should log it.
+  const unmatchedPatterns = CONSUMER_SUBSET_PATTERNS.filter((pattern) => !publishedFiles.some((rel) => matchesPattern(rel, pattern))).sort()
   const drifted = []
   const missing = []
   if (!blind) {
@@ -317,23 +349,11 @@ export function checkStaleness(publishedDir, installDir) {
   return {
     published_files_checked: publishedFiles.length,
     blind,
+    unmatched_patterns: unmatchedPatterns,
     drifted,
     missing,
     drift: [...drifted, ...missing].sort(),
   }
-}
-
-// ---- the SOURCE_COMMIT stamp (AC-ARCH-1..3): a small, separate concern --
-// this module reads the same three files anyway, so it is a free extra
-// signal, not a new file read. Written by .githooks/pre-commit, never by
-// hand; see that file's own header for why it necessarily names the PARENT
-// commit rather than the commit it ships inside (a commit cannot embed its
-// own hash).
-const SOURCE_COMMIT_RE = /SOURCE_COMMIT\s*[:=]\s*['"]?([0-9a-f]{40})['"]?/
-export function parseSourceCommitStamp(text) {
-  if (typeof text !== 'string') return null
-  const m = SOURCE_COMMIT_RE.exec(text)
-  return m ? m[1] : null
 }
 
 // ---- CLI: resolves an install directory, reads the files, runs the check ----
@@ -410,11 +430,6 @@ export function main(argDir) {
       ok: false,
       checked_dir: dir,
       lens_files_checked: lensFiles.length,
-      source_commits: {
-        agent_harness: parseSourceCommitStamp(agentHarnessMd),
-        plan_cycle: parseSourceCommitStamp(planCycleSource),
-        review_cycle: parseSourceCommitStamp(reviewCycleSource),
-      },
       error: `required file(s) missing under ${dir}: ${missingRequired.join(', ')}`,
       ...EMPTY_CHECK,
     }
@@ -426,11 +441,6 @@ export function main(argDir) {
     ok: true,
     checked_dir: dir,
     lens_files_checked: lensFiles.length,
-    source_commits: {
-      agent_harness: parseSourceCommitStamp(agentHarnessMd),
-      plan_cycle: parseSourceCommitStamp(planCycleSource),
-      review_cycle: parseSourceCommitStamp(reviewCycleSource),
-    },
     error: null,
     ...check,
   }

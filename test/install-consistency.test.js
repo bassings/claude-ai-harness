@@ -218,25 +218,6 @@ test('install-consistency: ANTI-VACUITY -- a workflow source where the named sch
   assert.equal(result.consistent, false)
 })
 
-// ---- parseSourceCommitStamp (AC-ARCH-1..3) ----
-
-test('install-consistency: parseSourceCommitStamp reads the JS const form', async () => {
-  const { parseSourceCommitStamp } = await loadModule()
-  const sha = parseSourceCommitStamp("const SOURCE_COMMIT = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n")
-  assert.equal(sha, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
-})
-
-test('install-consistency: parseSourceCommitStamp reads the AGENT-HARNESS.md HTML-comment form', async () => {
-  const { parseSourceCommitStamp } = await loadModule()
-  const sha = parseSourceCommitStamp('<!-- SOURCE_COMMIT: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -->\n')
-  assert.equal(sha, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
-})
-
-test('install-consistency: parseSourceCommitStamp returns null when no stamp is present, rather than matching something unrelated', async () => {
-  const { parseSourceCommitStamp } = await loadModule()
-  assert.equal(parseSourceCommitStamp('no stamp anywhere in this text\n'), null)
-})
-
 // ---- resolveInstallDir (AC-QA-4) ----
 
 test('install-consistency: resolveInstallDir prefers an explicit argument over CLAUDE_HOME and the ~/.claude default', async () => {
@@ -347,21 +328,6 @@ test('install-consistency: main() counts lens_files_checked from the actual agen
   })
   const out = main(dir)
   assert.equal(out.lens_files_checked, 3)
-})
-
-test('install-consistency: main() surfaces the SOURCE_COMMIT stamp from all three files it already reads, as source_commits', async () => {
-  const { main } = await loadModule()
-  const shaA = 'a'.repeat(40)
-  const shaP = 'b'.repeat(40)
-  const shaR = 'c'.repeat(40)
-  const dir = writeFixture({
-    agentHarnessMd: `<!-- SOURCE_COMMIT: ${shaA} -->\n` + AGENT_HARNESS_MD_RECURRENCE_ONLY,
-    lensFiles: {},
-    planCycleSource: `const SOURCE_COMMIT = '${shaP}'\n` + schemaSource('PLAN_SCHEMA', []),
-    reviewCycleSource: `const SOURCE_COMMIT = '${shaR}'\n` + schemaSource('REVIEW_SCHEMA', []),
-  })
-  const out = main(dir)
-  assert.deepEqual(out.source_commits, { agent_harness: shaA, plan_cycle: shaP, review_cycle: shaR })
 })
 
 // AC-QA-4, proven by REAL subprocess execution (not just calling main() in-process):
@@ -508,6 +474,33 @@ test('install-consistency: listConsumerSubsetFiles never throws when a pattern d
   assert.deepEqual(listConsumerSubsetFiles(dir), ['AGENT-HARNESS.md'])
 })
 
+// round-one review MED-8: isConsumerSubsetPath (via matchesPattern) and
+// listConsumerSubsetFiles used to be two INDEPENDENT matchers over the
+// same CONSUMER_SUBSET_PATTERNS -- proven divergent on a scratch copy of
+// the module with a pattern substituted. This is the round-trip proof that
+// the fix (listConsumerSubsetFiles now filters every candidate through
+// isConsumerSubsetPath, never a second inline matcher) holds: every path
+// the walk returns satisfies the standalone predicate, AND every file
+// actually on disk that the predicate accepts is reachable by the walk --
+// so a mutation to matchesPattern (see docs/install-consistency-mutation-proofs.md)
+// changes BOTH functions' behaviour together, never just one.
+test('install-consistency: MED-8 -- listConsumerSubsetFiles and isConsumerSubsetPath can never disagree (single authority, not two independent matchers)', async () => {
+  const { listConsumerSubsetFiles, isConsumerSubsetPath } = await loadModule()
+  const dir = publishedSubsetTree()
+  const files = listConsumerSubsetFiles(dir)
+  assert.ok(files.length > 5, 'sanity: expected several subset files')
+  for (const rel of files) {
+    assert.ok(isConsumerSubsetPath(rel), `listConsumerSubsetFiles returned "${rel}" but isConsumerSubsetPath rejects it -- the two matchers have diverged`)
+  }
+  // The negative controls the fixture deliberately plants (agents/implementer.md,
+  // skills/other-skill/SKILL.md, test/, docs/, README.md) must be excluded by
+  // BOTH functions identically, not just one.
+  for (const rel of ['agents/implementer.md', 'skills/other-skill/SKILL.md', 'test/some.test.js', 'docs/some-note.md', 'README.md']) {
+    assert.ok(!files.includes(rel), `listConsumerSubsetFiles must not include "${rel}"`)
+    assert.ok(!isConsumerSubsetPath(rel), `isConsumerSubsetPath must not accept "${rel}"`)
+  }
+})
+
 // ---- checkStaleness: the drift comparison itself (AC-OPS-4) ----
 
 test('install-consistency: checkStaleness reports no drift when the install matches the published subset exactly', async () => {
@@ -563,6 +556,39 @@ test('install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published 
   assert.equal(result.published_files_checked, 0)
   assert.equal(result.blind, true)
   assert.deepEqual(result.drift, [], 'blind must not be disguised as drift either -- it is a distinct, louder signal that nothing could be compared at all')
+})
+
+// round-one review MED-8(b): per-PATTERN blindness, independent of the
+// aggregate blind:true above. A published tree with SOME subset content
+// (aggregate blind stays false) but nothing at all under one whole
+// pattern's directory must still name that pattern -- the failure the
+// aggregate-only check cannot see (a renamed or moved subset directory
+// silently stops being compared while everything else still looks fine).
+test('install-consistency: checkStaleness (MED-8b) -- a published tree with content for every pattern EXCEPT one reports that one pattern in unmatched_patterns, while the aggregate blind stays false', async () => {
+  const { checkStaleness } = await loadModule()
+  const dir = writeTree({
+    'AGENT-HARNESS.md': 'harness contract\n',
+    'agents/lens-security.md': 'lens security\n',
+    'workflows/plan-cycle.js': 'plan cycle\n',
+    'workflows/review-cycle.js': 'review cycle\n',
+    'workflows/lib/ledger-append.mjs': 'ledger append\n',
+    'skills/optimise-cycle/SKILL.md': 'optimise-cycle skill\n',
+    // no agents/reviewer-*.md, no hooks/ at all
+  })
+  const install = dir
+  const result = checkStaleness(dir, install)
+  assert.equal(result.blind, false, 'sanity: the aggregate check must NOT be blind -- most patterns matched something')
+  assert.ok(result.unmatched_patterns.includes('hooks/'), `expected "hooks/" in unmatched_patterns, got: ${JSON.stringify(result.unmatched_patterns)}`)
+  assert.ok(result.unmatched_patterns.includes('agents/reviewer-*.md'), `expected "agents/reviewer-*.md" in unmatched_patterns, got: ${JSON.stringify(result.unmatched_patterns)}`)
+  assert.ok(!result.unmatched_patterns.includes('AGENT-HARNESS.md'), 'a pattern that DID match something must not be listed as unmatched')
+  assert.ok(!result.unmatched_patterns.includes('workflows/*.js'), 'a pattern that DID match something must not be listed as unmatched')
+})
+
+test('install-consistency: checkStaleness (MED-8b) -- a published tree with content for every pattern reports an EMPTY unmatched_patterns list (must not cry wolf)', async () => {
+  const { checkStaleness } = await loadModule()
+  const dir = publishedSubsetTree()
+  const result = checkStaleness(dir, dir)
+  assert.deepEqual(result.unmatched_patterns, [])
 })
 
 test('install-consistency: checkStaleness reads only -- never writes, creates or deletes anything in EITHER directory it is given (AC-OPS-2)', async () => {

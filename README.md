@@ -848,11 +848,12 @@ drifted-plus-missing files (never the file list -- the log line already
 carries that), mirroring the existing FAIL-summary stderr line below on the
 same already-wired `StandardErrorPath` channel. This is visibility only:
 drift never sets `overall_fail` and never fails the weekly run, exactly
-like `could-not-check`. Both the run's own header line and the staleness
-report's line separately name the installed `AGENT-HARNESS.md`'s
-`SOURCE_COMMIT` stamp (`unknown` when unreadable), so a log entry states
-both which copy of this SCRIPT ran and which commit the INSTALL it checked
-claimed to be.
+like `could-not-check`. The run's own header line names `SCRIPT_VERSION`, so
+a log entry states which copy of this SCRIPT ran (a per-commit install
+stamp was tried and withdrawn -- specs/harn-fix-3.md's "Version stamp --
+DROPPED 2026-08-23" -- because the hook that wrote it generated permanent
+false drift and could leak unstaged edits into a commit; full-file
+comparison against published `main` is this check's only staleness signal).
 
 Covered by `test/weekly-runner.test.js`, which drives the real script
 against real temp git repos with a stub `claude` on PATH -- no test run ever

@@ -1,9 +1,12 @@
-# HARN-FIX-3 (task 1 of 2): version stamp + consistency check mutation proofs
+# HARN-FIX-3 (task 1 of 2): consistency check + (withdrawn) version stamp mutation proofs
 
-Scope: `AC-ARCH-1`, `AC-ARCH-3`, `AC-QA-1` through `AC-QA-5`, `AC-SIMP-1`
-through `AC-SIMP-3` from `specs/harn-fix-3.md`. `AC-OPS-*` and `AC-ARCH-2`
-(the staleness check in `bin/optimise-cycle-weekly.sh`) belong to a separate
-task and are not covered here.
+Scope: `AC-QA-1` through `AC-QA-5`, `AC-SIMP-1` through `AC-SIMP-3` from
+`specs/harn-fix-3.md`, plus `AC-ARCH-4` (added round two, replacing the
+withdrawn `AC-ARCH-1`/`AC-ARCH-2`/`AC-ARCH-3`). `AC-OPS-*` (the staleness
+check in `bin/optimise-cycle-weekly.sh`) belongs to a separate task and is
+not covered here, except where `AC-ARCH-4`'s removal or `MED-8`'s fix
+surgically touched shared code in `workflows/lib/install-consistency.mjs`
+or (stamp-removal only) `bin/optimise-cycle-weekly.sh`.
 
 Per standard §11: every mutation below was actually applied to the working
 file (never "mentally mutated"), confirmed landed on the intended construct
@@ -13,11 +16,16 @@ failing set recorded, then restored from the snapshot and reconfirmed
 byte-identical and green before the next mutation. Mutations were applied
 one at a time, never stacked.
 
-Two bugs were found and fixed by this process, not merely by reading the
-code -- both are recorded in their own section below, because a report that
-only lists successful mutation proofs and omits what those proofs actually
-caught during development would be misleading about how this file was
-produced.
+**Sections 1-4 below are round one** (the consistency check: still shipped,
+unaffected by the withdrawal). **Two bugs were found and fixed by this
+process, not merely by reading the code, in round one** -- recorded there,
+because a report that only lists successful mutation proofs and omits what
+those proofs actually caught during development would be misleading about
+how this file was produced. Round one's own version-stamp mechanism
+(`.githooks/pre-commit`, `parseSourceCommitStamp`) and its mutation proofs
+were DELETED, not archived here, when the stamp was withdrawn -- see
+"Round two" below for why, and for the two further bugs that round's own
+process caught.
 
 ## 1. The workflow-level refuse gate (`plan-cycle.js`)
 
@@ -154,88 +162,301 @@ intended substring changed, inside the prompt string, not a comment.
 **Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical, suite
 back to 43/43.
 
-## 5. The pre-commit hook's staging step (`.githooks/pre-commit`)
+## Round two (2026-08-23): the version stamp is withdrawn, `AC-ARCH-4` replaces it
 
-**Guarded by**: `test/pre-commit-stamp.test.js`, executed against real,
-throwaway git repos (never the live checkout).
+Round-one review (18 findings) found the stamp mechanism -- sections 1-4
+above are about the CONSISTENCY CHECK, unaffected -- generated permanent
+false drift on every commit to `main` (the hook rewrote the stamp
+unconditionally, so the staleness check could never see past it) and,
+separately, that `stamp_md`/`stamp_js` staged the WHOLE working-tree file,
+sweeping unstaged edits in the three most-edited files in this repo into
+unrelated commits and this repo's public remote history. `specs/harn-fix-3.md`
+records the decision: `AC-ARCH-1`, `AC-ARCH-2` and `AC-ARCH-3` are
+**withdrawn, not deferred**, replaced by `AC-ARCH-4` (no mechanism writes a
+commit identifier into a shipped file, and no git hook rewrites tracked
+content during a commit). `.githooks/pre-commit`, `parseSourceCommitStamp`,
+`source_commits`, `test/pre-commit-stamp.test.js`, and the two prior
+sections' worth of stamp-specific mutation proofs (the original sections 5
+and the stamp-related "Bugs found" entries) were deleted along with the
+mechanism itself, per the withdrawal, rather than kept as proofs of a guard
+that no longer exists. The full removal diff also touched
+`bin/optimise-cycle-weekly.sh` (surgically: only `INSTALL_SOURCE_COMMIT`
+and the two `install_source_commit=` log fields), `test/weekly-runner.test.js`
+(deleted the two tests solely about the stamp, fixed one regex in a test
+whose primary subject was unrelated), and `README.md` (one paragraph that
+had claimed the mechanism's continued existence).
 
-**Mutation**: removed the `git add "$file"` line from the `stamp_md()`
-shell function only (`stamp_js()` untouched), so `AGENT-HARNESS.md` is still
-rewritten on disk but never staged into the commit.
+### `AC-ARCH-4`'s own static guard
 
-**Confirmed landed**: `diff` against the snapshot showed exactly the one
-intended line removed.
+**Guarded by**: `test/static-checks.test.js`'s new
+`"static: AC-ARCH-4 -- no shipped ... file contains a SOURCE_COMMIT stamp,
+and .githooks/ contains no pre-commit hook"` test, which scans every
+`git ls-files`-tracked path outside `test/`, `docs/` and `specs/` for the
+literal string `SOURCE_COMMIT`, and separately asserts `.githooks/` lists no
+`pre-commit` entry.
 
-**Result**: exactly 1 of 8 tests failed --
+**Mutation A**: appended `const SOURCE_COMMIT = '0000...0000'` to the end of
+`workflows/plan-cycle.js`.
+
+**Confirmed landed**: `diff` against a `cp` snapshot showed exactly the one
+appended line.
+
+**Result**: 1 of 45 `static-checks.test.js` tests failed, naming the exact
+file --
 
 ```
-✖ pre-commit: runs UNCONDITIONALLY -- a commit that only touches an unrelated file still re-stamps all three
-  files to the NEW parent, and includes that re-stamp in the SAME commit even though only the unrelated
-  file was staged by hand
-  AssertionError [ERR_ASSERTION]: the unconditional hook must fold the re-stamp into the SAME commit as the
-  unrelated change, even though only README.md was staged by hand
-  + actual - expected
-    [
-  -   'AGENT-HARNESS.md',
-      'README.md',
-      'workflows/plan-cycle.js',
-      'workflows/review-cycle.js'
-    ]
+✖ static: AC-ARCH-4 -- ...
+  AssertionError [ERR_ASSERTION]: AC-ARCH-4: SOURCE_COMMIT reappeared in
+  shipped file(s): workflows/plan-cycle.js -- the version stamp is
+  withdrawn, not deferred
 ```
-
-**Known residual gap, surfaced rather than hidden**: the FIRST pre-commit
-test ("stamps all three files with the value `git rev-parse HEAD`
-reported...") did **not** fail under this mutation, because it reads the
-stamp back via `fs.readFileSync` against the WORKING TREE, which the
-mutated hook still rewrites correctly -- only the COMMITTED blob is stale
-(the file is left modified-but-unstaged immediately after the commit
-completes). One test catching a defect class is sufficient to prove the
-guard load-bearing per AC-QA-5, but a reader should not conclude every test
-in the file independently detects every mutation shape; they do not, and
-this is the recorded example of why.
 
 **Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical, suite
-back to 8/8.
+back to 45/45.
 
-## Bugs found and fixed BY this mutation-testing process, not by reading
+**Mutation B**: recreated `.githooks/pre-commit` (a one-line `#!/bin/sh`
+stub, executable).
 
-Both were caught because a test was written first, run, and its failure
-message read carefully -- exactly the discipline this exercise exists to
-enforce.
+**Result**: 1 of 45 tests failed --
 
-### Bug 1: `SOURCE_COMMIT_RE` did not match the real JS const form
+```
+✖ static: AC-ARCH-4 -- ...
+  AssertionError [ERR_ASSERTION]: AC-ARCH-4: .githooks/pre-commit must not
+  exist -- no git hook may rewrite tracked content during a commit
+```
 
-`workflows/lib/install-consistency.mjs`'s original
-`parseSourceCommitStamp()` used
-`/SOURCE_COMMIT[:=]\s*['"]?([0-9a-f]{40})['"]?/` -- requiring `:` or `=` to
-follow `SOURCE_COMMIT` with **no intervening space**. The real JS form,
-`const SOURCE_COMMIT = '...'`, has a space before `=`, so the regex never
-matched it; only the Markdown comment form (`SOURCE_COMMIT: ...`, colon
-immediately adjacent) happened to match by coincidence of spelling. Caught
-by `test/install-consistency.test.js`'s
-"parseSourceCommitStamp reads the JS const form" test, which failed RED
-before the fix (not skipped, not mentally verified). Fixed by widening to
-`/SOURCE_COMMIT\s*[:=]\s*['"]?([0-9a-f]{40})['"]?/`.
+**Reverted**: `rm .githooks/pre-commit` (never re-created via `cp`, since
+the correct restored state is ABSENCE), suite back to 45/45.
 
-### Bug 2: `git rev-parse HEAD`'s stdout on an unborn branch broke the null-sha fallback
+**One real bug found while writing this guard, before it was ever
+mutation-tested**: the first cut's sanity floor
+(`assert.ok(shipped.length > 50, ...)`) was itself wrong -- this repo has
+only 88 tracked files total, 37 outside `test/`/`docs/`/`specs/`, so the
+guard was RED on its own first run, before any mutation, for a reason that
+had nothing to do with the thing it was meant to protect. Caught immediately
+by running it (not skipped, not assumed passing), fixed by lowering the
+floor to 25 (well under 37, generous headroom).
 
-The original hook used
-`SHA=$(git rev-parse HEAD 2>/dev/null || echo <null-sha>)`. Measured
-directly: on an unborn branch (the very first commit in a repo), `git
-rev-parse HEAD` exits 128 but **still prints the literal token `HEAD` to
-stdout** before failing (its best-effort echo of the unresolved revision).
-Command substitution captures that stdout regardless of exit code, and `||`
-then appends the fallback's output on a second line, leaving `SHA` as the
-two-line string `"HEAD\n0000...0000"` -- which broke the `sed` calls with
-`sed: unescaped newline inside substitute pattern` and failed the commit
-outright. Caught by `test/pre-commit-stamp.test.js`'s "the very FIRST commit
-in a repo (no parent at all)" test, RED before the fix. Fixed by checking
-the command substitution's own exit status directly (`if SHA=$(git
-rev-parse HEAD 2>/dev/null); then :; else SHA=<null-sha>; fi`), which
-discards whatever the failed command printed rather than trusting it.
+### `MED-2`: the in-process cross-check against the RUNNING schema object
 
-## Full-suite state around this work
+Round-one review: the refusal was decided entirely by the `consistent`
+boolean the scope agent reports, and nothing structural stopped a
+fabricated `{consistent:true}` from satisfying the schema and passing the
+gate undetectably -- the prompt could only PLEAD the point
+("NEVER omit the field or fabricate..."), which is not a guard. Fixed by
+adding `doc_fields`/`agent_fields` to `INSTALL_CONSISTENCY_SCHEMA` (now
+required) and a new `crossCheckAgainstOwnSchema()` function, part of the
+byte-identical `INSTALL_CONSISTENCY` block, which recomputes the comparison
+IN-PROCESS against `PLAN_SCHEMA`/`REVIEW_SCHEMA` as the literal object THIS
+running script holds -- no fs, no subprocess, no model, and (closing MED-3
+for the schema half of the preflight in the same move) no disk read of
+`plan-cycle.js`/`review-cycle.js` that could be stale relative to what this
+session actually executes.
 
-902/902 (up from the 855/855 baseline at the start of this task), run three
-times consecutively with no flakes, both before and after every mutation
-above was reverted.
+**Guarded by**: `test/plan-cycle.test.js`/`test/review-cycle.test.js`'s new
+`MED-2` tests (fabricated field, fabricated empty, and a genuine-shaped
+report that must not cry wolf).
+
+**Mutation (`plan-cycle.js`)**: replaced the cross-check call site --
+
+```js
+const planCrossCheck = crossCheckAgainstOwnSchema(scope.consistency, PLAN_SCHEMA, 'PLAN_SCHEMA')
+if (!planCrossCheck.ok) {
+  throw installConsistencyError(scope.consistency, planCrossCheck.reason)
+}
+```
+
+-- with `const planCrossCheck = { ok: true } // MUTATION: cross-check disabled`.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the
+intended four-line block replaced by the one-line stub.
+
+**Result**: exactly 2 of 36 tests failed, both and only the `MED-2` tests --
+
+```
+✖ plan-cycle.js: MED-2 -- a FABRICATED consistent:true is still refused ...
+✖ plan-cycle.js: MED-2 -- a fabricated consistent:true with EMPTY doc_fields/agent_fields is refused ...
+```
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical, suite
+back to 36/36.
+
+**Mutation (`review-cycle.js`)**: the identical replacement on
+`reviewCrossCheck`. **Result**: exactly 2 of 87 tests failed, both and only
+the `MED-2` tests for `review-cycle.js`. **Reverted**: `cp` from the
+snapshot, `diff` confirmed byte-identical, suite back to 87/87.
+
+**Residual, stated rather than hidden**: this closes the "fabricated
+`consistent:true`" bypass, not a fabrication of `doc_fields`/`agent_fields`
+themselves. A model that UNDER-reports (silently omits a genuinely
+instructed field from `doc_fields`, rather than inventing a false one) can
+still slip a real gap past both the model's own verdict and this in-process
+check, because that data -- what `AGENT-HARNESS.md` and `agents/lens-*.md`
+actually say -- exists only via the model's own Read/Bash tool use; no
+deterministic mechanism running in this process can independently observe
+it. What the cross-check DOES guarantee: any field the model claims is
+instructed, true or fabricated, is checked against the real running
+schema, not trusted at face value.
+
+### `MED-3`: closed as a consequence of `MED-2`'s design, not a separate fix
+
+Round-one review: the preflight validated the copy of
+`plan-cycle.js`/`review-cycle.js` ON DISK in the install, which a running
+session's own in-memory copy (loaded once at session start, per
+`README.md`'s measured snapshot behaviour) can diverge from. `MED-2`'s
+`crossCheckAgainstOwnSchema()` compares against the LITERAL `PLAN_SCHEMA`/
+`REVIEW_SCHEMA` object this process holds, never a disk read of its own
+source -- the running object structurally cannot diverge from itself. No
+separate mutation: `MED-2`'s two mutations above are also the proof for
+this criterion, since disabling the SAME cross-check is the only way either
+finding's protection can be removed.
+
+### `MED-6`: the vacuous `AC-QA-3` self-comparison test
+
+Round-one review, proven by execution: the original assertion ran the
+SAME code twice and compared the two runs to each other, so it could only
+ever fail on nondeterminism -- inserting a real spurious `agent()` dispatch
+left it green. Fixed by pinning the ABSOLUTE expected call sequence
+instead (one run, not two).
+
+**Guarded by**: the rewritten `AC-QA-3` test in each of
+`test/plan-cycle.test.js`/`test/review-cycle.test.js`.
+
+**Mutation (`review-cycle.js`)**: inserted
+`await agent('SPURIOUS EXTRA DISPATCH placed after the no-changes short-circuit', { label: 'consistency:preflight', effort: 'low' })`
+immediately after the no-changes short-circuit return.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the two
+inserted lines.
+
+**Result**: exactly 1 of 87 tests failed --
+
+```
+✖ review-cycle.js: AC-QA-3 -- ... (pinned absolute sequence, not a self-comparison -- MED-6)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+    actual:   [ 'ledger:write', 'scope:diff', 'consistency:preflight', 'lens-security', 'lens-qa', 'synthesis', 'ledger:write' ]
+    expected: [ 'ledger:write', 'scope:diff', 'lens-security', 'lens-qa', 'synthesis', 'ledger:write' ]
+```
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical, suite
+back to 87/87.
+
+**Mutation (`plan-cycle.js`)**: the identical shape, inserted after the
+cross-check block. **Result**: exactly 1 of 36 tests failed, the equivalent
+`AC-QA-3` test, with the analogous actual-vs-expected mismatch. **Reverted**:
+`cp` from the snapshot, `diff` confirmed byte-identical, suite back to 36/36.
+
+An initial attempt at this mutation (inserting the spurious dispatch
+immediately after `const scope = await agent(...)`, before the gate) broke
+85 of 87 unrelated tests in `review-cycle.test.js` -- a real observation,
+not discarded: that placement changes the call sequence for EVERY test
+exercising `run()`, which is a legitimate but far less targeted mutation.
+Re-placed after the no-changes short-circuit (matching where round-one
+review's own reproduction put it) to isolate the `AC-QA-3` test
+specifically, which is the placement recorded above.
+
+### `MED-8`: two independent pattern matchers collapsed to one
+
+Round-one review, proven divergent on a scratch copy of the module with a
+pattern substituted: `isConsumerSubsetPath()` (via `matchesPattern()`) and
+`listConsumerSubsetFiles()` used to implement the glob/directory/literal
+matching TWICE, independently -- nothing kept them in agreement, and a
+zero-file pattern read as a clean pass with no signal. Fixed by making
+`listConsumerSubsetFiles()` decide ONLY which directories to walk (an
+optimisation), then filter every candidate through `isConsumerSubsetPath()`
+-- one authority, not two -- and by adding per-pattern blindness
+(`unmatched_patterns`) to `checkStaleness()`'s result, independent of the
+aggregate `blind` flag.
+
+**Guarded by**: the new `MED-8` round-trip test
+("`listConsumerSubsetFiles` and `isConsumerSubsetPath` can never disagree")
+and the two new `MED-8(b)` `unmatched_patterns` tests in
+`test/install-consistency.test.js`, plus the pre-existing (task 2's)
+`isConsumerSubsetPath`/`listConsumerSubsetFiles`/`checkStaleness` tests,
+which the unification touches directly.
+
+**Mutation A**: `matchesPattern()` (the SINGLE shared authority after the
+fix) had `if (pattern === 'hooks/') return false` inserted as its first
+line.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the one
+inserted line.
+
+**Result**: exactly 4 of 39 tests failed --
+
+```
+✖ install-consistency: isConsumerSubsetPath matches every pattern shape ...
+✖ install-consistency: listConsumerSubsetFiles walks a real tree and returns exactly the subset paths ...
+✖ install-consistency: checkStaleness reports no drift when the install matches the published subset exactly
+✖ install-consistency: checkStaleness (MED-8b) -- a published tree with content for every pattern reports an EMPTY unmatched_patterns list ...
+```
+
+Both the `isConsumerSubsetPath` test AND the `listConsumerSubsetFiles` test
+failed TOGETHER from the ONE mutation -- direct proof the two are now
+driven by the same underlying logic, which is the unification `MED-8`
+required. The new round-trip test did NOT fail under this specific
+mutation (recorded, not omitted): both sides agreed with each other on the
+same wrong answer (`hooks/hooks.json` excluded from both), so a
+consistency-only check cannot see it -- it takes the tests that check
+against the KNOWN CORRECT file set to catch this shape, which is exactly
+why both kinds of test exist side by side.
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical, suite
+back to 39/39.
+
+**Mutation B**: `listConsumerSubsetFiles()`'s final line, `return
+[...candidates].filter((rel) => isConsumerSubsetPath(rel)).sort()`, had the
+`.filter(...)` call removed entirely (`return [...candidates].sort()`) --
+simulating the ORIGINAL pre-fix shape, where nothing forced the two
+matchers to agree.
+
+**Confirmed landed**: `diff` against the snapshot showed exactly the one
+line changed.
+
+**Result**: exactly 6 of 39 tests failed, including the round-trip test
+this time --
+
+```
+✖ install-consistency: listConsumerSubsetFiles walks a real tree and returns exactly the subset paths ...
+✖ install-consistency: MED-8 -- listConsumerSubsetFiles and isConsumerSubsetPath can never disagree (single authority, not two independent matchers)
+✖ install-consistency: checkStaleness reports no drift when the install matches the published subset exactly
+✖ install-consistency: checkStaleness reports a published file ABSENT from the install as drift, under "missing" ...
+✖ install-consistency: checkStaleness never reports a user-owned file the install has but the repo does not ship ...
+✖ install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published tree ... reports blind:true ...
+```
+
+This is the genuine-divergence shape (`listConsumerSubsetFiles` now returns
+MORE than `isConsumerSubsetPath` accepts -- every candidate the walk
+touches, unfiltered), and the round-trip test catches it directly, unlike
+Mutation A's shared-wrong-answer shape.
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical, suite
+back to 39/39.
+
+**One real bug found while writing the unification fix, before any
+mutation testing**: the directory-to-walk classification treated `'hooks/'`
+(a directory-prefix pattern with no FURTHER slash after stripping its
+trailing one) as a root-level pattern rather than a directory to walk,
+silently dropping `hooks/hooks.json` from every result -- caught immediately
+by the PRE-EXISTING `listConsumerSubsetFiles walks a real tree...` test
+(task 2's own test, written before this round's changes), which went RED
+the moment the refactor landed, before any deliberate mutation was applied.
+Fixed by classifying any pattern ending in `/` as a directory to walk
+regardless of remaining slash count, and reserving the root-only path for
+patterns with no trailing slash and no slash at all.
+
+**Not done, deliberately out of scope**: `bin/optimise-cycle-weekly.sh`
+does not yet log `unmatched_patterns` -- the field is computed and returned
+by `checkStaleness()`, available to whichever caller wants it, but this
+task's authorisation over `bin/` was surgical (the stamp removal only), so
+wiring the weekly runner's log line to consume it is left for that file's
+normal owner.
+
+## Full-suite state after round two
+
+924/924 (up from round one's 902/902: net +34 new tests across `AC-ARCH-4`,
+`MED-2` x6, `MED-6` (rewritten, not net-new), `MED-8` x3, minus the 8
+deleted `test/pre-commit-stamp.test.js` tests and the 2 deleted
+`test/weekly-runner.test.js` `AC-ARCH-2`/`AC-ARCH-3` tests), run three times
+consecutively with no flakes, both before and after every mutation above was
+reverted.

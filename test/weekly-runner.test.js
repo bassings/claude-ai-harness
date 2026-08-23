@@ -805,7 +805,7 @@ test('weekly runner: a GNU-behaving stat (where -f SUCCEEDS with filesystem info
 
 // ============================================================================
 // HARN-FIX-3 task 2 of 2: the consumer-install staleness check
-// (AC-OPS-1..5, AC-ARCH-2). See workflows/lib/install-consistency.mjs's
+// (AC-OPS-1..5). See workflows/lib/install-consistency.mjs's
 // CONSUMER_SUBSET_PATTERNS/checkStaleness for the comparison logic itself
 // (unit-tested there directly); this file proves the BASH plumbing around
 // it -- once-per-invocation placement, never writing to the install, the
@@ -983,41 +983,8 @@ test('weekly runner (AC-OPS-3): an unreachable remote never flips overall exit s
   setMarker(repo, 'noop') // the delivery repo genuinely fails (missing report)
   const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: goneRemote })
   assert.notEqual(status, 0, logContents) // fails because of the REPO, not the staleness check
-  assert.match(logContents, /STALENESS could-not-check install_source_commit=\S+ \{"error":"git clone of the staleness remote failed"\}/, logContents)
+  assert.match(logContents, /STALENESS could-not-check \{"error":"git clone of the staleness remote failed"\}/, logContents)
   assert.match(logContents, resultLineRegex('FAIL', label(repo)), logContents)
-})
-
-test('weekly runner (AC-ARCH-2/AC-ARCH-3): the installed AGENT-HARNESS.md\'s SOURCE_COMMIT stamp is reported BOTH on the run header line and on the staleness check\'s own report line', () => {
-  const sha = 'd'.repeat(40)
-  // The stamp must be readable WITHOUT it also causing drift -- published
-  // and install both carry the identical stamped AGENT-HARNESS.md, so this
-  // test isolates stamp reporting from the "drift" token added by the
-  // 2026-08-23 fix above. Stamping only the install's copy (as an earlier
-  // version of this test did) made the two AGENT-HARNESS.md's content
-  // genuinely differ, which is real drift -- that version of this test
-  // asserted "STALENESS ok" on a run that should have said "STALENESS
-  // drift", which is exactly the invisible-drift defect the coordinator's
-  // 2026-08-23 review caught.
-  const stampedAgentHarness = `<!-- SOURCE_COMMIT: ${sha} -->\nharness contract\n`
-  const published = makePublishedRepo({ 'AGENT-HARNESS.md': stampedAgentHarness })
-  const install = identicalInstallOf(published)
-  const repo = makeTempRepo()
-  setMarker(repo, 'pass')
-  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
-  assert.equal(status, 0, logContents)
-  assert.match(logContents, new RegExp(`weekly optimise-cycle starting.*install_source_commit=${sha}`), 'the header line must name the installed stamp')
-  assert.match(logContents, new RegExp(`^STALENESS ok install_source_commit=${sha} `, 'm'), 'the staleness report\'s own line must also name the installed stamp')
-})
-
-test('weekly runner (AC-ARCH-2): when the install has no readable stamp at all, both lines say "unknown" rather than a stale or fabricated value', () => {
-  const published = makePublishedRepo()
-  const install = identicalInstallOf(published) // no SOURCE_COMMIT line in this fixture's AGENT-HARNESS.md
-  const repo = makeTempRepo()
-  setMarker(repo, 'pass')
-  const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
-  assert.equal(status, 0, logContents)
-  assert.match(logContents, /weekly optimise-cycle starting.*install_source_commit=unknown/, logContents)
-  assert.match(logContents, /^STALENESS ok install_source_commit=unknown /m, logContents)
 })
 
 test('weekly runner (anti-vacuity, end to end): a "published" remote that clones successfully but has ZERO consumer-subset files is reported could-not-check, never as a clean "no drift" -- the guard that finds nothing and calls that clean is the failure shape this repo has hit before', () => {

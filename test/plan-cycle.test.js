@@ -19,6 +19,12 @@ const CONSISTENCY_OK = {
   blind: false,
   checked_dir: '/fake/install',
   lens_files_checked: 9,
+  // MED-2: doc_fields/agent_fields must be a subset the REAL PLAN_SCHEMA and
+  // REVIEW_SCHEMA both declare, or the in-process cross-check refuses even
+  // this "consistent" fixture -- 'recurrence' is the one field both real
+  // schemas' findings items actually carry.
+  doc_fields: ['recurrence'],
+  agent_fields: ['recurrence'],
   missing_in_review_schema: [],
   missing_in_plan_schema: [],
   review_only_props: [],
@@ -431,12 +437,27 @@ test('plan-cycle.js: AC-QA-1/AC-QA-2 -- a scope response missing the consistency
   )
 })
 
-test('plan-cycle.js: AC-QA-3 -- a consistent, non-blind install dispatches every triggered lens exactly as before, with NO additional agent() call beyond the pre-existing baseline (the check is folded into scope:spec, not a new dispatch)', async () => {
-  const { calls: baselineCalls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
+// round-one review MED-6: the ORIGINAL form of this test compared a run
+// against a second, identical run of the SAME code -- baselineCalls was
+// not a baseline, it was the change already applied, so the assertion
+// could only ever fail on nondeterminism. Proven by mutation (see
+// docs/install-consistency-mutation-proofs.md): inserting a real spurious
+// agent() dispatch before the gate left this test passing. Fixed by
+// pinning the ABSOLUTE expected call sequence instead, which needs only
+// ONE run and fails on any added, removed or reordered dispatch.
+test('plan-cycle.js: AC-QA-3 -- a consistent, non-blind install dispatches EXACTLY this call sequence, with no extra agent() call for the consistency check (pinned absolute sequence, not a self-comparison -- MED-6)', async () => {
   const { result, calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'], 'lenses must still dispatch normally')
-  assert.equal(calls.length, baselineCalls.length, 'a consistent install must add no agent() call beyond the pre-existing baseline')
-  assert.deepEqual(calls.map((c) => c.opts.label), baselineCalls.map((c) => c.opts.label))
+  assert.deepEqual(calls.map((c) => c.opts.label), [
+    'ledger:write',
+    'scope:spec',
+    'lens-security',
+    'lens-qa',
+    'lens-simplicity',
+    'lens-product',
+    'synthesis:write-back',
+    'ledger:write',
+  ])
 })
 
 test('plan-cycle.js: AC-QA-1 -- the scope:spec prompt instructs locating install-consistency.mjs via the SAME install-resolution search order the ledger writer already uses, and passing the install root as an explicit argument (never relying on a hardcoded ~/.claude default)', async () => {
@@ -453,4 +474,54 @@ test('plan-cycle.js: the scope:spec schema requires "consistency" -- an omitted 
   const { calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
   const scopeCall = calls.find((c) => c.opts.label === 'scope:spec')
   assert.ok(scopeCall.opts.schema.required.includes('consistency'))
+})
+
+// round-one review MED-2: the refusal must not be decided SOLELY by the
+// "consistent" boolean the scope agent reports -- a fabricated
+// {consistent:true} previously satisfied the schema and passed the gate
+// undetectably. These prove the in-process cross-check (crossCheckAgainstOwnSchema,
+// verified against the LITERAL PLAN_SCHEMA object this process holds) closes
+// that specific bypass.
+test('plan-cycle.js: MED-2 -- a FABRICATED consistent:true is still refused when the reported doc_fields/agent_fields name a field the RUNNING PLAN_SCHEMA does not declare (the in-process cross-check catches what the model-reported verdict alone could not)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: { spec: 'specs/foo.md' },
+        agent: baseAgent({
+          'scope:spec': {
+            ...SCOPE_OK,
+            consistency: { ...CONSISTENCY_OK, consistent: true, doc_fields: ['made_up_field'], agent_fields: ['made_up_field'] },
+          },
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /IN-PROCESS CROSS-CHECK \(MED-2\)/, 'must name the in-process cross-check, not only the (fabricated) model verdict')
+      assert.match(err.message, /made_up_field/, 'must name the offending field')
+      assert.match(err.message, /PLAN_SCHEMA/)
+      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES.includes(c.opts.label))
+      assert.equal(dispatchedLenses.length, 0, 'a fabricated consistent:true must not reach lens dispatch')
+      return true
+    }
+  )
+})
+
+test('plan-cycle.js: MED-2 -- a fabricated consistent:true with EMPTY doc_fields/agent_fields is refused (an empty report is treated as blind by the in-process cross-check too, not only by the model-reported blind flag)', async () => {
+  await assert.rejects(() =>
+    runWorkflow(WF, {
+      args: { spec: 'specs/foo.md' },
+      agent: baseAgent({
+        'scope:spec': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, consistent: true, doc_fields: [], agent_fields: [] } },
+      }),
+    })
+  )
+})
+
+test('plan-cycle.js: MED-2 -- a GENUINE, real-shaped consistency report (doc_fields/agent_fields naming a field the running PLAN_SCHEMA DOES declare) still dispatches normally (the cross-check must not cry wolf on honest input)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { spec: 'specs/foo.md' },
+    agent: baseAgent({
+      'scope:spec': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, doc_fields: ['recurrence', 'evidence'], agent_fields: ['recurrence'] } },
+    }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'])
 })
