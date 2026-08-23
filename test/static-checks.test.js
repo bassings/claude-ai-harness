@@ -909,3 +909,250 @@ test('static: README documents how to activate the gate, and says plainly that C
   assert.match(readme, /silent|silently/i, 'README must state that an unset hooksPath fails silently, which is why this is easy to miss')
   assert.match(readme, /backstop|CI is the/i, 'README must state that CI, not the hook, is what actually gates for everyone else')
 })
+
+// --- H6 (round-2 destructive-git-guard review): hooks/hooks.json's
+// registration is the wiring that makes a hook run AT ALL, and nothing in
+// test/destructive-git-guard.test.js can see it -- those tests all invoke
+// hooks/destructive-git-guard.py directly by path (runHook() in that file),
+// which is structurally incapable of noticing the registration itself is
+// missing, malformed, or points at a file that does not exist. Measured:
+// deleting the entire PreToolUse block from hooks/hooks.json left all 743
+// pre-existing tests green. This is the standard's own "correct in source,
+// absent from the artefact that runs" class (§11) applied to the wiring
+// rather than the logic, and its failure mode is the exact loss the guard
+// exists to prevent: a silently inert PreToolUse hook.
+//
+// Set-based rather than a fixed list of expected entries, so adding a NEW
+// hook script under hooks/ without wiring it into hooks.json fails this
+// test by name, instead of the omission being invisible until an operator
+// notices the hook never runs.
+test('static: every hooks/*.py script is registered in hooks/hooks.json, and every hooks.json entry names a script that actually exists (H6, registration wiring)', () => {
+  const hooksDir = path.join(ROOT, 'hooks')
+  const pyFiles = new Set(
+    fs.readdirSync(hooksDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith('.py'))
+      .map((e) => e.name)
+  )
+  assert.ok(pyFiles.size >= 2, `sanity: expected at least the two known hook scripts under hooks/, found ${pyFiles.size}`)
+
+  const raw = readAll('hooks', 'hooks.json')
+  let parsed
+  assert.doesNotThrow(() => { parsed = JSON.parse(raw) }, 'hooks/hooks.json must be valid JSON')
+
+  const registeredNames = new Set()
+  const entries = [] // { event, matcher, scriptPath }
+  for (const [event, matcherGroups] of Object.entries(parsed.hooks || {})) {
+    assert.ok(Array.isArray(matcherGroups), `hooks.json's "${event}" key must be an array of matcher groups`)
+    for (const group of matcherGroups) {
+      for (const hook of group.hooks || []) {
+        assert.ok(Array.isArray(hook.args) && hook.args.length > 0, `every hook command in hooks.json must have a non-empty args array (event=${event})`)
+        const resolved = hook.args[0].replace('${CLAUDE_PLUGIN_ROOT}', ROOT)
+        assert.ok(fs.existsSync(resolved), `hooks.json (event=${event}) points args[0] at ${resolved}, which does not exist`)
+        assert.ok(fs.statSync(resolved).isFile(), `hooks.json (event=${event}) points args[0] at ${resolved}, which is not a file`)
+        entries.push({ event, matcher: group.matcher, scriptPath: resolved })
+        registeredNames.add(path.basename(resolved))
+      }
+    }
+  }
+
+  assert.deepEqual(
+    [...pyFiles].sort(),
+    [...registeredNames].sort(),
+    `hooks/*.py and hooks.json's registered scripts must be the SAME set. hooks/ has: ${[...pyFiles].sort()}; hooks.json registers: ${[...registeredNames].sort()}. ` +
+      'A hook script that exists but is not registered will never run; a registration pointing at a script that no longer exists is dead configuration.'
+  )
+
+  const guardEntry = entries.find((e) => e.scriptPath.endsWith('destructive-git-guard.py'))
+  assert.ok(guardEntry, 'destructive-git-guard.py must be registered in hooks.json')
+  assert.equal(guardEntry.event, 'PreToolUse', 'destructive-git-guard.py must be registered under PreToolUse')
+  assert.equal(guardEntry.matcher, 'Bash', 'destructive-git-guard.py\'s PreToolUse matcher must be "Bash" -- a wrong or missing matcher means it never sees a Bash call at all')
+})
+
+// H3 (review round on fix/destructive-git-guard): commit d447030 added a
+// `Recurrence` field to AGENT-HARNESS.md's FINDINGS template and instructed
+// all nine agents/lens-*.md files to fill it, with no matching property in
+// either lens-output schema the workflow scripts declare (REVIEW_SCHEMA in
+// review-cycle.js, PLAN_SCHEMA in plan-cycle.js), no mention in the lens
+// prompt, no carry into the openFindingsRaw ledger projection, and no
+// mention in the synthesis keep-list -- an instruction with no consumer,
+// the exact shape this repo exists to stop. Fixed by adding `recurrence` to
+// both schemas' findings-item properties and to review-cycle.js's prompt,
+// projection and synthesis instructions. This test is the drift guard that
+// stops a repeat: it fails if EITHER side ever moves without the other --
+// a field documented/instructed with no schema slot (H3's own shape), or a
+// schema property nothing documents or instructs a lens to fill.
+test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s ### FINDINGS template, and every field agents/lens-*.md instruct filling there, has a like-named property in both review-cycle.js\'s REVIEW_SCHEMA and plan-cycle.js\'s PLAN_SCHEMA findings items -- and vice versa: every non-structural findings-item property is named in the template', () => {
+  const doc = readAll('AGENT-HARNESS.md')
+
+  // ---- side A: AGENT-HARNESS.md's ### FINDINGS template ----
+  const findingsHeadingIdx = doc.indexOf('### FINDINGS')
+  assert.ok(findingsHeadingIdx !== -1, 'AGENT-HARNESS.md must have a ### FINDINGS heading')
+  const fenceEnd = doc.indexOf('```', findingsHeadingIdx)
+  assert.ok(fenceEnd !== -1, 'the ### FINDINGS heading must be followed by a fenced example block')
+  const templateBlock = doc.slice(findingsHeadingIdx, fenceEnd)
+  const docFields = new Set()
+  for (const m of templateBlock.matchAll(/^\s{2}([A-Z][A-Za-z]+):\s/gm)) docFields.add(m[1].toLowerCase())
+  assert.ok(docFields.size >= 3, `sanity: expected several colon-labeled fields in the FINDINGS template, found ${[...docFields]}`)
+  assert.ok(docFields.has('recurrence'), 'sanity: the FINDINGS template must still name Recurrence -- this test exists to protect that specific field')
+
+  // ---- side B: agents/lens-*.md's own "fill AGENT-HARNESS.md's `X` field" instructions ----
+  const agentFiles = fs.readdirSync(path.join(ROOT, 'agents')).filter((f) => f.startsWith('lens-') && f.endsWith('.md'))
+  assert.ok(agentFiles.length >= 9, `sanity: expected at least 9 agents/lens-*.md files, found ${agentFiles.length}`)
+  const agentFields = new Set()
+  for (const f of agentFiles) {
+    const text = readAll('agents', f)
+    for (const m of text.matchAll(/fill AGENT-HARNESS\.md's `([A-Za-z]+)` field/g)) agentFields.add(m[1].toLowerCase())
+  }
+  assert.ok(agentFields.has('recurrence'), 'sanity: expected at least one agents/lens-*.md file to instruct filling the Recurrence field')
+
+  // ---- side C: the findings-item properties each workflow schema declares ----
+  function extractBalancedObject(text, openBraceIdx) {
+    let depth = 0
+    for (let i = openBraceIdx; i < text.length; i++) {
+      if (text[i] === '{') depth++
+      else if (text[i] === '}') {
+        depth--
+        if (depth === 0) return text.slice(openBraceIdx, i + 1)
+      }
+    }
+    throw new Error(`unbalanced braces from index ${openBraceIdx}`)
+  }
+  function findingsSchemaProps(fileRel, constName) {
+    const text = readAll(...fileRel.split('/'))
+    const constIdx = text.indexOf(`const ${constName}`)
+    assert.ok(constIdx !== -1, `expected "const ${constName}" in ${fileRel}`)
+    const findingsMatch = /\bfindings:\s*{/.exec(text.slice(constIdx))
+    assert.ok(findingsMatch, `expected a findings: property inside ${constName} in ${fileRel}`)
+    const findingsIdxAbs = constIdx + findingsMatch.index
+    const propsMatch = /properties:\s*{/.exec(text.slice(findingsIdxAbs))
+    assert.ok(propsMatch, `expected findings.items.properties inside ${constName} in ${fileRel}`)
+    const propsBraceIdx = findingsIdxAbs + propsMatch.index + propsMatch[0].length - 1
+    const obj = extractBalancedObject(text, propsBraceIdx)
+    const names = new Set()
+    for (const m of obj.matchAll(/(?:^|[{,])\s*([A-Za-z_]\w*)\s*:\s*{\s*type:/g)) names.add(m[1])
+    assert.ok(names.size >= 3, `sanity: expected several findings properties parsed from ${fileRel}'s ${constName}, found ${[...names]}`)
+    return names
+  }
+  const reviewProps = findingsSchemaProps('workflows/review-cycle.js', 'REVIEW_SCHEMA')
+  const planProps = findingsSchemaProps('workflows/plan-cycle.js', 'PLAN_SCHEMA')
+
+  // Direction 1 (H3 itself): a field documented in the template, or one
+  // agents/*.md are told to fill, must have a schema slot in BOTH workflows
+  // that build a lens-output schema from this contract.
+  for (const field of new Set([...docFields, ...agentFields])) {
+    assert.ok(reviewProps.has(field), `"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but review-cycle.js's REVIEW_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
+    assert.ok(planProps.has(field), `"${field}" is named in AGENT-HARNESS.md's FINDINGS template or instructed in agents/lens-*.md, but plan-cycle.js's PLAN_SCHEMA does not declare a matching findings-item property -- an instructed field with no schema slot is silently dropped (H3)`)
+  }
+
+  // Direction 2 (vice versa): a schema property that is NOT one of the
+  // structural fields (severity/claim/location come from the one-line
+  // "[SEVERITY] <claim>: <file:line>" header, not a colon-labeled template
+  // row; ac_id is review-mode AC attribution, a separate mechanism from the
+  // FINDINGS template) must be named in the template -- otherwise the
+  // schema invites a value nothing ever told a lens to produce.
+  const STRUCTURAL = new Set(['severity', 'claim', 'location', 'ac_id'])
+  for (const [label, props] of [['REVIEW_SCHEMA', reviewProps], ['PLAN_SCHEMA', planProps]]) {
+    for (const prop of props) {
+      if (STRUCTURAL.has(prop)) continue
+      assert.ok(docFields.has(prop), `${label}'s findings items declare "${prop}", but AGENT-HARNESS.md's FINDINGS template does not name it -- a schema field nothing instructs a lens to fill`)
+    }
+  }
+})
+
+// --- specs/harn-fix-2.md: AC-OPS-14, AC-PROD-4, AC-SEC-7, AC-QA-19. ---
+
+test('static AC-OPS-14: hooks.json\'s registered PreToolUse/Bash scripts and README\'s manual-install settings.json snippet register the SAME set, so adding one and not the other fails here', () => {
+  const hooksJson = JSON.parse(readAll('hooks', 'hooks.json'))
+  const registered = new Set()
+  for (const group of hooksJson.hooks.PreToolUse || []) {
+    for (const hook of group.hooks || []) {
+      registered.add(path.basename(hook.args[0]))
+    }
+  }
+  assert.ok(registered.size >= 2, `sanity: expected at least 2 registered PreToolUse scripts, found ${registered.size}`)
+
+  const readme = readAll('README.md')
+  const snippetStart = readme.indexOf('### As a plugin')
+  const snippetSection = readme.slice(snippetStart, readme.indexOf('## Recovering destroyed work'))
+  const named = new Set([...snippetSection.matchAll(/hooks\/([a-z0-9-]+\.py)/g)].map((m) => m[1]))
+
+  for (const script of registered) {
+    assert.ok(named.has(script), `${script} is registered in hooks.json but not named in README's install section`)
+  }
+})
+
+test('static AC-PROD-4: README states what the snapshot mechanism does NOT cover, and what it writes into a reader\'s own repository, before the install snippet', () => {
+  const readme = readAll('README.md')
+  assert.match(readme, /untracked files.*ignored files/is, 'README must name untracked and ignored files as uncovered loss paths')
+  assert.match(readme, /never written to disk/i, 'README must name work never written to disk as an uncovered loss path')
+  assert.match(readme, /`cd`s or `git -C`s into/i, 'README must name a cd/-C target repository as an uncovered loss path')
+  assert.match(readme, /non-Bash tool call/i, 'README must name non-Bash tool calls (Write, Edit) as an uncovered loss path')
+  const guardSectionStart = readme.indexOf('## Destructive git guard')
+  const guardSectionEnd = readme.indexOf('## Recovering destroyed work')
+  const guardSection = readme.slice(guardSectionStart, guardSectionEnd)
+  const installIdx = guardSection.lastIndexOf('Installing as a plugin wires the hook automatically')
+  const writesStatementIdx = guardSection.indexOf('this repo writes only')
+  assert.ok(installIdx !== -1, 'README\'s guard section must contain its own install snippet intro')
+  assert.ok(writesStatementIdx !== -1 && writesStatementIdx < installIdx + 400, 'README must state what the hooks write into the reader\'s own repository, at (or immediately around) the install snippet')
+})
+
+test('static AC-SEC-7: README\'s guard section states the detector is a best-effort early catch (no completeness claim) and names the measured-open bypass classes', () => {
+  const readme = readAll('README.md')
+  assert.match(readme, /best-effort early catch, not a boundary/i)
+  for (const bypass of ['env', 'command', '\\$\\(which git\\)', 'eval', 'subshell', 'bash\\s*-c', 'xargs', 'here-document']) {
+    assert.match(readme, new RegExp(bypass, 'i'), `README's guard section must name the "${bypass}" bypass class`)
+  }
+})
+
+// AC-QA-19: table-driven -- every spelling README documents as covered by
+// the detector is refused on a genuinely dirty file; every spelling it
+// documents as deliberately out of scope is allowed. Fails in BOTH
+// directions, so neither a closed hole nor a stopped guard leaves the
+// documentation stale.
+test('static AC-QA-19: every GUARDED shape is refused and every OUT-OF-SCOPE shape is allowed against a genuinely dirty file', () => {
+  const { makeTempRepo, cleanupTempRepos, sh, sanitizedGitEnv: sge } = require('./helpers/temp-repo.js')
+  const HOOK_PATH = path.join(ROOT, 'hooks', 'destructive-git-guard.py')
+  const fsMod = require('node:fs')
+
+  function runHook(command, dir) {
+    return spawnSync('python3', [HOOK_PATH], {
+      input: JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: dir }),
+      encoding: 'utf8', env: sge(), timeout: 10000,
+    })
+  }
+
+  const GUARDED = [
+    'git checkout -- README.md',
+    'git checkout README.md',
+    'git checkout .',
+    'git checkout -f',
+    'git switch -f other',
+    'git restore README.md',
+    'git reset --hard',
+  ]
+  const OUT_OF_SCOPE = [
+    'git clean -fd',
+    'git stash drop',
+    'git branch -D other',
+    'git checkout -b newbranch',
+  ]
+
+  try {
+    for (const command of GUARDED) {
+      const dir = makeTempRepo()
+      sh('git branch other', dir)
+      fsMod.writeFileSync(path.join(dir, 'README.md'), 'dirty\n')
+      const res = runHook(command, dir)
+      assert.equal(res.status, 2, `GUARDED "${command}" must be refused (exit 2), got ${res.status}; stderr: ${res.stderr}`)
+    }
+    for (const command of OUT_OF_SCOPE) {
+      const dir = makeTempRepo()
+      sh('git branch other', dir)
+      fsMod.writeFileSync(path.join(dir, 'README.md'), 'dirty\n')
+      const res = runHook(command, dir)
+      assert.equal(res.status, 0, `OUT-OF-SCOPE "${command}" must be allowed (exit 0), got ${res.status}; stderr: ${res.stderr}`)
+    }
+  } finally {
+    cleanupTempRepos()
+  }
+})
