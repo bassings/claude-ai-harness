@@ -1,8 +1,9 @@
 # HARN-FIX-3 (task 1 of 2): consistency check + (withdrawn) version stamp mutation proofs
 
-Scope: `AC-QA-1` through `AC-QA-5`, `AC-SIMP-1` through `AC-SIMP-3` from
-`specs/harn-fix-3.md`, plus `AC-ARCH-4` (added round two, replacing the
-withdrawn `AC-ARCH-1`/`AC-ARCH-2`/`AC-ARCH-3`). `AC-OPS-*` (the staleness
+Scope: `AC-QA-1` through `AC-QA-5` from `specs/harn-fix-3.md`, plus
+`AC-QA-6` (added round five, closing the previously-parked `M1`),
+`AC-SIMP-1` through `AC-SIMP-3`, and `AC-ARCH-4` (added round two, replacing
+the withdrawn `AC-ARCH-1`/`AC-ARCH-2`/`AC-ARCH-3`). `AC-OPS-*` (the staleness
 check in `bin/optimise-cycle-weekly.sh`) belongs to a separate task and is
 not covered here, except where `AC-ARCH-4`'s removal or `MED-8`'s fix
 surgically touched shared code in `workflows/lib/install-consistency.mjs`
@@ -710,6 +711,12 @@ uses the shared logic, not only that the two files' TEXT agrees.
 
 ### M9: the escape hatch, at both ends
 
+> **SUPERSEDED by round five, and the mechanism below is DELETED.** The
+> environment variable and the `escape_hatch_active` relay proved circular:
+> the relay ran through the scope agent, the model whose report the gate
+> checks. Kept as a record of what was proven and why it was replaced, not as
+> a description of shipped behaviour. See round five.
+
 Two mutations, at the two points the mechanism could silently stop
 working: where the environment is READ (`install-consistency.mjs`), and
 where the reported flag is CONSUMED (the workflow gate).
@@ -775,3 +782,277 @@ workflow file (x2 = 8) -- run three times consecutively with no flakes,
 both before and after every mutation above was reverted, and again after
 the `specs/harn-fix-3.md` and `README.md` documentation edits (which touch
 no test-bearing code).
+
+## Round five (2026-08-23): the override mechanism replaced, and M1 un-parked
+
+(Three labels, one piece of work, so the mapping is recorded once here rather
+than guessed at later. This document numbers build rounds, and this is its
+fifth. The coordinator's brief called it "the fourth fix round", counting only
+rounds that followed a review. The code comments and `specs/harn-fix-3.md` say
+"round three", following the spec's own review-round numbering: round-one
+review, round-two review, then this.)
+
+Scope: two changes.
+
+1. **The escape hatch's mechanism was replaced**, not extended. Round four's
+   `M9` fix shipped `HARNESS_ALLOW_INCONSISTENT_INSTALL=1`, an environment
+   variable. A dynamic-workflow script has no environment access, so that
+   variable had to be read by `install-consistency.mjs` and relayed to the
+   gate as `escape_hatch_active` **through the scope agent -- the model whose
+   report the gate is checking**. A gate whose override is asserted by the
+   thing being policed is circular: a fabricating scope agent could claim the
+   hatch was active, which is the same bypass class as `MED-2`, reintroduced
+   by the fix for `M9`. The override is now
+   `allow_inconsistent_install: true` on the invocation's own args, read by
+   the workflow script directly. Never from the environment, never persisted,
+   never through a model. Round four's four `M9` proofs below are therefore
+   **obsolete, not merely superseded**: the mechanism they proved is deleted.
+2. **`M1` was un-parked and built** (`AC-QA-6`): the `STRUCTURAL_FINDINGS_PROPS`
+   exemption was one-directional, so the check was blind to a schema that
+   LOSES a structural findings property.
+
+Same discipline as every section above: every mutation was applied to the
+working file, confirmed landed on the intended construct by `diff` against a
+`cp` snapshot taken before the edit (never `git checkout --`), run, the exact
+failing set recorded, restored from the snapshot and reconfirmed
+byte-identical and green. One at a time, never stacked.
+
+### 0. The defect itself, reproduced before fixing it
+
+Not a mutation of the new guard, but the measurement that justified it, run
+here rather than relayed. With the **pre-fix** `install-consistency.mjs`
+loaded and `location` deleted from the real `REVIEW_SCHEMA` in
+`workflows/review-cycle.js`, `checkConsistency` against the repo's own tree
+printed:
+
+```
+{"consistent":true,"missing_in_review_schema":[]}
+```
+
+An actively wrong "this install is fine" over a genuinely broken schema. That
+is the H3 defect sitting inside the mechanism that exists to catch H3.
+
+### 1. The structural floor itself (`checkConsistency`)
+
+**Guarded by**: the seven `M1` tests in `test/install-consistency.test.js`
+and the direction-3 assertions added to `test/static-checks.test.js`'s H3
+drift guard.
+
+**Mutation**: deleted both `for (const p of REQUIRED_STRUCTURAL_PROPS.*)`
+loops from `checkConsistency`.
+
+**Confirmed landed**: `diff` showed exactly the two intended loops removed,
+nothing else.
+
+**Result**: exactly 4 of 107 failed (`install-consistency` + `static-checks`
+together) -- the three unit-level `M1` losses and the `main()` fixture-
+directory `M1` test. The static H3 direction-3 assertion correctly stayed
+green: the repo's own schemas declare every structural property, so that
+assertion cannot fire on this mutation. It is proven separately in section 2.
+
+**Reverted**: `cp` from the snapshot, suite back to 107/107.
+
+### 2. The direction-3 assertion in the repo-tree H3 guard
+
+**Mutation**: deleted `location` (property AND its `required` entry) from the
+real `REVIEW_SCHEMA` findings item in `workflows/review-cycle.js` -- i.e. the
+exact scenario section 0 measured.
+
+**Confirmed landed**: `diff` showed the one intended `findings:` line
+changed. Three `location: { type: 'string' }` occurrences exist in that file
+(the other two are in `spec_bugs`/`rejected_findings`), so the replacement
+was anchored on surrounding text unique to the findings item -- the
+"mutated the wrong construct" trap this repo has already paid for once.
+
+**Result**: exactly 1 of 48 static tests failed, the H3 drift guard, on
+`REVIEW_SCHEMA's findings items have lost a structural property`, naming
+`['location']`. Before this round that mutation left the suite fully green.
+
+**Reverted**: `cp` from the snapshot, suite back to 48/48.
+
+### 3. NARROWING the floor (the direction the `deepEqual` pin exists for)
+
+**Mutation**: removed `'location'` from `REQUIRED_STRUCTURAL_PROPS.REVIEW_SCHEMA`.
+
+**Result**: exactly 4 of 107 failed -- three `M1` unit tests plus the
+static-checks pin, which fails by name on the `deepEqual` against the
+expected membership. Narrowing the floor is therefore a deliberate two-place
+edit, not a silent coverage loss.
+
+**Reverted**: `cp` from the snapshot, 107/107.
+
+### 4. WIDENING the floor (`M1`'s originally-filed concern)
+
+**Mutation**: added `'ac_id'` to `REQUIRED_STRUCTURAL_PROPS.PLAN_SCHEMA` --
+one word, the exact shape `M1` described as "silently defeats direction 2
+with the suite green".
+
+**Result**: 9 of 107 failed, including the static H3 drift guard. Not silent.
+`M1`'s widening half needs no separate fix: the floor is checked against the
+repo's own schemas, which do not declare the added word.
+
+**Reverted**: `cp` from the snapshot, 107/107.
+
+### 5. The two structural arrays in the self-contradiction set
+
+**Guarded by**: the four `M1 (round three)` workflow tests (two per cycle
+file).
+
+**Mutation**: removed both `missing_structural_in_*` spreads from
+`contradictionFields`, in **both** workflow files (the block is byte-pinned,
+so a one-file edit would have failed the pinning test for an unrelated
+reason and told us nothing).
+
+**Result**: exactly 4 of 197 failed -- the two `M1 (round three)` tests in
+each of `plan-cycle.test.js` and `review-cycle.test.js`. Without this, `M1`'s
+whole new signal could be paired with a fabricated `consistent:true` and pass
+the one check that needs no parsing to catch it.
+
+**Reverted**: `cp`, 197/197.
+
+### 6. The override flag, forced ON
+
+**Mutation**: replaced `opts.allow_inconsistent_install === true` with the
+literal `true` at both call sites.
+
+**Result**: 19 of 197 failed, including every pre-existing refusal test
+(`MED-2`, `M3`, the `AC-QA-1/AC-QA-2` proven-mismatch tests) plus the three
+new round-three refusal tests per file. A gate that always overrides is loud.
+
+**Reverted**: `cp`, 197/197.
+
+### 7. The override flag, forced OFF
+
+**Mutation**: replaced the same expression with the literal `false`.
+
+**Result**: exactly 6 of 149 failed -- the three override-honouring tests in
+each cycle file (proven mismatch warns, report banner, `M3` contradiction
+warns). Proves the override is genuinely reachable and not decorative.
+
+**Reverted**: `cp`, 149/149.
+
+### 8. The override's strictness (fails CLOSED on a mistype)
+
+**Mutation**: replaced `opts.allow_inconsistent_install === true` with
+`Boolean(opts.allow_inconsistent_install)` at both call sites.
+
+**Result**: exactly 2 of 149 failed -- the `flag must be exactly boolean
+true` test in each cycle file, driven by `args: {allow_inconsistent_install:
+'true'}`. Note this could NOT be proven by mutating the `=== true` inside
+`evaluateInstallConsistency`: the call site already narrows the value to a
+boolean, so loosening the comparison there is a no-op. The strictness lives
+at the call site, and the mutation had to go there to mean anything.
+
+**Reverted**: `cp`, 149/149.
+
+### 9. The circularity fix: re-honouring the model-asserted override
+
+**Mutation**: changed the proven-mismatch override condition to
+`if (allowInconsistentInstall || c.escape_hatch_active === true)` in both
+cycle files -- i.e. put round four's relayed, model-supplied boolean back.
+
+**Result**: exactly 3 of 197 failed -- the `SCOPE-AGENT-REPORTED
+escape_hatch_active:true STILL REFUSES` test in each cycle file, **and** the
+static guard `no shipped code file reads or declares escape_hatch_active`.
+Two independent guards, one behavioural and one mechanical, catch the
+regression that matters most in this round.
+
+**Reverted**: `cp`, 197/197.
+
+### 10. The report banner
+
+**Mutation**: replaced
+`report: reportOk ? (installOverrideNotice ? ... ) : ''` with the plain
+`report: reportOk ? synthesis.summary : ''` (and `synthesis.report` for
+review-cycle) -- the pre-round-three form.
+
+**Confirmed landed**: `diff` showed exactly the one return-object line
+changed in each file. A first attempt at this mutation FAILED to apply
+(0 occurrences) because the `\n` escapes in the template literal were being
+interpreted by the driver script rather than matched literally; the helper
+asserts an exact occurrence count, so the miss was caught rather than
+silently producing a no-op mutation and a false "guard is load-bearing"
+conclusion.
+
+**Result**: exactly 2 of 149 failed -- `the override is named in the RETURNED
+REPORT too` in each cycle file. The log-line assertions correctly stayed
+green, which is the point of having both.
+
+**Reverted**: `cp`, 149/149.
+
+### 11. `overrideMessage` stops naming the flag
+
+**Mutation**: replaced the opening clause
+`args.allow_inconsistent_install=true SUPPRESSED a refusal that would`
+with `an override was set and it changed the outcome of`.
+
+**Result**: exactly 6 of 149 failed -- all three override tests in each cycle
+file. "Impossible to miss" is asserted on the flag NAME, not on the presence
+of any warning.
+
+**Reverted**: `cp`, 149/149.
+
+### 12. `overrideMessage` stops saying WHAT was suppressed
+
+**Mutation**: removed `SUPPRESSED REFUSAL: ${suppressed}.` from the message,
+leaving the flag name and the caveat intact.
+
+**Result**: exactly 6 of 149 failed -- the same six, this time on the
+`must say WHAT was suppressed` and `self-contradiction` assertions. The two
+halves of the requirement (name the flag, say what it suppressed) are pinned
+independently, so neither can be dropped while the other carries the test.
+
+**Reverted**: `cp`, 149/149.
+
+### 13. The env-var ban (static)
+
+**Mutation**: reinserted `const ESCAPE_VAR = 'HARNESS_ALLOW_INCONSISTENT_INSTALL'`
+into `workflows/lib/install-consistency.mjs`.
+
+**Result**: exactly 1 of 48 static tests failed, naming the offending file.
+
+**Reverted**: `cp`, 48/48.
+
+### 14. The README half of the documentation guard
+
+**Mutation**: changed README's override instruction back to
+"set `HARNESS_ALLOW_INCONSISTENT_INSTALL=1`".
+
+**Result**: exactly 1 of 48 static tests failed. This guard deliberately does
+NOT ban the string from prose: README names the withdrawn variable so an
+operator with it in muscle memory learns it is gone, and the assertion is on
+the INSTRUCTION form (`set \`HARNESS_ALLOW_INCONSISTENT_INSTALL`) rather than
+on any mention. The `.md` exclusion in the code-file scan is the same
+decision.
+
+**Reverted**: `cp`, 48/48.
+
+### What is NOT proven here
+
+- **The floor is a constant in this file, so a stale installed
+  `install-consistency.mjs` carries a stale floor.** A property added to the
+  schemas after that snapshot is not demanded of an install running the old
+  lib. The direction that matters -- a fresh lib against stale workflow
+  scripts, which is the H3 partial-update shape -- does work, and is what
+  sections 1 and 2 prove. The reverse is structurally unclosable for a check
+  that ships inside the thing it checks, and is recorded rather than implied
+  away.
+- **`AC-QA-6`'s signal warns rather than refuses at the workflow gate.** A
+  reported structural loss arrives through the scope agent like every other
+  script-derived field, so under `AC-QA-2` it warns and proceeds unless the
+  report is self-contradictory (section 5). The hard gate for this signal is
+  the repo-side H3 static guard (section 2), which imports `checkConsistency`
+  directly and involves no model at all.
+- **`L3` is unchanged**: a scope agent that UNDER-reports still passes the
+  cross-check trivially. Round three narrows what a fabricating agent can
+  assert (it can no longer claim an override), but does not close omission.
+
+### Full-suite state after round five
+
+977/977 (up from round four's 956/956: net +21 -- seven new `M1` unit tests
+in `install-consistency.test.js`, three round-three escape-hatch removal
+tests replacing four `M9` tests there (net -1), seven new round-three tests
+per cycle file replacing two `M9` tests each (net +5 per file, +10), and
+three new static checks). Run three times consecutively with no flakes,
+after every mutation above was reverted and every file confirmed
+byte-identical to the pre-mutation snapshot.

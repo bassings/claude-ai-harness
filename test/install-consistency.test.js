@@ -69,14 +69,27 @@ more prose after the fence, never scanned
 
 const LENS_MD_INSTRUCTS_RECURRENCE = 'For every finding, fill AGENT-HARNESS.md\'s `Recurrence` field: say whether you expect more.\n'
 
-function schemaSource(constName, props) {
-  const propsText = props.map((p) => `${p}: { type: 'string' }`).join(', ')
+// M1 (round-three): the STRUCTURAL findings properties are emitted here, not
+// hardcoded into the template line below, so a test can build a fixture that
+// has LOST one of them (`omitStructural`) -- the exact defect M1 names. The
+// per-schema split is real, not a test convenience: REVIEW_SCHEMA declares
+// `ac_id` (review-mode AC attribution, H4) and PLAN_SCHEMA legitimately does
+// not, so a floor applied uniformly to both would report every honest
+// PLAN_SCHEMA as having lost a field.
+function structuralPropsFor(constName) {
+  return constName === 'REVIEW_SCHEMA' ? ['severity', 'claim', 'location', 'ac_id'] : ['severity', 'claim', 'location']
+}
+
+function schemaSource(constName, props, { omitStructural = [] } = {}) {
+  const structural = structuralPropsFor(constName).filter((p) => !omitStructural.includes(p))
+  const all = [...structural, ...props.filter((p) => !structural.includes(p))]
+  const propsText = all.map((p) => `${p}: { type: 'string' }`).join(', ')
   return (
     `export const meta = { name: 'x' }\n` +
     `const ${constName} = {\n` +
     `  type: 'object',\n` +
     `  properties: {\n` +
-    `    findings: { type: 'array', items: { type: 'object', properties: { severity: { type: 'string' }, claim: { type: 'string' }, location: { type: 'string' }, ${propsText} } } },\n` +
+    `    findings: { type: 'array', items: { type: 'object', properties: { ${propsText} } } },\n` +
     `  },\n` +
     `}\n`
   )
@@ -229,6 +242,107 @@ test('install-consistency: checkConsistency never flags the STRUCTURAL findings 
   assert.equal(result.consistent, true, `ac_id must not be flagged as an undocumented review_only_props entry: got ${JSON.stringify(result.review_only_props)}`)
 })
 
+// ---- M1 (round-three): a schema that LOSES a structural findings property ----
+// The four STRUCTURAL props (severity/claim/location/ac_id) are exempt from
+// direction 2 because they are not colon-labeled rows in AGENT-HARNESS.md's
+// FINDINGS template, so nothing on the doc side can vouch for them. That
+// exemption was ONE-DIRECTIONAL and left the check blind in the other
+// direction: deleting `location` from an installed REVIEW_SCHEMA reported
+// consistent:true with missing_in_review_schema:[] -- measured, not
+// inferred. That is the H3 defect the whole mechanism exists to catch,
+// sitting inside the mechanism. The floor below closes it WITHOUT touching
+// direction 2's behaviour: the exemption set stays exactly the same four
+// names, so nothing that was previously tolerated is now reported.
+
+test('install-consistency: M1 -- a REVIEW_SCHEMA that has LOST the structural "location" property is reported, not folded into consistent:true', async () => {
+  const { checkConsistency } = await loadModule()
+  const result = checkConsistency({
+    agentHarnessMd: AGENT_HARNESS_MD_RECURRENCE_ONLY,
+    lensFileTexts: [LENS_MD_INSTRUCTS_RECURRENCE],
+    reviewCycleSource: schemaSource('REVIEW_SCHEMA', ['recurrence'], { omitStructural: ['location'] }),
+    planCycleSource: schemaSource('PLAN_SCHEMA', ['recurrence']),
+  })
+  assert.deepEqual(result.missing_structural_in_review_schema, ['location'])
+  assert.deepEqual(result.missing_structural_in_plan_schema, [])
+  assert.equal(result.consistent, false, 'a lost structural property must flip the verdict, or the report is worse than useless: it actively asserts the install is fine')
+})
+
+test('install-consistency: M1 -- a PLAN_SCHEMA that has LOST the structural "severity" property is reported independently of the review side', async () => {
+  const { checkConsistency } = await loadModule()
+  const result = checkConsistency({
+    agentHarnessMd: AGENT_HARNESS_MD_RECURRENCE_ONLY,
+    lensFileTexts: [LENS_MD_INSTRUCTS_RECURRENCE],
+    reviewCycleSource: schemaSource('REVIEW_SCHEMA', ['recurrence']),
+    planCycleSource: schemaSource('PLAN_SCHEMA', ['recurrence'], { omitStructural: ['severity'] }),
+  })
+  assert.deepEqual(result.missing_structural_in_plan_schema, ['severity'])
+  assert.deepEqual(result.missing_structural_in_review_schema, [])
+  assert.equal(result.consistent, false)
+})
+
+test('install-consistency: M1 -- every structural property lost at once is named in full, not just the first one found', async () => {
+  const { checkConsistency } = await loadModule()
+  const result = checkConsistency({
+    agentHarnessMd: AGENT_HARNESS_MD_RECURRENCE_ONLY,
+    lensFileTexts: [LENS_MD_INSTRUCTS_RECURRENCE],
+    reviewCycleSource: schemaSource('REVIEW_SCHEMA', ['recurrence'], { omitStructural: ['severity', 'claim', 'location', 'ac_id'] }),
+    planCycleSource: schemaSource('PLAN_SCHEMA', ['recurrence']),
+  })
+  assert.deepEqual(result.missing_structural_in_review_schema, ['ac_id', 'claim', 'location', 'severity'])
+})
+
+// The false positive the one-directional exemption was preventing, restated
+// as a test so the fix cannot reintroduce it: PLAN_SCHEMA has never declared
+// ac_id (finding-to-AC attribution is a review-mode mechanism, H4), so a
+// uniform floor across both schemas would report every honest install as
+// having lost a field -- H1's total-lockout shape returning through a third
+// door.
+test('install-consistency: M1 -- a PLAN_SCHEMA WITHOUT ac_id is consistent: the structural floor is per-schema, because ac_id is review-mode AC attribution and plan-cycle legitimately has no such property', async () => {
+  const { checkConsistency } = await loadModule()
+  const result = checkConsistency({
+    agentHarnessMd: AGENT_HARNESS_MD_RECURRENCE_ONLY,
+    lensFileTexts: [LENS_MD_INSTRUCTS_RECURRENCE],
+    reviewCycleSource: schemaSource('REVIEW_SCHEMA', ['recurrence']),
+    planCycleSource: schemaSource('PLAN_SCHEMA', ['recurrence']),
+  })
+  assert.deepEqual(result.missing_structural_in_plan_schema, [], 'ac_id must not be demanded of PLAN_SCHEMA')
+  assert.deepEqual(result.missing_structural_in_review_schema, [])
+  assert.equal(result.consistent, true)
+})
+
+test('install-consistency: M1 -- direction 2 is UNCHANGED by the floor: STRUCTURAL_FINDINGS_PROPS is exactly the union of the two per-schema floors, so no structural property becomes a review_only_props/plan_only_props false positive', async () => {
+  const { STRUCTURAL_FINDINGS_PROPS, REQUIRED_STRUCTURAL_PROPS } = await loadModule()
+  assert.deepEqual([...STRUCTURAL_FINDINGS_PROPS].sort(), ['ac_id', 'claim', 'location', 'severity'])
+  const union = new Set([...REQUIRED_STRUCTURAL_PROPS.REVIEW_SCHEMA, ...REQUIRED_STRUCTURAL_PROPS.PLAN_SCHEMA])
+  assert.deepEqual([...union].sort(), [...STRUCTURAL_FINDINGS_PROPS].sort(), 'the exemption set must be DERIVED from the floors, not a third independent literal that can drift from them')
+})
+
+test('install-consistency: M1 -- a blind parse still reports blind, never a spurious "lost structural property" list built from an empty parse', async () => {
+  const { checkConsistency } = await loadModule()
+  const result = checkConsistency({
+    agentHarnessMd: AGENT_HARNESS_MD_RECURRENCE_ONLY,
+    lensFileTexts: [LENS_MD_INSTRUCTS_RECURRENCE],
+    reviewCycleSource: 'no schema const here at all\n',
+    planCycleSource: schemaSource('PLAN_SCHEMA', ['recurrence']),
+  })
+  assert.equal(result.blind, true)
+  assert.deepEqual(result.missing_structural_in_review_schema, [], 'an unparseable schema is blindness, already reported as such; it must not ALSO be reported as four lost properties')
+})
+
+test('install-consistency: M1 -- main() surfaces a lost structural property from a real fixture DIRECTORY, not only from the unit-level function', async () => {
+  const { main } = await loadModule()
+  const dir = writeFixture({
+    agentHarnessMd: AGENT_HARNESS_MD_RECURRENCE_ONLY,
+    lensFiles: { 'lens-security.md': LENS_MD_INSTRUCTS_RECURRENCE },
+    planCycleSource: schemaSource('PLAN_SCHEMA', ['recurrence']),
+    reviewCycleSource: schemaSource('REVIEW_SCHEMA', ['recurrence'], { omitStructural: ['location'] }),
+  })
+  const out = main(dir)
+  assert.equal(out.ok, true)
+  assert.equal(out.consistent, false)
+  assert.deepEqual(out.missing_structural_in_review_schema, ['location'])
+})
+
 // ---- ANTI-VACUITY (the failure class this whole module's header warns
 // about): a parse that finds ZERO fields on either side must never be read
 // as "nothing wrong", because it is indistinguishable from "the regex
@@ -333,65 +447,50 @@ test('install-consistency: main() reports consistent:true for a consistent fixtu
   assert.deepEqual(after_hashes, before_hashes, 'main() must never modify a file\'s content in the install (AC-SIMP-3)')
 })
 
-// round-two review M9: the escape hatch, read by main() from THIS process's
-// own environment (a real Node process -- the dynamic-workflow scripts
-// that consume this field have no process.env access at all), matching
-// hooks/destructive-git-guard.py's HARNESS_ALLOW_DESTRUCTIVE_GIT in naming
-// and shape.
-test('install-consistency: M9 -- main() reports escape_hatch_active:true when HARNESS_ALLOW_INCONSISTENT_INSTALL=1 is set in the environment', async () => {
+// Round three: the escape hatch is no longer an environment variable, and no
+// longer travels through this script at all.
+//
+// M9's original design read HARNESS_ALLOW_INCONSISTENT_INSTALL here (real
+// Node, has process.env) and RELAYED it to the workflow as
+// `escape_hatch_active`. That relay runs through the scope AGENT -- the model
+// whose report the gate is checking -- so a fabricated
+// `escape_hatch_active:true` disabled the gate: the same MED-2 bypass class
+// the in-process cross-check exists to close, reintroduced by M9's own fix. An
+// exported variable is also invisible at the point of use (unlike
+// HARNESS_ALLOW_DESTRUCTIVE_GIT, whose prefix sits inline in the very command
+// being guarded) and silently disables the gate for every subsequent run in
+// the session.
+//
+// The override is now an explicit per-invocation flag on the cycle's own args
+// (`allow_inconsistent_install: true`), read by the workflow script directly.
+// This script's only remaining job is to report what it measured.
+test('install-consistency: round three -- main() reports NO escape_hatch_active field at all; the override never travels through the model-relayed report', async () => {
   const { main } = await loadModule()
-  const dir = consistentFixtureDir()
-  const prev = process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
-  process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = '1'
-  try {
-    const out = main(dir)
-    assert.equal(out.escape_hatch_active, true)
-  } finally {
-    if (prev === undefined) delete process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
-    else process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = prev
-  }
+  const out = main(consistentFixtureDir())
+  assert.equal('escape_hatch_active' in out, false, `escape_hatch_active must be gone from the report: a field the scope agent transcribes is a field the scope agent can fabricate, which is exactly how M9's fix reopened MED-2. Got keys: ${JSON.stringify(Object.keys(out))}`)
 })
 
-test('install-consistency: M9 -- main() reports escape_hatch_active:false when the variable is unset (must not cry wolf)', async () => {
+test('install-consistency: round three -- setting HARNESS_ALLOW_INCONSISTENT_INSTALL=1 in the environment changes NOTHING about main()\'s output: the environment variable is removed, not merely unread', async () => {
   const { main } = await loadModule()
   const dir = consistentFixtureDir()
   const prev = process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
   delete process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
-  try {
-    const out = main(dir)
-    assert.equal(out.escape_hatch_active, false)
-  } finally {
-    if (prev !== undefined) process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = prev
-  }
-})
-
-test('install-consistency: M9 -- main() reports escape_hatch_active:false when the variable is set to something OTHER than the literal "1" (e.g. "true", "yes") -- exact match only, same discipline as HARNESS_ALLOW_DESTRUCTIVE_GIT', async () => {
-  const { main } = await loadModule()
-  const dir = consistentFixtureDir()
-  const prev = process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
-  process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = 'true'
-  try {
-    const out = main(dir)
-    assert.equal(out.escape_hatch_active, false)
-  } finally {
-    if (prev === undefined) delete process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
-    else process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = prev
-  }
-})
-
-test('install-consistency: M9 -- escape_hatch_active is reported on the ok:false (missing-required-file) path too, not only the successful check path', async () => {
-  const { main } = await loadModule()
-  const dir = writeFixture({ skipAgentHarness: true, lensFiles: {}, planCycleSource: schemaSource('PLAN_SCHEMA', []), reviewCycleSource: schemaSource('REVIEW_SCHEMA', []) })
-  const prev = process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
+  const without = JSON.stringify(main(dir))
   process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = '1'
   try {
-    const out = main(dir)
-    assert.equal(out.ok, false)
-    assert.equal(out.escape_hatch_active, true)
+    assert.equal(JSON.stringify(main(dir)), without)
   } finally {
     if (prev === undefined) delete process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL
     else process.env.HARNESS_ALLOW_INCONSISTENT_INSTALL = prev
   }
+})
+
+test('install-consistency: round three -- the ok:false (missing-required-file) path also carries no escape_hatch_active field', async () => {
+  const { main } = await loadModule()
+  const dir = writeFixture({ skipAgentHarness: true, lensFiles: {}, planCycleSource: schemaSource('PLAN_SCHEMA', []), reviewCycleSource: schemaSource('REVIEW_SCHEMA', []) })
+  const out = main(dir)
+  assert.equal(out.ok, false)
+  assert.equal('escape_hatch_active' in out, false)
 })
 
 test('install-consistency: main() reports consistent:false and names the field when the installed schema is missing an instructed field (the H3 shape, in an INSTALLED tree)', async () => {

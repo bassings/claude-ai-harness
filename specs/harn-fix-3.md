@@ -149,15 +149,67 @@ blocks harmless work gets switched off. An instructed-but-unsupported field
   report's own structure, no parsing needed, M3). Every other condition --
   the consistency field missing, `blind`, `ok:false`, or the script's own
   prose-derived verdict alone with no in-process proof -- **warns** (one
-  loud log line) **and proceeds**: lenses still dispatch. A documented
-  escape hatch, `HARNESS_ALLOW_INCONSISTENT_INSTALL=1` (M9, matching
+  loud log line) **and proceeds**: lenses still dispatch.
+
+  **The override (amended 2026-08-23, round three; supersedes M9).** A
+  proven refusal may be downgraded to a loud warning for a SINGLE
+  invocation by an explicit flag on that invocation's own args,
+  `allow_inconsistent_install: true`, read by the workflow script
+  directly. Never from the environment, never persisted, and never relayed
+  through the model. Round two specified
+  `HARNESS_ALLOW_INCONSISTENT_INSTALL=1` "matching
   `hooks/destructive-git-guard.py`'s `HARNESS_ALLOW_DESTRUCTIVE_GIT` in
-  naming and shape), downgrades even a proven refusal to a loud warning for
-  a single run. Test: a proven mismatch, or a self-contradictory report,
-  still refuses -- asserted by counting dispatches, never by reading a
-  message. A blind, could-not-check, missing-field, or unproven-mismatch
-  report dispatches normally with a warning logged. The escape hatch active
-  turns a would-be refusal into a warning, and is inactive by default.
+  naming and shape"; that was wrong on two counts. The analogy fails,
+  because the git guard's variable sits inline in the very command being
+  guarded and is therefore visible at the point of use, whereas an
+  exported variable here silently disables the gate for every subsequent
+  run in the session with nothing in the invocation showing it. More
+  seriously, a dynamic-workflow script has no environment access, so the
+  variable had to be read by `install-consistency.mjs` and relayed as
+  `escape_hatch_active` **through the scope agent -- the model whose
+  report this gate is checking**. A gate whose override is asserted by the
+  thing being policed is circular: the same bypass class as MED-2,
+  reintroduced by the fix for M9. `escape_hatch_active` is removed from
+  the reported schema and is ignored wherever it appears.
+
+  It may override a PROVEN mismatch, deliberately. "Proven" here means the
+  model's reported field list disagrees with the schema object held in
+  process; if the model OVER-reports a field that is not really
+  instructed, the cross-check proves a mismatch that does not exist, and
+  with no override that is H1's total lockout returning through a
+  different door. Using it must be impossible to miss: every suppression
+  is named in the log AND prefixed to the run's own report, saying what
+  was suppressed.
+
+  Test: a proven mismatch, or a self-contradictory report, still refuses
+  -- asserted by counting dispatches, never by reading a message. A blind,
+  could-not-check, missing-field, or unproven-mismatch report dispatches
+  normally with a warning logged. The flag turns a would-be refusal into a
+  warning, is inactive by default, must be exactly boolean `true` (a
+  mistyped `"true"` fails CLOSED), and a scope agent that reports
+  `escape_hatch_active: true` on a proven mismatch is still refused --
+  asserted by counting dispatches.
+- **AC-QA-6:** (Added 2026-08-23, round three; closes M1, which was
+  previously parked.) The check detects a findings schema that has **lost**
+  a structural property, not only one that has gained a property or is
+  missing an instructed field. `severity`, `claim`, `location` and `ac_id`
+  are exempt from the doc-side comparison because nothing in
+  `AGENT-HARNESS.md`'s FINDINGS template names them; that exemption was
+  one-directional, so deleting `location` from an installed
+  `REVIEW_SCHEMA` reported `consistent: true` with
+  `missing_in_review_schema: []` -- measured, the H3 defect sitting inside
+  the mechanism that exists to catch it. A per-schema required floor
+  closes it: `REVIEW_SCHEMA` must declare all four, `PLAN_SCHEMA` the
+  first three (`ac_id` is review-mode AC attribution and plan-cycle
+  legitimately has no such property). The floor must be per-schema, or
+  every honest install reports a lost field -- H1's lockout through a
+  third door. Direction 2's behaviour must be unchanged: the exemption set
+  is DERIVED from the floors, not a third literal that can drift from
+  them. Test: a fixture whose `REVIEW_SCHEMA` lost `location` is reported
+  and flips the verdict; a `PLAN_SCHEMA` without `ac_id` is not; a blind
+  parse reports blindness rather than four fabricated losses; a report
+  claiming `consistent: true` alongside a reported structural loss is
+  self-contradictory and refuses, by dispatch count.
 - **AC-QA-3:** On a consistent install it is silent and adds no measurable
   delay to startup. Test: a consistent fixture dispatches normally.
 - **AC-QA-4:** The check reads the **installed** files it will actually use, not
@@ -225,6 +277,17 @@ the harness's own exit condition (converge on substance, not on silencing
 every comment) -- not deferred silently, and not to be re-raised at a future
 review as unmet unless new evidence changes the ruling.
 
+**Round three (2026-08-23) changed two of these rulings and closed the
+list.** `M1` was un-parked and built (`AC-QA-6` above): it was measured, not
+argued, and it turned out to be the H3 defect sitting inside the mechanism
+that exists to catch H3. `M9`'s own fix was replaced rather than extended
+(`AC-QA-2`'s override paragraph above): the escape hatch it shipped was
+relayed through the model whose report the gate checks, which reopened
+MED-2's bypass class. `M5`'s ruling is unchanged, but its evidence is now a
+measurement rather than an impression -- see below. Everything else on this
+list is **parked permanently**: it is not deferred work, and it is not to be
+re-raised at a future review as unmet.
+
 - **H3:** Every `could-not-check` outcome of the weekly staleness check is
   stderr-silent. Parked under the standing ruling that no-network stays
   stderr-silent: warning weekly about a routine condition trains the
@@ -252,15 +315,39 @@ review as unmet unless new evidence changes the ruling.
 - **L8:** The weekly runner's one `EXIT` trap is scoped to a single resource;
   a later second `trap ... EXIT` registration would silently replace it and
   leak the shallow clone.
-- **M1:** `STRUCTURAL_FINDINGS_PROPS` is an unpinned hard-coded set; widening
-  it (even by one word) silently defeats direction 2 of the consistency
-  check with the suite green.
+- **M1: BUILT round three, no longer parked.** Parking this was wrong. The
+  finding as filed named the widening risk; measuring it found the worse
+  half, which is that the exemption was one-directional and the check was
+  blind to a schema that LOSES a real field (removing `location` from the
+  installed `REVIEW_SCHEMA` left `consistent: true` and
+  `missing_in_review_schema: []`). Closed by `AC-QA-6`. The original
+  widening concern is closed as a side effect and needs no separate fix:
+  adding a word to a floor now makes the repo's own schemas fail the H3
+  static guard by name, so the set can no longer grow quietly. Narrowing a
+  floor stays a deliberate two-place edit, pinned by a `deepEqual` in
+  `test/static-checks.test.js`.
 - **M4:** `AC-QA-2`'s "names both sides" test assertions match hardcoded
   boilerplate text rather than the field/value association, so the two
   sides can be transposed with the suite green.
-- **M5:** The `AC-OPS-5` single-definition guard is a proximity heuristic
-  that three different realistic partial- or spaced-out-copy shapes walk
-  past.
+- **M5: still PARKED, now with a measurement instead of an impression.**
+  The `AC-OPS-5` single-definition guard is a proximity heuristic. Five
+  duplicate shapes were planted against it by the coordinator on
+  2026-08-23 and the results recorded here, replacing the round-two note
+  that said only "found weak twice":
+
+  | Duplicate shape | Caught? |
+  |---|---|
+  | Contiguous, bash idiom | yes |
+  | Contiguous, JS idiom | yes |
+  | One-per-line with trailing comments | yes |
+  | Same list split ~90 lines apart | **no** |
+  | Partial copy, 3 of 7 patterns | **no** |
+
+  So it catches realistic contiguous copies and is blind to split and
+  partial ones. It stays parked because it is a guard on a guard, not a
+  correctness mechanism. Do not change the guard on the strength of the
+  two "no" rows alone; the next reader now inherits a measurement rather
+  than an impression, and can decide against acting on it.
 - **M6:** An unreadable published file during staleness comparison is
   silently skipped and the run still reports `status:"ok"`.
 - **M7:** The could-not-check reason names the failing step, not the cause
@@ -276,7 +363,7 @@ review as unmet unless new evidence changes the ruling.
 
 | Risk | Recoverability |
 |---|---|
-| The consistency check refuses on a false positive and blocks all review cycles | Bounded by AC-QA-2's amendment (refuse only on proof, warn on doubt) and the `HARNESS_ALLOW_INCONSISTENT_INSTALL` escape hatch, not by AC-QA-3 (AC-QA-3 is a startup-latency bound and never bounded this risk -- a round-two spec bug, corrected here) |
+| The consistency check refuses on a false positive and blocks all review cycles | Bounded by AC-QA-2's amendment (refuse only on proof, warn on doubt) and by the per-invocation `allow_inconsistent_install: true` override (round three; it replaces the `HARNESS_ALLOW_INCONSISTENT_INSTALL` environment variable, which was relayed through the model the gate checks). Never by AC-QA-3 -- that is a startup-latency bound and never bounded this risk, a round-two spec bug corrected here |
 | The drift report is noisy and gets ignored, becoming decoration | Cheap, and the likeliest way this ships useless |
 | A cache clone accumulates on a volume twice at 99% | Cheap if bounded at design time |
 

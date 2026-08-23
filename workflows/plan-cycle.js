@@ -1,7 +1,7 @@
 export const meta = {
   name: 'plan-cycle',
   description: 'Multi-lens planning cycle: triggered lenses write AC-<LENS>-<n> criteria into the spec, per AGENT-HARNESS.md',
-  whenToUse: 'After drafting a spec, before implementation. Args: {spec: string (path to the spec, required), lenses?: string[] (override triggering)}',
+  whenToUse: 'After drafting a spec, before implementation. Args: {spec: string (path to the spec, required), lenses?: string[] (override triggering), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one)}',
   phases: [
     { title: 'Scope', detail: 'read the spec, classify the change surface' },
     { title: 'Lenses', detail: 'triggered lenses draft acceptance criteria in parallel' },
@@ -31,6 +31,28 @@ export const meta = {
 // script's own prose-derived verdict alone with no in-process proof -- is
 // uncertainty: warn loudly via log() and PROCEED, never halt. See
 // evaluateInstallConsistency() below, the single decision point.
+//
+// ROUND THREE (the override): the escape hatch is an explicit flag on THIS
+// invocation's own args -- `allow_inconsistent_install: true` -- read by this
+// workflow script directly, never from the environment, never persisted, and
+// never relayed through a model.
+//
+// Round two put it in an environment variable and, because a workflow script
+// has no environment access, relayed it here as an escape_hatch_active field on
+// the reported consistency object -- through the scope agent, the model whose
+// report this gate is checking. A gate whose override is asserted by the thing
+// being policed is circular: a fabricating scope agent could claim the hatch
+// was active. That is the same bypass class as MED-2, reintroduced by the fix
+// for M9, so escape_hatch_active is now ignored wherever it appears and is no
+// longer part of the reported schema at all.
+//
+// It may override a PROVEN mismatch, deliberately. "Proven" here means the
+// model's reported field list disagrees with the schema object held in this
+// process. If the model OVER-reports a field that is not really instructed, the
+// cross-check proves a mismatch that does not exist, and with no override that
+// is H1's total lockout returning through a different door. Using it is
+// impossible to miss: every suppression is named in the log AND in the returned
+// report, and says what was suppressed.
 const INSTALL_CONSISTENCY_INSTRUCTION =
   `Before anything else, verify the installed harness agrees with itself (specs/harn-fix-3.md AC-QA-1): find this ` +
   `harness's install-consistency.mjs script. If the environment variable CLAUDE_HOME is set (M11: the SAME override ` +
@@ -45,7 +67,7 @@ const INSTALL_CONSISTENCY_INSTRUCTION =
   `this script, full stop -- there is deliberately no repo-local fallback option at all, even when this repo IS ` +
   `claude-ai-harness itself). If neither CLAUDE_HOME nor (a) nor (b) resolves to a real file, that is not a security ` +
   `concern, only an absent install: return ` +
-  `{ok:false, consistent:false, blind:true, checked_dir:"not found", error:"no install-consistency.mjs found outside the working tree", escape_hatch_active:false} ` +
+  `{ok:false, consistent:false, blind:true, checked_dir:"not found", error:"no install-consistency.mjs found outside the working tree"} ` +
   `as the "consistency" field instead of running anything.\n` +
   `Run it with the install root you found it under as its ONE argument (the parent of the ` +
   `workflows/lib directory it lives in), exactly like: \`node <path-to-install-consistency.mjs> <install-root>\`. ` +
@@ -53,12 +75,12 @@ const INSTALL_CONSISTENCY_INSTRUCTION =
   `field -- do not reinterpret, summarise, or recompute any part of it yourself, and do not skip this step even if ` +
   `you believe you already know the answer: the determination is made by the script, not by you. ` +
   `If the script failed to run at all (rather than printing its own JSON), that is itself a partial or broken ` +
-  `install: return {ok:false, consistent:false, blind:true, checked_dir:"not found", error:"<what happened>", escape_hatch_active:false} ` +
+  `install: return {ok:false, consistent:false, blind:true, checked_dir:"not found", error:"<what happened>"} ` +
   `as the "consistency" field yourself -- NEVER omit the field or fabricate {consistent:true, ...} to skip this step.\n\n`
 
 const INSTALL_CONSISTENCY_SCHEMA = {
   type: 'object',
-  required: ['ok', 'consistent', 'blind', 'checked_dir', 'doc_fields', 'agent_fields', 'escape_hatch_active'],
+  required: ['ok', 'consistent', 'blind', 'checked_dir', 'doc_fields', 'agent_fields'],
   properties: {
     ok: { type: 'boolean' },
     consistent: { type: 'boolean' },
@@ -76,15 +98,15 @@ const INSTALL_CONSISTENCY_SCHEMA = {
     missing_in_plan_schema: { type: 'array', items: { type: 'string' } },
     review_only_props: { type: 'array', items: { type: 'string' } },
     plan_only_props: { type: 'array', items: { type: 'string' } },
+    // M1 (round three): a schema that has LOST one of the structural findings
+    // properties (severity/claim/location, plus ac_id on the review side).
+    // NOT in `required` above, deliberately: an install carrying a
+    // pre-round-three install-consistency.mjs cannot emit these, and rejecting
+    // its report outright would turn a stale install into a hard stop, which is
+    // the H1 lockout shape AC-QA-2 exists to prevent. Absent reads as [].
+    missing_structural_in_review_schema: { type: 'array', items: { type: 'string' } },
+    missing_structural_in_plan_schema: { type: 'array', items: { type: 'string' } },
     error: { type: ['string', 'null'] },
-    // M9 (round-two review): HARNESS_ALLOW_INCONSISTENT_INSTALL=1, read from
-    // THIS PROCESS's own environment by install-consistency.mjs's main() (a
-    // real Node script, unlike this workflow script, which has no
-    // process.env access at all) and relayed here -- matching
-    // hooks/destructive-git-guard.py's HARNESS_ALLOW_DESTRUCTIVE_GIT in
-    // naming and shape. See evaluateInstallConsistency() below for what it
-    // does and does not override.
-    escape_hatch_active: { type: 'boolean' },
   },
 }
 
@@ -93,8 +115,9 @@ function installConsistencyError(reason) {
     `InstallInconsistent (AC-QA-2, PROVEN by the in-process cross-check -- not a heuristic, not a false positive): ` +
     `${reason} Refusing to dispatch any lens: an instructed field with no schema slot is silently dropped (H3's own ` +
     `shape). Re-sync the installed copy from the published repo, then re-run. To override in a genuine emergency ` +
-    `(NOT recommended; logged loudly when used, never silent): set HARNESS_ALLOW_INCONSISTENT_INSTALL=1 in the ` +
-    `environment the scope agent's Bash tool runs in, then re-run.`
+    `(NOT recommended; named in the log AND in the run's own report when used, never silent): re-run this cycle with ` +
+    `"allow_inconsistent_install": true in its args. It applies to that ONE invocation, is never persisted, and cannot ` +
+    `be set by the scope agent -- an escape_hatch_active field in the reported consistency object is ignored.`
   )
 }
 
@@ -140,13 +163,33 @@ function crossCheckAgainstOwnSchema(consistency, ownSchema, ownSchemaName) {
   return { ok: true, certain: true, reason: null }
 }
 
+// The one place the override's wording is built, so the log line and the
+// report banner can never say two different things about the same suppression.
+// It NAMES the flag and states WHAT was suppressed: an override whose output
+// only says "an override was used" leaves the next reader unable to tell
+// whether the run's findings are trustworthy.
+function overrideMessage(suppressed) {
+  return (
+    `INSTALL-CONSISTENCY OVERRIDE IN USE: args.allow_inconsistent_install=true SUPPRESSED a refusal that would ` +
+    `otherwise have halted this run before dispatching any lens. SUPPRESSED REFUSAL: ${suppressed}. Lens output from ` +
+    `this run may have been built against a broken or misreported findings schema, and should be read with that in mind.`
+  )
+}
+
 // AC-QA-2 (amended): the single decision point for refuse/warn/proceed.
-// Returns { action, message }: 'refuse' (halt -- PROVEN, certain), 'warn'
-// (proceed, log loudly -- uncertainty in either direction, or a DELIBERATE
-// escape-hatch override of a proven mismatch), or 'proceed' (silent,
-// AC-QA-3, the pinned call sequence -- no field of this decision may add an
-// agent() dispatch).
-function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName) {
+// Returns { action, message, override_used }: 'refuse' (halt -- PROVEN,
+// certain), 'warn' (proceed, log loudly -- uncertainty in either direction, or
+// a DELIBERATE override of a proven mismatch), or 'proceed' (silent, AC-QA-3,
+// the pinned call sequence -- no field of this decision may add an agent()
+// dispatch).
+//
+// `allowInconsistentInstall` is the caller's own args flag, passed in as a
+// plain boolean by the ONE call site below. It is never read from the
+// environment and never taken from `consistency` (which is model output).
+// `override_used` is true only when the flag actually turned a refusal into a
+// warning, so the caller can surface that fact in the run's report rather than
+// in a log line that scrolls away.
+function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName, allowInconsistentInstall) {
   if (!consistency) {
     return { action: 'warn', message: 'the scope agent returned no "consistency" field at all -- proceeding without verification (uncertain, not halted; AC-QA-2 amendment)' }
   }
@@ -155,17 +198,23 @@ function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName) {
   // external parsing to detect -- it is a fact about the report's OWN
   // structure, so (unlike blind/ok:false) it is treated as PROVEN, not
   // merely uncertain, and refuses like a genuine cross-check failure.
+  // M1 (round three): the two structural-loss arrays belong here too. They are
+  // the new signal, and without them a fabricated consistent:true paired with a
+  // reported lost property would sail through the one check that needs no
+  // parsing to catch it.
   const contradictionFields = [
     ...(Array.isArray(c.missing_in_review_schema) ? c.missing_in_review_schema : []),
     ...(Array.isArray(c.missing_in_plan_schema) ? c.missing_in_plan_schema : []),
     ...(Array.isArray(c.review_only_props) ? c.review_only_props : []),
     ...(Array.isArray(c.plan_only_props) ? c.plan_only_props : []),
+    ...(Array.isArray(c.missing_structural_in_review_schema) ? c.missing_structural_in_review_schema : []),
+    ...(Array.isArray(c.missing_structural_in_plan_schema) ? c.missing_structural_in_plan_schema : []),
   ]
   const contradictory = c.consistent === true && (c.blind === true || contradictionFields.length > 0)
   if (contradictory) {
     const reason = `the consistency report is self-contradictory (consistent:true alongside blind:${c.blind === true} and mismatch field(s) ${JSON.stringify(contradictionFields)}) -- a report that disagrees with itself cannot be trusted either way`
-    if (c.escape_hatch_active === true) {
-      return { action: 'warn', message: `PROVEN self-contradiction (${reason}), but HARNESS_ALLOW_INCONSISTENT_INSTALL=1 is set -- proceeding anyway. This is a deliberate override; lens output this session may be built against a broken or misreported schema.` }
+    if (allowInconsistentInstall === true) {
+      return { action: 'warn', override_used: true, message: overrideMessage(`PROVEN self-contradiction -- ${reason}`) }
     }
     return { action: 'refuse', message: reason }
   }
@@ -177,8 +226,8 @@ function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName) {
   }
   const crossCheck = crossCheckAgainstOwnSchema(c, ownSchema, ownSchemaName)
   if (!crossCheck.ok && crossCheck.certain) {
-    if (c.escape_hatch_active === true) {
-      return { action: 'warn', message: `PROVEN mismatch (${crossCheck.reason}), but HARNESS_ALLOW_INCONSISTENT_INSTALL=1 is set -- proceeding anyway. This is a deliberate override; lens output this session may be built against a broken schema.` }
+    if (allowInconsistentInstall === true) {
+      return { action: 'warn', override_used: true, message: overrideMessage(`PROVEN mismatch -- ${crossCheck.reason}`) }
     }
     return { action: 'refuse', message: crossCheck.reason }
   }
@@ -193,7 +242,9 @@ function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName) {
         `cross-check against the running ${ownSchemaName} found no proof of one -- proceeding (uncertain, not ` +
         `halted; AC-QA-2 amendment). Reported: missing_in_review_schema=${JSON.stringify(c.missing_in_review_schema || [])}, ` +
         `missing_in_plan_schema=${JSON.stringify(c.missing_in_plan_schema || [])}, review_only_props=${JSON.stringify(c.review_only_props || [])}, ` +
-        `plan_only_props=${JSON.stringify(c.plan_only_props || [])}`,
+        `plan_only_props=${JSON.stringify(c.plan_only_props || [])}, ` +
+        `missing_structural_in_review_schema=${JSON.stringify(c.missing_structural_in_review_schema || [])}, ` +
+        `missing_structural_in_plan_schema=${JSON.stringify(c.missing_structural_in_plan_schema || [])}`,
     }
   }
   return { action: 'proceed', message: null }
@@ -443,13 +494,20 @@ planHeadSha = typeof scope.head_sha === 'string' ? scope.head_sha : null
 // mismatch (evaluateInstallConsistency's 'refuse' action); everything
 // uncertain warns and proceeds. See the install-consistency preflight
 // block above for the reasoning and evaluateInstallConsistency() itself.
-const planEval = evaluateInstallConsistency(scope.consistency, PLAN_SCHEMA, 'PLAN_SCHEMA')
+// Round three: the override is THIS invocation's own args flag, read here
+// directly, never from the environment and never from scope.consistency (model
+// output). Strict === true, so a mistyped "true" or 1 fails CLOSED.
+let installOverrideNotice = null
+const planEval = evaluateInstallConsistency(scope.consistency, PLAN_SCHEMA, 'PLAN_SCHEMA', opts.allow_inconsistent_install === true)
 if (planEval.action === 'refuse') {
   throw installConsistencyError(planEval.message)
 }
 if (planEval.action === 'warn') {
   log(`WARNING (install-consistency preflight, AC-QA-2 amendment): ${redactLogText(planEval.message)}`)
 }
+// A log line scrolls away; the report is what gets read and pasted. An override
+// that suppressed a refusal has to appear in both.
+if (planEval.override_used) installOverrideNotice = planEval.message
 
 // ---- deterministic lens triggering (AGENT-HARNESS.md roster; simplicity is planning-only and always on) ----
 let lenses = ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product']
@@ -546,7 +604,7 @@ return {
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: reportOk ? synthesis.summary : '',
+  report: reportOk ? (installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.summary}` : synthesis.summary) : '',
   __outcome: outcome,
 }
 

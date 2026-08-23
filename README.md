@@ -766,14 +766,34 @@ in-process proof -- **warns** (one loud log line naming the uncertainty) and
 **If a refusal fires and you believe it is wrong** (a false positive from
 the prose-parsing half, not a genuine schema gap), the first line of the
 thrown error tells you which field and which schema side it named. To
-proceed anyway for one run: set `HARNESS_ALLOW_INCONSISTENT_INSTALL=1` in
-the environment the scope agent's Bash tool runs in, then re-run -- matching
-`HARNESS_ALLOW_DESTRUCTIVE_GIT`'s naming and shape (see "Destructive git
-guard" above). The override is read once per run by
-`install-consistency.mjs` itself (a real Node process; the dynamic-workflow
-scripts that consume the result have no `process.env` access at all) and
-is never silent: every use is logged loudly, naming the override
-explicitly. There is no persisted or repo-level way to disable the gate -- only this one-shot, one-run environment variable.
+proceed anyway for one run, pass the override on the invocation's own args:
+
+```
+/review-cycle {"allow_inconsistent_install": true}
+/plan-cycle   {"spec": "specs/X.md", "allow_inconsistent_install": true}
+```
+
+It is read directly by the workflow script, applies to that **one**
+invocation, and is never persisted. Using it is impossible to miss: every
+suppression is named in the log **and** prefixed to the run's own report,
+saying which refusal it suppressed and which field that refusal named.
+
+**Why an args flag rather than an environment variable.** The first cut of
+this override was `HARNESS_ALLOW_INCONSISTENT_INSTALL=1`, by analogy with
+`HARNESS_ALLOW_DESTRUCTIVE_GIT` (see "Destructive git guard" above). The
+analogy fails in two ways. There, the variable's prefix sits inline in the
+very command being guarded, so it is visible at the point of use; an
+exported variable here would silently disable the gate for every subsequent
+run in the session with nothing in the invocation showing it. Worse, a
+dynamic-workflow script has no environment access at all, so the variable
+had to be read by `install-consistency.mjs` and **relayed through the scope
+agent** -- the model whose report the gate is checking. A gate whose
+override is asserted by the thing being policed is circular, and it is the
+same bypass class the in-process cross-check exists to close. An
+`escape_hatch_active` field in a reported consistency object is now ignored
+wherever it appears.
+
+There is no persisted, environment or repo-level way to disable the gate.
 
 The script is resolved via `$CLAUDE_HOME` if set (the SAME override the
 staleness check below honours -- AC-QA-4), otherwise `~/.claude/workflows/lib/

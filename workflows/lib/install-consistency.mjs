@@ -142,7 +142,41 @@ export function parseSchemaFindingsProps(workflowSource, constName) {
 // <file:line>" header, not a colon-labeled template row; ac_id is
 // review-mode AC attribution, a separate mechanism from the FINDINGS
 // template. Neither needs a matching template row.
-export const STRUCTURAL_FINDINGS_PROPS = new Set(['severity', 'claim', 'location', 'ac_id'])
+//
+// M1 (round three): that exemption was ONE-DIRECTIONAL, and the gap it
+// left is the defect this whole module exists to catch, sitting inside the
+// module. Nothing on the doc side names these four, so direction 1 ("a
+// documented/instructed field with no schema slot") cannot see them; direction
+// 2 only ever reports an EXTRA property. A schema that has LOST one therefore
+// passed clean: deleting `location` from an installed REVIEW_SCHEMA reported
+// consistent:true with missing_in_review_schema:[] -- measured, not inferred.
+//
+// The floor below is the missing direction. It is PER-SCHEMA on purpose:
+// REVIEW_SCHEMA declares ac_id (finding-to-AC attribution, H4) and PLAN_SCHEMA
+// legitimately does not, so a floor applied uniformly to both would report
+// every honest install as having lost a field -- H1's total-lockout shape
+// returning through a third door, which is exactly the false positive the
+// original exemption existed to prevent.
+//
+// Direction 2's behaviour is UNCHANGED, because STRUCTURAL_FINDINGS_PROPS is
+// now DERIVED from these floors rather than being a third independent literal:
+// the exemption set is the same four names it always was, and nothing
+// previously tolerated is now reported.
+//
+// What this still cannot see, stated plainly rather than implied away: the
+// floor is a constant in THIS file. An install that copied a stale
+// install-consistency.mjs carries a stale floor, so a property added to the
+// schemas after that snapshot is not demanded. The direction that matters is
+// the one that works -- a fresh lib against stale workflow scripts (the H3
+// partial-update shape: instruction layers moved, schema layer did not) -- and
+// widening the floor without widening the schemas fails test/static-checks.test.js's
+// H3 guard by name, so the constant cannot quietly grow either.
+export const REQUIRED_STRUCTURAL_PROPS = {
+  REVIEW_SCHEMA: ['severity', 'claim', 'location', 'ac_id'],
+  PLAN_SCHEMA: ['severity', 'claim', 'location'],
+}
+
+export const STRUCTURAL_FINDINGS_PROPS = new Set([...REQUIRED_STRUCTURAL_PROPS.REVIEW_SCHEMA, ...REQUIRED_STRUCTURAL_PROPS.PLAN_SCHEMA])
 
 // The comparison itself, both directions, mirroring test/static-checks.test.js's
 // pre-existing H3 test exactly (that test now calls this function rather than
@@ -165,6 +199,12 @@ export function checkConsistency({ agentHarnessMd, lensFileTexts, planCycleSourc
   const missingInPlanSchema = []
   const reviewOnlyProps = []
   const planOnlyProps = []
+  // M1: computed ONLY when the parse actually saw something. An unparseable
+  // schema is blindness, already reported as such by blind_reasons above; it
+  // must not ALSO be reported as "lost every structural property", which would
+  // turn one honest could-not-check into four fabricated findings.
+  const missingStructuralInReviewSchema = []
+  const missingStructuralInPlanSchema = []
 
   if (!blind) {
     for (const field of new Set([...docFields, ...agentFields])) {
@@ -177,10 +217,22 @@ export function checkConsistency({ agentHarnessMd, lensFileTexts, planCycleSourc
     for (const p of planProps) {
       if (!STRUCTURAL_FINDINGS_PROPS.has(p) && !docFields.has(p)) planOnlyProps.push(p)
     }
+    for (const p of REQUIRED_STRUCTURAL_PROPS.REVIEW_SCHEMA) {
+      if (!reviewProps.has(p)) missingStructuralInReviewSchema.push(p)
+    }
+    for (const p of REQUIRED_STRUCTURAL_PROPS.PLAN_SCHEMA) {
+      if (!planProps.has(p)) missingStructuralInPlanSchema.push(p)
+    }
   }
 
   const consistent =
-    !blind && missingInReviewSchema.length === 0 && missingInPlanSchema.length === 0 && reviewOnlyProps.length === 0 && planOnlyProps.length === 0
+    !blind &&
+    missingInReviewSchema.length === 0 &&
+    missingInPlanSchema.length === 0 &&
+    reviewOnlyProps.length === 0 &&
+    planOnlyProps.length === 0 &&
+    missingStructuralInReviewSchema.length === 0 &&
+    missingStructuralInPlanSchema.length === 0
 
   return {
     consistent,
@@ -192,6 +244,8 @@ export function checkConsistency({ agentHarnessMd, lensFileTexts, planCycleSourc
     missing_in_plan_schema: missingInPlanSchema.sort(),
     review_only_props: reviewOnlyProps.sort(),
     plan_only_props: planOnlyProps.sort(),
+    missing_structural_in_review_schema: missingStructuralInReviewSchema.sort(),
+    missing_structural_in_plan_schema: missingStructuralInPlanSchema.sort(),
   }
 }
 
@@ -498,24 +552,28 @@ function listLensFiles(agentsDir) {
   return names.filter((f) => f.startsWith('lens-') && f.endsWith('.md')).sort()
 }
 
-// M9 (round-two review): the escape hatch, matching
-// hooks/destructive-git-guard.py's HARNESS_ALLOW_DESTRUCTIVE_GIT in naming
-// and shape (an env-var read once, real Node, no shell parsing needed since
-// this is not a Bash command guard). Read HERE, in this real Node process
-// (which has process.env), not in the dynamic-workflow script that consumes
-// this field -- that runtime has no process.env access at all (see this
-// file's own header on why workflow scripts cannot do any of this
-// themselves). The WORKFLOW decides what to do with it
-// (evaluateInstallConsistency in plan-cycle.js/review-cycle.js); this
-// script only reports the fact.
-const ESCAPE_VAR = 'HARNESS_ALLOW_INCONSISTENT_INSTALL'
-function isEscapeHatchActive() {
-  return process.env[ESCAPE_VAR] === '1'
-}
-
+// ROUND THREE: this script deliberately reports NO override state at all.
+//
+// M9 (round two) put the escape hatch in an environment variable read here and
+// RELAYED to the workflow as `escape_hatch_active`. That relay runs through the
+// scope agent -- the model whose report the gate is checking -- so a fabricated
+// escape_hatch_active of true disabled the gate outright: a gate whose override
+// is asserted by the thing being policed is circular, and it is the same bypass
+// class as MED-2, reintroduced by the fix for M9. The env-var shape was also
+// wrong on its own terms. It was chosen by analogy with
+// hooks/destructive-git-guard.py's HARNESS_ALLOW_DESTRUCTIVE_GIT, and the
+// analogy fails: there the prefix sits inline in the very command being
+// guarded, so it is visible at the point of use, whereas an exported variable
+// silently disables this gate for every subsequent run in the session with
+// nothing in the invocation showing it.
+//
+// The override is now `allow_inconsistent_install: true` on the cycle's own
+// args, read directly by workflows/plan-cycle.js and workflows/review-cycle.js:
+// explicit at the point of use, one invocation only, never persisted, and never
+// passing through a model. This script's only job is to report what it
+// measured.
 export function main(argDir) {
   const dir = resolveInstallDir(argDir)
-  const escapeHatchActive = isEscapeHatchActive()
   const agentHarnessPath = path.join(dir, 'AGENT-HARNESS.md')
   const agentsDir = path.join(dir, 'agents')
   const planPath = path.join(dir, 'workflows', 'plan-cycle.js')
@@ -547,6 +605,8 @@ export function main(argDir) {
     missing_in_plan_schema: [],
     review_only_props: [],
     plan_only_props: [],
+    missing_structural_in_review_schema: [],
+    missing_structural_in_plan_schema: [],
   }
 
   if (missingRequired.length) {
@@ -559,7 +619,6 @@ export function main(argDir) {
       checked_dir: dir,
       lens_files_checked: lensFiles.length,
       error: `required file(s) missing under ${dir}: ${missingRequired.join(', ')}`,
-      escape_hatch_active: escapeHatchActive,
       ...EMPTY_CHECK,
     }
   }
@@ -571,7 +630,6 @@ export function main(argDir) {
     checked_dir: dir,
     lens_files_checked: lensFiles.length,
     error: null,
-    escape_hatch_active: escapeHatchActive,
     ...check,
   }
 }

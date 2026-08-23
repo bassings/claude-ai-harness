@@ -30,7 +30,6 @@ const CONSISTENCY_OK = {
   review_only_props: [],
   plan_only_props: [],
   error: null,
-  escape_hatch_active: false,
 }
 
 const SCOPE_OK = {
@@ -566,33 +565,140 @@ test('plan-cycle.js: MED-2 -- a GENUINE, real-shaped consistency report (doc_fie
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'])
 })
 
-// round-two review M9: the escape hatch. HARNESS_ALLOW_INCONSISTENT_INSTALL=1
-// is read by install-consistency.mjs's main() (real Node, has process.env)
-// and relayed as consistency.escape_hatch_active; the workflow (no
-// process.env access at all) only ever reads that relayed boolean.
-test('plan-cycle.js: M9 -- a PROVEN mismatch with escape_hatch_active:true WARNS and PROCEEDS instead of refusing, and the warning names the override explicitly', async () => {
+// ROUND THREE: the escape hatch is an explicit flag on the invocation's own
+// args (`allow_inconsistent_install: true`), read by this workflow script
+// directly. It is NOT an environment variable and NOT relayed through the
+// scope agent.
+//
+// The decisive reason, which round two missed: the workflow script has no
+// environment access, so M9's `escape_hatch_active` was relayed THROUGH THE
+// MODEL whose report the gate is checking. A gate whose override is asserted
+// by the thing being policed is circular -- a fabricating scope agent could
+// claim the hatch was active. That is the same bypass class as MED-2,
+// reintroduced by the fix for M9. The env-var shape was also wrong on its own
+// terms: HARNESS_ALLOW_DESTRUCTIVE_GIT's prefix sits inline in the very
+// command being guarded, so it is visible at the point of use, whereas an
+// exported variable silently disables this gate for every subsequent run in
+// the session with nothing in the invocation showing it.
+test('plan-cycle.js: round three -- a PROVEN mismatch with args.allow_inconsistent_install:true WARNS and PROCEEDS, and the warning names the flag AND what it suppressed', async () => {
   const { result, logs } = await runWorkflow(WF, {
-    args: { spec: 'specs/foo.md' },
+    args: { spec: 'specs/foo.md', allow_inconsistent_install: true },
     agent: baseAgent({
       'scope:spec': {
         ...SCOPE_OK,
-        consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'], escape_hatch_active: true },
+        consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'] },
       },
     }),
   })
-  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'], 'the escape hatch must let dispatch proceed')
-  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('HARNESS_ALLOW_INCONSISTENT_INSTALL')), `expected a warning naming the override, got: ${JSON.stringify(logs)}`)
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'], 'the override must let dispatch proceed')
+  const named = logs.filter((l) => l.includes('allow_inconsistent_install'))
+  assert.ok(named.length > 0, `expected a log line naming the flag, got: ${JSON.stringify(logs)}`)
+  assert.ok(named.some((l) => l.includes('effort')), `the log must say WHAT was suppressed (the offending field), not merely that an override was used: ${JSON.stringify(named)}`)
+  assert.ok(named.some((l) => /suppress/i.test(l)), `the log must say a refusal was SUPPRESSED: ${JSON.stringify(named)}`)
 })
 
-test('plan-cycle.js: M9 -- a PROVEN mismatch with escape_hatch_active:false (the default) still refuses -- the escape hatch must not be active by default', async () => {
+test('plan-cycle.js: round three -- the override is named in the RETURNED REPORT too, not only in a log line that scrolls away', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { spec: 'specs/foo.md', allow_inconsistent_install: true },
+    agent: baseAgent({
+      'scope:spec': {
+        ...SCOPE_OK,
+        consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'] },
+      },
+    }),
+  })
+  assert.match(result.report, /allow_inconsistent_install/, `the report must name the override: ${JSON.stringify(result.report)}`)
+  assert.match(result.report, /effort/, 'the report must say what was suppressed')
+})
+
+test('plan-cycle.js: round three -- a report that is NOT overridden leaves the returned report untouched (the banner must not appear on every run)', async () => {
+  const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md', allow_inconsistent_install: true }, agent: baseAgent() })
+  assert.equal(result.report, '### Summary\n4 criteria', 'a consistent install must produce the synthesis report verbatim, with no override banner')
+})
+
+test('plan-cycle.js: round three -- a PROVEN mismatch with NO flag on args still refuses (the override must not be active by default)', async () => {
   await assert.rejects(() =>
     runWorkflow(WF, {
       args: { spec: 'specs/foo.md' },
       agent: baseAgent({
         'scope:spec': {
           ...SCOPE_OK,
-          consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'], escape_hatch_active: false },
+          consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'] },
         },
+      }),
+    })
+  )
+})
+
+// THE point of round three: the model cannot vote on its own gate.
+test('plan-cycle.js: round three -- a PROVEN mismatch whose SCOPE-AGENT-REPORTED consistency object claims escape_hatch_active:true STILL REFUSES: the override may never be asserted by the thing being policed (the MED-2 bypass class M9 reopened)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: { spec: 'specs/foo.md' },
+        agent: baseAgent({
+          'scope:spec': {
+            ...SCOPE_OK,
+            consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'], escape_hatch_active: true, __bypassSchemaValidation: true },
+          },
+        }),
+      }),
+    (err) => {
+      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES.includes(c.opts.label))
+      assert.equal(dispatchedLenses.length, 0, 'a model-asserted override must not reach lens dispatch, by COUNT')
+      return true
+    }
+  )
+})
+
+test('plan-cycle.js: round three -- the flag must be exactly boolean true: the string "true" does not activate it, so a mistyped override fails CLOSED', async () => {
+  await assert.rejects(() =>
+    runWorkflow(WF, {
+      args: { spec: 'specs/foo.md', allow_inconsistent_install: 'true' },
+      agent: baseAgent({
+        'scope:spec': {
+          ...SCOPE_OK,
+          consistency: { ...CONSISTENCY_OK, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], missing_in_review_schema: ['effort'], missing_in_plan_schema: ['effort'] },
+        },
+      }),
+    })
+  )
+})
+
+// M1 (round three) at the workflow seam: a report claiming consistent:true
+// while ALSO reporting a lost structural property is self-contradictory in
+// exactly the M3 sense -- provable from the report's own structure, no
+// parsing needed -- so it must refuse like any other contradiction. Without
+// the new arrays in the contradiction set, M1's whole new signal could be
+// paired with a fabricated consistent:true and pass.
+test('plan-cycle.js: M1 (round three) -- consistent:true alongside a non-empty missing_structural_in_review_schema is self-contradictory and refuses, by count', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: { spec: 'specs/foo.md' },
+        agent: baseAgent({
+          'scope:spec': {
+            ...SCOPE_OK,
+            consistency: { ...CONSISTENCY_OK, consistent: true, missing_structural_in_review_schema: ['location'] },
+          },
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /self-contradictory/)
+      assert.match(err.message, /location/, 'the refusal must name the lost property')
+      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES.includes(c.opts.label))
+      assert.equal(dispatchedLenses.length, 0)
+      return true
+    }
+  )
+})
+
+test('plan-cycle.js: M1 (round three) -- consistent:true alongside a non-empty missing_structural_in_plan_schema also refuses', async () => {
+  await assert.rejects(() =>
+    runWorkflow(WF, {
+      args: { spec: 'specs/foo.md' },
+      agent: baseAgent({
+        'scope:spec': { ...SCOPE_OK, consistency: { ...CONSISTENCY_OK, consistent: true, missing_structural_in_plan_schema: ['severity'] } },
       }),
     })
   )
@@ -635,18 +741,18 @@ test('plan-cycle.js: M3 -- a self-contradictory report (consistent:true alongsid
   )
 })
 
-test('plan-cycle.js: M3 -- a self-contradictory report with escape_hatch_active:true WARNS and PROCEEDS instead of refusing', async () => {
+test('plan-cycle.js: M3 (round three) -- a self-contradictory report with args.allow_inconsistent_install:true WARNS and PROCEEDS instead of refusing, naming the flag', async () => {
   const { result, logs } = await runWorkflow(WF, {
-    args: { spec: 'specs/foo.md' },
+    args: { spec: 'specs/foo.md', allow_inconsistent_install: true },
     agent: baseAgent({
       'scope:spec': {
         ...SCOPE_OK,
-        consistency: { ...CONSISTENCY_OK, consistent: true, missing_in_plan_schema: ['recurrence'], escape_hatch_active: true },
+        consistency: { ...CONSISTENCY_OK, consistent: true, missing_in_plan_schema: ['recurrence'] },
       },
     }),
   })
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'])
-  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('self-contradiction')), `expected a warning naming the override, got: ${JSON.stringify(logs)}`)
+  assert.ok(logs.some((l) => l.includes('self-contradiction') && l.includes('allow_inconsistent_install')), `expected a warning naming the override, got: ${JSON.stringify(logs)}`)
 })
 
 test('plan-cycle.js: M3 -- a NON-contradictory report (consistent:true, all four mismatch arrays genuinely empty, blind:false) is not flagged as self-contradictory (must not cry wolf)', async () => {
