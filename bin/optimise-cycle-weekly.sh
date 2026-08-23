@@ -365,9 +365,46 @@ else
     result_json=$(node "$LIB_SCRIPT" --check-staleness "$STALE_TMPDIR/src" "$CLAUDE_HOME" 2>/dev/null)
     node_status=$?
     if [ "$node_status" -eq 0 ] && [ -n "$result_json" ]; then
+      # Coordinator ruling 2026-08-23 (AC-OPS-1's "reports", read as reaching
+      # a human, not reaching a file): a drifted result and a clean result
+      # were both landing under the SAME "STALENESS ok" token -- the CLI's
+      # own `ok` field means "the check ran without error", which is
+      # defensible as a field name and was wrong as the thing a human scans
+      # first. A three-way token now distinguishes all three outcomes at a
+      # glance; the JSON tail (still parsed by the tests, and by anyone
+      # reading the log directly) is untouched. `"drift":[]` is JSON.stringify's
+      # exact, spaceless serialisation of an empty array -- see
+      # workflows/lib/install-consistency.mjs's checkStaleness()/--check-staleness,
+      # the only place that string is produced.
       case "$result_json" in
         *'"ok":false'*) log_staleness could-not-check "$result_json" ;;
-        *) log_staleness ok "$result_json" ;;
+        *'"drift":[]'*) log_staleness ok "$result_json" ;;
+        *)
+          log_staleness drift "$result_json"
+          # Drift recorded but invisible was the exact defect: the spec's
+          # own risk table names "The drift report is noisy and gets
+          # ignored, becoming decoration" -- invisible is worse. One line to
+          # stderr, mirroring the existing FAIL-summary line at the bottom
+          # of this script (same StandardErrorPath channel), naming the log
+          # path and a COUNT, never the file list -- the log line just
+          # written already carries that. Never sets overall_fail: this is
+          # about visibility, not about failing the run (AC-OPS-3's warn-
+          # only mechanism is deliberate and unchanged).
+          drift_summary=$(printf '%s' "$result_json" | node -e '
+            let raw = ""
+            process.stdin.on("data", (d) => { raw += d })
+            process.stdin.on("end", () => {
+              try {
+                const j = JSON.parse(raw)
+                process.stdout.write((j.drifted || []).length + " drifted, " + (j.missing || []).length + " missing")
+              } catch (e) {
+                process.stdout.write("drift detected")
+              }
+            })
+          ' 2>/dev/null)
+          [ -z "$drift_summary" ] && drift_summary="drift detected"
+          echo "weekly optimise-cycle: consumer install drift ($drift_summary) -- see $LOG" >&2
+          ;;
       esac
     else
       # AC-OPS-3: a git failure (clone succeeded but the comparison itself

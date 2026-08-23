@@ -833,10 +833,23 @@ under a fixture install before and after a run that reports drift.
 
 No network, an unreachable remote, or any other `git clone` failure
 produces a `could-not-check` line naming the reason and never fails the
-weekly run -- the one line every log carries either says `STALENESS ok
-...` with the drifted/missing file list (empty when the install matches),
-or `STALENESS could-not-check ...`. Both the run's own header line and the
-staleness report's line separately name the installed `AGENT-HARNESS.md`'s
+weekly run. The one line every run appends to the log carries a three-way
+status token -- `STALENESS ok ...` (the install matches), `STALENESS drift
+...` (it does not, with the drifted/missing file list in the JSON tail), or
+`STALENESS could-not-check ...` -- rather than collapsing "matches" and
+"does not match" into the same word. An earlier version used `ok` for both,
+because the CLI's own `ok` field means "the check ran without error", not
+"no drift found"; a person scanning the log for problems read `STALENESS
+ok` on a genuinely drifted install and moved on, which is the "recorded but
+invisible" failure the spec's own risk table names ("noisy and gets
+ignored, becoming decoration" -- invisible is worse). On `drift`, this
+script also prints one line to stderr naming the log path and a count of
+drifted-plus-missing files (never the file list -- the log line already
+carries that), mirroring the existing FAIL-summary stderr line below on the
+same already-wired `StandardErrorPath` channel. This is visibility only:
+drift never sets `overall_fail` and never fails the weekly run, exactly
+like `could-not-check`. Both the run's own header line and the staleness
+report's line separately name the installed `AGENT-HARNESS.md`'s
 `SOURCE_COMMIT` stamp (`unknown` when unreadable), so a log entry states
 both which copy of this SCRIPT ran and which commit the INSTALL it checked
 claimed to be.

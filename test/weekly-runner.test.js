@@ -897,9 +897,34 @@ test('weekly runner (AC-OPS-1/AC-OPS-4): a fixture install with one modified fil
   assert.equal(status, 0, logContents)
   const stalenessLines = logContents.match(/^STALENESS /gm) || []
   assert.equal(stalenessLines.length, 1, `AC-OPS-1: expected exactly ONE staleness report regardless of REPOS count (2 here), got ${stalenessLines.length}:\n${logContents}`)
-  const line = logContents.match(/^STALENESS ok .*$/m)[0]
+  // Coordinator ruling 2026-08-23: a drifted result must use the "drift"
+  // status token, never "ok" -- "ok" collapsed the clean and drifted cases
+  // into the same human-scannable prefix, which is the defect this fix
+  // closes. Assert both that "drift" appears and that "ok" specifically
+  // does NOT (a weaker /STALENESS (ok|drift) / match would not catch a
+  // regression back to always saying "ok").
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  assert.ok(!/^STALENESS ok /m.test(logContents), 'a genuinely drifted install must never be reported under the "ok" token')
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
   const json = JSON.parse(line.slice(line.indexOf('{')))
   assert.deepEqual(json.drifted, ['agents/lens-security.md'], 'the drift report must name the one modified file')
+})
+
+test('weekly runner (drift visibility, coordinator ruling 2026-08-23): a run that reports drift ALSO prints one line to stderr naming the log path and a count, never the file list -- "recorded but invisible" (log-only) is the exact defect this closes', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  fs.writeFileSync(path.join(install, 'agents', 'lens-security.md'), 'a stale, locally-edited copy\n')
+  fs.rmSync(path.join(install, 'hooks', 'hooks.json'))
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const { status, stderr, log, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
+  assert.equal(status, 0, logContents)
+  assert.ok(stderr && stderr.trim().length > 0, `a drifted run must print something to stderr, not only to the log file -- got empty stderr:\n${logContents}`)
+  assert.match(stderr, /drift/i, stderr)
+  assert.ok(stderr.includes(log), `the stderr line must name the actual log path so an operator knows where to look; stderr was:\n${stderr}`)
+  assert.match(stderr, /1 drifted, 1 missing/, `the stderr line must carry the exact count (1 drifted + 1 missing here), not merely say "drift happened"; stderr was:\n${stderr}`)
+  assert.ok(!/agents\/lens-security\.md/.test(stderr), 'stderr must name a COUNT, never the file list -- the log line already carries that')
+  assert.ok(!/hooks\.json/.test(stderr), 'stderr must name a COUNT, never the file list -- the log line already carries that')
 })
 
 test('weekly runner (AC-OPS-1): with ZERO delivery repos configured, the staleness check still runs exactly once', () => {
@@ -920,7 +945,8 @@ test('weekly runner (AC-OPS-4): a published file DELETED from the install is nam
   setMarker(repo, 'pass')
   const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })
   assert.equal(status, 0, logContents)
-  const line = logContents.match(/^STALENESS ok .*$/m)[0]
+  assert.match(logContents, /^STALENESS drift /m, logContents)
+  const line = logContents.match(/^STALENESS drift .*$/m)[0]
   const json = JSON.parse(line.slice(line.indexOf('{')))
   assert.deepEqual(json.missing, ['hooks/hooks.json'])
   assert.ok(!logContents.includes('CLAUDE.md'), 'CLAUDE.md is user-owned and not in the consumer subset -- it must never be named')
@@ -963,9 +989,18 @@ test('weekly runner (AC-OPS-3): an unreachable remote never flips overall exit s
 
 test('weekly runner (AC-ARCH-2/AC-ARCH-3): the installed AGENT-HARNESS.md\'s SOURCE_COMMIT stamp is reported BOTH on the run header line and on the staleness check\'s own report line', () => {
   const sha = 'd'.repeat(40)
-  const published = makePublishedRepo()
+  // The stamp must be readable WITHOUT it also causing drift -- published
+  // and install both carry the identical stamped AGENT-HARNESS.md, so this
+  // test isolates stamp reporting from the "drift" token added by the
+  // 2026-08-23 fix above. Stamping only the install's copy (as an earlier
+  // version of this test did) made the two AGENT-HARNESS.md's content
+  // genuinely differ, which is real drift -- that version of this test
+  // asserted "STALENESS ok" on a run that should have said "STALENESS
+  // drift", which is exactly the invisible-drift defect the coordinator's
+  // 2026-08-23 review caught.
+  const stampedAgentHarness = `<!-- SOURCE_COMMIT: ${sha} -->\nharness contract\n`
+  const published = makePublishedRepo({ 'AGENT-HARNESS.md': stampedAgentHarness })
   const install = identicalInstallOf(published)
-  fs.writeFileSync(path.join(install, 'AGENT-HARNESS.md'), `<!-- SOURCE_COMMIT: ${sha} -->\nharness contract\n`)
   const repo = makeTempRepo()
   setMarker(repo, 'pass')
   const { status, logContents } = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install })

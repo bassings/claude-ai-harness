@@ -15,7 +15,7 @@ export const meta = {
 // hash, so this necessarily lags the containing commit by exactly one; see
 // the hook's own header). A commit identity, not an age: read it with
 // workflows/lib/install-consistency.mjs's parseSourceCommitStamp.
-const SOURCE_COMMIT = '91554d2851fde6a6cbfdf75ba7f587f2269c7b9b'
+const SOURCE_COMMIT = 'c124bd970be74b348f801ea7cd48f582f56ea7c0'
 
 // HARN-FIX-3 install-consistency preflight block (AC-QA-1..4): byte-identical
 // across plan-cycle.js and review-cycle.js, mirroring the L5/PR2 triplicated

@@ -236,11 +236,108 @@ loop-count specifically, not some unrelated staleness behaviour.
 **Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
 `bash -n` syntax-checked, suite back to 41/41.
 
+## 7. Drift visibility: the stderr line (coordinator review, 2026-08-23)
+
+Follow-up round, after the coordinator drove the real script through four
+scenarios and found one genuine defect: drift was recorded in the log but
+invisible on stderr, and the log line's human-scannable prefix
+(`STALENESS ok ...`) was identical for a clean install and a genuinely
+drifted one -- the CLI's `ok` field means "the check ran without error",
+not "no drift found". Fixed by (a) a three-way status token (`ok` /
+`drift` / `could-not-check`, JSON tail unchanged) and (b) one stderr line
+on `drift`, naming the log path and a drifted/missing COUNT, never the
+file list. `overall_fail` is deliberately untouched -- this is a
+visibility fix, not a behaviour-failing one.
+
+**Guarded by**: the new dedicated test ("a run that reports drift ALSO
+prints one line to stderr...") plus, for the dispatch logic itself, the
+three tests requiring a genuine `ok` verdict.
+
+**Mutation A (the stderr line itself)**: the `echo "weekly optimise-cycle:
+consumer install drift ($drift_summary) -- see $LOG" >&2` line was replaced
+with a no-op (`: # mutation: drift stderr line silenced`).
+
+**Confirmed landed**: `diff` against a snapshot taken immediately before
+this mutation showed exactly the one intended line changed.
+
+**Result**: exactly 1 of 42 tests in `test/weekly-runner.test.js` failed --
+the new dedicated drift-visibility test, and only it:
+
+```
+✖ weekly runner (drift visibility, coordinator ruling 2026-08-23): a run that reports drift ALSO
+  prints one line to stderr naming the log path and a count, never the file list -- "recorded but
+  invisible" (log-only) is the exact defect this closes
+```
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+`bash -n` syntax-checked, suite back to 42/42.
+
+**Mutation B (the three-way dispatch pattern)**: the case pattern deciding
+"clean" --
+
+```sh
+*'"drift":[]'*) log_staleness ok "$result_json" ;;
+```
+
+-- had its match target replaced with a string that can never appear
+(`*'"drift":[MUTATED-NEVER-MATCHES]'*`), so a clean, non-drifted result can
+no longer reach the `ok` branch and falls through to `drift` instead.
+
+**Confirmed landed**: `diff` against a fresh snapshot showed exactly the
+one intended line changed.
+
+**Result**: exactly 3 of 42 tests failed -- every test that requires a
+genuinely clean `STALENESS ok` verdict on an install with no drift at all:
+
+```
+✖ weekly runner (AC-OPS-4): an identical install reports no drift -- STALENESS ok, drift:[]
+✖ weekly runner (AC-ARCH-2/AC-ARCH-3): the installed AGENT-HARNESS.md's SOURCE_COMMIT stamp is
+  reported BOTH on the run header line and on the staleness check's own report line
+✖ weekly runner (AC-ARCH-2): when the install has no readable stamp at all, both lines say "unknown"
+  rather than a stale or fabricated value
+```
+
+The three drift-specific tests (which WANT a `drift` token) correctly did
+**not** fail under this mutation, since forcing every result through the
+`drift` branch cannot break a test that already expects `drift` -- the
+correct, silent negative control.
+
+**Reverted**: `cp` from the snapshot, `diff` confirmed byte-identical,
+`bash -n` syntax-checked, suite back to 42/42.
+
+## 8. The AC-ARCH-2 stamp test's own fixture defect, found by this review
+
+Not a mutation of the shipped code -- a defect this round's own review
+found in a TEST fixture, recorded per standard §11 for the same reason
+task 1's mutation-proofs doc records the bugs its own process caught: a
+report that only lists successful mutation proofs and omits what the
+process actually caught during development would be misleading about how
+this file was produced.
+
+The original AC-ARCH-2/AC-ARCH-3 stamp test stamped only the INSTALL's
+`AGENT-HARNESS.md` (`<!-- SOURCE_COMMIT: ... -->\nharness contract\n`)
+while the published fixture's `AGENT-HARNESS.md` stayed unstamped
+(`harness contract\n`). Those two files genuinely differ, which is real
+drift -- so before this round's `ok`/`drift` split existed, the test's
+`assert.match(logContents, ... 'STALENESS ok ...')` was passing on a run
+that, correctly diagnosed, should have said `STALENESS drift`. It is the
+same "STALENESS ok" collapsing every non-error outcome into one word that
+this whole round exists to fix, just caught inside a test fixture rather
+than the shipped script. Fixed by stamping the PUBLISHED fixture's
+`AGENT-HARNESS.md` identically to the install's, so the test isolates
+stamp-reporting from drift status rather than accidentally exercising both
+at once.
+
 ## Full-suite re-run after all mutations
 
 `node --test test/*.test.js`, run three consecutive times after every
-mutation above was reverted and confirmed byte-identical against its
-snapshot: **926/926, 926/926, 926/926** (no flakiness observed across
+mutation in sections 1-6 was reverted and confirmed byte-identical against
+its snapshot: **926/926, 926/926, 926/926** (no flakiness observed across
 repeated runs, relevant here because this task's tests spawn real
 subprocesses -- `git clone`, `node`, the weekly script itself -- rather
 than only exercising in-process code).
+
+After the coordinator's 2026-08-23 drift-visibility follow-up (sections 7-8
+above), re-run three more consecutive times, every mutation there reverted
+and confirmed byte-identical: **927/927, 927/927, 927/927** (one net new
+test: the drift-visibility stderr test).
