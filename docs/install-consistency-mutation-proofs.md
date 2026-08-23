@@ -1157,3 +1157,49 @@ name rather than pass quietly.
 985/985 (up from 977/977: +8, four new tests per cycle file). Run three times
 consecutively with no flakes, after every mutation was reverted and both files
 confirmed byte-identical to the pre-mutation snapshot.
+
+## Round seven (2026-08-23): documentation only -- the threat model, and two overclaims
+
+(The coordinator's final change. No behavioural change, therefore no
+mutations: there is no new guard to break. Recorded here anyway so the
+document does not imply this round was skipped.)
+
+Three edits, all text:
+
+1. **The threat model, written down** in `specs/harn-fix-3.md` and in
+   `workflows/lib/install-consistency.mjs`'s header. Defends against an
+   accidental partial or stale install; does not defend against anyone able to
+   set environment variables or edit the installed files. `CLAUDE_HOME` is the
+   worked example, verified here rather than relayed: pointed at an empty
+   directory the real CLI prints
+   `{"ok":false,"consistent":false,"blind":true,"doc_fields":[],...}`, so the
+   in-process cross-check has nothing certain to prove and the gate warns.
+   Three routes to degrading the gate have now been closed and a fourth will
+   not be, because anyone who can set `CLAUDE_HOME` can also edit the files
+   the gate reads.
+2. **L-7 corrected**: the module header said "this module is that protection"
+   against the originating H3 scenario, while shipping in `workflows/lib/` --
+   one of the very layers a partial update can miss.
+3. **L-6 corrected**: README described the preflight as "unconditional,
+   refuse-on-mismatch" 130 lines from the amended "certainty refuses,
+   uncertainty warns" description, and made a second, milder version of the
+   same claim in the section opening.
+
+### One thing worth recording: the static guard fired on this edit
+
+The first draft of the new module header named the withdrawn environment
+variable in prose. `test/static-checks.test.js`'s round-three guard bans that
+string from shipped CODE files (`.md` is excluded, so the spec and README can
+name it) and failed the suite 984/985, naming the offending file.
+
+That is the guard working exactly as intended, on its author, one round later.
+The header now points at `specs/harn-fix-3.md` for the name instead of
+spelling it, which keeps the enforced rule unambiguous -- the alternative,
+teaching the guard to tell comments from code, is the fragile-parsing class
+this repo has been bitten by in four consecutive rounds.
+
+### Full-suite state after round seven
+
+985/985, unchanged from round six: this round adds no tests because it adds no
+behaviour. Run after the edits, with the module confirmed to still parse and
+export its 15 symbols.

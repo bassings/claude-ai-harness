@@ -735,9 +735,10 @@ redaction (AC-SEC-1).
 installed `AGENT-HARNESS.md` and `agents/lens-*.md` agree with the findings
 schema (`PLAN_SCHEMA`/`REVIEW_SCHEMA`) the cycle is about to use. This is
 distinct from, and independent of, the consumer-install staleness check
-below (AC-OPS-1..5): the preflight refuses on an INTERNALLY inconsistent
-install regardless of what published `main` says; the staleness check warns
-about drift from published `main` regardless of internal consistency.
+below (AC-OPS-1..5): the preflight can halt a run over an INTERNALLY
+inconsistent install regardless of what published `main` says (on proof --
+see the next paragraph); the staleness check warns about drift from published
+`main` regardless of internal consistency.
 
 **Certainty refuses; uncertainty warns, never halts (AC-QA-2, amended
 2026-08-23 after round-two review).** Two sources of truth feed the
@@ -812,6 +813,17 @@ Ships as `workflows/lib/install-consistency.mjs`, alongside
 "Making a change live: copying the files is not deploying them" above for the exact commands; this file
 must go live in the same sync as `plan-cycle.js`/`review-cycle.js`, or the
 very next run finds nothing to check and warns accordingly.
+
+**What this preflight does and does not promise.** It defends against an
+**accidental** partial or stale install, which is the incident that prompted
+it. It does **not** defend against anyone able to set environment variables or
+edit the installed files -- `CLAUDE_HOME` pointed at an empty directory
+degrades it to warn-only, silently, for the whole session. Three routes to
+degrading it have been closed and a fourth will not be, because anyone who can
+set `CLAUDE_HOME` can also edit the files it reads. The full boundary, with the
+measurements behind it, is under **"Threat model"** in `specs/harn-fix-3.md`
+and repeated in the module's own header. It is deliberately not restated in
+detail here: one statement of a security boundary is maintainable, three drift.
 
 
 ## Delivery optimiser
@@ -920,10 +932,13 @@ checks whether the consumer install at `$CLAUDE_HOME` (default
 
 A user-owned file the repo does not ship, like `CLAUDE.md`, is never
 compared. Warn-only, by design: a stale install is not necessarily broken,
-so this never fails the run, unlike the separate, unconditional,
-refuse-on-mismatch consistency preflight `workflows/lib/
-install-consistency.mjs` runs inside `plan-cycle.js`/`review-cycle.js`
-(AC-QA-1/2, above).
+so this never fails the run. The separate consistency preflight
+`workflows/lib/install-consistency.mjs` runs inside
+`plan-cycle.js`/`review-cycle.js` (AC-QA-1/2, above) CAN halt a run, but it
+is not unconditional either: it refuses on proof and warns on doubt. This
+sentence previously called it "unconditional, refuse-on-mismatch", which
+described round one's behaviour and contradicted the amended description 130
+lines above it (L-6, round-four review).
 
 **A subset pattern matching zero published files also forces
 `could-not-check`** (round-one review MED-8), never a bare `ok`, even when

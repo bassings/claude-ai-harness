@@ -11,8 +11,49 @@
 // layers that must move together, see test/static-checks.test.js's H3
 // guard). That guard protects the REPO's own tree; nothing protects an
 // INSTALLED ~/.claude copy that got layers 1-2 without layer 3. This module
-// is that protection, run at the start of every plan-cycle/review-cycle
-// invocation before any lens is dispatched (AC-QA-1, AC-QA-2).
+// runs at the start of every plan-cycle/review-cycle invocation, before any
+// lens is dispatched (AC-QA-1, AC-QA-2).
+//
+// THREAT MODEL -- read this before describing what the check guarantees, and
+// keep any such description inside these lines (L-7, round-four review: the
+// previous wording here said "this module is that protection", which claims
+// more than it delivers, and text asserting more protection than exists is
+// the defect class this repo exists to stop). The full version, with the
+// measurements behind it, is under "Threat model" in specs/harn-fix-3.md.
+//
+//   Defends against: an ACCIDENTAL partial or stale install. That is the
+//   incident that prompted the spec (twelve files in ~/.claude behind
+//   published main, because updating is a manual multi-file copy), and it is
+//   the whole claim.
+//
+//   Does NOT defend against: anyone able to set environment variables or edit
+//   the installed files. The worked example is CLAUDE_HOME -- pointed at an
+//   empty directory it yields consistent:false, blind:true, doc_fields:[], so
+//   the in-process cross-check has nothing certain to prove and the gate
+//   warns and proceeds. Session-persistent, silent, environment-driven.
+//
+//   Three routes to degrading this gate have been closed already: the
+//   environment-variable override withdrawn in round three (named in full in
+//   specs/harn-fix-3.md -- deliberately not spelled here, because a static
+//   check in test/static-checks.test.js bans that string from shipped CODE so
+//   the mechanism cannot creep back, and it correctly fired on an earlier
+//   draft of this very comment), the model-relayed escape_hatch_active flag,
+//   and CLAUDE_HOME's own effect. A fourth will not be: anyone who can set
+//   CLAUDE_HOME can also edit the files this script reads, so closing one
+//   more door buys nothing and implies a guarantee that cannot be given.
+//   This gate cannot be made tamper-proof against the environment it runs
+//   in. It defends against accident, not against intent.
+//
+//   The model-mediated half sits inside the same boundary: this script's
+//   output reaches the gate by way of the scope agent, so a dishonest scope
+//   agent is outside the model too. The workflow's in-process cross-check
+//   bounds what a dishonest transcription achieves (it cannot fabricate a
+//   clean verdict for a field the running schema lacks, and cannot assert an
+//   override at all), but under-reporting is not closed.
+//
+//   And this file ships in workflows/lib/, one of the very layers a partial
+//   update can miss, so an install that skipped this directory runs a stale
+//   copy or none. That produces a warning, not a refusal, deliberately.
 //
 // AC-SIMP-2 note: the spec's Affected Files table lists ONE new file under
 // workflows/lib/ ("the shared subset definition and both checks") for the

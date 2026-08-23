@@ -31,6 +31,14 @@ recorded in comments in both workflow files, and `test/static-checks.test.js`
 guards it, **in the repo**. The guard cannot see a consumer install, so H3 is
 reproducible in the field with nothing to catch it.
 
+**Bounding that claim honestly (L-7, corrected 2026-08-23).** The mechanism
+this spec adds does not eliminate the H3 scenario in the field; it makes the
+common accidental form of it visible. The check ships in `workflows/lib/`,
+which is one of the very layers a partial copy can miss, so an install that
+skipped that directory runs a stale check or none at all -- and the honest
+outcome there is a warning, not a refusal. See "Threat model" below for the
+full boundary.
+
 This is the repo's own recurring shape: a check that lives where the problem is
 not. Compare 2026-08-21, where deleting the entire `PreToolUse` registration
 left all 743 tests green.
@@ -402,16 +410,66 @@ failure of the heuristic half switched off the reliable half). **Everything
 else from this round is parked permanently.** Parked is not deferred: these
 are not to be re-raised at a future review as unmet work.
 
-**The list of sixteen is NOT reproduced here, because it was not supplied to
-the implementer.** The coordinator's instruction was to record sixteen further
-findings with one line each; the findings themselves did not accompany it, and
-inventing sixteen plausible bullet points would be a fabricated record inside
-the very spec whose subject is a mechanism that must not report things it did
-not verify. This paragraph is the honest placeholder. Anyone holding that
-review report should paste the sixteen lines in below; until then the
-authoritative record is the report, not this file.
+The sixteen, transcribed verbatim from the round-three review report. They
+are recorded, not fixed.
 
-What IS recorded here is only what can be attested from this repo:
+- **L-1.** `AC-QA-3`'s "on a consistent install it is silent" is unguarded:
+  making the happy path log a warning on every run survives the entire suite.
+- **L-2.** An overridden refusal loses its report banner on the no-op and
+  aborted return paths, so `AC-QA-2`'s "named in the log AND prefixed to the
+  report" holds only on the main path.
+- **L-3.** Eight refusal tests assert only on message text rather than on
+  behaviour.
+- **L-4.** The weekly runner's fail-closed branch for an absent or
+  unrecognised `status` field, the exact stale-lib partial-update case this
+  spec exists for, is untested.
+- **L-5.** The blind warning cannot name why the check went blind:
+  `blind_reasons` is not in the relayed schema and `error` is null on that
+  path.
+- **L-6.** README contradicts itself and the built behaviour, describing the
+  preflight as "unconditional, refuse-on-mismatch" 130 lines away from the
+  amended description. **Corrected in this edit** -- see "Threat model"
+  below; it is the same overclaim defect as L-7, not a parked nit.
+- **L-7.** The module header and the spec claim this gate protects against the
+  originating H3 scenario, but it ships in the same layer that scenario
+  compromises. **Corrected in this edit**, same reason.
+- **L-8.** Test fixtures still populate `escape_hatch_active`, the field round
+  three removed and the code now ignores.
+- **L-9.** HARN-FIX-3 carries no `AC-SEC-<n>` criteria at all, despite adding
+  agent-driven code execution, a network fetch and an environment-driven path
+  resolution. **This is a SPEC BUG, recorded as one**: the spec's author wrote
+  it and never asked for security criteria, so no lens was ever positioned to
+  write them. That list is how the harness improves rather than merely runs
+  (AGENT-HARNESS.md), so it is filed here as a defect in the spec, not as an
+  unmet criterion.
+- **M-1.** `CLAUDE_HOME` is an environment-based, session-persistent way to
+  silently degrade the gate to warn-only. **Ruled: documented limit, not a
+  code fix** -- see "Threat model" below.
+- **M-2.** Model-supplied `consistency.error` text is interpolated raw into
+  the operator-visible preflight warning, bypassing this file's own
+  neutralisation helper.
+- **M-3.** `parseFindingsTemplateFields` binds `indexOf('### FINDINGS')` to
+  any heading merely starting with that text, so a `### FINDINGS SUMMARY`
+  heading would capture the wrong section.
+- **M-4.** `parseFindingsTemplateFields` silently drops any template row not
+  indented by exactly two spaces, so a formatting edit turns the doc side
+  partially blind.
+- **M-5.** `parseSchemaFindingsProps` matches the const name by unanchored
+  `indexOf`, so a prefix-sharing const shadows the real schema.
+- **M-6.** The refusal path compares model-relayed field names to schema keys
+  with exact case- and whitespace-sensitive equality.
+- **M-7.** The preflight's `redactLogText` call is load-bearing for a real
+  absolute-path leak and no test exercises it; removing it leaves the suite
+  green.
+
+**Why M-3, M-4 and M-5 stay parked, recorded so the next reader knows they
+were considered rather than missed.** They are the same prose-parsing
+fragility found in four consecutive rounds. After round four's reorder, a
+parse failure produces `blind`, and `blind` no longer silences a certain
+cross-check. The fragile half can now fail without taking the reliable half
+with it, which is what changed the calculus.
+
+Also recorded, from this repo rather than from the report:
 
 - **Known coverage gaps, named by the coordinator, recorded as known rather
   than done.** This round ran neither the operability nor the architecture
@@ -437,6 +495,54 @@ What IS recorded here is only what can be attested from this repo:
   `doc_fields`/`agent_fields` passes the cross-check trivially. Round three
   removed the agent's ability to ASSERT an override; it did not close
   omission.
+
+## Threat model
+
+Written down 2026-08-23 (round four) because three separate routes to
+degrading this gate have now been closed, and the pattern is the finding
+rather than any one route. Text asserting more protection than exists is the
+defect this repo exists to stop, so the boundary is stated plainly instead.
+
+**What it defends against.** An **accidental** partial or stale install: the
+incident that prompted this spec, where twelve files in `~/.claude` were
+behind published `main` and updating is a manual multi-file copy. That is the
+whole claim.
+
+**What it does not defend against.** Any party able to set environment
+variables or edit the installed files. The worked example is `CLAUDE_HOME`,
+verified here rather than argued: pointed at an empty directory it yields
+
+```
+{"ok":false,"consistent":false,"blind":true,"doc_fields":[], ...}
+```
+
+so the in-process cross-check has nothing certain to prove and the gate warns
+and proceeds. Session-persistent, silent, environment-driven -- precisely the
+shape ruled against when `HARNESS_ALLOW_INCONSISTENT_INSTALL` was removed, and
+reintroduced by `M11`'s own fix in the round before.
+
+**No fourth route will be closed.** `HARNESS_ALLOW_INCONSISTENT_INSTALL` (an
+environment variable), the model-relayed `escape_hatch_active` flag, and now
+`CLAUDE_HOME` are three doors into the same room. Anyone who can set
+`CLAUDE_HOME` can also edit the files the gate reads, so a fourth fix would
+buy nothing and would imply a guarantee that cannot be given. **This gate
+cannot be made tamper-proof against the environment it runs in.** It defends
+against accident. It does not defend against intent.
+
+**The model-mediated half is inside the same boundary.** The script's output
+reaches the gate by way of the scope agent, so a dishonest scope agent is
+outside the model too. The in-process cross-check bounds what a dishonest
+transcription can achieve -- it cannot fabricate a clean verdict for a field
+the running schema does not declare, and (since round three) it cannot assert
+an override at all -- but under-reporting is not closed (parked `L3`), and the
+gate ships in `workflows/lib/`, one of the very layers a partial update can
+miss (parked `L-7`). A stale or absent `install-consistency.mjs` produces a
+warning, not a refusal, by design.
+
+Consequences for how the gate is described anywhere in this repo: it is
+**not** unconditional, it does **not** refuse on every mismatch, and it is
+**not** a guarantee that an install is coherent. It refuses on proof, warns on
+doubt, and reports.
 
 ## Risks
 
