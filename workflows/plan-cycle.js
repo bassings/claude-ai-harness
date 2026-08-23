@@ -218,18 +218,41 @@ function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName, allow
     }
     return { action: 'refuse', message: reason }
   }
-  if (c.blind === true) {
-    return { action: 'warn', message: `install-consistency reported blind (nothing could be compared): ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
-  }
-  if (c.ok === false) {
-    return { action: 'warn', message: `install-consistency could not run: ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
-  }
+  // ROUND FOUR (the ordering bug): the in-process cross-check runs HERE, BEFORE
+  // the blind and ok:false branches below, and a `certain` failure refuses
+  // first. The previous order returned `warn` for blind at this point, so a
+  // failure of the HEURISTIC half switched off the RELIABLE half -- precisely
+  // backwards from "certainty refuses, uncertainty warns", and the mechanism
+  // ended up holding the proof and declining to use it.
+  //
+  // Reproduced end to end before the reorder, with the exact partial install
+  // this spec exists for: AGENT-HARNESS.md updated to instruct a new `Effort:`
+  // field while workflows/review-cycle.js stayed stale enough that its schema
+  // const no longer parses. The real CLI printed blind:true with
+  // doc_fields:["consequence","effort","evidence","fix","recurrence"], and the
+  // gate dispatched every lens against a schema that has no `effort` slot. One
+  // unparseable file bought silence for every other field.
+  //
+  // This is sound because the cross-check needs NOTHING but the reported field
+  // list and the literal schema object this process already holds: no
+  // filesystem, no subprocess, no parse of anything. Blindness in the script's
+  // OTHER half therefore says nothing about this half's certainty. When there
+  // is genuinely nothing to cross-check (reported fields empty -- the shape a
+  // blind run usually has), crossCheckAgainstOwnSchema returns certain:false
+  // and control falls through to the same blind/ok:false warnings as before,
+  // unchanged.
   const crossCheck = crossCheckAgainstOwnSchema(c, ownSchema, ownSchemaName)
   if (!crossCheck.ok && crossCheck.certain) {
     if (allowInconsistentInstall === true) {
       return { action: 'warn', override_used: true, message: overrideMessage(`PROVEN mismatch -- ${crossCheck.reason}`) }
     }
     return { action: 'refuse', message: crossCheck.reason }
+  }
+  if (c.blind === true) {
+    return { action: 'warn', message: `install-consistency reported blind (nothing could be compared): ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
+  }
+  if (c.ok === false) {
+    return { action: 'warn', message: `install-consistency could not run: ${c.error || 'no reason given'} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }
   }
   if (!crossCheck.ok && !crossCheck.certain) {
     return { action: 'warn', message: `${crossCheck.reason} -- proceeding (uncertain, not halted; AC-QA-2 amendment)` }

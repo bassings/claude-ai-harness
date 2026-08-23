@@ -1056,3 +1056,104 @@ per cycle file replacing two `M9` tests each (net +5 per file, +10), and
 three new static checks). Run three times consecutively with no flakes,
 after every mutation above was reverted and every file confirmed
 byte-identical to the pre-mutation snapshot.
+
+## Round six (2026-08-23): the ordering inversion in `evaluateInstallConsistency`
+
+(The coordinator's "round four", and the final change to this spec.)
+
+`c.blind === true` and `c.ok === false` both returned `warn` BEFORE
+`crossCheckAgainstOwnSchema()` was called, so a failure of the HEURISTIC half
+switched off the RELIABLE half -- the exact inverse of `AC-QA-2`'s own rule.
+Fixed by moving the cross-check above both, with a `certain` failure refusing
+first; `ok:false` fixed in the same edit rather than left as a latent twin.
+
+### 0. The defect, reproduced end to end before touching the code
+
+Built the partial install this spec exists for, under a scratch directory,
+and ran the REAL CLI against it (not a unit fixture):
+
+- `AGENT-HARNESS.md` updated to instruct a new `Effort:` field
+- `agents/lens-qa.md` instructing `` fill AGENT-HARNESS.md's `Effort` field ``
+- `workflows/plan-cycle.js` copied fresh
+- `workflows/review-cycle.js` left stale enough that no `REVIEW_SCHEMA` const
+  parses
+
+```
+{"ok":true,...,"consistent":false,"blind":true,
+ "blind_reasons":{...,"review_schema_empty":true},
+ "doc_fields":["consequence","effort","evidence","fix","recurrence"],
+ "agent_fields":["effort"],...}
+```
+
+`effort` is declared by neither running schema. Fed through the gate, the
+observed log was:
+
+```
+WARNING (install-consistency preflight, AC-QA-2 amendment): install-consistency
+reported blind (nothing could be compared): review schema could not be parsed
+-- proceeding (uncertain, not halted; AC-QA-2 amendment)
+```
+
+Every lens dispatched. One unparseable file bought silence for every other
+field: the mechanism held the proof and declined to use it.
+
+### 1. The missing test (the real deliverable)
+
+Nothing pinned the ordering in either direction. The pre-existing
+`blind:true ... WARNS and PROCEEDS` test passes under BOTH orderings, because
+its fixture sets `doc_fields: []` -- there is nothing for the cross-check to
+prove wrong, so the two paths converge. That is the "incidentally passing"
+shape, and it is why the inversion survived a round with the suite green.
+
+Four tests added per cycle file (eight total): `blind:true` co-occurring with
+a reported field absent from the running schema refuses **by dispatch count**;
+the same for `ok:false`; the refusal stays overridable; and `blind:true` whose
+reported fields ARE all declared still warns and dispatches.
+
+**RED confirmed for the intended reason** before the fix: `Missing expected
+rejection` on the two refusal tests, and the override test failed printing the
+defect verbatim as the log line quoted above -- not on a typo or an import.
+
+### 2. Mutation: restore the old ordering (both branches)
+
+**Mutation**: moved the `blind` and `ok:false` branches back above the
+cross-check, in both cycle files.
+
+**Confirmed landed**: `diff -u` against a `cp` snapshot showed exactly the two
+branches relocated in each file, nothing else, and the byte-identical
+preflight-block guard stayed green (the block is pinned across both files, so
+a one-file edit would have failed for an unrelated reason and told us nothing).
+
+**Result**: exactly 6 of 157 failed -- the two refusal tests and the override
+test in each cycle file. Every other test, including the pre-existing blind
+test, stayed green: that test genuinely cannot tell the orderings apart.
+
+**Reverted**: `cp` from the snapshot, `diff -q` byte-identical, 157/157.
+
+### 3. Mutation: move ONLY `blind` back (is the twin pinned separately?)
+
+**Mutation**: `blind` restored above the cross-check; `ok:false` left in its
+new, correct position. The now-dead second `blind` branch was neutralised as
+`if (false)` so the mutation isolated ordering rather than deleting a branch.
+
+**Result**: exactly 4 of 157 failed -- the `blind` refusal and override tests
+in each file. **Both `ok:false` tests stayed green.**
+
+**Reverted**: `cp`, 157/157.
+
+### 4. Mutation: move ONLY `ok:false` back
+
+**Result**: exactly 2 of 157 failed -- the `ok:false` test in each file, and
+nothing else.
+
+**Reverted**: `cp`, byte-identical, 157/157.
+
+Sections 3 and 4 together are the point: the twin is pinned by its own test,
+not carried by its sibling's. Fixing one and leaving the other would fail by
+name rather than pass quietly.
+
+### Full-suite state after round six
+
+985/985 (up from 977/977: +8, four new tests per cycle file). Run three times
+consecutively with no flakes, after every mutation was reverted and both files
+confirmed byte-identical to the pre-mutation snapshot.

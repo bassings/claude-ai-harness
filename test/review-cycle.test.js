@@ -1428,6 +1428,99 @@ test('review-cycle.js: MED-2 -- a GENUINE, real-shaped consistency report (doc_f
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
 })
 
+// ROUND FOUR (the ordering bug). `blind` and `ok:false` used to return `warn`
+// BEFORE crossCheckAgainstOwnSchema() was ever called, so a failure of the
+// HEURISTIC half switched off the RELIABLE half -- precisely backwards from
+// "certainty refuses, uncertainty warns".
+//
+// Reproduced end to end against a real fixture install before this test was
+// written, using the real CLI: AGENT-HARNESS.md updated to instruct a new
+// `Effort:` field, workflows/review-cycle.js left stale enough that its schema
+// const no longer parses. The script printed blind:true, consistent:false,
+// blind_reasons:{review_schema_empty:true} and
+// doc_fields:["consequence","effort","evidence","fix","recurrence"] -- and the
+// gate warned and dispatched every lens against a schema with no `effort`
+// slot. One unparseable file bought silence for every other field: the
+// mechanism held the proof and declined to use it.
+//
+// Nothing pinned this. The existing blind test above passes under EITHER
+// ordering, because its fixture sets doc_fields:[] -- incidentally passing with
+// respect to ordering, which is why the bug survived a round. This fixture is
+// the one that can tell the two orderings apart: blind:true CO-OCCURRING with a
+// reported field the running REVIEW_SCHEMA does not declare. Asserted by DISPATCH
+// COUNT, never by message text.
+test('review-cycle.js: round four -- blind:true does NOT suppress a PROVEN cross-check failure: a reported field absent from the running REVIEW_SCHEMA refuses even when the script also reported blind, by dispatch count', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': {
+            ...SCOPE_OK,
+            consistency: { ...CONSISTENCY_OK, consistent: false, blind: true, doc_fields: ['consequence', 'effort', 'evidence', 'fix', 'recurrence'], agent_fields: ['effort'], error: 'review schema could not be parsed' },
+          },
+        }),
+      }),
+    (err) => {
+      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
+      assert.equal(dispatchedLenses.length, 0, 'a proven mismatch must refuse regardless of blindness elsewhere, by COUNT')
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: round four -- ok:false does NOT suppress a PROVEN cross-check failure either (the same ordering class, one line down; unreachable from main() today only by accident of its present shape, not by guarantee)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': {
+            ...SCOPE_OK,
+            consistency: { ...CONSISTENCY_OK, ok: false, consistent: false, doc_fields: ['effort'], agent_fields: ['effort'], error: 'required file(s) missing' },
+          },
+        }),
+      }),
+    (err) => {
+      const dispatchedLenses = err.calls.filter((c) => ALL_LENSES_REVIEW.includes(c.opts.label))
+      assert.equal(dispatchedLenses.length, 0, 'a proven mismatch must refuse regardless of ok:false, by COUNT')
+      return true
+    }
+  )
+})
+
+// The other side of the reorder: it must not turn blindness ITSELF into a
+// refusal. Blindness where every reported field IS declared still warns and
+// dispatches (and the doc_fields:[] case is covered by the existing blind test
+// above, which this reorder deliberately leaves green).
+test('review-cycle.js: round four -- blind:true with reported fields the running REVIEW_SCHEMA DOES declare still WARNS and dispatches: the reorder must not convert blindness itself into a refusal', async () => {
+  const { result, logs } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        consistency: { ...CONSISTENCY_OK, consistent: false, blind: true, doc_fields: ['recurrence'], agent_fields: ['recurrence'], error: 'nothing could be compared' },
+      },
+    }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
+  assert.ok(logs.some((l) => l.includes('WARNING') && l.includes('blind')), `expected the blind warning to survive the reorder, got: ${JSON.stringify(logs)}`)
+})
+
+test('review-cycle.js: round four -- the blind-plus-proven refusal is still overridable by args.allow_inconsistent_install, and the override names what it suppressed', async () => {
+  const { result, logs } = await runWorkflow(WF, {
+    args: { allow_inconsistent_install: true },
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        consistency: { ...CONSISTENCY_OK, consistent: false, blind: true, doc_fields: ['effort'], agent_fields: ['effort'], error: 'review schema could not be parsed' },
+      },
+    }),
+  })
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
+  assert.ok(logs.some((l) => l.includes('allow_inconsistent_install') && l.includes('effort')), `expected the override to name the flag and the suppressed field, got: ${JSON.stringify(logs)}`)
+})
+
 // ROUND THREE: the escape hatch is an explicit flag on the invocation's own
 // args (`allow_inconsistent_install: true`), read by this workflow script
 // directly. It is NOT an environment variable and NOT relayed through the

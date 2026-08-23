@@ -151,6 +151,41 @@ blocks harmless work gets switched off. An instructed-but-unsupported field
   prose-derived verdict alone with no in-process proof -- **warns** (one
   loud log line) **and proceeds**: lenses still dispatch.
 
+  **Ordering (amended 2026-08-23, round four). The in-process cross-check
+  is consulted FIRST, before `blind` and before `ok:false`, and a proven
+  failure refuses.** As first built, both of those returned `warn` before
+  `crossCheckAgainstOwnSchema` was ever called, so a failure of the
+  HEURISTIC half switched off the RELIABLE half -- the exact inverse of
+  this criterion's own rule. Reproduced end to end with the partial
+  install this spec exists for: `AGENT-HARNESS.md` updated to instruct a
+  new `Effort:` field, `workflows/review-cycle.js` left stale enough that
+  its schema const no longer parses. The real CLI reported `blind:true`
+  with `doc_fields` naming `effort`, and the gate dispatched every lens
+  against a schema with no `effort` slot. One unparseable file bought
+  silence for every other field.
+
+  The reorder is sound because the cross-check consumes nothing but the
+  reported field list and the schema object this process already holds --
+  no filesystem, no subprocess, no parse -- so blindness in the script's
+  other half says nothing about this half's certainty. Where there is
+  genuinely nothing to cross-check (reported fields empty, the usual shape
+  of a blind run) it returns uncertain and control falls through to the
+  same `blind`/`ok:false` warnings as before. `ok:false` is fixed in the
+  same edit rather than left as a latent twin: it is unreachable from
+  `main()`'s present shape only because that path returns empty
+  `doc_fields`, which is an accident, not a guarantee.
+
+  Test, in BOTH cycle files: `blind:true` CO-OCCURRING with `doc_fields`
+  naming a field absent from the running schema refuses, asserted by
+  DISPATCH COUNT, never by message text; the same for `ok:false`; the
+  refusal stays overridable by `allow_inconsistent_install`; and
+  `blind:true` whose reported fields ARE all declared still warns and
+  dispatches, so the reorder cannot convert blindness itself into a
+  refusal. The pre-existing `blind` test does NOT pin this: its fixture
+  sets `doc_fields: []`, so it passes under either ordering -- the
+  "incidentally passing" shape, and the reason the inversion survived a
+  round.
+
   **The override (amended 2026-08-23, round three; supersedes M9).** A
   proven refusal may be downgraded to a loud warning for a SINGLE
   invocation by an explicit flag on that invocation's own args,
@@ -358,6 +393,50 @@ re-raised at a future review as unmet.
 - **M10:** The never-execute-a-repo-local-script rule now lives in four
   prose sites across two prompt families (the consistency preflight and the
   ledger writer), pinned pairwise but not to each other.
+
+## Parked at review (2026-08-23, round-three review): closing the spec
+
+One finding from this round was built: the `AC-QA-2` ordering inversion above
+(`crossCheckAgainstOwnSchema` ran AFTER the `blind` and `ok:false` warns, so a
+failure of the heuristic half switched off the reliable half). **Everything
+else from this round is parked permanently.** Parked is not deferred: these
+are not to be re-raised at a future review as unmet work.
+
+**The list of sixteen is NOT reproduced here, because it was not supplied to
+the implementer.** The coordinator's instruction was to record sixteen further
+findings with one line each; the findings themselves did not accompany it, and
+inventing sixteen plausible bullet points would be a fabricated record inside
+the very spec whose subject is a mechanism that must not report things it did
+not verify. This paragraph is the honest placeholder. Anyone holding that
+review report should paste the sixteen lines in below; until then the
+authoritative record is the report, not this file.
+
+What IS recorded here is only what can be attested from this repo:
+
+- **Known coverage gaps, named by the coordinator, recorded as known rather
+  than done.** This round ran neither the operability nor the architecture
+  lens, so `AC-OPS-1`, `AC-OPS-3`, `AC-OPS-4` and `AC-ARCH-4` carry no verdict
+  from it. Their tests pass; that is a different claim from "a lens looked".
+- **The model half of `AC-QA-1` remains structurally unverifiable in this
+  repo.** Whether a scope agent actually runs the script and transcribes its
+  output faithfully cannot be tested here; every test drives a fake runtime.
+  The in-process cross-check bounds what a dishonest transcription can
+  achieve, and does not close it.
+- **`AC-QA-6`'s structural-loss signal warns at the workflow gate, it does not
+  refuse** (round three). It arrives through the scope agent like any other
+  script-derived field, so `AC-QA-2` puts it in the warn bucket unless the
+  report contradicts itself. The hard gate for that signal is the repo-side H3
+  static guard, which imports `checkConsistency` directly with no model
+  involved.
+- **The structural floor is a constant inside the file it ships in** (round
+  three). A stale installed `install-consistency.mjs` carries a stale floor.
+  The direction that matters -- a fresh lib against stale workflow scripts --
+  works; the reverse is structurally unclosable for a check that ships inside
+  the thing it checks.
+- **`L3` (round two) is unchanged**: a scope agent that UNDER-reports
+  `doc_fields`/`agent_fields` passes the cross-check trivially. Round three
+  removed the agent's ability to ASSERT an override; it did not close
+  omission.
 
 ## Risks
 
