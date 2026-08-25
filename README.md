@@ -61,6 +61,15 @@ cp -r claude-ai-harness/hooks/. ~/.claude/hooks/
 cp claude-ai-harness/AGENT-HARNESS.md ~/.claude/
 ```
 
+`agents/*.md` includes `implementer.md`: the agent `tdd-task` and
+`conduct-plan` dispatch to for all build work (every other shipped agent is
+read-only -- "lenses analyse, `implementer` builds"). It ships as a generic
+default, not a fixed dependency: replace it with your own
+`~/.claude/agents/implementer.md` to change how implementation is done
+without touching any workflow script. Because of that, it is deliberately
+excluded from the drift comparison below (`AC-OPS-4`) -- a replaced
+implementer is never reported as a stale install.
+
 Then **start a new Claude Code session** -- the workflow scripts are read
 when a session starts, so an install performed inside an already-open session
 is invisible to it (see the next section) -- and in any project:
