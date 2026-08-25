@@ -24,6 +24,34 @@ const MAX_ATTEMPTS = 3
 // part of the existing, publicly-documented return shape (AC-ARCH-10).
 const rounds = { test_attempts: 0, implement_attempts: 0 }
 
+// harn-fix-4: both the Test and Implement phases below dispatch
+// agentType: 'implementer', and a null agent() result at either site
+// previously aborted with a bare "test-writer agent failed" / "implementer
+// agent failed" -- naming neither the agent type nor where a missing
+// definition would come from. This workflow script has no filesystem
+// access (it cannot import, and cannot read agents/implementer.md to check
+// up front -- see the toBase64/ledgerWritePrompt comments below for the
+// same constraint), and the Test phase call is already the FIRST thing
+// run() does, so there is no earlier point to move a check to. What is
+// achievable is making the abort itself legible: name the agentType, name
+// where the missing definition would live, and say plainly this is a hint
+// (the most common cause of a null result here), not a diagnosis this
+// script is able to make -- a transient agent failure would look identical
+// from this vantage point. Deliberately placed OUTSIDE the L5 shared
+// run-ledger block below (see test/static-checks.test.js's L5 guard):
+// this helper is tdd-task-specific, and the block it would otherwise sit
+// inside is pinned byte-identical across all three workflow files.
+function agentDispatchFailedReason(phaseLabel) {
+  return (
+    `${phaseLabel} phase: agent() returned no result for agentType: 'implementer'. This workflow cannot check ` +
+    `your install from here (workflow scripts have no filesystem access), so this is a hint, not a diagnosis: the ` +
+    `most common cause is that no 'implementer' agent definition is installed. tdd-task's Test and Implement ` +
+    `phases both dispatch agentType: 'implementer'; a fresh install needs agents/implementer.md (see README.md's ` +
+    `install steps). If that file is already installed, the failure is something else -- check the agent step's ` +
+    `own output.`
+  )
+}
+
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: the
 // runtime statically rejects any import statement, so
 // workflows/lib/ledger-append.mjs -- the single definition site for the
@@ -206,7 +234,7 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       },
     }
   )
-  if (!test) return { verdict: 'ABORTED', reason: 'test-writer agent failed' }
+  if (!test) return { verdict: 'ABORTED', reason: agentDispatchFailedReason('Test') }
 
   phase('RED')
   red = await agent(
@@ -266,7 +294,7 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       },
     }
   )
-  if (!impl) return { verdict: 'ABORTED', reason: 'implementer agent failed' }
+  if (!impl) return { verdict: 'ABORTED', reason: agentDispatchFailedReason('Implement') }
 
   phase('GREEN')
   const hashList = red.test_hashes.map(h => `${h.file}: ${h.sha256}`).join('\n')

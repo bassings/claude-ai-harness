@@ -299,6 +299,42 @@ export function checkConsistency({ agentHarnessMd, lensFileTexts, planCycleSourc
 // mode below, and bash only ever sees that mode's JSON output. This array
 // therefore has exactly one definition in the codebase (AC-OPS-5), and
 // test/static-checks.test.js pins that.
+// harn-fix-4: agents/implementer.md is DELIBERATELY EXCLUDED from this list,
+// and from CONSUMER_OPTIONAL_PATTERNS below -- not merely absent from it.
+// Before this file existed, the two patterns immediately below it
+// ('agents/lens-*.md', 'agents/reviewer-*.md') already failed to match
+// 'agents/implementer.md' by accident of glob, not by decision: nobody had
+// chosen to exclude it, there was simply nothing yet to exclude. Now that
+// agents/implementer.md is a real, shipped, tracked file, the same
+// non-match has to be an explicit choice, or the next person who "completes"
+// this list by widening a glob (or adding 'agents/*.md' for tidiness)
+// reintroduces exactly the failure this comment exists to prevent.
+//
+// The reason: implementer.md ships as a GENERIC DEFAULT an operator is
+// expected to replace with their own (see agents/implementer.md's own
+// header and README.md's install section). Comparing it for drift would
+// report every operator who has done exactly that -- the intended, correct
+// use of the file -- as permanently, silently broken, on every weekly run,
+// forever. This repo has hit that exact shape twice in three days and
+// reversed course both times: the version-commit stamp mechanism was built,
+// reviewed and WITHDRAWN (test/static-checks.test.js's AC-ARCH-4 guard,
+// which also bans its constant name from reappearing in any shipped file --
+// deliberately not spelled out here, for that same reason) after round-one
+// review found it generated permanent false drift on every commit to main;
+// and hooks/hooks.json was moved from the required list to
+// CONSUMER_OPTIONAL_PATTERNS (L-4, this file's own header) after it fired
+// drift on every weekly run for every manual install, forever, for the same
+// reason -- a signal that always fires is the same as no signal, and it
+// drowns the true positive next to it. Excluding implementer.md here is
+// that same lesson applied before shipping it, not after.
+//
+// Enforced, not just stated: test/install-consistency.test.js pins both
+// arrays below to their exact expected contents (deepEqual), so literally
+// adding 'agents/implementer.md' to either fails those tests by diff; its
+// separate isConsumerSubsetPath('agents/implementer.md') === false
+// assertion catches the wider case of a glob broadened enough to sweep it
+// in without ever naming it (e.g. widening 'agents/lens-*.md' to
+// 'agents/*.md').
 export const CONSUMER_SUBSET_PATTERNS = [
   'AGENT-HARNESS.md',
   'agents/lens-*.md',
@@ -482,11 +518,22 @@ export function listConsumerSubsetFiles(dir) {
 // published file present in the install with DIFFERENT content; `missing`
 // is present in published, absent from the install entirely (AC-OPS-4's
 // explicit "reports a published file absent from the install as drift").
-// An install-only file the repo does not ship (CLAUDE.md,
-// agents/implementer.md) is structurally invisible here: this function
-// only ever iterates the PUBLISHED subset and looks each one up in the
-// install, so a file that exists only on the install side is never
-// examined at all, let alone reported (AC-OPS-4's other explicit case).
+// An install-only, genuinely user-owned file the repo does not ship
+// (CLAUDE.md) is structurally invisible here: this function only ever
+// iterates the PUBLISHED subset and looks each one up in the install, so a
+// file that exists only on the install side is never examined at all, let
+// alone reported (AC-OPS-4's other explicit case).
+//
+// agents/implementer.md is a DIFFERENT case, worth naming explicitly rather
+// than folding into the sentence above (harn-fix-4): the repo DOES ship it
+// (agents/implementer.md is a real, tracked file), but
+// CONSUMER_SUBSET_PATTERNS below deliberately does not match it, so it is
+// invisible to this function for the same structural reason as CLAUDE.md
+// (it is simply never in `publishedFiles`) despite being shipped, not
+// because it isn't. See CONSUMER_SUBSET_PATTERNS' own comment for why: it
+// is a shipped DEFAULT an operator is expected to replace with their own,
+// and comparing it for drift would report every operator who has done
+// exactly that as permanently, silently broken, forever.
 //
 // ANTI-VACUITY (mirrors checkConsistency()'s blind/blind_reasons above,
 // same failure shape, same fix): zero published files found is not

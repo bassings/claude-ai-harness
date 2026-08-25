@@ -39,6 +39,18 @@ ledger exists to measure. If a line is ever deliberately committed (an
 explicit opt-in; the file is untracked by default), it survives in git
 history like any other tracked change.
 
+## The `implementer` agent
+
+Every lens below is read-only. `implementer` (`agents/implementer.md`) is the
+one agent in the roster licensed to write, edit, run and commit -- `tdd-task`
+dispatches it for the Test and Implement phases, and `conduct-plan` delegates
+queued tasks to it. It ships as a **generic default**, not a fixed
+dependency: replace `~/.claude/agents/implementer.md` with your own to change
+how implementation is done without touching any workflow script. Because it
+is meant to be replaced, it is deliberately excluded from the install
+drift comparison (`workflows/lib/install-consistency.mjs`'s
+`CONSUMER_SUBSET_PATTERNS`) -- see that file's own comment for why.
+
 ## Lens roster
 
 **Always on**
