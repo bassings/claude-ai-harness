@@ -148,6 +148,43 @@ test('tdd-task.js: every terminating return reaches exactly one start write and 
   }
 })
 
+// harn-fix-4: the peer-review finding was that a fresh install missing
+// agents/implementer.md dies on either of these two agent() calls with a
+// message naming nothing an operator would recognise ("test-writer agent
+// failed" / "implementer agent failed"). Neither call site is checkable from
+// inside the workflow up front -- workflow scripts have no filesystem access
+// (see the toBase64/ledgerWritePrompt comments above), and the very first use
+// of agentType: 'implementer' IS the earliest possible point in run(), so
+// there is no earlier moment to move the check to. What IS achievable is
+// making the abort itself legible: name the agentType that was dispatched,
+// name where the missing definition would live, and say plainly that this is
+// a hint (the most common cause of a null agent() result here), not a
+// diagnosis this script is able to make.
+test('tdd-task.js: when the Test phase agent() call fails, the ABORTED reason names the missing "implementer" agent type and where it comes from, not just "test-writer agent failed" (harn-fix-4)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { task: 'x' },
+    agent: { 'ledger:write': LEDGER_OK },
+  })
+  assert.equal(result.verdict, 'ABORTED')
+  assert.match(result.reason, /agentType: 'implementer'/, 'must name the agentType that was dispatched')
+  assert.match(result.reason, /agents\/implementer\.md/, 'must name where the missing definition would live')
+  assert.match(result.reason, /no filesystem access|cannot check/i, 'must say honestly that this workflow cannot verify the install, not fake a check it cannot perform')
+})
+
+test('tdd-task.js: when the Implement phase agent() call fails, the ABORTED reason ALSO names "implementer" and agents/implementer.md -- both call sites dispatch the same agentType and must be equally legible (harn-fix-4)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: { task: 'x' },
+    agent: {
+      'write-test#1': DONE_AGENT['write-test#1'],
+      'verify-red#1': DONE_AGENT['verify-red#1'],
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  assert.equal(result.verdict, 'ABORTED')
+  assert.match(result.reason, /agentType: 'implementer'/, 'must name the agentType that was dispatched')
+  assert.match(result.reason, /agents\/implementer\.md/, 'must name where the missing definition would live')
+})
+
 test('tdd-task.js: hashes_match:false BLOCKs with zero commit calls (H4, dedicated)', async () => {
   const { calls, result } = await runWorkflow(WF, {
     args: { task: 'x' },
