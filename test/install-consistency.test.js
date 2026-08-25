@@ -618,7 +618,7 @@ function publishedSubsetTree(overrides = {}) {
     'agents/lens-security.md': 'lens security\n',
     'agents/lens-qa.md': 'lens qa\n',
     'agents/reviewer-verification.md': 'reviewer verification\n',
-    'agents/implementer.md': 'NOT in the subset -- agents/*.md only matches lens-*/reviewer-*\n',
+    'agents/implementer.md': 'shipped, but deliberately excluded from the consumer subset -- see CONSUMER_SUBSET_PATTERNS\' own comment (harn-fix-4)\n',
     'workflows/plan-cycle.js': 'plan cycle\n',
     'workflows/review-cycle.js': 'review cycle\n',
     'workflows/lib/install-consistency.mjs': 'the lib file itself\n',
@@ -663,7 +663,14 @@ test('install-consistency: isConsumerSubsetPath matches every pattern shape (lit
   assert.equal(isConsumerSubsetPath('skills/conduct-plan/SKILL.md'), true, 'HIGH-2: skills/ covers the whole directory, not just optimise-cycle/')
   assert.equal(isConsumerSubsetPath('bin/optimise-cycle-weekly.sh'), true, 'HIGH-2: an optional pattern is still "in the subset", just not required to be present')
   assert.equal(isConsumerSubsetPath('bin/redact-transcript.mjs'), true)
-  assert.equal(isConsumerSubsetPath('agents/implementer.md'), false, 'implementer.md is user-owned, not published under agents/lens-*.md or agents/reviewer-*.md')
+  // harn-fix-4: implementer.md is a real, shipped, tracked file (unlike
+  // CLAUDE.md below, which genuinely is never published) -- it is excluded
+  // from the subset by DECISION, not by omission, because it is a generic
+  // default an operator is expected to replace with their own. See
+  // CONSUMER_SUBSET_PATTERNS' own comment for the two prior false-positive
+  // incidents (the withdrawn version stamp, hooks.json L-4) this exclusion
+  // exists to avoid repeating a third time.
+  assert.equal(isConsumerSubsetPath('agents/implementer.md'), false, 'implementer.md is a shipped default, deliberately excluded from drift comparison so replacing it is never reported as drift')
   assert.equal(isConsumerSubsetPath('CLAUDE.md'), false, 'CLAUDE.md is user-owned, never published')
   assert.equal(isConsumerSubsetPath('bin/com.local.optimise-cycle-weekly.plist'), false, 'the plist is deliberately excluded -- it is a per-operator TEMPLATE, never byte-identical to the published copy by design')
   assert.equal(isConsumerSubsetPath('bin/setup-hooks.sh'), false, 'bin/ is not a directory-prefix pattern -- only the two literal optional files are in scope')
@@ -900,12 +907,12 @@ test('install-consistency: checkStaleness (L-4, harn-fix-3) -- hooks/hooks.json 
   assert.equal(result.status, 'drift')
 })
 
-test('install-consistency: checkStaleness never reports a user-owned file the install has but the repo does not ship (AC-OPS-4\'s other explicit case)', async () => {
+test('install-consistency: checkStaleness never reports a file the install has that is outside the consumer subset -- whether it is genuinely never shipped (CLAUDE.md) or shipped but deliberately excluded (agents/implementer.md, harn-fix-4) (AC-OPS-4\'s other explicit case)', async () => {
   const { checkStaleness } = await loadModule()
   const published = publishedSubsetTree()
-  const install = publishedSubsetTree({ 'CLAUDE.md': 'user-owned, never published\n', 'agents/implementer.md': 'user-owned\n' })
+  const install = publishedSubsetTree({ 'CLAUDE.md': 'user-owned, never published\n', 'agents/implementer.md': 'a locally-customised implementer, different from any published default\n' })
   const result = checkStaleness(published, install)
-  assert.deepEqual(result.drift, [], 'CLAUDE.md and agents/implementer.md exist only in the install and are not in the consumer subset, so they must never appear in drift')
+  assert.deepEqual(result.drift, [], 'CLAUDE.md (never shipped) and agents/implementer.md (shipped, but deliberately excluded from the subset) are both outside the consumer subset for different reasons, and neither may ever appear in drift')
 })
 
 test('install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published tree (zero subset files found) reports blind:true, never "no drift" (the CLAUDE.md-documented failure shape: a guard that finds zero files and calls that clean)', async () => {

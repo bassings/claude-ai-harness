@@ -1368,3 +1368,77 @@ test('static AC-QA-19: every GUARDED shape is refused and every OUT-OF-SCOPE sha
     cleanupTempRepos()
   }
 })
+
+// harn-fix-4 (the class, not just the instance): agents/implementer.md was
+// absent from this repo for its entire history (git log --all -- confirms
+// zero commits ever touched it) while workflows/tdd-task.js dispatched
+// agentType: 'implementer' at two call sites and AGENT-HARNESS.md's own
+// contract line named it as the agent that builds. Nothing in the repo ever
+// checked that every agentType a workflow or skill can DISPATCH has a
+// matching DEFINITION under agents/ -- install-consistency.mjs (see its own
+// header) only ever verifies an INSTALL against this repo, never that this
+// repo is internally complete, so a genuinely missing agent definition and a
+// byte-perfect install of that same gap both report "consistent". This test
+// closes that specific hole: it is deliberately scoped to what this repo's
+// three workflow scripts actually do, not a general-purpose JS parser (this
+// codebase has no dependencies and no parser, matching every other
+// text-scan check in this file), and its coverage is proven by mutation
+// below rather than merely argued.
+//
+// Three shapes of agentType reference exist in this codebase, and each needs
+// its own extraction:
+//   1. A literal `agentType: 'name'` -- workflows/tdd-task.js's two
+//      'implementer' call sites.
+//   2. Every element of the `const ALL = [...]` roster array in
+//      plan-cycle.js and review-cycle.js -- the complete set of lens names
+//      `agentType: lens` can ever be called with at runtime, since `lens` is
+//      a loop variable, not a literal, and ALL is each file's own documented
+//      superset of everything `lenses` can contain (see the "deterministic
+//      lens triggering" block in both files).
+//   3. Any string passed to `lenses.push(...)` -- review-cycle.js pushes
+//      'reviewer-verification' under opts.adversarial, which is a real
+//      dispatchable agentType that ALL deliberately does not enumerate
+//      (reviewer-verification is a specialist, not a standing lens; see
+//      AGENT-HARNESS.md's roster). Every OTHER push in both files (the
+//      trigger-driven `lenses.push('lens-design', 'lens-accessibility')`
+//      shapes) is already a subset of that file's own ALL array, so this
+//      step only ever adds names ALL would have missed.
+function extractAgentTypeReferences(source) {
+  const types = new Set()
+  for (const m of source.matchAll(/agentType:\s*'([A-Za-z0-9_-]+)'/g)) types.add(m[1])
+  const allMatch = /const ALL = \[([^\]]*)\]/.exec(source)
+  if (allMatch) {
+    for (const m of allMatch[1].matchAll(/'([A-Za-z0-9_-]+)'/g)) types.add(m[1])
+  }
+  for (const pushCall of source.matchAll(/lenses\.push\(([^)]*)\)/g)) {
+    for (const m of pushCall[1].matchAll(/'([A-Za-z0-9_-]+)'/g)) types.add(m[1])
+  }
+  return types
+}
+
+test('static: HARN-FIX-4 -- every agentType referenced anywhere in workflows/ or skills/ has a matching definition file in agents/ (the class of defect that shipped tdd-task.js dispatching agentType: \'implementer\' with no agents/implementer.md in the repo, ever)', () => {
+  const targets = [
+    ...walk(path.join(ROOT, 'workflows')).filter((f) => f.endsWith('.js')),
+    ...walk(path.join(ROOT, 'skills')).filter((f) => f.endsWith('.md')),
+  ]
+  assert.ok(targets.length > 3, `sanity: expected several workflow/skill files, found ${targets.length}`)
+
+  const referenced = new Set()
+  for (const f of targets) {
+    for (const t of extractAgentTypeReferences(fs.readFileSync(f, 'utf8'))) referenced.add(t)
+  }
+  // ANTI-VACUITY: a scan that finds nothing is not evidence nothing is
+  // referenced, it is evidence the extraction broke -- mirrors every other
+  // blind/anti-vacuity check in this file and in install-consistency.mjs.
+  assert.ok(referenced.size >= 10, `sanity: expected at least 10 distinct agentType references across workflows/skills, found ${referenced.size}: ${[...referenced].sort().join(', ')}`)
+
+  const definedAgents = new Set(
+    fs.readdirSync(path.join(ROOT, 'agents'))
+      .filter((f) => f.endsWith('.md'))
+      .map((f) => f.slice(0, -'.md'.length))
+  )
+  assert.ok(definedAgents.size >= 10, `sanity: expected at least 10 agent definition files, found ${definedAgents.size}`)
+
+  const missing = [...referenced].filter((t) => !definedAgents.has(t)).sort()
+  assert.deepEqual(missing, [], `agentType(s) referenced in workflows/ or skills/ with no matching agents/<name>.md definition: ${missing.join(', ')}`)
+})

@@ -144,8 +144,17 @@ blocks harmless work gets switched off. An instructed-but-unsupported field
   else current reports no drift at all (L-4). Absence being fine must not
   make presence unchecked: a fixture with `hooks/hooks.json` present but
   modified still reports drift (L-4). A user-owned file that the repo does
-  not ship (`CLAUDE.md`, `agents/implementer.md`) is never reported. Test:
-  both present in the fixture, neither named.
+  not ship (`CLAUDE.md`) is never reported. Test: both present in the
+  fixture, neither named. **Amended 2026-08-25 (harn-fix-4):**
+  `agents/implementer.md` is no longer an example of this case -- the repo
+  now ships it, as a generic default an operator is expected to replace.
+  It is still never reported, but for a different, decision-driven reason:
+  `CONSUMER_SUBSET_PATTERNS` deliberately does not match it (see that
+  constant's own comment in `workflows/lib/install-consistency.mjs`),
+  because comparing a shipped default for drift would report every operator
+  who has correctly replaced it as permanently broken -- the same
+  false-positive shape this spec's own version-stamp withdrawal and L-4
+  hit, applied here before shipping rather than after.
 - **AC-OPS-5:** The subset list has exactly one definition in the codebase. Test:
   a static check fails if a second literal copy of it appears.
 
