@@ -16,6 +16,14 @@ const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
 
+// AC-1 (this file's own writeTree() fixtures now shell out to `git init` --
+// see gitInitAndCommit() below): scrubbed at module load, same as
+// test/static-checks.test.js, so an inherited GIT_DIR cannot redirect that
+// `git init`/`git add`/`git commit` into a real repository. See
+// test/helpers/git-env.js's own header for why this is per-file, not
+// suite-wide, and why it must be called (not merely imported) here.
+require('./helpers/git-env.js').scrubGitEnv()
+
 const SCRIPT = path.join(__dirname, '..', 'workflows', 'lib', 'install-consistency.mjs')
 const MODULE_URL = pathToFileURL(SCRIPT).href
 
@@ -583,6 +591,30 @@ test('install-consistency: the CLI never touches the fixture directory it reads 
 // message, not only via an opaque subprocess run).
 // ============================================================================
 
+// AC-1: checkStaleness() now reads the published side through git ls-files,
+// so a tree used as its "published" argument has to be a real git working
+// tree with every written file actually tracked, or the whole run goes
+// blind (see listGitTrackedFiles()'s comment in the production module).
+// Applied unconditionally to every writeTree() output rather than only the
+// ones used as "published": a git repo the install side happens to carry
+// too is harmless (checkStaleness() never runs git against installDir), and
+// this keeps one tree builder instead of two that must be told apart at
+// every call site.
+function gitInitAndCommit(dir) {
+  const run = (args) => {
+    const res = spawnSync('git', args, { cwd: dir, encoding: 'utf8' })
+    if (res.status !== 0) {
+      throw new Error(`git ${args.join(' ')} failed in test fixture ${dir}: ${res.stderr}`)
+    }
+  }
+  run(['init', '-q'])
+  run(['add', '-A'])
+  // Throwaway fixture repos only, never the real project history -- the
+  // explicit identity and gpgsign=false avoid depending on this machine's
+  // global git config to make a commit succeed at all.
+  run(['-c', 'user.name=install-consistency test fixture', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'fixture'])
+}
+
 // A plain directory tree builder, deliberately more general than
 // writeFixture() above (which is shaped for the four consistency-check
 // inputs specifically): the staleness check compares two arbitrary trees
@@ -594,6 +626,7 @@ function writeTree(files) {
     fs.mkdirSync(path.dirname(abs), { recursive: true })
     fs.writeFileSync(abs, content)
   }
+  gitInitAndCommit(dir)
   return dir
 }
 
@@ -913,6 +946,44 @@ test('install-consistency: checkStaleness never reports a file the install has t
   const install = publishedSubsetTree({ 'CLAUDE.md': 'user-owned, never published\n', 'agents/implementer.md': 'a locally-customised implementer, different from any published default\n' })
   const result = checkStaleness(published, install)
   assert.deepEqual(result.drift, [], 'CLAUDE.md (never shipped) and agents/implementer.md (shipped, but deliberately excluded from the subset) are both outside the consumer subset for different reasons, and neither may ever appear in drift')
+})
+
+// AC-1 (measured false positive): listConsumerSubsetFiles() walks the
+// filesystem, so an untracked build artefact sitting in a watched directory
+// -- hooks/__pycache__/*.pyc, gitignored at .gitignore:12, written by
+// Python on every hook run -- used to be reported "published" and then,
+// correctly given that wrong premise, "missing from the install" forever.
+// "Published" means "tracked by git", not "present on disk".
+test('install-consistency: AC-1 -- a file that is gitignored and untracked in a watched directory is never reported missing, because "published" means "tracked by git", not "present on disk"', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree({ '.gitignore': 'hooks/__pycache__/\n' })
+  // Written AFTER publishedSubsetTree()'s own git commit, so it is
+  // genuinely untracked -- exactly the shape Python leaves behind after a
+  // hook runs, not merely uncommitted-but-staged.
+  fs.mkdirSync(path.join(published, 'hooks', '__pycache__'), { recursive: true })
+  fs.writeFileSync(path.join(published, 'hooks', '__pycache__', 'destructive-git-guard.cpython-314.pyc'), 'bytecode, never shipped\n')
+  const install = publishedSubsetTree() // a normal install: no __pycache__ at all
+  const result = checkStaleness(published, install)
+  assert.equal(result.missing_count, 0, 'a gitignored, untracked build artefact must never be counted as a file the repo published')
+  assert.deepEqual(result.missing, [])
+  assert.equal(result.blind, false, 'the fix must genuinely verify the install, not merely refuse to look')
+  assert.equal(result.status, 'ok')
+})
+
+// AC-5: the direction that must not be weakened. Filtering the published
+// side down to git-tracked files must never also hide a REAL missing file
+// -- a fix that made `missing` always empty would pass the AC-1 test above
+// for the wrong reason (see this test's own mutation proof in the report).
+test('install-consistency: AC-5 -- a genuinely tracked, published file that is absent from the install is still reported missing (the git-tracked filter narrows what counts as published, it must not narrow what counts as checked)', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree()
+  fs.rmSync(path.join(install, 'agents', 'lens-security.md'))
+  const result = checkStaleness(published, install)
+  assert.deepEqual(result.missing, ['agents/lens-security.md'])
+  assert.equal(result.missing_count, 1)
+  assert.equal(result.blind, false)
+  assert.equal(result.status, 'drift')
 })
 
 test('install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published tree (zero subset files found) reports blind:true, never "no drift" (the CLAUDE.md-documented failure shape: a guard that finds zero files and calls that clean)', async () => {
