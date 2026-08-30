@@ -122,16 +122,60 @@ const PAIRED_LEDGER = [
   { run_id: 'return-path-terminal', ts: 't2', write_ok: true, write_error: null },
 ]
 
-test('review-cycle.js: the "no changes found" early return (line 65 historically) still reaches the ledger write, with outcome no-op, and the terminal write reuses the start run_id (AC-ARCH-3, AC-QA-9)', async () => {
+test('review-cycle.js: a genuinely empty diff (scope succeeded, zero files) still reaches the ledger write, with outcome no-op, a report that says plainly no review happened, and the terminal write reuses the start run_id (AC-2, AC-ARCH-3, AC-QA-9)', async () => {
   const { result, calls } = await runWorkflow(WF, {
     args: {},
     agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, files: [] }, 'ledger:write': PAIRED_LEDGER }),
   })
-  assert.equal(result.report, 'No changes found between the base ref and HEAD. Nothing to review.')
+  assert.match(result.report, /no review/i, 'the report must say plainly that no review happened, not merely that nothing changed')
+  assert.match(result.report, /not a clean/i, 'the report must explicitly disclaim being a clean pass, not just stay silent on it')
   assert.equal(result.telemetry.outcome, 'no-op')
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
   assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
+})
+
+// AC-1: a scope step that returned NOTHING (the agent failed or was
+// stopped, not a legitimate empty diff) must not be reported as the same
+// "no changes found" no-op -- it is a broken run and must be loud. This
+// follows the install-consistency refusal's own shape immediately above it
+// in the source: throw, so the run goes through the existing exception
+// path (one terminal ledger write, outcome aborted, original error still
+// reaches the caller).
+test('review-cycle.js: a totally failed scope step (agent returned nothing) throws, is recorded as outcome aborted (never no-op or done), and the original error reaches the caller (AC-1)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': undefined,
+          'ledger:write': [
+            { run_id: 'start-scope-fail', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'terminal-scope-fail', ts: 't2', write_ok: true, write_error: null },
+          ],
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /scope/i, 'the error must name the scope step as the point of failure')
+      assert.match(err.message, /broken run, not an empty diff/i, 'the error must say plainly this is a failure, not an empty-diff no-op')
+      const ledgerCalls = err.calls.filter((c) => c.opts.label === 'ledger:write')
+      assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write even though run() threw')
+      const terminalPayload = extractLedgerPayload(ledgerCalls[1].prompt)
+      assert.equal(terminalPayload.outcome, 'aborted', 'a totally failed scope step must be recorded as aborted, never no-op or done')
+      return true
+    }
+  )
+})
+
+// AC-4 (both directions): a normal review with a non-empty diff must
+// proceed exactly as before -- a fix that makes every review loud (e.g.
+// throwing on ANY scope result, or on a non-empty files array) would
+// satisfy the empty-diff and failed-scope tests above while breaking this.
+test('review-cycle.js: a normal review with a non-empty diff still proceeds to completion with outcome done, unaffected by the empty-diff and failed-scope handling (AC-4)', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.equal(result.telemetry.outcome, 'done')
+  assert.notEqual(result.telemetry.outcome, 'no-op')
+  assert.ok(result.report.length > 0, 'a normal completed review must still carry a real report')
 })
 
 test('review-cycle.js: "every lens agent failed" early return (line 149 historically) still reaches the ledger write, with outcome aborted, and the terminal write reuses the start run_id (AC-ARCH-3, AC-QA-9)', async () => {

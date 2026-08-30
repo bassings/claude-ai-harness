@@ -25,8 +25,24 @@ const WORKFLOWS = {
 // The very first agent() call every workflow makes is its start-record
 // ledger:write (before any lens/work agent runs), so no scripted response
 // is needed to capture it -- an unscripted call still records its prompt.
+//
+// An entirely unscripted agent (agent: {}) makes every call, including the
+// scope step, resolve to undefined -- a totally failed scope agent. In
+// review-cycle.js that now throws (AC-1 of the no-op-masquerading-as-
+// success fix: a broken scope step must be loud, never a silent no-op), so
+// the workflow's own promise rejects even though the FIRST ledger:write
+// call still happened before the throw. runWorkflow attaches calls/logs to
+// a rejection for exactly this reason (see its own comment); read from
+// there when the run rejects, from the normal result otherwise, so this
+// helper works for a workflow that returns AND one that legitimately
+// throws after its first ledger write.
 async function firstLedgerWritePrompt(file, args) {
-  const { calls } = await runWorkflow(file, { args, agent: {} })
+  let calls
+  try {
+    ;({ calls } = await runWorkflow(file, { args, agent: {} }))
+  } catch (e) {
+    calls = e.calls
+  }
   const call = calls.find((c) => c.opts.label === 'ledger:write')
   assert.ok(call, 'expected a ledger:write call to have happened')
   return call.prompt
