@@ -15,7 +15,9 @@ point the next armed session re-claims.
 Allows the stop when:
   - stop_hook_active is set (never double-block; the escape hatch),
   - another session holds a live conductor claim (bystander),
-  - the plan file is missing, fully done, or marked blocked-on-human,
+  - the plan file is missing, fully done, or carries a LIVE
+    blocked-on-human status (above the conductor log, at line start;
+    a block recorded in the log is history and does not disarm it),
   - the transcript tail shows a wake source armed since the last user turn
     (ScheduleWakeup, Monitor, Workflow launch, or a background task/agent).
 Otherwise returns {"decision": "block"} naming what to arm.
@@ -37,6 +39,8 @@ WAKE_MARKERS = (
 )
 USER_TURN_MARKERS = ('"type":"user"', '"type": "user"')
 STALE_CONDUCTOR_SECONDS = 6 * 3600
+BLOCKED_MARKER = 'status: blocked-on-human'
+LOG_HEADING = '## Conductor log'
 
 
 def tail_lines(path, n=400):
@@ -59,6 +63,26 @@ def wake_armed_since_last_user_turn(lines):
             last_user = i
     window = lines[last_user + 1:] if last_user >= 0 else lines
     return any(m in line for line in window for m in WAKE_MARKERS)
+
+
+def blocked_on_human(plan_text):
+    """True only for a LIVE block, never for one a conductor merely recorded.
+
+    A conductor logs every block it hits, so a whole-file search for the
+    marker disarms the guard permanently the first time one is written: the
+    plan reads as blocked forever, on a question that was answered days ago.
+    Observed 2026-08-30, where a resolved billing escalation from 2026-08-27
+    had left the guard silently off with seven tasks still open.
+
+    So a live status must be BOTH above the conductor log (which is history
+    by definition) and at the start of its own line. Put the status line in
+    the plan's frontmatter or just under its title; a status written below
+    the log is treated as history and the guard keeps nagging, which is the
+    right way for a guard to fail.
+    """
+    head = plan_text.split(LOG_HEADING, 1)[0]
+    return any(line.strip().startswith(BLOCKED_MARKER)
+               for line in head.splitlines())
 
 
 def read_marker(marker):
@@ -137,7 +161,7 @@ def plan_guard_decision(cwd, stop_hook_active, transcript_lines,
             plan = f.read()
     except OSError:
         return None
-    if 'status: blocked-on-human' in plan:
+    if blocked_on_human(plan):
         return None
     open_tasks = plan.count('- [ ]')
     if open_tasks == 0:

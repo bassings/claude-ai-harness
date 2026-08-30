@@ -94,6 +94,15 @@ jobs:
           git init -q "${{ runner.temp }}/decoy"
           GIT_DIR="${{ runner.temp }}/decoy/.git" node --test test/*.test.js
 
+      # hooks/*.py has its own unittest suite, standard library only, no
+      # install step needed. Unlike the Node glob above, unittest's discover
+      # does not need a matching-count guard: it already fails loudly (exit
+      # 5, "NO TESTS RAN") when its pattern matches nothing, rather than
+      # exiting 0 on an empty suite the way an unmatched shell glob does for
+      # node --test.
+      - name: Test the Python hooks
+        run: python3 -m unittest discover -s hooks -p 'test_*.py'
+
   secrets:
     # This repo is public and has already had a credential's fingerprint
     # reach its history, requiring a filter-branch rewrite. Standard 3 asks
