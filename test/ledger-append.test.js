@@ -2536,6 +2536,37 @@ test('ledger-append (round 5, H-A pinned): an absolute spec through a symlinked 
   assert.equal(entry.spec, '<redacted-path>')
 })
 
+// Fixture-vs-defect boundary test (branch fix/ledger-path-under-symlinked-root):
+// every OTHER absolute-in-repo-spec test in this file builds its fixture
+// under SUITE_TMPDIR, which is realpath'd once at module load specifically
+// so an in-repo case reads as in-repo (see temp-repo.js's own comment at
+// SUITE_TMPDIR's definition). That fix makes the ORDINARY case pass on a
+// machine whose TMPDIR sits behind a symlink (macOS: /var/folders/... ->
+// /private/var/folders/...); it must not also make THIS case pass, or the
+// documented H-A limitation above has silently regressed into "always
+// works" without anyone noticing, since both would look identical from a
+// green run. This test builds its repo through `makeHostileTempRepo()`'s
+// OWN deliberate symlink layer (never realpath'd away) and constructs its
+// absolute spec the plain, uncorrected way a real caller would -- no PWD
+// override, unlike the round-2 H3 tests above that explicitly set PWD to
+// demonstrate the corrected path. The repo root genuinely sits behind a
+// symlink the writer's own cwd resolution does not see through, so this
+// must still record the out-of-repo marker: the one case in this file
+// where that outcome is correct, not a fixture that stopped matching its
+// own environment.
+test('ledger-append (fix/ledger-path-under-symlinked-root): a repo whose root genuinely sits under a symlinked ancestor, with no PWD correction, records the out-of-repo marker for its own in-repo spec -- the documented H-A limitation, distinguishable from a confused test fixture', () => {
+  const repo = makeHostileTempRepo()
+  fs.mkdirSync(path.join(repo, 'specs'))
+  fs.writeFileSync(path.join(repo, 'specs', 'a.md'), '# a\n')
+  const absoluteSpec = path.join(repo, 'specs', 'a.md')
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: absoluteSpec })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.plan_key, '<redacted-path>', `got ${JSON.stringify(entry.plan_key)} -- a repo root reached only through a symlinked ancestor, with nothing correcting for it, must record the documented marker, not the real key`)
+  assert.equal(entry.spec, '<redacted-path>')
+})
+
 // Round 5 (H-A): the purity/byte-identity requirement (AC-ARCH-2, AC-SEC-2,
 // AC-DATA-3) is about the WRITE-TIME PIPELINE'S OWN BEHAVIOUR, not merely
 // about canonicalPlanKey's own function body staying free of fs calls --
@@ -2629,7 +2660,14 @@ test('ledger-append (round-2 H3): the two existing worktree-identity assertions,
   fs.writeFileSync(path.join(repo, 'README.md'), 'seed\n')
   sh('git add README.md && git commit -q -m seed', repo)
 
-  const worktreeDir = path.join(os.tmpdir(), 'h3-wt-' + Math.random().toString(36).slice(2))
+  // Built under SUITE_TMPDIR (already realpath'd), not the bare os.tmpdir()
+  // -- the writer resolves its own cwd through the OS, which reports the
+  // canonical form, so an unresolved worktreeDir string here would stop
+  // lexically matching the root the writer sees, for the same ambient
+  // macOS TMPDIR-symlink reason temp-repo.js's own SUITE_TMPDIR comment
+  // explains. Unrelated to the DELIBERATE symlink this test constructs for
+  // `repo` above, which stays untouched.
+  const worktreeDir = path.join(SUITE_TMPDIR, 'h3-wt-' + Math.random().toString(36).slice(2))
   sh(`git worktree add -q -b h3-wt-branch "${worktreeDir}"`, repo)
   try {
     const absoluteSpecInWorktree = path.join(worktreeDir, 'specs', 'a.md')
@@ -2701,7 +2739,11 @@ test('ledger-append: writing from inside a REAL worktree with no origin remote r
 
 test('ledger-append: an absolute spec path authored INSIDE a worktree is recorded repo-relative, never as the redaction placeholder -- identical plan_key to the same plan run from the main checkout (AC-DATA-1, AC-ARCH-3, real git worktree add fixture)', () => {
   const repo = makeTempRepo()
-  const worktreeDir = path.join(os.tmpdir(), 'ledger-append-spec-wt-' + Math.random().toString(36).slice(2))
+  // Built under SUITE_TMPDIR (already realpath'd) for the same reason as
+  // the round-2 H3 fixture above: the writer resolves its own cwd through
+  // the OS, which reports the canonical form, so an unresolved worktreeDir
+  // string here would stop lexically matching the root the writer sees.
+  const worktreeDir = path.join(SUITE_TMPDIR, 'ledger-append-spec-wt-' + Math.random().toString(36).slice(2))
   sh(`git worktree add -q -b spec-wt-branch "${worktreeDir}"`, repo)
   try {
     const absoluteSpecInWorktree = path.join(worktreeDir, 'specs', 'a.md')
