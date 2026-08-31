@@ -25,8 +25,38 @@ const WORKFLOWS = {
 // The very first agent() call every workflow makes is its start-record
 // ledger:write (before any lens/work agent runs), so no scripted response
 // is needed to capture it -- an unscripted call still records its prompt.
+//
+// An entirely unscripted agent (agent: {}) makes every call, including the
+// scope step, resolve to undefined -- a totally failed scope agent. In
+// review-cycle.js that now throws (AC-1 of the no-op-masquerading-as-
+// success fix: a broken scope step must be loud, never a silent no-op), so
+// the workflow's own promise rejects even though the FIRST ledger:write
+// call still happened before the throw. runWorkflow attaches calls/logs to
+// a rejection for exactly this reason (see its own comment); read from
+// there when the run rejects, from the normal result otherwise, so this
+// helper works for a workflow that returns AND one that legitimately
+// throws after its first ledger write.
 async function firstLedgerWritePrompt(file, args) {
-  const { calls } = await runWorkflow(file, { args, agent: {} })
+  let calls
+  try {
+    ;({ calls } = await runWorkflow(file, { args, agent: {} }))
+  } catch (e) {
+    // Round-1 review finding 6: this helper is shared across all three
+    // workflows, so a bare catch would swallow ANY unexpected throw from
+    // ANY of them, not only review-cycle.js's deliberate scope-agent-failed
+    // throw (AC-1). Narrowed to the one error this fixture is known to
+    // produce -- an unexpected rejection (a different workflow throwing
+    // where it should still return, or review-cycle throwing something
+    // other than the scope-step failure) fails loudly here instead of
+    // being silently absorbed and possibly masking a real regression.
+    assert.match(
+      String(e && e.message),
+      /^ScopeStepFailed:/,
+      `firstLedgerWritePrompt(${file}) caught an unexpected rejection -- only review-cycle.js's totally-failed-scope ` +
+        `throw is expected here, so this must not be silently swallowed: ${e && e.message}`
+    )
+    calls = e.calls
+  }
   const call = calls.find((c) => c.opts.label === 'ledger:write')
   assert.ok(call, 'expected a ledger:write call to have happened')
   return call.prompt

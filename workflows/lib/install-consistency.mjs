@@ -108,6 +108,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
 
 // ---- side A: AGENT-HARNESS.md's ### FINDINGS template ----
 // Identical extraction to test/static-checks.test.js's pre-existing H3
@@ -512,6 +513,41 @@ export function listConsumerSubsetFiles(dir) {
   return [...candidates].filter((rel) => isConsumerSubsetPath(rel)).sort()
 }
 
+// ---- AC-1: "published" means "tracked by git" ----------------------------
+// listConsumerSubsetFiles() above answers "what sits on disk under a watched
+// pattern" -- that includes a build artefact nobody committed, sitting right
+// next to the tracked files it was written alongside. hooks/__pycache__/*.pyc
+// is the measured case: gitignored at .gitignore:12, written by Python on
+// every hook run, matched by the 'hooks/' directory-prefix pattern, and
+// never present in a fresh install because it is never published. Fed
+// straight into checkStaleness() as "published", it was reported "missing
+// from the install" forever, for anyone who had ever run a hook locally --
+// a permanent false positive sitting beside a genuine one (see this file's
+// module header). This function narrows a published directory's candidates
+// to what git actually tracks there, which is the literal meaning of
+// "published" in this repo.
+//
+// Returns null, never throws, when tracked-ness cannot be determined:
+// publishedDir is not a git working tree, the git binary is not on PATH, or
+// the command fails for any other reason. checkStaleness() treats null
+// exactly like its own pre-existing "nothing could be compared" case
+// (blind:true), not as a silent fall-back to the unfiltered walk (which
+// would quietly reintroduce the false positive above every time git happens
+// to be unavailable, with nothing in the report saying so) and not as a
+// silent empty tracked-set either (which would report every published file
+// as untracked, hiding genuine missing files). Loud and untrusted is the
+// same choice this module already makes everywhere else "cannot verify" is
+// possible -- see this file's header ANTI-VACUITY note.
+export function listGitTrackedFiles(dir) {
+  let output
+  try {
+    output = execFileSync('git', ['-C', dir, 'ls-files', '-z'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+  } catch (e) {
+    return null
+  }
+  return new Set(output.split('\0').filter(Boolean))
+}
+
 // AC-OPS-2/AC-OPS-4: compares the published tree's consumer subset against
 // an install directory. Reads both, writes neither -- every access below is
 // fs.readFileSync/readdirSync/statSync, never a write call. `drifted` is a
@@ -558,8 +594,16 @@ function computeStalenessStatus({ blind, unmatchedPatterns, drift }) {
 }
 
 export function checkStaleness(publishedDir, installDir) {
-  const publishedFiles = listConsumerSubsetFiles(publishedDir)
-  const blind = publishedFiles.length === 0
+  const candidateFiles = listConsumerSubsetFiles(publishedDir)
+  // AC-1: narrow the filesystem walk's candidates to what git actually
+  // tracks in publishedDir -- see listGitTrackedFiles()'s own comment for
+  // why (the hooks/__pycache__/*.pyc false positive) and for why null
+  // (cannot determine) collapses into blind below rather than a guess in
+  // either direction.
+  const trackedFiles = listGitTrackedFiles(publishedDir)
+  const gitBlind = trackedFiles === null
+  const publishedFiles = gitBlind ? [] : candidateFiles.filter((rel) => trackedFiles.has(rel))
+  const blind = gitBlind || publishedFiles.length === 0
   // MED-8(b): per-PATTERN blindness, independent of the aggregate `blind`
   // above. The aggregate check alone cannot see a renamed or moved subset
   // directory: other patterns still matching something keeps

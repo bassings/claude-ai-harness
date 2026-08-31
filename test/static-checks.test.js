@@ -1123,7 +1123,12 @@ test('static: every hooks/*.py script is registered in hooks/hooks.json, and eve
   const hooksDir = path.join(ROOT, 'hooks')
   const pyFiles = new Set(
     fs.readdirSync(hooksDir, { withFileTypes: true })
-      .filter((e) => e.isFile() && e.name.endsWith('.py'))
+      // test_*.py files are unittest suites picked up by CI's own
+      // `python3 -m unittest discover -s hooks -p 'test_*.py'`, not hook
+      // entry points. hooks.json registers scripts Claude Code invokes as
+      // hooks, so a test suite living alongside the script it tests must
+      // not be required to appear there.
+      .filter((e) => e.isFile() && e.name.endsWith('.py') && !e.name.startsWith('test_'))
       .map((e) => e.name)
   )
   assert.ok(pyFiles.size >= 2, `sanity: expected at least the two known hook scripts under hooks/, found ${pyFiles.size}`)
