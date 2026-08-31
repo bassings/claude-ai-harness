@@ -162,6 +162,16 @@ async function writeLedger(payload) {
           // sanitised -- optional, so an agent not carrying this field
           // (an older writer) is unaffected.
           invalid_ac_ids_dropped: { type: ['integer', 'null'] },
+          // Fix round 2 (specs/record-fixed-findings.md AC-1): the REAL ids
+          // ledger-append.mjs computed for this round's open_findings, in
+          // the same order they were supplied -- carried through so a
+          // caller (review-cycle.js) can hand them back to ITS OWN caller
+          // for use as a later round's prior_findings, instead of a
+          // conductor re-typing prose that hashes differently. Byte-
+          // identical across all three workflow files (the L5 pin):
+          // tdd-task.js/plan-cycle.js never send open_findings, so this
+          // field is simply absent from their own responses.
+          open_finding_ids: { type: ['array', 'null'], items: { type: ['string', 'null'] } },
         },
       },
     })
@@ -181,7 +191,7 @@ async function writeLedger(payload) {
   if (typeof response.invalid_ac_ids_dropped === 'number' && response.invalid_ac_ids_dropped > 0) {
     log(`Run ${response.run_id}: invalid_ac_ids_dropped=${response.invalid_ac_ids_dropped} (a lens supplied a non-conforming ac_id; sanitised, not lost -- see ac_id_raw in the ledger line)`)
   }
-  return { write_ok: true, write_error: null, run_id: response.run_id }
+  return { write_ok: true, write_error: null, run_id: response.run_id, open_finding_ids: Array.isArray(response.open_finding_ids) ? response.open_finding_ids : null }
 }
 
 // Review round-2 L-2: the exception guard below previously logged a thrown

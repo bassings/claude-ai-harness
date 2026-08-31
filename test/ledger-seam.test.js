@@ -105,6 +105,178 @@ test('seam: review_cycle terminal payload, captured from a real run with a non-e
   assert.equal(entry.spec_bug_count, 1)
 })
 
+// specs/record-fixed-findings.md AC-2: a full run with args.prior_findings
+// set, whose synthesis confirms one of them resolved -- the real terminal
+// payload this workflow builds is piped into the real ledger-append.mjs, and
+// the resulting line must carry a 'fixed' disposition entry for it.
+test('seam: review_cycle with prior_findings supplied, whose synthesis confirms one resolved, is written to the ledger with disposition fixed (AC-2)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
+  const PRIOR = [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1' }]
+  const { calls } = await runWorkflow(WF, {
+    args: { prior_findings: PRIOR },
+    agent: {
+      'scope:diff': {
+        base: 'main',
+        head_sha: 'abcdef1234567890',
+        files: [{ path: 'src/foo.js', status: 'M' }],
+        new_dependency_entries: false,
+        new_modules: false,
+        custom_rules: null,
+        harness_triggers_file_exists: false,
+        consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
+      },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      synthesis: {
+        report: '### VERDICT\nCLEAN',
+        spec_bugs: [],
+        rejected_findings: [],
+        fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+      },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  const payload = terminalPayload(calls)
+  assert.deepEqual(payload.prior_findings, PRIOR, 'the caller\'s prior_findings must ride through to the ledger payload unchanged')
+  const entry = pipeAndAssertWritten(payload, 'review_cycle with prior_findings')
+  const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
+  assert.equal(fixed.length, 1, 'the confirmed finding must reach the ledger line as disposition fixed')
+  assert.equal(fixed[0].lens, 'lens-security')
+  assert.equal(fixed[0].ac_id, 'AC-SEC-1')
+  assert.equal(entry.invalid_fixed_ids_dropped, 0)
+})
+
+// specs/record-fixed-findings.md AC-3: the id guard survives the FULL
+// round-trip through the real workflow AND the real ledger-append.mjs, not
+// just a hand-built payload -- a synthesis that fabricates a fixed_findings
+// entry with no matching prior_findings entry must not be recorded fixed.
+test('seam: review_cycle with prior_findings supplied, whose synthesis fabricates an unmatched fixed_findings entry, drops it rather than recording it fixed (AC-3, full round trip)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
+  const PRIOR = [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }]
+  const { calls } = await runWorkflow(WF, {
+    args: { prior_findings: PRIOR },
+    agent: {
+      'scope:diff': {
+        base: 'main',
+        head_sha: 'abcdef1234567890',
+        files: [{ path: 'src/foo.js', status: 'M' }],
+        new_dependency_entries: false,
+        new_modules: false,
+        custom_rules: null,
+        harness_triggers_file_exists: false,
+        consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
+      },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      synthesis: {
+        report: '### VERDICT\nCLEAN',
+        spec_bugs: [],
+        rejected_findings: [],
+        // Never in PRIOR: a fabricated confirmation.
+        fixed_findings: [{ lens: 'lens-security', location: 'nowhere.js:1', claim: 'never reported open' }],
+      },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  const payload = terminalPayload(calls)
+  const entry = pipeAndAssertWritten(payload, 'review_cycle with a fabricated fixed_findings entry')
+  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a fabricated confirmation must never be recorded fixed')
+  assert.equal(entry.invalid_fixed_ids_dropped, 1, 'the drop must be counted')
+})
+
+// specs/record-fixed-findings.md, fix round 2, AC-1: the whole point of the
+// feature, proven end to end -- a finding raised open in round one and
+// confirmed fixed in round two must carry the SAME id across BOTH REAL
+// ledger lines, so a reader can join them. Not a unit test of findingId:
+// this drives the actual `ledger:write` agent step through the REAL
+// ledger-append.mjs (never a hand-built payload), against ONE real temp
+// repo shared by both rounds, exactly the way a real run and a real
+// conductor tick would -- round one's review-cycle.js run, round two's
+// review-cycle.js run fed round one's own returned open_findings as its
+// prior_findings argument, and the two written lines read back off disk.
+function makeRealLedgerWriteFn(repo) {
+  return (prompt) => {
+    const payload = extractLedgerPayload(prompt)
+    const res = runAppend(repo, payload)
+    assert.equal(res.status, 0, `real ledger-append.mjs exited non-zero: ${res.stderr}`)
+    return JSON.parse(res.stdout.trim().split('\n').pop())
+  }
+}
+
+const SCOPE_AGENT_FIXTURE = {
+  base: 'main',
+  head_sha: 'abcdef1234567890',
+  files: [{ path: 'src/foo.js', status: 'M' }],
+  new_dependency_entries: false,
+  new_modules: false,
+  custom_rules: null,
+  harness_triggers_file_exists: false,
+  consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
+}
+
+test('seam: a finding raised open in round one and confirmed fixed in round two carries the SAME id across BOTH real ledger lines (specs/record-fixed-findings.md fix round 2, AC-1) -- proven by joining two real written lines, not by hashing in isolation', async () => {
+  const repo = makeTempRepo()
+  const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
+
+  // Round one: no prior_findings supplied (round one never has any). One
+  // lens reports one finding. The 'ledger:write' step is the REAL
+  // ledger-append.mjs, run against `repo` -- so this round's own returned
+  // open_findings (with the REAL id ledger-append.mjs computed) is exactly
+  // what review-cycle.js's own production code would hand a conductor.
+  const round1 = await runWorkflow(WF, {
+    args: {},
+    agent: {
+      'scope:diff': SCOPE_AGENT_FIXTURE,
+      'lens-security': {
+        verdict: 'FINDINGS',
+        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+        findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-1' }],
+      },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: [] },
+      'ledger:write': makeRealLedgerWriteFn(repo),
+    },
+  })
+  assert.ok(Array.isArray(round1.result.open_findings) && round1.result.open_findings.length === 1, `round one must return exactly one open finding with an id, got: ${JSON.stringify(round1.result.open_findings)}`)
+  assert.ok(typeof round1.result.open_findings[0].id === 'string' && round1.result.open_findings[0].id.length > 0, 'the returned open finding must carry a real id')
+
+  const linesAfterRound1 = readLedgerLines(repo)
+  const round1Entry = JSON.parse(linesAfterRound1[linesAfterRound1.length - 1])
+  const openEntry = round1Entry.findings.find((f) => f.disposition === 'open')
+  assert.ok(openEntry, 'round one\'s real ledger line must carry the open finding')
+  assert.equal(openEntry.id, round1.result.open_findings[0].id, 'the id review-cycle.js returned must be the SAME id the real ledger line was written with')
+
+  // Round two: the conductor passes round one's OWN returned open_findings,
+  // untouched, as this round's prior_findings -- never re-typed prose.
+  // The lens no longer reports the finding (it is fixed); synthesis
+  // confirms it by echoing the SAME lens/location/claim it was given.
+  const round2 = await runWorkflow(WF, {
+    args: { prior_findings: round1.result.open_findings },
+    agent: {
+      'scope:diff': SCOPE_AGENT_FIXTURE,
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      synthesis: {
+        report: '### VERDICT\nCLEAN',
+        spec_bugs: [],
+        rejected_findings: [],
+        fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+      },
+      'ledger:write': makeRealLedgerWriteFn(repo),
+    },
+  })
+
+  const linesAfterRound2 = readLedgerLines(repo)
+  const round2Entry = JSON.parse(linesAfterRound2[linesAfterRound2.length - 1])
+  const fixedEntry = round2Entry.findings.find((f) => f.disposition === 'fixed')
+  assert.ok(fixedEntry, 'round two\'s real ledger line must carry the fixed finding')
+  assert.equal(round2Entry.invalid_prior_ids_dropped, 0, 'round one\'s own returned id must be recognised as authentic, not rejected')
+  assert.equal(round2Entry.invalid_fixed_ids_dropped, 0)
+
+  // The actual join: the SAME id, read from two SEPARATE real ledger lines.
+  assert.equal(fixedEntry.id, openEntry.id, 'AC-1: a finding raised open in round one and confirmed fixed in round two must carry the SAME id across both real ledger lines')
+})
+
 test('seam: plan_cycle terminal payload, captured from a real run with a non-empty lenses_run, is accepted by ledger-append.mjs (C1 regression test)', async () => {
   const WF = path.join(__dirname, '..', 'workflows', 'plan-cycle.js')
   const LENS_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, acceptance_criteria: [{ id: 'AC-SEC-1', statement: 'x' }] }
