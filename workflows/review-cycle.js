@@ -669,7 +669,41 @@ if (scope) {
   if (reviewEval.override_used) installOverrideNotice = reviewEval.message
 }
 
-if (!scope || !scope.files.length) return { report: 'No changes found between the base ref and HEAD. Nothing to review.', __outcome: 'no-op' }
+// AC-1 (the no-op that read as success): a scope step that returned
+// NOTHING failed entirely -- there is no base ref, no head sha and no file
+// list, so this is a broken run, not an empty diff, and must never share
+// an exit with the genuinely-empty case below. This follows the shape of
+// the install-consistency refusal immediately above it in this file
+// (throw, with a clear reason and a next step): the run then goes through
+// the SAME exception path every other broken-run case in this file already
+// uses, so it lands as one terminal ledger write with outcome aborted, and
+// the original error still reaches the caller instead of looking like a
+// completed review that found nothing.
+if (!scope) {
+  throw new Error(
+    'ScopeStepFailed: the scope agent returned no result, so the base ref, head sha and changed-file list are ' +
+    'all unknown. This is a broken run, not an empty diff, and must not be reported as "no changes found" -- ' +
+    'that would read as a completed review with nothing to flag. Re-run the review cycle.'
+  )
+}
+
+// AC-2: a genuinely empty diff is the other, legitimate case -- the scope
+// step succeeded and correctly found nothing to review. __outcome keeps
+// the pre-existing 'no-op' value, which the run ledger's OUTCOMES enum
+// (workflows/lib/ledger-append.mjs) already keeps distinct from 'done', so
+// a ledger reader cannot count this as a clean pass. The report text says
+// plainly that no review happened, not that one ran and found nothing
+// wrong, and is logged too so it is not only visible to a reader who opens
+// the returned report.
+if (!scope.files.length) {
+  log('No review performed: the diff between the base ref and HEAD is empty. Reporting outcome no-op, not a clean pass.')
+  return {
+    report: 'NO REVIEW WAS PERFORMED -- the diff between the base ref and HEAD is empty (no changed files). ' +
+      'This is not a clean review outcome: no lens ran and nothing was checked. If a change was expected, ' +
+      'check the base ref and the branch.',
+    __outcome: 'no-op',
+  }
+}
 
 headSha = scope.head_sha
 

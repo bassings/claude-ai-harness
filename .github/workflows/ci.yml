@@ -94,6 +94,26 @@ jobs:
           git init -q "${{ runner.temp }}/decoy"
           GIT_DIR="${{ runner.temp }}/decoy/.git" node --test test/*.test.js
 
+      # Round-1 review finding 7: the previous comment here claimed
+      # unittest's discover always fails loudly (exit 5, "NO TESTS RAN") on
+      # an empty match, but that is version-dependent -- true from Python
+      # 3.12 on, but discover exits 0 on "Ran 0 tests" before it, and this
+      # job pins no interpreter, so it rides whatever ubuntu-latest ships.
+      # Rather than pin one Python version and still be trusting an
+      # implicit, version-sensitive guarantee, this asserts the discovered
+      # count directly, the same shape as the Node glob guard above and for
+      # the same reason: an empty suite must fail the job, not go green.
+      - name: Assert the Python discover pattern matches
+        run: |
+          count=$(python3 -c "import unittest; print(unittest.TestLoader().discover('hooks', pattern='test_*.py').countTestCases())")
+          echo "matched ${count} python test(s)"
+          [ "${count:-0}" -ge 10 ]
+
+      # hooks/*.py has its own unittest suite, standard library only, no
+      # install step needed.
+      - name: Test the Python hooks
+        run: python3 -m unittest discover -s hooks -p 'test_*.py'
+
   secrets:
     # This repo is public and has already had a credential's fingerprint
     # reach its history, requiring a filter-branch rewrite. Standard 3 asks

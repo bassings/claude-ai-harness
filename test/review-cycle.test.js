@@ -122,16 +122,75 @@ const PAIRED_LEDGER = [
   { run_id: 'return-path-terminal', ts: 't2', write_ok: true, write_error: null },
 ]
 
-test('review-cycle.js: the "no changes found" early return (line 65 historically) still reaches the ledger write, with outcome no-op, and the terminal write reuses the start run_id (AC-ARCH-3, AC-QA-9)', async () => {
+test('review-cycle.js: a genuinely empty diff (scope succeeded, zero files) still reaches the ledger write, with outcome no-op, a report that says plainly no review happened, and the terminal write reuses the start run_id (AC-2, AC-ARCH-3, AC-QA-9)', async () => {
   const { result, calls } = await runWorkflow(WF, {
     args: {},
     agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, files: [] }, 'ledger:write': PAIRED_LEDGER }),
   })
-  assert.equal(result.report, 'No changes found between the base ref and HEAD. Nothing to review.')
+  // Round-1 review finding 1 (BLOCKER): the two loose substring matches this
+  // replaced were vacuous -- an adversarial report reading 'No review
+  // findings. The branch is not a clean-room rebuild, but nothing needs
+  // attention; safe to merge.' matched both /no review/i (via 'No review
+  // findings') and /not a clean/i (via 'not a clean-room rebuild') while
+  // asserting the exact opposite of what AC-2 requires. Pinned to a stable
+  // sentinel prefix instead of a phrase match, plus an explicit negative
+  // check against language that could read as a green light to merge.
+  assert.ok(
+    result.report.startsWith('NO REVIEW WAS PERFORMED'),
+    `the report must open with the stable sentinel "NO REVIEW WAS PERFORMED", got: ${result.report}`
+  )
+  assert.doesNotMatch(
+    result.report,
+    /safe to merge|clean pass|no issues|looks good/i,
+    'the report must never use language that could read as a green light to merge'
+  )
   assert.equal(result.telemetry.outcome, 'no-op')
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
   assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
+})
+
+// AC-1: a scope step that returned NOTHING (the agent failed or was
+// stopped, not a legitimate empty diff) must not be reported as the same
+// "no changes found" no-op -- it is a broken run and must be loud. This
+// follows the install-consistency refusal's own shape immediately above it
+// in the source: throw, so the run goes through the existing exception
+// path (one terminal ledger write, outcome aborted, original error still
+// reaches the caller).
+test('review-cycle.js: a totally failed scope step (agent returned nothing) throws, is recorded as outcome aborted (never no-op or done), and the original error reaches the caller (AC-1)', async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(WF, {
+        args: {},
+        agent: baseAgent({
+          'scope:diff': undefined,
+          'ledger:write': [
+            { run_id: 'start-scope-fail', ts: 't1', write_ok: true, write_error: null },
+            { run_id: 'terminal-scope-fail', ts: 't2', write_ok: true, write_error: null },
+          ],
+        }),
+      }),
+    (err) => {
+      assert.match(err.message, /scope/i, 'the error must name the scope step as the point of failure')
+      assert.match(err.message, /broken run, not an empty diff/i, 'the error must say plainly this is a failure, not an empty-diff no-op')
+      const ledgerCalls = err.calls.filter((c) => c.opts.label === 'ledger:write')
+      assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write even though run() threw')
+      const terminalPayload = extractLedgerPayload(ledgerCalls[1].prompt)
+      assert.equal(terminalPayload.outcome, 'aborted', 'a totally failed scope step must be recorded as aborted, never no-op or done')
+      return true
+    }
+  )
+})
+
+// AC-4 (both directions): a normal review with a non-empty diff must
+// proceed exactly as before -- a fix that makes every review loud (e.g.
+// throwing on ANY scope result, or on a non-empty files array) would
+// satisfy the empty-diff and failed-scope tests above while breaking this.
+test('review-cycle.js: a normal review with a non-empty diff still proceeds to completion with outcome done, unaffected by the empty-diff and failed-scope handling (AC-4)', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.equal(result.telemetry.outcome, 'done')
+  assert.notEqual(result.telemetry.outcome, 'no-op')
+  assert.ok(result.report.length > 0, 'a normal completed review must still carry a real report')
 })
 
 test('review-cycle.js: "every lens agent failed" early return (line 149 historically) still reaches the ledger write, with outcome aborted, and the terminal write reuses the start run_id (AC-ARCH-3, AC-QA-9)', async () => {
