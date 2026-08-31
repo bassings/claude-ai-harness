@@ -39,7 +39,26 @@ const LEDGER_REL = '.claude/harness-ledger.jsonl'
 
 // One parent temp root per process, isolating this suite's temp repos from
 // the shared TMPDIR namespace entirely.
-const SUITE_TMPDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ledger-append-suite-'))
+//
+// realpathSync'd immediately: on macOS, os.tmpdir() returns a path through
+// a symlinked ancestor (/var/folders/... -> /private/var/folders/...), but
+// a spawned child process's own process.cwd() always reports the resolved
+// (real) form, because Node changes directory via the cwd option before
+// exec and the child's getcwd() call, run without a shell's own PWD
+// preserving the unresolved spelling, returns the canonical path. A
+// fixture built from the unresolved form (e.g. an absolute spec string
+// concatenated from this constant) then never lexically matches the root
+// the writer under test resolves for the SAME directory, so an in-repo
+// case reads as out-of-repo and gets redacted -- not a defect in the
+// writer, which is documented to resolve roots this same way, but a
+// fixture that stopped matching the environment it meant to build. Fixing
+// it once, here, keeps every fixture built from SUITE_TMPDIR genuinely
+// "plain" (as hostile-repo.js's own comment already assumes), rather than
+// requiring every call site to remember to resolve it itself. A helper
+// that deliberately wants an UNRESOLVED symlinked ancestor (the hostile
+// fixtures) builds that layer itself, on top of this already-resolved
+// root, so this does not weaken those cases.
+const SUITE_TMPDIR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ledger-append-suite-')))
 if (!fs.existsSync(SUITE_TMPDIR)) {
   throw new Error(`temp-repo.js: the suite temp root vanished immediately after mkdtempSync (${SUITE_TMPDIR}) -- something outside this process is sweeping it`)
 }
