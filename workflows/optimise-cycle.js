@@ -903,6 +903,25 @@ function buildReport(d) {
   // different counter. A silent neutralisation is how the H1 regression
   // stayed invisible in the first place.
   lines.push(`invalid_record_values_dropped (sanitised, non-conforming values elsewhere -- verdicts/ac_verdicts.verdict/lenses_run entries): ${fmtCountOrUnavailable(d.rework && d.rework.invalidRecordValuesDropped)}.`)
+  // Fix round 1, finding 5: invalid_fixed_ids_dropped and
+  // duplicate_fixed_ids_dropped (specs/record-fixed-findings.md) were
+  // written to every review_cycle line and summed by aggregateRework, but
+  // reached no report a human reads -- the exact same shape the two lines
+  // above already close, one field over. invalid_fixed_ids_dropped is a
+  // fabricated or contradictory confirmation (an id never open, or still
+  // open the same round); duplicate_fixed_ids_dropped is a genuinely
+  // matching confirmation repeated within one line. duplicateFixedAcrossRounds
+  // is the read-side twin: the SAME finding id confirmed fixed again in a
+  // LATER round (SKILL.md's own prose ambiguity, fix round 1 finding 2) --
+  // the writer cannot see this, only this aggregation can.
+  lines.push(`invalid_fixed_ids_dropped (a fixed_findings confirmation that did not match a genuinely open prior finding): ${fmtCountOrUnavailable(d.rework && d.rework.invalidFixedIdsDropped)}.`)
+  lines.push(`duplicate_fixed_ids_dropped (the same confirmed finding listed more than once in one round): ${fmtCountOrUnavailable(d.rework && d.rework.duplicateFixedIdsDropped)}.`)
+  lines.push(`duplicate fixed confirmations across rounds (the same finding id recorded fixed again in a later round): ${fmtCountOrUnavailable(d.rework && d.rework.duplicateFixedAcrossRounds)}.`)
+  // Fix round 2, AC-3 (specs/record-fixed-findings.md): invalid_prior_ids_dropped
+  // gets the same rendering treatment -- the new trust boundary this round
+  // created (a supplied prior-finding id that does not match its own
+  // recomputed content is caught here) is worth nothing if nobody sees it.
+  lines.push(`invalid_prior_ids_dropped (a supplied prior_findings id that did not match its own recomputed content -- mistyped, stale or fabricated): ${fmtCountOrUnavailable(d.rework && d.rework.invalidPriorIdsDropped)}.`)
   // Review round-1 H2: the two orphan classes AC-OPS-2 exists to separate
   // -- a start-only orphan and a terminal-only orphan (the START write
   // itself failed) -- were computed by optimise-read.mjs and reached no

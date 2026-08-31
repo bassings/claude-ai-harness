@@ -5,6 +5,16 @@
 .claude/harness-ledger.jsonl
 .claude/optimise-cycle-report.md
 
+# Fix round 3, finding 1 (specs/record-fixed-findings.md): conduct-plan's
+# cross-round prior_findings state. Carries every open finding's location
+# and claim VERBATIM -- exactly the free text the ledger schema itself is
+# designed to keep out (AC-SEC-2, "no free text, ever"), and exactly the
+# class of content (a quoted source line, a hardcoded secret a lens
+# happened to flag) that must never reach a commit on a public repository.
+# Route B's join (specs/record-fixed-findings.md) requires this data to
+# survive between ticks; it must never survive inside a TRACKED file.
+.claude/conductor-prior-findings.json
+
 # Python bytecode cache. test/destructive-git-guard.test.js's M3 allowlist
 # parity check imports hooks/destructive-git-guard.py as a module (to read
 # its GIT_ENV_ALLOWLIST constant as real data, not scraped source text),

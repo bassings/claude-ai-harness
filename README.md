@@ -653,6 +653,55 @@ true or false. A record is still refused outright when a STRUCTURAL error
 remains: a required TOP-LEVEL field absent, an unknown top-level key, or the
 entry (or an array element) not being an object at all.
 
+**The `fixed` disposition**: `review-cycle`'s optional `prior_findings`
+argument (`conduct-plan` supplies it on round two of review for the same
+task, and every round after) carries the findings that round's conductor
+reported open going into it. The synthesis step is asked which of those it
+can confirm resolved in the built change, and a confirmed one is written
+with disposition `fixed`. This is a lens CONFIRMING a previously reported
+finding is resolved, never proof of repair.
+
+What the guard actually proves, and what it does not (fix round 1, finding
+3: an earlier version of this section claimed it "cannot be rubber-
+stamped" -- it can, see below, and that was wrong to claim). A
+`fixed_findings` entry is only recorded when its `findingId` hash (the same
+hash `spec_bug`/`rejected`/`open` findings already use) matches one already
+present among `prior_findings`' own hashes: **a confirmation must
+reference one of the findings supplied in the same request**, it cannot
+invent an id that was never in that list. A finding reworded between
+rounds hashes differently and will not match, so it stays uncounted rather
+than being wrongly cleared. That guard alone does **not** stop a synthesis
+that echoes the entire supplied `prior_findings` list back as confirmed --
+every one of those references is genuinely "in the list", so nothing is
+dropped, and that is the literal shape of a rubber stamp. The guard closes
+fabrication (an id that was never open), not blanket, unverified
+confirmation of everything that was.
+
+Two further guards keep the count itself honest, distinct from whether any
+one confirmation is trustworthy:
+
+- **Duplicates within one round** (fix round 1, finding 1): the same
+  confirmed finding listed more than once in one `fixed_findings` array
+  (once per affected lens section, or simply repeated) is recorded ONCE,
+  with the repeats counted under `duplicate_fixed_ids_dropped`, never
+  multiplying the count.
+- **Duplicates across rounds** (fix round 1, finding 2): the ledger has no
+  memory between lines, so a conductor that re-supplies an already-
+  confirmed finding as `prior_findings` on a LATER round would otherwise
+  record it fixed again. The writer cannot see this; `optimise-read.mjs`'s
+  `aggregateRework` deduplicates by finding id, scoped per repo, across the
+  whole analysis window, and reports the skip count as
+  `duplicateFixedAcrossRounds`.
+
+A finding a lens is still reporting open THIS round is never also recorded
+fixed on the same line, even if a confirmation names it (fix round 1,
+finding 8) -- reconciled to `invalid_fixed_ids_dropped`, the same field a
+fabricated (never-open) claim is counted under, since both are a claim the
+writer refuses to honour. Both `invalid_fixed_ids_dropped` and
+`duplicate_fixed_ids_dropped` share `invalid_ac_ids_dropped`'s null-vs-zero
+convention, and the record is still written when either fires -- the
+offending value is dropped, the drop is counted, never the whole line.
+
 **`HARNESS_LEDGER_READONLY`**: a lens that needs to run or probe
 `ledger-append.mjs` itself (a mutation experiment during planning or review)
 is instructed to set this on the SAME command line as the writer invocation --
@@ -708,6 +757,41 @@ standing exposure, while a `git clean`-lost ledger is user-initiated,
 telemetry-only, and fully preventable by the exclusion above. This is a
 deliberate, accepted trade-off, not an oversight: AC-DATA-4's git-clean-
 survival clause is an accepted FAIL for this path.
+
+**The same discipline applies to `.claude/conductor-prior-findings.json`**
+(specs/record-fixed-findings.md): `conduct-plan`'s cross-round state for the
+`fixed`-disposition feature above, carrying every open finding's `location`
+and `claim` VERBATIM -- the same class of free text (AC-SEC-2) the ledger
+schema itself is designed to keep out. This file is written by prose
+(`skills/conduct-plan/SKILL.md`), never by `ledger-append.mjs` or any other
+real-Node script.
+
+Fix round 3 protected it by listing it in THIS repo's own tracked
+`.gitignore`. That line lives only in `claude-ai-harness`'s own git history
+and is never installed anywhere else -- the harness install carries
+`AGENT-HARNESS.md`, `agents/`, `workflows/`, `hooks/` and `skills/` into a
+delivery repo, never `.gitignore` -- so a `conduct-plan` conductor running in
+an operator's real delivery repo found this path genuinely untracked but NOT
+ignored: one ordinary `git add -A` away from being committed. Fix round 4
+replaces this with the same per-repo mechanism the run ledger's own
+`ensureGitignored()` and the optimiser's own report already use:
+`workflows/lib/optimise-report-ignore.mjs`'s `ensureIgnored(root,
+relativePath)`, invoked by SKILL.md's own prose (not code -- there is still
+no `ensureGitignored()` call site for this file) before every write. It
+writes to the CURRENT repo's `.git/info/exclude`, never a tracked
+`.gitignore`, and verifies with a real `git check-ignore`; SKILL.md instructs
+refusing the write outright when that check does not report success. This
+repo's own tracked `.gitignore` entry is left in place as a second,
+redundant layer here, but the operative protection for a delivery repo is
+the per-repo mechanism, proven in a throwaway repo (not `claude-ai-harness`)
+by `test/conduct-plan-prior-findings-protection.test.js`.
+
+**Retention**: entries are keyed `<plan file>:<task id>` and accumulate for
+every task, of every plan, the repo ever conducts -- there is no automatic
+expiry while a plan is in flight. SKILL.md's Done step prunes this plan's own
+keys (the `<plan file>:` prefix) when the plan finishes, leaving any other
+plan's entries untouched; before this fix (fix round 4, finding 3), nothing
+ever deleted this data and it survived indefinitely.
 
 **Known limitations**: an absolute `spec` path reached through a
 **symlinked ANCESTOR directory** (e.g. a checkout cloned at, or accessed

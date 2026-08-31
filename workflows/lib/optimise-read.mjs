@@ -301,9 +301,40 @@ export function aggregateRework(records, { root = '' } = {}) {
   // values (verdicts.<lens>, lenses_run[] entries, ...) were neutralised
   // in the window, not just infer it from the ac_id-specific counter.
   let invalidRecordValuesDropped = 0
+  // Fix round 1, finding 5: invalid_fixed_ids_dropped
+  // (specs/record-fixed-findings.md AC-3's id-guard drop count) was written
+  // to every review_cycle line and summed by nothing, exactly the
+  // "written to every line and read by nothing" defect class the comment
+  // above already names for invalid_record_values_dropped -- summed the
+  // same way, here.
+  let invalidFixedIdsDropped = 0
+  // Fix round 1, finding 1 (read-side half): duplicate_fixed_ids_dropped
+  // (the writer's own within-line dedup count) gets the same treatment,
+  // so it does not become the NEXT field this exact defect class recurs
+  // on.
+  let duplicateFixedIdsDropped = 0
+  // Fix round 1, finding 2: the ledger has no memory across lines -- each
+  // review_cycle write is independent, and a conductor that re-supplies an
+  // already-confirmed finding as prior_findings on a LATER round (a real
+  // risk in SKILL.md's own prose instruction, not eliminable by wording
+  // alone) produces a SECOND line recording the SAME finding id 'fixed'
+  // again. The writer structurally cannot see this: it only ever sees one
+  // line at a time. Deduplicated HERE instead, across the whole window,
+  // scoped per repo (not globally) so the same id in two unrelated repos
+  // is not treated as one giant coincidence.
+  const seenFixedIds = new Set()
+  let duplicateFixedAcrossRounds = 0
+  // Fix round 2, AC-3 (specs/record-fixed-findings.md): invalid_prior_ids_dropped
+  // (the writer's own supplied-id-doesn't-match-its-content counter) gets
+  // the same treatment as its siblings above, so it does not become the
+  // NEXT "written to every line and read by nothing" field.
+  let invalidPriorIdsDropped = 0
   for (const r of reviewRecords) {
     if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
     if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
+    if (typeof r.invalid_fixed_ids_dropped === 'number') invalidFixedIdsDropped += r.invalid_fixed_ids_dropped
+    if (typeof r.duplicate_fixed_ids_dropped === 'number') duplicateFixedIdsDropped += r.duplicate_fixed_ids_dropped
+    if (typeof r.invalid_prior_ids_dropped === 'number') invalidPriorIdsDropped += r.invalid_prior_ids_dropped
     for (const f of r.findings || []) {
       // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
       // not shape-based -- see this file's own header comment): a `lens`
@@ -315,7 +346,21 @@ export function aggregateRework(records, { root = '' } = {}) {
       // for ac_id, one field over. `typeof f.lens === 'string'` short-
       // circuits before the regex so `null`/`undefined`/a non-string never
       // reach it.
-      if (typeof f.lens === 'string' && LENS_RE.test(f.lens)) bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
+      if (typeof f.lens === 'string' && LENS_RE.test(f.lens)) {
+        // Fix round 1, finding 2: a 'fixed' disposition finding whose id
+        // (repo-scoped) has already been counted once in this window is a
+        // cross-round repeat, not a new fix -- skip the bump, but count the
+        // skip so it stays visible rather than silently vanishing.
+        if (f.disposition === 'fixed' && typeof f.id === 'string' && f.id) {
+          const dedupeKey = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(f.id)}`
+          if (seenFixedIds.has(dedupeKey)) {
+            duplicateFixedAcrossRounds += 1
+            continue
+          }
+          seenFixedIds.add(dedupeKey)
+        }
+        bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
+      }
     }
     const verdicts = r.ac_verdicts || []
     if (!verdicts.length) continue
@@ -396,7 +441,7 @@ export function aggregateRework(records, { root = '' } = {}) {
       else entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, unattributedFailBuckets }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -1188,7 +1233,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },

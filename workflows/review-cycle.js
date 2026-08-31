@@ -1,7 +1,7 @@
 export const meta = {
   name: 'review-cycle',
   description: 'Multi-lens review of the branch diff per AGENT-HARNESS.md: single-focus lenses in parallel, one synthesised report',
-  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one)}',
+  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one), prior_findings?: array (round two onward: findings reported open going into this round, as {id, lens, location, claim, severity?, ac_id?} -- id is REQUIRED and must be the exact value THIS workflow returned as open_findings[].id in an earlier round (verified by recomputing the hash from lens/location/claim; a mismatched or missing id is dropped, counted, and produces no fixed entry) -- a synthesis confirmation matching one gets recorded disposition "fixed" in the ledger, guarded so an unmatched claim is dropped, never recorded; absent, behaviour is unchanged)}',
   phases: [
     { title: 'Scope', detail: 'diff the branch, classify the change surface' },
     { title: 'Lenses', detail: 'triggered lenses review in parallel, isolated worktrees' },
@@ -403,6 +403,23 @@ if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts
 opts = opts || {}
 
 const specPath = opts.spec || null
+// specs/record-fixed-findings.md (AC-1/AC-3): the caller's own findings,
+// reported open going into this round -- {id, lens, location, claim,
+// severity?, ac_id?}. Fix round 3, finding 3: `id` is REQUIRED, not
+// optional -- it must be the exact value THIS workflow returned as
+// open_findings[].id in an earlier round (see result.open_findings,
+// below). ledger-append.mjs recomputes findingId(lens, location, claim)
+// from each entry's own content and refuses one whose supplied id does
+// not match: a caller that builds this shape without a genuine, sourced
+// id gets every entry dropped (invalid_prior_ids_dropped), zero fixed
+// entries, and no error -- only two counters as the trace. Absent on
+// round one, and on every caller that predates this argument, in which
+// case every other line touched by this change stays exactly as it ran
+// before: no prior-findings block reaches the synthesis prompt, no
+// fixed_findings field is requested, and the terminal payload's own
+// prior_findings/fixed_findings both stay null (ledger-append.mjs then
+// records nothing 'fixed' and leaves invalid_fixed_ids_dropped absent).
+const priorFindings = Array.isArray(opts.prior_findings) ? opts.prior_findings : null
 
 // Ledger telemetry accumulators, populated inside run() as each value
 // becomes available, read after run() resolves. Never part of the
@@ -423,6 +440,13 @@ let specBugsRaw = null
 let rejectedFindingsRaw = null
 let specBugCount = null
 let rejectedFindingCount = null
+// specs/record-fixed-findings.md (AC-2): the synthesis's own claimed-
+// resolved echoes of some of priorFindings, same raw shape -- null when
+// priorFindings was never supplied, or the synthesis response carried no
+// such array. ledger-append.mjs is where these get checked against
+// priorFindings' own ids and turned into 'fixed' entries (the id guard,
+// AC-3): this file never computes a finding id itself.
+let fixedFindingsRaw = null
 // H5: every finding each lens actually reported, not just the two synthesis
 // dispositions (spec_bug/rejected) -- without this, an accepted finding
 // that gets fixed leaves no trace on any ledger line, so "which lenses
@@ -557,6 +581,16 @@ async function writeLedger(payload) {
           // sanitised -- optional, so an agent not carrying this field
           // (an older writer) is unaffected.
           invalid_ac_ids_dropped: { type: ['integer', 'null'] },
+          // Fix round 2 (specs/record-fixed-findings.md AC-1): the REAL ids
+          // ledger-append.mjs computed for this round's open_findings, in
+          // the same order they were supplied -- carried through so a
+          // caller (review-cycle.js) can hand them back to ITS OWN caller
+          // for use as a later round's prior_findings, instead of a
+          // conductor re-typing prose that hashes differently. Byte-
+          // identical across all three workflow files (the L5 pin):
+          // tdd-task.js/plan-cycle.js never send open_findings, so this
+          // field is simply absent from their own responses.
+          open_finding_ids: { type: ['array', 'null'], items: { type: ['string', 'null'] } },
         },
       },
     })
@@ -576,7 +610,7 @@ async function writeLedger(payload) {
   if (typeof response.invalid_ac_ids_dropped === 'number' && response.invalid_ac_ids_dropped > 0) {
     log(`Run ${response.run_id}: invalid_ac_ids_dropped=${response.invalid_ac_ids_dropped} (a lens supplied a non-conforming ac_id; sanitised, not lost -- see ac_id_raw in the ledger line)`)
   }
-  return { write_ok: true, write_error: null, run_id: response.run_id }
+  return { write_ok: true, write_error: null, run_id: response.run_id, open_finding_ids: Array.isArray(response.open_finding_ids) ? response.open_finding_ids : null }
 }
 
 // Review round-2 L-2: the exception guard below previously logged a thrown
@@ -1003,6 +1037,7 @@ const synthesis = await agent(
   `~/.claude/AGENT-HARNESS.md, the repo root, and any installed claude-ai-harness plugin directory). ` +
   `Below are the structured reports from each lens for the branch diff against ${base}.\n\n` +
   `LENS REPORTS (JSON):\n${JSON.stringify(lensReports, null, 1)}\n\n` +
+  (priorFindings ? `PRIOR-ROUND FINDINGS (JSON), reported open going into this round:\n${JSON.stringify(priorFindings, null, 1)}\n\n` : '') +
   (simpCheck ? `AC-SIMP MECHANICAL CHECK:\n${simpCheck}\n\n` : '') +
   `Produce the single synthesised review report, in markdown:\n` +
   `1. A verdict table: one row per lens with its verdict and its "could not check" statement.\n` +
@@ -1017,7 +1052,16 @@ const synthesis = await agent(
   `Do not soften findings and do not invent any. If a lens returned BLOCKED, say so prominently. ` +
   `Also return spec_bugs (findings with no AC behind them) and rejected_findings (findings investigated and shown to be ` +
   `false alarms) as structured arrays, each item carrying lens, location and claim, so capture is mechanical rather than ` +
-  `left in the prose. Also run \`git rev-parse HEAD\` in the repo NOW, at synthesis time, and return its exact output as ` +
+  `left in the prose. ` +
+  (priorFindings
+    ? `Also return fixed_findings: for each PRIOR-ROUND FINDING above that this built change genuinely resolves, echo its ` +
+      `lens, location and claim EXACTLY as given above -- copy them, do not paraphrase. Only ever echo an entry that ` +
+      `appears above: a fixed_findings entry that does not match one of the prior findings verbatim is dropped and ` +
+      `counted, never recorded as fixed. This records a lens CONFIRMING a previously reported finding is resolved in the ` +
+      `built change, not proof of repair -- when in doubt, leave it out of fixed_findings; a finding that stays open is ` +
+      `the safe direction, a false confirmation is not. `
+    : '') +
+  `Also run \`git rev-parse HEAD\` in the repo NOW, at synthesis time, and return its exact output as ` +
   `head_sha_at_synthesis. This is not the sha you were told about: several agent sessions share these checkouts, and if ` +
   `another one switches branches mid-run the review would silently be about a different tree than it reports on. Report ` +
   `what git says now, even if it differs from anything above. Return only the markdown report as "report".`,
@@ -1035,6 +1079,12 @@ const synthesis = await agent(
         head_sha_at_synthesis: { type: ['string', 'null'] },
         spec_bugs: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
         rejected_findings: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
+        // specs/record-fixed-findings.md (AC-2): optional, never required --
+        // a caller that never supplied prior_findings is unaffected, and an
+        // older synthesis response with no such field is read as null below,
+        // never as "confirmed nothing" (which would be indistinguishable
+        // from a genuine empty confirmation).
+        fixed_findings: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
       },
     },
   }
@@ -1053,6 +1103,11 @@ specBugsRaw = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_b
 rejectedFindingsRaw = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
 specBugCount = specBugsRaw ? specBugsRaw.length : null
 rejectedFindingCount = rejectedFindingsRaw ? rejectedFindingsRaw.length : null
+// specs/record-fixed-findings.md (AC-2): same null-vs-absent handling as
+// spec_bugs/rejected_findings above. The id guard itself (AC-3) runs in
+// ledger-append.mjs, against priorFindings' own ids -- this file only
+// carries both raw arrays through unmapped.
+fixedFindingsRaw = synthesis && Array.isArray(synthesis.fixed_findings) ? synthesis.fixed_findings : null
 
 // M1: outcome was computed purely from lens verdicts, so a run whose
 // synthesis agent failed or returned nothing usable (undefined, or a
@@ -1131,9 +1186,41 @@ const telemetry = {
 // spec_bugs/rejected_findings ride along as raw descriptors for
 // ledger-append.mjs to hash into finding ids; they are NOT part of the
 // workflow's own public telemetry (which only carries the counts above).
-const terminalEntry = { kind: 'review_cycle', spec_bugs: specBugsRaw, rejected_findings: rejectedFindingsRaw, open_findings: openFindingsRaw, ...telemetry }
+// prior_findings/fixed_findings are the same shape of rider, for the id
+// guard (AC-3): both null on a run that never used the prior_findings
+// argument, exactly like specBugsRaw/rejectedFindingsRaw stay null on a
+// malformed synthesis response.
+const terminalEntry = {
+  kind: 'review_cycle',
+  spec_bugs: specBugsRaw,
+  rejected_findings: rejectedFindingsRaw,
+  open_findings: openFindingsRaw,
+  prior_findings: priorFindings,
+  fixed_findings: fixedFindingsRaw,
+  ...telemetry,
+}
 if (startRunId) terminalEntry.run_id = startRunId
 const terminalWrite = await writeLedger(terminalEntry)
+// Fix round 2 (specs/record-fixed-findings.md AC-1): openFindingsRaw
+// carries this round's full {lens, location, claim, severity, ac_id}
+// descriptors (H5, above); terminalWrite.open_finding_ids carries the REAL
+// ids ledger-append.mjs computed for them, in the SAME order (index-
+// aligned, since ledger-append.mjs's computeFindings preserves order via
+// .map()). Zipped together here into review-cycle's own return value
+// (result.open_findings, assigned onto `result` the same way
+// checkout_moved/ledger_write_failed already are, below -- never inline in
+// the pinned `return { ...result, telemetry }` line, which stays byte-
+// identical across all three workflow files per AC-ARCH-9), so a caller
+// (the conductor) can pass this EXACT array, untouched, as next round's
+// prior_findings: the real id, never a re-typed one, is what lets a
+// finding raised open in one round carry the SAME id into a later round's
+// confirmation. null when the write did not return ids at all (an older
+// ledger-append.mjs, or the write failed before computing them) -- a
+// caller must not read an ABSENT id list as "zero open findings this
+// round".
+result.open_findings = Array.isArray(terminalWrite.open_finding_ids)
+  ? openFindingsRaw.map((f, i) => (f && terminalWrite.open_finding_ids[i] ? { ...f, id: terminalWrite.open_finding_ids[i] } : null)).filter(Boolean)
+  : null
 // 2026-08-18: give write_ok:false a CONSUMER -- see plan-cycle.js for the
 // full rationale. It was computed, logged and returned to nobody, so the
 // ledger stopped recording on 2026-08-12 and nothing noticed for six days.

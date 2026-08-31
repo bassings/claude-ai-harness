@@ -275,6 +275,112 @@ test('static: conduct-plan/SKILL.md instructs logging CI-wait, human-wait, PR-ra
   assert.ok(/idempotent|no-op|duplicate/i.test(skill), 'SKILL.md must state that a replayed event_key does not double-count')
 })
 
+// Fix round 1, finding 10: the prior_findings pass-through is the single
+// point where specs/record-fixed-findings.md's 'fixed' disposition feature
+// is either used or silently never used by a real conductor -- it lives in
+// prose a Claude agent reads, not in code a test can execute, and had NO
+// test at all naming it. This cannot prove any given conductor run obeys
+// the instruction (that is inherent to a prose instruction governing a
+// judgement call), but it does prove the instruction itself is not
+// silently deleted from the file by a future edit -- the one thing a
+// static test on prose CAN prove.
+test('static: conduct-plan/SKILL.md instructs passing prior_findings to review-cycle from round two onward, names the ledger disposition it produces, and states plainly what the resulting number does and does not mean (specs/record-fixed-findings.md, fix round 1 finding 10)', () => {
+  const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
+  assert.ok(skill.includes('prior_findings'), 'SKILL.md must mention prior_findings by name')
+  assert.ok(/round two/i.test(skill), 'SKILL.md must say when to start passing it')
+  // Fix round 3, finding 4: a bare skill.includes('fixed') is satisfied by ANY
+  // mention of the word anywhere in the file (e.g. main's own unrelated "a fixed
+  // out-of-repo marker"), so this assertion could never fail even if every real
+  // reference to the disposition were deleted. Anchored on the exact phrase the
+  // file actually uses to name it.
+  assert.ok(/disposition:\s*'fixed'/.test(skill), 'SKILL.md must name the disposition this produces, not merely contain the word "fixed" somewhere')
+  assert.ok(/undercount/i.test(skill), 'SKILL.md must state plainly that the resulting number can undercount')
+  assert.ok(/accumulate|only the findings/i.test(skill), 'SKILL.md must warn against re-supplying an already-confirmed finding on a later round')
+})
+
+// Fix round 2, AC-5 (specs/record-fixed-findings.md; renumbered from AC-7 in fix round 3 -- AC-7 collided with the original brief's own "suite green" AC-7, see the spec's Acceptance criteria intro): the prior_findings
+// instruction must be MECHANICAL steps, the same style as the ledger-write
+// instruction eight lines below it -- not prose describing intent. Checks
+// for the concrete markers a mechanical instruction has that prose does
+// not: numbered steps, an exact field name to read the result from
+// (open_findings, never the markdown report), and an explicit
+// verbatim/byte-for-byte instruction not to retype or recompute the id.
+test('static: conduct-plan/SKILL.md\'s prior_findings instruction is MECHANICAL (numbered steps, an exact field name, an explicit verbatim/byte-for-byte requirement), not prose describing intent (specs/record-fixed-findings.md, fix round 2, AC-5)', () => {
+  const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
+  assert.ok(skill.includes('open_findings'), 'SKILL.md must name the exact field to read the ids from')
+  assert.ok(/verbatim|byte-for-byte/i.test(skill), 'SKILL.md must instruct passing the value through unmodified')
+  // Fix round 3, finding 4: the `||` fallback reduced to "the file contains the
+  // word markdown somewhere", satisfied by an unrelated ```` ```markdown ````
+  // fence -- deleting the whole clause this assertion exists to pin left this
+  // test, and the suite, green. Dropped; the regex alone is the real check.
+  assert.ok(/never\s+the\s+markdown\s+`report`/i.test(skill), 'SKILL.md must distinguish the structured return value from the markdown report')
+  // Numbered steps: at least "1." and "2." appearing near the prior_findings instruction.
+  // Window widened fix round 4 (6000, was 2500): the fix round 4 ensure-ignored
+  // paragraph and its own lettered (a/b/c) sub-steps -- also mechanical, not
+  // prose -- now sit between the marker and the "1." numbered list.
+  const idx = skill.indexOf('Mechanical steps for `prior_findings`')
+  assert.ok(idx !== -1, 'SKILL.md must introduce the mechanical steps explicitly')
+  const nearby = skill.slice(idx, idx + 6000)
+  assert.ok(nearby.includes('1.') && nearby.includes('2.') && nearby.includes('3.'), 'the instruction must be numbered steps, not a paragraph')
+})
+
+// Fix round 3, finding 1 (HIGHEST, privacy regression): the conductor's
+// prior_findings state (lens location/claim VERBATIM, potentially a
+// secret or a quoted source line) must never reach a TRACKED file. Proven
+// two ways: the real .gitignore pattern genuinely matches via a real `git
+// check-ignore` (not merely present as text -- a malformed pattern would
+// pass a naive .includes() check and still fail to ignore anything), and
+// SKILL.md instructs writing to that exact untracked path, never to the
+// plan file's own (tracked) Conductor log.
+test('static: .claude/conductor-prior-findings.json (the conductor\'s prior_findings state, which carries lens location/claim verbatim) is genuinely gitignored, confirmed by a real git check-ignore, not merely listed as text (specs/record-fixed-findings.md, fix round 3, finding 1)', () => {
+  const gitignore = readAll('.gitignore')
+  assert.ok(gitignore.includes('.claude/conductor-prior-findings.json'), '.gitignore must list the file')
+  const res = spawnSync('git', ['check-ignore', '-q', '.claude/conductor-prior-findings.json'], { cwd: ROOT, env: sanitizedGitEnv() })
+  assert.equal(res.status, 0, 'git check-ignore must exit 0 -- the pattern must genuinely match, not just appear as text in the file')
+})
+
+// Fix round 4, finding 1: this repo's own .gitignore entry (the test just
+// above) is real, but it is a property of claude-ai-harness alone -- it
+// never installs into a delivery repo, so a conductor running anywhere
+// else previously found this path untracked but NOT ignored. SKILL.md must
+// no longer rest on that entry; it must instruct the same per-repo
+// ensure-ignored mechanism the run ledger and the optimiser's own report
+// already use (workflows/lib/optimise-report-ignore.mjs), and refuse to
+// write when that mechanism does not confirm the path is ignored. Presence
+// only: the behavioural proof that this mechanism actually works in a
+// throwaway repo that is NOT claude-ai-harness, and the mutation-resistant
+// checks for fix round 3's own two bypasses, live in
+// test/conduct-plan-prior-findings-protection.test.js (deliberately
+// separate -- this file never builds temp repos, see its own header).
+test('static: conduct-plan/SKILL.md no longer rests its privacy protection on this repo\'s own .gitignore -- it names the real per-repo ensure-ignored mechanism (optimise-report-ignore.mjs + a real git check-ignore) and instructs refusing to write when it fails (specs/record-fixed-findings.md, fix round 4, finding 1)', () => {
+  const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
+  assert.ok(skill.includes('.claude/conductor-prior-findings.json'), 'SKILL.md must name the untracked state file')
+  assert.ok(skill.includes('optimise-report-ignore.mjs'), 'SKILL.md must name the real ensure-ignored mechanism')
+  assert.ok(/check-ignore/.test(skill), 'SKILL.md must mention verifying with a real git check-ignore')
+  assert.ok(/do not write|refus/i.test(skill), 'SKILL.md must instruct refusing to write when the path is not confirmed ignored')
+  assert.ok(/never install|does not install|not.*install.*gitignore|\.gitignore.*never/i.test(skill), 'SKILL.md must state plainly that the harness install does not carry .gitignore into a delivery repo')
+})
+
+// Fix round 3, finding 3 (specs/record-fixed-findings.md): review-cycle.js's
+// own whenToUse (the sentence a model reads when deciding how to call this
+// workflow) and its prior_findings code comment must document `id` as a
+// REQUIRED field on each prior_findings entry -- they drifted to the
+// pre-AC-3 shape ({lens, location, claim, severity?, ac_id?}, no id) after
+// AC-3 made id mandatory, so a caller built exactly to the documented
+// contract silently produced zero fixed entries with no error, only two
+// counters as the trace.
+test('static: review-cycle.js\'s whenToUse documents id as a REQUIRED field on prior_findings entries, not the pre-AC-3 optional shape (specs/record-fixed-findings.md, fix round 3, finding 3)', () => {
+  const src = readAll('workflows', 'review-cycle.js')
+  const whenToUseMatch = src.match(/whenToUse:\s*'([^']*(?:\'[^']*)*)'/)
+  assert.ok(whenToUseMatch, 'expected to find the whenToUse string literal')
+  const whenToUse = whenToUseMatch[1]
+  const priorIdx = whenToUse.indexOf('prior_findings?:')
+  assert.ok(priorIdx !== -1, 'whenToUse must document prior_findings')
+  const priorClause = whenToUse.slice(priorIdx, priorIdx + 400)
+  assert.ok(/\{id,\s*lens/.test(priorClause), `whenToUse's prior_findings shape must lead with id, got: ${priorClause}`)
+  assert.ok(/id is REQUIRED/i.test(priorClause), 'whenToUse must say id is required, not merely list it as one field among optional ones')
+})
+
 test('static: AGENT-HARNESS.md\'s ledger paragraph carries the absolute-timestamp justification and the git-history survival clause, not just README.md (L3, AC-SEC-3/AC-SEC-4)', () => {
   const doc = readAll('AGENT-HARNESS.md')
   assert.ok(/timestamp/i.test(doc), 'AGENT-HARNESS.md must justify why an absolute timestamp is retained')

@@ -81,9 +81,23 @@ test('review-cycle.js: normal completion preserves the existing return shape and
 // sentinel (destructured out via `const { __outcome, ...result } = raw`
 // before telemetry is added) into the public result would pass every
 // existing assertion above unnoticed.
-test('review-cycle.js: the result carries EXACTLY its documented keys plus telemetry -- the internal __outcome sentinel does not leak through (L5, AC-ARCH-10)', async () => {
+//
+// Fix round 2 (specs/record-fixed-findings.md AC-1): this pin is
+// DELIBERATELY widened here, not removed -- `open_findings` is a genuine,
+// reviewed, documented new key (this round's open findings WITH their real
+// ids, so a caller can pass them forward unchanged as next round's
+// prior_findings), never an accidental leak. The protection this test
+// exists for -- an UNDOCUMENTED key silently reaching a caller -- is fully
+// intact: the assertion still fails the instant any key other than this
+// named, deliberate set appears. What justified the change: `open_findings`
+// could not be threaded back any other way (workflow scripts have no
+// node:crypto, so the real id only exists after ledger-append.mjs computes
+// it inside the terminal write, which completes before this pinned return
+// statement runs -- see review-cycle.js's own comment at the
+// `result.open_findings = ...` assignment for the ordering).
+test('review-cycle.js: the result carries EXACTLY its documented keys plus telemetry -- the internal __outcome sentinel does not leak through (L5, AC-ARCH-10; widened fix round 2 for open_findings, justified above)', async () => {
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
-  assert.deepEqual(Object.keys(result).sort(), ['base', 'head', 'lenses', 'report', 'skipped', 'telemetry', 'verdicts'])
+  assert.deepEqual(Object.keys(result).sort(), ['base', 'head', 'lenses', 'open_findings', 'report', 'skipped', 'telemetry', 'verdicts'])
 })
 
 // M1: a run whose synthesis agent fails (undefined response) or returns a
@@ -544,6 +558,129 @@ test('review-cycle.js: a finding\'s ac_id survives into open_findings when a len
   const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
   const payload = extractLedgerPayload(terminalCall.prompt)
   assert.equal(payload.open_findings[0].ac_id, 'AC-SEC-3', 'a lens-supplied ac_id must survive, not be discarded to null')
+})
+
+// specs/record-fixed-findings.md AC-1: absent args.prior_findings, review-cycle.js's
+// behaviour is unchanged -- no prior-findings block in the synthesis prompt,
+// no fixed_findings requested, and the terminal payload's own
+// prior_findings/fixed_findings both stay null.
+test('review-cycle.js: with no prior_findings argument, the synthesis prompt carries no PRIOR-ROUND FINDINGS block and the terminal payload sends prior_findings/fixed_findings as null (AC-1)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
+  assert.ok(!synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'), 'no prior-findings block must appear in the synthesis prompt when the argument is absent')
+  assert.ok(!synthesisCall.prompt.includes('fixed_findings'), 'the fixed_findings instruction must not appear either')
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.prior_findings, null)
+  assert.equal(payload.fixed_findings, null)
+})
+
+// AC-1: a non-array prior_findings (a caller mistake, or a stale caller
+// passing something else entirely) must be treated exactly like "absent",
+// never partially trusted.
+test('review-cycle.js: a non-array args.prior_findings is treated as absent, not partially trusted (AC-1)', async () => {
+  const { calls } = await runWorkflow(WF, { args: { prior_findings: 'not-an-array' }, agent: baseAgent() })
+  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
+  assert.ok(!synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'))
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.prior_findings, null)
+})
+
+// AC-2: supplying prior_findings puts the exact array in the synthesis
+// prompt and carries it, plus the synthesis's own fixed_findings response,
+// through unmapped to the terminal ledger payload.
+test('review-cycle.js: with prior_findings supplied, the synthesis prompt carries them verbatim and the terminal payload carries both prior_findings and the synthesis\'s fixed_findings through unmapped (AC-2)', async () => {
+  const PRIOR = [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1' }]
+  const { calls } = await runWorkflow(WF, {
+    args: { prior_findings: PRIOR },
+    agent: baseAgent({
+      synthesis: {
+        report: '### VERDICT\nCLEAN',
+        spec_bugs: [],
+        rejected_findings: [],
+        fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+      },
+    }),
+  })
+  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
+  assert.ok(synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'), 'the prior-findings block must appear when the argument is supplied')
+  assert.ok(synthesisCall.prompt.includes('missing auth check'), 'the prior finding\'s own claim text must reach the prompt')
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.deepEqual(payload.prior_findings, PRIOR)
+  assert.deepEqual(payload.fixed_findings, [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }])
+})
+
+// AC-2: an older or misbehaving synthesis agent that never returns
+// fixed_findings at all (undefined, not an empty array) must read as null,
+// the same unmeasured-vs-zero distinction spec_bugs/rejected_findings
+// already hold to.
+test('review-cycle.js: a synthesis response with prior_findings supplied but no fixed_findings field at all sends fixed_findings as null, not an empty array (AC-2, AC-OPS-3\'s convention)', async () => {
+  const PRIOR = [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }]
+  const { calls } = await runWorkflow(WF, { args: { prior_findings: PRIOR }, agent: baseAgent() })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.fixed_findings, null)
+})
+
+// ---- Fix round 2 (specs/record-fixed-findings.md AC-1): result.open_findings.
+// Route B: the REAL id only exists after ledger-append.mjs computes it
+// inside the terminal write, so it can only reach review-cycle's OWN
+// return value via writeLedger's response -- proven here at the unit
+// level (a scripted ledger:write response), with the full real-writer
+// round trip proven separately in test/ledger-seam.test.js. ----
+
+test('review-cycle.js: result.open_findings zips this round\'s open finding descriptors with the REAL ids the ledger:write response returned, in order (fix round 2, AC-1)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-security': {
+        verdict: 'FINDINGS',
+        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+        findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-1' }],
+      },
+      'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: ['e74fb146b7ddc6cb'] }],
+    }),
+  })
+  assert.deepEqual(result.open_findings, [
+    { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1', recurrence: null, id: 'e74fb146b7ddc6cb' },
+  ])
+})
+
+test('review-cycle.js: result.open_findings is null when the ledger:write response carries no open_finding_ids at all (an older ledger-append.mjs, or the write failed before computing them) -- never a confident empty array (fix round 2, AC-1)', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.equal(result.open_findings, null)
+})
+
+test('review-cycle.js: result.open_findings is populated on ROUND ONE too, with no prior_findings argument supplied at all -- this is what a later round needs to join against, so it cannot be gated on prior_findings\' own presence (fix round 2, AC-1/AC-4)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-qa': {
+        verdict: 'FINDINGS',
+        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+        findings: [{ severity: 'Low', claim: 'a style nit', location: 'bar.js:1', evidence: 'e', consequence: 'c', fix: 'f' }],
+      },
+      'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: ['deadbeefdeadbeef'] }],
+    }),
+  })
+  assert.ok(Array.isArray(result.open_findings) && result.open_findings.length === 1, `expected round one to return its own open finding with an id, got: ${JSON.stringify(result.open_findings)}`)
+  assert.equal(result.open_findings[0].id, 'deadbeefdeadbeef')
+})
+
+// AC-4: absent prior_findings/fixed_findings, review-cycle's DECISIONS are
+// unchanged -- the addition of result.open_findings (unconditional, see
+// above) does not alter what gets written or how outcome is decided.
+test('review-cycle.js: AC-4 -- with nothing supplied, the terminal payload\'s prior_findings/fixed_findings stay null exactly as before, regardless of result.open_findings now always being populated', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: [] }] }),
+  })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.prior_findings, null)
+  assert.equal(payload.fixed_findings, null)
 })
 
 // Review round-2, new harness-level finding: during review round 2, a lens
