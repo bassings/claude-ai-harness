@@ -119,6 +119,23 @@ wrote:
 
 ## The escaped-defect counter-metric
 
+> **This number may NEVER be the reason a check is removed.** Settled
+> 2026-09-01 by the operator, after measurement showed the premise behind
+> scoping it was wrong. Filtering out pipeline self-repair moves the figure
+> from roughly 26% of commits to roughly 23%, because the noise is not
+> tooling churn: it is that a mature codebase fixes ordinary bugs constantly,
+> for reasons unrelated to any check anyone removed. No path filter separates
+> "this escaped because we deleted a check" from "someone fixed a bug on
+> Tuesday", because the question is causal and the data is commit metadata.
+>
+> So the counter-metric stays, reported, as CONTEXT. A proposal may cite it.
+> A proposal may not rest on it, and neither may a reviewer approving one.
+> Removing, demoting or skipping a check is a decision for the operator,
+> taken with the reasoning in front of them, never a conclusion drawn from
+> this figure moving. A proposal that says the counter-metric licenses its
+> own removal is making a claim this measure cannot support, and that is a
+> defect in the proposal.
+
 Every removal/demotion/skip proposal's report includes the escaped-defect
 counter-metric so the removal is not unbraked (AC-PROD-7), computed by
 `workflows/lib/optimise-read.mjs`'s `escaped-defects` command from git
@@ -131,11 +148,16 @@ proposal or merged PR:
   escaped defect fixed under a different commit-message type.
 - **Scoped**: the same `fix:` commits, narrowed to those whose changed
   paths include at least one path outside the configured pipeline/tooling
-  excludes. This exists because a large share of `fix:` commits are the
+  excludes. This exists because SOME `fix:` commits are the
   pipeline repairing itself (CI config, a flaky test, a hook) rather than a
   defect a user hit -- counting those the same way as a real fix makes the
   raw figure worse the more the harness itself is worked on, which is
-  backwards for a metric meant to brake harness changes. What counts as
+  backwards for a metric meant to brake harness changes. Measured 2026-09-01
+  across 500 commits in a real delivery repo, that share is about one in ten
+  (73 `fix:` commits touching product code only, 47 touching both, 13
+  touching tooling or tests only), so the scoping is a real but SMALL
+  correction: 130 raw against 125 scoped there, and 123 against 121 in the
+  other repo. What counts as
   "pipeline/tooling" is per-repo configuration (these repos differ), read
   from `.claude/harness-triggers.json`'s `escapedDefectExcludePaths` array
   -- the same file and the same per-repo-override mechanism review-cycle.js
