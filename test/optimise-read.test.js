@@ -608,6 +608,31 @@ test('optimise-read CLI: the ledger command\'s output includes rework.invalidAcI
   assert.equal(out.rework.invalidAcIdsDropped, 1)
 })
 
+// Fix round 1, finding 5: the same CLI-boundary whitelist gap, for
+// invalid_fixed_ids_dropped/duplicate_fixed_ids_dropped/the cross-round
+// dedupe count -- computed correctly one function away, but dropped at
+// exactly this boundary unless explicitly named here too.
+test('optimise-read CLI: the ledger command\'s output includes rework.invalidFixedIdsDropped and rework.duplicateFixedIdsDropped, computed from a real record (fix round 1, finding 5)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec: 'specs/a.md',
+    prior_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    fixed_findings: [
+      { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
+      { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
+      { lens: 'lens-security', location: 'nowhere.js:1', claim: 'never reported open' },
+    ],
+  })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.rework.invalidFixedIdsDropped, 1, 'the fabricated confirmation')
+  assert.equal(out.rework.duplicateFixedIdsDropped, 1, 'the repeated confirmation')
+})
+
 test('optimise-read CLI: the ledger command\'s output includes a citationPool of real run_ids from the window', () => {
   const repo = makeTempRepo()
   runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
@@ -1819,6 +1844,69 @@ test('optimise-read: aggregateRework sums invalid_ac_ids_dropped across the wind
     { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', invalid_ac_ids_dropped: 1 },
   ])
   assert.equal(dirty.invalidAcIdsDropped, 3, 'must sum across every review_cycle record in the window')
+})
+
+// Fix round 1, finding 5: invalid_fixed_ids_dropped (specs/record-fixed-findings.md
+// AC-3's own counter) was written to every review_cycle line and summed by
+// nothing -- the one signal that a synthesis fabricated a confirmation this
+// round reached no report. Mirrors invalidAcIdsDropped's own test exactly.
+test('optimise-read: aggregateRework sums invalid_fixed_ids_dropped across the window and returns it, a real zero when clean (fix round 1, finding 5)', () => {
+  const clean = mod.aggregateRework([{ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', invalid_fixed_ids_dropped: 0 }])
+  assert.equal(clean.invalidFixedIdsDropped, 0)
+  const dirty = mod.aggregateRework([
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', invalid_fixed_ids_dropped: 2 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', invalid_fixed_ids_dropped: 1 },
+  ])
+  assert.equal(dirty.invalidFixedIdsDropped, 3, 'must sum across every review_cycle record in the window')
+})
+
+// Fix round 1, finding 1 (read-side half): duplicate_fixed_ids_dropped
+// gets the same treatment as invalid_fixed_ids_dropped above -- the new
+// counter this fix round's writer-side dedup introduced must not become
+// the NEXT "written to every line and read by nothing" field.
+test('optimise-read: aggregateRework sums duplicate_fixed_ids_dropped across the window and returns it, a real zero when clean (fix round 1, finding 1 read-side)', () => {
+  const clean = mod.aggregateRework([{ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', duplicate_fixed_ids_dropped: 0 }])
+  assert.equal(clean.duplicateFixedIdsDropped, 0)
+  const dirty = mod.aggregateRework([
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', duplicate_fixed_ids_dropped: 2 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', duplicate_fixed_ids_dropped: 1 },
+  ])
+  assert.equal(dirty.duplicateFixedIdsDropped, 3, 'must sum across every review_cycle record in the window')
+})
+
+// Fix round 1, finding 2 (HIGH, coordinator finding): the ledger has no
+// memory across lines, and a conductor that re-supplies an already-
+// confirmed finding as prior_findings on a LATER round (SKILL.md's own
+// ambiguity, tightened but not eliminable in prose) produces a SECOND
+// ledger line recording the SAME finding id 'fixed' again. Deduplication
+// has to happen here, read-side, across the whole window -- the writer
+// cannot see a different record it already wrote.
+test('optimise-read: aggregateRework counts the SAME finding id confirmed fixed in TWO DIFFERENT records (same repo) only ONCE in lensDispositionCounts, not once per record (fix round 1, finding 2)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'sha1', outcome: 'done', findings: [{ id: 'f1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }] },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'sha2', outcome: 'done', findings: [{ id: 'f1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }] },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.lensDispositionCounts['lens-security'].fixed, 1, 'the same finding id confirmed twice across rounds must count once, not twice')
+  assert.equal(result.duplicateFixedAcrossRounds, 1, 'the skip itself must be visible, not silently swallowed')
+})
+
+test('optimise-read: aggregateRework counts a finding id confirmed fixed once, PLUS a genuinely DIFFERENT finding id confirmed fixed, as two -- the cross-round dedupe must not over-collapse distinct findings (fix round 1, finding 2, not vacuous)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'sha1', outcome: 'done', findings: [{ id: 'f1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }] },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'sha2', outcome: 'done', findings: [{ id: 'f2', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }] },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.lensDispositionCounts['lens-security'].fixed, 2, 'two genuinely different finding ids must both count')
+})
+
+test('optimise-read: aggregateRework does NOT dedupe the same finding id across TWO DIFFERENT repos -- distinct repos are distinct evidence, even on the astronomically unlikely id collision (fix round 1, finding 2, scope check)', () => {
+  const records = [
+    { kind: 'review_cycle', repo: 'demo-a', spec: 'specs/a.md', round_key: 'sha1', outcome: 'done', findings: [{ id: 'f1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }] },
+    { kind: 'review_cycle', repo: 'demo-b', spec: 'specs/a.md', round_key: 'sha1', outcome: 'done', findings: [{ id: 'f1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }] },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.lensDispositionCounts['lens-security'].fixed, 2, 'the same id in two different repos must both count -- dedup is scoped per repo, not global')
 })
 
 // ---- Round-4 review M3: a FAILED criterion silently inverts to

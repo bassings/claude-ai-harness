@@ -109,9 +109,15 @@ const AC_ID_PATTERN_STR = '^AC-[A-Z]+-[0-9]+$'
 // question about whether the writer happened to neutralise it.
 export const LENS_PATTERN_STR = '^(lens|reviewer)-[a-z]+$'
 const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
-// 'fixed' is never written by the workflows in this PR: no single run can
-// know a finding from an earlier round was fixed. It is reserved for a
-// later consumer that compares finding ids (AC-QA-11) across ledger lines.
+// specs/record-fixed-findings.md: 'fixed' IS now written, but only via the
+// guarded path in computeFixedFindings below (review-cycle.js's optional
+// prior_findings argument). It records that a lens, this round, confirmed
+// a specific PRIOR finding is resolved in the built change -- a confirmation,
+// not proof of repair. Where a finding was reworded rather than fixed, its
+// findingId hash differs from the one this round computes for it, the id
+// guard does not match, and it is never recorded fixed: this measure can
+// undercount a genuine fix, never overcount one, which is the safe
+// direction for a number that feeds rework attribution.
 const DISPOSITIONS = ['open', 'rejected', 'spec_bug', 'fixed']
 
 // The envelope + payload schema for one ledger line. additionalProperties is
@@ -290,6 +296,35 @@ export const LEDGER_ENTRY_SCHEMA = {
     // one specific input array's presence the way the ac_id/finding-field
     // counters are.
     invalid_record_values_dropped: { type: ['integer', 'null'] },
+    // specs/record-fixed-findings.md, the id guard (AC-3): how many entries
+    // in a supplied fixed_findings array were dropped because their
+    // findingId hash was not among the ids computed from the caller's own
+    // prior_findings -- a claimed-fixed finding that was never reported
+    // open this round, or reworded enough that the hash no longer matches.
+    // Fix round 1, finding 8: also counts a claim that DOES match a prior
+    // finding but whose id is ALSO present in this same round's own
+    // open_findings -- a finding a lens is still reporting open cannot also
+    // be recorded fixed on the same line, and this is where that
+    // contradiction is folded in (a different reason from an unmatched
+    // claim, but the same fail-closed outcome: dropped, never written).
+    // Computed in computeFixedFindings, before the entry object exists, so
+    // it follows spec_bug_count/rejected_finding_count's placement rather
+    // than degradeEntry's general mechanism (below): this is a REFERENCE
+    // check against caller-supplied context, not a schema-shape violation.
+    // Real, measured 0 when fixed_findings was supplied and nothing was
+    // dropped, null when it was not supplied at all, OR when it was
+    // supplied but was not an array (a malformed synthesis response reads
+    // the same as "not supplied" here, matching findings_truncated's own
+    // null-vs-zero convention).
+    invalid_fixed_ids_dropped: { type: ['integer', 'null'] },
+    // Fix round 1, finding 1: the SAME finding confirmed more than once in
+    // one fixed_findings array (once per affected lens section, or simply
+    // repeated) used to record one 'fixed' entry per repeat, with
+    // invalid_fixed_ids_dropped correctly reporting 0 -- nothing was
+    // invalid, the repeats were genuine matches, just counted separately
+    // now under this field instead of silently inflating `findings`. Same
+    // null-vs-zero convention as invalid_fixed_ids_dropped.
+    duplicate_fixed_ids_dropped: { type: ['integer', 'null'] },
     // Round-5 H1: bounded, redacted raw retention for exactly the
     // neutralisations counted above (never for ac_id/lens/severity/verdict,
     // which already have their own dedicated *_raw sibling field) -- a
@@ -837,6 +872,130 @@ function computeFindings(descriptors, disposition) {
     }
   })
   return { entries, count: entries.length }
+}
+
+// specs/record-fixed-findings.md: turns a synthesis's claimed-resolved
+// descriptors into {id, lens, severity, ac_id, disposition:'fixed'}
+// entries, gated by the id guard (AC-3). What the guard actually proves:
+// a recorded confirmation must reference one of the findings supplied in
+// the SAME request, via the shared priorFindings argument -- it cannot
+// invent an id that was never in that list. Fix round 1, finding 3: this
+// is NOT "cannot be rubber-stamped" (a synthesis that echoes the ENTIRE
+// supplied prior list back, confirming everything with no genuine
+// verification, passes this guard with nothing dropped -- that is the
+// literal definition of a rubber stamp, and the guard alone does not
+// prevent it). `priorFindings` is the caller's own prior_findings argument
+// (the findings it reported open going into this round, same {lens,
+// location, claim, severity?, ac_id?} shape as
+// spec_bugs/rejected_findings/open_findings); `fixedFindingDescriptors` is
+// the synthesis's own claimed-fixed echoes of some of those. Both sides are
+// hashed through the SAME findingId(lens, location, claim) function
+// computeFindings already uses, so a claimed-fixed entry is only kept when
+// its hash lands on one already present among the hashes of priorFindings
+// -- an id that was never open, or a finding reworded enough that its hash
+// no longer matches, is dropped and counted in the returned invalidDropped,
+// never written as fixed. This is the same fail-closed sanitiser shape as
+// the rest of this file: the offending value is dropped, the drop is
+// counted, and the record is still written.
+//
+// null count/invalidDropped (never a bare 0) when fixedFindingDescriptors
+// was not supplied at all, OR was supplied but was not an array (fix round
+// 1, finding 7: a malformed value reads identically to "absent" here,
+// since Array.isArray() is the only check made) -- matching
+// findings_truncated's own null-vs-zero convention: a run with no
+// prior_findings feature in play, or a caller that sent something
+// unusable, must not read as "measured zero dropped".
+function computeFixedFindings(priorFindings, fixedFindingDescriptors, stillOpenIds) {
+  if (!Array.isArray(fixedFindingDescriptors)) return { entries: [], invalidDropped: null, duplicateDropped: null }
+  // Keyed by the SAME findingId hash computeFindings uses for every other
+  // disposition, so a fixed_findings entry only matches when its own
+  // lens/location/claim hash to an id already present here -- the id guard.
+  // The matched PRIOR entry's own lens/severity/ac_id are what get written
+  // (never the fixed_findings descriptor's own severity/ac_id, which the
+  // synthesis prompt does not even ask for): this is "the finding
+  // previously reported open, now marked resolved," so its recorded
+  // severity/ac_id stay the ones that were actually reported, not whatever
+  // a confirming echo happens to repeat.
+  const priorById = new Map()
+  for (const f of Array.isArray(priorFindings) ? priorFindings : []) {
+    if (f && typeof f === 'object') {
+      const id = findingId(f.lens, f.location, f.claim)
+      if (!priorById.has(id)) priorById.set(id, f)
+    }
+  }
+  // Fix round 1, finding 8: a finding a lens is STILL reporting open THIS
+  // round is never eligible to also be recorded fixed on the same line --
+  // that pairing is a contradiction (the id guard alone cannot see it,
+  // since it only checks membership against prior_findings, and a
+  // still-open finding legitimately WAS reported open before too).
+  // Reconciled the same way an unmatched claim is: dropped, counted under
+  // invalidDropped, never written.
+  const openIds = stillOpenIds instanceof Set ? stillOpenIds : new Set(Array.isArray(stillOpenIds) ? stillOpenIds : [])
+  const candidates = computeFindings(fixedFindingDescriptors, 'fixed').entries
+  const entries = []
+  // Fix round 1, finding 1 (coordinator repro: one real finding, THREE
+  // identical fixed_findings entries, produced three 'fixed' lines with
+  // invalid_fixed_ids_dropped:0, since nothing here deduplicated a
+  // genuinely MATCHING id repeated more than once). seenIds tracks which
+  // matched ids have already produced an entry; a repeat is a real,
+  // correctly-matched confirmation, not a fabricated one, so it is counted
+  // separately from invalidDropped under duplicateDropped -- conflating the
+  // two would make "the synthesis fabricated a claim" and "the synthesis
+  // repeated a real one" indistinguishable to a reader of the count.
+  const seenIds = new Set()
+  let invalidDropped = 0
+  let duplicateDropped = 0
+  for (const candidate of candidates) {
+    const prior = candidate && priorById.get(candidate.id)
+    if (!prior || openIds.has(candidate.id)) {
+      invalidDropped += 1
+      continue
+    }
+    if (seenIds.has(candidate.id)) {
+      duplicateDropped += 1
+      continue
+    }
+    seenIds.add(candidate.id)
+    entries.push({
+      id: candidate.id,
+      lens: prior.lens,
+      severity: prior.severity || 'Low',
+      ac_id: prior.ac_id || null,
+      disposition: 'fixed',
+    })
+  }
+  return { entries, invalidDropped, duplicateDropped }
+}
+
+// Fix round 1, finding 4: a flat concatenate-then-slice truncation let
+// whichever disposition was listed EARLIEST consume the whole MAX_FINDINGS
+// budget, starving every disposition listed after it once the earlier one
+// alone reached the cap -- measured directly: 15 open findings (already at
+// the cap on their own) plus 20 validly-confirmed fixed findings produced
+// ZERO fixed entries no matter how many were confirmed, silently switching
+// this feature off on exactly the busy rounds it exists to measure.
+// Round-robins ONE entry at a time across the still-non-empty categories,
+// in the priority order the caller supplies them, so a category with fewer
+// items never blocks another from filling the remaining budget, and no
+// single category can consume the WHOLE budget while a smaller one behind
+// it gets nothing. The TOTAL kept is unaffected (still min(maxTotal, sum of
+// all categories)), so findings_truncated's own count is unchanged by this
+// -- only WHICH entries survive changes.
+function budgetFindings(categories, maxTotal) {
+  const queues = categories.map((c) => c.slice())
+  const kept = []
+  let anyLeft = true
+  while (kept.length < maxTotal && anyLeft) {
+    anyLeft = false
+    for (const q of queues) {
+      if (kept.length >= maxTotal) break
+      if (q.length) {
+        kept.push(q.shift())
+        anyLeft = true
+      }
+    }
+  }
+  return kept
 }
 
 const TRUNCATABLE_FIELDS = ['task', 'spec', 'spec_raw', 'round_key', 'event', 'event_key']
@@ -1482,21 +1641,41 @@ export function main() {
   const specBugs = computeFindings(payload.spec_bugs, 'spec_bug')
   const rejected = computeFindings(payload.rejected_findings, 'rejected')
   const open = computeFindings(payload.open_findings, 'open')
+  // specs/record-fixed-findings.md: prior_findings/fixed_findings are the
+  // optional round-two-onward pair (review-cycle.js's prior_findings
+  // argument, and the synthesis's own echoed confirmations) -- see
+  // computeFixedFindings' own comment for the id guard this runs. `open`'s
+  // own ids are passed through too (fix round 1, finding 8): a finding this
+  // SAME round's lens reports still open is never eligible to be recorded
+  // fixed on the same line, even when a confirmation matches it.
+  const fixed = computeFixedFindings(payload.prior_findings, payload.fixed_findings, new Set(open.entries.map((e) => e && e.id).filter(Boolean)))
   // event_scope is consumed above to mint event_key (M2) and must never
   // itself reach the schema-validated entry: it is not a declared field, and
   // additionalProperties:false would reject the whole write if it leaked
-  // through here.
-  const { spec_bugs, rejected_findings, open_findings, event_scope, ...restPayload } = payload
-  const allFindings = [...specBugs.entries, ...rejected.entries, ...open.entries]
+  // through here. prior_findings/fixed_findings are consumed just above,
+  // by computeFixedFindings, and must never reach the entry directly
+  // either -- the entry only ever carries their computed, guarded result
+  // inside `findings` (disposition 'fixed'), never the raw descriptors.
+  const { spec_bugs, rejected_findings, open_findings, prior_findings, fixed_findings, event_scope, ...restPayload } = payload
+  const allFindings = [...specBugs.entries, ...rejected.entries, ...open.entries, ...fixed.entries]
   // M2: bound the findings array at MAX_FINDINGS rather than letting an
   // unusually finding-heavy run (a 7-lens envelope, or H5's open_findings
   // covering every finding every lens reported) push the whole line over
   // the byte cap by count alone; findings_truncated records exactly how
   // many were dropped, a real measured number, never silently zero.
+  //
+  // Fix round 1, finding 4: WHICH findings survive the cap is decided by
+  // budgetFindings (round-robin across dispositions), not a flat
+  // concatenate-then-slice -- see its own comment. spec_bugs/rejected keep
+  // their pre-existing priority (unaffected by this fix); fixed is placed
+  // ahead of open, the category that was starving it, so a busy round with
+  // 15+ open findings no longer zeroes fixed out no matter how many were
+  // confirmed. The TOTAL truncated count is identical either way (governed
+  // by allFindings.length alone), only the selected entries differ.
   const findingsFields =
-    'spec_bugs' in payload || 'rejected_findings' in payload || 'open_findings' in payload
+    'spec_bugs' in payload || 'rejected_findings' in payload || 'open_findings' in payload || 'fixed_findings' in payload
       ? {
-          findings: allFindings.slice(0, MAX_FINDINGS),
+          findings: budgetFindings([specBugs.entries, rejected.entries, fixed.entries, open.entries], MAX_FINDINGS),
           findings_truncated: Math.max(0, allFindings.length - MAX_FINDINGS),
           spec_bug_count: specBugs.count,
           rejected_finding_count: rejected.count,
@@ -1512,6 +1691,20 @@ export function main() {
     repo,
     write_ok: true,
     write_error: null,
+  }
+  // specs/record-fixed-findings.md AC-3: the id-guard drop count, set only
+  // when fixed_findings was actually supplied (computeFixedFindings returns
+  // null otherwise) -- same null-vs-zero convention as findings_truncated,
+  // placed alongside the entry's own creation rather than inside
+  // findingsFields above, since it must survive even a run whose
+  // spec_bugs/rejected_findings/open_findings were all absent.
+  if (fixed.invalidDropped !== null) {
+    entry.invalid_fixed_ids_dropped = fixed.invalidDropped
+  }
+  // Fix round 1, finding 1: same null-vs-zero convention, alongside its
+  // sibling counter above.
+  if (fixed.duplicateDropped !== null) {
+    entry.duplicate_fixed_ids_dropped = fixed.duplicateDropped
   }
   // H4: bounded defensively like `findings`, though in practice ac_verdicts
   // is sized by the spec's own AC count times the lens roster -- a few
@@ -1784,6 +1977,13 @@ export function main() {
   // Round-5 H1: invalid_record_values_dropped (the general degrade
   // mechanism's own counter) rides on the CLI result too, same reason.
   if (typeof entry.invalid_record_values_dropped === 'number') extra.invalid_record_values_dropped = entry.invalid_record_values_dropped
+  // specs/record-fixed-findings.md AC-3: invalid_fixed_ids_dropped rides on
+  // the CLI result too, same reason -- not currently surfaced by any
+  // workflow's own writeLedger response schema (that pinned trio is left
+  // untouched by this change), but present here for any direct caller.
+  if (typeof entry.invalid_fixed_ids_dropped === 'number') extra.invalid_fixed_ids_dropped = entry.invalid_fixed_ids_dropped
+  // Fix round 1, finding 1: same reason, alongside its sibling above.
+  if (typeof entry.duplicate_fixed_ids_dropped === 'number') extra.duplicate_fixed_ids_dropped = entry.duplicate_fixed_ids_dropped
   return Object.keys(extra).length ? { ...result(run_id, ts, true, null), ...extra } : result(run_id, ts, true, null)
 }
 

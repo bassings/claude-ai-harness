@@ -55,6 +55,29 @@ task, a Monitor, or a ScheduleWakeup.
    - `awaiting-ci` green → run the review cycle (/review-cycle where
      installed); fix findings or record evidenced rejections → `in-review`.
      CI red → fix, push, re-arm the watch.
+     **On round two of review for the same task and every round after**,
+     pass `prior_findings`: ONLY the findings that task's *immediately
+     preceding* review round reported open, as `{lens, location, claim,
+     severity?, ac_id?}` (you already have this -- you just read that
+     round's report to decide what to fix). Do not accumulate: a finding
+     already confirmed fixed in an earlier round must not be passed again
+     in a later round's `prior_findings` -- the ledger has no memory across
+     lines, so a re-supplied finding would be recorded fixed a second time,
+     inflating the count for something already counted once. review-cycle
+     then asks its own synthesis step to confirm which of the findings you
+     supplied are now resolved, and records a confirmed one in the run
+     ledger as `fixed`, guarded so a claim that does not reference one of
+     the findings you supplied is dropped, never recorded.
+     **What this proves and what it does not** (fix round 1, finding 3):
+     the guard stops a FABRICATED claim -- an id that was never in the list
+     you supplied -- it does not verify that a genuine confirmation is
+     actually true, and a synthesis that echoes your entire list back as
+     "all resolved" passes it with nothing dropped. This is the harness
+     recording "a lens confirmed this specific finding is resolved," not
+     proof of repair: a finding reworded between rounds will not match and
+     stays uncounted rather than being wrongly cleared, which undercounts
+     rather than overcounts on THAT axis -- it says nothing about whether
+     any one confirmation itself was honest.
    - `in-review` clean + user's merge policy allows → merge → `merged`,
      tick the box. If merging needs the user, mark blocked-on-human.
 3. **Log the tick**: append one line to `## Conductor log`: what changed,

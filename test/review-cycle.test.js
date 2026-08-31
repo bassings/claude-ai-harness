@@ -546,6 +546,70 @@ test('review-cycle.js: a finding\'s ac_id survives into open_findings when a len
   assert.equal(payload.open_findings[0].ac_id, 'AC-SEC-3', 'a lens-supplied ac_id must survive, not be discarded to null')
 })
 
+// specs/record-fixed-findings.md AC-1: absent args.prior_findings, review-cycle.js's
+// behaviour is unchanged -- no prior-findings block in the synthesis prompt,
+// no fixed_findings requested, and the terminal payload's own
+// prior_findings/fixed_findings both stay null.
+test('review-cycle.js: with no prior_findings argument, the synthesis prompt carries no PRIOR-ROUND FINDINGS block and the terminal payload sends prior_findings/fixed_findings as null (AC-1)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
+  assert.ok(!synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'), 'no prior-findings block must appear in the synthesis prompt when the argument is absent')
+  assert.ok(!synthesisCall.prompt.includes('fixed_findings'), 'the fixed_findings instruction must not appear either')
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.prior_findings, null)
+  assert.equal(payload.fixed_findings, null)
+})
+
+// AC-1: a non-array prior_findings (a caller mistake, or a stale caller
+// passing something else entirely) must be treated exactly like "absent",
+// never partially trusted.
+test('review-cycle.js: a non-array args.prior_findings is treated as absent, not partially trusted (AC-1)', async () => {
+  const { calls } = await runWorkflow(WF, { args: { prior_findings: 'not-an-array' }, agent: baseAgent() })
+  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
+  assert.ok(!synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'))
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.prior_findings, null)
+})
+
+// AC-2: supplying prior_findings puts the exact array in the synthesis
+// prompt and carries it, plus the synthesis's own fixed_findings response,
+// through unmapped to the terminal ledger payload.
+test('review-cycle.js: with prior_findings supplied, the synthesis prompt carries them verbatim and the terminal payload carries both prior_findings and the synthesis\'s fixed_findings through unmapped (AC-2)', async () => {
+  const PRIOR = [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1' }]
+  const { calls } = await runWorkflow(WF, {
+    args: { prior_findings: PRIOR },
+    agent: baseAgent({
+      synthesis: {
+        report: '### VERDICT\nCLEAN',
+        spec_bugs: [],
+        rejected_findings: [],
+        fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+      },
+    }),
+  })
+  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
+  assert.ok(synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'), 'the prior-findings block must appear when the argument is supplied')
+  assert.ok(synthesisCall.prompt.includes('missing auth check'), 'the prior finding\'s own claim text must reach the prompt')
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.deepEqual(payload.prior_findings, PRIOR)
+  assert.deepEqual(payload.fixed_findings, [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }])
+})
+
+// AC-2: an older or misbehaving synthesis agent that never returns
+// fixed_findings at all (undefined, not an empty array) must read as null,
+// the same unmeasured-vs-zero distinction spec_bugs/rejected_findings
+// already hold to.
+test('review-cycle.js: a synthesis response with prior_findings supplied but no fixed_findings field at all sends fixed_findings as null, not an empty array (AC-2, AC-OPS-3\'s convention)', async () => {
+  const PRIOR = [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }]
+  const { calls } = await runWorkflow(WF, { args: { prior_findings: PRIOR }, agent: baseAgent() })
+  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(terminalCall.prompt)
+  assert.equal(payload.fixed_findings, null)
+})
+
 // Review round-2, new harness-level finding: during review round 2, a lens
 // wrote two TEST-FIXTURE records into the live ledger while probing
 // ledger-append.mjs -- lenses are specified read-only, but the writer

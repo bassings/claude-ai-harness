@@ -275,6 +275,24 @@ test('static: conduct-plan/SKILL.md instructs logging CI-wait, human-wait, PR-ra
   assert.ok(/idempotent|no-op|duplicate/i.test(skill), 'SKILL.md must state that a replayed event_key does not double-count')
 })
 
+// Fix round 1, finding 10: the prior_findings pass-through is the single
+// point where specs/record-fixed-findings.md's 'fixed' disposition feature
+// is either used or silently never used by a real conductor -- it lives in
+// prose a Claude agent reads, not in code a test can execute, and had NO
+// test at all naming it. This cannot prove any given conductor run obeys
+// the instruction (that is inherent to a prose instruction governing a
+// judgement call), but it does prove the instruction itself is not
+// silently deleted from the file by a future edit -- the one thing a
+// static test on prose CAN prove.
+test('static: conduct-plan/SKILL.md instructs passing prior_findings to review-cycle from round two onward, names the ledger disposition it produces, and states plainly what the resulting number does and does not mean (specs/record-fixed-findings.md, fix round 1 finding 10)', () => {
+  const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
+  assert.ok(skill.includes('prior_findings'), 'SKILL.md must mention prior_findings by name')
+  assert.ok(/round two/i.test(skill), 'SKILL.md must say when to start passing it')
+  assert.ok(skill.includes('fixed'), 'SKILL.md must name the disposition this produces')
+  assert.ok(/undercount/i.test(skill), 'SKILL.md must state plainly that the resulting number can undercount')
+  assert.ok(/accumulate|only the findings/i.test(skill), 'SKILL.md must warn against re-supplying an already-confirmed finding on a later round')
+})
+
 test('static: AGENT-HARNESS.md\'s ledger paragraph carries the absolute-timestamp justification and the git-history survival clause, not just README.md (L3, AC-SEC-3/AC-SEC-4)', () => {
   const doc = readAll('AGENT-HARNESS.md')
   assert.ok(/timestamp/i.test(doc), 'AGENT-HARNESS.md must justify why an absolute timestamp is retained')

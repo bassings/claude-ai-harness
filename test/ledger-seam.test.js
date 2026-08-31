@@ -105,6 +105,85 @@ test('seam: review_cycle terminal payload, captured from a real run with a non-e
   assert.equal(entry.spec_bug_count, 1)
 })
 
+// specs/record-fixed-findings.md AC-2: a full run with args.prior_findings
+// set, whose synthesis confirms one of them resolved -- the real terminal
+// payload this workflow builds is piped into the real ledger-append.mjs, and
+// the resulting line must carry a 'fixed' disposition entry for it.
+test('seam: review_cycle with prior_findings supplied, whose synthesis confirms one resolved, is written to the ledger with disposition fixed (AC-2)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
+  const PRIOR = [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1' }]
+  const { calls } = await runWorkflow(WF, {
+    args: { prior_findings: PRIOR },
+    agent: {
+      'scope:diff': {
+        base: 'main',
+        head_sha: 'abcdef1234567890',
+        files: [{ path: 'src/foo.js', status: 'M' }],
+        new_dependency_entries: false,
+        new_modules: false,
+        custom_rules: null,
+        harness_triggers_file_exists: false,
+        consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
+      },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      synthesis: {
+        report: '### VERDICT\nCLEAN',
+        spec_bugs: [],
+        rejected_findings: [],
+        fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+      },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  const payload = terminalPayload(calls)
+  assert.deepEqual(payload.prior_findings, PRIOR, 'the caller\'s prior_findings must ride through to the ledger payload unchanged')
+  const entry = pipeAndAssertWritten(payload, 'review_cycle with prior_findings')
+  const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
+  assert.equal(fixed.length, 1, 'the confirmed finding must reach the ledger line as disposition fixed')
+  assert.equal(fixed[0].lens, 'lens-security')
+  assert.equal(fixed[0].ac_id, 'AC-SEC-1')
+  assert.equal(entry.invalid_fixed_ids_dropped, 0)
+})
+
+// specs/record-fixed-findings.md AC-3: the id guard survives the FULL
+// round-trip through the real workflow AND the real ledger-append.mjs, not
+// just a hand-built payload -- a synthesis that fabricates a fixed_findings
+// entry with no matching prior_findings entry must not be recorded fixed.
+test('seam: review_cycle with prior_findings supplied, whose synthesis fabricates an unmatched fixed_findings entry, drops it rather than recording it fixed (AC-3, full round trip)', async () => {
+  const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
+  const PRIOR = [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }]
+  const { calls } = await runWorkflow(WF, {
+    args: { prior_findings: PRIOR },
+    agent: {
+      'scope:diff': {
+        base: 'main',
+        head_sha: 'abcdef1234567890',
+        files: [{ path: 'src/foo.js', status: 'M' }],
+        new_dependency_entries: false,
+        new_modules: false,
+        custom_rules: null,
+        harness_triggers_file_exists: false,
+        consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
+      },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      synthesis: {
+        report: '### VERDICT\nCLEAN',
+        spec_bugs: [],
+        rejected_findings: [],
+        // Never in PRIOR: a fabricated confirmation.
+        fixed_findings: [{ lens: 'lens-security', location: 'nowhere.js:1', claim: 'never reported open' }],
+      },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  const payload = terminalPayload(calls)
+  const entry = pipeAndAssertWritten(payload, 'review_cycle with a fabricated fixed_findings entry')
+  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a fabricated confirmation must never be recorded fixed')
+  assert.equal(entry.invalid_fixed_ids_dropped, 1, 'the drop must be counted')
+})
+
 test('seam: plan_cycle terminal payload, captured from a real run with a non-empty lenses_run, is accepted by ledger-append.mjs (C1 regression test)', async () => {
   const WF = path.join(__dirname, '..', 'workflows', 'plan-cycle.js')
   const LENS_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, acceptance_criteria: [{ id: 'AC-SEC-1', statement: 'x' }] }
