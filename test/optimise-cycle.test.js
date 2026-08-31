@@ -35,7 +35,7 @@ function ledgerFixture(overrides = {}) {
     // real CLI now actually emits, not the pre-round-2 raw-path shape.
     perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
     skipped: [],
-    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }], invalidAcIdsDropped: 0, invalidRecordValuesDropped: 0 },
+    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }], invalidAcIdsDropped: 0, invalidRecordValuesDropped: 0, invalidFixedIdsDropped: 0, duplicateFixedIdsDropped: 0, duplicateFixedAcrossRounds: 0, invalidPriorIdsDropped: 0 },
     neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false }],
     // Review round-2 H-1: the orphan/aborted fields are included here as
     // explicit real zeros -- representing an UP-TO-DATE reader that
@@ -424,6 +424,61 @@ test('optimise-cycle: the Sample completeness section renders invalid_record_val
 test('optimise-cycle: the Sample completeness section renders a real ZERO for invalid_record_values_dropped on a clean fixture, never omitting the line (round-7 F7, not vacuous)', async () => {
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
   const line = result.report.split('\n').find((l) => l.includes('invalid_record_values_dropped'))
+  assert.ok(line, `expected the line even when clean, report was: ${result.report}`)
+  assert.ok(/\b0\b/.test(line), `got: ${line}`)
+})
+
+// ---- Fix round 1, finding 5: invalid_fixed_ids_dropped/duplicate_fixed_ids_dropped
+// (specs/record-fixed-findings.md) get the same rendering treatment as
+// invalid_ac_ids_dropped/invalid_record_values_dropped above -- computed by
+// the writer and summed by the reader, but this is the point where a
+// counter with nobody reading it becomes visible to a human. ----
+
+test('optimise-cycle: the Sample completeness section renders invalid_fixed_ids_dropped with a real non-zero number when the fixture carries one (fix round 1, finding 5)', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { n: 1, lensDispositionCounts: {}, acVerdicts: [], invalidAcIdsDropped: 0, invalidFixedIdsDropped: 5 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_fixed_ids_dropped'))
+  assert.ok(line, `expected a line naming invalid_fixed_ids_dropped, report was: ${result.report}`)
+  assert.ok(line.includes('5'), `got: ${line}`)
+})
+
+test('optimise-cycle: the Sample completeness section renders a real ZERO for invalid_fixed_ids_dropped on a clean fixture, never omitting the line (fix round 1, finding 5, not vacuous)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_fixed_ids_dropped'))
+  assert.ok(line, `expected the line even when clean, report was: ${result.report}`)
+  assert.ok(/\b0\b/.test(line), `got: ${line}`)
+})
+
+test('optimise-cycle: the Sample completeness section renders duplicate_fixed_ids_dropped with a real non-zero number when the fixture carries one (fix round 1, finding 1/5)', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { n: 1, lensDispositionCounts: {}, acVerdicts: [], invalidAcIdsDropped: 0, duplicateFixedIdsDropped: 2 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('duplicate_fixed_ids_dropped'))
+  assert.ok(line, `expected a line naming duplicate_fixed_ids_dropped, report was: ${result.report}`)
+  assert.ok(line.includes('2'), `got: ${line}`)
+})
+
+test('optimise-cycle: the Sample completeness section renders the cross-round duplicate fixed count with a real non-zero number when the fixture carries one (fix round 1, finding 2/5)', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { n: 1, lensDispositionCounts: {}, acVerdicts: [], invalidAcIdsDropped: 0, duplicateFixedAcrossRounds: 7 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('duplicate fixed confirmations across rounds'))
+  assert.ok(line, `expected a line naming the cross-round duplicate fixed count, report was: ${result.report}`)
+  assert.ok(line.includes('7'), `got: ${line}`)
+})
+
+// ---- Fix round 2, AC-3 (specs/record-fixed-findings.md): invalid_prior_ids_dropped
+// (the new trust-boundary counter) gets the same rendering treatment. ----
+
+test('optimise-cycle: the Sample completeness section renders invalid_prior_ids_dropped with a real non-zero number when the fixture carries one (fix round 2, AC-3)', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { n: 1, lensDispositionCounts: {}, acVerdicts: [], invalidAcIdsDropped: 0, invalidPriorIdsDropped: 4 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_prior_ids_dropped'))
+  assert.ok(line, `expected a line naming invalid_prior_ids_dropped, report was: ${result.report}`)
+  assert.ok(line.includes('4'), `got: ${line}`)
+})
+
+test('optimise-cycle: the Sample completeness section renders a real ZERO for invalid_prior_ids_dropped on a clean fixture, never omitting the line (fix round 2, AC-3, not vacuous)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const line = result.report.split('\n').find((l) => l.includes('invalid_prior_ids_dropped'))
   assert.ok(line, `expected the line even when clean, report was: ${result.report}`)
   assert.ok(/\b0\b/.test(line), `got: ${line}`)
 })
