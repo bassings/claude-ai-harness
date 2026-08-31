@@ -116,7 +116,7 @@ class TestPlanGuard(unittest.TestCase):
         f = self.fixture(PLAN_OPEN.replace('- [ ] T2', '- [x] T2'))
         result = f.decide()
         self.assertIn('never written as', result.message)
-        self.assertIn("'- [ ] ' checklist lines", result.message)
+        self.assertIn("'- [ ]' checklist lines", result.message)
 
     def test_allows_when_no_marker_file(self):
         empty = tempfile.mkdtemp()
@@ -187,6 +187,37 @@ class TestPlanGuard(unittest.TestCase):
         result = self.fixture(fm).decide()
         self.assertEqual(result.decision, 'allow')
         self.assertIn('status: blocked-on-human: the budget is spent', result.message)
+
+    def test_an_oversized_live_block_status_is_truncated_in_the_message(self):
+        """Round-2 review finding 3: a plan's status line is written by
+        whatever agent is conducting it and can paste arbitrary text (a CI
+        log, a PR body). Quoted back with no limit, it would be re-emitted
+        on every stop for as long as the plan stays blocked, unboundedly
+        bloating the session record. 200,000 characters here stands in for
+        the pasted-CI-log shape; the message must stay bounded regardless."""
+        huge_reason = 'x' * 200_000
+        live = PLAN_OPEN.replace(
+            '# A plan', '# A plan\n\nstatus: blocked-on-human: ' + huge_reason)
+        f = self.fixture(live)
+        result = f.decide()
+        self.assertEqual(result.decision, 'allow')
+        # The quoted status must be truncated to STATUS_QUOTE_LIMIT (200)
+        # characters plus an ellipsis, not the full 200,000-character line.
+        self.assertNotIn(huge_reason, result.message)
+        self.assertIn(
+            'status: blocked-on-human: ' + ('x' * (pg.STATUS_QUOTE_LIMIT - len('status: blocked-on-human: '))) + '...',
+            result.message)
+        self.assertLess(len(result.message), 1000,
+                        'an oversized status line must not make it into an unbounded message')
+
+    def test_truncate_for_quoting_leaves_a_short_line_untouched(self):
+        """The mutation this pairs with: replacing the length check with an
+        unconditional truncate (or an unconditional no-op) is caught by one
+        of this test and test_an_oversized_live_block_status_is_truncated,
+        never both -- proving the len(text) <= limit branch is load-bearing
+        in both directions."""
+        short = 'status: blocked-on-human: short question?'
+        self.assertEqual(pg.truncate_for_quoting(short), short)
 
     def test_historical_block_in_the_conductor_log_does_NOT_disarm_the_guard(self):
         """The defect this test exists for.
@@ -394,6 +425,29 @@ class TestMainEndToEnd(unittest.TestCase):
         })
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, '')
+
+    def test_a_non_string_session_id_does_not_crash_and_is_coerced_to_plain_text(self):
+        """Round-2 review nit: session_id comes straight off the JSON
+        payload, so a malformed caller can hand it a non-string (a JSON
+        number, or worse, an array/object). Uncoerced, that reaches
+        claim()'s '+' string concatenation (a crash for anything but a
+        str) and, in a message, would print with whatever repr its type's
+        default __str__ produces. main() must coerce it to str() once at
+        the boundary rather than either crashing or leaking a non-string
+        type downstream."""
+        proc = self._run({
+            'cwd': self.dir,
+            'session_id': 424242,  # a JSON number, not a string
+            'stop_hook_active': False,
+            'transcript_path': '',
+        })
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        # This session is a bystander on the fixture's conductor (SESSION);
+        # the numeric id must appear as plain text, not a crash or a
+        # bracketed/quoted container repr.
+        self.assertIn('systemMessage', out)
+        self.assertIn('Session 424242 is a bystander', out['systemMessage'])
 
 
 if __name__ == '__main__':

@@ -14,13 +14,16 @@ point the next armed session re-claims.
 
 Every ALLOW now states which of the eleven conditions applied, with one
 deliberate exception (below). A stop that is allowed prints
-{"systemMessage": "<reason>"} and exits 0 without blocking. This does not
-print to the terminal: it is carried on stdout of an exit-0, non-blocking
-Stop hook, which the client parses out of stdout and attaches to the session
-record as its own entry (verified against a real transcript; see the spec
-this shipped against). That is the reader this exists for -- the conductor
-loop and anyone auditing the record -- not a claim that a human sees it
-rendered on screen.
+{"systemMessage": "<reason>"} and exits 0 without blocking. This is carried
+on stdout of an exit-0, non-blocking Stop hook, which the client parses out
+of stdout and writes into the session record as its own hook_system_message
+entry -- verified directly against a real transcript, headless (see
+docs/plan-guard-reasons-mutation-proofs.md). Whether it is ALSO rendered to
+a human in an interactive terminal is not established either way by that
+probe, and nothing here depends on it: the reader this exists for is the
+conductor loop and anyone auditing the record, not necessarily a human
+watching in real time. Do not assert the terminal question either way from
+this comment; re-derive it before relying on it.
 
 The one path that stays silent: no .claude/active-plan marker at all. This
 Stop hook has no matcher, so it runs on every stop in every session with the
@@ -32,6 +35,17 @@ of which have nothing to do with conducted plans, which is the "noise
 nobody reads" failure this change exists to avoid, not the one it exists to
 fix. Every other allow, including the routine one below, fires only once a
 plan is actually being conducted.
+
+The blind spot this silence accepts, stated rather than left implied:
+deleting .claude/active-plan mid-plan disarms the guard completely and now
+produces no narration either, because it silently re-enters this exact "no
+marker" path -- indistinguishable from a session that never touched a plan
+at all. A conducting session is meant to delete the marker only once the
+plan is genuinely done (see skills/conduct-plan/SKILL.md, step 6). Anything
+else that deletes it early -- a bug, a stray `rm`, a test stub -- removes
+the guard's own evidence that a plan was ever being enforced, and this
+design has no way to see that happen. This repo has already seen a test
+stub defeat an earlier check this same way, by deleting this exact file.
 
 The routine, high-frequency case -- a wake source armed, tasks still open,
 everything fine -- is deliberately NOT suppressed, unlike the no-marker
@@ -79,6 +93,14 @@ BLOCKED_MARKER = 'status: blocked-on-human'
 # this branch fixes, just reached through a spelling variant instead of a
 # missing check.
 LOG_HEADING_RE = re.compile(r'^#+\s*conductor log\b', re.IGNORECASE)
+# Round-2 review finding 3: a plan's status line is written by whatever
+# agent is conducting it, and can paste CI logs or PR bodies verbatim.
+# Quoted back into a systemMessage with no limit, an oversized line would
+# be re-emitted on every stop for as long as the plan stays blocked,
+# bloating the session record indefinitely with no upper bound. This is a
+# display limit, not a security boundary -- the JSON stays well-formed
+# regardless of length either way.
+STATUS_QUOTE_LIMIT = 200
 
 # plan_guard_decision()'s return value. decision is one of:
 #   'block'  -- the stop is refused; message is the reason a human/conductor
@@ -164,6 +186,16 @@ def live_block_line(plan_text):
 def blocked_on_human(plan_text):
     """True only for a LIVE block; see live_block_line() for the rule."""
     return live_block_line(plan_text) is not None
+
+
+def truncate_for_quoting(text, limit=STATUS_QUOTE_LIMIT):
+    """Bound how much of a plan's own text is echoed back into a message.
+
+    See the STATUS_QUOTE_LIMIT comment: this is a display limit against an
+    unbounded status line, not a security boundary."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + '...'
 
 
 def read_marker(marker):
@@ -279,16 +311,16 @@ def plan_guard_decision(cwd, stop_hook_active, transcript_lines,
         return _allow(
             'Plan guard: allowed. %s carries a live blocked-on-human '
             'status (%s); the guard will not nag while a human question '
-            'is open.' % (plan_path, line)
+            'is open.' % (plan_path, truncate_for_quoting(line))
         )
     open_tasks = plan.count('- [ ]')
     if open_tasks == 0:
         return _allow(
             'Plan guard: allowed, and this is worth reading. %s counts 0 '
-            "open ('- [ ] ') tasks. The guard is enforcing NOTHING on this "
+            "open ('- [ ]') tasks. The guard is enforcing NOTHING on this "
             'plan right now: either it is genuinely finished (delete '
             ".claude/active-plan), or its tasks were never written as "
-            "'- [ ] ' checklist lines -- which counts as zero too and "
+            "'- [ ]' checklist lines -- which counts as zero too and "
             'disarms the guard exactly as silently.' % plan_path
         )
     if armed:
@@ -314,6 +346,12 @@ def main():
     cwd = payload.get('cwd') or os.getcwd()
     transcript_path = payload.get('transcript_path', '')
     session_id = payload.get('session_id')
+    # Coerce at the boundary: session_id is interpolated into messages with
+    # %s and concatenated with '+' in claim(), so a malformed payload
+    # carrying a non-string session_id (an int, a dict) must become a plain
+    # str here rather than reaching either of those as its raw type.
+    if session_id is not None:
+        session_id = str(session_id)
     if not session_id and transcript_path.endswith('.jsonl'):
         session_id = os.path.basename(transcript_path)[:-6]
     result = plan_guard_decision(
