@@ -1088,13 +1088,235 @@ export function citationPool(records, size = CITATION_POOL_SIZE) {
 // captures today. Matches only at the START of the subject line (a commit
 // merely mentioning "fix:" in prose, e.g. a docs commit, must not count).
 const FIX_COMMIT_RE = /^fix(\([^)]*\))?:/i
-export function countEscapedDefectCandidates(commits) {
+
+// AC-1/AC-2: the RAW figure above
+// counts a "fix:" commit that repairs the pipeline itself (CI config, a
+// flaky test, a hook) exactly the same as one that repairs a real defect a
+// user hit -- measured on this repo's own recent history, roughly a third
+// of "fix:" commits are the former. Tightening the harness inflates the
+// very number meant to brake harness changes, which is backwards. This is
+// a SECOND, narrower figure alongside the raw one (never a replacement --
+// AC-2), counting only "fix:" commits whose changed paths include at least
+// one path OUTSIDE the configured pipeline/tooling exclude globs.
+//
+// AC-3: what counts as "pipeline/tooling" differs by repo (a Python media
+// server, a web app, and this harness itself all keep different things in
+// different places), so it is per-repo configuration, read from the same
+// per-repo override file the harness already uses elsewhere for its own
+// per-repo tuning, `.claude/harness-triggers.json` -- under a NEW key,
+// `escapedDefectExcludePaths`, so it does not collide with that file's
+// existing ui/data/architecture/operability keys. AC-ARCH-8 keeps this
+// file from naming the OTHER reader of those keys by filename, but that
+// reader's own allowlist for them is widened to accept this new key too
+// (see that reader's own CUSTOM_RULE_KEYS), since both consumers read the
+// same file and an unrecognised key there aborts that reader entirely.
+//
+// The default below is deliberately conservative: it excludes only paths
+// that are pipeline/tooling in EVERY repo (CI provider config, dependency
+// lockfiles, and test files/dirs by common naming convention, plus this
+// harness's own `.claude/` bookkeeping directory) and leaves out anything
+// repo-dependent -- e.g. `scripts/**`, `Dockerfile*` or `hooks/**`, any of
+// which is real shipped product in some repo and pure tooling in another.
+// A repo that needs more excluded configures it via the override key.
+export const DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS = [
+  '.github/**',
+  '.gitlab-ci.yml',
+  '.circleci/**',
+  'Jenkinsfile',
+  '.pre-commit-config.yaml',
+  '**/*.lock',
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  'poetry.lock',
+  '**/test/**',
+  '**/tests/**',
+  '**/__tests__/**',
+  '**/*.test.*',
+  '**/*.spec.*',
+  '.claude/**',
+]
+
+const PRODUCT_SOURCE_EXCLUDE_KEY = 'escapedDefectExcludePaths'
+const HARNESS_TRIGGERS_RELATIVE_PATH = '.claude/harness-triggers.json'
+
+// Same measured ReDoS bounds as this harness's other harness-triggers.json
+// reader applies to its own glob keys (an unbounded "**"/"*"/"?" glob
+// compiles to a regex whose backtracking cost grows ~9-10x per added
+// wildcard). This key lives in the SAME file, which on a public repo is as
+// attacker-influenceable as any other harness-triggers.json key, so it
+// gets the same bounds here too.
+const MAX_GLOB_LENGTH = 200
+const MAX_GLOB_WILDCARDS = 6
+const MAX_GLOB_DOUBLESTAR = 3
+const MAX_GLOBS_PER_KEY = 50
+
+// Trims and bounds untrusted glob text before it can reach an error
+// message that flows into the operator-visible report -- same rationale as
+// the harness's other harness-triggers.json reader's own neutralise().
+function neutraliseGlobText(text) {
+  const collapsed = String(text).replace(/\s+/g, ' ').trim()
+  return collapsed.length > 60 ? collapsed.slice(0, 60) + '…' : collapsed
+}
+
+function validateGlobArray(value) {
+  if (!Array.isArray(value)) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" must be an array of glob strings, got ${typeof value}`
+  if (value.length === 0) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" is an empty array, which would exclude nothing -- omit the key entirely to use the default excludes rather than an empty override`
+  if (value.length > MAX_GLOBS_PER_KEY) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" has too many globs: ${value.length}, over the limit of ${MAX_GLOBS_PER_KEY}`
+  for (const g of value) {
+    if (typeof g !== 'string') return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains a non-string glob`
+    if (g.trim() === '') return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains an empty glob string`
+    if (g.length > MAX_GLOB_LENGTH) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains a glob longer than ${MAX_GLOB_LENGTH} characters: ${neutraliseGlobText(g)}`
+    const wildcards = (g.match(/[*?]/g) || []).length
+    if (wildcards > MAX_GLOB_WILDCARDS) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains a glob with too many wildcards (${wildcards}, over ${MAX_GLOB_WILDCARDS}): ${neutraliseGlobText(g)}`
+    const doubleStars = g.split('**').length - 1
+    if (doubleStars > MAX_GLOB_DOUBLESTAR) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains a glob with too many "**" segments (${doubleStars}, over ${MAX_GLOB_DOUBLESTAR}): ${neutraliseGlobText(g)}`
+  }
+  return null
+}
+
+// Same glob->regex expansion as the harness's other harness-triggers.json
+// reader's own globToRe: "**" becomes ".*", a single "*" becomes "[^/]*",
+// "?" becomes "[^/]". Every glob reaching this point has already passed
+// validateGlobArray's bounds, so the backtracking cost this shape can
+// otherwise incur is capped.
+function globToRe(g) {
+  let s = g.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+  s = s.replace(/\*\*/g, '').replace(/\*/g, '[^/]*').replace(//g, '.*')
+  s = s.replace(/\?/g, '[^/]')
+  return new RegExp('^' + s + '$')
+}
+function pathMatchesAny(p, globs) {
+  return globs.some((g) => globToRe(g).test(p))
+}
+
+// AC-3/AC-4: resolves the exclude-glob list for ONE repo root, reading
+// `.claude/harness-triggers.json` directly (this module has real fs
+// access, unlike the workflow scripts -- see the file header) rather than
+// via an agent round-trip. Fails CLOSED on anything that looks like a
+// genuine override the operator intended but that could not be honoured:
+// the file exists but could not be read, is not valid JSON, does not
+// parse to an object, or its escapedDefectExcludePaths value fails shape
+// validation -- each of those returns excludeGlobs:null and a configError
+// string, which the caller must surface as "scoped figure unavailable"
+// rather than silently falling back to the default (a fallback here would
+// look like a real measurement of a repo that configured something
+// different). A MISSING file, or a file that simply does not carry this
+// key, is the ordinary "no override" case: default excludes, no error.
+export function resolveProductSourceExcludeGlobs(root) {
+  const triggersPath = path.join(root, HARNESS_TRIGGERS_RELATIVE_PATH)
+  let exists = false
+  try {
+    exists = fs.existsSync(triggersPath)
+  } catch (e) {
+    return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
+  }
+  if (!exists) return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
+
+  let raw
+  try {
+    raw = fs.readFileSync(triggersPath, 'utf8')
+  } catch (e) {
+    return { excludeGlobs: null, configSource: 'repo-override', configError: `.claude/harness-triggers.json exists but could not be read (${e && e.code ? e.code : 'read error'})` }
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (e) {
+    return { excludeGlobs: null, configSource: 'repo-override', configError: '.claude/harness-triggers.json is not valid JSON' }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { excludeGlobs: null, configSource: 'repo-override', configError: '.claude/harness-triggers.json did not parse to a JSON object' }
+  }
+  if (!(PRODUCT_SOURCE_EXCLUDE_KEY in parsed)) {
+    return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
+  }
+  const value = parsed[PRODUCT_SOURCE_EXCLUDE_KEY]
+  const error = validateGlobArray(value)
+  if (error) return { excludeGlobs: null, configSource: 'repo-override', configError: error }
+  return { excludeGlobs: value, configSource: 'repo-override', configError: null }
+}
+
+// AC-1: parses the raw stdout of exactly
+//   git log --max-count=<N> --name-only --pretty=format:'%x1e%P%x1f%s'
+// (metadata only -- parent hashes, subject line, changed-file paths;
+// NEVER a diff, NEVER file contents) into one {subject, paths} record per
+// commit. %P is the space-separated list of parent hashes: a commit with
+// 2+ parents is a merge, and `--name-only` with no other flags reports NO
+// changed files for a merge commit by git's own default combined-diff
+// suppression -- so a merge commit's paths are UNAVAILABLE by
+// construction, not genuinely empty, and (AC-4) must be told apart from
+// an ordinary commit that really touched nothing (e.g. an --allow-empty
+// commit): paths is `null` for a merge commit, `[]` (or a real list) for
+// everything else.
+const GIT_LOG_RECORD_SEP = ''
+const GIT_LOG_HEADER_SEP = ''
+export function parseGitLogRaw(raw) {
+  const text = typeof raw === 'string' ? raw : ''
+  if (!text) return []
+  // The format string starts every record with the separator, so the
+  // FIRST split segment (everything before the first separator) is always
+  // empty and is dropped here.
+  const blocks = text.split(GIT_LOG_RECORD_SEP).slice(1)
+  return blocks.map((block) => {
+    const lines = block.split('\n')
+    const header = lines[0] || ''
+    const sepIndex = header.indexOf(GIT_LOG_HEADER_SEP)
+    const parentsField = sepIndex === -1 ? '' : header.slice(0, sepIndex)
+    const subject = sepIndex === -1 ? header : header.slice(sepIndex + 1)
+    const isMerge = parentsField.split(' ').filter(Boolean).length >= 2
+    const paths = lines.slice(1).filter((l) => l.trim() !== '')
+    return { subject, paths: isMerge ? null : paths }
+  })
+}
+
+export function countEscapedDefectCandidates(commits, options = {}) {
   const list = Array.isArray(commits) ? commits : []
-  const count = list.filter((c) => c && typeof c.subject === 'string' && FIX_COMMIT_RE.test(c.subject.trim())).length
+  const fixCommits = list.filter((c) => c && typeof c.subject === 'string' && FIX_COMMIT_RE.test(c.subject.trim()))
+  const count = fixCommits.length
+
+  // AC-2: the raw figure/method above is UNCHANGED -- this block only adds
+  // the scoped figure alongside it, never redefines what `count` means.
+  const configSource = options.configSource === 'repo-override' ? 'repo-override' : 'default'
+  const configError = typeof options.configError === 'string' ? options.configError : null
+  const excludeGlobs = configError ? null : (Array.isArray(options.excludeGlobs) ? options.excludeGlobs : DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS)
+
+  let scopedCount = null
+  let scopedExcludedCount = null
+  let scopedUnavailableCount = null
+  if (excludeGlobs) {
+    scopedCount = 0
+    scopedExcludedCount = 0
+    scopedUnavailableCount = 0
+    for (const c of fixCommits) {
+      // AC-4: a commit whose paths are unavailable (not an array -- absent,
+      // or explicitly null for a detected merge) is counted in NEITHER
+      // direction, only in scoped_unavailable_count.
+      if (!Array.isArray(c.paths)) {
+        scopedUnavailableCount++
+        continue
+      }
+      const touchesProduct = c.paths.some((p) => typeof p === 'string' && p !== '' && !pathMatchesAny(p, excludeGlobs))
+      if (touchesProduct) scopedCount++
+      else scopedExcludedCount++
+    }
+  }
+
+  const scopedMethod = configError
+    ? `unavailable: ${configError}`
+    : `scoped heuristic: of the same "fix:" commits counted above, counts only those touching product source -- whose changed paths include at least one path OUTSIDE the configured pipeline/tooling exclude globs (source: ${configSource === 'repo-override' ? '.claude/harness-triggers.json escapedDefectExcludePaths' : 'harness default excludes'}) -- STILL not a verified causal attribution to a specific proposal or merged PR, and a genuine escaped defect fixed under a commit type other than "fix:" is still missed. A commit whose changed paths could not be determined (most commonly a merge commit) is counted in neither scoped_count nor scoped_excluded_count, only scoped_unavailable_count.`
+
   return {
     count,
     n_commits_examined: list.length,
-    method: 'heuristic proxy: count of commit subjects starting with the conventional-commit "fix:" type (optionally scoped) within the examined window -- NOT a verified causal attribution to a specific merged PR; a fix: commit unrelated to any recent proposal still counts, and a genuine escaped defect fixed under a different commit-message type is missed',
+    method: 'heuristic proxy: count of commit subjects starting with the conventional-commit "fix:" type (optionally scoped) within the examined window -- NOT a verified causal attribution to a specific merged PR; a fix: commit unrelated to any recent proposal still counts, and a genuine escaped defect fixed under a different commit-message type is missed. A second, narrower scoped_count is reported alongside this raw figure -- see scoped_method.',
+    scoped_count: scopedCount,
+    scoped_excluded_count: scopedExcludedCount,
+    scoped_unavailable_count: scopedUnavailableCount,
+    scoped_config_source: configSource,
+    scoped_exclude_globs: excludeGlobs || [],
+    scoped_method: scopedMethod,
   }
 }
 
@@ -1291,7 +1513,16 @@ export function main() {
       // Review round-2 L2: same fix as the `ci` command above.
       return { error: 'stdin was not valid JSON (invalid JSON syntax)', count: null }
     }
-    return countEscapedDefectCandidates(Array.isArray(payload && payload.commits) ? payload.commits : [])
+    // AC-1: the agent no longer parses
+    // git log output itself -- it captures `git log --name-only
+    // --pretty=format:'%x1e%P%x1f%s'`'s raw stdout verbatim into
+    // git_log_raw, and this script does all parsing/scoring deterministically
+    // (parseGitLogRaw), so a mis-parse can never silently misattribute a
+    // changed path to the wrong commit.
+    const commits = parseGitLogRaw(typeof payload.git_log_raw === 'string' ? payload.git_log_raw : '')
+    const root = typeof payload.root === 'string' && payload.root ? payload.root : process.cwd()
+    const config = resolveProductSourceExcludeGlobs(root)
+    return countEscapedDefectCandidates(commits, config)
   }
   if (command === 'ids') {
     const raw = readStdin()

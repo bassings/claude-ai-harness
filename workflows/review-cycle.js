@@ -783,7 +783,18 @@ if (scope.harness_triggers_file_exists === false && scope.custom_rules !== null)
 // value throws an unrelated error deep in glob compilation and a stray key
 // is silently ignored -- neither of which names what is actually wrong with
 // the repo's override file.
-const CUSTOM_RULE_KEYS = ['ui', 'data', 'architecture', 'operability']
+//
+// 'escapedDefectExcludePaths' is a SECOND consumer of this same file, not a
+// review-cycle trigger: workflows/lib/optimise-read.mjs reads it (in a
+// wholly separate, per-PR-uninvoked delivery-metrics script -- see that
+// file's DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS) to scope a git-history
+// counter-metric to product source. It has to be accepted here too, or a
+// repo that sets it would fail every review-cycle run with "unrecognised
+// key" the moment it also configures a trigger override -- this loop
+// otherwise still validates its shape (array-of-bounded-globs) exactly
+// like the four review-cycle keys; it is simply never read into
+// `rules` below, since no lens triggers on it.
+const CUSTOM_RULE_KEYS = ['ui', 'data', 'architecture', 'operability', 'escapedDefectExcludePaths']
 if (scope.custom_rules !== null) {
   for (const key of Object.keys(scope.custom_rules)) {
     if (!CUSTOM_RULE_KEYS.includes(key)) {

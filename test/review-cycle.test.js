@@ -1057,6 +1057,28 @@ test('review-cycle.js: custom_rules with all four known keys, each a valid array
   assert.equal(result.telemetry.outcome, 'done')
 })
 
+// AC-3: escapedDefectExcludePaths is a
+// SECOND consumer of this same file (the optimiser's escaped-defect
+// scoping, workflows/lib/optimise-read.mjs), not a review-cycle trigger --
+// it must be ACCEPTED (not rejected as an unrecognised key) so a repo that
+// sets it does not fail every review just because it also happens to carry
+// a harness-triggers.json, but it must never affect which lens triggers.
+test('review-cycle.js: custom_rules with escapedDefectExcludePaths (the optimiser\'s own key, not a review-cycle trigger) is accepted, not rejected as unrecognised, and does not itself trigger any lens (AC-SEC-3)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        harness_triggers_file_exists: true,
+        custom_rules: { escapedDefectExcludePaths: ['.github/**'] },
+        files: [{ path: 'src/plain.js', status: 'M' }],
+      },
+    }),
+  })
+  assert.equal(result.telemetry.outcome, 'done', 'must not abort with HarnessTriggersShapeInvalid')
+  assert.ok(!result.lenses.includes('lens-operability'), 'escapedDefectExcludePaths must not itself trigger lens-operability or any other lens')
+})
+
 // AC-SEC-4: custom_rules content (a glob string) must never reach a later
 // agent prompt -- it is matched by regex in the sandbox only.
 test('review-cycle.js: no content from custom_rules is interpolated into any later agent prompt (AC-SEC-4)', async () => {
