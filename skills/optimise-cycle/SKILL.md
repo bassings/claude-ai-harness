@@ -45,10 +45,11 @@ Reads: each analysed repo's `.claude/harness-ledger.jsonl` (via
 `workflows/lib/optimise-read.mjs`'s `ledger` command), GitHub Actions run and
 JOB METADATA ONLY via `gh` (never a job's log output, never `--log`, never a
 `/logs` endpoint -- AC-SEC-7), and the current repo's own recent commit
-subjects (`git log`, metadata only, never diffs) for the escaped-defect
-heuristic. Repos and paths come only from `args.repos` or its documented
-default; never from a path found inside a ledger line, a plan file, a commit
-message, or `gh` output (AC-SEC-7).
+subjects AND changed-file paths (`git log --name-only`, metadata only, never
+a diff and never file contents) for the escaped-defect heuristic. Repos and
+paths come only from `args.repos` or its documented default; never from a
+path found inside a ledger line, a plan file, a commit message, or `gh`
+output (AC-SEC-7).
 
 Never mutates anything (AC-SEC-9): no `git commit`, `git push`, `gh pr
 create/merge/edit`, no `gh api` write. The **only** file any step may create
@@ -119,13 +120,38 @@ wrote:
 ## The escaped-defect counter-metric
 
 Every removal/demotion/skip proposal's report includes the escaped-defect
-counter-metric so the removal is not unbraked (AC-PROD-7): a **heuristic
-proxy**, derived from git history (commit subjects matching the
-conventional-commit `fix:` type within the examined window), computed by
-`workflows/lib/optimise-read.mjs`'s `escaped-defects` command -- **not** a
-verified causal attribution to a specific merged PR. State this limitation
-plainly in the report every time; do not let a reader mistake it for a
-precise count.
+counter-metric so the removal is not unbraked (AC-PROD-7), computed by
+`workflows/lib/optimise-read.mjs`'s `escaped-defects` command from git
+history within the examined window. It is reported as TWO figures, both a
+**heuristic proxy**, neither a verified causal attribution to a specific
+proposal or merged PR:
+
+- **Raw**: every commit subject matching the conventional-commit `fix:`
+  type. Counts a fix unrelated to any recent proposal, and misses a genuine
+  escaped defect fixed under a different commit-message type.
+- **Scoped**: the same `fix:` commits, narrowed to those whose changed
+  paths include at least one path outside the configured pipeline/tooling
+  excludes. This exists because a large share of `fix:` commits are the
+  pipeline repairing itself (CI config, a flaky test, a hook) rather than a
+  defect a user hit -- counting those the same way as a real fix makes the
+  raw figure worse the more the harness itself is worked on, which is
+  backwards for a metric meant to brake harness changes. What counts as
+  "pipeline/tooling" is per-repo configuration (these repos differ), read
+  from `.claude/harness-triggers.json`'s `escapedDefectExcludePaths` array
+  -- the same file and the same per-repo-override mechanism review-cycle.js
+  already uses for its own trigger tuning, so a repo without an override
+  gets a documented harness default
+  (`workflows/lib/optimise-read.mjs`'s `DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS`:
+  CI provider config, dependency lockfiles, and test files/dirs by common
+  naming convention). A commit whose changed paths cannot be determined (a
+  merge commit, most commonly) is counted in neither direction and reported
+  separately as unavailable, never silently folded into either count.
+
+Both figures still carry the same two limitations: neither attributes a fix
+to a specific proposal, and both still miss a genuine escaped defect fixed
+under a commit type other than `fix:`. State both figures, and both
+limitations, plainly in the report every time; do not let a reader mistake
+either one for a precise, causally attributed count.
 
 ## Recording a proposal's outcome (AC-DATA-10)
 
