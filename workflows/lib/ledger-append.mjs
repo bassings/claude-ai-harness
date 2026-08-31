@@ -325,6 +325,15 @@ export const LEDGER_ENTRY_SCHEMA = {
     // now under this field instead of silently inflating `findings`. Same
     // null-vs-zero convention as invalid_fixed_ids_dropped.
     duplicate_fixed_ids_dropped: { type: ['integer', 'null'] },
+    // Fix round 2, AC-3 (specs/record-fixed-findings.md): how many
+    // prior_findings entries were dropped because their supplied `id` did
+    // not match findingId recomputed from that SAME entry's own
+    // lens/location/claim -- a mistyped, stale or fabricated id, caught
+    // before it could ever enter the joinable set. Gated on prior_findings'
+    // OWN presence (not fixed_findings'), since verifying supplied ids is
+    // meaningful even on a request that never confirmed anything this
+    // round. Same null-vs-zero convention as its siblings.
+    invalid_prior_ids_dropped: { type: ['integer', 'null'] },
     // Round-5 H1: bounded, redacted raw retention for exactly the
     // neutralisations counted above (never for ac_id/lens/severity/verdict,
     // which already have their own dedicated *_raw sibling field) -- a
@@ -898,30 +907,60 @@ function computeFindings(descriptors, disposition) {
 // the rest of this file: the offending value is dropped, the drop is
 // counted, and the record is still written.
 //
+// Fix round 2 (specs/record-fixed-findings.md AC-1/AC-3): priorFindings now
+// carries an `id` field too -- sourced, via review-cycle.js's open_findings
+// return value, from the EXACT id ledger-append.mjs itself computed and
+// wrote for that finding the round it was first reported open (never
+// re-typed prose). This is what lets a finding raised `open` in one round
+// and confirmed `fixed` in a later one carry the SAME id across both
+// ledger lines: findingId is a pure function of (lens, location, claim),
+// so passing the untouched original triple through -- instead of a
+// conductor's re-transcription of a markdown report -- reproduces the
+// identical hash on the second write.
+//
+// AC-3, the new trust boundary this creates: the conductor now supplies an
+// id directly, not just prose the writer hashes itself, so a MISTYPED,
+// STALE or FABRICATED id must never be trusted merely because it is
+// present. Every priorFindings entry has its `id` field verified by
+// RECOMPUTING findingId(lens, location, claim) from that SAME entry's own
+// supplied content and comparing -- an entry is only ever entered into
+// priorById when the two agree. A mismatch (or a missing id) is dropped,
+// counted under the returned invalidPriorIdsDropped, and the entry never
+// becomes part of the joinable set for this write -- fail closed, the same
+// shape as every other guard in this file: caught, counted, never trusted.
+//
 // null count/invalidDropped (never a bare 0) when fixedFindingDescriptors
 // was not supplied at all, OR was supplied but was not an array (fix round
 // 1, finding 7: a malformed value reads identically to "absent" here,
 // since Array.isArray() is the only check made) -- matching
 // findings_truncated's own null-vs-zero convention: a run with no
 // prior_findings feature in play, or a caller that sent something
-// unusable, must not read as "measured zero dropped".
+// unusable, must not read as "measured zero dropped". invalidPriorIdsDropped
+// follows the SAME convention but is gated on priorFindings' own presence
+// instead, since verifying supplied ids is meaningful even on a request
+// that never sent fixed_findings at all.
 function computeFixedFindings(priorFindings, fixedFindingDescriptors, stillOpenIds) {
-  if (!Array.isArray(fixedFindingDescriptors)) return { entries: [], invalidDropped: null, duplicateDropped: null }
-  // Keyed by the SAME findingId hash computeFindings uses for every other
-  // disposition, so a fixed_findings entry only matches when its own
-  // lens/location/claim hash to an id already present here -- the id guard.
-  // The matched PRIOR entry's own lens/severity/ac_id are what get written
-  // (never the fixed_findings descriptor's own severity/ac_id, which the
-  // synthesis prompt does not even ask for): this is "the finding
-  // previously reported open, now marked resolved," so its recorded
-  // severity/ac_id stay the ones that were actually reported, not whatever
-  // a confirming echo happens to repeat.
+  // AC-3: validate priorFindings' own supplied ids FIRST, independent of
+  // whether fixed_findings was even supplied this round -- an untrustworthy
+  // id must never quietly enter the joinable set regardless of what else
+  // this request contains.
   const priorById = new Map()
-  for (const f of Array.isArray(priorFindings) ? priorFindings : []) {
-    if (f && typeof f === 'object') {
-      const id = findingId(f.lens, f.location, f.claim)
-      if (!priorById.has(id)) priorById.set(id, f)
+  let invalidPriorIdsDropped = null
+  if (Array.isArray(priorFindings)) {
+    invalidPriorIdsDropped = 0
+    for (const f of priorFindings) {
+      const safe = f && typeof f === 'object' ? f : {}
+      const trueId = findingId(safe.lens, safe.location, safe.claim)
+      if (typeof safe.id !== 'string' || safe.id !== trueId) {
+        invalidPriorIdsDropped += 1
+        continue
+      }
+      if (!priorById.has(trueId)) priorById.set(trueId, safe)
     }
+  }
+
+  if (!Array.isArray(fixedFindingDescriptors)) {
+    return { entries: [], invalidDropped: null, duplicateDropped: null, invalidPriorIdsDropped }
   }
   // Fix round 1, finding 8: a finding a lens is STILL reporting open THIS
   // round is never eligible to also be recorded fixed on the same line --
@@ -964,7 +1003,7 @@ function computeFixedFindings(priorFindings, fixedFindingDescriptors, stillOpenI
       disposition: 'fixed',
     })
   }
-  return { entries, invalidDropped, duplicateDropped }
+  return { entries, invalidDropped, duplicateDropped, invalidPriorIdsDropped }
 }
 
 // Fix round 1, finding 4: a flat concatenate-then-slice truncation let
@@ -1641,6 +1680,19 @@ export function main() {
   const specBugs = computeFindings(payload.spec_bugs, 'spec_bug')
   const rejected = computeFindings(payload.rejected_findings, 'rejected')
   const open = computeFindings(payload.open_findings, 'open')
+  // Fix round 2 (specs/record-fixed-findings.md AC-1): the REAL ids this
+  // write computed for this round's open findings, in the same order they
+  // were supplied -- returned on the CLI result (never persisted as a NEW
+  // field on the ledger line itself; entry.findings already carries these
+  // same ids per-item) so review-cycle.js can hand them back to its own
+  // caller. That is what lets a finding raised open in one round carry the
+  // IDENTICAL id into a later round's confirmation, instead of a
+  // conductor re-typing prose that hashes to a different value. null when
+  // open_findings was not supplied at all, matching the null-vs-absent
+  // convention used throughout this file; an individual null entry means
+  // that ONE descriptor was malformed (mirrors computeFindings' own null
+  // handling for a non-object element).
+  const openFindingIds = Array.isArray(payload.open_findings) ? open.entries.map((e) => (e ? e.id : null)) : null
   // specs/record-fixed-findings.md: prior_findings/fixed_findings are the
   // optional round-two-onward pair (review-cycle.js's prior_findings
   // argument, and the synthesis's own echoed confirmations) -- see
@@ -1705,6 +1757,10 @@ export function main() {
   // sibling counter above.
   if (fixed.duplicateDropped !== null) {
     entry.duplicate_fixed_ids_dropped = fixed.duplicateDropped
+  }
+  // Fix round 2, AC-3: same null-vs-zero convention, alongside its siblings.
+  if (fixed.invalidPriorIdsDropped !== null) {
+    entry.invalid_prior_ids_dropped = fixed.invalidPriorIdsDropped
   }
   // H4: bounded defensively like `findings`, though in practice ac_verdicts
   // is sized by the spec's own AC count times the lens roster -- a few
@@ -1984,6 +2040,14 @@ export function main() {
   if (typeof entry.invalid_fixed_ids_dropped === 'number') extra.invalid_fixed_ids_dropped = entry.invalid_fixed_ids_dropped
   // Fix round 1, finding 1: same reason, alongside its sibling above.
   if (typeof entry.duplicate_fixed_ids_dropped === 'number') extra.duplicate_fixed_ids_dropped = entry.duplicate_fixed_ids_dropped
+  // Fix round 2, AC-3: invalid_prior_ids_dropped rides on the CLI result
+  // too, same reason.
+  if (typeof entry.invalid_prior_ids_dropped === 'number') extra.invalid_prior_ids_dropped = entry.invalid_prior_ids_dropped
+  // Fix round 2, AC-1: openFindingIds is NOT a stored entry field (see its
+  // own comment) -- it rides on the CLI result directly, the only place it
+  // lives, so review-cycle.js's writeLedger step can relay it back to its
+  // own caller as the next round's joinable prior_findings ids.
+  if (Array.isArray(openFindingIds)) extra.open_finding_ids = openFindingIds
   return Object.keys(extra).length ? { ...result(run_id, ts, true, null), ...extra } : result(run_id, ts, true, null)
 }
 

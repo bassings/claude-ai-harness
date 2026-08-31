@@ -917,6 +917,11 @@ function buildReport(d) {
   lines.push(`invalid_fixed_ids_dropped (a fixed_findings confirmation that did not match a genuinely open prior finding): ${fmtCountOrUnavailable(d.rework && d.rework.invalidFixedIdsDropped)}.`)
   lines.push(`duplicate_fixed_ids_dropped (the same confirmed finding listed more than once in one round): ${fmtCountOrUnavailable(d.rework && d.rework.duplicateFixedIdsDropped)}.`)
   lines.push(`duplicate fixed confirmations across rounds (the same finding id recorded fixed again in a later round): ${fmtCountOrUnavailable(d.rework && d.rework.duplicateFixedAcrossRounds)}.`)
+  // Fix round 2, AC-3 (specs/record-fixed-findings.md): invalid_prior_ids_dropped
+  // gets the same rendering treatment -- the new trust boundary this round
+  // created (a supplied prior-finding id that does not match its own
+  // recomputed content is caught here) is worth nothing if nobody sees it.
+  lines.push(`invalid_prior_ids_dropped (a supplied prior_findings id that did not match its own recomputed content -- mistyped, stale or fabricated): ${fmtCountOrUnavailable(d.rework && d.rework.invalidPriorIdsDropped)}.`)
   // Review round-1 H2: the two orphan classes AC-OPS-2 exists to separate
   // -- a start-only orphan and a terminal-only orphan (the START write
   // itself failed) -- were computed by optimise-read.mjs and reached no

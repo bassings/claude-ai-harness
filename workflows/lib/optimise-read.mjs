@@ -324,11 +324,17 @@ export function aggregateRework(records, { root = '' } = {}) {
   // is not treated as one giant coincidence.
   const seenFixedIds = new Set()
   let duplicateFixedAcrossRounds = 0
+  // Fix round 2, AC-3 (specs/record-fixed-findings.md): invalid_prior_ids_dropped
+  // (the writer's own supplied-id-doesn't-match-its-content counter) gets
+  // the same treatment as its siblings above, so it does not become the
+  // NEXT "written to every line and read by nothing" field.
+  let invalidPriorIdsDropped = 0
   for (const r of reviewRecords) {
     if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
     if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
     if (typeof r.invalid_fixed_ids_dropped === 'number') invalidFixedIdsDropped += r.invalid_fixed_ids_dropped
     if (typeof r.duplicate_fixed_ids_dropped === 'number') duplicateFixedIdsDropped += r.duplicate_fixed_ids_dropped
+    if (typeof r.invalid_prior_ids_dropped === 'number') invalidPriorIdsDropped += r.invalid_prior_ids_dropped
     for (const f of r.findings || []) {
       // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
       // not shape-based -- see this file's own header comment): a `lens`
@@ -435,7 +441,7 @@ export function aggregateRework(records, { root = '' } = {}) {
       else entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, unattributedFailBuckets }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -1227,7 +1233,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },

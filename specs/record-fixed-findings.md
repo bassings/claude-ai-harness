@@ -1,6 +1,8 @@
-# Record fixed findings in the run ledger, guarded by the id it was reported open under
+# Record fixed findings in the run ledger, joined across rounds by a verified id
 
-**Status:** implemented, fix round 1 in progress
+<!-- no-acceptance-criteria: this file uses its own AC-1..AC-4 numbering (matching what the code and tests already cite by number), not the AC-<LENS>-<n> multi-lens harness convention -- see "Acceptance criteria" below. The AC-ARCH-9/AC-SEC-2/etc mentions elsewhere in this file are prose references to OTHER specs' pre-existing criteria (explaining why a pinned test or a free-text exclusion exists), never definitions of new ones in this file. -->
+
+**Status:** implemented, fix round 2 in progress
 **Lenses run:** none at planning (implemented directly against a written brief, not through plan-cycle). This file is written retrospectively (fix round 1, finding 6) to close the gap between the code's own citations and a spec that did not exist.
 
 ## Problem
@@ -50,13 +52,20 @@ These three match what the code and tests already cite by number
 `test/ledger-append.test.js`, `test/review-cycle.test.js`,
 `test/ledger-seam.test.js`).
 
-**AC-1**: `review-cycle` accepts an optional `prior_findings` argument.
-Absent, every existing behaviour is byte-for-byte unchanged: no
-prior-findings block reaches the synthesis prompt, no `fixed_findings`
-field is requested, and the terminal ledger payload's `prior_findings`/
-`fixed_findings` both stay `null`. Proven by the existing suite passing
-untouched, plus dedicated tests asserting the absence of the prior-findings
-prompt block and the null payload fields.
+**AC-1** (extended, fix round 2): `review-cycle` accepts an optional
+`prior_findings` argument. Absent, every existing behaviour is
+byte-for-byte unchanged: no prior-findings block reaches the synthesis
+prompt, no `fixed_findings` field is requested, and the terminal ledger
+payload's `prior_findings`/`fixed_findings` both stay `null`. Proven by the
+existing suite passing untouched, plus dedicated tests asserting the
+absence of the prior-findings prompt block and the null payload fields.
+**Fix round 2 adds the identity requirement the original AC-1 did not
+state**: a finding raised `open` in one round and confirmed `fixed` in a
+later one must carry the SAME `id` on both ledger lines, so a reader can
+join the two records. Proven end to end in `test/ledger-seam.test.js` by
+writing two REAL ledger lines (through the real `ledger-append.mjs`, never
+a hand-built payload) and reading both ids back off disk -- see "Fix round
+2" below for how.
 
 **AC-2**: When `prior_findings` is supplied, findings the synthesis
 confirms resolved (by echoing one of the supplied descriptors verbatim) are
@@ -65,18 +74,35 @@ echoed back is never recorded fixed, even though it is present in
 `prior_findings` -- confirmation is required per finding; presence in the
 supplied list alone is not enough.
 
-**AC-3**: The id guard. A claimed-fixed entry whose `findingId` hash does
-not match one already present among `prior_findings`' hashes is dropped,
-counted under `invalid_fixed_ids_dropped`, and the record is still written
-(fail closed, same sanitiser shape as `invalid_ac_ids_dropped` elsewhere in
-this file: the offending value is dropped, the drop is counted, never the
-whole line).
+**AC-3** (extended, fix round 2 -- the criterion this round cares about
+most). Two distinct guards, both fail-closed, both counted, both proven by
+mutation:
+- The ORIGINAL id guard: a claimed-fixed entry whose `findingId` hash does
+  not match one already present among `prior_findings`' hashes is dropped,
+  counted under `invalid_fixed_ids_dropped`, and the record is still
+  written.
+- **The NEW trust boundary fix round 2 introduces**: `prior_findings` now
+  carries an `id` field, supplied by the conductor (sourced from a
+  previous round's own ledger write, never re-typed). A supplied id that
+  does NOT match `findingId` recomputed from that SAME entry's own
+  `lens`/`location`/`claim` -- mistyped, stale, hand-edited or fabricated
+  -- is dropped, counted under `invalid_prior_ids_dropped`, and never
+  becomes part of the joinable set for that write. This is what makes
+  AC-1's identity claim trustworthy rather than merely convenient: a
+  supplied id is only ever honoured after it has been independently
+  re-derived from its own content.
+Both counters follow the same fail-closed sanitiser shape as
+`invalid_ac_ids_dropped` elsewhere in this file: the offending value is
+dropped, the drop is counted, never the whole line.
 
 **AC-4** (delivery discipline, not a runtime behaviour): every guard above
 is mutation-proven in both directions -- the id guard removed, `fixed`
 never written, and every prior finding recorded fixed regardless of
 confirmation -- each mutation observed to fail a real test, then reverted
-and confirmed green again.
+and confirmed green again. Fix round 2 adds: the prior-id verification
+guard removed (a mismatched or missing supplied id trusted anyway), and
+`findingId` recomputation broken so round one and round two ids diverge
+again -- both observed to fail a real test, then reverted.
 
 ## Fix round 1 (2026-08-31)
 
@@ -238,3 +264,108 @@ review-cycle instruction, so a future edit cannot silently delete the
 instruction without failing a test. This proves the instruction still
 exists in the file; it does not and cannot prove any given conductor run
 obeys it.
+
+## Fix round 2 (2026-08-31): cross-round identity
+
+The operator, reading fix round 1's review, chose the thorough option over
+the cheap one: a finding raised `open` in round one and confirmed `fixed`
+in round two must carry ONE identity across both ledger lines, so a reader
+can join them. Demonstrated by execution: the same finding, same location,
+across two rounds, wrote `358720dcff1040e7` (open) and `b0dfa52409dd6e97`
+(fixed) -- two different hashes for one real finding, with
+`invalid_fixed_ids_dropped: 0`, so nothing noticed.
+
+**The cause.** `open_findings` ids are hashed from a lens's own JSON
+`claim` string. `prior_findings`, under fix round 1's design, was whatever
+the conductor re-typed after reading the SYNTHESISED MARKDOWN report --
+prose, not the lens's structured text. `findingId` is a pure function of
+its three inputs, so two different strings, however similar, hash to two
+different ids. Fix round 1's id guard was self-consistent WITHIN one
+request (a claim echoed by synthesis matched a claim the conductor typed
+into `prior_findings` in the SAME request) but had no relationship at all
+to the id a PREVIOUS request actually wrote to the ledger. It joined
+nothing across requests, which was always the point of the feature.
+
+**Two routes, weighed.**
+
+*Route A: the conductor reads the previous round's ledger line*
+(`workflows/lib/optimise-read.mjs`'s `ledger` command, the model-mediated
+shell-out pattern already established at `workflows/optimise-cycle.js:336`).
+Rejected. The ledger deliberately never retains `location`/`claim` free
+text (AC-SEC-2, "no free text, ever" -- `findings` items carry only `{id,
+lens, severity, ac_id, disposition}`). AC-3's guard requires recomputing
+`findingId(lens, location, claim)` from SUPPLIED content and comparing it
+to a supplied id; under Route A the conductor would have the TRUE id but
+no `location`/`claim` to verify it against, or would have to fall back to
+re-typing `location`/`claim` from the markdown report anyway -- reopening
+the exact defect this fix round exists to close, since a lossy
+transcription would almost never rehash to the id it is supposed to
+verify. Route A cannot deliver AC-1 and AC-3 together.
+
+*Route B: the ids travel out in review-cycle's own return value.* Chosen.
+`ledger-append.mjs` already computes the real id for every open finding
+before it ever writes; it now also RETURNS those ids (`open_finding_ids`,
+in the same order `open_findings` was supplied) on the CLI result.
+`review-cycle.js`'s `writeLedger` step relays that array back; review-cycle
+zips it against `openFindingsRaw` (the full `{lens, location, claim,
+severity, ac_id}` descriptors it already held in memory, never stripped)
+and returns the result as a new `open_findings` field on its own public
+return value. A conductor that stores this EXACT array and passes it
+forward, untouched, as next round's `prior_findings` supplies the true id
+alongside the true content that hashes to it -- both AC-1 (same id joins)
+and AC-3 (a genuine pass-through always verifies) fall out of one
+mechanism, with no extra shell-out per round.
+
+**The ordering constraint, resolved.** review-cycle's own return statement
+(`return { ...result, telemetry }`, pinned byte-identical across all three
+workflow files per AC-ARCH-9) runs AFTER the terminal `writeLedger` call
+completes, not before -- so the real id is available in time to be attached
+to `result.open_findings`, assigned onto `result` the same way
+`checkout_moved`/`ledger_write_failed` already are, never inline in the
+pinned return line itself.
+
+**The pinned exact-return-shape test, deliberately widened, not
+removed.** `test/review-cycle.test.js`'s AC-ARCH-10 test (`the result
+carries EXACTLY its documented keys plus telemetry`) now expects
+`open_findings` as an eighth key. The protection that test exists for -- an
+UNDOCUMENTED key silently leaking into the public result (its own original
+motivation: the internal `__outcome` sentinel) -- is fully intact: the
+assertion still fails the instant any key outside this named, reviewed set
+appears. Nothing about the guard's purpose is weakened; its expected value
+was widened for one genuine, reviewed, necessary addition.
+
+**What changed, file by file:**
+- `workflows/lib/ledger-append.mjs`: `computeFixedFindings` gained the
+  prior-id verification guard (AC-3) and now returns `invalidPriorIdsDropped`;
+  `main()` computes and returns `open_finding_ids` on the CLI result
+  (never persisted as a new field on the ledger LINE itself -- `entry.findings`
+  already carries each item's id).
+- `workflows/review-cycle.js`, `workflows/tdd-task.js`, `workflows/plan-cycle.js`:
+  the pinned L5 `writeLedger` block gained `open_finding_ids` on its response
+  schema and return value, mirrored byte-identically across all three (only
+  review-cycle.js ever populates it; the other two always see it `null`).
+  review-cycle.js assigns `result.open_findings` after the terminal write.
+- `workflows/lib/optimise-read.mjs` / `workflows/optimise-cycle.js`:
+  `invalid_prior_ids_dropped` summed, returned, and rendered, the same
+  discipline finding 5 established for its siblings -- a new counter must
+  not become the next "written to every line and read by nothing" field.
+- `skills/conduct-plan/SKILL.md`: the `prior_findings` instruction is now
+  numbered mechanical steps (read `open_findings` from the STRUCTURED
+  return value, store it verbatim in the conductor log tagged by task id,
+  retrieve and pass it forward unmodified on the next round), not prose
+  describing intent (AC-7).
+
+**Honesty, restated plainly (this repo has had to correct this claim
+once already, in fix round 1 -- see finding 3 above).** This joins a
+confirmation to a previously recorded finding, by a verified id. It does
+**not** prove the confirmation is honest: it is still a lens's judgement
+that the thing is resolved, never proof of repair, and nothing in fix
+round 2 changes that. A finding reworded between rounds -- different
+`claim` text, even if it is "the same bug" to a human reader -- still will
+not join: `findingId` recomputes from the exact text, and the safe
+direction remains undercounting, never a false join. What fix round 2 adds
+is narrower than "the number is now trustworthy": it is "a supplied id is
+now verified against its own content before it is trusted," which closes
+one specific failure (a mistyped, stale or fabricated id silently
+producing a joinable record) without closing, or claiming to close, the
+others (a false confirmation, a rubber-stamped list, a reworded finding).

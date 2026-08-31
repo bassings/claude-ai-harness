@@ -55,29 +55,57 @@ task, a Monitor, or a ScheduleWakeup.
    - `awaiting-ci` green → run the review cycle (/review-cycle where
      installed); fix findings or record evidenced rejections → `in-review`.
      CI red → fix, push, re-arm the watch.
-     **On round two of review for the same task and every round after**,
-     pass `prior_findings`: ONLY the findings that task's *immediately
-     preceding* review round reported open, as `{lens, location, claim,
-     severity?, ac_id?}` (you already have this -- you just read that
-     round's report to decide what to fix). Do not accumulate: a finding
-     already confirmed fixed in an earlier round must not be passed again
-     in a later round's `prior_findings` -- the ledger has no memory across
-     lines, so a re-supplied finding would be recorded fixed a second time,
-     inflating the count for something already counted once. review-cycle
-     then asks its own synthesis step to confirm which of the findings you
-     supplied are now resolved, and records a confirmed one in the run
-     ledger as `fixed`, guarded so a claim that does not reference one of
-     the findings you supplied is dropped, never recorded.
+
+     **Mechanical steps for `prior_findings` (specs/record-fixed-findings.md
+     AC-1/AC-3), the SAME shape of instruction as the ledger-write one
+     below, not prose describing intent -- round two of review for the same
+     task, and every round after, follow these before invoking
+     `/review-cycle` again:**
+     1. Before invoking `/review-cycle` for this task, search `## Conductor
+        log` (this plan file, newest entries first) for a line starting
+        `prior_findings for <this task's id>:`. If none exists (this is
+        round one for this task), invoke `/review-cycle` with no
+        `prior_findings` argument at all.
+     2. If one exists, parse the JSON that follows the colon and pass it,
+        VERBATIM, byte-for-byte, as this invocation's `prior_findings`
+        argument. Do not retype it, reformat it, translate it from the
+        markdown report, or edit any field -- especially not `id`. Every
+        entry's `id` must be the exact value review-cycle returned; a
+        recomputed, corrected or "tidied" id fails AC-3's guard and the
+        confirmation is silently dropped.
+     3. After `/review-cycle` returns, take its `open_findings` field
+        (an array of `{id, lens, location, claim, severity, ac_id,
+        recurrence}` -- this is the STRUCTURED return value, never the
+        markdown `report` string) and append ONE new line to `## Conductor
+        log` in this exact form: `prior_findings for <task id>:
+        <JSON.stringify(open_findings)>`. Write it even when the array is
+        empty (`[]`) -- an empty array is real data (nothing is open), not
+        the same as no line at all.
+     4. Do NOT accumulate: step 3's line REPLACES what you pass forward for
+        this task, it does not merge with an earlier one. A finding already
+        confirmed fixed drops out of `open_findings` on its own (the lens
+        stops reporting it), so the next round's search in step 1 finds the
+        latest line and nothing more needs doing. Passing an OLDER line's
+        contents forward, or a hand-merged union of several rounds', is
+        exactly the mistake that used to inflate the fixed count across
+        rounds (fix round 1, finding 2).
+
      **What this proves and what it does not** (fix round 1, finding 3):
      the guard stops a FABRICATED claim -- an id that was never in the list
-     you supplied -- it does not verify that a genuine confirmation is
-     actually true, and a synthesis that echoes your entire list back as
-     "all resolved" passes it with nothing dropped. This is the harness
-     recording "a lens confirmed this specific finding is resolved," not
-     proof of repair: a finding reworded between rounds will not match and
-     stays uncounted rather than being wrongly cleared, which undercounts
-     rather than overcounts on THAT axis -- it says nothing about whether
-     any one confirmation itself was honest.
+     you supplied, or one that does not match its own lens/location/claim
+     when recomputed (fix round 2, AC-3: a mistyped, stale or hand-edited
+     id is caught the same way) -- it does not verify that a genuine
+     confirmation is actually true, and a synthesis that echoes your entire
+     list back as "all resolved" passes it with nothing dropped. This is
+     the harness recording "a lens confirmed this specific finding is
+     resolved," not proof of repair: a finding reworded between rounds will
+     not match and stays uncounted rather than being wrongly cleared, which
+     undercounts rather than overcounts on THAT axis -- it says nothing
+     about whether any one confirmation itself was honest. What fix round 2
+     adds: a finding raised open in one round and confirmed fixed in a
+     later one now carries the SAME id on both ledger lines (step 2's
+     verbatim pass-through is what makes that true), so the two records can
+     be joined by a reader -- this is the join, not new proof of repair.
    - `in-review` clean + user's merge policy allows → merge → `merged`,
      tick the box. If merging needs the user, mark blocked-on-human.
 3. **Log the tick**: append one line to `## Conductor log`: what changed,

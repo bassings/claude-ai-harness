@@ -619,7 +619,7 @@ test('optimise-read CLI: the ledger command\'s output includes rework.invalidFix
     kind: 'review_cycle',
     outcome: 'done',
     spec: 'specs/a.md',
-    prior_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
     fixed_findings: [
       { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
       { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
@@ -631,6 +631,21 @@ test('optimise-read CLI: the ledger command\'s output includes rework.invalidFix
   const out = JSON.parse(res.stdout.trim())
   assert.equal(out.rework.invalidFixedIdsDropped, 1, 'the fabricated confirmation')
   assert.equal(out.rework.duplicateFixedIdsDropped, 1, 'the repeated confirmation')
+})
+
+test('optimise-read CLI: the ledger command\'s output includes rework.invalidPriorIdsDropped, computed from a real record (fix round 2, AC-3)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec: 'specs/a.md',
+    prior_findings: [{ id: 'wrongwrongwrong0', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+  })
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.rework.invalidPriorIdsDropped, 1)
 })
 
 test('optimise-read CLI: the ledger command\'s output includes a citationPool of real run_ids from the window', () => {
@@ -1872,6 +1887,19 @@ test('optimise-read: aggregateRework sums duplicate_fixed_ids_dropped across the
     { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', duplicate_fixed_ids_dropped: 1 },
   ])
   assert.equal(dirty.duplicateFixedIdsDropped, 3, 'must sum across every review_cycle record in the window')
+})
+
+// Fix round 2, AC-3 (specs/record-fixed-findings.md): invalid_prior_ids_dropped
+// (the new trust-boundary counter -- a supplied prior_findings id that did
+// not match its own recomputed content) gets the same summing treatment.
+test('optimise-read: aggregateRework sums invalid_prior_ids_dropped across the window and returns it, a real zero when clean (fix round 2, AC-3)', () => {
+  const clean = mod.aggregateRework([{ kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', invalid_prior_ids_dropped: 0 }])
+  assert.equal(clean.invalidPriorIdsDropped, 0)
+  const dirty = mod.aggregateRework([
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', outcome: 'done', invalid_prior_ids_dropped: 2 },
+    { kind: 'review_cycle', repo: 'demo', spec: 'specs/b.md', outcome: 'done', invalid_prior_ids_dropped: 1 },
+  ])
+  assert.equal(dirty.invalidPriorIdsDropped, 3, 'must sum across every review_cycle record in the window')
 })
 
 // Fix round 1, finding 2 (HIGH, coordinator finding): the ledger has no

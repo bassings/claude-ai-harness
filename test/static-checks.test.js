@@ -293,6 +293,25 @@ test('static: conduct-plan/SKILL.md instructs passing prior_findings to review-c
   assert.ok(/accumulate|only the findings/i.test(skill), 'SKILL.md must warn against re-supplying an already-confirmed finding on a later round')
 })
 
+// Fix round 2, AC-7 (specs/record-fixed-findings.md): the prior_findings
+// instruction must be MECHANICAL steps, the same style as the ledger-write
+// instruction eight lines below it -- not prose describing intent. Checks
+// for the concrete markers a mechanical instruction has that prose does
+// not: numbered steps, an exact field name to read the result from
+// (open_findings, never the markdown report), and an explicit
+// verbatim/byte-for-byte instruction not to retype or recompute the id.
+test('static: conduct-plan/SKILL.md\'s prior_findings instruction is MECHANICAL (numbered steps, an exact field name, an explicit verbatim/byte-for-byte requirement), not prose describing intent (specs/record-fixed-findings.md, fix round 2, AC-7)', () => {
+  const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
+  assert.ok(skill.includes('open_findings'), 'SKILL.md must name the exact field to read the ids from')
+  assert.ok(/verbatim|byte-for-byte/i.test(skill), 'SKILL.md must instruct passing the value through unmodified')
+  assert.ok(/report, never the markdown|never the markdown `report`|never the markdown \`report\`/i.test(skill) || (skill.includes('open_findings') && skill.includes('markdown')), 'SKILL.md must distinguish the structured return value from the markdown report')
+  // Numbered steps: at least "1." and "2." appearing near the prior_findings instruction.
+  const idx = skill.indexOf('Mechanical steps for `prior_findings`')
+  assert.ok(idx !== -1, 'SKILL.md must introduce the mechanical steps explicitly')
+  const nearby = skill.slice(idx, idx + 2500)
+  assert.ok(nearby.includes('1.') && nearby.includes('2.') && nearby.includes('3.'), 'the instruction must be numbered steps, not a paragraph')
+})
+
 test('static: AGENT-HARNESS.md\'s ledger paragraph carries the absolute-timestamp justification and the git-history survival clause, not just README.md (L3, AC-SEC-3/AC-SEC-4)', () => {
   const doc = readAll('AGENT-HARNESS.md')
   assert.ok(/timestamp/i.test(doc), 'AGENT-HARNESS.md must justify why an absolute timestamp is retained')
