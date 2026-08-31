@@ -27,6 +27,7 @@ fixture directories and synthetic transcript lines.
 """
 import json
 import os
+import re
 import sys
 import time
 
@@ -40,7 +41,14 @@ WAKE_MARKERS = (
 USER_TURN_MARKERS = ('"type":"user"', '"type": "user"')
 STALE_CONDUCTOR_SECONDS = 6 * 3600
 BLOCKED_MARKER = 'status: blocked-on-human'
-LOG_HEADING = '## Conductor log'
+# Round-1 review finding 4: matched case-insensitively (any heading level,
+# 'conductor log' in any case) rather than one exact literal string. A plan
+# spelling it '## Conductor Log' previously never split at all, so the WHOLE
+# file read as the live region forever -- a historical block in what is
+# genuinely the log then permanently disarms the guard, the exact defect
+# this branch fixes, just reached through a spelling variant instead of a
+# missing check.
+LOG_HEADING_RE = re.compile(r'^#+\s*conductor log\b', re.IGNORECASE)
 
 
 def tail_lines(path, n=400):
@@ -65,6 +73,19 @@ def wake_armed_since_last_user_turn(lines):
     return any(m in line for line in window for m in WAKE_MARKERS)
 
 
+def _text_before_log_heading(plan_text):
+    """Everything before the conductor-log heading, matched case-insensitively
+    against any heading level (## Conductor log, ### conductor LOG, ...) rather
+    than one exact literal. Returns the whole text unchanged if no such heading
+    is found -- an unheaded plan has no history region to exclude, so every line
+    stays eligible for a live block, matching the guard's fail-loud default."""
+    lines = plan_text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if LOG_HEADING_RE.match(line.strip()):
+            return ''.join(lines[:i])
+    return plan_text
+
+
 def blocked_on_human(plan_text):
     """True only for a LIVE block, never for one a conductor merely recorded.
 
@@ -80,7 +101,7 @@ def blocked_on_human(plan_text):
     the log is treated as history and the guard keeps nagging, which is the
     right way for a guard to fail.
     """
-    head = plan_text.split(LOG_HEADING, 1)[0]
+    head = _text_before_log_heading(plan_text)
     return any(line.strip().startswith(BLOCKED_MARKER)
                for line in head.splitlines())
 

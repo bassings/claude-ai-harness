@@ -139,6 +139,52 @@ class TestPlanGuard(unittest.TestCase):
         self.assertIsNotNone(self.fixture(historical).decide(),
                              'the conductor log is history, whatever its formatting')
 
+    def test_a_differently_cased_conductor_log_heading_still_splits_the_history_region(self):
+        """Round-1 review finding 4: LOG_HEADING used to be one exact-case
+        literal ('## Conductor log'). A plan spelling it '## Conductor Log'
+        (any other case) previously never matched at all, so the split never
+        fired and the WHOLE file read as the live region -- a line-start
+        status recorded after that heading (genuinely history) then
+        disarmed the guard permanently, the same failure shape this branch
+        exists to fix, reached through a spelling variant instead of a
+        missing check.
+
+        Deliberately an UNBOLDED, line-start marker (mirroring
+        test_unbolded_historical_block_in_the_log_also_does_not_disarm just
+        above): a bolded one would already fail the line-start half of
+        blocked_on_human() regardless of region, which would not actually
+        exercise the heading match this test targets.
+        """
+        plan = PLAN_OPEN.replace('## Conductor log', '## Conductor Log') + (
+            '\n- **Tick 9**: escalated, since resolved.\n\n'
+            'status: blocked-on-human: the payment failed\n'
+        )
+        reason = self.fixture(plan).decide()
+        self.assertIsNotNone(
+            reason,
+            'a differently-cased conductor-log heading must still be recognised as the history boundary')
+        self.assertIn('1 task(s) not done', reason)
+
+    def test_marker_mentioned_in_prose_above_the_log_does_NOT_disarm_the_guard(self):
+        """Round-1 review finding 3: region alone is not the discriminator either;
+        line-start matters too, and nothing previously exercised it.
+
+        A plan can legitimately quote the policy instruction itself ("add
+        `status: blocked-on-human: <reason>` under the title and stop")
+        somewhere above the log, in a notes or policy section, without that
+        being a live status line. Dropping the line-start half of
+        blocked_on_human() while keeping the region split reads this prose
+        mention as a real block and wrongly disarms the guard.
+        """
+        prose = PLAN_OPEN.replace(
+            '# A plan',
+            '# A plan\n\nPolicy: add `status: blocked-on-human: <reason>` under the title and stop.'
+        )
+        reason = self.fixture(prose).decide()
+        self.assertIsNotNone(
+            reason, 'a mention of the marker in prose, not at the start of its own line, must not disarm the guard')
+        self.assertIn('1 task(s) not done', reason)
+
     # --- conductor scoping -------------------------------------------------
 
     def test_a_bystander_session_is_not_enforced(self):

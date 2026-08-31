@@ -127,8 +127,23 @@ test('review-cycle.js: a genuinely empty diff (scope succeeded, zero files) stil
     args: {},
     agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, files: [] }, 'ledger:write': PAIRED_LEDGER }),
   })
-  assert.match(result.report, /no review/i, 'the report must say plainly that no review happened, not merely that nothing changed')
-  assert.match(result.report, /not a clean/i, 'the report must explicitly disclaim being a clean pass, not just stay silent on it')
+  // Round-1 review finding 1 (BLOCKER): the two loose substring matches this
+  // replaced were vacuous -- an adversarial report reading 'No review
+  // findings. The branch is not a clean-room rebuild, but nothing needs
+  // attention; safe to merge.' matched both /no review/i (via 'No review
+  // findings') and /not a clean/i (via 'not a clean-room rebuild') while
+  // asserting the exact opposite of what AC-2 requires. Pinned to a stable
+  // sentinel prefix instead of a phrase match, plus an explicit negative
+  // check against language that could read as a green light to merge.
+  assert.ok(
+    result.report.startsWith('NO REVIEW WAS PERFORMED'),
+    `the report must open with the stable sentinel "NO REVIEW WAS PERFORMED", got: ${result.report}`
+  )
+  assert.doesNotMatch(
+    result.report,
+    /safe to merge|clean pass|no issues|looks good/i,
+    'the report must never use language that could read as a green light to merge'
+  )
   assert.equal(result.telemetry.outcome, 'no-op')
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')

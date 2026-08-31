@@ -630,6 +630,23 @@ function writeTree(files) {
   return dir
 }
 
+// Round-1 review finding 2: writeTree() above always git-inits, so nothing
+// in this file previously exercised the git-unavailable path (gitBlind in
+// checkStaleness / a null return from listGitTrackedFiles) -- every fixture
+// was, deliberately, a real git working tree. This builds the one shape
+// that is not: real files on disk with no .git at all, so `git -C dir
+// ls-files` fails the way it would for a non-repo directory or a PATH
+// without git.
+function writeNonGitTree(files) {
+  const dir = fs.mkdtempSync(path.join(TMP_ROOT, 'nongit-tree-'))
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, content)
+  }
+  return dir
+}
+
 // A minimal but representative "published" tree: one file from each
 // pattern shape in CONSUMER_SUBSET_PATTERNS/CONSUMER_OPTIONAL_PATTERNS (a
 // literal name, two single-segment globs, a top-level glob, three
@@ -994,6 +1011,43 @@ test('install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published 
   assert.equal(result.published_files_checked, 0)
   assert.equal(result.blind, true)
   assert.deepEqual(result.drift, [], 'blind must not be disguised as drift either -- it is a distinct, louder signal that nothing could be compared at all')
+})
+
+// Round-1 review finding 2: listGitTrackedFiles() returning null (git
+// unavailable, or publishedDir is not a git working tree at all) is a
+// DIFFERENT case from the empty-published-tree test above -- that one is a
+// real git tree that just has nothing IN the subset. This is the git-itself-
+// unavailable path the module's own comment (listGitTrackedFiles, "Returns
+// null ... checkStaleness() treats null exactly like blind:true, not as a
+// silent fall-back to the unfiltered walk") describes but nothing exercised.
+test('install-consistency: listGitTrackedFiles returns null (not an empty set, not a throw) for a directory that is not a git working tree at all', async () => {
+  const { listGitTrackedFiles } = await loadModule()
+  const dir = writeNonGitTree({ 'AGENT-HARNESS.md': 'harness contract\n' })
+  assert.equal(listGitTrackedFiles(dir), null, 'a non-git directory must report null, distinguishable from a git tree that legitimately tracks nothing')
+})
+
+test('install-consistency: checkStaleness reports blind:true AND published_files_checked:0 when the published tree is not a git working tree at all (git unavailable / gitBlind), never silently falling back to the unfiltered filesystem walk (AC-1, round-1 review finding 2)', async () => {
+  const { checkStaleness } = await loadModule()
+  // Real subset files present on disk, deliberately with NO .git: this is
+  // what would betray a regression to the unfiltered walk. `blind` alone
+  // cannot catch it -- blind is `gitBlind || publishedFiles.length === 0`,
+  // so it stays true either way once gitBlind is true. published_files_checked
+  // is the field that would change: 0 if git-unavailable correctly yields no
+  // candidates, non-zero (3, matching the fixture below) if it silently fell
+  // back to walking the filesystem unfiltered -- reintroducing exactly the
+  // hooks/__pycache__ false-positive class listGitTrackedFiles exists to close.
+  const nonGitPublished = writeNonGitTree({
+    'AGENT-HARNESS.md': 'harness contract\n',
+    'agents/lens-security.md': 'lens security\n',
+    'workflows/plan-cycle.js': 'plan cycle\n',
+  })
+  const install = publishedSubsetTree()
+  const result = checkStaleness(nonGitPublished, install)
+  assert.equal(result.blind, true, 'a non-git published tree must be reported blind, git being unavailable is a "cannot verify" case, not a "nothing published" one')
+  assert.equal(
+    result.published_files_checked, 0,
+    'git unavailable must never fall back to the unfiltered filesystem walk -- published_files_checked must stay 0, not count the real files present on disk'
+  )
 })
 
 // round-one review MED-8(b): per-PATTERN blindness, independent of the

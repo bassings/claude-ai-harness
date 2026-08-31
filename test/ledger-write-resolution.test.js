@@ -41,6 +41,20 @@ async function firstLedgerWritePrompt(file, args) {
   try {
     ;({ calls } = await runWorkflow(file, { args, agent: {} }))
   } catch (e) {
+    // Round-1 review finding 6: this helper is shared across all three
+    // workflows, so a bare catch would swallow ANY unexpected throw from
+    // ANY of them, not only review-cycle.js's deliberate scope-agent-failed
+    // throw (AC-1). Narrowed to the one error this fixture is known to
+    // produce -- an unexpected rejection (a different workflow throwing
+    // where it should still return, or review-cycle throwing something
+    // other than the scope-step failure) fails loudly here instead of
+    // being silently absorbed and possibly masking a real regression.
+    assert.match(
+      String(e && e.message),
+      /^ScopeStepFailed:/,
+      `firstLedgerWritePrompt(${file}) caught an unexpected rejection -- only review-cycle.js's totally-failed-scope ` +
+        `throw is expected here, so this must not be silently swallowed: ${e && e.message}`
+    )
     calls = e.calls
   }
   const call = calls.find((c) => c.opts.label === 'ledger:write')
