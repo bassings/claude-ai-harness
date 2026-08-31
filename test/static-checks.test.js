@@ -315,9 +315,12 @@ test('static: conduct-plan/SKILL.md\'s prior_findings instruction is MECHANICAL 
   // test, and the suite, green. Dropped; the regex alone is the real check.
   assert.ok(/never\s+the\s+markdown\s+`report`/i.test(skill), 'SKILL.md must distinguish the structured return value from the markdown report')
   // Numbered steps: at least "1." and "2." appearing near the prior_findings instruction.
+  // Window widened fix round 4 (6000, was 2500): the fix round 4 ensure-ignored
+  // paragraph and its own lettered (a/b/c) sub-steps -- also mechanical, not
+  // prose -- now sit between the marker and the "1." numbered list.
   const idx = skill.indexOf('Mechanical steps for `prior_findings`')
   assert.ok(idx !== -1, 'SKILL.md must introduce the mechanical steps explicitly')
-  const nearby = skill.slice(idx, idx + 2500)
+  const nearby = skill.slice(idx, idx + 6000)
   assert.ok(nearby.includes('1.') && nearby.includes('2.') && nearby.includes('3.'), 'the instruction must be numbered steps, not a paragraph')
 })
 
@@ -336,25 +339,26 @@ test('static: .claude/conductor-prior-findings.json (the conductor\'s prior_find
   assert.equal(res.status, 0, 'git check-ignore must exit 0 -- the pattern must genuinely match, not just appear as text in the file')
 })
 
-test('static: conduct-plan/SKILL.md instructs writing prior_findings state to the untracked .claude/conductor-prior-findings.json, and does NOT instruct writing it to the plan file\'s own (tracked) Conductor log (specs/record-fixed-findings.md, fix round 3, finding 1)', () => {
+// Fix round 4, finding 1: this repo's own .gitignore entry (the test just
+// above) is real, but it is a property of claude-ai-harness alone -- it
+// never installs into a delivery repo, so a conductor running anywhere
+// else previously found this path untracked but NOT ignored. SKILL.md must
+// no longer rest on that entry; it must instruct the same per-repo
+// ensure-ignored mechanism the run ledger and the optimiser's own report
+// already use (workflows/lib/optimise-report-ignore.mjs), and refuse to
+// write when that mechanism does not confirm the path is ignored. Presence
+// only: the behavioural proof that this mechanism actually works in a
+// throwaway repo that is NOT claude-ai-harness, and the mutation-resistant
+// checks for fix round 3's own two bypasses, live in
+// test/conduct-plan-prior-findings-protection.test.js (deliberately
+// separate -- this file never builds temp repos, see its own header).
+test('static: conduct-plan/SKILL.md no longer rests its privacy protection on this repo\'s own .gitignore -- it names the real per-repo ensure-ignored mechanism (optimise-report-ignore.mjs + a real git check-ignore) and instructs refusing to write when it fails (specs/record-fixed-findings.md, fix round 4, finding 1)', () => {
   const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
   assert.ok(skill.includes('.claude/conductor-prior-findings.json'), 'SKILL.md must name the untracked state file')
-  assert.ok(/untracked/i.test(skill) || /gitignore/i.test(skill), 'SKILL.md must say the file is untracked/gitignored, not leave that implicit')
-  // The mechanical steps section (between the two markers below) must not
-  // INSTRUCT appending prior_findings data to "## Conductor log" -- that
-  // was the fix round 2 defect. A bare .includes('## Conductor log') is
-  // vacuous here: the block LEGITIMATELY mentions that heading once, in
-  // the sentence saying NEVER to write there, so presence alone proves
-  // nothing (this is the exact fix round 3, finding 4 shape, caught
-  // against my own test rather than shipped). Checked instead for the
-  // OLD instruction's own exact wording (now absent) and the NEW
-  // destination's own exact wording (now present).
-  const start = skill.indexOf('Mechanical steps for `prior_findings`')
-  const end = skill.indexOf('What this proves and what it does not')
-  assert.ok(start !== -1 && end > start, 'could not locate the mechanical-steps block')
-  const block = skill.slice(start, end)
-  assert.ok(!/append ONE new line to `## Conductor\s+log`/.test(block), 'the mechanical-steps block must not still instruct appending prior_findings data into the tracked Conductor log (the fix round 2 defect)')
-  assert.ok(/write the whole object back/i.test(block), 'the mechanical-steps block must instruct the NEW write target')
+  assert.ok(skill.includes('optimise-report-ignore.mjs'), 'SKILL.md must name the real ensure-ignored mechanism')
+  assert.ok(/check-ignore/.test(skill), 'SKILL.md must mention verifying with a real git check-ignore')
+  assert.ok(/do not write|refus/i.test(skill), 'SKILL.md must instruct refusing to write when the path is not confirmed ignored')
+  assert.ok(/never install|does not install|not.*install.*gitignore|\.gitignore.*never/i.test(skill), 'SKILL.md must state plainly that the harness install does not carry .gitignore into a delivery repo')
 })
 
 // Fix round 3, finding 3 (specs/record-fixed-findings.md): review-cycle.js's

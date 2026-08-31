@@ -755,18 +755,39 @@ deliberate, accepted trade-off, not an oversight: AC-DATA-4's git-clean-
 survival clause is an accepted FAIL for this path.
 
 **The same discipline applies to `.claude/conductor-prior-findings.json`**
-(specs/record-fixed-findings.md, fix round 3): `conduct-plan`'s cross-round
-state for the `fixed`-disposition feature above, carrying every open
-finding's `location` and `claim` VERBATIM -- the same class of free text
-(AC-SEC-2) the ledger schema itself is designed to keep out. It is
-gitignored the same way (listed in the tracked `.gitignore`, not only
-`.git/info/exclude`) and for the same reason: a lens's own quoted evidence
-can include a secret or a source line, and this repository is public.
-Unlike the ledger, this file is written by prose (`skills/conduct-plan/SKILL.md`),
-never by `ledger-append.mjs` or any other real-Node script -- there is no
-code-level `ensureGitignored()` check for it, only the tracked `.gitignore`
-entry, verified in `test/static-checks.test.js` against a real
-`git check-ignore`.
+(specs/record-fixed-findings.md): `conduct-plan`'s cross-round state for the
+`fixed`-disposition feature above, carrying every open finding's `location`
+and `claim` VERBATIM -- the same class of free text (AC-SEC-2) the ledger
+schema itself is designed to keep out. This file is written by prose
+(`skills/conduct-plan/SKILL.md`), never by `ledger-append.mjs` or any other
+real-Node script.
+
+Fix round 3 protected it by listing it in THIS repo's own tracked
+`.gitignore`. That line lives only in `claude-ai-harness`'s own git history
+and is never installed anywhere else -- the harness install carries
+`AGENT-HARNESS.md`, `agents/`, `workflows/`, `hooks/` and `skills/` into a
+delivery repo, never `.gitignore` -- so a `conduct-plan` conductor running in
+an operator's real delivery repo found this path genuinely untracked but NOT
+ignored: one ordinary `git add -A` away from being committed. Fix round 4
+replaces this with the same per-repo mechanism the run ledger's own
+`ensureGitignored()` and the optimiser's own report already use:
+`workflows/lib/optimise-report-ignore.mjs`'s `ensureIgnored(root,
+relativePath)`, invoked by SKILL.md's own prose (not code -- there is still
+no `ensureGitignored()` call site for this file) before every write. It
+writes to the CURRENT repo's `.git/info/exclude`, never a tracked
+`.gitignore`, and verifies with a real `git check-ignore`; SKILL.md instructs
+refusing the write outright when that check does not report success. This
+repo's own tracked `.gitignore` entry is left in place as a second,
+redundant layer here, but the operative protection for a delivery repo is
+the per-repo mechanism, proven in a throwaway repo (not `claude-ai-harness`)
+by `test/conduct-plan-prior-findings-protection.test.js`.
+
+**Retention**: entries are keyed `<plan file>:<task id>` and accumulate for
+every task, of every plan, the repo ever conducts -- there is no automatic
+expiry while a plan is in flight. SKILL.md's Done step prunes this plan's own
+keys (the `<plan file>:` prefix) when the plan finishes, leaving any other
+plan's entries untouched; before this fix (fix round 4, finding 3), nothing
+ever deleted this data and it survived indefinitely.
 
 **Known limitations**: an absolute `spec` path reached through a
 **symlinked ANCESTOR directory** (e.g. a checkout cloned at, or accessed
