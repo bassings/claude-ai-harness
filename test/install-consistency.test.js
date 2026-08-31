@@ -16,6 +16,14 @@ const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
 
+// AC-1 (this file's own writeTree() fixtures now shell out to `git init` --
+// see gitInitAndCommit() below): scrubbed at module load, same as
+// test/static-checks.test.js, so an inherited GIT_DIR cannot redirect that
+// `git init`/`git add`/`git commit` into a real repository. See
+// test/helpers/git-env.js's own header for why this is per-file, not
+// suite-wide, and why it must be called (not merely imported) here.
+require('./helpers/git-env.js').scrubGitEnv()
+
 const SCRIPT = path.join(__dirname, '..', 'workflows', 'lib', 'install-consistency.mjs')
 const MODULE_URL = pathToFileURL(SCRIPT).href
 
@@ -583,12 +591,54 @@ test('install-consistency: the CLI never touches the fixture directory it reads 
 // message, not only via an opaque subprocess run).
 // ============================================================================
 
+// AC-1: checkStaleness() now reads the published side through git ls-files,
+// so a tree used as its "published" argument has to be a real git working
+// tree with every written file actually tracked, or the whole run goes
+// blind (see listGitTrackedFiles()'s comment in the production module).
+// Applied unconditionally to every writeTree() output rather than only the
+// ones used as "published": a git repo the install side happens to carry
+// too is harmless (checkStaleness() never runs git against installDir), and
+// this keeps one tree builder instead of two that must be told apart at
+// every call site.
+function gitInitAndCommit(dir) {
+  const run = (args) => {
+    const res = spawnSync('git', args, { cwd: dir, encoding: 'utf8' })
+    if (res.status !== 0) {
+      throw new Error(`git ${args.join(' ')} failed in test fixture ${dir}: ${res.stderr}`)
+    }
+  }
+  run(['init', '-q'])
+  run(['add', '-A'])
+  // Throwaway fixture repos only, never the real project history -- the
+  // explicit identity and gpgsign=false avoid depending on this machine's
+  // global git config to make a commit succeed at all.
+  run(['-c', 'user.name=install-consistency test fixture', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'fixture'])
+}
+
 // A plain directory tree builder, deliberately more general than
 // writeFixture() above (which is shaped for the four consistency-check
 // inputs specifically): the staleness check compares two arbitrary trees
 // of relative paths, so this takes a flat {relPath: content} map instead.
 function writeTree(files) {
   const dir = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(abs), { recursive: true })
+    fs.writeFileSync(abs, content)
+  }
+  gitInitAndCommit(dir)
+  return dir
+}
+
+// Round-1 review finding 2: writeTree() above always git-inits, so nothing
+// in this file previously exercised the git-unavailable path (gitBlind in
+// checkStaleness / a null return from listGitTrackedFiles) -- every fixture
+// was, deliberately, a real git working tree. This builds the one shape
+// that is not: real files on disk with no .git at all, so `git -C dir
+// ls-files` fails the way it would for a non-repo directory or a PATH
+// without git.
+function writeNonGitTree(files) {
+  const dir = fs.mkdtempSync(path.join(TMP_ROOT, 'nongit-tree-'))
   for (const [rel, content] of Object.entries(files)) {
     const abs = path.join(dir, rel)
     fs.mkdirSync(path.dirname(abs), { recursive: true })
@@ -915,6 +965,44 @@ test('install-consistency: checkStaleness never reports a file the install has t
   assert.deepEqual(result.drift, [], 'CLAUDE.md (never shipped) and agents/implementer.md (shipped, but deliberately excluded from the subset) are both outside the consumer subset for different reasons, and neither may ever appear in drift')
 })
 
+// AC-1 (measured false positive): listConsumerSubsetFiles() walks the
+// filesystem, so an untracked build artefact sitting in a watched directory
+// -- hooks/__pycache__/*.pyc, gitignored at .gitignore:12, written by
+// Python on every hook run -- used to be reported "published" and then,
+// correctly given that wrong premise, "missing from the install" forever.
+// "Published" means "tracked by git", not "present on disk".
+test('install-consistency: AC-1 -- a file that is gitignored and untracked in a watched directory is never reported missing, because "published" means "tracked by git", not "present on disk"', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree({ '.gitignore': 'hooks/__pycache__/\n' })
+  // Written AFTER publishedSubsetTree()'s own git commit, so it is
+  // genuinely untracked -- exactly the shape Python leaves behind after a
+  // hook runs, not merely uncommitted-but-staged.
+  fs.mkdirSync(path.join(published, 'hooks', '__pycache__'), { recursive: true })
+  fs.writeFileSync(path.join(published, 'hooks', '__pycache__', 'destructive-git-guard.cpython-314.pyc'), 'bytecode, never shipped\n')
+  const install = publishedSubsetTree() // a normal install: no __pycache__ at all
+  const result = checkStaleness(published, install)
+  assert.equal(result.missing_count, 0, 'a gitignored, untracked build artefact must never be counted as a file the repo published')
+  assert.deepEqual(result.missing, [])
+  assert.equal(result.blind, false, 'the fix must genuinely verify the install, not merely refuse to look')
+  assert.equal(result.status, 'ok')
+})
+
+// AC-5: the direction that must not be weakened. Filtering the published
+// side down to git-tracked files must never also hide a REAL missing file
+// -- a fix that made `missing` always empty would pass the AC-1 test above
+// for the wrong reason (see this test's own mutation proof in the report).
+test('install-consistency: AC-5 -- a genuinely tracked, published file that is absent from the install is still reported missing (the git-tracked filter narrows what counts as published, it must not narrow what counts as checked)', async () => {
+  const { checkStaleness } = await loadModule()
+  const published = publishedSubsetTree()
+  const install = publishedSubsetTree()
+  fs.rmSync(path.join(install, 'agents', 'lens-security.md'))
+  const result = checkStaleness(published, install)
+  assert.deepEqual(result.missing, ['agents/lens-security.md'])
+  assert.equal(result.missing_count, 1)
+  assert.equal(result.blind, false)
+  assert.equal(result.status, 'drift')
+})
+
 test('install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published tree (zero subset files found) reports blind:true, never "no drift" (the CLAUDE.md-documented failure shape: a guard that finds zero files and calls that clean)', async () => {
   const { checkStaleness } = await loadModule()
   const emptyPublished = writeTree({ 'README.md': 'nothing in the subset here\n' })
@@ -923,6 +1011,43 @@ test('install-consistency: checkStaleness is ANTI-VACUOUS -- an empty published 
   assert.equal(result.published_files_checked, 0)
   assert.equal(result.blind, true)
   assert.deepEqual(result.drift, [], 'blind must not be disguised as drift either -- it is a distinct, louder signal that nothing could be compared at all')
+})
+
+// Round-1 review finding 2: listGitTrackedFiles() returning null (git
+// unavailable, or publishedDir is not a git working tree at all) is a
+// DIFFERENT case from the empty-published-tree test above -- that one is a
+// real git tree that just has nothing IN the subset. This is the git-itself-
+// unavailable path the module's own comment (listGitTrackedFiles, "Returns
+// null ... checkStaleness() treats null exactly like blind:true, not as a
+// silent fall-back to the unfiltered walk") describes but nothing exercised.
+test('install-consistency: listGitTrackedFiles returns null (not an empty set, not a throw) for a directory that is not a git working tree at all', async () => {
+  const { listGitTrackedFiles } = await loadModule()
+  const dir = writeNonGitTree({ 'AGENT-HARNESS.md': 'harness contract\n' })
+  assert.equal(listGitTrackedFiles(dir), null, 'a non-git directory must report null, distinguishable from a git tree that legitimately tracks nothing')
+})
+
+test('install-consistency: checkStaleness reports blind:true AND published_files_checked:0 when the published tree is not a git working tree at all (git unavailable / gitBlind), never silently falling back to the unfiltered filesystem walk (AC-1, round-1 review finding 2)', async () => {
+  const { checkStaleness } = await loadModule()
+  // Real subset files present on disk, deliberately with NO .git: this is
+  // what would betray a regression to the unfiltered walk. `blind` alone
+  // cannot catch it -- blind is `gitBlind || publishedFiles.length === 0`,
+  // so it stays true either way once gitBlind is true. published_files_checked
+  // is the field that would change: 0 if git-unavailable correctly yields no
+  // candidates, non-zero (3, matching the fixture below) if it silently fell
+  // back to walking the filesystem unfiltered -- reintroducing exactly the
+  // hooks/__pycache__ false-positive class listGitTrackedFiles exists to close.
+  const nonGitPublished = writeNonGitTree({
+    'AGENT-HARNESS.md': 'harness contract\n',
+    'agents/lens-security.md': 'lens security\n',
+    'workflows/plan-cycle.js': 'plan cycle\n',
+  })
+  const install = publishedSubsetTree()
+  const result = checkStaleness(nonGitPublished, install)
+  assert.equal(result.blind, true, 'a non-git published tree must be reported blind, git being unavailable is a "cannot verify" case, not a "nothing published" one')
+  assert.equal(
+    result.published_files_checked, 0,
+    'git unavailable must never fall back to the unfiltered filesystem walk -- published_files_checked must stay 0, not count the real files present on disk'
+  )
 })
 
 // round-one review MED-8(b): per-PATTERN blindness, independent of the

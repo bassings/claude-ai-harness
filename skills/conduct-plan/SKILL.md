@@ -103,8 +103,14 @@ task, a Monitor, or a ScheduleWakeup.
    than stopping. Under /loop, always ScheduleWakeup: match the delay to the
    slowest thing you are waiting on, 1200s+ as a pure heartbeat.
 5. **Blocked on the human?** Add `status: blocked-on-human: <the specific
-   question>` to the plan file, ask the question in your reply, and stop.
-   Remove that line the moment the answer arrives.
+   question>` at the start of its own line, ABOVE the `## Conductor log`
+   heading (the plan's frontmatter or just under its title -- never
+   appended to the log itself, which step 3 has you writing to every tick).
+   The plan-guard Stop hook only reads a line-start status above that
+   heading as a LIVE block; one below it, or not at the start of its own
+   line, reads as history and the hook refuses to let you stop. Ask the
+   question in your reply, and stop. Remove that line the moment the answer
+   arrives.
 6. **Done?** All boxes ticked: delete `<repo>/.claude/active-plan`, stop the
    loop (ScheduleWakeup stop:true if under /loop), and report: what shipped,
    what was rejected with evidence, what remains as recorded debt.

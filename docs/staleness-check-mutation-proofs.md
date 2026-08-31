@@ -79,10 +79,12 @@ green.
 **Guarded by**: the ANTI-VACUOUS unit test, the CLI blind test, and (at the
 full end-to-end level) the weekly-runner anti-vacuity test below.
 
-**Mutation**: --
+**Mutation**: -- (updated to the current line; AC-1's git-tracked narrowing
+later added the `gitBlind ||` term, so the quoted line has moved since this
+proof was first recorded, per round-1 review finding 8)
 
 ```js
-const blind = publishedFiles.length === 0
+const blind = gitBlind || publishedFiles.length === 0
 ```
 
 -- replaced with `const blind = false`, unconditionally.
