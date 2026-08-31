@@ -15,6 +15,17 @@ end a tick only (a) with the plan done, (b) blocked on a human decision and
 the plan marked so, or (c) with at least one armed wake source: a background
 task, a Monitor, or a ScheduleWakeup.
 
+Every time the hook allows a stop, it now names which of those conditions
+applied via `systemMessage` on the hook's own stdout, which lands in the
+session record as its own entry (not something a human necessarily sees
+rendered). This closes the gap where "plan finished", "waiting on a human"
+and "the guard is silently broken" all used to look identical from outside:
+a stop with tasks still open and nothing armed should never be silent, and
+if it is, the guard itself has stopped working. The one exception is a stop
+with no `.claude/active-plan` marker at all: that fires on every ordinary
+stop in every session, conducted or not, so it stays silent by design
+rather than narrating a condition that does not apply here.
+
 ## First invocation for a plan
 
 1. Read the plan file (from args). If it has no `## Tasks` checklist, create
