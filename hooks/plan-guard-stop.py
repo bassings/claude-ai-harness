@@ -12,24 +12,68 @@ session is enforced; other sessions in the repo stop freely. A claim goes
 stale when the conductor's transcript has been silent for six hours, at which
 point the next armed session re-claims.
 
-Allows the stop when:
-  - stop_hook_active is set (never double-block; the escape hatch),
-  - another session holds a live conductor claim (bystander),
-  - the plan file is missing, fully done, or carries a LIVE
-    blocked-on-human status (above the conductor log, at line start;
-    a block recorded in the log is history and does not disarm it),
-  - the transcript tail shows a wake source armed since the last user turn
-    (ScheduleWakeup, Monitor, Workflow launch, or a background task/agent).
-Otherwise returns {"decision": "block"} naming what to arm.
+Every ALLOW now states which of the eleven conditions applied, with one
+deliberate exception (below). A stop that is allowed prints
+{"systemMessage": "<reason>"} and exits 0 without blocking. This is carried
+on stdout of an exit-0, non-blocking Stop hook, which the client parses out
+of stdout and writes into the session record as its own hook_system_message
+entry -- verified directly against a real transcript, headless (see
+docs/plan-guard-reasons-mutation-proofs.md). Whether it is ALSO rendered to
+a human in an interactive terminal is not established either way by that
+probe, and nothing here depends on it: the reader this exists for is the
+conductor loop and anyone auditing the record, not necessarily a human
+watching in real time. Do not assert the terminal question either way from
+this comment; re-derive it before relying on it.
 
-Test rig: plan_guard_decision() takes its inputs explicitly; tests feed it
-fixture directories and synthetic transcript lines.
+The one path that stays silent: no .claude/active-plan marker at all. This
+Stop hook has no matcher, so it runs on every stop in every session with the
+harness installed, whether or not that session has ever touched a plan; that
+is the single most frequent path by a wide margin, and it means "this guard
+has nothing to do here", not "the guard checked and decided". Narrating it
+would put a plan-guard message on essentially every Claude Code stop, most
+of which have nothing to do with conducted plans, which is the "noise
+nobody reads" failure this change exists to avoid, not the one it exists to
+fix. Every other allow, including the routine one below, fires only once a
+plan is actually being conducted.
+
+The blind spot this silence accepts, stated rather than left implied:
+deleting .claude/active-plan mid-plan disarms the guard completely and now
+produces no narration either, because it silently re-enters this exact "no
+marker" path -- indistinguishable from a session that never touched a plan
+at all. A conducting session is meant to delete the marker only once the
+plan is genuinely done (see skills/conduct-plan/SKILL.md, step 6). Anything
+else that deletes it early -- a bug, a stray `rm`, a test stub -- removes
+the guard's own evidence that a plan was ever being enforced, and this
+design has no way to see that happen. This repo has already seen a test
+stub defeat an earlier check this same way, by deleting this exact file.
+
+The routine, high-frequency case -- a wake source armed, tasks still open,
+everything fine -- is deliberately NOT suppressed, unlike the no-marker
+case above. Reasoning: the incident this guard exists to prevent was a
+guard that had silently stopped enforcing anything for four days, on an
+active plan, and was indistinguishable from a guard correctly deciding
+"armed, all fine" on every one of those days, because both produce silence.
+Muting exactly that tick again would recreate the same blind spot one level
+down: a broken guard and a healthy, ticking one would again look identical
+for as long as the plan stays armed. This message is kept short and
+constant in shape precisely so it can be skimmed or ignored by a human while
+still working as a heartbeat: its absence during an active plan is the
+signal that the guard has gone quiet, checkable from the session record
+without needing anyone to have been watching in real time.
+
+Otherwise returns {"decision": "block", "reason": ...} naming what to arm;
+that path and its exact wording are unchanged.
+
+Test rig: plan_guard_decision() takes its inputs explicitly and returns a
+GuardResult(decision, message) where decision is 'block', 'allow' or
+'silent'; tests feed it fixture directories and synthetic transcript lines.
 """
 import json
 import os
 import re
 import sys
 import time
+from collections import namedtuple
 
 WAKE_MARKERS = (
     '"name":"ScheduleWakeup"', '"name": "ScheduleWakeup"',
@@ -49,6 +93,36 @@ BLOCKED_MARKER = 'status: blocked-on-human'
 # this branch fixes, just reached through a spelling variant instead of a
 # missing check.
 LOG_HEADING_RE = re.compile(r'^#+\s*conductor log\b', re.IGNORECASE)
+# Round-2 review finding 3: a plan's status line is written by whatever
+# agent is conducting it, and can paste CI logs or PR bodies verbatim.
+# Quoted back into a systemMessage with no limit, an oversized line would
+# be re-emitted on every stop for as long as the plan stays blocked,
+# bloating the session record indefinitely with no upper bound. This is a
+# display limit, not a security boundary -- the JSON stays well-formed
+# regardless of length either way.
+STATUS_QUOTE_LIMIT = 200
+
+# plan_guard_decision()'s return value. decision is one of:
+#   'block'  -- the stop is refused; message is the reason a human/conductor
+#               must act on before ending the turn.
+#   'allow'  -- the stop is permitted, and message names which of the ten
+#               narrated conditions allowed it.
+#   'silent' -- the stop is permitted with no output at all (message is
+#               None). Reserved for the single no-marker path; see the
+#               module docstring for why that one path stays quiet.
+GuardResult = namedtuple('GuardResult', ['decision', 'message'])
+
+
+def _block(reason):
+    return GuardResult('block', reason)
+
+
+def _allow(reason):
+    return GuardResult('allow', reason)
+
+
+def _silent():
+    return GuardResult('silent', None)
 
 
 def tail_lines(path, n=400):
@@ -86,8 +160,8 @@ def _text_before_log_heading(plan_text):
     return plan_text
 
 
-def blocked_on_human(plan_text):
-    """True only for a LIVE block, never for one a conductor merely recorded.
+def live_block_line(plan_text):
+    """Return the LIVE blocked-on-human status line (stripped), or None.
 
     A conductor logs every block it hits, so a whole-file search for the
     marker disarms the guard permanently the first time one is written: the
@@ -102,8 +176,26 @@ def blocked_on_human(plan_text):
     right way for a guard to fail.
     """
     head = _text_before_log_heading(plan_text)
-    return any(line.strip().startswith(BLOCKED_MARKER)
-               for line in head.splitlines())
+    for line in head.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(BLOCKED_MARKER):
+            return stripped
+    return None
+
+
+def blocked_on_human(plan_text):
+    """True only for a LIVE block; see live_block_line() for the rule."""
+    return live_block_line(plan_text) is not None
+
+
+def truncate_for_quoting(text, limit=STATUS_QUOTE_LIMIT):
+    """Bound how much of a plan's own text is echoed back into a message.
+
+    See the STATUS_QUOTE_LIMIT comment: this is a display limit against an
+    unbounded status line, not a security boundary."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + '...'
 
 
 def read_marker(marker):
@@ -145,20 +237,33 @@ def claim(marker, plan_path, session_id):
 def plan_guard_decision(cwd, stop_hook_active, transcript_lines,
                         session_id=None, transcripts_dir=None):
     if stop_hook_active:
-        return None
+        return _allow(
+            'Plan guard: allowed without a fresh check. stop_hook_active is '
+            'set, meaning this hook already blocked this stop once this '
+            'turn; blocking again would loop, so this retry is let through '
+            'unconditionally.'
+        )
     marker = os.path.join(cwd, '.claude', 'active-plan')
     if not os.path.isfile(marker):
-        return None
+        return _silent()  # no plan is being conducted here; see module docstring
     try:
         plan_path, conductor = read_marker(marker)
     except OSError:
-        return None
+        return _allow(
+            'Plan guard: allowed. %s exists but could not be read (OSError); '
+            'an unreadable marker cannot be evaluated, so nothing is '
+            'enforced against it.' % marker
+        )
     if not plan_path:
-        return None
+        return _allow(
+            'Plan guard: allowed. %s exists but names no plan file (empty '
+            'or malformed marker); there is nothing to check, so nothing '
+            'is enforced.' % marker
+        )
     if not os.path.isabs(plan_path):
         plan_path = os.path.join(cwd, plan_path)
     if not os.path.isfile(plan_path):
-        return ('active-plan points at %s, which does not exist. Fix the '
+        return _block('active-plan points at %s, which does not exist. Fix the '
                 'pointer or remove .claude/active-plan.' % plan_path)
 
     armed = wake_armed_since_last_user_turn(transcript_lines)
@@ -167,34 +272,70 @@ def plan_guard_decision(cwd, stop_hook_active, transcript_lines,
     if conductor and session_id:
         if conductor != session_id:
             if not conductor_is_stale(conductor, transcripts_dir):
-                return None  # bystander session; the conductor is enforced
+                return _allow(
+                    'Plan guard: allowed. Session %s is a bystander on '
+                    'plan %s; session %s holds the live conductor claim.'
+                    % (session_id, plan_path, conductor)
+                )
             if armed:
                 claim(marker, plan_path, session_id)  # re-claim a dead conductor's plan
-                return None
+                return _allow(
+                    'Plan guard: allowed. Conductor %s on plan %s has been '
+                    'silent past the %d-hour staleness window; session %s '
+                    'has re-claimed conduction with a wake source armed.'
+                    % (conductor, plan_path, STALE_CONDUCTOR_SECONDS // 3600,
+                       session_id)
+                )
             # stale conductor and this session is not conducting either:
             # fall through to the plan checks so SOMEONE is told.
     elif session_id and armed:
         claim(marker, plan_path, session_id)  # first armed stop claims conduction
-        return None
+        return _allow(
+            'Plan guard: allowed. Plan %s had no conductor claimed; '
+            'session %s has claimed conduction with a wake source armed.'
+            % (plan_path, session_id)
+        )
 
     try:
         with open(plan_path) as f:
             plan = f.read()
     except OSError:
-        return None
-    if blocked_on_human(plan):
-        return None
+        return _allow(
+            'Plan guard: allowed, and this is worth reading. %s exists but '
+            'could not be read (OSError), a race between the existence '
+            'check and the read. The guard is enforcing NOTHING on this '
+            'plan while it cannot read it.' % plan_path
+        )
+    line = live_block_line(plan)
+    if line is not None:
+        return _allow(
+            'Plan guard: allowed. %s carries a live blocked-on-human '
+            'status (%s); the guard will not nag while a human question '
+            'is open.' % (plan_path, truncate_for_quoting(line))
+        )
     open_tasks = plan.count('- [ ]')
     if open_tasks == 0:
-        return None
+        return _allow(
+            'Plan guard: allowed, and this is worth reading. %s counts 0 '
+            "open ('- [ ]') tasks. The guard is enforcing NOTHING on this "
+            'plan right now: either it is genuinely finished (delete '
+            ".claude/active-plan), or its tasks were never written as "
+            "'- [ ]' checklist lines -- which counts as zero too and "
+            'disarms the guard exactly as silently.' % plan_path
+        )
     if armed:
-        return None
-    return ('Plan %s has %d task(s) not done and no wake source was armed '
-            'this turn. Before stopping: arm a wake source (a background '
-            'watch such as `gh pr checks <n> --watch`, a Monitor, or '
-            'ScheduleWakeup), or mark the plan `status: blocked-on-human: '
-            '<the question>`, or tick the remaining tasks done.'
-            % (plan_path, open_tasks))
+        return _allow(
+            'Plan guard: allowed. %s has %d task(s) open and a wake '
+            'source is armed; conduction continues.' % (plan_path, open_tasks)
+        )
+    return _block(
+        'Plan %s has %d task(s) not done and no wake source was armed '
+        'this turn. Before stopping: arm a wake source (a background '
+        'watch such as `gh pr checks <n> --watch`, a Monitor, or '
+        'ScheduleWakeup), or mark the plan `status: blocked-on-human: '
+        '<the question>`, or tick the remaining tasks done.'
+        % (plan_path, open_tasks)
+    )
 
 
 def main():
@@ -205,17 +346,25 @@ def main():
     cwd = payload.get('cwd') or os.getcwd()
     transcript_path = payload.get('transcript_path', '')
     session_id = payload.get('session_id')
+    # Coerce at the boundary: session_id is interpolated into messages with
+    # %s and concatenated with '+' in claim(), so a malformed payload
+    # carrying a non-string session_id (an int, a dict) must become a plain
+    # str here rather than reaching either of those as its raw type.
+    if session_id is not None:
+        session_id = str(session_id)
     if not session_id and transcript_path.endswith('.jsonl'):
         session_id = os.path.basename(transcript_path)[:-6]
-    reason = plan_guard_decision(
+    result = plan_guard_decision(
         cwd,
         bool(payload.get('stop_hook_active')),
         tail_lines(transcript_path),
         session_id=session_id,
         transcripts_dir=os.path.dirname(transcript_path) if transcript_path else None,
     )
-    if reason:
-        print(json.dumps({'decision': 'block', 'reason': reason}))
+    if result.decision == 'block':
+        print(json.dumps({'decision': 'block', 'reason': result.message}))
+    elif result.decision == 'allow':
+        print(json.dumps({'systemMessage': result.message}))
     sys.exit(0)
 
 
