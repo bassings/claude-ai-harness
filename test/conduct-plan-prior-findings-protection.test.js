@@ -134,3 +134,30 @@ test('conduct-plan prior_findings protection: the Done step (step 6) prunes THIS
   assert.ok(/untouched|left as is|not.*delete/i.test(doneBlock), 'step 6 must state that another plan\'s entries are left alone, not wiped along with this one')
   assert.equal(writeTargets(doneBlock).filter((t) => t === '.claude/conductor-prior-findings.json').length, 1, 'step 6 must carry its own WRITE TARGET tag for the pruned write-back')
 })
+
+// Fix round 4, found while verifying the round's own mutation proof: the
+// mechanical-steps check above is scoped to that block, so an instruction to
+// write prior_findings data into the tracked plan file placed ANYWHERE ELSE in
+// SKILL.md is invisible to it. Verified by mutation: appending the leak
+// instruction to the end of the file left the whole suite green, while the
+// same sentence inside the block failed. A conductor reads the entire file,
+// not one section of it, so the guard has to as well.
+//
+// Whole-file counting of the heading alone would be wrong: SKILL.md names
+// `## Conductor log` four times legitimately (a sample plan, the prohibition
+// itself, the tick-logging instruction, and the blocked-on-human placement
+// rule). What is never legitimate is one line naming BOTH the tracked log and
+// the findings payload, which is exactly the shape of an instruction to write
+// the payload there.
+test('conduct-plan prior_findings protection: no line ANYWHERE in SKILL.md names both the tracked `## Conductor log` and the prior_findings payload -- the mechanical-steps check above is block-scoped and cannot see an instruction placed elsewhere in the file', () => {
+  const skill = readSkill()
+  const offenders = skill
+    .split('\n')
+    .map((line, i) => ({ line, n: i + 1 }))
+    .filter(({ line }) => /Conductor log/.test(line) && /(prior_findings|open_findings)/.test(line))
+  assert.deepEqual(
+    offenders.map(({ n, line }) => `${n}: ${line.trim()}`),
+    [],
+    'a line naming both the tracked conductor log and the prior_findings payload is an instruction to leak lens free text into a committed file'
+  )
+})
