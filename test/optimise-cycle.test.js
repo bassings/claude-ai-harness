@@ -64,7 +64,11 @@ function ciFixture(overrides = {}) {
   return { byJob: { 'ci.yml::test': { workflow: 'ci.yml', job: 'test', n: 5, windowStart: '2026-08-01T00:00:00Z', windowEnd: '2026-08-05T00:00:00Z', truncated: false, insufficientData: false, neverFailed: true, meanDurationS: 100 } }, citationPool: ['1001', '1002'], failures: [], ...overrides }
 }
 function gitFixture(overrides = {}) {
-  return { count: 3, n_commits_examined: 500, method: 'heuristic proxy: conventional-commit fix: prefix count, not a verified causal attribution', window_note: 'most recent 500 commits', ...overrides }
+  return {
+    count: 3, n_commits_examined: 500, method: 'heuristic proxy: conventional-commit fix: prefix count, not a verified causal attribution', window_note: 'most recent 500 commits',
+    scoped_count: 2, scoped_excluded_count: 1, scoped_unavailable_count: 0, scoped_config_source: 'default', scoped_exclude_globs: ['.github/**'], scoped_method: 'scoped heuristic: counts only fix: commits touching product source',
+    ...overrides,
+  }
 }
 function proposal(overrides = {}) {
   return { target: { category: 'trigger_tune', lens: 'lens-operability' }, statement: 'Narrow the lens-operability trigger glob', motivating_measurement: '3 of 5 runs were CLEAN with zero trigger matches (run-1..run-3)', confirming_measurement: 'trigger accuracy improves next cycle', n: 6, citations: ['run-1'], reinstatement_evidence: null, ...overrides }
@@ -127,6 +131,38 @@ test('optimise-cycle: happy path returns ranked proposals, writes the report, an
   // alongside the failure-path tests below so the guard cannot be
   // satisfied by simply always returning false.
   assert.equal(result.proposal_ids_computed, true)
+})
+
+// ---- AC-2/AC-4: the escaped-defect counter-metric section renders BOTH the raw and the scoped figure, clearly labelled, and never silently drops the scoped one ----
+
+test('optimise-cycle: the Escaped-defect counter-metric section renders BOTH the raw figure and the scoped figure, clearly labelled, with the real numbers from the git lane (AC-2)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, {
+    args: {},
+    agent: baseResponses({
+      'lane:git': gitFixture({ count: 5, n_commits_examined: 500, scoped_count: 3, scoped_excluded_count: 2, scoped_unavailable_count: 0, scoped_config_source: 'repo-override' }),
+    }),
+  })
+  const raw = result.report.split('\n').find((l) => l.startsWith('Raw (unscoped):'))
+  assert.ok(raw, `expected a "Raw (unscoped):" line, report was: ${result.report}`)
+  assert.ok(raw.includes('5 of 500'), raw)
+  const scoped = result.report.split('\n').find((l) => l.startsWith('Scoped to product source'))
+  assert.ok(scoped, `expected a "Scoped to product source" line, report was: ${result.report}`)
+  assert.ok(scoped.includes('3 counted'), scoped)
+  assert.ok(scoped.includes('2 excluded'), scoped)
+  assert.ok(scoped.includes('repo-override'), scoped)
+})
+
+test('optimise-cycle: when the scoped figure is unavailable (scoped_count:null, a broken repo override), the report says so plainly instead of rendering a fabricated number (AC-4)', async () => {
+  const { result } = await runWorkflow(WORKFLOW, {
+    args: {},
+    agent: baseResponses({
+      'lane:git': gitFixture({ scoped_count: null, scoped_excluded_count: null, scoped_unavailable_count: null, scoped_method: 'unavailable: .claude/harness-triggers.json is not valid JSON' }),
+    }),
+  })
+  const line = result.report.split('\n').find((l) => l.startsWith('Scoped figure unavailable:'))
+  assert.ok(line, `expected a "Scoped figure unavailable:" line, report was: ${result.report}`)
+  assert.ok(line.includes('not valid JSON'), line)
+  assert.ok(!result.report.includes('Scoped to product source'), 'must not also render a numeric scoped line when the figure is unavailable')
 })
 
 // ---- Review round-1 H1 (AC-OPS-11, AC-OPS-12, AC-OPS-3): buildReport must actually RENDER what it is given, and the return must include it ----

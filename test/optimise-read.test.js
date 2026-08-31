@@ -16,6 +16,7 @@ const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
 const { makeTempRepo, runAppend, trackTempDir, cleanupTempRepos, SUITE_TMPDIR, sh, LEDGER_REL } = require('./helpers/temp-repo.js')
 const fs = require('node:fs')
+const os = require('node:os')
 
 const MODULE_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
 const MODULE_URL = pathToFileURL(MODULE_PATH).href
@@ -938,13 +939,224 @@ test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal 
   assert.notEqual(out.ids[0].proposal_id, out.ids[1].proposal_id)
 })
 
-test('optimise-read CLI: `node optimise-read.mjs escaped-defects` reads commits from stdin and returns the fix: count', () => {
-  const payload = { commits: [{ sha: 'a', subject: 'fix: repair a heal' }, { sha: 'b', subject: 'feat: add a thing' }] }
+// AC-1: the CLI no longer accepts a
+// pre-parsed {commits:[...]} array -- it accepts the RAW, verbatim stdout
+// of `git log --name-only --pretty=format:'%x1e%P%x1f%s'` (git_log_raw)
+// plus the repo root, and parses/scores it deterministically itself
+// (parseGitLogRaw + countEscapedDefectCandidates), so a mis-parse in an
+// agent's own text handling can never misattribute a changed path.
+test('optimise-read CLI: `node optimise-read.mjs escaped-defects` parses raw git log output (git_log_raw) and returns both the raw fix: count and a scoped count (AC-1, AC-2)', () => {
+  const gitLogRaw = '\x1eparent1\x1ffix: repair a heal\nsrc/heal.js\ntest/heal.test.js\n' + '\x1eparent2\x1ffeat: add a thing\nsrc/thing.js\n'
+  const payload = { git_log_raw: gitLogRaw, root: '/nonexistent-root-no-override-xyz' }
   const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify(payload), encoding: 'utf8' })
   assert.equal(res.status, 0, res.stderr)
   const out = JSON.parse(res.stdout.trim())
   assert.equal(out.count, 1)
   assert.equal(out.n_commits_examined, 2)
+  assert.equal(out.scoped_count, 1, 'src/heal.js is outside the default excludes, so the fix: commit is scoped-counted')
+  assert.equal(out.scoped_excluded_count, 0)
+  assert.equal(out.scoped_unavailable_count, 0)
+  assert.equal(out.scoped_config_source, 'default')
+})
+
+test('optimise-read CLI: `escaped-defects` with an empty/missing git_log_raw reports zero commits, never throwing', () => {
+  const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify({}), encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.count, 0)
+  assert.equal(out.n_commits_examined, 0)
+  assert.equal(out.scoped_count, 0)
+})
+
+test('optimise-read CLI: `escaped-defects` with no root falls back to process.cwd() (does not crash, uses defaults when cwd has no override)', () => {
+  const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify({ git_log_raw: '\x1ep\x1ffix: x\na.js\n' }), encoding: 'utf8', cwd: os.tmpdir() })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.count, 1)
+  assert.equal(typeof out.scoped_count, 'number')
+})
+
+// ---- parseGitLogRaw (AC-1): the deterministic parser the CLI now owns ----
+
+test('optimise-read: parseGitLogRaw splits raw `git log --name-only --pretty=format:\'%x1e%P%x1f%s\'` output into one {subject, paths} record per commit, in order', () => {
+  const raw = '\x1eaaa\x1ffeat: first\nREADME.md\nsrc/a.js\n' + '\x1ebbb\x1ffix: second\nsrc/b.js\n'
+  const result = mod.parseGitLogRaw(raw)
+  assert.equal(result.length, 2)
+  assert.equal(result[0].subject, 'feat: first')
+  assert.deepEqual(result[0].paths, ['README.md', 'src/a.js'])
+  assert.equal(result[1].subject, 'fix: second')
+  assert.deepEqual(result[1].paths, ['src/b.js'])
+})
+
+test('optimise-read: parseGitLogRaw reports paths:null for a merge commit (2+ parent hashes) -- %P with no changed files is NOT the same as an ordinary commit that touched nothing (AC-4)', () => {
+  const raw = '\x1eaaa bbb\x1fMerge pull request #1\n'
+  const result = mod.parseGitLogRaw(raw)
+  assert.equal(result.length, 1)
+  assert.equal(result[0].paths, null)
+})
+
+test('optimise-read: parseGitLogRaw reports paths:[] (not null) for an ordinary single-parent commit that genuinely touched nothing, e.g. an --allow-empty commit', () => {
+  const raw = '\x1eaaa\x1ffix: an empty commit\n'
+  const result = mod.parseGitLogRaw(raw)
+  assert.equal(result.length, 1)
+  assert.deepEqual(result[0].paths, [])
+})
+
+test('optimise-read: parseGitLogRaw on an empty string returns an empty array, never throwing', () => {
+  assert.deepEqual(mod.parseGitLogRaw(''), [])
+  assert.deepEqual(mod.parseGitLogRaw(undefined), [])
+})
+
+test('optimise-read: parseGitLogRaw treats a ROOT commit (no parents at all, %P empty) as non-merge, not unavailable', () => {
+  const raw = '\x1e\x1ffix: the very first commit\nREADME.md\n'
+  const result = mod.parseGitLogRaw(raw)
+  assert.deepEqual(result[0].paths, ['README.md'])
+})
+
+// ---- countEscapedDefectCandidates: the scoped figure (AC-2, AC-4, AC-5) ----
+
+test('optimise-read: countEscapedDefectCandidates with no options at all uses the harness default excludes and computes a scoped figure alongside the unchanged raw one (AC-2 backward compatibility)', () => {
+  const commits = [
+    { subject: 'fix: repair the torn-line heal', paths: ['workflows/lib/optimise-read.mjs'] },
+    { subject: 'fix(ledger): handle a short write', paths: ['.github/workflows/ci.yml'] },
+  ]
+  const result = mod.countEscapedDefectCandidates(commits)
+  assert.equal(result.count, 2, 'the raw figure must be unchanged by this change')
+  assert.equal(result.scoped_config_source, 'default')
+  assert.equal(result.scoped_count, 1, 'only the commit touching workflows/lib is outside the default excludes')
+  assert.equal(result.scoped_excluded_count, 1, 'the commit touching ONLY .github/workflows/ci.yml is pipeline-only')
+})
+
+test('optimise-read: countEscapedDefectCandidates counts a fix: commit as scoped when AT LEAST ONE changed path is outside the exclude globs, even if others are inside them', () => {
+  const commits = [{ subject: 'fix: bundled change', paths: ['.github/workflows/ci.yml', 'src/real.js'] }]
+  const result = mod.countEscapedDefectCandidates(commits, { excludeGlobs: ['.github/**'], configSource: 'default' })
+  assert.equal(result.scoped_count, 1)
+  assert.equal(result.scoped_excluded_count, 0)
+})
+
+test('optimise-read: countEscapedDefectCandidates excludes a fix: commit whose changed paths are ALL inside the exclude globs', () => {
+  const commits = [{ subject: 'fix: ci only', paths: ['.github/workflows/ci.yml', '.github/workflows/deploy.yml'] }]
+  const result = mod.countEscapedDefectCandidates(commits, { excludeGlobs: ['.github/**'], configSource: 'default' })
+  assert.equal(result.scoped_count, 0)
+  assert.equal(result.scoped_excluded_count, 1)
+})
+
+test('optimise-read: countEscapedDefectCandidates(AC-4) counts a fix: commit with unavailable paths (paths:null, e.g. a merge commit) in NEITHER scoped_count nor scoped_excluded_count -- only scoped_unavailable_count', () => {
+  const commits = [{ subject: 'fix: from a merge', paths: null }]
+  const result = mod.countEscapedDefectCandidates(commits, { excludeGlobs: ['.github/**'], configSource: 'default' })
+  assert.equal(result.scoped_count, 0)
+  assert.equal(result.scoped_excluded_count, 0)
+  assert.equal(result.scoped_unavailable_count, 1)
+})
+
+test('optimise-read: countEscapedDefectCandidates(AC-4) counts a fix: commit with a MISSING paths field (not present at all, never an array) as unavailable too', () => {
+  const commits = [{ subject: 'fix: no paths field' }]
+  const result = mod.countEscapedDefectCandidates(commits, { excludeGlobs: ['.github/**'], configSource: 'default' })
+  assert.equal(result.scoped_unavailable_count, 1)
+})
+
+test('optimise-read: countEscapedDefectCandidates invariant -- scoped_count + scoped_excluded_count + scoped_unavailable_count always equals the raw count', () => {
+  const commits = [
+    { subject: 'fix: a', paths: ['src/a.js'] },
+    { subject: 'fix: b', paths: ['.github/workflows/ci.yml'] },
+    { subject: 'fix: c', paths: null },
+    { subject: 'feat: not counted at all', paths: ['src/d.js'] },
+  ]
+  const result = mod.countEscapedDefectCandidates(commits, { excludeGlobs: ['.github/**'], configSource: 'default' })
+  assert.equal(result.count, 3)
+  assert.equal(result.scoped_count + result.scoped_excluded_count + result.scoped_unavailable_count, result.count)
+})
+
+test('optimise-read: countEscapedDefectCandidates(AC-4) reports the scoped figure as UNAVAILABLE (null), never a guessed default, when configError is set -- a broken repo override must not silently fall back to the default excludes', () => {
+  const commits = [{ subject: 'fix: a', paths: ['src/a.js'] }]
+  const result = mod.countEscapedDefectCandidates(commits, { configError: '.claude/harness-triggers.json is not valid JSON', configSource: 'repo-override' })
+  assert.equal(result.count, 1, 'the raw figure is unaffected by a broken config')
+  assert.equal(result.scoped_count, null)
+  assert.equal(result.scoped_excluded_count, null)
+  assert.equal(result.scoped_unavailable_count, null)
+  assert.match(result.scoped_method, /unavailable/i)
+  assert.match(result.scoped_method, /not valid JSON/)
+})
+
+test('optimise-read: countEscapedDefectCandidates scoped_method names what it counts (product source, excluding pipeline/tooling) and disclaims causal attribution, same as the raw method already does (AC-2, AC-6)', () => {
+  const result = mod.countEscapedDefectCandidates([{ subject: 'fix: a', paths: ['src/a.js'] }])
+  assert.match(result.scoped_method, /product source/i)
+  assert.match(result.scoped_method, /pipeline|tooling/i)
+  assert.match(result.scoped_method, /not.*verified causal attribution/i)
+})
+
+// ---- resolveProductSourceExcludeGlobs (AC-3, AC-4): reads .claude/harness-triggers.json's escapedDefectExcludePaths, the same file review-cycle.js reads ----
+
+test('optimise-read: resolveProductSourceExcludeGlobs with no .claude/harness-triggers.json file at all returns the harness default excludes, no error (AC-3)', () => {
+  const repo = makeTempRepo()
+  const result = mod.resolveProductSourceExcludeGlobs(repo)
+  assert.equal(result.configSource, 'default')
+  assert.equal(result.configError, null)
+  assert.deepEqual(result.excludeGlobs, mod.DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS)
+})
+
+test('optimise-read: resolveProductSourceExcludeGlobs reads a valid escapedDefectExcludePaths override from .claude/harness-triggers.json (AC-3)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'harness-triggers.json'), JSON.stringify({ escapedDefectExcludePaths: ['scripts/**', 'deploy/**'] }))
+  const result = mod.resolveProductSourceExcludeGlobs(repo)
+  assert.equal(result.configSource, 'repo-override')
+  assert.equal(result.configError, null)
+  assert.deepEqual(result.excludeGlobs, ['scripts/**', 'deploy/**'])
+})
+
+test('optimise-read: resolveProductSourceExcludeGlobs with a harness-triggers.json that exists but does not carry the key falls back to the default, no error (a repo tuning ONLY review-cycle triggers must not break this)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'harness-triggers.json'), JSON.stringify({ ui: ['**/*.foo'] }))
+  const result = mod.resolveProductSourceExcludeGlobs(repo)
+  assert.equal(result.configSource, 'default')
+  assert.equal(result.configError, null)
+})
+
+test('optimise-read: resolveProductSourceExcludeGlobs(AC-4) fails closed with a configError, excludeGlobs:null, when harness-triggers.json is not valid JSON -- never silently falls back to defaults on a broken override', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'harness-triggers.json'), '{not valid json')
+  const result = mod.resolveProductSourceExcludeGlobs(repo)
+  assert.equal(result.excludeGlobs, null)
+  assert.ok(result.configError)
+})
+
+test('optimise-read: resolveProductSourceExcludeGlobs fails closed when harness-triggers.json parses to a non-object (e.g. a bare array)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'harness-triggers.json'), '["not", "an", "object"]')
+  const result = mod.resolveProductSourceExcludeGlobs(repo)
+  assert.equal(result.excludeGlobs, null)
+  assert.ok(result.configError)
+})
+
+test('optimise-read: resolveProductSourceExcludeGlobs fails closed when escapedDefectExcludePaths is not an array', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'harness-triggers.json'), JSON.stringify({ escapedDefectExcludePaths: 'scripts/**' }))
+  const result = mod.resolveProductSourceExcludeGlobs(repo)
+  assert.equal(result.excludeGlobs, null)
+  assert.match(result.configError, /array/)
+})
+
+test('optimise-read: resolveProductSourceExcludeGlobs fails closed when escapedDefectExcludePaths is an empty array (would exclude nothing and is not the supported way to opt out)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'harness-triggers.json'), JSON.stringify({ escapedDefectExcludePaths: [] }))
+  const result = mod.resolveProductSourceExcludeGlobs(repo)
+  assert.equal(result.excludeGlobs, null)
+  assert.match(result.configError, /empty/)
+})
+
+test('optimise-read: resolveProductSourceExcludeGlobs bounds glob length/wildcards/"**" segments/count the same way review-cycle.js does, against the SAME file (ReDoS defence in depth)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'harness-triggers.json'), JSON.stringify({ escapedDefectExcludePaths: ['**a**a**a**a**a**a**b'] }))
+  const result = mod.resolveProductSourceExcludeGlobs(repo)
+  assert.equal(result.excludeGlobs, null)
+  assert.ok(result.configError)
 })
 
 test('optimise-read CLI: an unknown command name is reported as an error, not a crash', () => {

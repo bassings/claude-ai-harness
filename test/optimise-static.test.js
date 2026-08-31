@@ -151,6 +151,19 @@ test('static: skills/optimise-cycle/SKILL.md states the escaped-defect metric is
   assert.ok(/escaped-defects/.test(skill))
 })
 
+// ---- AC-6: the scoped figure is documented alongside the raw one, with
+// both of the metric's residual limitations stated plainly (it still
+// cannot attribute a fix to a specific proposal, and it still misses a
+// defect fixed under a commit type other than "fix:") ----
+
+test('static: skills/optimise-cycle/SKILL.md documents BOTH the raw and the scoped escaped-defect figures, names escapedDefectExcludePaths as the per-repo override, and states the scoped figure still cannot attribute a fix to a specific proposal (AC-6)', () => {
+  const skill = readAll('skills', 'optimise-cycle', 'SKILL.md')
+  assert.match(skill, /\*\*Raw\*\*/, 'must name the raw figure')
+  assert.match(skill, /\*\*Scoped\*\*/, 'must name the scoped figure')
+  assert.match(skill, /escapedDefectExcludePaths/, 'must name the per-repo override key')
+  assert.match(skill, /(not|neither).{0,40}verified causal attribution/i, 'must not let either figure read as a causal, per-proposal attribution')
+})
+
 // ---- Review round-2 L4 (AC-QA-20): the perf bound is measured but was
 // enforced by no test at all. The cheaper structural guard the AC itself
 // names -- rather than a timing assertion, which is real but slower and

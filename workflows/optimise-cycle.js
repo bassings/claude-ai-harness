@@ -314,14 +314,27 @@ const CI_LANE_SCHEMA = {
     failures: { type: 'array', items: { type: 'object', required: ['repo', 'mode', 'command', 'error'], properties: { repo: { type: 'string' }, mode: { type: 'string', enum: ['absent_from_path', 'unauthenticated', 'rate_limited', 'no_history', 'other'] }, command: { type: 'string' }, error: { type: 'string' } } } },
   },
 }
+// AC-1/AC-2: scoped_* fields carry the
+// second, narrower escaped-defect figure alongside the unchanged raw one
+// (count/n_commits_examined/method) -- required so a drafting step cannot
+// silently omit it. scoped_count/scoped_excluded_count/scoped_unavailable_count
+// are nullable (AC-4): null means the scoped figure is unavailable (a
+// broken or invalid .claude/harness-triggers.json override), reported via
+// scoped_method rather than guessed at.
 const GIT_LANE_SCHEMA = {
   type: 'object',
-  required: ['count', 'n_commits_examined', 'method', 'window_note'],
+  required: ['count', 'n_commits_examined', 'method', 'window_note', 'scoped_count', 'scoped_excluded_count', 'scoped_unavailable_count', 'scoped_config_source', 'scoped_exclude_globs', 'scoped_method'],
   properties: {
     count: { type: 'integer' },
     n_commits_examined: { type: 'integer' },
     method: { type: 'string' },
     window_note: { type: 'string' },
+    scoped_count: { type: ['integer', 'null'] },
+    scoped_excluded_count: { type: ['integer', 'null'] },
+    scoped_unavailable_count: { type: ['integer', 'null'] },
+    scoped_config_source: { type: 'string', enum: ['default', 'repo-override'] },
+    scoped_exclude_globs: { type: 'array', items: { type: 'string' } },
+    scoped_method: { type: 'string' },
   },
 }
 
@@ -371,13 +384,18 @@ const ciLanePrompt =
 const ciLane = () => agent(ciLanePrompt, { label: 'lane:ci', phase: 'Lanes', schema: CI_LANE_SCHEMA })
 
 const gitLanePrompt =
-  `In the CURRENT repo, run \`git log --max-count=500 --pretty=format:%s\` and capture every commit SUBJECT LINE ` +
-  `(never the diff, never file contents -- this is metadata only, and this lane never reads or reports another ` +
-  `repo's history). Find optimise-read.mjs the same way the other lanes do. Pipe ` +
-  `\`{"commits": [{"subject": "<line 1>"}, {"subject": "<line 2>"}, ...]}\` (one entry per commit subject, in the ` +
-  `order git printed them) into \`node <path> escaped-defects\` and return exactly what it printed, plus a ` +
-  `window_note stating how many commits back this covers (e.g. "most recent 500 commits") -- this is a heuristic ` +
-  `proxy for escaped defects (AC-PROD-7), not a verified per-PR causal count; state that plainly, do not overclaim.`
+  `In the CURRENT repo, run exactly \`git log --max-count=500 --name-only --pretty=format:'%x1e%P%x1f%s'\` and ` +
+  `capture its ENTIRE stdout verbatim, unmodified, character-for-character (never the diff, never file contents ` +
+  `-- this is metadata only: parent hashes, subject lines, and the paths of files each commit changed; this lane ` +
+  `never reads or reports another repo's history). Also run \`git rev-parse --show-toplevel\` to get this repo's ` +
+  `root path. Find optimise-read.mjs the same way the other lanes do. Pipe exactly ` +
+  `\`{"git_log_raw": "<the entire git log output above, verbatim>", "root": "<the repo root above>"}\` as JSON ` +
+  `into \`node <path> escaped-defects\` -- do not parse, reformat, or summarise the git log output yourself; the ` +
+  `script does all parsing and scoring, deterministically, from the raw text you pass it. Return exactly what it ` +
+  `printed, plus a window_note stating how many commits back this covers (e.g. "most recent 500 commits") -- ` +
+  `this is a heuristic proxy for escaped defects (AC-PROD-7), not a verified per-PR causal count, and the script ` +
+  `reports BOTH a raw figure (every "fix:"-typed commit) and a scoped figure (narrowed to commits that touch ` +
+  `product source, excluding configured pipeline/tooling paths); state both plainly, do not overclaim either.`
 const gitLane = () => agent(gitLanePrompt, { label: 'lane:git', phase: 'Lanes', schema: GIT_LANE_SCHEMA })
 
 const [ledgerAgg, ciAgg, gitAgg] = await parallel([ledgerLane, ciLane, gitLane])
@@ -1065,7 +1083,15 @@ function buildReport(d) {
   lines.push('')
   lines.push('## Escaped-defect counter-metric')
   if (d.escapedDefects && typeof d.escapedDefects.count === 'number') {
-    lines.push(`${d.escapedDefects.count} of ${d.escapedDefects.n_commits_examined} examined commits matched the heuristic. ${d.escapedDefects.method}`)
+    lines.push(`Raw (unscoped): ${d.escapedDefects.count} of ${d.escapedDefects.n_commits_examined} examined commits matched the heuristic. ${d.escapedDefects.method}`)
+    // AC-2/AC-4: the scoped figure is reported alongside the raw one, never
+    // in place of it, and is stated as unavailable rather than guessed at
+    // when the config could not be resolved (scoped_count null).
+    if (typeof d.escapedDefects.scoped_count === 'number') {
+      lines.push(`Scoped to product source (config: ${d.escapedDefects.scoped_config_source}): ${d.escapedDefects.scoped_count} counted, ${d.escapedDefects.scoped_excluded_count} excluded as pipeline/tooling-only, ${d.escapedDefects.scoped_unavailable_count} unavailable (changed paths could not be determined). ${d.escapedDefects.scoped_method}`)
+    } else {
+      lines.push(`Scoped figure unavailable: ${d.escapedDefects.scoped_method || 'no reason given by the git lane'}`)
+    }
   } else {
     lines.push('Escaped defects are not currently captured (git-lane unavailable).')
   }
