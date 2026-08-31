@@ -301,12 +301,15 @@ export const LEDGER_ENTRY_SCHEMA = {
     // findingId hash was not among the ids computed from the caller's own
     // prior_findings -- a claimed-fixed finding that was never reported
     // open this round, or reworded enough that the hash no longer matches.
-    // Fix round 1, finding 8: also counts a claim that DOES match a prior
-    // finding but whose id is ALSO present in this same round's own
-    // open_findings -- a finding a lens is still reporting open cannot also
-    // be recorded fixed on the same line, and this is where that
-    // contradiction is folded in (a different reason from an unmatched
-    // claim, but the same fail-closed outcome: dropped, never written).
+    // Fix round 1, finding 8 (widened, fix round 3, finding 5): also
+    // counts a claim that DOES match a prior finding but whose id is ALSO
+    // present in this same round's own open_findings, rejected_findings or
+    // spec_bugs -- a finding this round's synthesis already gave a
+    // DIFFERENT disposition to (still open, a rejected false alarm, or a
+    // spec bug) cannot also be recorded fixed on the same line, and this is
+    // where that contradiction is folded in (a different reason from an
+    // unmatched claim, but the same fail-closed outcome: dropped, never
+    // written).
     // Computed in computeFixedFindings, before the entry object exists, so
     // it follows spec_bug_count/rejected_finding_count's placement rather
     // than degradeEntry's general mechanism (below): this is a REFERENCE
@@ -939,7 +942,7 @@ function computeFindings(descriptors, disposition) {
 // follows the SAME convention but is gated on priorFindings' own presence
 // instead, since verifying supplied ids is meaningful even on a request
 // that never sent fixed_findings at all.
-function computeFixedFindings(priorFindings, fixedFindingDescriptors, stillOpenIds) {
+function computeFixedFindings(priorFindings, fixedFindingDescriptors, sameRoundOtherDispositionIds) {
   // AC-3: validate priorFindings' own supplied ids FIRST, independent of
   // whether fixed_findings was even supplied this round -- an untrustworthy
   // id must never quietly enter the joinable set regardless of what else
@@ -962,14 +965,22 @@ function computeFixedFindings(priorFindings, fixedFindingDescriptors, stillOpenI
   if (!Array.isArray(fixedFindingDescriptors)) {
     return { entries: [], invalidDropped: null, duplicateDropped: null, invalidPriorIdsDropped }
   }
-  // Fix round 1, finding 8: a finding a lens is STILL reporting open THIS
-  // round is never eligible to also be recorded fixed on the same line --
-  // that pairing is a contradiction (the id guard alone cannot see it,
-  // since it only checks membership against prior_findings, and a
-  // still-open finding legitimately WAS reported open before too).
-  // Reconciled the same way an unmatched claim is: dropped, counted under
-  // invalidDropped, never written.
-  const openIds = stillOpenIds instanceof Set ? stillOpenIds : new Set(Array.isArray(stillOpenIds) ? stillOpenIds : [])
+  // Fix round 1, finding 8 (widened, fix round 3, finding 5): a finding
+  // this SAME round already carries a DIFFERENT disposition -- still open,
+  // investigated and rejected as a false alarm, or flagged as a spec bug
+  // with no AC behind it -- is never ALSO eligible to be recorded fixed on
+  // the same line. "false alarm" and "now fixed" (or "still open" and "now
+  // fixed") are contradictory dispositions for the same id, and
+  // aggregateRework would otherwise count both against the same lens. The
+  // id guard alone cannot see this: it only checks membership against
+  // prior_findings, and a finding with any of these three dispositions
+  // legitimately WAS reported open before too. Reconciled the same way an
+  // unmatched claim is: dropped, counted under invalidDropped, never
+  // written. `sameRoundOtherDispositionIds` is the union of this round's
+  // own open, rejected AND spec_bug ids (renamed from the fix round 1
+  // finding 8 parameter, `stillOpenIds`, now that it covers three
+  // dispositions, not one).
+  const otherDispositionIds = sameRoundOtherDispositionIds instanceof Set ? sameRoundOtherDispositionIds : new Set(Array.isArray(sameRoundOtherDispositionIds) ? sameRoundOtherDispositionIds : [])
   const candidates = computeFindings(fixedFindingDescriptors, 'fixed').entries
   const entries = []
   // Fix round 1, finding 1 (coordinator repro: one real finding, THREE
@@ -986,7 +997,7 @@ function computeFixedFindings(priorFindings, fixedFindingDescriptors, stillOpenI
   let duplicateDropped = 0
   for (const candidate of candidates) {
     const prior = candidate && priorById.get(candidate.id)
-    if (!prior || openIds.has(candidate.id)) {
+    if (!prior || otherDispositionIds.has(candidate.id)) {
       invalidDropped += 1
       continue
     }
@@ -1691,16 +1702,29 @@ export function main() {
   // open_findings was not supplied at all, matching the null-vs-absent
   // convention used throughout this file; an individual null entry means
   // that ONE descriptor was malformed (mirrors computeFindings' own null
-  // handling for a non-object element).
+  // handling for a non-object element) OR -- fix round 3, finding 2 -- that
+  // this specific finding's id was computed here but did NOT survive into
+  // the written line (MAX_FINDINGS' budgetFindings, or the separate
+  // byte-rescue truncation further below, dropped it). Reconciled against
+  // what was ACTUALLY written just before this array reaches the CLI
+  // result -- see that reconciliation's own comment, near `line`'s final
+  // value -- so a caller can never be handed an id nothing in the ledger
+  // actually recorded.
   const openFindingIds = Array.isArray(payload.open_findings) ? open.entries.map((e) => (e ? e.id : null)) : null
   // specs/record-fixed-findings.md: prior_findings/fixed_findings are the
   // optional round-two-onward pair (review-cycle.js's prior_findings
   // argument, and the synthesis's own echoed confirmations) -- see
-  // computeFixedFindings' own comment for the id guard this runs. `open`'s
-  // own ids are passed through too (fix round 1, finding 8): a finding this
-  // SAME round's lens reports still open is never eligible to be recorded
-  // fixed on the same line, even when a confirmation matches it.
-  const fixed = computeFixedFindings(payload.prior_findings, payload.fixed_findings, new Set(open.entries.map((e) => e && e.id).filter(Boolean)))
+  // computeFixedFindings' own comment for the id guard this runs.
+  // specBugs/rejected/open's own ids are passed through too (fix round 1,
+  // finding 8; widened fix round 3, finding 5): a finding this SAME
+  // round's synthesis ALSO reports as a spec bug, a rejected false alarm,
+  // or still open is never eligible to be recorded fixed on the same
+  // line, even when a confirmation matches it -- three contradictory
+  // dispositions can share an id just as easily as one.
+  const sameRoundOtherDispositionIds = new Set(
+    [...specBugs.entries, ...rejected.entries, ...open.entries].map((e) => e && e.id).filter(Boolean)
+  )
+  const fixed = computeFixedFindings(payload.prior_findings, payload.fixed_findings, sameRoundOtherDispositionIds)
   // event_scope is consumed above to mint event_key (M2) and must never
   // itself reach the schema-validated entry: it is not a declared field, and
   // additionalProperties:false would reject the whole write if it leaked
@@ -1892,6 +1916,37 @@ export function main() {
     line = JSON.stringify(minimal)
     if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
       return result(run_id, ts, false, `even the minimal degraded record exceeded MAX_LINE_BYTES (${MAX_LINE_BYTES})`)
+    }
+  }
+
+  // Fix round 3, finding 2: openFindingIds (computed above from EVERY open
+  // descriptor) is not yet reconciled against what actually survived into
+  // the written line -- MAX_FINDINGS' budgetFindings, and separately the
+  // byte-rescue loop just above, can both drop an 'open' entry that this
+  // round's caller still has an id for. Returning that id anyway would let
+  // a LATER round confirm it fixed with nothing to join against in the
+  // ledger at all -- the exact false-join AC-1 exists to prevent, one
+  // layer up from the id-authenticity guard. `line` is exactly what is
+  // about to be written (whichever of the paths above produced it,
+  // including the minimal-degrade path, where `entry` itself was never
+  // reassigned and so cannot be trusted here) -- parsed back once as
+  // ground truth for which ids are genuinely joinable, rather than
+  // tracking every drop path's own state.
+  let writtenOpenIds = new Set()
+  try {
+    const writtenForIds = JSON.parse(line)
+    if (Array.isArray(writtenForIds.findings)) {
+      for (const f of writtenForIds.findings) {
+        if (f && f.disposition === 'open' && typeof f.id === 'string') writtenOpenIds.add(f.id)
+      }
+    }
+  } catch (e) {
+    // `line` was just produced by JSON.stringify above and is always valid
+    // JSON; defensive only, never expected to fire.
+  }
+  if (Array.isArray(openFindingIds)) {
+    for (let i = 0; i < openFindingIds.length; i++) {
+      if (openFindingIds[i] !== null && !writtenOpenIds.has(openFindingIds[i])) openFindingIds[i] = null
     }
   }
 

@@ -754,6 +754,20 @@ telemetry-only, and fully preventable by the exclusion above. This is a
 deliberate, accepted trade-off, not an oversight: AC-DATA-4's git-clean-
 survival clause is an accepted FAIL for this path.
 
+**The same discipline applies to `.claude/conductor-prior-findings.json`**
+(specs/record-fixed-findings.md, fix round 3): `conduct-plan`'s cross-round
+state for the `fixed`-disposition feature above, carrying every open
+finding's `location` and `claim` VERBATIM -- the same class of free text
+(AC-SEC-2) the ledger schema itself is designed to keep out. It is
+gitignored the same way (listed in the tracked `.gitignore`, not only
+`.git/info/exclude`) and for the same reason: a lens's own quoted evidence
+can include a secret or a source line, and this repository is public.
+Unlike the ledger, this file is written by prose (`skills/conduct-plan/SKILL.md`),
+never by `ledger-append.mjs` or any other real-Node script -- there is no
+code-level `ensureGitignored()` check for it, only the tracked `.gitignore`
+entry, verified in `test/static-checks.test.js` against a real
+`git check-ignore`.
+
 **Known limitations**: an absolute `spec` path reached through a
 **symlinked ANCESTOR directory** (e.g. a checkout cloned at, or accessed
 via, a symlink somewhere above the repo root) records the out-of-repo

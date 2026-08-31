@@ -2138,6 +2138,31 @@ test('ledger-append: open_finding_ids is absent/null on the CLI result when open
   assert.ok(out.open_finding_ids === null || out.open_finding_ids === undefined)
 })
 
+// Fix round 3, finding 2 (HIGH, coordinator repro): openFindingIds used to
+// be computed from EVERY open descriptor, independent of MAX_FINDINGS
+// truncation -- so a busy round (20 open findings, budgetFindings keeping
+// only 15) returned 20 ids on the CLI result while only 15 were ever
+// actually written to entry.findings. A conductor confirming one of the
+// other 5 next round would write a 'fixed' entry with NO open counterpart
+// anywhere in the ledger -- exactly the false-join AC-1 exists to prevent,
+// one layer up from the guard that already checks id authenticity.
+test('ledger-append: open_finding_ids only ever returns ids that actually survived into the written entry.findings -- a truncated-out open finding\'s id comes back null, never a phantom id nothing was recorded under (fix round 3, finding 2)', () => {
+  const repo = makeTempRepo()
+  const many = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-qa', location: `f${i}.js:1`, claim: `finding ${i}` }))
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: many })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  const writtenOpenIds = new Set(entry.findings.filter((f) => f.disposition === 'open').map((f) => f.id))
+  assert.ok(Array.isArray(out.open_finding_ids), 'expected open_finding_ids on the CLI result')
+  assert.equal(out.open_finding_ids.length, 20, 'positional alignment with the 20 supplied descriptors must be preserved')
+  const nonNullReturned = out.open_finding_ids.filter((id) => id !== null)
+  assert.equal(nonNullReturned.length, writtenOpenIds.size, 'every non-null returned id must correspond to something genuinely written')
+  for (const id of nonNullReturned) {
+    assert.ok(writtenOpenIds.has(id), `returned id ${id} was never actually written to entry.findings -- exactly the phantom-id defect this test exists to catch`)
+  }
+  assert.ok(nonNullReturned.length < 20, 'sanity: this fixture must genuinely exceed MAX_FINDINGS to prove anything -- otherwise every id trivially survives')
+})
+
 test('ledger-append: a reworded finding (same lens/location, different claim text) does not match prior_findings -- the safe, undercounting direction, not an overcount (specs/record-fixed-findings.md)', () => {
   const repo = makeTempRepo()
   runAppend(repo, {
@@ -2279,6 +2304,45 @@ test('ledger-append: a finding present in BOTH open_findings and a matching fixe
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a finding still open this round must never ALSO be recorded fixed')
   assert.equal(entry.findings.filter((f) => f.disposition === 'open').length, 1, 'the open record must survive untouched')
+  assert.equal(entry.invalid_fixed_ids_dropped, 1, 'the contradictory confirmation must be counted, not silently dropped')
+})
+
+// Fix round 3, finding 5 (LOW, same shape as fix round 1 finding 8, which
+// the coordinator judged worth fixing there): a finding investigated and
+// REJECTED this same round (a false alarm) must never ALSO be recorded
+// fixed on the same line, same id -- "false alarm" and "now fixed" are
+// contradictory, and aggregateRework would otherwise count both against
+// the same lens.
+test('ledger-append: a finding present in BOTH rejected_findings and a matching fixed_findings confirmation, on the same line, is never recorded fixed -- reconciled to rejected, the contradiction counted (fix round 3, finding 5)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    rejected_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a finding rejected as a false alarm this round must never ALSO be recorded fixed')
+  assert.equal(entry.findings.filter((f) => f.disposition === 'rejected').length, 1, 'the rejected record must survive untouched')
+  assert.equal(entry.invalid_fixed_ids_dropped, 1, 'the contradictory confirmation must be counted, not silently dropped')
+})
+
+// Fix round 3, finding 5: the same reconciliation for spec_bugs.
+test('ledger-append: a finding present in BOTH spec_bugs and a matching fixed_findings confirmation, on the same line, is never recorded fixed -- reconciled to spec_bug, the contradiction counted (fix round 3, finding 5)', () => {
+  const repo = makeTempRepo()
+  runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    spec_bugs: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+  })
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a finding flagged as a spec bug this round must never ALSO be recorded fixed')
+  assert.equal(entry.findings.filter((f) => f.disposition === 'spec_bug').length, 1, 'the spec_bug record must survive untouched')
   assert.equal(entry.invalid_fixed_ids_dropped, 1, 'the contradictory confirmation must be counted, not silently dropped')
 })
 

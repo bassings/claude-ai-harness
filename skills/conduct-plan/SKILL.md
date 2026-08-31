@@ -60,35 +60,57 @@ task, a Monitor, or a ScheduleWakeup.
      AC-1/AC-3), the SAME shape of instruction as the ledger-write one
      below, not prose describing intent -- round two of review for the same
      task, and every round after, follow these before invoking
-     `/review-cycle` again:**
-     1. Before invoking `/review-cycle` for this task, search `## Conductor
-        log` (this plan file, newest entries first) for a line starting
-        `prior_findings for <this task's id>:`. If none exists (this is
-        round one for this task), invoke `/review-cycle` with no
+     `/review-cycle` again:** passing it lets review-cycle's synthesis step
+     confirm which of these findings are now resolved and record each
+     confirmed one with `disposition: 'fixed'` in the run ledger.
+
+     **This data goes in `<repo>/.claude/conductor-prior-findings.json`, an
+     UNTRACKED file (`.claude/conductor-prior-findings.json` is in
+     `.gitignore`), NEVER in the plan file's own `## Conductor log` or any
+     other tracked file (fix round 3, finding 1).** Every open finding's
+     `location` and `claim` travel through this data VERBATIM -- a lens's
+     own quoted evidence, which can include a secret or a source line it
+     flagged. The plan file lives under `specs/`, which is tracked and
+     committed; the ledger schema itself exists specifically to keep this
+     same class of free text out of a durable, shared store (AC-SEC-2, "no
+     free text, ever" -- see `workflows/lib/ledger-append.mjs`'s own
+     comment on `LEDGER_ENTRY_SCHEMA`). Writing it into a committed file
+     would defeat that protection through a side door.
+     1. Before invoking `/review-cycle` for this task, read
+        `.claude/conductor-prior-findings.json` (a JSON object; treat a
+        missing or unreadable file as `{}`) and look up the key `<plan
+        file>:<this task's id>` (e.g. `specs/foo.md:T3`). If absent, this
+        is round one for this task -- invoke `/review-cycle` with no
         `prior_findings` argument at all.
-     2. If one exists, parse the JSON that follows the colon and pass it,
-        VERBATIM, byte-for-byte, as this invocation's `prior_findings`
-        argument. Do not retype it, reformat it, translate it from the
-        markdown report, or edit any field -- especially not `id`. Every
-        entry's `id` must be the exact value review-cycle returned; a
-        recomputed, corrected or "tidied" id fails AC-3's guard and the
-        confirmation is silently dropped.
-     3. After `/review-cycle` returns, take its `open_findings` field
+     2. If the key is present, its value is an array; pass it, VERBATIM,
+        byte-for-byte, as this invocation's `prior_findings` argument. Do
+        not retype it, reformat it, translate it from the markdown report,
+        or edit any field -- especially not `id`. Every entry's `id` must
+        be the exact value review-cycle returned; a recomputed, corrected
+        or "tidied" id fails AC-3's guard and the confirmation is silently
+        dropped.
+     3. After `/review-cycle` returns, inspect its `open_findings` field
         (an array of `{id, lens, location, claim, severity, ac_id,
         recurrence}` -- this is the STRUCTURED return value, never the
-        markdown `report` string) and append ONE new line to `## Conductor
-        log` in this exact form: `prior_findings for <task id>:
-        <JSON.stringify(open_findings)>`. Write it even when the array is
-        empty (`[]`) -- an empty array is real data (nothing is open), not
-        the same as no line at all.
-     4. Do NOT accumulate: step 3's line REPLACES what you pass forward for
+        markdown `report` string, and it is `null`, not `[]`, when the
+        ledger write itself failed or an older `ledger-append.mjs` did not
+        return ids). If it is an array (including empty -- `[]` is real
+        data, nothing is open, not the same as "unmeasured"): read
+        `.claude/conductor-prior-findings.json` again (or start from `{}`
+        if it does not exist), set the key `<plan file>:<task id>` to this
+        EXACT array, and write the whole object back to that file. If it
+        is `null`: do NOT touch the stored entry for this task -- leave
+        whatever the previous round left there, and note the anomaly
+        (`open_findings was null for <task id>`) in this tick's log entry,
+        step 3 below.
+     4. Do NOT accumulate: step 3's write REPLACES the stored value for
         this task, it does not merge with an earlier one. A finding already
         confirmed fixed drops out of `open_findings` on its own (the lens
-        stops reporting it), so the next round's search in step 1 finds the
-        latest line and nothing more needs doing. Passing an OLDER line's
-        contents forward, or a hand-merged union of several rounds', is
-        exactly the mistake that used to inflate the fixed count across
-        rounds (fix round 1, finding 2).
+        stops reporting it), so the next round's lookup in step 1 finds the
+        latest value and nothing more needs doing. Passing an OLDER
+        round's contents forward, or a hand-merged union of several
+        rounds', is exactly the mistake that used to inflate the fixed
+        count across rounds (fix round 1, finding 2).
 
      **What this proves and what it does not** (fix round 1, finding 3):
      the guard stops a FABRICATED claim -- an id that was never in the list

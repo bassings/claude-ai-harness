@@ -1,7 +1,7 @@
 export const meta = {
   name: 'review-cycle',
   description: 'Multi-lens review of the branch diff per AGENT-HARNESS.md: single-focus lenses in parallel, one synthesised report',
-  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one), prior_findings?: array (round two onward: findings reported open going into this round, as {lens, location, claim, severity?, ac_id?} -- a synthesis confirmation matching one gets recorded disposition "fixed" in the ledger, guarded so an unmatched claim is dropped, never recorded; absent, behaviour is unchanged)}',
+  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one), prior_findings?: array (round two onward: findings reported open going into this round, as {id, lens, location, claim, severity?, ac_id?} -- id is REQUIRED and must be the exact value THIS workflow returned as open_findings[].id in an earlier round (verified by recomputing the hash from lens/location/claim; a mismatched or missing id is dropped, counted, and produces no fixed entry) -- a synthesis confirmation matching one gets recorded disposition "fixed" in the ledger, guarded so an unmatched claim is dropped, never recorded; absent, behaviour is unchanged)}',
   phases: [
     { title: 'Scope', detail: 'diff the branch, classify the change surface' },
     { title: 'Lenses', detail: 'triggered lenses review in parallel, isolated worktrees' },
@@ -403,12 +403,19 @@ if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts
 opts = opts || {}
 
 const specPath = opts.spec || null
-// specs/record-fixed-findings.md (AC-1): the caller's own findings, reported
-// open going into this round -- {lens, location, claim, severity?, ac_id?},
-// the same raw shape open_findings/spec_bugs/rejected_findings already use.
-// Absent on round one, and on every caller that predates this argument, in
-// which case every other line touched by this change stays exactly as it
-// ran before: no prior-findings block reaches the synthesis prompt, no
+// specs/record-fixed-findings.md (AC-1/AC-3): the caller's own findings,
+// reported open going into this round -- {id, lens, location, claim,
+// severity?, ac_id?}. Fix round 3, finding 3: `id` is REQUIRED, not
+// optional -- it must be the exact value THIS workflow returned as
+// open_findings[].id in an earlier round (see result.open_findings,
+// below). ledger-append.mjs recomputes findingId(lens, location, claim)
+// from each entry's own content and refuses one whose supplied id does
+// not match: a caller that builds this shape without a genuine, sourced
+// id gets every entry dropped (invalid_prior_ids_dropped), zero fixed
+// entries, and no error -- only two counters as the trace. Absent on
+// round one, and on every caller that predates this argument, in which
+// case every other line touched by this change stays exactly as it ran
+// before: no prior-findings block reaches the synthesis prompt, no
 // fixed_findings field is requested, and the terminal payload's own
 // prior_findings/fixed_findings both stay null (ledger-append.mjs then
 // records nothing 'fixed' and leaves invalid_fixed_ids_dropped absent).

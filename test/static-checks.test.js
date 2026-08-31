@@ -288,28 +288,93 @@ test('static: conduct-plan/SKILL.md instructs passing prior_findings to review-c
   const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
   assert.ok(skill.includes('prior_findings'), 'SKILL.md must mention prior_findings by name')
   assert.ok(/round two/i.test(skill), 'SKILL.md must say when to start passing it')
-  assert.ok(skill.includes('fixed'), 'SKILL.md must name the disposition this produces')
+  // Fix round 3, finding 4: a bare skill.includes('fixed') is satisfied by ANY
+  // mention of the word anywhere in the file (e.g. main's own unrelated "a fixed
+  // out-of-repo marker"), so this assertion could never fail even if every real
+  // reference to the disposition were deleted. Anchored on the exact phrase the
+  // file actually uses to name it.
+  assert.ok(/disposition:\s*'fixed'/.test(skill), 'SKILL.md must name the disposition this produces, not merely contain the word "fixed" somewhere')
   assert.ok(/undercount/i.test(skill), 'SKILL.md must state plainly that the resulting number can undercount')
   assert.ok(/accumulate|only the findings/i.test(skill), 'SKILL.md must warn against re-supplying an already-confirmed finding on a later round')
 })
 
-// Fix round 2, AC-7 (specs/record-fixed-findings.md): the prior_findings
+// Fix round 2, AC-5 (specs/record-fixed-findings.md; renumbered from AC-7 in fix round 3 -- AC-7 collided with the original brief's own "suite green" AC-7, see the spec's Acceptance criteria intro): the prior_findings
 // instruction must be MECHANICAL steps, the same style as the ledger-write
 // instruction eight lines below it -- not prose describing intent. Checks
 // for the concrete markers a mechanical instruction has that prose does
 // not: numbered steps, an exact field name to read the result from
 // (open_findings, never the markdown report), and an explicit
 // verbatim/byte-for-byte instruction not to retype or recompute the id.
-test('static: conduct-plan/SKILL.md\'s prior_findings instruction is MECHANICAL (numbered steps, an exact field name, an explicit verbatim/byte-for-byte requirement), not prose describing intent (specs/record-fixed-findings.md, fix round 2, AC-7)', () => {
+test('static: conduct-plan/SKILL.md\'s prior_findings instruction is MECHANICAL (numbered steps, an exact field name, an explicit verbatim/byte-for-byte requirement), not prose describing intent (specs/record-fixed-findings.md, fix round 2, AC-5)', () => {
   const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
   assert.ok(skill.includes('open_findings'), 'SKILL.md must name the exact field to read the ids from')
   assert.ok(/verbatim|byte-for-byte/i.test(skill), 'SKILL.md must instruct passing the value through unmodified')
-  assert.ok(/report, never the markdown|never the markdown `report`|never the markdown \`report\`/i.test(skill) || (skill.includes('open_findings') && skill.includes('markdown')), 'SKILL.md must distinguish the structured return value from the markdown report')
+  // Fix round 3, finding 4: the `||` fallback reduced to "the file contains the
+  // word markdown somewhere", satisfied by an unrelated ```` ```markdown ````
+  // fence -- deleting the whole clause this assertion exists to pin left this
+  // test, and the suite, green. Dropped; the regex alone is the real check.
+  assert.ok(/never\s+the\s+markdown\s+`report`/i.test(skill), 'SKILL.md must distinguish the structured return value from the markdown report')
   // Numbered steps: at least "1." and "2." appearing near the prior_findings instruction.
   const idx = skill.indexOf('Mechanical steps for `prior_findings`')
   assert.ok(idx !== -1, 'SKILL.md must introduce the mechanical steps explicitly')
   const nearby = skill.slice(idx, idx + 2500)
   assert.ok(nearby.includes('1.') && nearby.includes('2.') && nearby.includes('3.'), 'the instruction must be numbered steps, not a paragraph')
+})
+
+// Fix round 3, finding 1 (HIGHEST, privacy regression): the conductor's
+// prior_findings state (lens location/claim VERBATIM, potentially a
+// secret or a quoted source line) must never reach a TRACKED file. Proven
+// two ways: the real .gitignore pattern genuinely matches via a real `git
+// check-ignore` (not merely present as text -- a malformed pattern would
+// pass a naive .includes() check and still fail to ignore anything), and
+// SKILL.md instructs writing to that exact untracked path, never to the
+// plan file's own (tracked) Conductor log.
+test('static: .claude/conductor-prior-findings.json (the conductor\'s prior_findings state, which carries lens location/claim verbatim) is genuinely gitignored, confirmed by a real git check-ignore, not merely listed as text (specs/record-fixed-findings.md, fix round 3, finding 1)', () => {
+  const gitignore = readAll('.gitignore')
+  assert.ok(gitignore.includes('.claude/conductor-prior-findings.json'), '.gitignore must list the file')
+  const res = spawnSync('git', ['check-ignore', '-q', '.claude/conductor-prior-findings.json'], { cwd: ROOT, env: sanitizedGitEnv() })
+  assert.equal(res.status, 0, 'git check-ignore must exit 0 -- the pattern must genuinely match, not just appear as text in the file')
+})
+
+test('static: conduct-plan/SKILL.md instructs writing prior_findings state to the untracked .claude/conductor-prior-findings.json, and does NOT instruct writing it to the plan file\'s own (tracked) Conductor log (specs/record-fixed-findings.md, fix round 3, finding 1)', () => {
+  const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
+  assert.ok(skill.includes('.claude/conductor-prior-findings.json'), 'SKILL.md must name the untracked state file')
+  assert.ok(/untracked/i.test(skill) || /gitignore/i.test(skill), 'SKILL.md must say the file is untracked/gitignored, not leave that implicit')
+  // The mechanical steps section (between the two markers below) must not
+  // INSTRUCT appending prior_findings data to "## Conductor log" -- that
+  // was the fix round 2 defect. A bare .includes('## Conductor log') is
+  // vacuous here: the block LEGITIMATELY mentions that heading once, in
+  // the sentence saying NEVER to write there, so presence alone proves
+  // nothing (this is the exact fix round 3, finding 4 shape, caught
+  // against my own test rather than shipped). Checked instead for the
+  // OLD instruction's own exact wording (now absent) and the NEW
+  // destination's own exact wording (now present).
+  const start = skill.indexOf('Mechanical steps for `prior_findings`')
+  const end = skill.indexOf('What this proves and what it does not')
+  assert.ok(start !== -1 && end > start, 'could not locate the mechanical-steps block')
+  const block = skill.slice(start, end)
+  assert.ok(!/append ONE new line to `## Conductor\s+log`/.test(block), 'the mechanical-steps block must not still instruct appending prior_findings data into the tracked Conductor log (the fix round 2 defect)')
+  assert.ok(/write the whole object back/i.test(block), 'the mechanical-steps block must instruct the NEW write target')
+})
+
+// Fix round 3, finding 3 (specs/record-fixed-findings.md): review-cycle.js's
+// own whenToUse (the sentence a model reads when deciding how to call this
+// workflow) and its prior_findings code comment must document `id` as a
+// REQUIRED field on each prior_findings entry -- they drifted to the
+// pre-AC-3 shape ({lens, location, claim, severity?, ac_id?}, no id) after
+// AC-3 made id mandatory, so a caller built exactly to the documented
+// contract silently produced zero fixed entries with no error, only two
+// counters as the trace.
+test('static: review-cycle.js\'s whenToUse documents id as a REQUIRED field on prior_findings entries, not the pre-AC-3 optional shape (specs/record-fixed-findings.md, fix round 3, finding 3)', () => {
+  const src = readAll('workflows', 'review-cycle.js')
+  const whenToUseMatch = src.match(/whenToUse:\s*'([^']*(?:\'[^']*)*)'/)
+  assert.ok(whenToUseMatch, 'expected to find the whenToUse string literal')
+  const whenToUse = whenToUseMatch[1]
+  const priorIdx = whenToUse.indexOf('prior_findings?:')
+  assert.ok(priorIdx !== -1, 'whenToUse must document prior_findings')
+  const priorClause = whenToUse.slice(priorIdx, priorIdx + 400)
+  assert.ok(/\{id,\s*lens/.test(priorClause), `whenToUse's prior_findings shape must lead with id, got: ${priorClause}`)
+  assert.ok(/id is REQUIRED/i.test(priorClause), 'whenToUse must say id is required, not merely list it as one field among optional ones')
 })
 
 test('static: AGENT-HARNESS.md\'s ledger paragraph carries the absolute-timestamp justification and the git-history survival clause, not just README.md (L3, AC-SEC-3/AC-SEC-4)', () => {

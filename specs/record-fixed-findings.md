@@ -2,7 +2,7 @@
 
 <!-- no-acceptance-criteria: this file uses its own AC-1..AC-4 numbering (matching what the code and tests already cite by number), not the AC-<LENS>-<n> multi-lens harness convention -- see "Acceptance criteria" below. The AC-ARCH-9/AC-SEC-2/etc mentions elsewhere in this file are prose references to OTHER specs' pre-existing criteria (explaining why a pinned test or a free-text exclusion exists), never definitions of new ones in this file. -->
 
-**Status:** implemented, fix round 2 in progress
+**Status:** implemented, fix round 3 in progress
 **Lenses run:** none at planning (implemented directly against a written brief, not through plan-cycle). This file is written retrospectively (fix round 1, finding 6) to close the gap between the code's own citations and a spec that did not exist.
 
 ## Problem
@@ -23,11 +23,16 @@ findings simply evaporate from the report between rounds.
 
 `workflows/review-cycle.js` gains an optional `prior_findings` argument:
 findings the caller (in practice, `conduct-plan`) reports as open going into
-this round, as `{lens, location, claim, severity?, ac_id?}` -- the same raw
-descriptor shape `open_findings`/`spec_bugs`/`rejected_findings` already
-use. When supplied, the synthesis step is asked which of those it can
-confirm resolved in the built change, and returns `fixed_findings`, echoes
-of the ones it confirms. Both raw arrays ride through to
+this round, as `{id, lens, location, claim, severity?, ac_id?}` (fix round
+3, finding 3: `id` is REQUIRED, sourced from an earlier round's own
+`open_findings` return value -- a caller that omits it, or supplies one
+that does not match its own content, gets every entry dropped and zero
+fixed entries recorded, silently, per AC-3's guard). This shape differs
+from `open_findings`/`spec_bugs`/`rejected_findings`'s raw descriptor shape
+in exactly that one field. When supplied, the synthesis step is asked
+which of those it can confirm resolved in the built change, and returns
+`fixed_findings`, echoes of the ones it confirms (without an `id` -- see
+AC-2). Both raw arrays ride through to
 `workflows/lib/ledger-append.mjs` as opaque payload data (workflow scripts
 have no `node:crypto`, so id hashing happens there, same as every other
 disposition).
@@ -47,10 +52,18 @@ with nothing dropped (fix round 1, finding 3 -- see below).
 
 ## Acceptance criteria
 
-These three match what the code and tests already cite by number
+These match what the code and tests already cite by number
 (`workflows/lib/ledger-append.mjs`, `workflows/review-cycle.js`,
-`test/ledger-append.test.js`, `test/review-cycle.test.js`,
-`test/ledger-seam.test.js`).
+`skills/conduct-plan/SKILL.md`, `test/ledger-append.test.js`,
+`test/review-cycle.test.js`, `test/ledger-seam.test.js`,
+`test/static-checks.test.js`). Fix round 3, nit: this section previously
+said "these three" while defining four, and separately used `AC-7` for two
+DIFFERENT things across fix rounds -- the original brief's "full suite
+green" and, introduced in fix round 2, "SKILL.md's instruction is
+mechanical, not prose". The second use is folded into AC-5 below, where it
+belongs; AC-7 keeps its original meaning. `skills/conduct-plan/SKILL.md`
+and `test/static-checks.test.js` are updated to cite AC-5, not AC-7, for
+the mechanical-steps requirement.
 
 **AC-1** (extended, fix round 2): `review-cycle` accepts an optional
 `prior_findings` argument. Absent, every existing behaviour is
@@ -103,6 +116,30 @@ and confirmed green again. Fix round 2 adds: the prior-id verification
 guard removed (a mismatched or missing supplied id trusted anyway), and
 `findingId` recomputation broken so round one and round two ids diverge
 again -- both observed to fail a real test, then reverted.
+
+**AC-5** (extended, fix round 2): `skills/conduct-plan/SKILL.md` passes
+`prior_findings` on round two of review for the same task and every round
+after, and states plainly what the resulting number does and does not
+mean (undercounts, never falsely joins; a lens's judgement, not proof of
+repair). The instruction is MECHANICAL steps -- an exact field to read the
+result from, an explicit verbatim/byte-for-byte requirement, numbered
+steps -- the same style as the ledger-write instruction beside it, not
+prose describing intent. Pinned in `test/static-checks.test.js` by regex
+anchors on the file's own exact wording, not by `.includes()` substring
+checks that prose elsewhere in the file could satisfy by coincidence (fix
+round 3, finding 4: two such checks were found and tightened).
+
+**AC-6**: `workflows/lib/optimise-read.mjs` computes rework attribution
+from these dispositions. Checked in fix round 1: `bumpDisposition`'s counts
+object already included a `fixed: 0` slot and `optimise-cycle.js` already
+rendered it, both dead code waiting on this feature -- no change was
+needed for the base case. Fix round 1 and fix round 3 findings that DID
+require changes here (duplicate/cross-round dedupe, the new trust-boundary
+counters) are their own numbered findings below, not part of this AC.
+
+**AC-7**: the full test suite passes -- `node --test test/*.test.js` and
+`python3 -m unittest discover -s hooks -p 'test_*.py'` both green, with any
+failure attributed to this change, never assumed pre-existing.
 
 ## Fix round 1 (2026-08-31)
 
@@ -351,9 +388,10 @@ was widened for one genuine, reviewed, necessary addition.
   not become the next "written to every line and read by nothing" field.
 - `skills/conduct-plan/SKILL.md`: the `prior_findings` instruction is now
   numbered mechanical steps (read `open_findings` from the STRUCTURED
-  return value, store it verbatim in the conductor log tagged by task id,
-  retrieve and pass it forward unmodified on the next round), not prose
-  describing intent (AC-7).
+  return value, store it verbatim keyed by `<plan file>:<task id>` in
+  `.claude/conductor-prior-findings.json` -- an UNTRACKED file, fix round
+  3, finding 1, below -- retrieve and pass it forward unmodified on the
+  next round), not prose describing intent (AC-5).
 
 **Honesty, restated plainly (this repo has had to correct this claim
 once already, in fix round 1 -- see finding 3 above).** This joins a
@@ -369,3 +407,146 @@ now verified against its own content before it is trusted," which closes
 one specific failure (a mistyped, stale or fabricated id silently
 producing a joinable record) without closing, or claiming to close, the
 others (a false confirmation, a rubber-stamped list, a reworded finding).
+
+## Fix round 3 (2026-08-31): a privacy regression, and four narrower defects
+
+Ten mutations against fix round 2's guards were all caught by the test
+that names them, including the end-to-end join -- the guards hold. This
+round found five different problems, none of them the join mechanism
+itself.
+
+**Finding 1 (HIGHEST) -- the conductor instruction wrote lens free text
+into a committed file.** `skills/conduct-plan/SKILL.md`'s step 3 (fix
+round 2) told the conductor to append `prior_findings for <task id>:
+<JSON.stringify(open_findings)>` to the plan file's own `## Conductor
+log`. `open_findings` carries `location` and `claim` verbatim for every
+finding every lens reports -- exactly the free text
+`workflows/lib/ledger-append.mjs`'s own `LEDGER_ENTRY_SCHEMA` comment
+names as the reason `additionalProperties: false` exists (AC-SEC-2, "no
+free text, ever"): to keep a secret or a quoted source line from being
+routed through the ledger. Plan files live under `specs/`, which is
+tracked. Route B (fix round 2) was chosen specifically because Route A
+could not deliver AC-1/AC-3 without the full `{lens, location, claim}`
+triple -- and then relocated that exact triple to a store with STRICTLY
+WEAKER properties than the one it was kept out of: committed, permanent,
+in git history, on a public repository. Concrete: a `lens-security`
+finding whose `claim` quotes a hardcoded credential, once written by step
+3, is one `git commit` away from git history -- and rewriting a branch
+removes a string from the branch, not from the repository.
+
+Fixed by moving the data, not by removing it (the full triple is still
+required for AC-3's recompute-and-compare -- ids alone are not enough):
+`.claude/conductor-prior-findings.json`, an UNTRACKED file (added to
+`.gitignore`, matching `.claude/harness-ledger.jsonl`'s own existing
+pattern and reasoning), a JSON object keyed by `<plan file>:<task id>`,
+overwritten (never appended) per task per round. SKILL.md's steps 1 and 3
+now read and write this file instead of the plan file's own conductor
+log, with the reasoning stated inline, not left implicit. The
+REPLACE-not-APPEND shape also addresses the coordinator's separate note
+that nothing bounded the old conductor-log line's size: a task's own
+stored entry no longer grows across rounds, only within one round's own
+finding count (itself now bounded to at most `MAX_FINDINGS` by fix round
+3's own finding 2 fix, below).
+
+**Finding 2 (HIGH) -- the join silently broke on busy rounds, which is
+when it matters.** `ledger-append.mjs` returned an id for EVERY open
+descriptor on the CLI result, computed before `MAX_FINDINGS` (15) capped
+what actually reached `entry.findings`. Measured: 20 open findings in one
+round wrote 15, returned 20 ids, and the 5 ids for findings that were
+NEVER RECORDED were handed to the caller anyway. Confirming one of those 5
+in a later round wrote a `fixed` entry with `invalid_prior_ids_dropped: 0`
+(the id genuinely matched its own content -- the guard has no way to know
+the ledger never actually recorded it) and no `open` counterpart anywhere
+in the ledger. This is fix round 1's starvation class (finding 4)
+recurring one layer up: not "which disposition gets truncated out of the
+line" but "does a returned id correspond to anything the line actually
+holds". Fixed by reconciling `openFindingIds` against what the write
+ACTUALLY produced, once, right before it reaches the CLI result: `line`
+(whichever code path produced it -- the ordinary case, the byte-rescue
+truncation loop, or the minimal-envelope degrade, where `entry` itself is
+never reassigned and so cannot be trusted for this check) is parsed back
+as ground truth, and any returned id not present among the written
+`entry.findings`' own `open` entries is nulled out. review-cycle.js's
+existing zip logic (fix round 2) already treats a null id as "drop this
+descriptor", so no change was needed there.
+
+**Finding 3 (MEDIUM) -- the argument contract a model reads was wrong,
+and failed silently.** `review-cycle.js`'s `meta.whenToUse` (and its own
+code comment, and this spec's Approach section) still described
+`prior_findings` entries as `{lens, location, claim, severity?, ac_id?}`
+after AC-3 (fix round 2) made `id` REQUIRED. A caller built exactly to the
+documented shape produced `invalid_prior_ids_dropped` and
+`invalid_fixed_ids_dropped` both 1, zero fixed entries, and no error --
+only two counters as the trace. Fixed by correcting all three (whenToUse,
+the code comment, this spec's Approach section) to lead with `id` and say
+plainly it is required, sourced from an earlier round's own
+`open_findings` return value. Pinned in `test/static-checks.test.js`
+against the real `whenToUse` string, not a paraphrase of it.
+
+**Finding 4 (MEDIUM-LOW) -- two assertions added in fix round 2 could not
+fail.** `skill.includes('fixed')` was already satisfied by main's own
+unrelated "a fixed out-of-repo marker" sentence. A `||` fallback reduced
+to "the file contains the word markdown somewhere", satisfied by an
+unrelated code fence. Both were assertions on prose rather than behaviour
+-- the third such assertion this branch has produced (fix round 1 found
+one, fix round 2 found none but this round found two more of the SAME
+shape). Fixed by anchoring on the file's actual, specific wording
+(`disposition:\s*'fixed'`, and a whitespace-tolerant match on "never the
+markdown \`report\`" that survives this file's own line wrapping) and
+dropping the vacuous `||` clause entirely. Mutation-proven: removing the
+real phrase each regex targets fails the corresponding test; the file
+otherwise passing does not.
+
+The pattern is worth naming rather than only patching: a prose assertion
+that uses `.includes()` on a common word, or falls back to a weaker `||`
+clause "just in case", degrades toward "the file is non-empty" the moment
+the file grows. The discipline this round applied, and that any future
+prose assertion in this file should apply on sight: anchor on the
+EXACT phrase the file uses (a regex tight enough that a plausible edit
+elsewhere in the file cannot satisfy it by coincidence), and mutation-test
+it immediately -- delete the specific phrase, confirm the test dies,
+restore -- rather than trusting that a plausible-looking `assert.ok` does
+what its message claims.
+
+**Finding 5 (LOW) -- the same-line reconciliation covered `open` but not
+`rejected` or `spec_bug`.** Fix round 1's finding 8 stopped a finding
+still reported `open` this round from also being recorded `fixed` on the
+same line. The same contradiction was still reachable through the other
+two dispositions synthesis can assign a finding this round: a finding
+investigated and REJECTED as a false alarm, or flagged as a SPEC BUG,
+could still be confirmed `fixed` in the same payload, writing two
+contradictory dispositions under one id with `invalid_fixed_ids_dropped:
+0`. `aggregateRework` would then count both against the same lens.
+Fixed by widening the reconciliation set from `open`'s own ids to the
+union of `spec_bugs`, `rejected_findings` and `open_findings`' ids
+(the function parameter renamed from `stillOpenIds` to
+`sameRoundOtherDispositionIds` to match); the schema comment for
+`invalid_fixed_ids_dropped` widened to name all three reasons.
+
+**Nits, addressed alongside the findings above:**
+- The Acceptance criteria section said "these three" while defining four,
+  and used `AC-7` for two different things across fix rounds (the
+  original brief's "suite green" and, introduced in fix round 2, the
+  mechanical-steps requirement). AC-5 and AC-6 are now formally defined
+  (they existed in the original brief but were never written into this
+  file), AC-7 keeps its original "suite green" meaning, and the
+  mechanical-steps requirement is folded into AC-5 where it belongs.
+  `SKILL.md` and `test/static-checks.test.js` cite AC-5, not AC-7, for it.
+- `SKILL.md`'s step 3 already needed a branch for `open_findings` being
+  `null` (the ledger write failed, or an older `ledger-append.mjs`), not
+  just empty (`[]`) -- addressed as part of finding 1's rewrite: `null`
+  leaves the stored entry untouched and logs the anomaly, rather than
+  being conflated with "genuinely zero open findings".
+
+**Not a defect, recorded for anyone reading this later.** A fabricated
+`{id, lens, location, claim}` triple where the id genuinely IS
+`findingId(lens, location, claim)` for that exact triple passes the AC-3
+guard: the guard is a self-consistency checksum (does the supplied id
+match the supplied content), not an authenticity proof (was this content
+ever genuinely reported by a real lens in a real prior round). Anyone able
+to supply both halves consistently can make them agree. The documentation
+throughout this file already scopes AC-3 to exactly that ("a confirmation
+must reference one of the findings supplied in the same request", never
+"the confirmation is proven genuine") -- no change follows from this, and
+it is recorded here so a later edit does not widen that claim past what
+the guard actually proves.
