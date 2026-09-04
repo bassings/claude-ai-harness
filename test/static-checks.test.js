@@ -161,14 +161,30 @@ const LEAK_PATTERNS = [
   { key: 'users', name: 'an absolute /Users/ path', re: /\/Users\/[a-zA-Z0-9_.-]/ },
   { key: 'volumes', name: 'an absolute /Volumes/ path', re: /\/Volumes\/[a-zA-Z0-9_.-]/ },
   { key: 'home', name: 'an absolute /home/<name> path', re: /\/home\/[a-zA-Z0-9_.-]/ },
-  // The only genuinely PRIVATE delivery repo. Verified 2026-09-04 by
-  // `gh repo view`: bassings/CouchPotatoServer is PUBLIC, so naming it is a
-  // documentation choice rather than a disclosure, and it is split out below.
-  { key: 'private-repo', name: 'a private target repo', re: /said.?of.?you/i },
-  // Public, but still banned from GENERIC shipped files: workflows/, skills/,
-  // agents/, hooks/ and bin/ go to every consumer and must not name any
-  // particular target repo. Docs citing it as a worked example are exempt.
-  { key: 'target-repo', name: 'a specific target repo', re: /couchpotato/i },
+  // ONE repo-name rule, and it is HYGIENE, not secrecy.
+  //
+  // Owner ruling, 2026-09-04: neither delivery repo's NAME is confidential.
+  // CouchPotatoServer is a public repo (`gh repo view`, verified same day),
+  // and Scott ruled that the other name is not confidential either, having
+  // been shown that it appears 27 times across three tracked specs published
+  // since 2026-08-17. The guard previously asserted the opposite while specs/
+  // published the name openly one directory across; that contradiction is now
+  // resolved in favour of what the repo actually does.
+  //
+  // The rule that REMAINS, and why it is not merely decoration: workflows/,
+  // skills/, agents/, hooks/ and bin/ are GENERIC and ship to every consumer
+  // verbatim. A generic harness file naming one particular delivery repo is a
+  // defect regardless of whether that name is secret, because it hardcodes one
+  // installation's world into everybody's copy. That is the leak this clause
+  // actually caught on 2026-09-04, in a review-cycle.js comment. Documentation
+  // that cites a repo as a worked example (AGENT-HARNESS.md, README.md,
+  // specs/) is exempt, because naming the case is the point there.
+  //
+  // NOT ruled on, and deliberately out of this guard's scope: those specs also
+  // describe that system's CI, production setup and settings. A name being
+  // non-confidential says nothing about the operational detail beside it, and
+  // no pattern here would catch that anyway. Raised with the owner separately.
+  { key: 'target-repo', name: 'a specific target repo', re: /said.?of.?you|couchpotato/i },
 ]
 
 // The literal placeholder an install instruction is SUPPOSED to contain.
@@ -199,13 +215,21 @@ const EXEMPTIONS = [
     paths: ['test/'],
     skip: ['users', 'volumes', 'home', 'target-repo'],
     placeholder: false,
-    why: 'Fixtures deliberately contain hostile-looking absolute paths (path traversal, injection) and repo names, as test DATA. They are never installed anywhere. The private-repo pattern is NOT waived: no fixture needs that name, and a synthetic one always works. Use a synthetic account name (some-operator, victim) rather than a real one, which is how the real leak here was found.',
+    // Declared blanket exemption. This directory is scanned for nothing, and
+    // saying so out loud is the point: after the two repo-name patterns merged
+    // under the 2026-09-04 owner ruling, test/'s four waivers became every
+    // pattern there is, and the exemption-table check below caught it rather
+    // than letting a whole directory quietly fall out of the scan. Kept as a
+    // blanket rather than trimmed, because each waiver is individually
+    // justified (see why) and pretending otherwise would be theatre.
+    blanket: true,
+    why: 'Fixtures deliberately contain hostile-looking absolute paths (path traversal, injection) and repo names, as test DATA. They are never installed anywhere. Still: use a synthetic account name (some-operator, victim) rather than a real one. A fixture using this operator\'s actual username is how the one real leak in this repo was found, on 2026-09-04.',
   },
   {
     paths: ['specs/'],
-    skip: ['private-repo', 'target-repo', 'users'],
+    skip: ['target-repo', 'users'],
     placeholder: false,
-    why: 'PENDING OWNER DECISION, raised 2026-09-04 (review round one M1 recurrence, round two L1). Three tracked specs name the private delivery repo 27 times, with context about its CI and production setup, in a PUBLIC repo. Not introduced by any recent change. The repo currently holds two contradictory positions: this guard treats the string as something that must never ship, and specs/ publishes it openly. Resolving it means either scrubbing the name (which clears the tip, not the history a secret scanner reads) or demoting the pattern because the name is not actually confidential. Until the owner rules, the gap is recorded HERE rather than left invisible, which is the whole point of an exemption table. The /Volumes/ and /home/ clauses are NOT waived.',
+    why: 'Specs are written FROM real incidents in real repos, so naming the repo is the point rather than an accident, exactly as it is in AGENT-HARNESS.md and README.md. Owner ruling 2026-09-04: neither delivery repo name is confidential, which resolved a contradiction where this guard treated the string as unshippable while specs/ published it openly. The /Volumes/ and /home/ clauses are NOT waived, and the users waiver only covers the YOUR_USERNAME placeholder convention these docs share. What this exemption does NOT cover, and what no pattern here could: those specs also describe a delivery system\'s CI, production setup and settings allow-list. That is a judgement about operational detail, raised with the owner separately, not something a regex decides.',
   },
 ]
 
@@ -253,7 +277,16 @@ test('static: every EXEMPTIONS entry names a real tracked path, waives only know
     for (const k of e.skip) {
       assert.ok(keys.includes(k), `EXEMPTIONS waives unknown pattern key ${k}`)
     }
-    assert.ok(e.skip.length < keys.length, `EXEMPTIONS for ${e.paths.join(', ')} waives every pattern, which is the same as not scanning it at all`)
+    // A blanket exemption is allowed, but only when DECLARED. The failure this
+    // prevents is an entry that waives everything by accident -- one more key
+    // added to skip, or a pattern list that shrinks underneath it -- leaving a
+    // directory unscanned with nobody aware. Declaring it costs one field and
+    // makes the gap visible in review.
+    if (e.skip.length >= keys.length) {
+      assert.equal(e.blanket, true, `EXEMPTIONS for ${e.paths.join(', ')} waives every pattern, which is the same as not scanning it at all. If that is intended, set blanket: true so it is a stated decision rather than an accident.`)
+    } else {
+      assert.ok(e.blanket === undefined, `EXEMPTIONS for ${e.paths.join(', ')} declares blanket: true but does not actually waive every pattern -- a stale declaration hides how much is really covered`)
+    }
     assert.ok(typeof e.why === 'string' && e.why.length > 40, `EXEMPTIONS for ${e.paths.join(', ')} needs a real reason, not a shrug`)
   }
 })
