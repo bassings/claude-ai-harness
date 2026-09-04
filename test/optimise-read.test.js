@@ -1893,8 +1893,8 @@ test('optimise-read: a stored plan_key that is a genuine absolute path UNDER the
 
 test('optimise-read: a hand-seeded pre-PR1 line whose spec is a verbatim "../" traversal (no plan_key stored) is redacted on read via the spec fallback, counted as unattributable, and leaks nothing into the output (M1, end-to-end)', () => {
   const records = [
-    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '../../../home/scott.b/.ssh/config', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
-    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: '../../../home/scott.b/.ssh/config', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'started', spec: '../../../home/some-operator/.ssh/config', run_id: 'r1', ts: '2026-08-01T00:00:00.000Z' },
+    { kind: 'tdd_task', repo: 'demo', outcome: 'done', spec: '../../../home/some-operator/.ssh/config', run_id: 'r1', ts: '2026-08-01T00:01:00.000Z' },
   ]
   const result = mod.aggregateWallClock(records, { root: '/repo' })
   assert.equal(result.byPlan.size, 0, 'the traversal must never create (or share) a byPlan bucket')

@@ -38,15 +38,23 @@ Whether the feature is worth building (`lens-product`).
 
 1. **Which existing components does this reuse?** Name them. A new component is
    a cost: justify it, or use what exists.
-2. **Draw the flow**, including the exits: cancel, back, undo, "I changed my
+2. **What does this replace, and what must be GONE when it lands?** Name every
+   control, screen, section and piece of copy the new work supersedes, and
+   write each removal as its own `AC-DESIGN-<n>` phrased so review can fail it
+   ("the secondary dismiss control is gone; the dialog renders exactly one
+   close control"),
+   never as "old controls are cleaned up". If it replaces nothing, say so in
+   one line: an empty list stated is a different claim from one never
+   considered. See AGENT-HARNESS.md, "What a change replaces".
+3. **Draw the flow**, including the exits: cancel, back, undo, "I changed my
    mind after confirming".
-3. **Enumerate the states.** For each, what does the user see and what can they
+4. **Enumerate the states.** For each, what does the user see and what can they
    do. The empty state and the error state are the ones that get skipped and
    the ones users hit first.
-4. **Destructive actions**: what is the confirmation, is it reversible, and
+5. **Destructive actions**: what is the confirmation, is it reversible, and
    does the copy say what will actually happen ("Delete 3 files from disk", not
    "Are you sure?").
-5. **At phone width**, what changes.
+6. **At phone width**, what changes.
 
 Produce `AC-DESIGN-<n>` criteria that name the state or flow and the expected
 result. Reference the design system file where one exists.
@@ -57,6 +65,17 @@ Verify each `AC-DESIGN-<n>` against the built templates and styles. **Render it
 if you can**: read the actual template output, run the conformance check the
 project provides, look at the screenshots the E2E suite produces. Reading the
 diff is the weakest form of evidence available to you.
+
+Then take an inventory of every interactive control the change leaves on the
+screen and answer two questions about each: **does it do anything, and does it
+do something different from its neighbours?** A control that renders and calls
+nothing is a finding. So are two controls that call the same thing while being
+styled as a choice: they promise the user a decision the app cannot honour.
+This is not covered by the tests, which drive the control they were written
+for and pass identically with a redundant one sitting beside it, and it is not
+covered by `lens-architecture`, whose dead-code duty reads the call graph
+rather than the screen. Working code with nothing behind it is live to the
+compiler and dead to the user.
 
 Then check the states nobody implements: what does this look like with zero
 items, with one, with a thousand, mid-request, and after a failure. A state

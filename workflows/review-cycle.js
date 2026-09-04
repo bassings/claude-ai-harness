@@ -933,12 +933,23 @@ if (dataHit.length) {
   lenses.push('lens-data')
   triggerCounts['lens-data'] = dataHit.length
 }
-if (archHit.length || scope.new_modules || scope.new_dependency_entries) {
+// uiHit too, added 2026-09-04 after a design-system change in a
+// delivery repo added a new UI and left old buttons on screen wired to nothing. This lens's review
+// mode holds the only "dead code this change created and did not remove" duty
+// in the roster, and architecture's globs are dependency manifests and core
+// wiring -- which a components-and-CSS diff never touches. The lens carrying
+// the duty was structurally absent from the change class that creates the
+// debris. Deliberately review-side only: at planning the removal question
+// belongs to the lens owning the area (AGENT-HARNESS.md, "What a change
+// replaces"), and architecture's removal duty lives in its review text.
+if (archHit.length || uiHit.length || scope.new_modules || scope.new_dependency_entries) {
   lenses.push('lens-architecture')
-  // Honestly 0 when triggered purely by new_modules/new_dependency_entries
-  // with no file matching the architecture globs: a real, measured zero,
-  // not a stand-in borrowed from an unrelated rule group.
-  triggerCounts['lens-architecture'] = archHit.length
+  // Credits whichever surface actually triggered it, deduplicated: a file
+  // matching both globs is one file, not two. Still honestly 0 when triggered
+  // purely by new_modules/new_dependency_entries with nothing matching either
+  // glob -- a real, measured zero, not a stand-in borrowed from an unrelated
+  // rule group.
+  triggerCounts['lens-architecture'] = new Set([...archHit, ...uiHit]).size
 }
 if (opsHit.length) {
   lenses.push('lens-operability')

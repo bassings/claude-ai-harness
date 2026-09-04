@@ -567,6 +567,15 @@ const lensPrompt = (lens) =>
   `Read the spec and the relevant code, then produce your lens's numbered acceptance criteria as AC-<LENS>-<n> ` +
   `(e.g. AC-SEC-1, AC-QA-1, AC-SIMP-1: use your lens's short code). Each statement must be testable: a thing that can be ` +
   `shown true or false against the built change. Do not write criteria for another lens's concern.\n` +
+  // Added 2026-09-04. Lenses wrote criteria for what a change ADDS and were
+  // never asked what it REMOVES, so a replacement shipped its new half
+  // verified and its old half still on screen, wired to nothing. Review
+  // verifies criteria, so a removal with no criterion is invisible to it.
+  // Contract and worked examples: AGENT-HARNESS.md, "What a change replaces".
+  `If anything in YOUR area is replaced or made redundant by this change, write its removal as its own numbered ` +
+  `criterion, phrased so review can fail it ("the secondary dismiss control is gone; the dialog renders exactly one ` +
+  `close control"), never as "the old one is cleaned up". If your area replaces nothing, say so in one line: an empty ` +
+  `removal list stated is a different claim from one never considered.\n` +
   `Do NOT modify any file, including the spec: the synthesis step writes the criteria in. Return them via the structured ` +
   `output schema, with your coverage statement (could_not_check is mandatory and must be honest). Findings here are ` +
   `problems with the SPEC itself (missing decisions, untestable asks, scope risks).\n\n` +
