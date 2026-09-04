@@ -83,7 +83,19 @@ that leaves orphaned code behind. **The `ui` key still defines the surface, and
 that is deliberate**: narrowing a repo's `ui` globs switches off design,
 accessibility, product and now architecture together, which is what tuning that
 key is FOR. The guarantee is that `architecture` cannot be tuned to exclude UI,
-not that UI can never be narrowed. Its planning trigger is unchanged, because
+not that UI can never be narrowed.
+
+**When this widening should be reversed.** It buys one lens run on every diff
+touching the `ui` globs, which include `**/*.css` and `**/e2e/**`, so a colour
+token change now dispatches it too. That is a real cost against this file's own
+proportionality rule. The condition, stated now so a later `/optimise-cycle`
+does not have to invent a threshold: if over eight weeks `lens-architecture`
+returns no structural finding on any diff triggered through the `ui` globs
+alone, narrow its UI trigger to `**/components/**` and `**/ui/**`, or drop it
+and leave the on-screen half to `lens-design`. The ledger already records
+`trigger_counts` and per-lens findings, so this is measurable rather than a
+matter of opinion. A widening with no stated failure condition is a check
+nobody can ever argue for removing, which is how rosters only grow. Its planning trigger is unchanged, because
 the removal duty lives in its review-mode text and belongs at planning to the
 lens that owns the area.
 

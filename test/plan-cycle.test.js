@@ -887,4 +887,17 @@ test('plan-cycle.js: every planning lens prompt carries the removal duty, so a l
     /phrased so review can fail it/,
     'a removal criterion nobody can fail is the vacuous-guard shape wearing a new hat'
   )
+  // Round-two review M2. The three assertions above pin the DIAGNOSIS half of
+  // the instruction and leave the INSTRUCTION half freely invertible: the
+  // reviewer rewrote the worked example so the banned wording became the
+  // recommended one, and all three still matched, because all three phrases
+  // survive verbatim in the corrupted text. That is CLAUDE.md section 11's
+  // named vacuous shape -- asserting on the diagnosis clause while the
+  // instruction clause can be inverted freely -- reproduced inside the guard
+  // written to prevent it. 34 more pinned characters close it.
+  assert.match(
+    lensCall.prompt,
+    /never as "the old one is cleaned up"/,
+    'the prompt must keep NAMING the banned wording: without this, the worked example can be inverted so the forbidden phrasing becomes the recommended one and every other assertion still passes'
+  )
 })
