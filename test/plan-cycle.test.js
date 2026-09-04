@@ -852,3 +852,39 @@ test('plan-cycle.js: M3 -- a NON-contradictory report (consistent:true, all four
   const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa', 'lens-simplicity', 'lens-product'])
 })
+
+// Review round 1, M5: the four lines added to lensPrompt are the ONLY
+// mechanical carrier of the removal duty. The AGENT-HARNESS.md section is
+// guidance a lens may or may not read; this string is put in front of every
+// lens on every run. Deleting it left the whole suite at 1091/1091 green, so
+// it could be dropped, truncated by a careless edit to the adjacent template
+// literal, or paraphrased into the "old controls are cleaned up" wording the
+// change explicitly forbids, with the gate saying nothing.
+//
+// AGENT-HARNESS.md's own worked example is a policy list that drifted into a
+// new paraphrase every review round for four rounds and closed only once it
+// became a test instead of a prose reminder. This is that test.
+//
+// Deliberately pins the minimum that would notice deletion, not the whole
+// paragraph: an assertion on 434 characters of prose fails on every wording
+// improvement, which trains people to loosen it.
+test('plan-cycle.js: every planning lens prompt carries the removal duty, so a lens is told to write what its area LOSES and not only what it gains (review M5)', async () => {
+  const { calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
+  const lensCall = calls.find((c) => c.opts.label === 'lens-security')
+  assert.ok(lensCall, 'expected a lens-security call')
+  assert.match(
+    lensCall.prompt,
+    /removal as its own numbered criterion/,
+    'the removal must be demanded AS A CRITERION: review verifies criteria, so a removal stated anywhere else is invisible to it'
+  )
+  assert.match(
+    lensCall.prompt,
+    /replaces nothing, say so in one line/,
+    'an empty removal list STATED must be distinguishable from one never considered -- the whole defect class this change exists for'
+  )
+  assert.match(
+    lensCall.prompt,
+    /phrased so review can fail it/,
+    'a removal criterion nobody can fail is the vacuous-guard shape wearing a new hat'
+  )
+})

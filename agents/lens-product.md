@@ -54,6 +54,16 @@ Answer, in the spec:
    built. If the honest answer is that this change needs no measurement, write
    that as the criterion and say why.
 
+   **Name the minimum field set, and hand the personal half over.** The
+   criterion states the fewest fields that make the signal observable, whether
+   any of them identify a person, and where the data lands (including whether
+   that is a third party). If any of it is personal, say so in the criterion
+   and state that `lens-security` owns its minimisation, retention and
+   deletion, so it also appears as an `AC-SEC` criterion. You are not deciding
+   the retention period; you are making sure someone does. A field that reaches
+   an acceptance criterion is a field something gets built to carry, and the
+   one moment when not collecting it is free is right now.
+
    The failure this replaces, 2026-09-04: this lens used to be told to say
    plainly when a metric would never be read, and it read as licence to skip
    the question on a real multi-user product. Naming a measure nobody can

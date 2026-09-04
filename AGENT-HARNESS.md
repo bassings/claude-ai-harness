@@ -79,7 +79,11 @@ judgement, and say in the coverage statement which lenses you ran and why.
 a repo's `architecture` globs: the merge of `.claude/harness-triggers.json` over
 the defaults is key-level, so a repo that names only wiring files under
 `architecture` would otherwise switch the lens off for exactly the change class
-that leaves orphaned code behind. Its planning trigger is unchanged, because
+that leaves orphaned code behind. **The `ui` key still defines the surface, and
+that is deliberate**: narrowing a repo's `ui` globs switches off design,
+accessibility, product and now architecture together, which is what tuning that
+key is FOR. The guarantee is that `architecture` cannot be tuned to exclude UI,
+not that UI can never be narrowed. Its planning trigger is unchanged, because
 the removal duty lives in its review-mode text and belongs at planning to the
 lens that owns the area.
 

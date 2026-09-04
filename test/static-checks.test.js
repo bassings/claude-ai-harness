@@ -133,27 +133,84 @@ test('static: the three instrumented workflow scripts contain no EXECUTABLE impo
   }
 })
 
-test('static: no new file under workflows/, skills/, agents/ or docs/ hardcodes an absolute /Users/ or /Volumes/ path, or a private target repo name (AC-ARCH-9)', () => {
+// ---------------------------------------------------------------------------
+// ONE pattern list, consumed by BOTH leak guards below.
+//
+// Extracted 2026-09-04 (review round 1, M2). The two guards were near-
+// duplicates that had ALREADY diverged once: bin/'s checked a real
+// /home/<name> path and AC-ARCH-9's did not, so a Linux operator's home
+// directory shipped clean from workflows/, skills/, agents/ and docs/ while
+// being caught one directory across. Public CI runs on ubuntu-latest, where
+// $HOME is /home/<name>, and this operator's real path contains the literal
+// substring /home/scott.b, so it was a live shape rather than a hypothetical.
+// A fourth leak pattern added to one copy and forgotten in the other is the
+// same failure again; there is now only one copy to add it to.
+const LEAK_PATTERNS = [
+  { name: 'an absolute /Users/ path', re: /\/Users\/[a-zA-Z0-9_.-]/, key: 'users' },
+  { name: 'an absolute /Volumes/ path', re: /\/Volumes\/[a-zA-Z0-9_.-]/, key: 'volumes' },
+  { name: 'an absolute /home/<name> path', re: /\/home\/[a-zA-Z0-9_.-]/, key: 'home' },
+  // The only genuinely PRIVATE delivery repo. Verified 2026-09-04 via
+  // `gh repo view`: bassings/CouchPotatoServer is PUBLIC, so naming it is a
+  // documentation choice rather than a disclosure, and it is split out below.
+  { name: 'a private target repo', re: /said.?of.?you/i, key: 'private-repo' },
+  // Public, but still banned from GENERIC harness files: workflows/, skills/,
+  // agents/ and bin/ are shipped to every consumer and must not name any
+  // particular target repo. Documentation that cites it as a worked example
+  // (AGENT-HARNESS.md, README.md) is exempt from this one pattern only.
+  { name: 'a specific target repo', re: /couchpotato/i, key: 'target-repo' },
+]
+
+// The literal placeholder an install instruction is SUPPOSED to contain.
+// Stripped before matching rather than exempting the whole /Users/ clause:
+// a file allowed to say "/Users/YOUR_USERNAME" must still be caught if it
+// says "/Users/scott.b". An exemption that turns a clause off entirely is the
+// difference between a documented placeholder and a real leak going unnoticed.
+const PLACEHOLDER_RE = /\/Users\/YOUR_USERNAME/g
+
+function assertNoLeaks(f, { exempt = [], allowPlaceholder = false } = {}) {
+  const raw = fs.readFileSync(f, 'utf8')
+  const contents = allowPlaceholder ? raw.replace(PLACEHOLDER_RE, '/Users/') : raw
+  for (const { name, re, key } of LEAK_PATTERNS) {
+    if (exempt.includes(key)) continue
+    // A real leaked path has a segment after the prefix (e.g. /Users/scott/);
+    // documentation is allowed to mention the bare pattern /Users/ itself
+    // when describing what to reject (as this very test's name does).
+    assert.ok(!re.test(contents), `${f} hardcodes ${name}`)
+  }
+}
+
+test('static: no new file under workflows/, skills/, agents/ or docs/, nor AGENT-HARNESS.md or README.md, hardcodes an absolute /Users/, /Volumes/ or /home/<name> path, or a private target repo name (AC-ARCH-9)', () => {
   // agents/ added 2026-09-04. It was outside this guard for its whole life,
   // and it is the directory most likely to leak: lens prose is written from a
   // real incident in a real repo, so the natural way to write it is to name
   // the repo. Caught by hand this round on a review-cycle.js comment, which
   // WAS scanned; the same sentence pasted into agents/lens-design.md would
   // have shipped. The published install carries these files verbatim.
-  const targets = [
+  //
+  // AGENT-HARNESS.md and README.md added in the same round (review M1). Both
+  // ship to consumers exactly as agents/lens-*.md do -- README.md:61 is the
+  // `cp AGENT-HARNESS.md ~/.claude/` instruction, and
+  // workflows/lib/install-consistency.mjs lists AGENT-HARNESS.md first in
+  // CONSUMER_SUBSET_PATTERNS -- and this very commit added incident prose to
+  // AGENT-HARNESS.md, which is precisely the authoring pattern that leaks.
+  // Both carry the literal placeholder "/Users/YOUR_USERNAME" in install
+  // instructions, so both strip exactly that placeholder before matching --
+  // a REAL /Users/<operator> path in either file still fails. Both cite the
+  // PUBLIC CouchPotatoServer as a worked example, so they are exempt from
+  // 'target-repo' only. Nothing here weakens the private-repo, /Volumes/ or
+  // /home/ clauses, which are the ones that would carry a real disclosure.
+  const dirTargets = [
     ...walk(path.join(ROOT, 'workflows')),
     ...walk(path.join(ROOT, 'skills')),
     ...walk(path.join(ROOT, 'agents')),
     fs.existsSync(path.join(ROOT, 'docs')) ? walk(path.join(ROOT, 'docs')) : [],
   ].flat()
-  for (const f of targets) {
-    const contents = fs.readFileSync(f, 'utf8')
-    // A real leaked path has a segment after the prefix (e.g. /Users/scott/);
-    // documentation is allowed to mention the bare pattern /Users/ itself
-    // when describing what to reject (as this very test's name does).
-    assert.ok(!/\/Users\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Users/ path`)
-    assert.ok(!/\/Volumes\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Volumes/ path`)
-    assert.ok(!/said.?of.?you|couchpotato/i.test(contents), `${f} names a private target repo`)
+  for (const f of dirTargets) assertNoLeaks(f)
+
+  for (const rel of ['AGENT-HARNESS.md', 'README.md']) {
+    const f = path.join(ROOT, rel)
+    assert.ok(fs.existsSync(f), `${rel} must exist for this guard to mean anything`)
+    assertNoLeaks(f, { exempt: ['target-repo'], allowPlaceholder: true })
   }
 })
 
@@ -173,13 +230,7 @@ test('static: no file under bin/ hardcodes an absolute /Users/ or /Volumes/ path
   const targets = walk(path.join(ROOT, 'bin'))
   for (const f of targets) {
     const isPlistTemplate = path.basename(f) === 'com.local.optimise-cycle-weekly.plist'
-    const contents = fs.readFileSync(f, 'utf8')
-    if (!isPlistTemplate) {
-      assert.ok(!/\/Users\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Users/ path`)
-    }
-    assert.ok(!/\/Volumes\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Volumes/ path`)
-    assert.ok(!/\/home\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /home/<name> path`)
-    assert.ok(!/said.?of.?you|couchpotato/i.test(contents), `${f} names a private target repo`)
+    assertNoLeaks(f, { allowPlaceholder: isPlistTemplate })
   }
 })
 
