@@ -293,6 +293,22 @@ repo root; any key you supply replaces the default list for that key:
 runs at planning (and only at planning: its veto is spent before anything is
 built, the only point where cutting scope is free).
 
+**The keys are not fully independent.** At review, the `ui` globs also trigger
+`lens-architecture`, because that lens holds the only duty covering dead code a
+change created and did not remove, and the `architecture` globs are dependency
+manifests a components-and-styles diff never touches. Two consequences worth
+knowing before you tune:
+
+- Narrowing `ui` switches off **four** lenses together for the paths you drop:
+  `lens-design`, `lens-accessibility`, `lens-product` and `lens-architecture`.
+- Narrowing `architecture` does **not** switch `lens-architecture` off for UI
+  changes. That path is deliberately not overridable, since a repo naming only
+  wiring files there would otherwise disable the lens for exactly the change
+  class that leaves orphaned code behind.
+
+`AGENT-HARNESS.md` records the reasoning, and the condition under which the UI
+trigger should be narrowed again if it proves not to earn its cost.
+
 **This override fails closed, not silently.** `.claude/harness-triggers.json`
 is read and transcribed by an LLM step, not by the workflow script itself
 (dynamic-workflow scripts have no filesystem access), so a transcription
