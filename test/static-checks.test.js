@@ -133,10 +133,17 @@ test('static: the three instrumented workflow scripts contain no EXECUTABLE impo
   }
 })
 
-test('static: no new file under workflows/, skills/ or docs/ hardcodes an absolute /Users/ or /Volumes/ path, or a private target repo name (AC-ARCH-9)', () => {
+test('static: no new file under workflows/, skills/, agents/ or docs/ hardcodes an absolute /Users/ or /Volumes/ path, or a private target repo name (AC-ARCH-9)', () => {
+  // agents/ added 2026-09-04. It was outside this guard for its whole life,
+  // and it is the directory most likely to leak: lens prose is written from a
+  // real incident in a real repo, so the natural way to write it is to name
+  // the repo. Caught by hand this round on a review-cycle.js comment, which
+  // WAS scanned; the same sentence pasted into agents/lens-design.md would
+  // have shipped. The published install carries these files verbatim.
   const targets = [
     ...walk(path.join(ROOT, 'workflows')),
     ...walk(path.join(ROOT, 'skills')),
+    ...walk(path.join(ROOT, 'agents')),
     fs.existsSync(path.join(ROOT, 'docs')) ? walk(path.join(ROOT, 'docs')) : [],
   ].flat()
   for (const f of targets) {

@@ -37,9 +37,28 @@ Answer, in the spec:
    actually the problem.
 2. **What can they do afterwards that they cannot do now?** One sentence. If it
    is hard to write, the feature is unclear, not the sentence.
-3. **How will we know it worked?** For self-hosted or single-user software this
-   is rarely a metric: it may be "the operator stops having to do X manually".
-   Say so plainly rather than inventing analytics that will never be read.
+3. **How will we know it worked, and can we actually see it?** Two parts, and
+   the second is the one that gets skipped.
+
+   First, name the signal. For multi-user software that is usually a measure of
+   real use: who reached this, how far they got, where they stopped. For
+   self-hosted or single-user software it is rarely a metric and may be "the
+   operator stops having to do X manually", which is a legitimate answer.
+
+   Second, and always: **write the signal as a numbered `AC-PROD-<n>` naming
+   what must exist for it to be observable.** Not "we will track adoption", but
+   "an event fires once per completed submission, carrying whether the optional
+   step was used, and lands where <the named person> will actually look for it". A
+   success measure that lives only in prose is verified by nobody: review
+   checks criteria, so an unnumbered measure is a decision recorded and never
+   built. If the honest answer is that this change needs no measurement, write
+   that as the criterion and say why.
+
+   The failure this replaces, 2026-09-04: this lens used to be told to say
+   plainly when a metric would never be read, and it read as licence to skip
+   the question on a real multi-user product. Naming a measure nobody can
+   observe and naming no measure at all are both worse than a one-line
+   criterion saying none is needed.
 4. **What is explicitly out of scope**, and what would have to be true for that
    to change.
 5. **What happens if we do nothing?** Sometimes the honest answer is "very
@@ -54,6 +73,11 @@ without removing it first." Bad: "the search function is improved."
 Verify each `AC-PROD-<n>` against the built change. Drive the real path where
 you can: read the templates and handlers the user actually reaches, not the
 plan's description of them.
+
+Then verify the measurement criterion the same way: find the instrumentation
+in the built change and say where it lands, or fail the criterion. A feature
+shipped with its success measure unbuilt cannot be judged after release, and
+that is the round nobody comes back for.
 
 Then ask the question only this lens asks: **did we build the thing, or did we
 build something adjacent to it?** Scope drift in either direction is your

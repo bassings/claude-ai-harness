@@ -1933,3 +1933,85 @@ test('review-cycle.js: M3 -- a NON-contradictory report (consistent:true, all fo
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
 })
+
+// ---------------------------------------------------------------------------
+// A UI change wakes lens-architecture (specs: the orphaned-control gap,
+// reported from a delivery repo's staging environment, 2026-09-04).
+//
+// The defect: a design-system update added a new UI and left old buttons on
+// the screen wired to nothing. `agents/lens-architecture.md`'s review mode is
+// the ONLY lens carrying "dead code this change created and did not remove",
+// and it was not triggered -- architecture's globs are dependency manifests
+// and core wiring, which a components-and-CSS diff never touches. The lens
+// holding the duty was absent from precisely the change class that creates
+// the debris.
+//
+// Deliberately review-only. At planning the removal question belongs to the
+// lens that owns the area (lens-design writes AC-DESIGN removal criteria for
+// screens); architecture's removal duty lives in its REVIEW mode text, so
+// waking it at planning would add a lens without adding a duty.
+test('review-cycle.js: a UI-only diff triggers lens-architecture, so its "dead code this change created and did not remove" review duty runs on the change class that leaves orphaned controls behind', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/components/PhotoSheet.tsx', status: 'M' }] },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(
+    result.lenses.includes('lens-architecture'),
+    'a component file changed with no dependency manifest touched must still wake lens-architecture'
+  )
+  assert.equal(
+    result.telemetry.trigger_counts['lens-architecture'],
+    1,
+    'the count must credit the UI file that actually triggered it, not a bare 0 from the unrelated architecture glob group'
+  )
+})
+
+test('review-cycle.js: lens-architecture triggered by BOTH surfaces counts each file once, not the sum of two overlapping groups', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        // package.json matches the architecture globs; the .tsx matches ui.
+        files: [{ path: 'package.json', status: 'M' }, { path: 'src/components/Button.tsx', status: 'M' }],
+      },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.equal(result.telemetry.trigger_counts['lens-architecture'], 2)
+})
+
+// The honest-zero guarantee above must survive the widening: a lens woken by
+// a non-glob signal alone still reports 0, and a repo whose override REPLACES
+// the architecture globs (Object.assign is key-level, so a repo override
+// drops the harness defaults for that key entirely) still gets the UI path.
+test('review-cycle.js: the UI trigger for lens-architecture survives a repo override that replaces the architecture globs entirely', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        files: [{ path: 'src/components/PhotoSheet.tsx', status: 'M' }],
+        harness_triggers_file_exists: true,
+        // A real delivery repo's shape: architecture names only wiring files, none
+        // of which a design-system change touches.
+        custom_rules: { architecture: ['package.json', 'tsconfig.json', 'src/lib/**'] },
+      },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-architecture'), 'a repo-tuned architecture key must not be able to switch off the UI path')
+  assert.equal(result.telemetry.trigger_counts['lens-architecture'], 1)
+})

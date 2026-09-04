@@ -65,15 +65,23 @@ drift comparison (`workflows/lib/install-consistency.mjs`'s
 
 | Lens | Runs when | Owns |
 |---|---|---|
-| `lens-product` | A spec or user-facing change exists | Problem, user, benefit, success measure |
+| `lens-product` | A spec or user-facing change exists | Problem, user, benefit, and a success measure written as a criterion naming what must exist for it to be observable |
 | `lens-design` | UI, templates, styles, copy | Design-system conformance, flows, states |
 | `lens-accessibility` | UI, templates, styles, copy | WCAG 2.2 AA, keyboard, focus, AT behaviour |
-| `lens-architecture` | New module, boundary, or dependency | Coupling, extension points, scale |
+| `lens-architecture` | New module, boundary, or dependency; **and any UI change, at review only** | Coupling, extension points, scale, and dead code the change created and did not remove |
 | `lens-data` | Schema, migrations, destructive ops, personal data | Irreversibility, races, correctness of lookups, and whether a deletion/export mechanism does what `lens-security` requires |
 | `lens-operability` | Anything reaching production behaviour | Observability, rollback, failure modes |
 
 Each repo defines its own path globs in its `AGENTS.md`. Absent that, use
 judgement, and say in the coverage statement which lenses you ran and why.
+
+`lens-architecture`'s UI trigger is review-side only, and is not overridable by
+a repo's `architecture` globs: the merge of `.claude/harness-triggers.json` over
+the defaults is key-level, so a repo that names only wiring files under
+`architecture` would otherwise switch the lens off for exactly the change class
+that leaves orphaned code behind. Its planning trigger is unchanged, because
+the removal duty lives in its review-mode text and belongs at planning to the
+lens that owns the area.
 
 **Specialists, invoked as needed**, not part of the standing set.
 `reviewer-verification` (adversarial fresh-eyes pass on review, no plan
@@ -125,6 +133,42 @@ couchpotatoserver-dc session: CouchPotatoServer PR #279 took six review
 rounds to close, four of which were the same policy list drifting into a new
 paraphrase every round -- it closed only once that list was turned into a
 test instead of a prose reminder.
+
+## What a change replaces
+
+Every lens writes criteria for what the change ADDS. Nothing has ever been
+asked what it REMOVES, and a replacement is two jobs: put the new thing in,
+take the old thing out. Only the first half has ever had a criterion behind
+it, so the second half is invisible to review, which verifies criteria.
+
+**The lens that owns the area owns the removal.** `lens-design` owns the
+control, screen or copy the new one supersedes; `lens-data` owns the table,
+column or file the new shape retires; `lens-architecture` owns the module,
+helper or route left with no caller; `lens-operability` owns the metric,
+alert, job or runbook entry the old path needed and the new one does not.
+No single lens owns removal for the whole change: the specialist who knows
+what the new thing does is the only one who knows what it makes redundant.
+
+At planning, for anything your area gains, ask what it displaces, and write
+the removal as its own numbered criterion, phrased so review can fail it:
+
+- Good: `AC-DESIGN-4: the secondary dismiss control is gone; the dialog
+  renders exactly one close control.`
+- Bad: `AC-DESIGN-4: old controls are cleaned up.`
+
+If the change genuinely replaces nothing, say so in one line. An empty
+removal list stated is a different claim from one never considered, and this
+harness exists because those two look identical from the outside.
+
+At review, verify the removal criteria the way you verify the additions:
+against the built change, not the plan's description of it.
+
+**Why this is here and not in one lens's file.** Reported 2026-09-04: a
+design-system update shipped a new UI and left the superseded controls on
+screen, rendered and styled, wired to nothing. Every acceptance criterion
+described the new UI, and the new UI was correct, so the review passed
+honestly. The tests drove the new control and asserted it worked, which they
+did just as happily with the old ones still sitting beside it.
 
 ## Severity
 
