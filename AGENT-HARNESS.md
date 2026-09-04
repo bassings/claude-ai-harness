@@ -86,9 +86,15 @@ key is FOR. The guarantee is that `architecture` cannot be tuned to exclude UI,
 not that UI can never be narrowed.
 
 **When this widening should be reversed.** It buys one lens run on every diff
-touching the `ui` globs, which include `**/*.css` and `**/e2e/**`, so a colour
-token change now dispatches it too. That is a real cost against this file's own
-proportionality rule. The condition, stated now so a later `/optimise-cycle`
+touching the `ui` globs. Those are wider than "UI" sounds, in two stages. The
+harness defaults already include `**/*.css` and `**/e2e/**`, so a colour token
+change dispatches it. And a repo REPLACES that key wholesale, so `ui` means
+whatever that repo says it means: measured 2026-09-05, one delivery repo lists
+`.github/workflows/ci.yml` under `ui`, which was a deliberate choice made for
+other reasons and long predates this change. In that repo a CI-config-only diff
+now dispatches four lenses, `lens-architecture` among them, and none of them has
+much to say about a workflow file. That is a real cost against this file's own
+proportionality rule, and it is larger than the default globs suggest. The condition, stated now so a later `/optimise-cycle`
 does not have to invent a threshold: if over eight weeks `lens-architecture`
 returns no structural finding on any diff triggered through the `ui` globs
 alone, narrow its UI trigger to `**/components/**` and `**/ui/**`, or drop it
