@@ -133,48 +133,171 @@ test('static: the three instrumented workflow scripts contain no EXECUTABLE impo
   }
 })
 
-test('static: no new file under workflows/, skills/ or docs/ hardcodes an absolute /Users/ or /Volumes/ path, or a private target repo name (AC-ARCH-9)', () => {
-  const targets = [
-    ...walk(path.join(ROOT, 'workflows')),
-    ...walk(path.join(ROOT, 'skills')),
-    fs.existsSync(path.join(ROOT, 'docs')) ? walk(path.join(ROOT, 'docs')) : [],
-  ].flat()
-  for (const f of targets) {
-    const contents = fs.readFileSync(f, 'utf8')
-    // A real leaked path has a segment after the prefix (e.g. /Users/scott/);
-    // documentation is allowed to mention the bare pattern /Users/ itself
-    // when describing what to reject (as this very test's name does).
-    assert.ok(!/\/Users\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Users/ path`)
-    assert.ok(!/\/Volumes\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Volumes/ path`)
-    assert.ok(!/said.?of.?you|couchpotato/i.test(contents), `${f} names a private target repo`)
+// ---------------------------------------------------------------------------
+// Leak guard. Scans EVERY TRACKED FILE, minus the exemption table below.
+//
+// Round-two review, M1. This guard's file list has now been wrong three times
+// running: it shipped covering workflows/skills/docs; agents/ was added when a
+// leak was caught by hand; AGENT-HARNESS.md and README.md were added the round
+// after; and review round two then found hooks/ still open, along with
+// .claude-plugin/, .githooks/ and .github/. That is not three bugs, it is one
+// wrong shape, and CLAUDE.md section 12 says to re-open the approach rather
+// than spend another round on the next patch.
+//
+// The wrong shape was an ALLOWLIST of directories to scan, which has to be
+// kept in step by hand with the set of files that ship. Every new directory
+// was covered only if somebody remembered. Inverted: everything git tracks is
+// scanned, and anything not scanned must earn a line in EXEMPTIONS saying
+// which patterns it skips and why. A new directory is now covered the day it
+// is created, and the failure mode flips from a silent gap to a visible,
+// argued exemption. It also ends the second duplication the same review named:
+// there is one file set and one pattern list, both consumed by this one test.
+//
+// Inverting it immediately found a real leak nothing had ever looked at: a
+// path-traversal fixture in test/optimise-read.test.js used the operator's
+// actual account name instead of a synthetic one, in a public repo. Fixed in
+// the same commit.
+const LEAK_PATTERNS = [
+  { key: 'users', name: 'an absolute /Users/ path', re: /\/Users\/[a-zA-Z0-9_.-]/ },
+  { key: 'volumes', name: 'an absolute /Volumes/ path', re: /\/Volumes\/[a-zA-Z0-9_.-]/ },
+  { key: 'home', name: 'an absolute /home/<name> path', re: /\/home\/[a-zA-Z0-9_.-]/ },
+  // ONE repo-name rule, and it is HYGIENE, not secrecy.
+  //
+  // Owner ruling, 2026-09-04: neither delivery repo's NAME is confidential.
+  // CouchPotatoServer is a public repo (`gh repo view`, verified same day),
+  // and Scott ruled that the other name is not confidential either, having
+  // been shown that it appears 27 times across three tracked specs published
+  // since 2026-08-17. The guard previously asserted the opposite while specs/
+  // published the name openly one directory across; that contradiction is now
+  // resolved in favour of what the repo actually does.
+  //
+  // The rule that REMAINS, and why it is not merely decoration: workflows/,
+  // skills/, agents/, hooks/ and bin/ are GENERIC and ship to every consumer
+  // verbatim. A generic harness file naming one particular delivery repo is a
+  // defect regardless of whether that name is secret, because it hardcodes one
+  // installation's world into everybody's copy. That is the leak this clause
+  // actually caught on 2026-09-04, in a review-cycle.js comment. Documentation
+  // that cites a repo as a worked example (AGENT-HARNESS.md, README.md,
+  // specs/) is exempt, because naming the case is the point there.
+  //
+  // NOT ruled on, and deliberately out of this guard's scope: those specs also
+  // describe that system's CI, production setup and settings. A name being
+  // non-confidential says nothing about the operational detail beside it, and
+  // no pattern here would catch that anyway. Raised with the owner separately.
+  { key: 'target-repo', name: 'a specific target repo', re: /said.?of.?you|couchpotato/i },
+]
+
+// The literal placeholder an install instruction is SUPPOSED to contain.
+// Stripped before matching rather than exempting the whole /Users/ clause: a
+// file allowed to say "/Users/YOUR_USERNAME" must still be caught if it says
+// "/Users/scott.b". An exemption that turns a clause off entirely is the
+// difference between a documented placeholder and a real leak going unnoticed.
+const PLACEHOLDER_RE = /\/Users\/YOUR_USERNAME/g
+
+// Every gap in the scan, stated. `paths` are repo-relative prefixes; `skip`
+// names the pattern keys waived, and `why` has to be a reason, not a shrug.
+// Adding a line here is the deliberate act that adding a directory to the old
+// allowlist never was.
+const EXEMPTIONS = [
+  {
+    paths: ['AGENT-HARNESS.md', 'README.md'],
+    skip: ['target-repo'],
+    placeholder: true,
+    why: 'Both cite the PUBLIC CouchPotatoServer as a worked example, and both carry the literal /Users/YOUR_USERNAME placeholder in install instructions. Only that exact placeholder is stripped, so a REAL /Users/<operator> path in either file still fails.',
+  },
+  {
+    paths: ['bin/com.local.optimise-cycle-weekly.plist'],
+    skip: [],
+    placeholder: true,
+    why: 'A launchd template that deliberately contains /Users/YOUR_USERNAME, asserted by its own test below.',
+  },
+  {
+    paths: ['test/'],
+    skip: ['users', 'volumes', 'home', 'target-repo'],
+    placeholder: false,
+    // Declared blanket exemption. This directory is scanned for nothing, and
+    // saying so out loud is the point: after the two repo-name patterns merged
+    // under the 2026-09-04 owner ruling, test/'s four waivers became every
+    // pattern there is, and the exemption-table check below caught it rather
+    // than letting a whole directory quietly fall out of the scan. Kept as a
+    // blanket rather than trimmed, because each waiver is individually
+    // justified (see why) and pretending otherwise would be theatre.
+    blanket: true,
+    why: 'Fixtures deliberately contain hostile-looking absolute paths (path traversal, injection) and repo names, as test DATA. They are never installed anywhere. Still: use a synthetic account name (some-operator, victim) rather than a real one. A fixture using this operator\'s actual username is how the one real leak in this repo was found, on 2026-09-04.',
+  },
+  {
+    paths: ['specs/'],
+    skip: ['target-repo', 'users'],
+    placeholder: false,
+    why: 'Specs are written FROM real incidents in real repos, so naming the repo is the point rather than an accident, exactly as it is in AGENT-HARNESS.md and README.md. Owner ruling 2026-09-04: neither delivery repo name is confidential, which resolved a contradiction where this guard treated the string as unshippable while specs/ published it openly. The /Volumes/ and /home/ clauses are NOT waived, and the users waiver only covers the YOUR_USERNAME placeholder convention these docs share. What this exemption does NOT cover, and what no pattern here could: those specs also describe a delivery system\'s CI, production setup and settings allow-list. That is a judgement about operational detail, raised with the owner separately, not something a regex decides.',
+  },
+]
+
+function exemptionFor(rel) {
+  return EXEMPTIONS.find((e) => e.paths.some((p) => (p.endsWith('/') ? rel.startsWith(p) : rel === p)))
+}
+
+function trackedFiles() {
+  const out = spawnSync('git', ['-C', ROOT, 'ls-files', '-z'], { encoding: 'utf8', env: sanitizedGitEnv() })
+  assert.equal(out.status, 0, `git ls-files failed: ${out.stderr}`)
+  const files = out.stdout.split('\0').filter(Boolean)
+  // A guard that scans nothing passes. This is the "absence reads as success"
+  // shape the harness exists to catch, so the floor is asserted explicitly.
+  assert.ok(files.length > 50, `expected the repo to track more than 50 files, got ${files.length} -- a scan of nothing passes trivially`)
+  return files
+}
+
+test('static: NO tracked file leaks an absolute /Users/, /Volumes/ or /home/<name> path or a private target repo name, outside the explicitly recorded EXEMPTIONS (AC-ARCH-9, inverted round-two review M1)', () => {
+  let scanned = 0
+  for (const rel of trackedFiles()) {
+    const abs = path.join(ROOT, rel)
+    if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) continue
+    const raw = fs.readFileSync(abs)
+    // Skip binaries: a NUL byte in the first 4KB is the usual heuristic.
+    if (raw.subarray(0, 4096).includes(0)) continue
+    const ex = exemptionFor(rel) || { skip: [], placeholder: false }
+    const text = ex.placeholder ? raw.toString('utf8').replace(PLACEHOLDER_RE, '/Users/') : raw.toString('utf8')
+    scanned += 1
+    for (const { key, name, re } of LEAK_PATTERNS) {
+      if (ex.skip.includes(key)) continue
+      assert.ok(!re.test(text), `${rel} hardcodes ${name}. If that is deliberate, add it to EXEMPTIONS with a reason; do not widen the pattern.`)
+    }
+  }
+  assert.ok(scanned > 50, `only ${scanned} files were actually scanned`)
+})
+
+test('static: every EXEMPTIONS entry names a real tracked path, waives only known pattern keys, and gives a reason -- so a stale or blanket exemption cannot quietly hide a whole directory', () => {
+  const tracked = trackedFiles()
+  const keys = LEAK_PATTERNS.map((p) => p.key)
+  for (const e of EXEMPTIONS) {
+    for (const p of e.paths) {
+      const matches = p.endsWith('/') ? tracked.some((f) => f.startsWith(p)) : tracked.includes(p)
+      assert.ok(matches, `EXEMPTIONS names ${p}, which no tracked file matches -- a stale exemption is a gap nobody is watching`)
+    }
+    for (const k of e.skip) {
+      assert.ok(keys.includes(k), `EXEMPTIONS waives unknown pattern key ${k}`)
+    }
+    // A blanket exemption is allowed, but only when DECLARED. The failure this
+    // prevents is an entry that waives everything by accident -- one more key
+    // added to skip, or a pattern list that shrinks underneath it -- leaving a
+    // directory unscanned with nobody aware. Declaring it costs one field and
+    // makes the gap visible in review.
+    if (e.skip.length >= keys.length) {
+      assert.equal(e.blanket, true, `EXEMPTIONS for ${e.paths.join(', ')} waives every pattern, which is the same as not scanning it at all. If that is intended, set blanket: true so it is a stated decision rather than an accident.`)
+    } else {
+      assert.ok(e.blanket === undefined, `EXEMPTIONS for ${e.paths.join(', ')} declares blanket: true but does not actually waive every pattern -- a stale declaration hides how much is really covered`)
+    }
+    assert.ok(typeof e.why === 'string' && e.why.length > 40, `EXEMPTIONS for ${e.paths.join(', ')} needs a real reason, not a shrug`)
   }
 })
 
-// Subtraction round item 9 (specs/harn-opt-2.md conductor log tick 46): the
-// same operator-path-leak class AC-ARCH-9 already guards for workflows/,
-// skills/ and docs/ was found live under bin/ -- bin/optimise-cycle-weekly.sh
-// hardcoded two private repo names and this operator's volume layout in a
-// tracked file in a PUBLIC repo, while the sibling plist three files away
-// was already sanitised and guarded. The default repo list now comes from
-// $HOME/.claude/optimise-weekly-repos (never tracked anywhere) instead, and
-// this extends the leak check to bin/ so it can never regress silently.
-// bin/com.local.optimise-cycle-weekly.plist is exempt from the /Users/
-// clause specifically -- it deliberately CONTAINS the literal placeholder
-// segment "/Users/YOUR_USERNAME" (asserted by its own test below), which
-// would otherwise trip this same guard on a placeholder, not a leak.
-test('static: no file under bin/ hardcodes an absolute /Users/ or /Volumes/ path, a real /home/<name> path, or a private target repo name (subtraction round item 9, mirrors AC-ARCH-9 for bin/)', () => {
-  const targets = walk(path.join(ROOT, 'bin'))
-  for (const f of targets) {
-    const isPlistTemplate = path.basename(f) === 'com.local.optimise-cycle-weekly.plist'
-    const contents = fs.readFileSync(f, 'utf8')
-    if (!isPlistTemplate) {
-      assert.ok(!/\/Users\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Users/ path`)
-    }
-    assert.ok(!/\/Volumes\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /Volumes/ path`)
-    assert.ok(!/\/home\/[a-zA-Z0-9_.-]/.test(contents), `${f} hardcodes an absolute /home/<name> path`)
-    assert.ok(!/said.?of.?you|couchpotato/i.test(contents), `${f} names a private target repo`)
-  }
-})
+// The separate bin/ leak guard that used to live here is GONE, subsumed by the
+// whole-repo scan above. It was added by subtraction round item 9 after
+// bin/optimise-cycle-weekly.sh was found hardcoding two repo names and this
+// operator's volume layout in a tracked file in a PUBLIC repo. bin/ is still
+// scanned, now by the same single guard as everything else: with nothing
+// outside the scan, a second near-duplicate guard is exactly the divergence
+// that produced round-two M1.
 
 test('static: the ledger envelope field list appears in exactly one file (AC-ARCH-5). It lives in workflows/lib/ledger-append.mjs, not a separate ledger.mjs: workflow scripts cannot import anything, so the envelope owner must be the real-Node script they invoke via Bash, not a module they pull in.', () => {
   const all = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'skills'))]
@@ -1552,4 +1675,62 @@ test('static: HARN-FIX-4 -- every agentType referenced anywhere in workflows/ or
 
   const missing = [...referenced].filter((t) => !definedAgents.has(t)).sort()
   assert.deepEqual(missing, [], `agentType(s) referenced in workflows/ or skills/ with no matching agents/<name>.md definition: ${missing.join(', ')}`)
+})
+
+// ---------------------------------------------------------------------------
+// Round-two review M3. Four prose duties this change adds, or that its new
+// code DEPENDS on, were pinned by nothing: the reviewer deleted all four (53
+// lines across four files) and the suite stayed at 1095 pass, 0 fail.
+//
+// The sharpest of them is agents/lens-architecture.md's dead-code duty.
+// workflows/review-cycle.js now wakes that lens on every UI diff, and its
+// comment states in so many words that the lens holds the roster's only
+// "dead code this change created and did not remove" duty. That claim is true
+// today and asserted by nothing: paraphrase the duty away and the harness
+// keeps dispatching the lens, the ledger keeps recording it as triggered, and
+// the orphaned-control class goes unowned again behind a fully green gate.
+// Code depending on prose in another file, with no assertion joining them, is
+// the same absence-reads-as-success shape in a new place.
+//
+// Pins the minimum phrase that would notice deletion, never the paragraph:
+// an assertion on prose that fails on every wording improvement trains people
+// to loosen it. Same idiom this file already uses for conduct-plan's SKILL.md.
+const PROSE_DUTIES = [
+  {
+    file: 'agents/lens-architecture.md',
+    re: /[Dd]ead code this change created and did not remove/,
+    why: 'workflows/review-cycle.js wakes this lens on every UI diff BECAUSE of this duty, and says so in its own comment. If the duty goes, the trigger is cost with no owner.',
+  },
+  {
+    file: 'AGENT-HARNESS.md',
+    re: /## What a change replaces/,
+    why: 'the headline contract of this change: the lens owning the area owns the removal.',
+  },
+  {
+    file: 'AGENT-HARNESS.md',
+    re: /removal as its own numbered criterion/,
+    why: 'the section can survive as a heading while the load-bearing sentence is paraphrased out. Review verifies criteria, so a removal that is not a criterion is invisible to it.',
+  },
+  {
+    file: 'agents/lens-design.md',
+    re: /do something different from its neighbours/,
+    why: 'the on-screen control inventory: the duty that would actually have caught the reported defect, which lens-architecture cannot because it reads the call graph, not the screen.',
+  },
+  {
+    file: 'agents/lens-product.md',
+    re: /what must exist for it to be observable/,
+    why: 'without this the success measure reverts to prose nobody verifies, which is the analytics half of the same defect.',
+  },
+  {
+    file: 'agents/lens-product.md',
+    re: /owns its minimisation, retention and/,
+    why: 'the brake on the clause above. Requiring a measurement criterion makes per-user behavioural data a standing planning deliverable, so the routing of the personal half to lens-security is load-bearing, not decoration (round-one review M3).',
+  },
+]
+
+test('static: the prose duties that this harness\'s own CODE depends on are still present in the agent and contract files (round-two review M3) -- a duty relied on by a trigger, with no assertion joining them, can be paraphrased away behind a green gate', () => {
+  for (const { file, re, why } of PROSE_DUTIES) {
+    const contents = readAll(file)
+    assert.match(contents, re, `${file} no longer carries a load-bearing duty: ${why}`)
+  }
 })
