@@ -1933,3 +1933,157 @@ test('review-cycle.js: M3 -- a NON-contradictory report (consistent:true, all fo
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'])
 })
+
+// ---------------------------------------------------------------------------
+// A UI change wakes lens-architecture (specs: the orphaned-control gap,
+// reported from a delivery repo's staging environment, 2026-09-04).
+//
+// The defect: a design-system update added a new UI and left old buttons on
+// the screen wired to nothing. `agents/lens-architecture.md`'s review mode is
+// the ONLY lens carrying "dead code this change created and did not remove",
+// and it was not triggered -- architecture's globs are dependency manifests
+// and core wiring, which a components-and-CSS diff never touches. The lens
+// holding the duty was absent from precisely the change class that creates
+// the debris.
+//
+// Deliberately review-only. At planning the removal question belongs to the
+// lens that owns the area (lens-design writes AC-DESIGN removal criteria for
+// screens); architecture's removal duty lives in its REVIEW mode text, so
+// waking it at planning would add a lens without adding a duty.
+test('review-cycle.js: a UI-only diff dispatches lens-architecture, so its review-mode structural duties reach a components-and-CSS change (this asserts DISPATCH, not detection: the on-screen orphan is lens-design\'s, per agents/lens-design.md)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/components/PhotoSheet.tsx', status: 'M' }] },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(
+    result.lenses.includes('lens-architecture'),
+    'a component file changed with no dependency manifest touched must still wake lens-architecture'
+  )
+  assert.equal(
+    result.telemetry.trigger_counts['lens-architecture'],
+    1,
+    'the count must credit the UI file that actually triggered it, not a bare 0 from the unrelated architecture glob group'
+  )
+})
+
+// Review round 1, M4: the first version of this test used package.json (an
+// architecture glob) plus a .tsx (a ui glob). Those groups are DISJOINT, so
+// the Set and a naive archHit.length + uiHit.length both yield 2 and the test
+// passed identically with the de-duplication removed -- the incidentally-
+// passing shape from CLAUDE.md section 11, and doubly embarrassing in a test
+// whose own comment named the case it failed to construct.
+//
+// ONE file matching BOTH default glob groups is the only fixture that can
+// tell the two apart: app/ui/settings.gradle matches the architecture glob
+// **/settings.gradle* AND the ui glob **/ui/**. No repo override needed.
+//
+// The inflated count is not decorative. trigger_counts is written to
+// .claude/harness-ledger.jsonl and read by /optimise-cycle for lens-value
+// analysis, which is licensed to propose retiring checks. An inflated count
+// is an argument, built from corrupt data, for removing one.
+test('review-cycle.js: one file matching BOTH the architecture and ui globs counts ONCE for lens-architecture (M4: the de-duplication itself, which the disjoint fixture below cannot reach)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'app/ui/settings.gradle', status: 'M' }] },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.equal(
+    result.telemetry.trigger_counts['lens-architecture'],
+    1,
+    'one changed file is one file: a naive archHit.length + uiHit.length reports 2 here'
+  )
+})
+
+test('review-cycle.js: two files in DISJOINT trigger groups still count as two for lens-architecture, so the de-duplication above cannot be satisfied by always returning 1', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        // package.json matches the architecture globs; the .tsx matches ui.
+        files: [{ path: 'package.json', status: 'M' }, { path: 'src/components/Button.tsx', status: 'M' }],
+      },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.equal(result.telemetry.trigger_counts['lens-architecture'], 2)
+})
+
+// M4 recurrence, pre-dating this diff and fixed in the same round because the
+// harness's own worked example (AGENT-HARNESS.md) is about a policy that took
+// six review rounds by being fixed one instance at a time. lens-product's
+// count at review-cycle.js merges specHit and uiHit with the identical Set,
+// and both existing tests of it use a single UI file and assert 1 -- so the
+// same naive-sum mutation passed there too. specs/mock.html matches BOTH
+// specs/** and the **/*.html ui glob.
+test('review-cycle.js: one file matching BOTH specs/** and the ui globs counts ONCE for lens-product (M4 recurrence)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'specs/mock.html', status: 'M' }] },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.equal(
+    result.telemetry.trigger_counts['lens-product'],
+    1,
+    'one changed file is one file: a naive specHit.length + uiHit.length reports 2 here'
+  )
+})
+
+test('review-cycle.js: two files in DISJOINT trigger groups still count as two for lens-product (the other direction of the M4 recurrence)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'specs/plan.md', status: 'M' }, { path: 'src/app.css', status: 'M' }] },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.equal(result.telemetry.trigger_counts['lens-product'], 2)
+})
+
+// The honest-zero guarantee above must survive the widening: a lens woken by
+// a non-glob signal alone still reports 0, and a repo whose override REPLACES
+// the architecture globs (Object.assign is key-level, so a repo override
+// drops the harness defaults for that key entirely) still gets the UI path.
+test('review-cycle.js: the UI trigger for lens-architecture survives a repo override that replaces the architecture globs entirely', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        files: [{ path: 'src/components/PhotoSheet.tsx', status: 'M' }],
+        harness_triggers_file_exists: true,
+        // A real delivery repo's shape: architecture names only wiring files, none
+        // of which a design-system change touches.
+        custom_rules: { architecture: ['package.json', 'tsconfig.json', 'src/lib/**'] },
+      },
+      'lens-design': SECURITY_CLEAN,
+      'lens-accessibility': SECURITY_CLEAN,
+      'lens-product': SECURITY_CLEAN,
+      'lens-architecture': SECURITY_CLEAN,
+    }),
+  })
+  assert.ok(result.lenses.includes('lens-architecture'), 'a repo-tuned architecture key must not be able to switch off the UI path')
+  assert.equal(result.telemetry.trigger_counts['lens-architecture'], 1)
+})
