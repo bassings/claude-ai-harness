@@ -24,3 +24,12 @@ hooks/__pycache__/
 # SonarQube scanner state and coverage output (never committed)
 .scannerwork/
 coverage/
+
+# Conductor state. Machine- and session-specific by construction: the plan-guard
+# Stop hook rewrites this file with an ABSOLUTE plan path and stamps the
+# conducting session's id into it. Committed by accident on 2026-09-05 via a
+# `git add -A`, and caught by this repo's own leak guard at the pre-push gate
+# before the rewritten form could reach the remote -- every pushed commit held
+# only the relative path. Untracked from here so the accident cannot recur.
+.claude/active-plan
+.claude/conductor-prior-findings.json

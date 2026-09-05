@@ -27,6 +27,8 @@ omitted.
 
 ---
 
+status: blocked-on-human: T1 and T4 are both non-actionable this session (T1 is a standing practice by owner decision, T4 needs roughly five more real-work PRs, which is days not minutes). Should this plan stay open with the loop ticking, or be closed with both recorded as standing items to restart later?
+
 ## Tasks
 
 - [ ] T1: adversarial pass against `main` — state: queued — Owner decision 2026-09-05: keep
@@ -46,7 +48,7 @@ omitted.
   is the defect class this repo exists to catch**, and it is currently doing it
   on its own dashboard.
 
-- [ ] T3: triage the SonarQube findings that survive correct configuration — state: queued —
+- [x] T3: triage the SonarQube findings that survive correct configuration — state: merged —
   192 open after sources and tests were split. Do NOT dismiss to move the
   number. Two things are already known and must be recorded before anything
   else: 14 of the 16 "bugs" are one rule whose recommended fix would introduce a
@@ -125,3 +127,21 @@ omitted.
   boundary for the durable ledger, which makes its complexity a correctness risk
   rather than a readability one. That is the one worth attention.
   Rework rounds this tick: 0. Open findings 179 -> 175. Armed: ScheduleWakeup.
+
+- 2026-09-05 tick 4: **T3 done. Plan has no actionable work left.**
+  T4's precondition MEASURED here rather than relayed: non-dependabot PRs merged
+  in CouchPotatoServer since the 2026-08-24 baseline are #291, #292, #300, #301,
+  #302 -- five, or seven counting the two that merged on the baseline day
+  itself, or eight counting the dependency triage. The threshold is ten real-work
+  PRs. Three of these (#300, #301, #302) merged TODAY and were not in the count
+  the CouchPotato session gave me earlier, which is why measuring beat relaying.
+  Still short, and the gap closes on a multi-day timescale, not a 20-minute one.
+  T3's remaining findings are the mechanical style class (55 optional-chaining,
+  14 nested ternary, and similar). Owner declined bulk application; the triage
+  outcome for them is "no action", recorded rather than left ambiguous.
+  One item identified as genuinely worth doing and NOT done: ledger-append's
+  main(), 739 lines at the trust boundary between agent-supplied text and the
+  durable ledger, in the same file today's adversarial pass found two validator
+  holes in. That is a real change with tests, not a refactor to move a number,
+  and it is not in this plan's scope.
+  Rework rounds this tick: 0. Blocked on human, question above the log heading.
