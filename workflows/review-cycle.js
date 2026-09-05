@@ -989,7 +989,7 @@ if (scope.custom_rules !== null) {
 ruleSource = scope.custom_rules ? 'repo-tuned' : 'harness defaults'
 ruleSourceOverriddenKeys = scope.custom_rules ? Object.keys(scope.custom_rules).length : null
 
-const rules = Object.assign({}, DEFAULT_RULES, scope.custom_rules || {})
+const rules = { ...DEFAULT_RULES, ...(scope.custom_rules || {}) }
 const paths = scope.files.map(f => f.path)
 
 // ---- deterministic lens triggering (AGENT-HARNESS.md roster) ----
