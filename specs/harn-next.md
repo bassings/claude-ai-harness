@@ -88,3 +88,22 @@ omitted.
   would attack. Read together: a standing practice, not this tick's work.
   Rework rounds this tick: 0. T3 unblocked. T4 still blocked on data (4-5 of 10
   real-work PRs). Armed: ScheduleWakeup.
+
+- 2026-09-05 tick 2: **T3 part done, bugs cleared.** Owner approved dismissing
+  the 14 sort-rule findings; each carries its reasoning and an expiry condition.
+  **I corrected my own justification before acting on it**: I had told Scott the
+  tool's fix would introduce locale-dependent ordering into a cross-machine
+  comparison. Overstated. Those sorts format the returned report AFTER the
+  comparison runs, within one process, on ASCII field names where localeCompare
+  would order identically. The real reason is simpler and true: the rule targets
+  NUMERIC sorts, and every array flagged holds strings, verified from a live run.
+  The wrong reason is recorded in the dismissal comments beside the right one.
+  Of the two remaining bugs, one was genuine: three RAW C0 bytes in
+  optimise-read.mjs, converted to escapes, with a static guard now failing the
+  build on any raw C0 byte in tracked source. The other already used the escape
+  and is dismissed with evidence. Bugs 16 -> 0; open findings 192 -> 179.
+  The guard's first mutation proof SILENTLY FAILED TO APPLY and looked green;
+  caught by checking, re-planted, confirmed. That is the third time today a
+  mutation result would have been misread without that check.
+  Rework rounds this tick: 0. Remaining: 173 code smells and 6 vulnerabilities,
+  none yet examined. Armed: ScheduleWakeup.
