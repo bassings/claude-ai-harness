@@ -77,3 +77,26 @@ what HIGH-1 forbids. The choice was an expensive test that lies or no test.
 Recorded here rather than dropped silently: a deleted guard with no explanation
 is indistinguishable from one nobody thought of. What replaced it is a pin on
 the residual declaration in the spec, which is the thing that actually decays.
+
+## The flaky decoy-repo assertion (found by CI, not by review)
+
+Not part of this change's scope. It went red on the Node 22 job while Node 26
+passed, and it had passed on `main`, so the first instinct was to re-run. That
+instinct is what CLAUDE.md section 11 names as the reason a flaky guard is worse
+than an absent one.
+
+The assertion compared the COUNT of entries in the decoy repo's `.git/objects`
+before and after, for equality. CI reported expected 6, actual 5: the decoy
+LOST an entry. That is git packing loose objects and pruning the emptied
+two-character directories, which can fire at any moment. A count comparison
+cannot tell "the hook wrote here" from "git tidied up", so it failed on the
+harmless case while its own name promises to catch only the harmful one.
+
+Now compares SETS and asserts nothing was ADDED, which is what the name claims
+and is immune to removals.
+
+| Mutation | Result |
+|---|---|
+| A directory added to the decoy after the hook ran, simulating a real leak | CAUGHT, naming the directory |
+| An entry removed between the two reads, simulating git packing | correctly NOT caught (this was the flake) |
+| Five consecutive full runs of the file | 61 pass, 0 fail, every time |
