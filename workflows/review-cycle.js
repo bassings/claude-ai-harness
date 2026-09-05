@@ -280,9 +280,30 @@ function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName, allow
 // text (MED-3) -- the literal object IS what this session executes.
 const REVIEW_SCHEMA = {
   type: 'object',
-  required: ['verdict', 'coverage', 'findings'],
+  // Unknown keys rejected outright: the spread above is the first layer, this
+  // is the second. A response carrying a `lens` key is a response trying to be
+  // something other than an answer (review F1).
+  additionalProperties: false,
+  required: ['verdict', 'coverage', 'findings', 'head_sha_measured', 'head_tree_measured'],
   properties: {
     verdict: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] },
+    // The sha the lens ACTUALLY read, checked by the orchestrator against the
+    // reviewed tip below. Added 2026-09-05: worktrees were observed starting on
+    // a different commit in all three runs of 2026-09-04/05, and the only
+    // defence was a prompt paragraph asking the model to notice and say so.
+    // Three for three self-corrected, which is what made it dangerous.
+    // Constrained, for two reasons. It is compared to the pinned tip, and an
+    // unconstrained string made four benign formats of the CORRECT sha abort
+    // the run (review A). And it is interpolated into a thrown error that
+    // escapes the workflow, so an unbounded model-authored string was a free
+    // text channel out of a reviewed diff (review B). Hex-only and bounded
+    // closes both: there is nothing left to neutralise.
+    head_sha_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
+    // The witness the prompt does not contain (review F3). head_sha_measured
+    // alone could not fail for the case this gate exists for: the pinned sha is
+    // printed in line one of the prompt, so a lens that reviewed the wrong tree
+    // and echoed it passed. A tree hash cannot be echoed from the prompt.
+    head_tree_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
     coverage: {
       type: 'object',
       required: ['examined', 'verified_by', 'could_not_check'],
@@ -425,6 +446,12 @@ const priorFindings = Array.isArray(opts.prior_findings) ? opts.prior_findings :
 // becomes available, read after run() resolves. Never part of the
 // pre-existing, publicly-documented return shape (AC-ARCH-10).
 const triggerCounts = {}
+// null, not [], when lens-architecture never ran: an empty list would say
+// "triggered by nothing", which is a different and false claim.
+let architectureTriggerSource = null
+// Per-lens checkout drift, recorded not gated (MED-2). Empty means every lens
+// was already on the reviewed tip, which has not happened in five observed runs.
+let lensCheckoutDrift = {}
 let headSha = null
 // 2026-08-18: the sha git reports at SYNTHESIS time, so a checkout that moved
 // mid-run is detectable. Several agent sessions share these checkouts; a
@@ -644,7 +671,7 @@ const scope = await agent(
   INSTALL_CONSISTENCY_INSTRUCTION +
   `In the repo at the current working directory:\n` +
   `1. Determine the base ref: ${opts.base ? `use "${opts.base}".` : 'the repository default branch (usually main or master; check `git remote show origin` or local branch names).'}\n` +
-  `2. Run \`git diff --name-status <base>...HEAD\` and return every changed file path with its status letter, plus the base ref you used and the exact output of \`git rev-parse HEAD\` as head_sha.\n` +
+  `2. Run \`git diff --name-status <base>...HEAD\` and return every changed file path with its status letter, plus the base ref you used, the exact output of \`git rev-parse HEAD\` as head_sha, and the exact output of \`git rev-parse HEAD^{tree}\` as head_tree.\n` +
   `3. Report whether any dependency manifest (package.json, requirements*.txt, pyproject.toml, go.mod, Cargo.toml, Gemfile, or equivalent) gained a NEW entry (a new package, not a version bump), and whether the diff ADDS a new module or package (a new source file outside tests, or a new package directory).\n` +
   `4. Check whether a file .claude/harness-triggers.json exists at the repo root and report that as ` +
   `harness_triggers_file_exists (true/false). If it exists, return its parsed JSON as custom_rules; if it does not ` +
@@ -656,10 +683,15 @@ const scope = await agent(
     effort: 'low',
     schema: {
       type: 'object',
-      required: ['base', 'head_sha', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists', 'consistency'],
+      required: ['base', 'head_sha', 'head_tree', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists', 'consistency'],
       properties: {
-        base: { type: 'string' },
-        head_sha: { type: 'string' },
+        base: { type: 'string', pattern: '^[A-Za-z0-9._/@^~-]{1,120}$' },
+        head_sha: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
+        // The WITNESS (round-two review F3). The reviewed tip's tree hash is not
+        // derivable from its commit sha without reading the object, so a lens
+        // can only answer it by running git in the tree it actually read. It is
+        // deliberately never placed in a lens prompt.
+        head_tree: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
         files: { type: 'array', items: { type: 'object', required: ['path', 'status'], properties: { path: { type: 'string' }, status: { type: 'string' } } } },
         new_dependency_entries: { type: 'boolean' },
         new_modules: { type: 'boolean' },
@@ -739,9 +771,64 @@ if (!scope.files.length) {
   }
 }
 
-headSha = scope.head_sha
 
-const base = scope.base
+// ---- validate EVERY model-authored scope value, here, once, before use ----
+// Round-three review HIGH-1, and this is a structural change rather than a
+// patch. Each of these values had been validated somewhere: base nowhere at
+// all, head_sha and head_tree about ninety lines below, after the lenses they
+// protect had already been dispatched. Validating a value at the point where
+// somebody noticed it mattered is how base ended up interpolated, unchecked,
+// into a shell command inside nine tool-capable sub-agent prompts, next to the
+// sentence "Run both commands exactly as written and report exactly what they
+// print". A branch name may legally contain a semicolon.
+//
+// Everything the scope step returns is model-authored. So the boundary is here,
+// where it arrives, and nothing downstream re-derives its own opinion.
+const SHA_RE = /^[0-9a-f]{7,40}$/
+// Deliberately narrower than git's ref rules: this value is interpolated into a
+// command, so it is an allowlist of what a ref may contain, not a denylist of
+// what a shell treats specially. No spaces, no semicolons, no substitution, no
+// newlines, nothing to quote around.
+const REF_RE = /^[A-Za-z0-9._/@^~-]{1,120}$/
+const scopeBase = typeof scope.base === 'string' ? scope.base.trim() : ''
+if (!REF_RE.test(scopeBase)) {
+  throw new Error(
+    `ScopeBaseInvalid: the scope step reported the base ref as ${neutralise(scope.base)}, which is not a plain ref ` +
+    `name. That value is interpolated into a git command inside every lens prompt, so it is refused here, BEFORE any ` +
+    `lens is dispatched, rather than being passed to nine tool-capable agents and checked afterwards. Re-run the ` +
+    `review cycle; if the branch name genuinely contains unusual characters, rename it or pass base explicitly.`
+  )
+}
+const scopeSha = typeof scope.head_sha === 'string' ? scope.head_sha.trim().toLowerCase() : ''
+if (!SHA_RE.test(scopeSha)) {
+  throw new Error(
+    `ScopeHeadShaInvalid: the scope step reported the pinned tip as ${neutralise(scope.head_sha)}, which is not a ` +
+    `valid commit sha. Every comparison in this run is made against that value, and it is interpolated into a git ` +
+    `command in every lens prompt, so a malformed pin either disables the reviewed-tip check or fails correct ` +
+    `lenses. This is a SCOPE failure, not a checkout problem and not a lens problem: re-run the review cycle.`
+  )
+}
+const scopeTree = typeof scope.head_tree === 'string' ? scope.head_tree.trim().toLowerCase() : ''
+if (!SHA_RE.test(scopeTree)) {
+  throw new Error(
+    `ScopeHeadTreeInvalid: the scope step reported the reviewed tip's tree hash as ${neutralise(scope.head_tree)}, ` +
+    `which is not a valid object id. That value is the ONLY thing a lens cannot echo from its prompt, so without it ` +
+    `the reviewed-tip check degrades to a self-report. This is a SCOPE failure: re-run the review cycle.`
+  )
+}
+
+// Telemetry takes the VALIDATED sha too, and is assigned only after the three
+// checks above have passed. Previously set from scope.head_sha before any of
+// them ran, so a rejected run still recorded the raw value.
+headSha = scopeSha
+
+// scopeBase, NOT scope.base (round-four adversarial pass, HIGH 3). The
+// validated values were computed at the boundary and then discarded here, so
+// the raw model-authored string is what reached every lens prompt -- and the
+// comment at the boundary claimed the opposite. A trailing newline alone breaks
+// the backticked command a lens is told to run verbatim, turning a review of
+// the branch into a review of the working tree with no sign anything is wrong.
+const base = scopeBase
 
 // specs/custom-rules-fail-closed.md AC-SEC-2: the contradiction that catches
 // a transcription failure. The scope step has no filesystem access of its
@@ -944,6 +1031,21 @@ if (dataHit.length) {
 // replaces"), and architecture's removal duty lives in its review text.
 if (archHit.length || uiHit.length || scope.new_modules || scope.new_dependency_entries) {
   lenses.push('lens-architecture')
+  // WHICH rule group woke it, recorded because trigger_counts cannot answer it:
+  // that number is the deduplicated union of both surfaces, so a ledger line
+  // could not be classified as ui-triggered-alone versus anything else.
+  // AGENT-HARNESS.md's eight-week reversal condition counts exactly the
+  // ui-alone population, and without this it had to be reconstructed from the
+  // diffs by hand, which is another way of saying it would not have been.
+  architectureTriggerSource = [
+    ...(archHit.length ? ['arch-glob'] : []),
+    ...(uiHit.length ? ['ui-glob'] : []),
+    ...(scope.new_modules ? ['new-module'] : []),
+    // Distinct from new-module (review J): a diff that only adds a package was
+    // being labelled "new-module" in the durable record, which is simply not
+    // what happened, and the enum offered no other value.
+    ...(scope.new_dependency_entries ? ['new-dependency'] : []),
+  ]
   // Credits whichever surface actually triggered it, deduplicated: a file
   // matching both globs is one file, not two. Still honestly 0 when triggered
   // purely by new_modules/new_dependency_entries with nothing matching either
@@ -980,7 +1082,7 @@ const skipped = ALL.filter(l => !lenses.includes(l))
 // operator reading the run output can tell which applied without inspecting
 // the repo.
 const ruleSourceText = ruleSource === 'repo-tuned' ? `repo-tuned (${ruleSourceOverriddenKeys} overridden keys)` : 'harness defaults'
-log(`Reviewing ${paths.length} changed files against ${base} at ${scope.head_sha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}. Rule source: ${ruleSourceText}.`)
+log(`Reviewing ${paths.length} changed files against ${base} at ${scopeSha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}. Rule source: ${ruleSourceText}.`)
 
 // ---- Phase 2: lenses in parallel, each in its own worktree ----
 
@@ -997,9 +1099,19 @@ const qaBudget =
   `an honest skip list beats an unbounded run.\n`
 
 const lensPrompt = (lens) =>
-  `REVIEW mode. The reviewed tip is commit ${scope.head_sha}. First run \`git rev-parse HEAD\` in your worktree; if it ` +
-  `differs, your checkout has drifted from the reviewed tip (a parallel session may have advanced the branch): diff ` +
-  `against the pinned SHA explicitly and record the drift in could_not_check. Review \`git diff ${base}...${scope.head_sha}\`.\n` +
+  `REVIEW mode. The reviewed tip is commit ${scopeSha}. FIRST, before anything else, run \`git rev-parse HEAD\` ` +
+  `in your worktree. If it differs, your checkout has drifted from the reviewed tip (a parallel session may have ` +
+  `advanced the branch): check out or diff against the pinned SHA explicitly, and record the drift in could_not_check. ` +
+  `Review \`git diff ${base}...${scopeSha}\`.\n` +
+  `Then report two values. Run both commands exactly as written and report exactly what they print. NEITHER command ` +
+  `moves your checkout, and you must not move it: these worktrees can be shared, and checking out a different commit ` +
+  `underneath another session is the incident this whole check exists to prevent.\n` +
+  `  head_tree_measured: \`git rev-parse ${scopeSha}^{tree}\`   <- the reviewed tip's tree. This is the one ` +
+  `that is checked. Its value appears NOWHERE in this prompt, deliberately: the sha does appear above, so reporting ` +
+  `that back proves nothing. There is exactly one legal answer and only running the command produces it.\n` +
+  `  head_sha_measured:  \`git rev-parse HEAD\`   <- wherever your worktree happens to be. This is RECORDED, not ` +
+  `checked, so report it honestly even if it differs from the reviewed tip. Drift is expected and is measured here; ` +
+  `it is not held against you and does not fail the run.\n` +
   `Changed files (${paths.length} total):\n${fileList}\n\n` +
   `${specClause}\n\n` +
   (lens === 'lens-qa' ? qaBudget : '') +
@@ -1021,12 +1133,34 @@ const lensPrompt = (lens) =>
 
 const reports = await parallel(lenses.map(lens => () =>
   agent(lensPrompt(lens), { agentType: lens, label: lens, phase: 'Lenses', schema: REVIEW_SCHEMA, isolation: 'worktree' })
-    .then(r => (r ? { lens, ...r } : null))
+    // `lens` LAST, deliberately (round-two review F1). Spreading the model's
+    // response over the workflow's own label let a lens rename itself: a `lens`
+    // key in the response won, attacker-chosen text reached the thrown error
+    // verbatim dressed as a harness system error, and the roster check then
+    // reported the real lens as vanished. The orchestrator must never take an
+    // identity it assigned from the party it assigned it to.
+    .then(r => (r ? { ...r, lens } : null))
 ))
 const lensReports = reports.filter(Boolean)
+// TOTAL failure returns softly; PARTIAL failure throws (round-two review F8).
+// That asymmetry is deliberate, not accidental, and the reason is which outcome
+// can be mistaken for a completed review. "No review produced" is unmistakable:
+// there are no verdicts to read and nothing to act on. A review missing three of
+// nine lenses reads exactly like a review, and its verdicts look like coverage
+// they do not have. The mistakable one is the one that must stop the run.
 if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
 lensesRunRaw = lensReports.map(r => r.lens)
 
+// These two are set HERE, immediately after lensReports exists and ABOVE every
+// check that can throw. Review round one, finding C: the reviewed-tip check was
+// inserted between lensesRunRaw and these assignments, so one lens misreporting
+// its sha destroyed every OTHER lens's findings for the round -- and the ledger
+// line then read "these lenses ran and found nothing". A probe with a Critical
+// security finding and one foreign sha produced lenses_run of both lenses and
+// open_findings of []. That is the absence-reads-as-success shape this whole
+// change exists to close, rebuilt inside the fix for it, and the file's own
+// rule at the accumulator declarations already said not to do it. The rule was
+// a comment; it is now a test.
 // H5: capture every finding each lens reported, as-is, before synthesis
 // dedupes/arbitrates them -- this is the "open" (accepted) side that was
 // previously never recorded at all.
@@ -1041,12 +1175,121 @@ acVerdicts = lensReports.flatMap(r =>
   (r.ac_verdicts || []).map(v => ({ ac_id: v.id, verdict: v.verdict }))
 )
 
+// ---- the reviewed-tip check: mechanical, fail-closed ----
+// Every lens must state the sha its findings came from, and it must be the tip
+// this run pinned. An ABSENT value is treated as a mismatch, never as
+// agreement: "no sha reported" and "the right sha" are different claims, and
+// collapsing them is the absence-reads-as-success shape this check exists to
+// stop, reappearing inside the check itself.
+//
+// Fails the whole run rather than dropping one lens, matching ScopeStepFailed
+// and the install-consistency refusal. A review of the wrong tree is not a
+// partial review, it is a confident wrong answer, and the operator needs to
+// know before they act on it rather than find a caveat in a coverage line.
+//
+// Two failure shapes, one check, because they are the same defect wearing
+// different clothes. A lens can measure the WRONG tree, or it can vanish
+// entirely -- a response that fails schema validation is dropped to null by the
+// runtime and filtered out above, so a lens that was dispatched and produced
+// nothing usable leaves a review that simply has one fewer opinion in it, with
+// no sign anything is missing. Found while testing the sha check: the fixture
+// that omitted the field did not trip the mismatch branch, because the lens
+// never made it into lensReports at all.
+const reported = new Set(lensReports.map(r => r.lens))
+const vanished = lenses.filter(l => !reported.has(l))
+
+// Both sides are model-transcribed from `git rev-parse HEAD`, so compare them
+// as shas rather than as strings (review A). Raw !== rejected the short sha git
+// log prints, an uppercase sha, a trailing newline (the literal output of a
+// shell capture) and a leading space -- four spellings of the CORRECT commit,
+// each aborting a run after the whole multi-lens budget was already spent.
+// That is the flaky shape from CLAUDE.md section 11, inside a guard written to
+// fix a different one.
+//
+// A prefix of at least 7 hex characters is git's own abbreviation floor, so
+// this accepts what git prints and nothing looser: 'abcde' is still refused,
+// and a genuinely different tree is still refused.
+const normaliseSha = (v) => (typeof v === 'string' ? v.trim().toLowerCase() : null)
+const pinnedSha = scopeSha  // the value validated at the boundary, not a second derivation of the raw one
+// The PIN is model-transcribed too, and round-two review F2 found both failure
+// modes rebuilt on this unguarded side. Measured: a 3-character pin let lenses
+// on a DIFFERENT tree through with outcome=done, because the hex floor was
+// applied only to the lens's value and the pin was then used as a bare prefix.
+// And a pin of 'HEAD' -- a plausible answer to "return the output of git
+// rev-parse HEAD" -- refused a run whose lenses were entirely correct, blaming
+// a parallel session that did not exist. Checked here, before either
+// comparison, and named as what it is: a scope failure, not a drift signal.
+// Written as a single expression deliberately: `return` inside a helper here is
+// indistinguishable, to the AC-QA-9 static guard, from a new exit path out of
+// run() itself. That guard is a change detector for unpaired exits and is worth
+// more than the readability of an early return.
+
+// Split by CAUSE, because the two shapes need different remedies (review F).
+// Telling an operator whose lens merely crashed to "let a parallel session
+// settle" sends them after a cause that does not exist.
+const pinnedTree = scopeTree  // likewise
+const treeAgrees = (v) => ((got) => Boolean(got) && /^[0-9a-f]{7,40}$/.test(got)
+  && (got.length <= pinnedTree.length ? pinnedTree.startsWith(got) : got.startsWith(pinnedTree)))(normaliseSha(v))
+
+// THE GATE is the tree hash only (round-two review F3 and F4, arbitrated).
+//
+// F3: gating on head_sha_measured could not fail for the case it was built for.
+// The pinned sha is printed in line one of the prompt, so a lens that reviewed
+// the wrong tree and echoed it passed. The tree hash of the pinned commit is
+// not in the prompt and cannot be reconstructed without the object.
+//
+// F4: and the sha must NOT be gated, because the prompt legitimately allows a
+// lens to diff against the pinned sha without moving its checkout. Gating on
+// "git rev-parse HEAD in the tree you read" would abort correct runs on exactly
+// the drift path this change exists to handle. Mandating a checkout instead is
+// worse: these worktrees can be shared, and moving one under another session is
+// the original incident.
+//
+// So head_sha_measured is RECORDED and never gated. That also fixes the
+// incentive the previous version created: it attached an aborted run to an
+// honest answer, which is the wrong thing to attach to a self-report.
+//
+// Honest limitation, stated because the comment above could read as stronger
+// than it is: this proves the lens had the reviewed commit's object available,
+// not that every finding was derived from that tree. It closes the echo, which
+// was the hole; it does not make a self-report into an observation.
+// MED-2: the prompt promises head_sha_measured is RECORDED. It was demanded from
+// every lens on every run and recorded nowhere, which made the sentence beside
+// it false and wasted the only honest drift signal the harness has. Recorded
+// here, per lens, for the lenses whose checkout differed from the reviewed tip.
+// Drift is counted rather than pressured out: it never fails a run.
+lensCheckoutDrift = Object.fromEntries(
+  lensReports
+    .filter(r => normaliseSha(r.head_sha_measured) && normaliseSha(r.head_sha_measured) !== pinnedSha)
+    .map(r => [r.lens, normaliseSha(r.head_sha_measured)])
+)
+
+const wrongTree = lensReports.filter(r => !treeAgrees(r.head_tree_measured))
+if (wrongTree.length) {
+  throw new Error(
+    `ReviewedTipMismatch: this run pinned ${pinnedSha}, but ` +
+    wrongTree.map(r => `${r.lens} reported the reviewed tip's tree as ` +
+      `${normaliseSha(r.head_tree_measured) || 'nothing'}, not ${pinnedTree}`).join('; ') +
+    `. A review of a different tree reads exactly like a review of the reviewed one, so the run is refused rather ` +
+    `than reported with a caveat. If a parallel session is advancing this branch, let it settle and re-run.`
+  )
+}
+if (vanished.length) {
+  throw new Error(
+    `LensProducedNoReport: ${vanished.join(', ')} ${vanished.length === 1 ? 'was' : 'were'} dispatched but returned ` +
+    `no usable report, so ${vanished.length === 1 ? 'its' : 'their'} share of this review did not happen and the ` +
+    `remaining verdicts cover less than they appear to. This is a lens failure, NOT a checkout problem. Re-run the ` +
+    `review cycle, or re-run just the missing work with {lenses: ["${vanished.join('", "')}"]}. The findings the ` +
+    `other lenses did report are already recorded in this round's ledger line.`
+  )
+}
+
 // AC-SIMP constraints are mechanical: checked directly against the diff, not by an agent lens (harness rule)
 let simpCheck = null
 if (specPath) {
   simpCheck = await agent(
     `Read ${specPath}. If it contains AC-SIMP-<n> acceptance criteria, check each one mechanically against ` +
-    `\`git diff ${base}...${scope.head_sha}\` (they are constraints like "no new dependency", "no new setting", "no abstraction for a single call site"). ` +
+    `\`git diff ${base}...${scopeSha}\` (they are constraints like "no new dependency", "no new setting", "no abstraction for a single call site"). ` +
     `Return one verdict per AC-SIMP with the diff evidence. If the spec has none, say so. Raw data only.`,
     { label: 'ac-simp:mechanical', phase: 'Lenses', effort: 'low' }
   )
@@ -1142,7 +1385,7 @@ const outcome = !reportOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLO
 
 return {
   base,
-  head: scope.head_sha,
+  head: scopeSha,
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
@@ -1188,6 +1431,15 @@ const telemetry = {
   lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],
   trigger_counts: triggerCounts,
+  lens_checkout_drift: lensCheckoutDrift,
+  // Omitted entirely, not written as null, when lens-architecture did not run
+  // (review I). ledger-append.mjs has additionalProperties:false, so a NEW
+  // workflow writing to an OLDER installed copy of that library has its whole
+  // record rejected, not just this field -- losing 100% of review telemetry,
+  // which this repo has been bitten by before. Omitting keeps an old writer
+  // accepting the line unchanged, and "key absent" already means "the lens did
+  // not run", so nothing is lost.
+  ...(architectureTriggerSource ? { architecture_trigger_source: architectureTriggerSource } : {}),
   verdicts: result.verdicts || {},
   spec_bug_count: specBugCount,
   rejected_finding_count: rejectedFindingCount,
@@ -1252,7 +1504,18 @@ result.open_findings = Array.isArray(terminalWrite.open_finding_ids)
 // DIFFERS counts. A missing sha means the synthesis agent did not answer, which
 // is not evidence of stability -- reading absence as "unmoved" is exactly the
 // shape that has recurred through this repo's history.
-const checkoutMoved = Boolean(headSha && synthesisHeadSha && synthesisHeadSha !== headSha)
+// Normalised, not raw !== (round-two review F5). This is the SAME defect the
+// reviewed-tip gate fixed one screen above, left in its sibling: both values
+// are model-transcribed, so the benign spellings enumerated there (short sha,
+// uppercase, trailing newline from a shell capture) each set this flag and told
+// the operator their correct review might be about a different tree. A drift
+// alarm that fires for reasons unrelated to drift is worse than none.
+const sameSha = (a, b) => {
+  const x = typeof a === 'string' ? a.trim().toLowerCase() : null
+  const y = typeof b === 'string' ? b.trim().toLowerCase() : null
+  return Boolean(x) && Boolean(y) && (x.length <= y.length ? y.startsWith(x) : x.startsWith(y))
+}
+const checkoutMoved = Boolean(headSha && synthesisHeadSha && !sameSha(synthesisHeadSha, headSha))
 if (checkoutMoved) {
   result.checkout_moved = true
   result.checkout_moved_detail = `scoped at ${headSha}, synthesis found ${synthesisHeadSha} -- the working tree moved mid-review, so these findings may be about a different tree than they name. Re-run from an isolated worktree.`
