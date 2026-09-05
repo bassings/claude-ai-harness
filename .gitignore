@@ -20,3 +20,7 @@
 # its GIT_ENV_ALLOWLIST constant as real data, not scraped source text),
 # which makes CPython write this on every run.
 hooks/__pycache__/
+
+# SonarQube scanner state and coverage output (never committed)
+.scannerwork/
+coverage/

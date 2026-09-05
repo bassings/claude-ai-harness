@@ -280,6 +280,9 @@ function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName, allow
 // text (MED-3) -- the literal object IS what this session executes.
 const PLAN_SCHEMA = {
   type: 'object',
+  // Second layer for the same defect: a response carrying a key the contract
+  // does not declare is a response trying to be something other than an answer.
+  additionalProperties: false,
   required: ['verdict', 'coverage', 'acceptance_criteria'],
   properties: {
     verdict: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] },
@@ -589,7 +592,12 @@ const lensPrompt = (lens) =>
 
 const reports = await parallel(lenses.map(lens => () =>
   agent(lensPrompt(lens), { agentType: lens, label: lens, phase: 'Lenses', schema: PLAN_SCHEMA })
-    .then(r => (r ? { lens, ...r } : null))
+    // `lens` LAST (round-two review F1, second instance). Spreading the model's
+    // response over the workflow's own label let a lens rename itself, and the
+    // orchestrator then carried that name into its output and the ledger. The
+    // orchestrator must never take an identity it assigned from the party it
+    // assigned it to. Fixed in review-cycle.js first; this is the sibling.
+    .then(r => (r ? { ...r, lens } : null))
 ))
 const lensReports = reports.filter(Boolean)
 if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no plan produced.', __outcome: 'aborted' }
