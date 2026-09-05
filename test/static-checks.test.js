@@ -2050,3 +2050,49 @@ test('static: no tracked text file contains a RAW C0 control byte -- a sentinel 
   }
   assert.deepEqual(offenders, [], `raw control bytes in tracked source: ${offenders.join(', ')}. Use the escape form instead -- an invisible byte cannot be reviewed, and an editor may strip it and silently change behaviour.`)
 })
+
+// ---------------------------------------------------------------------------
+// Round-five adversarial pass, and the single worst finding of the day: EVERY
+// hook could be replaced with a no-op and all 1182 tests stayed green.
+//
+//   for each entry: entry.command = 'true'
+//
+// That disables the destructive-git guard, the git-snapshot hook and the
+// no-stall guard simultaneously, in a three-word edit, with a fully passing
+// gate. The existing wiring test above checks that each script is REGISTERED --
+// that the args name it -- and never that the command actually runs it. So the
+// guard on the wiring watched the half that was not load-bearing.
+//
+// This is the "watching the wrapper, not the capability" shape from CLAUDE.md
+// section 11, applied to the wiring of the guards themselves: the registration
+// looked healthy while nothing behind it would ever execute.
+test('static: every hooks.json entry actually INVOKES its script -- the command must be a real interpreter, not a no-op (round-five adversarial pass)', () => {
+  const parsed = JSON.parse(readAll('hooks', 'hooks.json'))
+  const seen = []
+  for (const [event, groups] of Object.entries(parsed.hooks || {})) {
+    for (const g of groups) {
+      for (const h of g.hooks || []) {
+        seen.push({ event, command: h.command, args: h.args })
+      }
+    }
+  }
+  assert.ok(seen.length >= 3, `sanity: expected at least three wired hooks, found ${seen.length}`)
+
+  for (const { event, command, args } of seen) {
+    // The interpreter must be one that can actually run a Python hook. `true`,
+    // `:`, `echo` and friends all "succeed" and run nothing, which is exactly
+    // how a disabled guard reports healthy.
+    assert.match(
+      String(command),
+      /^(python3|python|\/usr\/bin\/env)$/,
+      `${event}: command is ${JSON.stringify(command)}, which does not execute the hook. A command that exits 0 without running the script disables the guard while every other check still passes.`
+    )
+    // And the args must still name a real script, so swapping the interpreter
+    // for a real one pointed at nothing is caught too.
+    assert.ok(Array.isArray(args) && args.length >= 1, `${event}: args must name the script to run`)
+    const target = String(args[args.length - 1])
+    assert.match(target, /hooks\/[a-z0-9-]+\.py$/, `${event}: args must end at a hooks/*.py script, got ${JSON.stringify(target)}`)
+    const bare = target.replace(/^.*hooks\//, '')
+    assert.ok(fs.existsSync(path.join(ROOT, 'hooks', bare)), `${event}: wired script hooks/${bare} does not exist`)
+  }
+})
