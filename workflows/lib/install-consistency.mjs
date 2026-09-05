@@ -280,14 +280,14 @@ export function checkConsistency({ agentHarnessMd, lensFileTexts, planCycleSourc
     consistent,
     blind,
     blind_reasons: blindReasons,
-    doc_fields: docFields ? [...docFields].sort() : [],
-    agent_fields: agentFields ? [...agentFields].sort() : [],
-    missing_in_review_schema: missingInReviewSchema.sort(),
-    missing_in_plan_schema: missingInPlanSchema.sort(),
-    review_only_props: reviewOnlyProps.sort(),
-    plan_only_props: planOnlyProps.sort(),
-    missing_structural_in_review_schema: missingStructuralInReviewSchema.sort(),
-    missing_structural_in_plan_schema: missingStructuralInPlanSchema.sort(),
+    doc_fields: docFields ? [...docFields].toSorted() : [],
+    agent_fields: agentFields ? [...agentFields].toSorted() : [],
+    missing_in_review_schema: missingInReviewSchema.toSorted(),
+    missing_in_plan_schema: missingInPlanSchema.toSorted(),
+    review_only_props: reviewOnlyProps.toSorted(),
+    plan_only_props: planOnlyProps.toSorted(),
+    missing_structural_in_review_schema: missingStructuralInReviewSchema.toSorted(),
+    missing_structural_in_plan_schema: missingStructuralInPlanSchema.toSorted(),
   }
 }
 

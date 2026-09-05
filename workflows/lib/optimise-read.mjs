@@ -685,7 +685,10 @@ export function aggregateWallClock(records, { root = '' } = {}) {
       // A malformed event_key (no parseable occurrence) can never be
       // trusted to pair with anything -- each one is its own unmeasured
       // attempt, never guessed at by adjacency.
-      for (const s of nullOcc.starts) { bucket.unterminatedWaits += 1; bucket[unmeasuredField] += 1 }
+      // Counting, not iterating: the loop bound a variable it never used
+      // (SonarQube S1854). Arithmetic says what this does.
+      bucket.unterminatedWaits += nullOcc.starts.length
+      bucket[unmeasuredField] += nullOcc.starts.length
       for (const e of nullOcc.ends) {
         bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} ended event has a malformed event_key and cannot be paired` })
         bucket[unmeasuredField] += 1
