@@ -2014,3 +2014,39 @@ test('static: the removal-criteria exemplars sit under the right labels, so swap
   assert.doesNotMatch(goodText, /cleaned up|tidied away/, 'and the GOOD exemplar must never be that phrasing')
   assert.match(goodText, /is gone|renders exactly/, 'the GOOD exemplar must be the specific, failable one')
 })
+
+// ---------------------------------------------------------------------------
+// No RAW C0 control byte may sit in tracked source. SonarQube found one on
+// 2026-09-05: workflows/lib/optimise-read.mjs carried a literal 0x01 inside a
+// regex, used as a placeholder sentinel while expanding globs, while the
+// sibling line in review-cycle.js doing the identical job used the readable
+// backslash-u escape.
+//
+// The behaviour is identical; the difference is that one form is visible in a
+// diff, a review and a terminal, and the other is not. An invisible byte cannot
+// be reviewed, survives copy-paste unpredictably, and is exactly the kind of
+// thing an editor silently strips -- which would change a regex without any
+// diff to show for it.
+//
+// Demonstrated while writing this test: pasting the raw byte into a shell
+// command was REFUSED by the tooling, "contains control characters that would
+// be hidden in the approval dialog". The same argument, one layer up.
+//
+// Tab, newline and carriage return are excluded: ordinary whitespace.
+test('static: no tracked text file contains a RAW C0 control byte -- a sentinel must use the readable escape, which can be reviewed', () => {
+  const offenders = []
+  for (const rel of trackedFiles()) {
+    const abs = path.join(ROOT, rel)
+    if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) continue
+    const raw = fs.readFileSync(abs)
+    if (raw.subarray(0, 4096).includes(0)) continue
+    for (const [i, byte] of raw.entries()) {
+      if (byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) {
+        const line = raw.subarray(0, i).toString('utf8').split('\n').length
+        offenders.push(`${rel}:${line} (0x${byte.toString(16).padStart(2, '0')})`)
+        break
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], `raw control bytes in tracked source: ${offenders.join(', ')}. Use the escape form instead -- an invisible byte cannot be reviewed, and an editor may strip it and silently change behaviour.`)
+})
