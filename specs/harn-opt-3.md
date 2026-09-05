@@ -330,7 +330,7 @@ to re-read first.
 - **AC-SEC-6:** After T2, the CI lane's requested field set -- every `gh run list --json` field, every `gh api` path and every field read off a jobs response -- contains no person-identifying value (`actor`, `triggeringActor`, `author`, `committer`, any `email`, `displayTitle`, `headBranch`) and no log access (`--log`, `gh run view --log`, any URL ending `/logs`). Enforced as a static test over the built prompt strings that fails on any of those tokens, and confirmed by grepping a real report produced for the PUBLIC delivery repo for a GitHub login other than the repo-owner slug: zero matches.
 - **AC-SEC-7:** A prompt-injection canary placed in a field T2 newly ingests -- a per-job name, a step name or a workflow file name, not the field the existing canary at `test/optimise-cycle.test.js:852` already covers -- reaches the synthesis prompt only inside the nonce-tagged UNTRUSTED-DATA block, and a drafting agent scripted to obey it produces no proposal that survives the citation and security-removal filters. The adversary is concrete: Couch Potato is public, so `gh run list` there returns runs whose surrounding text a stranger opening a pull request controls.
 - **AC-SEC-8:** The T4 branch-ref sweep never interpolates a ref name into a shell string and deletes only refs matching an anchored, exact pattern. Proven in a throwaway repo carrying branches named `worktree-wf_$(touch <marker-path>)`, `worktree-wf_a;id`, `my-worktree-wf_a`, `worktree-wf_a-keepme` and `main`: afterwards `<marker-path>` does not exist, the last three branches and `main` all survive, and only exact-pattern refs are gone. The sweep touches no remote ref unless a flag explicitly asks for it, proven by a repo with a matching remote-tracking branch still present afterwards.
-- **AC-SEC-9:** `git diff origin/main...HEAD` adds no tracked line containing the operator's home path, the OS username, or a live credential's fingerprint (its file location, prefix, length or file mode); and at the end of this plan `grep -rn "AIza\|[A-Z_]*API_KEY" $(git ls-files)` returns no line stating where any live key lives, its prefix, its length or its mode. (Generalised 2026-09-05: the pattern named one specific credential, which is itself a small disclosure in a PUBLIC repo. The check is stronger generalised, not weaker.) Two spec lines did so historically; both have been purged from history.
+- **AC-SEC-9:** `git diff origin/main...HEAD` adds no tracked line containing the operator's home path, the OS username, or a live credential's fingerprint (its file location, prefix, length or file mode); and at the end of this plan `grep -rn "AIza\|[A-Z_]*API_KEY" $(git ls-files)` returns no line stating where any live key lives, its prefix, its length or its mode. (Generalised 2026-09-05: the pattern named one specific credential, which is itself a small disclosure in a PUBLIC repo. The check is stronger generalised, not weaker.) Two spec lines did so historically. **This AC recorded both as "purged from history" until 2026-09-05; that was FALSE and is corrected here.** Measured on 2026-09-05 against `origin/main`: the credential name remains in three commits reachable on the public default branch, two of which also carry a location fingerprint. What IS true, and was re-measured the same day: no key VALUE appears anywhere in history, on any ref. See "Residual exposure, stated" below.
 - **AC-SEC-10:** The documented deletion procedure names every artefact holding ledger-derived data -- each instrumented repo's `.claude/harness-ledger.jsonl`, each repo's `.claude/optimise-cycle-report.md`, and `~/.claude/logs/optimise-cycle-weekly.log` -- and, executed verbatim, leaves zero matches on disk for a distinctive `run_id` that was in a deleted ledger. The same documentation states in one line what instrumenting a repo begins collecting (run timestamps, spec paths, repo identity, lens verdicts and AC ids), that retention is indefinite with no rotation, and the command that deletes it. Whether the mechanism reaches every artefact is AC-DATA-1's to verify; this is the policy it must satisfy.
 
 ### Architecture
@@ -457,6 +457,41 @@ Recorded so they are not silently reconsidered:
 - **A minimum-harness-version assertion against a repo's override file.** No
   mechanism exists for it today, and inventing one is disproportionate to a
   risk that has not yet occurred.
+
+## RESIDUAL EXPOSURE, STATED (2026-09-05)
+
+The operational-detail scrub of 2026-09-05 changed **the tip only**. Stating
+what remains, because the alternative is a repo that reads as clean:
+
+| Still reachable on the public default branch | Where |
+|---|---|
+| A delivery system's live compose project name and container prefix | current tree of `origin/main`, and history |
+| Its staging project name | same |
+| Its production database volume name | derivable from the project name by Docker's default naming |
+| Its rollback tags | history |
+| One credential's name, and in two commits its location fingerprint | history, three commits |
+| A named system's destructive permission allow-list entry | history |
+
+**Not exposed, measured the same day:** no key value appears in history on any
+ref. The exposure is a runbook and a fingerprint, not a secret.
+
+**Publicly readable since 2026-08-18**, so roughly eighteen days at the time of
+writing. GitHub retains unreferenced objects and any fork keeps its own copy, so
+a later rewrite reduces this rather than closing it.
+
+**This is an OPEN decision, not an accepted risk.** It is the owner's to make,
+between rewriting the public history and recording this as an accepted
+disclosure. Until it is made, this section is the honest state and must not be
+deleted: `test/static-checks.test.js` pins its heading for exactly that reason,
+because the failure being prevented is a redaction note being tidied away and
+the repo quietly resuming the claim that the item is closed. That is what
+AC-SEC-9 did for eighteen days.
+
+**Why it was missed:** every leak guard in this repo reads `git ls-files`, so
+all of them measure the working tree and none has ever looked at a commit older
+than HEAD. A tip-only scrub therefore passes every check and reads as a
+redaction. Noted as the structural half of this finding, and it applies to the
+2026-08-18 redaction this one copied as its pattern.
 
 ## Owner actions, not tasks here
 

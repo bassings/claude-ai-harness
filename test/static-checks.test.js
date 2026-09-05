@@ -18,6 +18,7 @@ const { sanitizedGitEnv } = require('./helpers/git-env.js')
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
+const crypto = require('node:crypto')
 
 const ROOT = path.join(__dirname, '..')
 
@@ -1722,6 +1723,11 @@ const PROSE_DUTIES = [
     why: 'without this the success measure reverts to prose nobody verifies, which is the analytics half of the same defect.',
   },
   {
+    file: 'specs/harn-opt-3.md',
+    re: /RESIDUAL EXPOSURE, STATED/,
+    why: 'the scrub of 2026-09-05 changed the tip only; the material is still reachable on the public default branch. If this declaration is tidied away the repo silently starts claiming a closed item again, which is what AC-SEC-9 did until this round (review HIGH-2).',
+  },
+  {
     file: 'agents/lens-product.md',
     re: /owns its minimisation, retention and/,
     why: 'the brake on the clause above. Requiring a measurement criterion makes per-user behavioural data a standing planning deliverable, so the routing of the personal half to lens-security is load-bearing, not decoration (round-one review M3).',
@@ -1733,45 +1739,152 @@ const PROSE_DUTIES = [
 // them may not. Names are covered by LEAK_PATTERNS; this covers what a regex on
 // a name never could.
 //
-// What was actually published in this PUBLIC repo until 2026-09-05: a delivery
-// system's live compose project name, every running container name, its
-// production database volume, its rollback tags, the fact that its own settings
-// allow-list permitted a broadly destructive shell command while it sat first in
-// an unsandboxed weekly job's list, and one credential named outright. Together
-// that was a working runbook for destroying someone's production, published in a
-// document arguing for care.
+// What was published in this PUBLIC repo until 2026-09-05: a delivery system's
+// live compose project name, every running container name, its production
+// database volume, its rollback tags, the fact that its own settings allow-list
+// permitted a broadly destructive shell command while it sat first in an
+// unsandboxed weekly job's list, and one credential named outright. Together
+// that was a working runbook for destroying someone's production, published in
+// a document arguing for care.
 //
-// This cannot be a general "no operational detail" check: that is a judgement,
-// not a pattern. What it CAN do is stop these exact identifiers returning, which
-// is the realistic regression -- specs here are written from real incidents, and
-// the natural way to write one is to paste what you saw. Each literal is a
-// thing, not a description of a thing, so a false positive is very unlikely.
-const SCRUBBED_LITERALS = [
-  { re: /REDACTED-PROJECT-NAME/i, what: "a delivery repo's live compose project name and container prefix" },
-  { re: /REDACTED-STAGING-NAME/i, what: "a delivery repo's staging project name" },
-  { re: /rollback-2026\d{4}-\d{6}/, what: 'a production rollback tag' },
-  { re: /REDACTED_CREDENTIAL_NAME/, what: 'a specific credential, named' },
-  { re: /Bash\(rm -rf/, what: "a named system's destructive permission allow-list entry" },
+// FIRST ATTEMPT AT THIS GUARD WAS WORSE THAN THE PROBLEM, review round one
+// HIGH-1. It listed the banned strings as plain regex literals, and exempted
+// its own file so it stayed green. Net effect: the three identifiers were
+// removed from three spec files and CONCENTRATED into one file, each beside a
+// label saying exactly what it was, in a public repo, with the spec now
+// asserting they had been removed so the next reader would not look. A deny-list
+// that names what it denies is not a scrub. Proven: planting the literal in
+// README, AGENT-HARNESS.md or any workflow was caught every time; planting the
+// identical line in this file left the suite 56/56 green.
+//
+// So the identity-bearing literals are stored as DIGESTS, never as text, and
+// this file is no longer exempt from anything.
+//
+// How it matches without holding the string: each file is reduced to its
+// alphanumeric atoms (`some-project-name_pgdata` -> some, project, name,
+// pgdata), then every window of 1..MAX_ATOMS consecutive atoms is concatenated
+// and hashed. That example is deliberately fictional: the FIRST draft of this
+// very comment used the real name to illustrate the point, and this guard
+// caught it on the next run, which is the behaviour the round-one finding
+// asked for. Separator-insensitive by construction, so it catches
+// the hyphenated, underscored and camel-joined forms alike, and it catches the
+// literal embedded in a longer token, which is how the production volume name
+// was formed in the first place.
+//
+// Honest about what this buys: SHA-256 of a short known string is brute-forcible
+// by anyone who already GUESSES the value. It defeats discovery by reading or
+// code-searching the repo, which is the actual exposure here. It is not a
+// secret store, and nothing that needs one should ever be put in this list.
+//
+// To add a literal WITHOUT publishing it:
+//   node -e "const c=require('node:crypto');const t=process.argv[1].toLowerCase().match(/[a-z0-9]+/g);console.log(c.createHash('sha256').update(t.join('')).digest('hex'),t.length)" 'the-string'
+// `atoms` is documentation of the literal's shape only. Every window size from
+// 1 to MAX_ATOMS is tried regardless: see scrubbedHit().
+const SCRUBBED_TOKEN_HASHES = [
+  { sha256: '2e4702de24a792d564a59fc4663f24c07b5fe615665050c4d5f92f58c6988fb5', atoms: 3, what: "a delivery repo's live compose project name and container prefix" },
+  { sha256: '66a9b0d52d8e642154e4182cb446b506e1bf8efca1729ce74d361d8faa789557', atoms: 2, what: "a delivery repo's staging project name" },
+  { sha256: '65722b6ab0c761e28847c08c2e8e8ef6fe999bd97d5b6ec5bc56acb8bba2073b', atoms: 3, what: 'a specific credential, named' },
 ]
 
-test('static: no tracked file republishes the operational detail scrubbed on 2026-09-05 -- production project and container names, the database volume, rollback tags, a named credential, or a destructive allow-list entry', () => {
-  const files = trackedFiles()
+// SHAPES, not identities. These reveal nothing about any particular system, so
+// they stay as readable patterns: a rollback tag's format is a convention, and
+// `rm -rf` is not a secret. What made the original disclosure serious was the
+// ASSOCIATION with a named system, and the name is now hashed.
+// CO-OCCURRENCE, round-one review MEDIUM-2. The digests above pin the identity
+// literals; they did not pin the OTHER four things this scrub removed, which
+// were volumetric attributions: a named delivery repo beside a file count or a
+// disk size. Proven by mutation: restoring the exact sentence this change
+// removed from specs/harn-opt-2.md passed 1098/1098.
+//
+// A bare-literal rule cannot cover it, because the figures alone are legitimate
+// and still present, deliberately unattached, in README.md and the weekly
+// script ("a real delivery repo held 50,120 files") -- that is evidence, not a
+// disclosure. What made it a disclosure was the ATTRIBUTION. So the rule is
+// co-occurrence on one line, in either order, and it leaves the anonymous form
+// alone. specs/ waives the repo-name pattern under the owner's naming ruling,
+// so nothing else would catch this.
+const REPO_NAME_RE = /said.?of.?you|couchpotato/i
+const VOLUMETRIC_RE = /\b\d{1,3}(?:,\d{3})+\b|\b\d+(?:\.\d+)?\s?[KMGT]B\b/
+
+const SCRUBBED_SHAPES = [
+  { re: /rollback-2026\d{4}-\d{6}/, what: 'a production rollback tag' },
+  { re: /Bash\(rm -rf/, what: 'a destructive permission allow-list entry' },
+]
+
+const MAX_ATOMS = 4
+
+function scrubbedHit(text) {
+  const atoms = text.toLowerCase().match(/[a-z0-9]+/g) || []
+  const want = new Map(SCRUBBED_TOKEN_HASHES.map((e) => [e.sha256, e]))
+  // EVERY window size 1..MAX_ATOMS, not only the sizes the entries declare.
+  // Deriving the sizes from `atoms` missed the camel-joined form: BirthdayFoo
+  // lowercases to ONE atom whose join equals the three-atom join, so a literal
+  // written without separators slipped straight through a guard that only ever
+  // tried three-atom windows. Caught by mutation, not by reading.
+  for (let i = 0; i < atoms.length; i += 1) {
+    for (let n = 1; n <= MAX_ATOMS; n += 1) {
+      if (i + n > atoms.length) continue
+      const h = crypto.createHash('sha256').update(atoms.slice(i, i + n).join('')).digest('hex')
+      const e = want.get(h)
+      if (e) return e.what
+    }
+  }
+  return null
+}
+
+test('static: no tracked file republishes the operational detail scrubbed on 2026-09-05 -- production project and container names, the database volume, rollback tags, a named credential, or a destructive allow-list entry (round-one HIGH-1: the literals are stored as digests, and this file is NOT exempt)', () => {
   let scanned = 0
-  for (const rel of files) {
-    // This test file necessarily contains the literals it bans.
-    if (rel === 'test/static-checks.test.js') continue
+  for (const rel of trackedFiles()) {
     const abs = path.join(ROOT, rel)
     if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) continue
     const raw = fs.readFileSync(abs)
     if (raw.subarray(0, 4096).includes(0)) continue
     const text = raw.toString('utf8')
     scanned += 1
-    for (const { re, what } of SCRUBBED_LITERALS) {
-      assert.ok(!re.test(text), `${rel} republishes scrubbed operational detail (${what}). This was removed on the owner's decision; the argument it supported is kept in the spec without the identifier.`)
+    const hit = scrubbedHit(text)
+    assert.equal(hit, null, `${rel} republishes scrubbed operational detail (${hit}). This was removed on the owner's decision; the argument it supported is kept without the identifier. Do NOT add the literal here to silence this -- add its digest, per the one-liner above.`)
+    for (const { re, what } of SCRUBBED_SHAPES) {
+      assert.ok(!re.test(text), `${rel} republishes a scrubbed shape (${what}).`)
+    }
+    if (rel !== 'test/static-checks.test.js') {
+      for (const [n, line] of text.split('\n').entries()) {
+        const bad = REPO_NAME_RE.test(line) && VOLUMETRIC_RE.test(line)
+        assert.ok(!bad, `${rel}:${n + 1} names a delivery repo on the same line as a file count or disk size. The figure on its own is fine and is used that way elsewhere; attributing it to a named system is what was scrubbed on 2026-09-05.`)
+      }
     }
   }
   assert.ok(scanned > 50, `only ${scanned} files scanned`)
 })
+
+
+// ---------------------------------------------------------------------------
+// Round-one review HIGH-2: THE SCRUB ABOVE IS TIP-ONLY, and that is recorded in
+// the spec rather than enforced here. The reason is worth writing down.
+//
+// `trackedFiles()` is `git ls-files`, so every guard in this file measures the
+// working tree and nothing else. Measured, not assumed: the runbook identifiers
+// are in the CURRENT tree of the public default branch AND in its history, and
+// two lines carrying the credential's location fingerprint are still reachable
+// on origin/main -- while AC-SEC-9 asserted both had been purged. That claim is
+// corrected in this change. The key VALUE is not published: zero key-shaped
+// values were added anywhere in history.
+//
+// I WROTE A HISTORY-SCANNING TEST HERE AND DELETED IT, because it was vacuous.
+// To search history without holding the literal it hashed atom windows out of
+// sampled blobs; instrumented, it found ONE of the three digests it was meant
+// to detect, and passed. The sampling (400 paths, three commits each) could not
+// reach the commits that carry them. A real search needs `git log -S <literal>`,
+// which needs the literal in the tree, which is precisely what HIGH-1 says must
+// not be here. So the honest options were an expensive test that lies, or no
+// test. Recorded rather than quietly dropped, because a deleted guard with no
+// explanation is indistinguishable from one nobody thought of.
+//
+// What IS enforced, below and cheaply: the residual declaration exists in the
+// spec. That is the thing that actually decays -- someone tidies the redaction
+// note away and the repo silently starts claiming a closed item again. Whether
+// to rewrite public history is the owner's decision and was never a test's to
+// make.
+
 
 test('static: the prose duties that this harness\'s own CODE depends on are still present in the agent and contract files (round-two review M3) -- a duty relied on by a trigger, with no assertion joining them, can be paraphrased away behind a green gate', () => {
   for (const { file, re, why } of PROSE_DUTIES) {
