@@ -209,12 +209,32 @@ harness exists because those two look identical from the outside.
 At review, verify the removal criteria the way you verify the additions:
 against the built change, not the plan's description of it.
 
-**Why this is here and not in one lens's file.** Reported 2026-09-04: a
-design-system update shipped a new UI and left the superseded controls on
-screen, rendered and styled, wired to nothing. Every acceptance criterion
-described the new UI, and the new UI was correct, so the review passed
-honestly. The tests drove the new control and asserted it worked, which they
-did just as happily with the old ones still sitting beside it.
+**Why this is here and not in one lens's file.** Reported 2026-08-31: a
+story-collection screen carried two controls, styled as a choice, that called
+the same function with the same arguments. The owner read them as leftovers not
+wired to anything. They WERE wired up, which is worse: a dead control is
+obvious and gets fixed, while two live controls that quietly mean the same
+thing promise the user a decision the app cannot honour. Every acceptance
+criterion described the new work, and the new work was correct, so review
+passed honestly. The tests drove one control and asserted it worked, which they
+did just as happily with its twin sitting beside it.
+
+Note the shape, because it decides where the duty lives: this failure is
+invisible to a call-graph reader, since both controls are live and called, and
+to a test that clicks one of them. That is why the on-screen inventory belongs
+to `lens-design` and not to `lens-architecture`. A contract that said "orphaned
+controls were left on screen" would teach the reader to hunt dead things, which
+is the easy case and the one that gets found anyway.
+
+*(Corrected 2026-09-05. This paragraph previously dated the incident 2026-09-04
+and described the controls as wired to nothing. Both were wrong, and both came
+from me: the date was the timestamp of the TELLING rather than of the event,
+and the mechanism was the owner's reported symptom adopted as the diagnosis.
+Settled by searching the session transcripts for every user-authored mention of
+a button since 2026-08-20: three, of which two are this one incident reported
+four days apart. Two review rounds did not catch either error, because a review
+checks whether the code matches the document, not whether the document's
+account of history is true.)*
 
 ## Severity
 
