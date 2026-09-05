@@ -27,6 +27,8 @@ omitted.
 
 ---
 
+status: blocked-on-human: T4 is the only task left and is blocked on data neither of us controls -- it needs roughly five more real-work PRs in CouchPotatoServer, which is days away, not minutes. Should this plan close with T4 recorded as a standing item, or stay open with the loop ticking against something that changes on a multi-day timescale?
+
 ## Tasks
 
 - [x] T1: adversarial pass against `main` — state: merged — Owner decision 2026-09-05: keep
@@ -181,4 +183,10 @@ omitted.
   load. Until that is closed, every green/red reading taken while other work runs
   is unreliable -- including the ones above, which is why each was re-verified
   from a confirmed baseline.
-  Rework rounds this tick: 0. T4 remains blocked on data. Armed: ScheduleWakeup.
+  Rework rounds this tick: 0. T4 remains blocked on data.
+  **Armed: NOTHING -- and this line originally said "Armed: ScheduleWakeup".**
+  That was false when written: I logged the arming and did not do it, and the
+  Stop hook caught it. Corrected in place rather than quietly amended, because a
+  conductor log that records an action not taken is the same defect as a guard
+  that reports healthy without running -- which is what tick 6 spent its time
+  fixing. Third mechanical catch of the session, all three on me.
