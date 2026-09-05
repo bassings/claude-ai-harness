@@ -227,8 +227,8 @@ const EXEMPTIONS = [
   },
   {
     paths: ['specs/'],
-    skip: ['target-repo', 'users'],
-    placeholder: false,
+    skip: ['target-repo'],
+    placeholder: true,
     why: 'Specs are written FROM real incidents in real repos, so naming the repo is the point rather than an accident, exactly as it is in AGENT-HARNESS.md and README.md. Owner ruling 2026-09-04: neither delivery repo name is confidential, which resolved a contradiction where this guard treated the string as unshippable while specs/ published it openly. The /Volumes/ and /home/ clauses are NOT waived, and the users waiver only covers the YOUR_USERNAME placeholder convention these docs share. What this exemption does NOT cover, and what no pattern here could: those specs also describe a delivery system\'s CI, production setup and settings allow-list. That is a judgement about operational detail, raised with the owner separately, not something a regex decides.',
   },
 ]
@@ -1727,6 +1727,51 @@ const PROSE_DUTIES = [
     why: 'the brake on the clause above. Requiring a measurement criterion makes per-user behavioural data a standing planning deliverable, so the routing of the personal half to lens-security is load-bearing, not decoration (round-one review M3).',
   },
 ]
+
+// ---------------------------------------------------------------------------
+// Owner decision 2026-09-05: repo NAMES may stay, the OPERATIONAL DETAIL beside
+// them may not. Names are covered by LEAK_PATTERNS; this covers what a regex on
+// a name never could.
+//
+// What was actually published in this PUBLIC repo until 2026-09-05: a delivery
+// system's live compose project name, every running container name, its
+// production database volume, its rollback tags, the fact that its own settings
+// allow-list permitted a broadly destructive shell command while it sat first in
+// an unsandboxed weekly job's list, and one credential named outright. Together
+// that was a working runbook for destroying someone's production, published in a
+// document arguing for care.
+//
+// This cannot be a general "no operational detail" check: that is a judgement,
+// not a pattern. What it CAN do is stop these exact identifiers returning, which
+// is the realistic regression -- specs here are written from real incidents, and
+// the natural way to write one is to paste what you saw. Each literal is a
+// thing, not a description of a thing, so a false positive is very unlikely.
+const SCRUBBED_LITERALS = [
+  { re: /REDACTED-PROJECT-NAME/i, what: "a delivery repo's live compose project name and container prefix" },
+  { re: /REDACTED-STAGING-NAME/i, what: "a delivery repo's staging project name" },
+  { re: /rollback-2026\d{4}-\d{6}/, what: 'a production rollback tag' },
+  { re: /REDACTED_CREDENTIAL_NAME/, what: 'a specific credential, named' },
+  { re: /Bash\(rm -rf/, what: "a named system's destructive permission allow-list entry" },
+]
+
+test('static: no tracked file republishes the operational detail scrubbed on 2026-09-05 -- production project and container names, the database volume, rollback tags, a named credential, or a destructive allow-list entry', () => {
+  const files = trackedFiles()
+  let scanned = 0
+  for (const rel of files) {
+    // This test file necessarily contains the literals it bans.
+    if (rel === 'test/static-checks.test.js') continue
+    const abs = path.join(ROOT, rel)
+    if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) continue
+    const raw = fs.readFileSync(abs)
+    if (raw.subarray(0, 4096).includes(0)) continue
+    const text = raw.toString('utf8')
+    scanned += 1
+    for (const { re, what } of SCRUBBED_LITERALS) {
+      assert.ok(!re.test(text), `${rel} republishes scrubbed operational detail (${what}). This was removed on the owner's decision; the argument it supported is kept in the spec without the identifier.`)
+    }
+  }
+  assert.ok(scanned > 50, `only ${scanned} files scanned`)
+})
 
 test('static: the prose duties that this harness\'s own CODE depends on are still present in the agent and contract files (round-two review M3) -- a duty relied on by a trigger, with no assertion joining them, can be paraphrased away behind a green gate', () => {
   for (const { file, re, why } of PROSE_DUTIES) {

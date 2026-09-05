@@ -57,9 +57,9 @@ The measured position today:
   records; **both delivery repos have zero**. So rework attribution, wall-clock
   decomposition and trigger accuracy produce nothing for the repos that matter,
   and the weekly report correctly says `uninstrumented` for both.
-- **Said of You's CI is unmeasured per job.** `CI::CI` collapses six jobs into
-  one number, so the critical path (e2e 210-229s running in parallel with
-  CodeQL 225-236s) is invisible.
+- **Said of You's CI is unmeasured per job.** One workflow collapses several
+  jobs into a single number, so the critical path is invisible. *(Job names and
+  measured durations redacted 2026-09-05, owner's decision.)*
   **Do not reason from the Actions-budget figure.** An earlier draft cited
   "~610 of ~625 purchased minutes spent" from
   `docs/plans/2026-08-10-audit-remediation.md:2` as a live constraint. That
@@ -102,15 +102,19 @@ tasks; they are things any task here must not break.
   must return, or a PR can go green against a stale base. **Preserve that
   comment verbatim**; a decomposition change would reflow it away without
   noticing. Surface any ruleset change rather than adjusting it.
-- **Said of You runs production out of this repo under the OLD project name.**
-  `docker-compose.yml` is the live stack and `docker-compose.yml:8` reads
-  `name: REDACTED-PROJECT-NAME`. Running containers are `REDACTED-PROJECT-NAME`,
-  `-auth`, `-db-1`, `-cloudflared-1`; only staging moved to
-  `REDACTED-STAGING-NAME`. **`REDACTED-PROJECT-NAME_pgdata` is the production
-  database volume.** Never `docker compose up` against `docker-compose.yml`,
-  and never "tidy" anything named `REDACTED-PROJECT-NAME`. The
-  `REDACTED-ROLLBACK-TAG` tags on both services are the n-1 rollback path
-  and must not be swept.
+- **Said of You runs production out of that repo under an OLD project name.**
+  *(Operational detail redacted 2026-09-05, owner's decision: the original
+  named the compose file and line, the live project name, every running
+  container, the production database volume and the rollback tags. This repo is
+  PUBLIC, and that paragraph was a working runbook for destroying someone's
+  production. The reasoning it supported is kept because the harness needs it;
+  the identifiers are not, because nothing here needs them.)*
+  The generalisable point, which is why this survives at all: a repo whose
+  compose project name no longer matches its product name is a trap for any
+  agent doing housekeeping. Anything that looks like a stale artefact from a
+  previous product may be the live stack, and rollback tags read as clutter.
+  Before an agent removes anything in a delivery repo, it confirms with the
+  owner what is live, by name, in that repo rather than from a spec.
 - **`.stryker-tmp` exists holding only `app-incremental.json`.** Deleting it
   loses roughly 7,000 reused mutant results and turns the next mutation run
   from minutes into very long. It is not rubbish; it will not look broken.
@@ -326,7 +330,7 @@ to re-read first.
 - **AC-SEC-6:** After T2, the CI lane's requested field set -- every `gh run list --json` field, every `gh api` path and every field read off a jobs response -- contains no person-identifying value (`actor`, `triggeringActor`, `author`, `committer`, any `email`, `displayTitle`, `headBranch`) and no log access (`--log`, `gh run view --log`, any URL ending `/logs`). Enforced as a static test over the built prompt strings that fails on any of those tokens, and confirmed by grepping a real report produced for the PUBLIC delivery repo for a GitHub login other than the repo-owner slug: zero matches.
 - **AC-SEC-7:** A prompt-injection canary placed in a field T2 newly ingests -- a per-job name, a step name or a workflow file name, not the field the existing canary at `test/optimise-cycle.test.js:852` already covers -- reaches the synthesis prompt only inside the nonce-tagged UNTRUSTED-DATA block, and a drafting agent scripted to obey it produces no proposal that survives the citation and security-removal filters. The adversary is concrete: Couch Potato is public, so `gh run list` there returns runs whose surrounding text a stranger opening a pull request controls.
 - **AC-SEC-8:** The T4 branch-ref sweep never interpolates a ref name into a shell string and deletes only refs matching an anchored, exact pattern. Proven in a throwaway repo carrying branches named `worktree-wf_$(touch <marker-path>)`, `worktree-wf_a;id`, `my-worktree-wf_a`, `worktree-wf_a-keepme` and `main`: afterwards `<marker-path>` does not exist, the last three branches and `main` all survive, and only exact-pattern refs are gone. The sweep touches no remote ref unless a flag explicitly asks for it, proven by a repo with a matching remote-tracking branch still present afterwards.
-- **AC-SEC-9:** `git diff origin/main...HEAD` adds no tracked line containing the operator's home path, the OS username, or a live credential's fingerprint (its file location, prefix, length or file mode); and at the end of this plan `grep -rn "AIza\|REDACTED_CREDENTIAL_NAME" $(git ls-files)` returns no line stating where the key lives, its prefix, its length or its mode. Two spec lines did so historically; both have been purged from history.
+- **AC-SEC-9:** `git diff origin/main...HEAD` adds no tracked line containing the operator's home path, the OS username, or a live credential's fingerprint (its file location, prefix, length or file mode); and at the end of this plan `grep -rn "AIza\|[A-Z_]*API_KEY" $(git ls-files)` returns no line stating where any live key lives, its prefix, its length or its mode. (Generalised 2026-09-05: the pattern named one specific credential, which is itself a small disclosure in a PUBLIC repo. The check is stronger generalised, not weaker.) Two spec lines did so historically; both have been purged from history.
 - **AC-SEC-10:** The documented deletion procedure names every artefact holding ledger-derived data -- each instrumented repo's `.claude/harness-ledger.jsonl`, each repo's `.claude/optimise-cycle-report.md`, and `~/.claude/logs/optimise-cycle-weekly.log` -- and, executed verbatim, leaves zero matches on disk for a distinctive `run_id` that was in a deleted ledger. The same documentation states in one line what instrumenting a repo begins collecting (run timestamps, spec paths, repo identity, lens verdicts and AC ids), that retention is indefinite with no rotation, and the command that deletes it. Whether the mechanism reaches every artefact is AC-DATA-1's to verify; this is the policy it must satisfy.
 
 ### Architecture
@@ -456,8 +460,8 @@ Recorded so they are not silently reconsidered:
 
 ## Owner actions, not tasks here
 
-- **Rotate the plaintext `REDACTED_CREDENTIAL_NAME`** (the operator knows the file; it is
-  deliberately not named here)
+- **One credential-hygiene item** (the operator knows which; the credential,
+  its file and its identity are all deliberately unnamed here)
   (details deliberately not restated here; see AC-SEC-9. Stating a live key's
   location, prefix, length and file mode on a public branch narrows the search
   for anyone who finds it, which is what the original wording did.)
