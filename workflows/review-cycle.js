@@ -449,6 +449,9 @@ const triggerCounts = {}
 // null, not [], when lens-architecture never ran: an empty list would say
 // "triggered by nothing", which is a different and false claim.
 let architectureTriggerSource = null
+// Per-lens checkout drift, recorded not gated (MED-2). Empty means every lens
+// was already on the reviewed tip, which has not happened in five observed runs.
+let lensCheckoutDrift = {}
 let headSha = null
 // 2026-08-18: the sha git reports at SYNTHESIS time, so a checkout that moved
 // mid-run is detectable. Several agent sessions share these checkouts; a
@@ -682,7 +685,7 @@ const scope = await agent(
       type: 'object',
       required: ['base', 'head_sha', 'head_tree', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists', 'consistency'],
       properties: {
-        base: { type: 'string' },
+        base: { type: 'string', pattern: '^[A-Za-z0-9._/@^~-]{1,120}$' },
         head_sha: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
         // The WITNESS (round-two review F3). The reviewed tip's tree hash is not
         // derivable from its commit sha without reading the object, so a lens
@@ -769,6 +772,51 @@ if (!scope.files.length) {
 }
 
 headSha = scope.head_sha
+
+// ---- validate EVERY model-authored scope value, here, once, before use ----
+// Round-three review HIGH-1, and this is a structural change rather than a
+// patch. Each of these values had been validated somewhere: base nowhere at
+// all, head_sha and head_tree about ninety lines below, after the lenses they
+// protect had already been dispatched. Validating a value at the point where
+// somebody noticed it mattered is how base ended up interpolated, unchecked,
+// into a shell command inside nine tool-capable sub-agent prompts, next to the
+// sentence "Run both commands exactly as written and report exactly what they
+// print". A branch name may legally contain a semicolon.
+//
+// Everything the scope step returns is model-authored. So the boundary is here,
+// where it arrives, and nothing downstream re-derives its own opinion.
+const SHA_RE = /^[0-9a-f]{7,40}$/
+// Deliberately narrower than git's ref rules: this value is interpolated into a
+// command, so it is an allowlist of what a ref may contain, not a denylist of
+// what a shell treats specially. No spaces, no semicolons, no substitution, no
+// newlines, nothing to quote around.
+const REF_RE = /^[A-Za-z0-9._/@^~-]{1,120}$/
+const scopeBase = typeof scope.base === 'string' ? scope.base.trim() : ''
+if (!REF_RE.test(scopeBase)) {
+  throw new Error(
+    `ScopeBaseInvalid: the scope step reported the base ref as ${neutralise(scope.base)}, which is not a plain ref ` +
+    `name. That value is interpolated into a git command inside every lens prompt, so it is refused here, BEFORE any ` +
+    `lens is dispatched, rather than being passed to nine tool-capable agents and checked afterwards. Re-run the ` +
+    `review cycle; if the branch name genuinely contains unusual characters, rename it or pass base explicitly.`
+  )
+}
+const scopeSha = typeof scope.head_sha === 'string' ? scope.head_sha.trim().toLowerCase() : ''
+if (!SHA_RE.test(scopeSha)) {
+  throw new Error(
+    `ScopeHeadShaInvalid: the scope step reported the pinned tip as ${neutralise(scope.head_sha)}, which is not a ` +
+    `valid commit sha. Every comparison in this run is made against that value, and it is interpolated into a git ` +
+    `command in every lens prompt, so a malformed pin either disables the reviewed-tip check or fails correct ` +
+    `lenses. This is a SCOPE failure, not a checkout problem and not a lens problem: re-run the review cycle.`
+  )
+}
+const scopeTree = typeof scope.head_tree === 'string' ? scope.head_tree.trim().toLowerCase() : ''
+if (!SHA_RE.test(scopeTree)) {
+  throw new Error(
+    `ScopeHeadTreeInvalid: the scope step reported the reviewed tip's tree hash as ${neutralise(scope.head_tree)}, ` +
+    `which is not a valid object id. That value is the ONLY thing a lens cannot echo from its prompt, so without it ` +
+    `the reviewed-tip check degrades to a self-report. This is a SCOPE failure: re-run the review cycle.`
+  )
+}
 
 const base = scope.base
 
@@ -1161,33 +1209,15 @@ const pinnedSha = normaliseSha(scope.head_sha)
 // rev-parse HEAD" -- refused a run whose lenses were entirely correct, blaming
 // a parallel session that did not exist. Checked here, before either
 // comparison, and named as what it is: a scope failure, not a drift signal.
-if (!pinnedSha || !/^[0-9a-f]{7,40}$/.test(pinnedSha)) {
-  throw new Error(
-    `ScopeHeadShaInvalid: the scope step reported the pinned tip as ${JSON.stringify(String(scope.head_sha).slice(0, 60))}, ` +
-    `which is not a valid commit sha. Every comparison in this run is made against that value, so a malformed pin either ` +
-    `disables the reviewed-tip check or fails correct lenses. This is a SCOPE failure, not a checkout problem and not a ` +
-    `lens problem: re-run the review cycle.`
-  )
-}
 // Written as a single expression deliberately: `return` inside a helper here is
 // indistinguishable, to the AC-QA-9 static guard, from a new exit path out of
 // run() itself. That guard is a change detector for unpaired exits and is worth
 // more than the readability of an early return.
-const shaAgrees = (v) => ((got) => Boolean(got) && Boolean(pinnedSha) && /^[0-9a-f]{7,40}$/.test(got)
-  && (got.length <= pinnedSha.length ? pinnedSha.startsWith(got) : got.startsWith(pinnedSha)))(normaliseSha(v))
 
 // Split by CAUSE, because the two shapes need different remedies (review F).
 // Telling an operator whose lens merely crashed to "let a parallel session
 // settle" sends them after a cause that does not exist.
 const pinnedTree = normaliseSha(scope.head_tree)
-if (!pinnedTree || !/^[0-9a-f]{7,40}$/.test(pinnedTree)) {
-  throw new Error(
-    `ScopeHeadTreeInvalid: the scope step reported the reviewed tip's tree hash as ` +
-    `${JSON.stringify(String(scope.head_tree).slice(0, 60))}, which is not a valid object id. That value is the only ` +
-    `thing a lens cannot echo from its prompt, so without it the reviewed-tip check degrades to a self-report. This ` +
-    `is a SCOPE failure: re-run the review cycle.`
-  )
-}
 const treeAgrees = (v) => ((got) => Boolean(got) && /^[0-9a-f]{7,40}$/.test(got)
   && (got.length <= pinnedTree.length ? pinnedTree.startsWith(got) : got.startsWith(pinnedTree)))(normaliseSha(v))
 
@@ -1213,6 +1243,17 @@ const treeAgrees = (v) => ((got) => Boolean(got) && /^[0-9a-f]{7,40}$/.test(got)
 // than it is: this proves the lens had the reviewed commit's object available,
 // not that every finding was derived from that tree. It closes the echo, which
 // was the hole; it does not make a self-report into an observation.
+// MED-2: the prompt promises head_sha_measured is RECORDED. It was demanded from
+// every lens on every run and recorded nowhere, which made the sentence beside
+// it false and wasted the only honest drift signal the harness has. Recorded
+// here, per lens, for the lenses whose checkout differed from the reviewed tip.
+// Drift is counted rather than pressured out: it never fails a run.
+lensCheckoutDrift = Object.fromEntries(
+  lensReports
+    .filter(r => normaliseSha(r.head_sha_measured) && normaliseSha(r.head_sha_measured) !== pinnedSha)
+    .map(r => [r.lens, normaliseSha(r.head_sha_measured)])
+)
+
 const wrongTree = lensReports.filter(r => !treeAgrees(r.head_tree_measured))
 if (wrongTree.length) {
   throw new Error(
@@ -1380,6 +1421,7 @@ const telemetry = {
   lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],
   trigger_counts: triggerCounts,
+  lens_checkout_drift: lensCheckoutDrift,
   // Omitted entirely, not written as null, when lens-architecture did not run
   // (review I). ledger-append.mjs has additionalProperties:false, so a NEW
   // workflow writing to an OLDER installed copy of that library has its whole

@@ -1724,6 +1724,16 @@ const PROSE_DUTIES = [
   },
   {
     file: 'AGENT-HARNESS.md',
+    re: /head_tree_measured: <output of `git rev-parse/,
+    why: 'the published contract must name the field that is actually CHECKED, with the command that produces it. Round-three review HIGH-2: the block existed but described a single value and asserted the orchestrator compares the SHA -- the opposite of what ships. Pinning the heading alone let the body say anything.',
+  },
+  {
+    file: 'AGENT-HARNESS.md',
+    re: /recorded, never checked/,
+    why: 'and must distinguish the checked field from the recorded one. A lens told both are checked will hide honest drift, which is the incentive this design exists to avoid.',
+  },
+  {
+    file: 'AGENT-HARNESS.md',
     re: /### MEASURED AT/,
     why: 'the published lens output contract must list the field REVIEW_SCHEMA now requires. Review round one, finding H: the schema required head_sha_measured and omitting it aborts the whole run, while the contract adopting users read said "every lens returns exactly this" and never mentioned it. Anyone writing a lens from the published contract produced one that aborts every review it joins.',
   },

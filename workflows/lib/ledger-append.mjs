@@ -194,6 +194,11 @@ export const LEDGER_ENTRY_SCHEMA = {
     // deduplicated union of both surfaces and cannot answer it. Without this,
     // AGENT-HARNESS.md's eight-week reversal condition is not computable.
     architecture_trigger_source: { type: ['array', 'null'], items: { type: 'string', enum: ['arch-glob', 'ui-glob', 'new-module', 'new-dependency'] } },
+    // Which lenses were NOT on the reviewed tip when they reviewed, and where
+    // they were. Recorded, never gated: drift is expected in shared checkouts,
+    // and attaching a penalty to an honest answer is the wrong incentive for a
+    // self-report. Additive and optional, like rule_source before it.
+    lens_checkout_drift: { type: ['object', 'null'], additionalProperties: { type: 'string' } },
     rule_source: { type: ['string', 'null'], enum: ['repo-tuned', 'harness defaults'] },
     rule_source_overridden_keys: { type: ['integer', 'null'] },
     findings: {

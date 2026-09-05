@@ -2661,3 +2661,122 @@ test('review-cycle.js: an items schema with a UNION type still rejects a NON-mem
   })
   assert.equal(result.open_findings, null, 'a non-member item must not survive validation into a real finding id')
 })
+
+// ---------------------------------------------------------------------------
+// Round-three review HIGH-1: model-authored values reached SHELL COMMANDS inside
+// nine tool-capable sub-agent prompts, and the lenses were dispatched ~90 lines
+// BEFORE the validation meant to protect them.
+//
+// Reproduced: base = 'main; touch /tmp/CANARY #' has no schema constraint at
+// all, landed in every lens prompt as `git diff main; touch /tmp/CANARY #...`,
+// and the run completed with no error. The prompt beside it says "Run both
+// commands exactly as written". A branch name may legally contain a semicolon.
+//
+// The structural fix, and the reason this is not another patch: EVERY value the
+// scope agent returns is model-authored, and each has been validated at a
+// different place, at a different time, some after dispatch. They are now all
+// validated ONCE, at the boundary where they arrive, before anything is
+// interpolated or any lens is dispatched.
+for (const [label, hostile] of [
+  ['a semicolon command separator', 'main; touch /tmp/CANARY #'],
+  ['command substitution', 'main$(id)'],
+  ['backticks', 'main`id`'],
+  ['a newline', 'main\nid'],
+]) {
+  test(`review-cycle.js: ${label} in the base ref is refused BEFORE any lens is dispatched (review HIGH-1)`, async () => {
+    let calls = null
+    await assert.rejects(
+      () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, base: hostile, __bypassSchemaValidation: true } }) })
+        .catch((e) => { calls = e.calls; throw e }),
+      (err) => {
+        assert.match(err.message, /ScopeBaseInvalid/, 'the base ref must be named as the malformed thing')
+        return true
+      }
+    )
+    const dispatched = (calls || []).filter((c) => String(c.opts.label).startsWith('lens-'))
+    assert.deepEqual(dispatched, [], 'no lens may be dispatched with an unvalidated base ref in its prompt')
+  })
+}
+
+test('review-cycle.js: a malformed pinned sha is refused BEFORE dispatch too, not ninety lines after it (review HIGH-1)', async () => {
+  let calls = null
+  await assert.rejects(
+    () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, head_sha: 'abc; id #', __bypassSchemaValidation: true } }) })
+      .catch((e) => { calls = e.calls; throw e }),
+    (err) => { assert.match(err.message, /ScopeHeadShaInvalid/); return true }
+  )
+  assert.deepEqual((calls || []).filter((c) => String(c.opts.label).startsWith('lens-')), [], 'no lens dispatched')
+})
+
+test('review-cycle.js: an ordinary base ref with slashes and dots still works, so the validation is not simply refusing everything', async () => {
+  for (const good of ['main', 'origin/main', 'release/2.1.x', 'v1.0.0']) {
+    const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, base: good } }) })
+    assert.equal(result.telemetry.outcome, 'done', `${good} must be accepted`)
+  }
+})
+
+// --- Round-three review HIGH-3: ScopeHeadTreeInvalid had NO test. It matched
+// exactly one line in the worktree, the throw itself, and replacing its
+// condition with `if (false)` left all 1134 tests green. After F3/F4 moved the
+// gate off the sha and onto the tree, this became the guard on the single value
+// the entire reviewed-tip check compares against, and it was the one guard in
+// the change never broken and watched to fail.
+for (const [label, bad] of [
+  ['a non-hex value', 'not-a-tree'],
+  ['a too-short prefix', '11111'],
+  ['an empty string', ''],
+  ['a shell fragment', '1111111; id #'],
+]) {
+  test(`review-cycle.js: ${label} as the pinned TREE is refused before dispatch (review HIGH-3)`, async () => {
+    let calls = null
+    await assert.rejects(
+      () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, head_tree: bad, __bypassSchemaValidation: true } }) })
+        .catch((e) => { calls = e.calls; throw e }),
+      (err) => {
+        assert.match(err.message, /ScopeHeadTreeInvalid/, 'the tree pin must be named as the malformed thing')
+        assert.match(err.message, /self-report/, 'and the message must say WHY it matters: without it the gate degrades')
+        return true
+      }
+    )
+    assert.deepEqual((calls || []).filter((c) => String(c.opts.label).startsWith('lens-')), [], 'no lens dispatched')
+  })
+}
+
+test('review-cycle.js: the scope schema ALSO refuses a malformed tree pin, so the two layers are independent (review HIGH-3)', async () => {
+  await assert.rejects(
+    () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, head_tree: 'not-a-tree' } }) }),
+    (err) => { assert.match(err.message, /schema|head_tree/i); return true }
+  )
+})
+
+// --- Round-three review MED-2: head_sha_measured was demanded from every lens
+// on every run, the prompt promised it was "RECORDED", and it was recorded
+// nowhere. That made the sentence beside it false and threw away the only
+// honest drift signal the harness has -- drift observed in five consecutive
+// review runs, visible only as free text in coverage fields.
+test('review-cycle.js: a lens whose checkout differed from the reviewed tip has that drift RECORDED, not gated (review MED-2)', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      // Correct TREE, so the run completes -- drift is not a failure. Different
+      // HEAD, which is exactly the shared-worktree case seen in every real run.
+      'lens-qa': { ...QA_CLEAN, head_sha_measured: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' },
+    }),
+  })
+  const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.deepEqual(payload.lens_checkout_drift, { 'lens-qa': 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' })
+})
+
+test('review-cycle.js: drift does NOT fail the run, so honesty is never punished (review MED-2)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'lens-qa': { ...QA_CLEAN, head_sha_measured: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } }),
+  })
+  assert.equal(result.telemetry.outcome, 'done')
+})
+
+test('review-cycle.js: lenses already on the reviewed tip record no drift, so the field means something when non-empty', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.deepEqual(payload.lens_checkout_drift, {})
+})

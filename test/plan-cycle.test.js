@@ -915,8 +915,19 @@ test('plan-cycle.js: a lens cannot rename itself -- the dispatch label always wi
       'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, acceptance_criteria: [{ id: 'AC-SEC-1', statement: 'x' }], lens: evil, __bypassSchemaValidation: true },
     }),
   })
+  // Asserted on VERDICTS, not lenses_run. The first version of this test used
+  // lenses_run and passed with the fix reverted (round-three review HIGH-4):
+  // plan-cycle writes `lenses_run: result.lenses || lensesRunRaw`, so the
+  // dispatched list always wins and the reported names never reach it. The
+  // verdicts map IS keyed by the reported name, so that is where a rename shows.
   const write = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  assert.doesNotMatch(write.prompt, /INJECTED/, 'model-authored text must never become a lens identity in the ledger payload')
+  const payload = extractLedgerPayload(write.prompt)
+  assert.deepEqual(
+    Object.keys(payload.verdicts).filter((k) => /INJECTED/.test(k)),
+    [],
+    'a lens must not be able to key its own verdict under a name it chose'
+  )
+  assert.ok(Object.keys(payload.verdicts).includes('lens-security'), 'and the verdict must appear under the DISPATCHED name')
 })
 
 test('plan-cycle.js: the lens schema rejects unknown keys outright, independently of the spread order (review F1, second layer)', async () => {

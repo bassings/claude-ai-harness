@@ -163,10 +163,21 @@ Every lens returns exactly this. No preamble, no summary of the codebase.
 CLEAN | FINDINGS | BLOCKED
 
 ### MEASURED AT                [review mode only]
-<the sha your findings were actually derived from: `git rev-parse HEAD` in the
-tree you read, or the sha you explicitly diffed against. The orchestrator
-compares it to the reviewed tip and refuses the run if they differ, so report
-what you measured, not what you were told to measure.>
+head_tree_measured: <output of `git rev-parse <reviewed-tip-sha>^{tree}`>
+head_sha_measured:  <output of `git rev-parse HEAD` in your own worktree>
+
+<Both are required. The FIRST is checked: the orchestrator compares it to the
+reviewed tip's tree and refuses the whole run if they differ. Its expected value
+is deliberately absent from your prompt, because the tip's SHA is given to you
+and echoing something you were told proves nothing about what you read.
+
+The SECOND is recorded, never checked. Report it honestly even when your
+checkout has drifted from the tip, which is normal and expected: drift is
+measured, not punished, and it never fails a run.
+
+Neither command moves your checkout, and you must not move it. These worktrees
+can be shared, and checking out a different commit underneath another session is
+the incident this check exists to detect.>
 
 ### COVERAGE
 Examined:      <files, paths, commands: be specific>
