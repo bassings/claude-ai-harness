@@ -689,7 +689,9 @@ export function aggregateWallClock(records, { root = '' } = {}) {
       // (SonarQube S1854). Arithmetic says what this does.
       bucket.unterminatedWaits += nullOcc.starts.length
       bucket[unmeasuredField] += nullOcc.starts.length
-      for (const e of nullOcc.ends) {
+      // Counted, not bound: the body never uses the element, it records one
+      // unusable interval per malformed end event (SonarQube S1854).
+      for (let i = 0; i < nullOcc.ends.length; i += 1) {
         bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} ended event has a malformed event_key and cannot be paired` })
         bucket[unmeasuredField] += 1
       }
