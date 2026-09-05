@@ -29,7 +29,7 @@ omitted.
 
 ## Tasks
 
-- [ ] T1: adversarial pass against `main` — state: building — Owner decision 2026-09-05: keep
+- [x] T1: adversarial pass against `main` — state: merged — Owner decision 2026-09-05: keep
   the adversarial mutation pass as a standing practice rather than a gate on one
   branch. The shape that worked: a fresh agent picks the mutations, is told to
   assume every mutation the author ran was chosen to succeed, and is told a
@@ -156,3 +156,29 @@ omitted.
   bit me today written in: confirm green before each mutation, and check the
   mutation actually landed before believing a green run.
   Rework rounds this tick: 0. T1 building. Armed: the background agent.
+
+- 2026-09-05 tick 6: **T1 done.** ~97 mutations, ~53 green. Four fixed here, in
+  consequence order, each verified before acting rather than relayed.
+  1. **Every hook could be replaced by a no-op** (`command: "true"`) with
+     1182/1182 green -- all three guards off in a three-word edit. The existing
+     wiring test checked REGISTRATION and never that the command runs the script:
+     section 11's wrapper-not-capability shape, aimed at the guards' own wiring.
+  2. **The local gate did not mirror CI** (section 4). pre-push ran only the Node
+     suite; plan-guard-stop.py has zero Node coverage; its only tests ran in CI.
+     The no-stall guard could be broken outright with pre-push reporting success.
+     One line, and it closes the class for every Python hook, not one instance.
+  3. **The destructive-git guard had three independent defeat routes** -- wiring,
+     the keyword-stripping parser stage, and an escape hatch where `=0` would
+     have DISABLED it. The code was correct throughout; nothing pinned it. This
+     is the guard protecting the shared checkout.
+  4. **The transcript reader had no coverage at all**, and the reason was worse
+     than the report's "unpinned window": every test injects a list and bypasses
+     the file-reading function entirely.
+  **One relayed claim did not reproduce** (widening WAKE_MARKERS: fails six
+  tests). Checked rather than accepted.
+  **Recorded, not done:** the flaky timing tests. Three attackers and I each took
+  at least one false reading from them today; 6/6 green quiet, 2/5 red under
+  load. Until that is closed, every green/red reading taken while other work runs
+  is unreliable -- including the ones above, which is why each was re-verified
+  from a confirmed baseline.
+  Rework rounds this tick: 0. T4 remains blocked on data. Armed: ScheduleWakeup.
