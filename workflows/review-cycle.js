@@ -511,7 +511,7 @@ function readBudgetSpent() {
   try {
     const v = budget.spent()
     return typeof v === 'number' && Number.isFinite(v) ? v : null
-  } catch (e) {
+  } catch {
     // Deliberately swallowed, and SonarQube S2486 is right to ask why rather
     // than accept silence. budget.spent() is TELEMETRY: it exists so a run's
     // cost can be recorded, and it must never be able to fail the run it is
