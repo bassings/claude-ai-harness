@@ -330,7 +330,7 @@ to re-read first.
 - **AC-SEC-6:** After T2, the CI lane's requested field set -- every `gh run list --json` field, every `gh api` path and every field read off a jobs response -- contains no person-identifying value (`actor`, `triggeringActor`, `author`, `committer`, any `email`, `displayTitle`, `headBranch`) and no log access (`--log`, `gh run view --log`, any URL ending `/logs`). Enforced as a static test over the built prompt strings that fails on any of those tokens, and confirmed by grepping a real report produced for the PUBLIC delivery repo for a GitHub login other than the repo-owner slug: zero matches.
 - **AC-SEC-7:** A prompt-injection canary placed in a field T2 newly ingests -- a per-job name, a step name or a workflow file name, not the field the existing canary at `test/optimise-cycle.test.js:852` already covers -- reaches the synthesis prompt only inside the nonce-tagged UNTRUSTED-DATA block, and a drafting agent scripted to obey it produces no proposal that survives the citation and security-removal filters. The adversary is concrete: Couch Potato is public, so `gh run list` there returns runs whose surrounding text a stranger opening a pull request controls.
 - **AC-SEC-8:** The T4 branch-ref sweep never interpolates a ref name into a shell string and deletes only refs matching an anchored, exact pattern. Proven in a throwaway repo carrying branches named `worktree-wf_$(touch <marker-path>)`, `worktree-wf_a;id`, `my-worktree-wf_a`, `worktree-wf_a-keepme` and `main`: afterwards `<marker-path>` does not exist, the last three branches and `main` all survive, and only exact-pattern refs are gone. The sweep touches no remote ref unless a flag explicitly asks for it, proven by a repo with a matching remote-tracking branch still present afterwards.
-- **AC-SEC-9:** `git diff origin/main...HEAD` adds no tracked line containing the operator's home path, the OS username, or a live credential's fingerprint (its file location, prefix, length or file mode); and at the end of this plan `grep -rn "AIza\|[A-Z_]*API_KEY" $(git ls-files)` returns no line stating where any live key lives, its prefix, its length or its mode. (Generalised 2026-09-05: the pattern named one specific credential, which is itself a small disclosure in a PUBLIC repo. The check is stronger generalised, not weaker.) Two spec lines did so historically. **This AC recorded both as "purged from history" until 2026-09-05; that was FALSE and is corrected here.** Measured on 2026-09-05 against `origin/main`: the credential name remains in three commits reachable on the public default branch, ONE of which also names its file. (First stated as "two" on 2026-09-05 and corrected the same day: my own grep counted AC-SEC-9 itself, whose text lists the fingerprint categories in order to forbid them. A check's description of what it bans is not an instance of the thing.) What IS true, and was re-measured the same day: no key VALUE appears anywhere in history, on any ref. See "Residual exposure, stated" below.
+- **AC-SEC-9:** `git diff origin/main...HEAD` adds no tracked line containing the operator's home path, the OS username, or a live credential's fingerprint (its file location, prefix, length or file mode); and at the end of this plan `grep -rn "AIza\|[A-Z_]*API_KEY" $(git ls-files)` returns no line stating where any live key lives, its prefix, its length or its mode. (Generalised 2026-09-05: the pattern named one specific credential, which is itself a small disclosure in a PUBLIC repo. The check is stronger generalised, not weaker.) Two spec lines did so historically. **This AC recorded both as "purged from history" until 2026-09-05; that was FALSE for eighteen days, was corrected on that date, and the purge was then actually carried out.** Verified from a fresh clone of the public repository rather than the local copy. Measured on 2026-09-05 against `origin/main`: the credential name remains in three commits reachable on the public default branch, ONE of which also names its file. (First stated as "two" on 2026-09-05 and corrected the same day: my own grep counted AC-SEC-9 itself, whose text lists the fingerprint categories in order to forbid them. A check's description of what it bans is not an instance of the thing.) What IS true, and was re-measured the same day: no key VALUE appears anywhere in history, on any ref. See "Residual exposure, stated" below.
 - **AC-SEC-10:** The documented deletion procedure names every artefact holding ledger-derived data -- each instrumented repo's `.claude/harness-ledger.jsonl`, each repo's `.claude/optimise-cycle-report.md`, and `~/.claude/logs/optimise-cycle-weekly.log` -- and, executed verbatim, leaves zero matches on disk for a distinctive `run_id` that was in a deleted ledger. The same documentation states in one line what instrumenting a repo begins collecting (run timestamps, spec paths, repo identity, lens verdicts and AC ids), that retention is indefinite with no rotation, and the command that deletes it. Whether the mechanism reaches every artefact is AC-DATA-1's to verify; this is the policy it must satisfy.
 
 ### Architecture
@@ -460,38 +460,49 @@ Recorded so they are not silently reconsidered:
 
 ## RESIDUAL EXPOSURE, STATED (2026-09-05)
 
-The operational-detail scrub of 2026-09-05 changed **the tip only**. Stating
-what remains, because the alternative is a repo that reads as clean:
+**History rewritten 2026-09-05 on the owner's decision.** What was published,
+what was done, and what is left. This section stays whether or not it reads
+comfortably, because the failure it exists to prevent is a redaction note being
+tidied away and the repo quietly resuming a claim that an item is closed. That
+is exactly what AC-SEC-9 did for eighteen days.
 
-| Still reachable on the public default branch | Where |
-|---|---|
-| A delivery system's live compose project name and container prefix | current tree of `origin/main`, and history |
-| Its staging project name | same |
-| Its production database volume name | derivable from the project name by Docker's default naming |
-| Its rollback tags | history |
-| One credential's name, and in one commit its file | history, three commits |
-| A named system's destructive permission allow-list entry | history |
+**What had been public since 2026-08-18:** a delivery system's live compose
+project name and container prefix, its staging project name, its production
+database volume (derivable from the project name by Docker's default naming),
+its rollback tags, one credential's name and in one commit its file, and a
+named system's destructive permission allow-list entry. Together a working
+runbook for destroying someone's production, inside a document arguing for care.
 
-**Not exposed, measured the same day:** no key value appears in history on any
-ref. The exposure is a runbook and a fingerprint, not a secret.
+**What was never public, measured on every ref before and after:** any key
+value. Zero matches for a key-shaped string anywhere in history. The exposure
+was a runbook and a pointer, not a secret.
 
-**Publicly readable since 2026-08-18**, so roughly eighteen days at the time of
-writing. GitHub retains unreferenced objects and any fork keeps its own copy, so
-a later rewrite reduces this rather than closing it.
+**What was done:** `git filter-repo` over all refs, replacing each identifier in
+both blob content and commit messages, then a force-push of `main`. Branch
+protection was relaxed for the push and restored to a byte-identical
+configuration immediately after; the four required status checks and the
+force-push and deletion prohibitions are all back on. Verified from a FRESH
+CLONE of the public repository, not from the local copy: zero occurrences across
+every ref, every diff and every commit message.
 
-**This is an OPEN decision, not an accepted risk.** It is the owner's to make,
-between rewriting the public history and recording this as an accepted
-disclosure. Until it is made, this section is the honest state and must not be
-deleted: `test/static-checks.test.js` pins its heading for exactly that reason,
-because the failure being prevented is a redaction note being tidied away and
-the repo quietly resuming the claim that the item is closed. That is what
-AC-SEC-9 did for eighteen days.
+**What is left, and it is not nothing.** GitHub retains unreferenced objects for
+a period and serves them to anyone who already recorded a specific commit
+identity. Nobody had forked, starred or watched this repository at any point, so
+there is no evidence anyone did, but absence of evidence is the argument this
+harness exists to distrust. A rewrite reduces this exposure; it does not prove
+it closed. Anyone holding a pre-rewrite clone still holds the original.
 
-**Why it was missed:** every leak guard in this repo reads `git ls-files`, so
-all of them measure the working tree and none has ever looked at a commit older
-than HEAD. A tip-only scrub therefore passes every check and reads as a
-redaction. Noted as the structural half of this finding, and it applies to the
-2026-08-18 redaction this one copied as its pattern.
+**One unredacted copy exists deliberately**, a local mirror taken before the
+rewrite. It is off the network and is the only rollback path if this rewrite
+turns out to have damaged something. It is not published and must not be.
+
+**The structural cause, which outlives this incident:** every leak guard in this
+repo reads `git ls-files`, so all of them measure the working tree and none has
+ever looked at a commit older than HEAD. A tip-only scrub therefore passes every
+check and reads exactly like a redaction. That is why the first attempt at this
+scrub was recorded as complete when it had changed nothing anyone could not
+still read, and it is why the 2026-08-18 redaction this one copied as its
+pattern made the same mistake.
 
 ## Owner actions, not tasks here
 
