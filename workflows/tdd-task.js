@@ -66,6 +66,16 @@ function readBudgetSpent() {
     const v = budget.spent()
     return typeof v === 'number' && Number.isFinite(v) ? v : null
   } catch (e) {
+    // Deliberately swallowed, and SonarQube S2486 is right to ask why rather
+    // than accept silence. budget.spent() is TELEMETRY: it exists so a run's
+    // cost can be recorded, and it must never be able to fail the run it is
+    // measuring. A caller that cannot read the budget records null -- "not
+    // measured" -- which the ledger schema models explicitly and keeps distinct
+    // from zero.
+    //
+    // The information is not lost: null reaches budget_spent in the run ledger,
+    // so an operator sees that this run's cost was unmeasured rather than being
+    // told it was free.
     return null
   }
 }

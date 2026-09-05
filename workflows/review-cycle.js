@@ -512,6 +512,16 @@ function readBudgetSpent() {
     const v = budget.spent()
     return typeof v === 'number' && Number.isFinite(v) ? v : null
   } catch (e) {
+    // Deliberately swallowed, and SonarQube S2486 is right to ask why rather
+    // than accept silence. budget.spent() is TELEMETRY: it exists so a run's
+    // cost can be recorded, and it must never be able to fail the run it is
+    // measuring. A caller that cannot read the budget records null -- "not
+    // measured" -- which the ledger schema models explicitly and keeps distinct
+    // from zero.
+    //
+    // The information is not lost: null reaches budget_spent in the run ledger,
+    // so an operator sees that this run's cost was unmeasured rather than being
+    // told it was free.
     return null
   }
 }
@@ -989,7 +999,9 @@ if (scope.custom_rules !== null) {
 ruleSource = scope.custom_rules ? 'repo-tuned' : 'harness defaults'
 ruleSourceOverriddenKeys = scope.custom_rules ? Object.keys(scope.custom_rules).length : null
 
-const rules = { ...DEFAULT_RULES, ...(scope.custom_rules || {}) }
+// `|| {}` dropped (S7744): object spread of null or undefined is a no-op, so
+// the empty object was doing nothing. Behaviour identical.
+const rules = { ...DEFAULT_RULES, ...scope.custom_rules }
 const paths = scope.files.map(f => f.path)
 
 // ---- deterministic lens triggering (AGENT-HARNESS.md roster) ----
