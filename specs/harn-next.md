@@ -27,8 +27,6 @@ omitted.
 
 ---
 
-status: blocked-on-human: T4 is the only task left and is blocked on data neither of us controls -- it needs roughly five more real-work PRs in CouchPotatoServer, which is days away, not minutes. Should this plan close with T4 recorded as a standing item, or stay open with the loop ticking against something that changes on a multi-day timescale?
-
 ## Tasks
 
 - [x] T1: adversarial pass against `main` — state: merged — Owner decision 2026-09-05: keep
@@ -57,7 +55,7 @@ status: blocked-on-human: T4 is the only task left and is blocked on data neithe
   machines); and one is a genuine find, a raw control byte in source where the
   sibling line uses the readable escape.
 
-- [ ] T4: the delivery comparison, when there is enough data — state: blocked-on-data — Baseline is 15
+- [x] T4: the delivery comparison — state: CLOSED AS STANDING, not done — Baseline is 15
   review rounds per real-work PR as at 2026-08-24. Measured 2026-09-05: four to
   five real-work PRs since, not the ten this needs. **Do not compute early.**
   Settle explicitly, before computing, whether the one severe outlier is in or
@@ -190,3 +188,44 @@ status: blocked-on-human: T4 is the only task left and is blocked on data neithe
   conductor log that records an action not taken is the same defect as a guard
   that reports healthy without running -- which is what tick 6 spent its time
   fixing. Third mechanical catch of the session, all three on me.
+
+---
+
+## Standing items, carried out of this plan (2026-09-06)
+
+Closed rather than left ticking, on the owner's decision. Neither is finished;
+both are recorded here so a fresh session can pick them up from the record
+rather than from someone's memory.
+
+**T4, the delivery comparison.** Baseline: 15 review rounds per real-work PR as
+at 2026-08-24. Measured 2026-09-05: five real-work PRs since (#291, #292, #300,
+#301, #302), or seven counting the two that merged on the baseline day, or eight
+counting the dependency triage. Threshold is ten. **Settle the outlier question
+BEFORE computing anything**: #292 ran four review rounds, tripped the rework
+circuit-breaker, reintroduced the same data-destroying defect three times, and
+shipped with the feature disabled. At n around ten that single item moves a
+median on its own, so whether it is in or out must be a stated decision, not one
+the median makes silently. Re-run `gh pr list --repo bassings/CouchPotatoServer
+--state merged` and count non-dependabot PRs; do not take the figure from
+another session, which is how the count was wrong twice yesterday.
+
+**The flaky timing tests.** Owner decision 2026-09-06: recorded, not fixed. Two
+wall-clock assertions go red under parallel load and green on a quiet machine --
+observed 6/6 green idle, 2/5 red under load. Three separate adversarial agents
+and I each took at least one FALSE reading from them yesterday. The consequence
+is not that a test fails; it is that **every pass/fail reading taken while other
+work runs is unreliable**, which is why each of yesterday's findings had to be
+re-verified from a confirmed-green baseline. CLAUDE.md section 11 calls this
+shape worse than an absent guard, because it teaches everyone to re-run until
+green and a real regression gets re-run away with it. Anyone doing mutation work
+here should fix these first.
+
+**Not in this plan, and worth its own:** ledger-append's `main()`, 739 lines at
+the trust boundary between agent-supplied text and the durable ledger, in the
+file yesterday's adversarial pass found two validator holes in. A real change
+with tests, not a refactor to move a complexity number.
+
+- 2026-09-06 tick 7: **plan closed.** T1, T2 and T3 done and merged. T4 closed as
+  standing with its threshold, its outlier trap and its measurement method
+  recorded. Flaky tests recorded as debt on the owner's decision. active-plan
+  marker deleted, loop stopped.
