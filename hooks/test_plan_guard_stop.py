@@ -88,6 +88,45 @@ class TestPlanGuard(unittest.TestCase):
         self.assertEqual(result.decision, 'block')
         self.assertIn('1 task(s) not done', result.message)
 
+    def test_tail_lines_reads_a_real_file_and_keeps_a_useful_window(self):
+        """Round-five adversarial pass, sharpened.
+
+        The reported finding was that narrowing `tail_lines(path, n=400)` to
+        n=1 left the whole suite green. True, and the reason is worse than an
+        unpinned constant: EVERY other test injects the transcript as a LIST
+        via decide(), which passes it straight to plan_guard_decision. So
+        tail_lines -- the function that actually reads the transcript file off
+        disk and decides how much of it to look at -- was never called by any
+        test at all. Narrowing it was invisible because nothing exercised it.
+
+        This tests it directly. A list-injecting test cannot cover a
+        file-reading function, and writing more of those would not have helped.
+        """
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, 'transcript.jsonl')
+        with open(path, 'w') as f:
+            for i in range(1000):
+                f.write('{"line":%d}\n' % i)
+
+        got = pg.tail_lines(path)
+        self.assertGreaterEqual(
+            len(got), 100,
+            'the default window must be wide enough to span a real turn; a narrow one '
+            'silently reports "nothing armed" for a conductor that armed correctly',
+        )
+        self.assertIn('{"line":999}', got[-1], 'the window must be the TAIL, not the head')
+
+        narrow = pg.tail_lines(path, n=5)
+        self.assertEqual(len(narrow), 5, 'an explicit n must be honoured')
+        self.assertIn('{"line":995}', narrow[0])
+
+    def test_tail_lines_handles_a_missing_or_unreadable_file_without_raising(self):
+        """A hook that raises on a missing transcript fails closed in the worst way:
+        it would block every stop in every session, conducted or not."""
+        got = pg.tail_lines(os.path.join(tempfile.mkdtemp(), 'does-not-exist.jsonl'))
+        self.assertEqual(got, [], 'a missing transcript must read as no lines, not an exception')
+
     def test_allows_when_a_wake_source_was_armed(self):
         f = self.fixture(PLAN_OPEN)
         result = f.decide(transcript=WAKE)
