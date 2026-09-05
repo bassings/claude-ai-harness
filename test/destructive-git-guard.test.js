@@ -790,3 +790,64 @@ test('destructive-git-guard AC-PROD-6: a here-document body cannot be used to SM
   const res = runHook(bashPayload("git checkout -- README.md <<'DOC'\nharmless text\nDOC", dir))
   assert.equal(res.status, 2, `a real destructive command on the heredoc's own marker line must still be refused, got ${res.status}`)
 })
+
+// ---------------------------------------------------------------------------
+// Round-five adversarial pass. This guard protects the shared checkout, which is
+// the incident class the harness's recent work exists to detect -- and it could
+// be defeated three independent ways with the whole suite green. The CODE is
+// right: driven against a real dirty repo, pristine, it refuses every shape
+// below. Nothing pinned it, which is a different problem and the one that lets
+// a future edit remove a stage silently.
+//
+// SHELL_KEYWORDS has twelve members and no test named one. Deleting the
+// normalisation stage that strips them left 1166/0 green while these four
+// commands -- all things an operator would really type -- flipped from refused
+// to allowed.
+for (const [shape, command] of [
+  ['an if/then/fi wrapper', 'if true; then git checkout -- README.md; fi'],
+  ['a `time` prefix', 'time git reset --hard'],
+  ['a for/do/done loop', 'for f in a; do git checkout -- README.md; done'],
+  ['a brace group', '{ git reset --hard ; }'],
+  ['a subshell', '( git reset --hard )'],
+  ['a negation prefix', '! git reset --hard'],
+]) {
+  test(`destructive-git-guard: a destructive command behind ${shape} is still refused (round-five: the keyword-stripping stage was unpinned)`, () => {
+    const dir = makeTempRepo()
+    makeDirtyFile(dir)
+    const res = runHook(bashPayload(command, dir))
+    assert.equal(res.status, 2, `expected exit 2 for ${JSON.stringify(command)}, got ${res.status}; stderr: ${res.stderr}`)
+  })
+}
+
+// The escape hatch had only its POSITIVE case tested. Changing the check from
+// `value == '1'` to merely `name == ESCAPE_VAR` left the suite green, and an
+// operator writing =0 -- to be SAFER -- would have disabled the guard. The
+// process-environment branch checks the value correctly, so the two halves of
+// one hatch would silently disagree about what "off" means.
+for (const value of ['0', 'false', 'no', '', 'true']) {
+  test(`destructive-git-guard: the escape hatch does NOT open for HARNESS_ALLOW_DESTRUCTIVE_GIT=${JSON.stringify(value)} -- only an exact "1" opens it`, () => {
+    const dir = makeTempRepo()
+    makeDirtyFile(dir)
+    const res = runHook(bashPayload(`HARNESS_ALLOW_DESTRUCTIVE_GIT=${value} git checkout -- README.md`, dir))
+    assert.equal(res.status, 2, `=${value} must NOT disable the guard; got exit ${res.status}`)
+  })
+}
+
+test('destructive-git-guard: the escape hatch DOES open for an exact "1", so the tests above are not simply asserting it never opens', () => {
+  const dir = makeTempRepo()
+  makeDirtyFile(dir)
+  const res = runHook(bashPayload('HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- README.md', dir))
+  assert.equal(res.status, 0, `an explicit opt-in must still work; got exit ${res.status}: ${res.stderr}`)
+})
+
+// The global options that redirect git at ANOTHER repository. Dropping them from
+// the option table left the suite green, and they are the ones that make a
+// destructive command land somewhere the operator is not looking.
+for (const opt of ['--git-dir=/tmp/other', '--work-tree=/tmp/other', '-p', '--paginate']) {
+  test(`destructive-git-guard: a destructive command carrying ${opt} is still parsed and refused`, () => {
+    const dir = makeTempRepo()
+    makeDirtyFile(dir)
+    const res = runHook(bashPayload(`git ${opt} checkout -- README.md`, dir))
+    assert.notEqual(res.status, 0, `${opt} must not smuggle the command past the parser; got exit ${res.status}`)
+  })
+}
