@@ -587,7 +587,19 @@ test('git-snapshot AC-SEC-5a: a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE poin
   const dir = makeTempRepo()
   dirty(dir)
   const decoy = makeTempRepo()
-  const decoyRefsBefore = fs.readdirSync(path.join(decoy, '.git', 'objects')).length
+  // A SET, not a count. This assertion used to compare counts for equality and
+  // was flaky in CI (observed 2026-09-05 on the Node 22 job: expected 6, got 5).
+  // The decoy LOST an entry, which is git packing loose objects and pruning the
+  // emptied two-character directories -- benign housekeeping that can fire at
+  // any moment. A count comparison cannot tell "the hook wrote here" from "git
+  // tidied up", so it failed on the harmless one while the test name promises
+  // to catch only the harmful one. Per CLAUDE.md section 11 a flaky guard is
+  // worse than an absent one: it teaches everyone to re-run until green, and a
+  // real regression gets re-run away with it. Comparing sets and asserting that
+  // nothing was ADDED is exactly what the test name claims, and it is immune to
+  // removals.
+  const objectsDir = path.join(decoy, '.git', 'objects')
+  const decoyObjectsBefore = new Set(fs.readdirSync(objectsDir))
   const res = spawnSync('python3', [HOOK_PATH], {
     input: JSON.stringify(bashPayload(dir)),
     encoding: 'utf8',
@@ -599,8 +611,8 @@ test('git-snapshot AC-SEC-5a: a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE poin
   })
   assert.equal(res.status, 0)
   assert.equal(snapshotRefs(decoy).length, 0, 'the decoy repo must gain no snapshot ref')
-  const decoyRefsAfter = fs.readdirSync(path.join(decoy, '.git', 'objects')).length
-  assert.equal(decoyRefsAfter, decoyRefsBefore, 'the decoy repo must gain no new loose object directory')
+  const added = fs.readdirSync(objectsDir).filter((e) => !decoyObjectsBefore.has(e))
+  assert.deepEqual(added, [], `the decoy repo must gain no new loose object directory, but gained: ${added.join(', ')}`)
   // The real dirty repo must still have been snapshotted via its own cwd.
   assert.equal(snapshotRefs(dir).length, 1, 'the actual payload cwd must still be snapshotted despite the leaked env')
 })
