@@ -86,24 +86,48 @@ key is FOR. The guarantee is that `architecture` cannot be tuned to exclude UI,
 not that UI can never be narrowed.
 
 **When this widening should be reversed.** It buys one lens run on every diff
-touching the `ui` globs. Those are wider than "UI" sounds, in two stages. The
-harness defaults already include `**/*.css` and `**/e2e/**`, so a colour token
-change dispatches it. And a repo REPLACES that key wholesale, so `ui` means
-whatever that repo says it means: measured 2026-09-05, one delivery repo lists
-`.github/workflows/ci.yml` under `ui`, which was a deliberate choice made for
-other reasons and long predates this change. In that repo a CI-config-only diff
-now dispatches four lenses, `lens-architecture` among them, and none of them has
-much to say about a workflow file. That is a real cost against this file's own
-proportionality rule, and it is larger than the default globs suggest. The condition, stated now so a later `/optimise-cycle`
-does not have to invent a threshold: if over eight weeks `lens-architecture`
-returns no structural finding on any diff triggered through the `ui` globs
-alone, narrow its UI trigger to `**/components/**` and `**/ui/**`, or drop it
-and leave the on-screen half to `lens-design`. The ledger already records
-`trigger_counts` and per-lens findings, so this is measurable rather than a
-matter of opinion. A widening with no stated failure condition is a check
-nobody can ever argue for removing, which is how rosters only grow. Its planning trigger is unchanged, because
-the removal duty lives in its review-mode text and belongs at planning to the
-lens that owns the area.
+touching the `ui` globs, and those are wider than "UI" sounds, in two stages.
+The harness defaults already include `**/*.css` and `**/e2e/**`, so a colour
+token change dispatches it. And a repo REPLACES that key wholesale rather than
+extending it, so `ui` means whatever that repo says it means: one delivery repo
+lists `.github/workflows/ci.yml` under `ui`, a deliberate choice made for other
+reasons that predates this change.
+
+Two different costs live in that example and they must not be confused, because
+a reversal argument needs both. Measured 2026-09-05 by driving that repo's real
+`harness-triggers.json` through this workflow with `.github/workflows/ci.yml` as
+the only changed path: **seven lenses dispatch, and removing this widening takes
+that to six.** So the total load on such a diff is seven and the marginal price
+of this trigger is exactly one. Three of the seven (`lens-design`,
+`lens-accessibility`, `lens-product`) already fired on that diff before this
+widening existed, and `lens-operability` fires on its own merits, since
+`.github/workflows/**` is in its globs and a CI workflow is squarely what that
+lens owns. Only `lens-architecture` is new here, and only it is in scope for
+this reversal.
+
+That is a real cost against this file's own proportionality rule, and it is
+larger than the default globs suggest. `lens-architecture`'s PLANNING trigger is
+unchanged, because the removal duty lives in its review-mode text and belongs at
+planning to the lens that owns the area.
+
+The reversal condition, stated now so a later `/optimise-cycle` does not have to
+invent a threshold: if over eight weeks `lens-architecture` returns no
+structural finding on any diff where the `ui` globs are what woke it, narrow its
+UI trigger to `**/components/**` and `**/ui/**`, or drop it and leave the
+on-screen half to `lens-design`.
+
+**Half of that is not computable from the ledger today, and saying so is the
+point.** The ledger records `lenses_run` and per-lens findings, so "did it run
+and did it find anything" is answerable. It does not record changed paths or
+which rule group fired, and `trigger_counts['lens-architecture']` is the
+deduplicated union of the architecture and ui hits, so a ledger line cannot be
+classified as ui-triggered-alone versus architecture-triggered versus
+new-module-triggered. Until one optional field records that attribution (all
+three inputs are already in scope at the trigger site, and it would be additive
+exactly as `rule_source` was), the eight-week review has to reconstruct it from
+the diffs by hand. A stated condition that cannot be computed reads as a
+commitment already discharged, which is the same failure as no condition at all:
+a widening nobody can ever argue for removing, which is how rosters only grow.
 
 **Specialists, invoked as needed**, not part of the standing set.
 `reviewer-verification` (adversarial fresh-eyes pass on review, no plan
