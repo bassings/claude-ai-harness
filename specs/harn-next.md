@@ -107,3 +107,21 @@ omitted.
   mutation result would have been misread without that check.
   Rework rounds this tick: 0. Remaining: 173 code smells and 6 vulnerabilities,
   none yet examined. Armed: ScheduleWakeup.
+
+- 2026-09-05 tick 3: **T3 continued.** Owner ruled on both open questions.
+  The four PATH findings are ACCEPTED, not dismissed: the finding is accurate
+  (git resolves through PATH), and the reasoning plus an expiry is recorded on
+  each. Marked `accept` rather than `falsepositive` deliberately -- "we looked
+  and this is not real" and "we looked, it is real, and we are living with it"
+  are different claims, and collapsing them destroys the signal the tool exists
+  to give.
+  Complexity triage done and reported: the four worst are ledger-append main()
+  at 739 lines, optimise-cycle buildReport() at 348, optimise-read
+  aggregateWallClock() at 344, and review-cycle run() at 734. The structural
+  fact that decides the triage: workflow scripts CANNOT import (production
+  rejects it statically and a test enforces it), so review-cycle's run() and its
+  siblings are inline BY CONSTRUCTION, not by choice -- the tool's usual advice
+  is unavailable there. ledger-append's main() is a real module and is the trust
+  boundary for the durable ledger, which makes its complexity a correctness risk
+  rather than a readability one. That is the one worth attention.
+  Rework rounds this tick: 0. Open findings 179 -> 175. Armed: ScheduleWakeup.
