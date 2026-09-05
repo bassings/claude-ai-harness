@@ -3930,3 +3930,42 @@ test('ledger-append module: a declared integer field REFUSES a non-integer numbe
   assert.ok(validateEntry({ ...base, trigger_counts: { 'lens-qa': 3.7 } }).length > 0, 'a float must be refused where the schema says integer')
   assert.deepEqual(validateEntry({ ...base, trigger_counts: { 'lens-qa': 3 } }), [], 'and a genuine integer must still pass')
 })
+
+// SonarQube S8786: the regex this replaced had super-linear runtime, measured
+// in isolation at roughly n squared -- 1,000 separators took 0.9ms and 50,000
+// took 1,060ms. This repo has already lost a workflow to that exact class.
+//
+// Tests the helper DIRECTLY. A first version of this test went through
+// canonicalPlanKey and passed while never reaching the regex at all, which is
+// the seam problem: a function reachable only through a path that bypasses it
+// is a function nothing is testing.
+test('ledger-append module: stripTrailingSeparators is linear on the input that made the old regex quadratic', async () => {
+  const { stripTrailingSeparators } = await import(APPEND_MODULE_URL)
+  const time = (n) => {
+    const s = '/'.repeat(n) + 'x'          // separators THEN a non-separator
+    const t = process.hrtime.bigint()
+    for (let i = 0; i < 50; i += 1) stripTrailingSeparators(s)
+    return Number(process.hrtime.bigint() - t) / 1e6
+  }
+  time(2000)
+  const small = Math.max(time(2000), 0.01)
+  const large = Math.max(time(20000), 0.01)
+  assert.ok(large / small < 30, `10x the input cost ${(large / small).toFixed(0)}x the time (${small.toFixed(2)}ms -> ${large.toFixed(2)}ms); the old regex was ~190x`)
+})
+
+test('ledger-append module: stripTrailingSeparators strips what the regex stripped, and nothing else', async () => {
+  const { stripTrailingSeparators } = await import(APPEND_MODULE_URL)
+  for (const [input, want] of [
+    ['/a/b/', '/a/b'],
+    ['/a/b///', '/a/b'],
+    ['/a/b\\', '/a/b'],
+    ['/a/b/\\/', '/a/b'],
+    ['/a/b', '/a/b'],
+    ['/', ''],
+    ['', ''],
+    ['///', ''],
+    ['/a//b/', '/a//b'],          // interior separators are untouched
+  ]) {
+    assert.equal(stripTrailingSeparators(input), want, `${JSON.stringify(input)}`)
+  }
+})
