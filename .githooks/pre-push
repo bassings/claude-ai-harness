@@ -48,3 +48,23 @@ fi
 
 echo "pre-push: running the test suite (${_count} files)"
 node --test test/*.test.js
+
+# The Python hooks suite. Added 2026-09-05 after an adversarial pass found that
+# hooks/plan-guard-stop.py -- the no-stall guard -- could be broken outright with
+# this gate still reporting success: no file under test/ mentions it, so the Node
+# suite cannot see it, and its only coverage ran in CI. CLAUDE.md section 4 says
+# the local gate mirrors CI and is the source of truth for "does this pass"; for
+# these hooks it did not, which is exactly the shape where a guard looks alive
+# and is not.
+#
+# The count check mirrors the one above, and CI's own: unittest discover exits 5
+# on "NO TESTS RAN", but a pattern that silently matches nothing is worth
+# refusing explicitly rather than relying on an exit code nobody reads.
+_pycount=$(python3 -c "import unittest; print(unittest.TestLoader().discover('hooks', pattern='test_*.py').countTestCases())" 2>/dev/null || echo 0)
+if [ "${_pycount:-0}" -lt 1 ]; then
+  echo "pre-push: expected at least 1 test in hooks/test_*.py, found ${_pycount:-0}." >&2
+  echo "pre-push: refusing to report success on a suite that matched nothing." >&2
+  exit 1
+fi
+echo "pre-push: running the hooks suite (${_pycount} tests)"
+python3 -m unittest discover -s hooks -p 'test_*.py'
