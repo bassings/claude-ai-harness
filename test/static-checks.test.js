@@ -1864,8 +1864,8 @@ test('static: no tracked file republishes the operational detail scrubbed on 202
 // `trackedFiles()` is `git ls-files`, so every guard in this file measures the
 // working tree and nothing else. Measured, not assumed: the runbook identifiers
 // are in the CURRENT tree of the public default branch AND in its history, and
-// two lines carrying the credential's location fingerprint are still reachable
-// on origin/main -- while AC-SEC-9 asserted both had been purged. That claim is
+// the credential name is in three reachable commits on origin/main, one of
+// which names its file -- while AC-SEC-9 asserted this had been purged. That claim is
 // corrected in this change. The key VALUE is not published: zero key-shaped
 // values were added anywhere in history.
 //
