@@ -3918,3 +3918,15 @@ test('ledger-append module: a union-typed array rejects non-string items too, so
 })
 
 
+
+// Round-four adversarial pass, MEDIUM 7. The docstring on typeMatches says
+// "'integer' does not accept a non-integer number". Only the other half of that
+// sentence was tested, so widening 'integer' to accept any number stayed green.
+// Every count-shaped field in the durable ledger would then accept 3.7 and write
+// it, and the readers downstream treat those counts as evidence.
+test('ledger-append module: a declared integer field REFUSES a non-integer number, not just a string (review round-four MED 7)', async () => {
+  const { validateEntry } = await import(APPEND_MODULE_URL)
+  const base = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null }
+  assert.ok(validateEntry({ ...base, trigger_counts: { 'lens-qa': 3.7 } }).length > 0, 'a float must be refused where the schema says integer')
+  assert.deepEqual(validateEntry({ ...base, trigger_counts: { 'lens-qa': 3 } }), [], 'and a genuine integer must still pass')
+})

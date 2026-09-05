@@ -290,6 +290,34 @@ test('static: every EXEMPTIONS entry names a real tracked path, waives only know
     }
     assert.ok(typeof e.why === 'string' && e.why.length > 40, `EXEMPTIONS for ${e.paths.join(', ')} needs a real reason, not a shrug`)
   }
+
+  // A FLOOR on what remains scanned (round-four adversarial pass, 6e). Every
+  // check above validates the SHAPE of an exemption -- that its paths exist,
+  // that its waived keys are real, that a blanket waiver is declared, that its
+  // reason is not a shrug. None of them asked how much of the tree was left.
+  // Proven: one well-formed entry waiving workflows/, agents/, skills/, bin/
+  // and hooks/ passed every one of those checks, and a planted operator path in
+  // review-cycle.js then went from caught to invisible.
+  //
+  // These five directories ship to every consumer verbatim, which is the whole
+  // reason the guard exists. They are named here so switching one off requires
+  // editing this assertion and saying why, rather than adding a line that reads
+  // like all the others.
+  const MUST_STAY_SCANNED = ['workflows/', 'agents/', 'skills/', 'bin/', 'hooks/']
+  for (const dir of MUST_STAY_SCANNED) {
+    for (const e of EXEMPTIONS) {
+      // Whole-directory waivers only. A single named FILE inside one of these
+      // directories is a different thing and is allowed: bin/'s launchd
+      // template legitimately carries the YOUR_USERNAME placeholder and waives
+      // nothing else. What must never happen is the directory itself falling
+      // out of the scan.
+      const covers = e.paths.some((p) => p.endsWith('/') && dir.startsWith(p))
+      assert.ok(
+        !covers,
+        `EXEMPTIONS waives ${e.paths.join(', ')}, which covers ${dir}. That directory ships to every consumer verbatim and must stay scanned. If this is genuinely intended, change MUST_STAY_SCANNED and say why here -- do not add an exemption that reads like all the others.`
+      )
+    }
+  }
 })
 
 // The separate bin/ leak guard that used to live here is GONE, subsumed by the
@@ -1729,7 +1757,7 @@ const PROSE_DUTIES = [
   },
   {
     file: 'AGENT-HARNESS.md',
-    re: /recorded, never checked/,
+    re: /IS RECORDED, NEVER CHECKED/,
     why: 'and must distinguish the checked field from the recorded one. A lens told both are checked will hide honest drift, which is the incentive this design exists to avoid.',
   },
   {
@@ -1819,7 +1847,18 @@ const SCRUBBED_TOKEN_HASHES = [
 // alone. specs/ waives the repo-name pattern under the owner's naming ruling,
 // so nothing else would catch this.
 const REPO_NAME_RE = /said.?of.?you|couchpotato/i
-const VOLUMETRIC_RE = /\b\d{1,3}(?:,\d{3})+\b|\b\d+(?:\.\d+)?\s?[KMGT]B\b/
+// Spelled-out units, and bare digit runs FOLLOWED BY A COUNTABLE NOUN
+// (round-four 6c). Requiring comma grouping or a KB/MB/GB suffix let
+// "50120 files" and "2600 megabytes" straight through, and the mutation
+// originally chosen to prove this rule was the one sentence it was written
+// against. A bare \d{4,} was tried first and is WRONG: it matches years and PR
+// numbers, and immediately fired on "CouchPotatoServer PR #260, 2026-08-17".
+// The noun is what makes a number volumetric -- and only SOME nouns do. A first
+// version included "lines" and "commits" and fired on "its review-cycle.js is
+// 231 lines", which is ordinary technical prose about a source file, not a
+// disclosure about a system's data. The scrubbed material was file counts and
+// disk sizes of a repo's working state, so those are the nouns.
+const VOLUMETRIC_RE = /\b\d{1,3}(?:,\d{3})+\b|\b\d+(?:\.\d+)?\s?(?:[KMGT]B|kilo|mega|giga|tera)(?:bytes?)?\b|\b\d{3,}\s+(?:files?|bytes?|worktrees?|directories|dirs?)\b/
 
 const SCRUBBED_SHAPES = [
   { re: /rollback-2026\d{4}-\d{6}/, what: 'a production rollback tag' },
@@ -1861,9 +1900,25 @@ test('static: no tracked file republishes the operational detail scrubbed on 202
     for (const { re, what } of SCRUBBED_SHAPES) {
       assert.ok(!re.test(text), `${rel} republishes a scrubbed shape (${what}).`)
     }
-    if (rel !== 'test/static-checks.test.js') {
-      for (const [n, line] of text.split('\n').entries()) {
-        const bad = REPO_NAME_RE.test(line) && VOLUMETRIC_RE.test(line)
+    {
+      // NO self-exemption (round-four 6d). This rule used to skip its own file,
+      // which is exactly the round-one HIGH-1 shape: a guard that cannot see
+      // itself. Proven by the adversarial pass -- the same canary caught in
+      // another test file was invisible here.
+      //
+      // WINDOWED over two lines, not per-line (round-four 6c): a soft wrap
+      // between the repo name and the figure defeated a line-scoped rule.
+      // Joined to the next line ONLY across a genuine soft wrap: the current
+      // line ends mid-sentence and the next continues it in lower case. A naive
+      // two-line window fired on two unrelated adjacent sentences, which is a
+      // false positive, and loosening the RULE to silence that would have been
+      // the wrong fix -- the window was too broad, not the rule too strict.
+      const lines = text.split('\n')
+      const softWrap = (a, b) => Boolean(a) && Boolean(b) && !/[.!?:;)\]]\s*$/.test(a) && /^\s*[a-z]/.test(b)
+      for (const [n, line] of lines.entries()) {
+        const next = lines[n + 1] || ''
+        const window = softWrap(line, next) ? `${line} ${next}` : line
+        const bad = REPO_NAME_RE.test(window) && VOLUMETRIC_RE.test(window)
         assert.ok(!bad, `${rel}:${n + 1} names a delivery repo on the same line as a file count or disk size. The figure on its own is fine and is used that way elsewhere; attributing it to a named system is what was scrubbed on 2026-09-05.`)
       }
     }
@@ -1906,4 +1961,56 @@ test('static: the prose duties that this harness\'s own CODE depends on are stil
     const contents = readAll(file)
     assert.match(contents, re, `${file} no longer carries a load-bearing duty: ${why}`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Round-four adversarial pass, 6a and 6b. FIVE of six mutations against the
+// prose pins survived, and the reason is structural: PROSE_DUTIES pins the
+// PRESENCE of phrases, so a document can keep every pinned string and still say
+// the opposite. Two proven inversions, both green before this:
+//
+//   "The FIRST is checked" -> "The SECOND is checked", one word, and the
+//   contract now tells every lens author that the recorded field is the gated
+//   one and the gated field is merely recorded. That is round three's HIGH-2
+//   defect restored.
+//
+//   Swapping the Good and Bad exemplars under the removal-criteria section, so
+//   the contract holds up the exact phrasing it exists to forbid as the model
+//   to follow.
+//
+// Presence pins cannot catch either. What catches both is asserting the
+// RELATIONSHIP: which field is named as checked, and which exemplar sits under
+// which label. These are ORDER-SENSITIVE assertions, not substring searches.
+test('static: the contract names the CHECKED field and the RECORDED field the right way round, so a one-word inversion cannot pass (round-four 6a)', () => {
+  const doc = readAll('AGENT-HARNESS.md')
+  const block = doc.slice(doc.indexOf('### MEASURED AT'), doc.indexOf('### COVERAGE'))
+  assert.ok(block.length > 100, 'the MEASURED AT block must exist and be substantial')
+
+  const checkedIdx = block.indexOf('IS CHECKED')
+  const treeIdx = block.indexOf('head_tree_measured')
+  const shaIdx = block.indexOf('head_sha_measured')
+  assert.ok(checkedIdx > 0 && treeIdx >= 0 && shaIdx >= 0, 'both fields and the checked claim must appear')
+
+  // The claim must be attached to a NAMED field, not to a position. Positional
+  // wording ("the first is checked") is one word from meaning the opposite, and
+  // the adversarial pass proved that inversion passed every check here.
+  assert.match(block, /`head_tree_measured` IS CHECKED/, 'the checked field must be named, not referred to by position')
+  assert.match(block, /`head_sha_measured` IS RECORDED, NEVER CHECKED/, 'and so must the recorded one')
+  assert.doesNotMatch(block, /`head_sha_measured` IS CHECKED/, 'the recorded field must never be described as checked')
+  assert.doesNotMatch(block, /The (FIRST|SECOND) is checked/, 'positional attribution must not return: it is what made the inversion invisible')
+  void checkedIdx; void treeIdx; void shaIdx
+})
+
+test('static: the removal-criteria exemplars sit under the right labels, so swapping Good and Bad cannot pass (round-four 6b)', () => {
+  const doc = readAll('AGENT-HARNESS.md')
+  const good = doc.indexOf('- Good: `AC-DESIGN-4')
+  const bad = doc.indexOf('- Bad: `AC-DESIGN-4')
+  assert.ok(good > 0 && bad > 0, 'both exemplars must exist')
+  const goodText = doc.slice(good, doc.indexOf('\n', doc.indexOf('`', good + 40)))
+  const badText = doc.slice(bad, doc.indexOf('\n', doc.indexOf('`', bad + 40)))
+  // The forbidden phrasing is vague ("cleaned up"); the model names a control
+  // and an observable count. Assert which side each lands on.
+  assert.match(badText, /cleaned up|tidied away/, 'the BAD exemplar must be the vague one the section forbids')
+  assert.doesNotMatch(goodText, /cleaned up|tidied away/, 'and the GOOD exemplar must never be that phrasing')
+  assert.match(goodText, /is gone|renders exactly/, 'the GOOD exemplar must be the specific, failable one')
 })

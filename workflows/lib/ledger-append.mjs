@@ -462,6 +462,11 @@ function typeMatches(value, declaredType) {
   if (!declaredType) return true
   const types = Array.isArray(declaredType) ? declaredType : [declaredType]
   const actual = jsonType(value)
+  // 'number' accepts an integer; 'integer' does NOT accept a non-integer number.
+  // Round-four adversarial pass, MEDIUM 7: only the first half was tested, so
+  // widening 'integer' to accept any number stayed green. Every count-shaped
+  // field in the durable ledger would then accept 3.7 and write it, and the
+  // readers downstream treat those counts as evidence.
   return types.some((t) => (t === 'number' ? actual === 'number' || actual === 'integer' : actual === t))
 }
 

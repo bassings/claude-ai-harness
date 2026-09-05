@@ -166,13 +166,18 @@ CLEAN | FINDINGS | BLOCKED
 head_tree_measured: <output of `git rev-parse <reviewed-tip-sha>^{tree}`>
 head_sha_measured:  <output of `git rev-parse HEAD` in your own worktree>
 
-<Both are required. The FIRST is checked: the orchestrator compares it to the
-reviewed tip's tree and refuses the whole run if they differ. Its expected value
-is deliberately absent from your prompt, because the tip's SHA is given to you
-and echoing something you were told proves nothing about what you read.
+<Both are required, and they are treated differently. Naming them rather than
+saying "the first" and "the second" is deliberate: positional wording is one
+word away from meaning the opposite, and an adversarial pass proved that
+inversion passed every check on this document.
 
-The SECOND is recorded, never checked. Report it honestly even when your
-checkout has drifted from the tip, which is normal and expected: drift is
+`head_tree_measured` IS CHECKED. The orchestrator compares it to the reviewed
+tip's tree and refuses the whole run if they differ. Its expected value is
+deliberately absent from your prompt, because the tip's SHA is given to you and
+echoing something you were told proves nothing about what you read.
+
+`head_sha_measured` IS RECORDED, NEVER CHECKED. Report it honestly even when
+your checkout has drifted from the tip, which is normal and expected: drift is
 measured, not punished, and it never fails a run.
 
 Neither command moves your checkout, and you must not move it. These worktrees

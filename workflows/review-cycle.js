@@ -771,7 +771,6 @@ if (!scope.files.length) {
   }
 }
 
-headSha = scope.head_sha
 
 // ---- validate EVERY model-authored scope value, here, once, before use ----
 // Round-three review HIGH-1, and this is a structural change rather than a
@@ -818,7 +817,18 @@ if (!SHA_RE.test(scopeTree)) {
   )
 }
 
-const base = scope.base
+// Telemetry takes the VALIDATED sha too, and is assigned only after the three
+// checks above have passed. Previously set from scope.head_sha before any of
+// them ran, so a rejected run still recorded the raw value.
+headSha = scopeSha
+
+// scopeBase, NOT scope.base (round-four adversarial pass, HIGH 3). The
+// validated values were computed at the boundary and then discarded here, so
+// the raw model-authored string is what reached every lens prompt -- and the
+// comment at the boundary claimed the opposite. A trailing newline alone breaks
+// the backticked command a lens is told to run verbatim, turning a review of
+// the branch into a review of the working tree with no sign anything is wrong.
+const base = scopeBase
 
 // specs/custom-rules-fail-closed.md AC-SEC-2: the contradiction that catches
 // a transcription failure. The scope step has no filesystem access of its
@@ -1072,7 +1082,7 @@ const skipped = ALL.filter(l => !lenses.includes(l))
 // operator reading the run output can tell which applied without inspecting
 // the repo.
 const ruleSourceText = ruleSource === 'repo-tuned' ? `repo-tuned (${ruleSourceOverriddenKeys} overridden keys)` : 'harness defaults'
-log(`Reviewing ${paths.length} changed files against ${base} at ${scope.head_sha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}. Rule source: ${ruleSourceText}.`)
+log(`Reviewing ${paths.length} changed files against ${base} at ${scopeSha.slice(0, 8)}. Lenses: ${lenses.join(', ')}. Skipped (not triggered): ${skipped.join(', ') || 'none'}. Rule source: ${ruleSourceText}.`)
 
 // ---- Phase 2: lenses in parallel, each in its own worktree ----
 
@@ -1089,14 +1099,14 @@ const qaBudget =
   `an honest skip list beats an unbounded run.\n`
 
 const lensPrompt = (lens) =>
-  `REVIEW mode. The reviewed tip is commit ${scope.head_sha}. FIRST, before anything else, run \`git rev-parse HEAD\` ` +
+  `REVIEW mode. The reviewed tip is commit ${scopeSha}. FIRST, before anything else, run \`git rev-parse HEAD\` ` +
   `in your worktree. If it differs, your checkout has drifted from the reviewed tip (a parallel session may have ` +
   `advanced the branch): check out or diff against the pinned SHA explicitly, and record the drift in could_not_check. ` +
-  `Review \`git diff ${base}...${scope.head_sha}\`.\n` +
+  `Review \`git diff ${base}...${scopeSha}\`.\n` +
   `Then report two values. Run both commands exactly as written and report exactly what they print. NEITHER command ` +
   `moves your checkout, and you must not move it: these worktrees can be shared, and checking out a different commit ` +
   `underneath another session is the incident this whole check exists to prevent.\n` +
-  `  head_tree_measured: \`git rev-parse ${scope.head_sha}^{tree}\`   <- the reviewed tip's tree. This is the one ` +
+  `  head_tree_measured: \`git rev-parse ${scopeSha}^{tree}\`   <- the reviewed tip's tree. This is the one ` +
   `that is checked. Its value appears NOWHERE in this prompt, deliberately: the sha does appear above, so reporting ` +
   `that back proves nothing. There is exactly one legal answer and only running the command produces it.\n` +
   `  head_sha_measured:  \`git rev-parse HEAD\`   <- wherever your worktree happens to be. This is RECORDED, not ` +
@@ -1200,7 +1210,7 @@ const vanished = lenses.filter(l => !reported.has(l))
 // this accepts what git prints and nothing looser: 'abcde' is still refused,
 // and a genuinely different tree is still refused.
 const normaliseSha = (v) => (typeof v === 'string' ? v.trim().toLowerCase() : null)
-const pinnedSha = normaliseSha(scope.head_sha)
+const pinnedSha = scopeSha  // the value validated at the boundary, not a second derivation of the raw one
 // The PIN is model-transcribed too, and round-two review F2 found both failure
 // modes rebuilt on this unguarded side. Measured: a 3-character pin let lenses
 // on a DIFFERENT tree through with outcome=done, because the hex floor was
@@ -1217,7 +1227,7 @@ const pinnedSha = normaliseSha(scope.head_sha)
 // Split by CAUSE, because the two shapes need different remedies (review F).
 // Telling an operator whose lens merely crashed to "let a parallel session
 // settle" sends them after a cause that does not exist.
-const pinnedTree = normaliseSha(scope.head_tree)
+const pinnedTree = scopeTree  // likewise
 const treeAgrees = (v) => ((got) => Boolean(got) && /^[0-9a-f]{7,40}$/.test(got)
   && (got.length <= pinnedTree.length ? pinnedTree.startsWith(got) : got.startsWith(pinnedTree)))(normaliseSha(v))
 
@@ -1279,7 +1289,7 @@ let simpCheck = null
 if (specPath) {
   simpCheck = await agent(
     `Read ${specPath}. If it contains AC-SIMP-<n> acceptance criteria, check each one mechanically against ` +
-    `\`git diff ${base}...${scope.head_sha}\` (they are constraints like "no new dependency", "no new setting", "no abstraction for a single call site"). ` +
+    `\`git diff ${base}...${scopeSha}\` (they are constraints like "no new dependency", "no new setting", "no abstraction for a single call site"). ` +
     `Return one verdict per AC-SIMP with the diff evidence. If the spec has none, say so. Raw data only.`,
     { label: 'ac-simp:mechanical', phase: 'Lenses', effort: 'low' }
   )
@@ -1375,7 +1385,7 @@ const outcome = !reportOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLO
 
 return {
   base,
-  head: scope.head_sha,
+  head: scopeSha,
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
