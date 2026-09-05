@@ -2087,3 +2087,46 @@ test('review-cycle.js: the UI trigger for lens-architecture survives a repo over
   assert.ok(result.lenses.includes('lens-architecture'), 'a repo-tuned architecture key must not be able to switch off the UI path')
   assert.equal(result.telemetry.trigger_counts['lens-architecture'], 1)
 })
+
+// Round-one review of the blast-radius doc fix, Medium 3. AGENT-HARNESS.md now
+// states replace-not-extend merge semantics as a documented contract, and
+// NOTHING in the suite could fail if that semantics were inverted: an additive
+// merge (concatenating a repo's globs onto the defaults instead of replacing
+// them) left 1096/1096 green, and so did falsifying the sentence itself. The
+// nearest existing test asserts only that a custom glob DOES trigger a lens,
+// which passes identically either way.
+//
+// Two concrete losses it allowed. A repo operator reading the contract re-lists
+// **/*.html and friends in their ui key believing it is mandatory, which is
+// essential under replacement and pointless under extension, with nothing
+// telling them which world they are in. And review-cycle.js's own empty-array
+// abort explains itself by saying an empty array "would REPLACE the harness
+// defaults for that key and silently stop the corresponding lens triggering":
+// under an additive merge that stated reason becomes false while the guard
+// still fires, which is this repo's definition of a guard that cannot fail.
+//
+// The assertion that separates the two worlds is the NEGATIVE one: a file the
+// DEFAULTS would have matched, which the override does not, must NOT trigger.
+test('review-cycle.js: a repo override REPLACES a trigger key rather than extending it -- a file matched only by the harness default globs does NOT trigger the lens once that key is overridden', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': {
+        ...SCOPE_OK,
+        // src/tokens.css matches DEFAULT_RULES.ui (**/*.css) but NOT the
+        // override below. Under replacement no ui lens triggers; under an
+        // additive merge the default **/*.css survives and they all do.
+        files: [{ path: 'src/tokens.css', status: 'M' }],
+        harness_triggers_file_exists: true,
+        custom_rules: { ui: ['**/*.foo'] },
+      },
+    }),
+  })
+  assert.ok(
+    !result.lenses.includes('lens-design'),
+    'the ui key was overridden to **/*.foo, so a .css file must not trigger lens-design: it does under an additive merge, which is the semantics the contract says we do NOT have'
+  )
+  assert.ok(!result.lenses.includes('lens-accessibility'), 'same key, same override')
+  assert.ok(!result.lenses.includes('lens-architecture'), 'the UI path into lens-architecture rides the same overridden ui key')
+  assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'], 'only the always-on pair should remain')
+})
