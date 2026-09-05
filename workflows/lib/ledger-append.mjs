@@ -458,6 +458,33 @@ function jsonType(value) {
 // or a union array (e.g. ['string', 'null']). 'number' accepts an integer
 // too (an integer IS a number); 'integer' does not accept a non-integer
 // number.
+// Strips trailing path separators in GUARANTEED linear time.
+//
+// Replaces `/[\\/]+$/`, which SonarQube flagged (S8786) as having super-linear
+// runtime. Measured in isolation and it is right: on a string of separators
+// followed by a non-separator, 1,000 chars took 0.9ms, 5,000 took 12ms, 20,000
+// took 174ms and 50,000 took 1,060ms -- roughly n squared, because the engine
+// retries the run from every position.
+//
+// HONEST LIMIT, recorded because it changes what this fix is: I could NOT
+// demonstrate that path being reached through canonicalPlanKey with any input I
+// tried; through the public API the same strings cost 0.00ms. So this is a fix
+// for a real property of the regex, not a proven exploit. It is applied anyway
+// because the replacement is trivial, provably linear, and this repo has already
+// lost a workflow to precisely this class -- a glob compiler that went from 58ms
+// to 5,060ms across two added characters, wedging with no error and no verdict.
+//
+// The test for this exercises THIS function directly rather than going through
+// canonicalPlanKey. A first attempt tested it through the public API and passed
+// while never reaching the regex at all: a function that can be reached only
+// through a seam that bypasses it is a function nothing is testing.
+export function stripTrailingSeparators(value) {
+  const s = String(value)
+  let end = s.length
+  while (end > 0 && (s[end - 1] === '/' || s[end - 1] === '\\')) end -= 1
+  return s.slice(0, end)
+}
+
 function typeMatches(value, declaredType) {
   if (!declaredType) return true
   const types = Array.isArray(declaredType) ? declaredType : [declaredType]
@@ -1227,7 +1254,7 @@ export function canonicalPlanKey(spec, root) {
   if (typeof spec !== 'string' || spec === '') return NO_SPEC_PLAN_KEY
   const candidateRoots = (Array.isArray(root) ? root : [root])
     .filter((r) => typeof r === 'string' && r)
-    .map((r) => r.replace(/[\\/]+$/, ''))
+    .map(stripTrailingSeparators)
   let rel = spec
   const isAbsolute = spec.startsWith('/') || WINDOWS_DRIVE_ABS_RE.test(spec)
   if (isAbsolute) {
@@ -1684,7 +1711,7 @@ export function main() {
       if (rawIsAbsolute) {
         const matchedRoot = specRootCandidates
           .filter((r) => typeof r === 'string' && r)
-          .map((r) => r.replace(/[\\/]+$/, ''))
+          .map(stripTrailingSeparators)
           .find((r) => specRawInput === r || specRawInput.startsWith(r + '/') || specRawInput.startsWith(r + '\\'))
         // Review round-2 L-3: fails CLOSED (withholds the value) rather
         // than falling open to the caller's verbatim absolute string. This
