@@ -280,7 +280,11 @@ function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName, allow
 // text (MED-3) -- the literal object IS what this session executes.
 const REVIEW_SCHEMA = {
   type: 'object',
-  required: ['verdict', 'coverage', 'findings', 'head_sha_measured'],
+  // Unknown keys rejected outright: the spread above is the first layer, this
+  // is the second. A response carrying a `lens` key is a response trying to be
+  // something other than an answer (review F1).
+  additionalProperties: false,
+  required: ['verdict', 'coverage', 'findings', 'head_sha_measured', 'head_tree_measured'],
   properties: {
     verdict: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] },
     // The sha the lens ACTUALLY read, checked by the orchestrator against the
@@ -295,6 +299,11 @@ const REVIEW_SCHEMA = {
     // text channel out of a reviewed diff (review B). Hex-only and bounded
     // closes both: there is nothing left to neutralise.
     head_sha_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
+    // The witness the prompt does not contain (review F3). head_sha_measured
+    // alone could not fail for the case this gate exists for: the pinned sha is
+    // printed in line one of the prompt, so a lens that reviewed the wrong tree
+    // and echoed it passed. A tree hash cannot be echoed from the prompt.
+    head_tree_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
     coverage: {
       type: 'object',
       required: ['examined', 'verified_by', 'could_not_check'],
@@ -659,7 +668,7 @@ const scope = await agent(
   INSTALL_CONSISTENCY_INSTRUCTION +
   `In the repo at the current working directory:\n` +
   `1. Determine the base ref: ${opts.base ? `use "${opts.base}".` : 'the repository default branch (usually main or master; check `git remote show origin` or local branch names).'}\n` +
-  `2. Run \`git diff --name-status <base>...HEAD\` and return every changed file path with its status letter, plus the base ref you used and the exact output of \`git rev-parse HEAD\` as head_sha.\n` +
+  `2. Run \`git diff --name-status <base>...HEAD\` and return every changed file path with its status letter, plus the base ref you used, the exact output of \`git rev-parse HEAD\` as head_sha, and the exact output of \`git rev-parse HEAD^{tree}\` as head_tree.\n` +
   `3. Report whether any dependency manifest (package.json, requirements*.txt, pyproject.toml, go.mod, Cargo.toml, Gemfile, or equivalent) gained a NEW entry (a new package, not a version bump), and whether the diff ADDS a new module or package (a new source file outside tests, or a new package directory).\n` +
   `4. Check whether a file .claude/harness-triggers.json exists at the repo root and report that as ` +
   `harness_triggers_file_exists (true/false). If it exists, return its parsed JSON as custom_rules; if it does not ` +
@@ -671,10 +680,15 @@ const scope = await agent(
     effort: 'low',
     schema: {
       type: 'object',
-      required: ['base', 'head_sha', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists', 'consistency'],
+      required: ['base', 'head_sha', 'head_tree', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists', 'consistency'],
       properties: {
         base: { type: 'string' },
-        head_sha: { type: 'string' },
+        head_sha: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
+        // The WITNESS (round-two review F3). The reviewed tip's tree hash is not
+        // derivable from its commit sha without reading the object, so a lens
+        // can only answer it by running git in the tree it actually read. It is
+        // deliberately never placed in a lens prompt.
+        head_tree: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
         files: { type: 'array', items: { type: 'object', required: ['path', 'status'], properties: { path: { type: 'string' }, status: { type: 'string' } } } },
         new_dependency_entries: { type: 'boolean' },
         new_modules: { type: 'boolean' },
@@ -1031,10 +1045,15 @@ const lensPrompt = (lens) =>
   `in your worktree. If it differs, your checkout has drifted from the reviewed tip (a parallel session may have ` +
   `advanced the branch): check out or diff against the pinned SHA explicitly, and record the drift in could_not_check. ` +
   `Review \`git diff ${base}...${scope.head_sha}\`.\n` +
-  `Then report, as head_sha_measured, the full sha your findings were ACTUALLY derived from: the output of ` +
-  `\`git rev-parse HEAD\` in the tree you actually read, or the sha you explicitly diffed against. Report what you ` +
-  `measured, not what you were told to measure. Deliberately not restating the expected value here: it is in the ` +
-  `first line, and repeating it beside the penalty for any other answer is a copy prompt, not a check.\n` +
+  `Then report two values. Run both commands exactly as written and report exactly what they print. NEITHER command ` +
+  `moves your checkout, and you must not move it: these worktrees can be shared, and checking out a different commit ` +
+  `underneath another session is the incident this whole check exists to prevent.\n` +
+  `  head_tree_measured: \`git rev-parse ${scope.head_sha}^{tree}\`   <- the reviewed tip's tree. This is the one ` +
+  `that is checked. Its value appears NOWHERE in this prompt, deliberately: the sha does appear above, so reporting ` +
+  `that back proves nothing. There is exactly one legal answer and only running the command produces it.\n` +
+  `  head_sha_measured:  \`git rev-parse HEAD\`   <- wherever your worktree happens to be. This is RECORDED, not ` +
+  `checked, so report it honestly even if it differs from the reviewed tip. Drift is expected and is measured here; ` +
+  `it is not held against you and does not fail the run.\n` +
   `Changed files (${paths.length} total):\n${fileList}\n\n` +
   `${specClause}\n\n` +
   (lens === 'lens-qa' ? qaBudget : '') +
@@ -1056,7 +1075,13 @@ const lensPrompt = (lens) =>
 
 const reports = await parallel(lenses.map(lens => () =>
   agent(lensPrompt(lens), { agentType: lens, label: lens, phase: 'Lenses', schema: REVIEW_SCHEMA, isolation: 'worktree' })
-    .then(r => (r ? { lens, ...r } : null))
+    // `lens` LAST, deliberately (round-two review F1). Spreading the model's
+    // response over the workflow's own label let a lens rename itself: a `lens`
+    // key in the response won, attacker-chosen text reached the thrown error
+    // verbatim dressed as a harness system error, and the roster check then
+    // reported the real lens as vanished. The orchestrator must never take an
+    // identity it assigned from the party it assigned it to.
+    .then(r => (r ? { ...r, lens } : null))
 ))
 const lensReports = reports.filter(Boolean)
 if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
@@ -1122,6 +1147,22 @@ const vanished = lenses.filter(l => !reported.has(l))
 // and a genuinely different tree is still refused.
 const normaliseSha = (v) => (typeof v === 'string' ? v.trim().toLowerCase() : null)
 const pinnedSha = normaliseSha(scope.head_sha)
+// The PIN is model-transcribed too, and round-two review F2 found both failure
+// modes rebuilt on this unguarded side. Measured: a 3-character pin let lenses
+// on a DIFFERENT tree through with outcome=done, because the hex floor was
+// applied only to the lens's value and the pin was then used as a bare prefix.
+// And a pin of 'HEAD' -- a plausible answer to "return the output of git
+// rev-parse HEAD" -- refused a run whose lenses were entirely correct, blaming
+// a parallel session that did not exist. Checked here, before either
+// comparison, and named as what it is: a scope failure, not a drift signal.
+if (!pinnedSha || !/^[0-9a-f]{7,40}$/.test(pinnedSha)) {
+  throw new Error(
+    `ScopeHeadShaInvalid: the scope step reported the pinned tip as ${JSON.stringify(String(scope.head_sha).slice(0, 60))}, ` +
+    `which is not a valid commit sha. Every comparison in this run is made against that value, so a malformed pin either ` +
+    `disables the reviewed-tip check or fails correct lenses. This is a SCOPE failure, not a checkout problem and not a ` +
+    `lens problem: re-run the review cycle.`
+  )
+}
 // Written as a single expression deliberately: `return` inside a helper here is
 // indistinguishable, to the AC-QA-9 static guard, from a new exit path out of
 // run() itself. That guard is a change detector for unpaired exits and is worth
@@ -1132,13 +1173,46 @@ const shaAgrees = (v) => ((got) => Boolean(got) && Boolean(pinnedSha) && /^[0-9a
 // Split by CAUSE, because the two shapes need different remedies (review F).
 // Telling an operator whose lens merely crashed to "let a parallel session
 // settle" sends them after a cause that does not exist.
-const wrongTree = lensReports.filter(r => !shaAgrees(r.head_sha_measured))
+const pinnedTree = normaliseSha(scope.head_tree)
+if (!pinnedTree || !/^[0-9a-f]{7,40}$/.test(pinnedTree)) {
+  throw new Error(
+    `ScopeHeadTreeInvalid: the scope step reported the reviewed tip's tree hash as ` +
+    `${JSON.stringify(String(scope.head_tree).slice(0, 60))}, which is not a valid object id. That value is the only ` +
+    `thing a lens cannot echo from its prompt, so without it the reviewed-tip check degrades to a self-report. This ` +
+    `is a SCOPE failure: re-run the review cycle.`
+  )
+}
+const treeAgrees = (v) => ((got) => Boolean(got) && /^[0-9a-f]{7,40}$/.test(got)
+  && (got.length <= pinnedTree.length ? pinnedTree.startsWith(got) : got.startsWith(pinnedTree)))(normaliseSha(v))
+
+// THE GATE is the tree hash only (round-two review F3 and F4, arbitrated).
+//
+// F3: gating on head_sha_measured could not fail for the case it was built for.
+// The pinned sha is printed in line one of the prompt, so a lens that reviewed
+// the wrong tree and echoed it passed. The tree hash of the pinned commit is
+// not in the prompt and cannot be reconstructed without the object.
+//
+// F4: and the sha must NOT be gated, because the prompt legitimately allows a
+// lens to diff against the pinned sha without moving its checkout. Gating on
+// "git rev-parse HEAD in the tree you read" would abort correct runs on exactly
+// the drift path this change exists to handle. Mandating a checkout instead is
+// worse: these worktrees can be shared, and moving one under another session is
+// the original incident.
+//
+// So head_sha_measured is RECORDED and never gated. That also fixes the
+// incentive the previous version created: it attached an aborted run to an
+// honest answer, which is the wrong thing to attach to a self-report.
+//
+// Honest limitation, stated because the comment above could read as stronger
+// than it is: this proves the lens had the reviewed commit's object available,
+// not that every finding was derived from that tree. It closes the echo, which
+// was the hole; it does not make a self-report into an observation.
+const wrongTree = lensReports.filter(r => !treeAgrees(r.head_tree_measured))
 if (wrongTree.length) {
   throw new Error(
     `ReviewedTipMismatch: this run pinned ${pinnedSha}, but ` +
-    wrongTree.map(r => (typeof r.head_sha_measured === 'string' && r.head_sha_measured
-      ? `${r.lens} measured ${normaliseSha(r.head_sha_measured)}`
-      : `${r.lens} did not report the sha it measured`)).join('; ') +
+    wrongTree.map(r => `${r.lens} reported the reviewed tip's tree as ` +
+      `${normaliseSha(r.head_tree_measured) || 'nothing'}, not ${pinnedTree}`).join('; ') +
     `. A review of a different tree reads exactly like a review of the reviewed one, so the run is refused rather ` +
     `than reported with a caveat. If a parallel session is advancing this branch, let it settle and re-run.`
   )
@@ -1371,7 +1445,18 @@ result.open_findings = Array.isArray(terminalWrite.open_finding_ids)
 // DIFFERS counts. A missing sha means the synthesis agent did not answer, which
 // is not evidence of stability -- reading absence as "unmoved" is exactly the
 // shape that has recurred through this repo's history.
-const checkoutMoved = Boolean(headSha && synthesisHeadSha && synthesisHeadSha !== headSha)
+// Normalised, not raw !== (round-two review F5). This is the SAME defect the
+// reviewed-tip gate fixed one screen above, left in its sibling: both values
+// are model-transcribed, so the benign spellings enumerated there (short sha,
+// uppercase, trailing newline from a shell capture) each set this flag and told
+// the operator their correct review might be about a different tree. A drift
+// alarm that fires for reasons unrelated to drift is worse than none.
+const sameSha = (a, b) => {
+  const x = typeof a === 'string' ? a.trim().toLowerCase() : null
+  const y = typeof b === 'string' ? b.trim().toLowerCase() : null
+  return Boolean(x) && Boolean(y) && (x.length <= y.length ? y.startsWith(x) : x.startsWith(y))
+}
+const checkoutMoved = Boolean(headSha && synthesisHeadSha && !sameSha(synthesisHeadSha, headSha))
 if (checkoutMoved) {
   result.checkout_moved = true
   result.checkout_moved_detail = `scoped at ${headSha}, synthesis found ${synthesisHeadSha} -- the working tree moved mid-review, so these findings may be about a different tree than they name. Re-run from an isolated worktree.`

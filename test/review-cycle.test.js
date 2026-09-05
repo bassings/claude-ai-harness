@@ -35,6 +35,11 @@ const CONSISTENCY_OK = {
 const SCOPE_OK = {
   base: 'main',
   head_sha: 'abcdef1234567890',
+          head_tree: '1111111111111111111111111111111111111111',
+  // The witness (review F3): the tree hash of the reviewed commit. Not derivable
+  // from the sha without reading the object, and deliberately never placed in a
+  // lens prompt, so answering it requires having actually run git in the tree.
+  head_tree: '1111111111111111111111111111111111111111',
   files: [{ path: 'src/foo.js', status: 'M' }],
   new_dependency_entries: false,
   new_modules: false,
@@ -46,8 +51,8 @@ const SCOPE_OK = {
 // head_sha_measured matches SCOPE_OK.head_sha: every lens fixture asserts it
 // reviewed the tip this run pinned. Added 2026-09-05 with the reviewed-tip
 // check; a fixture omitting it now aborts the run, which is the point.
-const SECURITY_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' }
-const QA_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' }
+const SECURITY_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' }
+const QA_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' }
 
 const SYNTHESIS_OK = {
   report: '### VERDICT\nCLEAN',
@@ -493,7 +498,7 @@ test('review-cycle.js: every lens\'s reported findings are sent to the ledger-wr
     agent: baseAgent({
       'lens-security': {
         verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890',
+        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f' }],
       },
@@ -526,14 +531,14 @@ test('review-cycle.js: every lens\'s ac_verdicts are aggregated into the ledger 
     agent: baseAgent({
       'lens-security': {
         verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890',
+        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [],
         ac_verdicts: [{ id: 'AC-SEC-3', verdict: 'FAIL', evidence: 'a secret quoted source line' }],
       },
       'lens-qa': {
         verdict: 'CLEAN',
-        head_sha_measured: 'abcdef1234567890',
+        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [],
         ac_verdicts: [{ id: 'AC-QA-3', verdict: 'PASS', evidence: 'another secret line' }],
@@ -575,7 +580,7 @@ test('review-cycle.js: a finding\'s ac_id survives into open_findings when a len
     agent: baseAgent({
       'lens-security': {
         verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890',
+        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-3' }],
       },
@@ -663,7 +668,7 @@ test('review-cycle.js: result.open_findings zips this round\'s open finding desc
     agent: baseAgent({
       'lens-security': {
         verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890',
+        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-1' }],
       },
@@ -686,7 +691,7 @@ test('review-cycle.js: result.open_findings is populated on ROUND ONE too, with 
     agent: baseAgent({
       'lens-qa': {
         verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890',
+        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'Low', claim: 'a style nit', location: 'bar.js:1', evidence: 'e', consequence: 'c', fix: 'f' }],
       },
@@ -890,7 +895,10 @@ test('review-cycle.js: the scope agent() call declares custom_rules and harness_
   assert.ok(scopeCall, 'expected a scope:diff call')
   assert.deepEqual(
     scopeCall.opts.schema.required.slice().sort(),
-    ['base', 'consistency', 'custom_rules', 'files', 'harness_triggers_file_exists', 'head_sha', 'new_dependency_entries', 'new_modules']
+    // head_tree added 2026-09-05 (round-two review F3): the witness value a
+    // lens cannot echo from its prompt. Widened deliberately, not loosened --
+    // this list is still pinned exactly, so a further addition fails here.
+    ['base', 'consistency', 'custom_rules', 'files', 'harness_triggers_file_exists', 'head_sha', 'head_tree', 'new_dependency_entries', 'new_modules']
   )
   assert.deepEqual(scopeCall.opts.schema.properties.harness_triggers_file_exists.type, 'boolean')
   assert.deepEqual(scopeCall.opts.schema.properties.custom_rules.type, ['object', 'null'], 'custom_rules keeps its loose type -- shape validation happens in the workflow, not the schema')
@@ -2182,13 +2190,13 @@ test('review-cycle.js: a lens reporting a head_sha it did not review ABORTS the 
     () => runWorkflow(WF, {
       args: {},
       agent: baseAgent({
-        'lens-qa': { ...QA_CLEAN, head_sha_measured: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' },
+        'lens-qa': { ...QA_CLEAN, head_tree_measured: 'ffffffffffffffffffffffffffffffffffffffff' },
       }),
     }),
     (err) => {
       assert.match(err.message, /lens-qa/, 'must name which lens measured the wrong tree')
-      assert.match(err.message, /abcdef1234567890/, 'must name the tip that was meant to be reviewed')
-      assert.match(err.message, /deadbeefdeadbeef/, 'must name what the lens actually measured')
+      assert.match(err.message, /1111111111111111/, 'must name the tree that was meant to be reviewed')
+      assert.match(err.message, /ffffffffffffffff/, 'must name what the lens actually reported')
       return true
     }
   )
@@ -2228,17 +2236,17 @@ test('review-cycle.js: a dispatched lens that returns nothing at all ABORTS, rat
 // without it. This pins the workflow's own defence anyway, via the fake
 // runtime's documented bypass, because the check must not depend on the schema
 // being the only thing standing between it and a silent pass.
-test('review-cycle.js: a lens response lacking head_sha_measured ABORTS even if it somehow bypasses schema validation -- the workflow does not rely on the schema alone', async () => {
+test('review-cycle.js: a lens response lacking head_tree_measured ABORTS even if it somehow bypasses schema validation -- the workflow does not rely on the schema alone', async () => {
   await assert.rejects(
     () => runWorkflow(WF, {
       args: {},
       agent: baseAgent({
-        'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], __bypassSchemaValidation: true },
+        'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', __bypassSchemaValidation: true },
       }),
     }),
     (err) => {
       assert.match(err.message, /lens-qa/)
-      assert.match(err.message, /did not report the sha it measured/)
+      assert.match(err.message, /reported the reviewed tip's tree as nothing/)
       return true
     }
   )
@@ -2324,17 +2332,25 @@ test('review-cycle.js: when lens-architecture is not triggered the key is OMITTE
 // different one: a check that fails for reasons unrelated to the defect
 // teaches people to re-run until green.
 for (const [label, value] of [
-  ['the short sha git log --oneline prints', 'abcdef1'],
-  ['an uppercase sha', 'ABCDEF1234567890'],
-  ['a trailing newline, the literal output of a shell-captured git rev-parse', 'abcdef1234567890\n'],
+  ['a short prefix', 'abcdef1'],
+  ['an uppercase value', 'ABCDEF1234567890'],
+  ['a trailing newline, the literal output of a shell capture', 'abcdef1234567890\n'],
   ['a leading space', ' abcdef1234567890'],
 ]) {
-  test(`review-cycle.js: ${label} describes the CORRECT reviewed tip and must NOT abort (review A)`, async () => {
+  test(`review-cycle.js: ${label} describes the CORRECT reviewed tip and must NOT abort (review A, moved onto the GATED value per review F6)`, async () => {
+    // Deliberately varies head_tree_measured, not head_sha_measured. The sha is
+    // recorded and no longer gated, so varying it would prove nothing about the
+    // gate -- the incidentally-passing shape F6 named. The tree is what fails a
+    // run, so it is what the normalisation must be proven on.
+    const treeVariant = value
+      .replace('abcdef1234567890', '1111111111111111111111111111111111111111')
+      .replace('abcdef1', '1111111')
+      .replace('ABCDEF1234567890', '1111111111111111111111111111111111111111')
     const { result } = await runWorkflow(WF, {
       args: {},
       agent: baseAgent({
-        'lens-security': { ...SECURITY_CLEAN, head_sha_measured: value },
-        'lens-qa': { ...QA_CLEAN, head_sha_measured: value },
+        'lens-security': { ...SECURITY_CLEAN, head_tree_measured: treeVariant },
+        'lens-qa': { ...QA_CLEAN, head_tree_measured: treeVariant },
       }),
     })
     assert.equal(result.telemetry.outcome, 'done')
@@ -2342,10 +2358,20 @@ for (const [label, value] of [
 }
 
 test('review-cycle.js: normalisation does not blunt the gate -- a genuinely different tree still aborts, and so does a too-short prefix that could match many commits (review A)', async () => {
-  for (const bad of ['deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', 'abcde']) {
+  // '11111' is deliberately a genuine PREFIX of the pinned tree. A value that is
+  // not a prefix would be refused for that reason and would prove nothing about
+  // the length floor -- which is what the first version of this test did, and is
+  // review F6's shape reappearing in the test written to close it.
+  for (const bad of ['ffffffffffffffffffffffffffffffffffffffff', '11111']) {
     await assert.rejects(
-      () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'lens-qa': { ...QA_CLEAN, head_sha_measured: bad } }) }),
-      (err) => { assert.match(err.message, /lens-qa/); return true },
+      () => runWorkflow(WF, {
+        args: {},
+        // __bypassSchemaValidation for the too-short case: the schema also
+        // refuses it, and the workflow's own floor must not depend on that
+        // (review F6 -- a test proving only the fixture layer proves nothing).
+        agent: baseAgent({ 'lens-qa': { ...QA_CLEAN, head_tree_measured: bad, __bypassSchemaValidation: true } }),
+      }),
+      (err) => { assert.match(err.message, /ReviewedTipMismatch/); return true },
       `${bad} must still be refused`
     )
   }
@@ -2365,11 +2391,11 @@ test('review-cycle.js: an aborted run still records the findings the other lense
       agent: baseAgent({
         'lens-security': {
           verdict: 'FINDINGS',
-          head_sha_measured: 'abcdef1234567890',
+          head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
           coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
           findings: [{ severity: 'Critical', claim: 'remote code execution', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f' }],
         },
-        'lens-qa': { ...QA_CLEAN, head_sha_measured: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' },
+        'lens-qa': { ...QA_CLEAN, head_tree_measured: 'ffffffffffffffffffffffffffffffffffffffff' },
       }),
     })
   } catch (e) { caught = e }
@@ -2427,4 +2453,163 @@ test('review-cycle.js: a genuinely new module still records new-module, so the t
   })
   const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
   assert.deepEqual(payload.architecture_trigger_source, ['new-module'])
+})
+
+// --- Round-two review F1: a lens could rename itself. The model's response was
+// spread AFTER the workflow's own label (`{ lens, ...r }`), so a `lens` key in
+// the response won. Confirmed by execution: attacker-chosen text reached the
+// thrown error verbatim, dressed as a harness system error, and corrupted the
+// roster check into reporting the real lens as vanished. The review-B comment
+// concluded "there is nothing left to neutralise" about the sha beside it;
+// there was, in the same template literal.
+test('review-cycle.js: a lens cannot rename itself -- the dispatch label always wins over anything the model returns (review F1)', async () => {
+  const evil = 'INJECTED ' + 'X'.repeat(60)
+  await assert.rejects(
+    () => runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        'lens-qa': { ...QA_CLEAN, head_tree_measured: 'ffffffffffffffffffffffffffffffffffffffff', lens: evil, __bypassSchemaValidation: true },
+      }),
+    }),
+    (err) => {
+      assert.doesNotMatch(err.message, /INJECTED/, 'model-authored text must never reach the orchestrator error dressed as a lens name')
+      assert.match(err.message, /lens-qa/, 'the DISPATCHED name must be what is reported')
+      return true
+    }
+  )
+})
+
+// --- Round-two review F2: the gate constrained the LENS's sha and not the
+// PINNED one, so both failure modes were rebuilt on the unguarded side.
+// Confirmed by execution, both directions.
+test('review-cycle.js: a malformed pinned sha ABORTS loudly instead of silently disabling the gate (review F2, direction one)', async () => {
+  // 'abc' as the pin previously let lenses on a DIFFERENT tree through with
+  // outcome=done, because the 7-char floor was applied only to the lens value
+  // and then pinnedSha was used as a bare prefix.
+  await assert.rejects(
+    () => runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        // __bypassSchemaValidation deliberately: the scope schema now rejects
+        // this too, and the workflow's own defence must not DEPEND on that.
+        // Review F6's lesson -- a test that only proves the fixture layer
+        // refused something proves nothing about the code under it.
+        'scope:diff': { ...SCOPE_OK, head_sha: 'abc', __bypassSchemaValidation: true },
+        'lens-security': { ...SECURITY_CLEAN, head_sha_measured: 'abc9999999999999999999999999999999999999' },
+        'lens-qa': { ...QA_CLEAN, head_sha_measured: 'abc9999999999999999999999999999999999999' },
+      }),
+    }),
+    (err) => {
+      assert.match(err.message, /ScopeHeadShaInvalid/, 'a malformed pin is a SCOPE failure and must be named as one')
+      assert.doesNotMatch(err.message, /parallel session/, 'and must not be blamed on drift')
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: the scope schema ALSO refuses a malformed pinned sha, so the two layers are independent (review F2)', async () => {
+  await assert.rejects(
+    () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, head_sha: 'abc' } }) }),
+    (err) => { assert.match(err.message, /schema|head_sha/i); return true }
+  )
+})
+
+test('review-cycle.js: a non-sha pin is named as the problem, not blamed on the lenses (review F2, direction two)', async () => {
+  // 'HEAD' is a plausible model answer to "return the exact output of git
+  // rev-parse HEAD". Previously this refused a run whose lenses were correct,
+  // and told the operator to let a parallel session settle.
+  await assert.rejects(
+    () => runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, head_sha: 'HEAD', __bypassSchemaValidation: true } }),
+    }),
+    (err) => {
+      assert.doesNotMatch(err.message, /parallel session/, 'a malformed PIN is not a drift problem and must not be reported as one')
+      assert.match(err.message, /ScopeHeadShaInvalid/, 'the error must name the pin as the malformed thing')
+      return true
+    }
+  )
+})
+
+// --- Round-two review F3, and it is the deepest finding of the round: the gate
+// COULD NOT FAIL for the case it was built for.
+//
+// The prompt opened "The reviewed tip is commit <sha>" and five lines later
+// asked the lens to report that sha back. A lens that reviewed the WRONG tree
+// and echoed line one passed. So the check caught only a lens honest enough to
+// report a foreign sha but not diligent enough to fix its checkout -- a case
+// that was already self-correcting in all four observed runs -- and could not
+// catch the case that actually loses data.
+//
+// The fix is to ask for a value the prompt DOES NOT CONTAIN and the orchestrator
+// can verify: the tree hash of the reviewed commit. It cannot be derived from
+// the sha without reading the object, so answering it requires actually running
+// git in the tree the lens read. An echo of line one no longer passes.
+test('review-cycle.js: a lens that echoes the pinned sha but read a DIFFERENT tree is caught, because the witness value is not in its prompt (review F3)', async () => {
+  await assert.rejects(
+    () => runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        // Echoes the sha perfectly -- the old gate passed this -- but its tree
+        // hash is another commit's, which is what reviewing main would produce.
+        'lens-qa': { ...QA_CLEAN, head_sha_measured: SCOPE_OK.head_sha, head_tree_measured: 'ffffffffffffffffffffffffffffffffffffffff' },
+      }),
+    }),
+    (err) => {
+      assert.match(err.message, /lens-qa/)
+      assert.match(err.message, /tree/i, 'the error must say the TREE disagreed, not the sha, since the sha matched')
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: the witness value is NOT present in the lens prompt, or it could be echoed like the sha was (review F3)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const lensCall = calls.find((c) => c.opts.label === 'lens-qa')
+  assert.doesNotMatch(lensCall.prompt, new RegExp(SCOPE_OK.head_tree), 'the expected tree hash must never appear in the prompt')
+  assert.match(lensCall.prompt, /head_tree_measured/, 'but the field must be asked for by name')
+  assert.match(lensCall.prompt, /rev-parse HEAD\^\{tree\}|\^\{tree\}/, 'and the prompt must say how to obtain it')
+})
+
+test('review-cycle.js: a lens reporting the correct tree completes normally, so the witness is not simply refusing everything (review F3)', async () => {
+  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  assert.equal(result.telemetry.outcome, 'done')
+})
+
+// F1's SECOND layer, proven independently of the first. The spread order is
+// what catches a renaming lens today, so this schema guard is defence in depth
+// and would otherwise be an untested assertion about a mechanism nothing
+// exercises -- the shape this repo keeps finding.
+test('review-cycle.js: the lens schema rejects unknown keys outright, independently of the spread order (review F1, second layer)', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const schema = calls.find((c) => c.opts.label === 'lens-qa').opts.schema
+  assert.equal(schema.additionalProperties, false, 'a lens response carrying a key the contract does not declare must be refused')
+})
+
+// --- Round-two review F5: the sibling drift flag compared two model-transcribed
+// shas with raw !==, the exact defect fixed one screen above in the same commit.
+// Confirmed by execution: the benign spellings the review-A section enumerates
+// each set checkout_moved and told the operator a correct review might be about
+// a different tree.
+for (const [label, value] of [
+  ['a short sha from git log --oneline', 'abcdef1'],
+  ['an uppercase sha', 'ABCDEF1234567890'],
+  ['a trailing newline from a shell capture', 'abcdef1234567890\n'],
+]) {
+  test(`review-cycle.js: ${label} at synthesis does NOT raise a false drift alarm (review F5)`, async () => {
+    const { result } = await runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({ synthesis: { ...SYNTHESIS_OK, head_sha_at_synthesis: value } }),
+    })
+    assert.notEqual(result.checkout_moved, true, 'the same commit spelled differently is not drift')
+  })
+}
+
+test('review-cycle.js: a genuinely different sha at synthesis DOES still raise the drift alarm, so F5 did not blunt it', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ synthesis: { ...SYNTHESIS_OK, head_sha_at_synthesis: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } }),
+  })
+  assert.equal(result.checkout_moved, true)
+  assert.match(result.checkout_moved_detail, /moved mid-review/)
 })

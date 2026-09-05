@@ -80,6 +80,7 @@ test('seam: review_cycle terminal payload, captured from a real run with a non-e
       'scope:diff': {
         base: 'main',
         head_sha: 'abcdef1234567890',
+          head_tree: '1111111111111111111111111111111111111111',
         files: [{ path: 'src/foo.js', status: 'M' }],
         new_dependency_entries: false,
         new_modules: false,
@@ -87,8 +88,8 @@ test('seam: review_cycle terminal payload, captured from a real run with a non-e
         harness_triggers_file_exists: false,
         consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
       },
-      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
-      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
       synthesis: {
         report: '### VERDICT\nCLEAN',
         spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: 'no AC covers this' }],
@@ -118,6 +119,7 @@ test('seam: review_cycle with prior_findings supplied, whose synthesis confirms 
       'scope:diff': {
         base: 'main',
         head_sha: 'abcdef1234567890',
+          head_tree: '1111111111111111111111111111111111111111',
         files: [{ path: 'src/foo.js', status: 'M' }],
         new_dependency_entries: false,
         new_modules: false,
@@ -125,8 +127,8 @@ test('seam: review_cycle with prior_findings supplied, whose synthesis confirms 
         harness_triggers_file_exists: false,
         consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
       },
-      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
-      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
       synthesis: {
         report: '### VERDICT\nCLEAN',
         spec_bugs: [],
@@ -159,6 +161,7 @@ test('seam: review_cycle with prior_findings supplied, whose synthesis fabricate
       'scope:diff': {
         base: 'main',
         head_sha: 'abcdef1234567890',
+          head_tree: '1111111111111111111111111111111111111111',
         files: [{ path: 'src/foo.js', status: 'M' }],
         new_dependency_entries: false,
         new_modules: false,
@@ -166,8 +169,8 @@ test('seam: review_cycle with prior_findings supplied, whose synthesis fabricate
         harness_triggers_file_exists: false,
         consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
       },
-      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
-      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
       synthesis: {
         report: '### VERDICT\nCLEAN',
         spec_bugs: [],
@@ -206,6 +209,7 @@ function makeRealLedgerWriteFn(repo) {
 const SCOPE_AGENT_FIXTURE = {
   base: 'main',
   head_sha: 'abcdef1234567890',
+          head_tree: '1111111111111111111111111111111111111111',
   files: [{ path: 'src/foo.js', status: 'M' }],
   new_dependency_entries: false,
   new_modules: false,
@@ -229,11 +233,11 @@ test('seam: a finding raised open in round one and confirmed fixed in round two 
       'scope:diff': SCOPE_AGENT_FIXTURE,
       'lens-security': {
         verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890',
+        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-1' }],
       },
-      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
       synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: [] },
       'ledger:write': makeRealLedgerWriteFn(repo),
     },
@@ -255,8 +259,8 @@ test('seam: a finding raised open in round one and confirmed fixed in round two 
     args: { prior_findings: round1.result.open_findings },
     agent: {
       'scope:diff': SCOPE_AGENT_FIXTURE,
-      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
-      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
       synthesis: {
         report: '### VERDICT\nCLEAN',
         spec_bugs: [],
@@ -457,6 +461,7 @@ test('seam: review_cycle\'s THROW-path terminal payload, when the throw happens 
         'scope:diff': {
           base: 'main',
           head_sha: 'abcdef1234567890',
+          head_tree: '1111111111111111111111111111111111111111',
           files: [{ path: 'src/foo.js', status: 'M' }],
           new_dependency_entries: false,
           new_modules: false,
@@ -464,8 +469,8 @@ test('seam: review_cycle\'s THROW-path terminal payload, when the throw happens 
           harness_triggers_file_exists: false,
           consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
         },
-        'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
-        'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
+        'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
+        'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' },
         synthesis: () => { throw new Error('synthesis crashed after every lens reported') },
         'ledger:write': LEDGER_OK,
       },
