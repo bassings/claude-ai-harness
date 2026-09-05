@@ -901,3 +901,37 @@ test('plan-cycle.js: every planning lens prompt carries the removal duty, so a l
     'the prompt must keep NAMING the banned wording: without this, the worked example can be inverted so the forbidden phrasing becomes the recommended one and every other assertion still passes'
   )
 })
+
+// Round-two review F1, second instance. plan-cycle carried the identical
+// `{ lens, ...r }` spread as review-cycle: the model's response spread OVER the
+// workflow's own label, so a lens could rename itself and the orchestrator would
+// carry that name into its output and the durable ledger. Recorded as follow-up
+// when review-cycle was fixed rather than fixed silently, and closed here.
+test('plan-cycle.js: a lens cannot rename itself -- the dispatch label always wins over anything the model returns (review F1, second instance)', async () => {
+  const evil = 'INJECTED ' + 'X'.repeat(60)
+  const { calls } = await runWorkflow(WF, {
+    args: { spec: 'specs/foo.md' },
+    agent: baseAgent({
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, acceptance_criteria: [{ id: 'AC-SEC-1', statement: 'x' }], lens: evil, __bypassSchemaValidation: true },
+    }),
+  })
+  // Asserted on VERDICTS, not lenses_run. The first version of this test used
+  // lenses_run and passed with the fix reverted (round-three review HIGH-4):
+  // plan-cycle writes `lenses_run: result.lenses || lensesRunRaw`, so the
+  // dispatched list always wins and the reported names never reach it. The
+  // verdicts map IS keyed by the reported name, so that is where a rename shows.
+  const write = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(write.prompt)
+  assert.deepEqual(
+    Object.keys(payload.verdicts).filter((k) => /INJECTED/.test(k)),
+    [],
+    'a lens must not be able to key its own verdict under a name it chose'
+  )
+  assert.ok(Object.keys(payload.verdicts).includes('lens-security'), 'and the verdict must appear under the DISPATCHED name')
+})
+
+test('plan-cycle.js: the lens schema rejects unknown keys outright, independently of the spread order (review F1, second layer)', async () => {
+  const { calls } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
+  const schema = calls.find((c) => c.opts.label === 'lens-security').opts.schema
+  assert.equal(schema.additionalProperties, false)
+})

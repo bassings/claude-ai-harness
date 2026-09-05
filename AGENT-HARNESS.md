@@ -116,18 +116,38 @@ structural finding on any diff where the `ui` globs are what woke it, narrow its
 UI trigger to `**/components/**` and `**/ui/**`, or drop it and leave the
 on-screen half to `lens-design`.
 
-**Half of that is not computable from the ledger today, and saying so is the
-point.** The ledger records `lenses_run` and per-lens findings, so "did it run
-and did it find anything" is answerable. It does not record changed paths or
-which rule group fired, and `trigger_counts['lens-architecture']` is the
-deduplicated union of the architecture and ui hits, so a ledger line cannot be
-classified as ui-triggered-alone versus architecture-triggered versus
-new-module-triggered. Until one optional field records that attribution (all
-three inputs are already in scope at the trigger site, and it would be additive
-exactly as `rule_source` was), the eight-week review has to reconstruct it from
-the diffs by hand. A stated condition that cannot be computed reads as a
-commitment already discharged, which is the same failure as no condition at all:
-a widening nobody can ever argue for removing, which is how rosters only grow.
+**Restated so the ledger can answer it, and honest about what is still missing.**
+The first version of this condition asked whether the lens "returns no
+STRUCTURAL finding", and the ledger cannot answer that: findings records carry
+`severity` and no category, deliberately, because AC-SEC-2 keeps free text out
+of them. Severity IS recorded and enum-constrained, so the condition is:
+
+> Over eight weeks, `lens-architecture` returns no finding above `Low` severity
+> on any `review_cycle` line whose `architecture_trigger_source` is exactly
+> `['ui-glob']` **and** whose `outcome` is `done`. If so, narrow its UI trigger
+> to `**/components/**` and `**/ui/**`, or drop it and leave the on-screen half
+> to `lens-design`.
+
+The `outcome` clause is load-bearing: `optimise-read.mjs` iterates every
+`review_cycle` record with no outcome filter, so an aborted round would
+otherwise be counted as a clean one.
+
+Each review line carries `architecture_trigger_source` as of 2026-09-05: an
+array of `arch-glob`, `ui-glob`, `new-module` and `new-dependency`, recorded
+where all those inputs are already in scope, and OMITTED entirely when the lens
+did not run. **No line written before 2026-09-05 carries it, so the earliest
+this window can close is 2026-10-31.**
+
+**What is NOT yet built, stated rather than implied:** nothing reads the field.
+`aggregateTriggerAccuracy` looks at `lenses_run`, `trigger_counts` and
+`verdicts` and never touches it, so today the raw line records the attribution
+and no report aggregates it. Running this condition in eight weeks means either
+adding that aggregation first, or reading the lines by hand.
+
+The general rule, which this paragraph has now broken twice in its own history:
+**a retirement or reversal condition justified by "the ledger already records X"
+is not finished until someone has checked that X answers the question, and that
+something actually reads it.** Writing the field is not that check.
 
 **Specialists, invoked as needed**, not part of the standing set.
 `reviewer-verification` (adversarial fresh-eyes pass on review, no plan
@@ -141,6 +161,28 @@ Every lens returns exactly this. No preamble, no summary of the codebase.
 ```
 ### VERDICT
 CLEAN | FINDINGS | BLOCKED
+
+### MEASURED AT                [review mode only]
+head_tree_measured: <output of `git rev-parse <reviewed-tip-sha>^{tree}`>
+head_sha_measured:  <output of `git rev-parse HEAD` in your own worktree>
+
+<Both are required, and they are treated differently. Naming them rather than
+saying "the first" and "the second" is deliberate: positional wording is one
+word away from meaning the opposite, and an adversarial pass proved that
+inversion passed every check on this document.
+
+`head_tree_measured` IS CHECKED. The orchestrator compares it to the reviewed
+tip's tree and refuses the whole run if they differ. Its expected value is
+deliberately absent from your prompt, because the tip's SHA is given to you and
+echoing something you were told proves nothing about what you read.
+
+`head_sha_measured` IS RECORDED, NEVER CHECKED. Report it honestly even when
+your checkout has drifted from the tip, which is normal and expected: drift is
+measured, not punished, and it never fails a run.
+
+Neither command moves your checkout, and you must not move it. These worktrees
+can be shared, and checking out a different commit underneath another session is
+the incident this check exists to detect.>
 
 ### COVERAGE
 Examined:      <files, paths, commands: be specific>

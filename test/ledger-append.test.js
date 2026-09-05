@@ -3886,3 +3886,47 @@ test('ledger-append module: LEDGER_ENTRY_SCHEMA declares plan_key as optional (n
   const preExisting = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'tdd_task', outcome: 'done', write_ok: true, write_error: null }
   assert.deepEqual(validateEntry(preExisting), [], 'an entry with no plan_key at all must still validate cleanly')
 })
+
+// ---------------------------------------------------------------------------
+// Round-one review D: union-typed arrays skipped item validation ENTIRELY.
+// The gate read `propSchema.type === 'array'`, a strict comparison that is
+// false for `type: ['array', 'null']`, so every item constraint on such a field
+// -- enum, type, anything -- was declared and never applied. Proven: bogus
+// strings, numbers and whole objects all validated with zero errors, while the
+// same probes against a plain-array field errored correctly.
+//
+// This is not specific to the field that exposed it. `['x', 'null']` is this
+// file's house style for "not measured", so every future nullable array loses
+// item validation the same way, silently. The fix is the gate, not the field.
+test('ledger-append module: a union-typed array ([\'array\',\'null\']) still validates its ITEMS -- the enum on architecture_trigger_source is enforced, not decorative (review D)', async () => {
+  const { validateEntry } = await import(APPEND_MODULE_URL)
+  const base = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null }
+  const bad = validateEntry({ ...base, architecture_trigger_source: ['not-a-real-source'] })
+  assert.ok(bad.length > 0, 'a value outside the enum must be rejected')
+  assert.ok(bad.some((e) => /architecture_trigger_source/.test(e)), `the error must name the field, got: ${JSON.stringify(bad)}`)
+  // Both halves of the union must still be accepted, or the fix is just a ban.
+  assert.deepEqual(validateEntry({ ...base, architecture_trigger_source: ['ui-glob'] }), [], 'a legitimate value must still pass')
+  assert.deepEqual(validateEntry({ ...base, architecture_trigger_source: null }), [], 'null remains legal: the lens did not run')
+})
+
+test('ledger-append module: a union-typed array rejects non-string items too, so a number or an object cannot ride into the durable ledger (review D)', async () => {
+  const { validateEntry } = await import(APPEND_MODULE_URL)
+  const base = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null }
+  for (const value of [[42], [{ evil: 1 }], [['nested']]]) {
+    assert.ok(validateEntry({ ...base, architecture_trigger_source: value }).length > 0, `${JSON.stringify(value)} must be rejected`)
+  }
+})
+
+
+
+// Round-four adversarial pass, MEDIUM 7. The docstring on typeMatches says
+// "'integer' does not accept a non-integer number". Only the other half of that
+// sentence was tested, so widening 'integer' to accept any number stayed green.
+// Every count-shaped field in the durable ledger would then accept 3.7 and write
+// it, and the readers downstream treat those counts as evidence.
+test('ledger-append module: a declared integer field REFUSES a non-integer number, not just a string (review round-four MED 7)', async () => {
+  const { validateEntry } = await import(APPEND_MODULE_URL)
+  const base = { schema_version: 1, run_id: 'r', ts: 't', repo: 'r', kind: 'review_cycle', outcome: 'done', write_ok: true, write_error: null }
+  assert.ok(validateEntry({ ...base, trigger_counts: { 'lens-qa': 3.7 } }).length > 0, 'a float must be refused where the schema says integer')
+  assert.deepEqual(validateEntry({ ...base, trigger_counts: { 'lens-qa': 3 } }), [], 'and a genuine integer must still pass')
+})
