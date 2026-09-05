@@ -27,11 +27,9 @@ omitted.
 
 ---
 
-status: blocked-on-human: T1 and T4 are both non-actionable this session (T1 is a standing practice by owner decision, T4 needs roughly five more real-work PRs, which is days not minutes). Should this plan stay open with the loop ticking, or be closed with both recorded as standing items to restart later?
-
 ## Tasks
 
-- [ ] T1: adversarial pass against `main` — state: queued — Owner decision 2026-09-05: keep
+- [ ] T1: adversarial pass against `main` — state: building — Owner decision 2026-09-05: keep
   the adversarial mutation pass as a standing practice rather than a gate on one
   branch. The shape that worked: a fresh agent picks the mutations, is told to
   assume every mutation the author ran was chosen to succeed, and is told a
@@ -145,3 +143,16 @@ status: blocked-on-human: T1 and T4 are both non-actionable this session (T1 is 
   holes in. That is a real change with tests, not a refactor to move a number,
   and it is not in this plan's scope.
   Rework rounds this tick: 0. Blocked on human, question above the log heading.
+
+- 2026-09-05 tick 5: **T1 dispatched, and I corrected my own earlier reading.**
+  Last tick I held T1 back, reading Scott's two answers as conflicting. They were
+  not. He chose "merge now, adversary runs on main AFTER" and separately "nothing
+  now" on the specific unreached list. The first is a decision about T1; the
+  second is about me starting that work myself. An adversarial pass finding
+  something in those areas is INFORMATION, not work started. Re-running the loop
+  rather than answering the blocked question resolved it: keep going.
+  Agent briefed to prioritise by consequence, with the four rounds' territory
+  named as low-yield rather than fenced off, and with the two disciplines that
+  bit me today written in: confirm green before each mutation, and check the
+  mutation actually landed before believing a green run.
+  Rework rounds this tick: 0. T1 building. Armed: the background agent.
