@@ -180,3 +180,13 @@ discriminates.
 |---|---|---|
 | Tree hex floor relaxed 7 -> 1 | MISSED | CAUGHT |
 | Tree normalisation removed | MISSED | CAUGHT |
+
+## Round-two follow-ups, closed rather than carried
+
+| Finding | Fix | Proof |
+|---|---|---|
+| F1 second instance | `plan-cycle.js` carried the identical `{ lens, ...r }` spread. Fixed, with `additionalProperties: false` as the second layer. | Injected lens name no longer reaches the ledger payload; schema guard asserted separately since the spread catches it first |
+| F7 | `maxLength` was declared four times and implemented nowhere, AND was redundant beside a pattern that already bounds the value. **Deleted rather than implemented.** A constraint nothing applies is worse than none: it reads as a second line of defence. The test asserting its presence is gone with it. | 4 declarations removed, suite green |
+| F8 | The partial/total failure asymmetry is now stated rather than accidental: total failure returns softly because "no review produced" is unmistakable; partial failure throws because a review missing three of nine lenses reads exactly like a review. The remedy now names the `{lenses: [...]}` re-run. | — |
+| F9 | The union-item fix had no test of its own and survived on three unrelated ones. The only union-typed items schema in the repo is this workflow's ledger response, so the test lives there. | Reverting the union handling: CAUGHT (2). Switching item checking off entirely: CAUGHT (1) |
+| F10 | The forward-compatibility test proved the half never at risk. Title and comment now say what is true: omitting on the null path NARROWS the stale-writer exposure, it does not close it. | — |

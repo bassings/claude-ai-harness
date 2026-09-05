@@ -298,12 +298,12 @@ const REVIEW_SCHEMA = {
     // escapes the workflow, so an unbounded model-authored string was a free
     // text channel out of a reviewed diff (review B). Hex-only and bounded
     // closes both: there is nothing left to neutralise.
-    head_sha_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
+    head_sha_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
     // The witness the prompt does not contain (review F3). head_sha_measured
     // alone could not fail for the case this gate exists for: the pinned sha is
     // printed in line one of the prompt, so a lens that reviewed the wrong tree
     // and echoed it passed. A tree hash cannot be echoed from the prompt.
-    head_tree_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
+    head_tree_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
     coverage: {
       type: 'object',
       required: ['examined', 'verified_by', 'could_not_check'],
@@ -683,12 +683,12 @@ const scope = await agent(
       required: ['base', 'head_sha', 'head_tree', 'files', 'new_dependency_entries', 'new_modules', 'custom_rules', 'harness_triggers_file_exists', 'consistency'],
       properties: {
         base: { type: 'string' },
-        head_sha: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
+        head_sha: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
         // The WITNESS (round-two review F3). The reviewed tip's tree hash is not
         // derivable from its commit sha without reading the object, so a lens
         // can only answer it by running git in the tree it actually read. It is
         // deliberately never placed in a lens prompt.
-        head_tree: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
+        head_tree: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$' },
         files: { type: 'array', items: { type: 'object', required: ['path', 'status'], properties: { path: { type: 'string' }, status: { type: 'string' } } } },
         new_dependency_entries: { type: 'boolean' },
         new_modules: { type: 'boolean' },
@@ -1084,6 +1084,12 @@ const reports = await parallel(lenses.map(lens => () =>
     .then(r => (r ? { ...r, lens } : null))
 ))
 const lensReports = reports.filter(Boolean)
+// TOTAL failure returns softly; PARTIAL failure throws (round-two review F8).
+// That asymmetry is deliberate, not accidental, and the reason is which outcome
+// can be mistaken for a completed review. "No review produced" is unmistakable:
+// there are no verdicts to read and nothing to act on. A review missing three of
+// nine lenses reads exactly like a review, and its verdicts look like coverage
+// they do not have. The mistakable one is the one that must stop the run.
 if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
 lensesRunRaw = lensReports.map(r => r.lens)
 
@@ -1221,8 +1227,9 @@ if (vanished.length) {
   throw new Error(
     `LensProducedNoReport: ${vanished.join(', ')} ${vanished.length === 1 ? 'was' : 'were'} dispatched but returned ` +
     `no usable report, so ${vanished.length === 1 ? 'its' : 'their'} share of this review did not happen and the ` +
-    `remaining verdicts cover less than they appear to. This is a lens failure, NOT a checkout problem: re-dispatch ` +
-    `or re-run. The findings the other lenses did report are already recorded in this round's ledger line.`
+    `remaining verdicts cover less than they appear to. This is a lens failure, NOT a checkout problem. Re-run the ` +
+    `review cycle, or re-run just the missing work with {lenses: ["${vanished.join('", "')}"]}. The findings the ` +
+    `other lenses did report are already recorded in this round's ledger line.`
   )
 }
 

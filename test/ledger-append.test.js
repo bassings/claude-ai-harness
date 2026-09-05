@@ -3916,3 +3916,5 @@ test('ledger-append module: a union-typed array rejects non-string items too, so
     assert.ok(validateEntry({ ...base, architecture_trigger_source: value }).length > 0, `${JSON.stringify(value)} must be rejected`)
   }
 })
+
+

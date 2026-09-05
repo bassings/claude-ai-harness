@@ -2319,7 +2319,14 @@ test('review-cycle.js: a lens-architecture woken only by new_modules records tha
 // so a new workflow writing to an older installed copy of that library would
 // have its ENTIRE record rejected rather than just this field. "Key absent"
 // already means "the lens did not run", so nothing is lost by omitting it.
-test('review-cycle.js: when lens-architecture is not triggered the key is OMITTED, so an older installed ledger writer still accepts the whole line (review I)', async () => {
+// Round-two review F10: this proves the half that was never at risk. The
+// absent-key case always validated against the previous schema; the case that
+// BROKE was the key PRESENT, and that is unchanged -- a repo whose diff triggers
+// lens-architecture still emits a key an older installed writer rejects
+// wholesale. Omitting on the null path narrows the exposure to changes that
+// actually wake the lens; it does not remove it. Stated here rather than
+// implied, because the test title otherwise reads as a guarantee.
+test('review-cycle.js: when lens-architecture is not triggered the key is OMITTED, which narrows (does NOT close) the stale-installed-writer exposure (review I, scoped by F10)', async () => {
   const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
   assert.ok(!('architecture_trigger_source' in payload), 'the key must be absent entirely, not present as null')
@@ -2421,7 +2428,14 @@ test('review-cycle.js: head_sha_measured is constrained to a bounded hex string,
   })())
   const prop = schema.properties.head_sha_measured
   assert.ok(prop.pattern, 'the field must carry a pattern')
-  assert.ok(prop.maxLength && prop.maxLength <= 64, 'and a bound')
+  // Deliberately NOT asserting a maxLength (round-two review F7). One was
+  // declared here and implemented by nothing: the validator handles type, enum,
+  // pattern and additionalProperties, and maxLength appeared exactly twice in
+  // the repo, both times as a declaration. It was also redundant -- the pattern
+  // below already bounds the value to 40 hex characters. A constraint nothing
+  // applies is worse than none, because it reads as a second line of defence,
+  // and a test asserting its PRESENCE reads like a behavioural guarantee while
+  // proving only that a line of configuration exists.
   const re = new RegExp(prop.pattern)
   assert.ok(re.test('abcdef1234567890'), 'a real sha must pass')
   assert.ok(re.test('  abcdef1234567890\n'), 'surrounding whitespace from a shell capture must pass')
@@ -2612,4 +2626,38 @@ test('review-cycle.js: a genuinely different sha at synthesis DOES still raise t
   })
   assert.equal(result.checkout_moved, true)
   assert.match(result.checkout_moved_detail, /moved mid-review/)
+})
+
+// Round-two review F9: the second half of the review-D validator fix (union
+// types in an ITEMS schema) had no test of its own. Reverting it left
+// ledger-append's own suite fully green; only the full run caught it, through
+// three tests about an unrelated feature that happened to exercise the path.
+// A fix surviving on somebody else's coverage is one refactor from unguarded.
+//
+// It belongs here rather than in ledger-append's suite because the only
+// union-typed items schema in the repo is this workflow's ledger:write response
+// (open_finding_ids: items { type: ['string','null'] }), validated by the fake
+// runtime through the very function under test.
+test('review-cycle.js: an items schema with a UNION type accepts every member of the union (review F9)', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: ['abcdef0123456789', null] }] }),
+  })
+  assert.equal(result.telemetry.outcome, 'done', 'both members of the union must be accepted by the response validator')
+})
+
+test('review-cycle.js: an items schema with a UNION type still rejects a NON-member, so F9 did not simply switch item checking off', async () => {
+  // The ledger step deliberately swallows its own failures -- telemetry must
+  // never fail the caller's run -- so a rejected response is not observable as
+  // a throw. It is observable as the ids not arriving: a number is refused by
+  // the validator rather than carried through as an id.
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/foo.js', status: 'M' }] },
+      'lens-security': { ...SECURITY_CLEAN, verdict: 'FINDINGS', findings: [{ severity: 'High', claim: 'c', location: 'a.js:1', evidence: 'e', consequence: 'x', fix: 'f' }] },
+      'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: [42] }],
+    }),
+  })
+  assert.equal(result.open_findings, null, 'a non-member item must not survive validation into a real finding id')
 })
