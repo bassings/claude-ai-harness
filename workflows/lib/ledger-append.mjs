@@ -188,6 +188,12 @@ export const LEDGER_ENTRY_SCHEMA = {
     // ac_id_raw before it (see README's AC-OPS-4 section): an older writer or
     // reader omitting these fields is not itself an error, so no SCHEMA_VERSION
     // bump.
+    // Additive and optional, exactly as rule_source was before it, so no
+    // SCHEMA_VERSION bump: an older line simply lacks the key. Records which
+    // rule group woke lens-architecture, because trigger_counts is the
+    // deduplicated union of both surfaces and cannot answer it. Without this,
+    // AGENT-HARNESS.md's eight-week reversal condition is not computable.
+    architecture_trigger_source: { type: ['array', 'null'], items: { type: 'string', enum: ['arch-glob', 'ui-glob', 'new-module'] } },
     rule_source: { type: ['string', 'null'], enum: ['repo-tuned', 'harness defaults'] },
     rule_source_overridden_keys: { type: ['integer', 'null'] },
     findings: {

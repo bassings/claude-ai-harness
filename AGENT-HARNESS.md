@@ -116,18 +116,24 @@ structural finding on any diff where the `ui` globs are what woke it, narrow its
 UI trigger to `**/components/**` and `**/ui/**`, or drop it and leave the
 on-screen half to `lens-design`.
 
-**Half of that is not computable from the ledger today, and saying so is the
-point.** The ledger records `lenses_run` and per-lens findings, so "did it run
-and did it find anything" is answerable. It does not record changed paths or
-which rule group fired, and `trigger_counts['lens-architecture']` is the
-deduplicated union of the architecture and ui hits, so a ledger line cannot be
-classified as ui-triggered-alone versus architecture-triggered versus
-new-module-triggered. Until one optional field records that attribution (all
-three inputs are already in scope at the trigger site, and it would be additive
-exactly as `rule_source` was), the eight-week review has to reconstruct it from
-the diffs by hand. A stated condition that cannot be computed reads as a
-commitment already discharged, which is the same failure as no condition at all:
-a widening nobody can ever argue for removing, which is how rosters only grow.
+**It is computable, as of 2026-09-05.** It was not when this condition was
+written, and that gap is worth recording rather than quietly closing. The ledger
+carried `lenses_run` and per-lens findings, so "did it run and did it find
+anything" was answerable, but it carried no changed paths and no rule-group
+attribution, and `trigger_counts['lens-architecture']` is the deduplicated union
+of the architecture and ui hits, so a line could not be classified as
+ui-triggered-alone versus anything else. The condition read as a commitment
+already discharged, which is the same failure as no condition at all.
+
+Each review line now carries `architecture_trigger_source`: an array of
+`arch-glob`, `ui-glob` and `new-module`, recorded where all three inputs are
+already in scope, and `null` when the lens did not run at all so that "not
+triggered" stays distinguishable from "triggered, source unrecorded". The
+eight-week population is the lines whose only entry is `ui-glob`.
+
+The general rule this came from: **a retirement or reversal condition justified
+by "the ledger already records X" is not finished until someone has checked that
+X actually answers it.** Nobody had.
 
 **Specialists, invoked as needed**, not part of the standing set.
 `reviewer-verification` (adversarial fresh-eyes pass on review, no plan

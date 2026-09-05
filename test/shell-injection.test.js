@@ -58,8 +58,8 @@ function runReviewCycleAndGetTerminalPrompt(hostileClaim) {
         harness_triggers_file_exists: false,
         consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
       },
-      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
-      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] },
+      'lens-security': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
+      'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' },
       synthesis: {
         report: '### VERDICT\nCLEAN',
         spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: hostileClaim }],

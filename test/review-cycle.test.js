@@ -43,8 +43,11 @@ const SCOPE_OK = {
   consistency: CONSISTENCY_OK,
 }
 
-const SECURITY_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] }
-const QA_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [] }
+// head_sha_measured matches SCOPE_OK.head_sha: every lens fixture asserts it
+// reviewed the tip this run pinned. Added 2026-09-05 with the reviewed-tip
+// check; a fixture omitting it now aborts the run, which is the point.
+const SECURITY_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' }
+const QA_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890' }
 
 const SYNTHESIS_OK = {
   report: '### VERDICT\nCLEAN',
@@ -55,8 +58,21 @@ const SYNTHESIS_OK = {
 function baseAgent(overrides = {}) {
   return {
     'scope:diff': SCOPE_OK,
+    // EVERY lens gets a default clean response, not just the always-on pair.
+    // Before 2026-09-05 a test whose diff triggered lens-design (say) but
+    // scripted no reply for it simply got one fewer opinion in the review, with
+    // nothing saying so -- the runtime returned null and the workflow filtered
+    // it out. That silence is now an abort, so the fixture has to be honest
+    // about who was asked. Tests override only the lenses they care about.
     'lens-security': SECURITY_CLEAN,
     'lens-qa': QA_CLEAN,
+    'lens-design': SECURITY_CLEAN,
+    'lens-accessibility': SECURITY_CLEAN,
+    'lens-product': SECURITY_CLEAN,
+    'lens-architecture': SECURITY_CLEAN,
+    'lens-data': SECURITY_CLEAN,
+    'lens-operability': SECURITY_CLEAN,
+    'reviewer-verification': SECURITY_CLEAN,
     synthesis: SYNTHESIS_OK,
     'ledger:write': LEDGER_OK,
     ...overrides,
@@ -238,7 +254,13 @@ test('review-cycle.js: telemetry.round_key tracks a DIFFERENT head SHA, not a co
   const sameShaTwice = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   const differentSha = await runWorkflow(WF, {
     args: {},
-    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, head_sha: '1111111111111111111111111111111111aaaa' } }),
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, head_sha: '1111111111111111111111111111111111aaaa' },
+      // the lenses must report the SAME varied sha, or the reviewed-tip check
+      // refuses the run -- which is the behaviour, not a fixture inconvenience
+      'lens-security': { ...SECURITY_CLEAN, head_sha_measured: '1111111111111111111111111111111111aaaa' },
+      'lens-qa': { ...QA_CLEAN, head_sha_measured: '1111111111111111111111111111111111aaaa' },
+    }),
   })
   assert.equal(differentSha.result.telemetry.round_key, '1111111111111111111111111111111111aaaa')
   assert.notEqual(sameShaTwice.result.telemetry.round_key, differentSha.result.telemetry.round_key, 'round_key must actually vary with the reviewed SHA, not be pinned to one literal value')
@@ -471,6 +493,7 @@ test('review-cycle.js: every lens\'s reported findings are sent to the ledger-wr
     agent: baseAgent({
       'lens-security': {
         verdict: 'FINDINGS',
+        head_sha_measured: 'abcdef1234567890',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f' }],
       },
@@ -503,12 +526,14 @@ test('review-cycle.js: every lens\'s ac_verdicts are aggregated into the ledger 
     agent: baseAgent({
       'lens-security': {
         verdict: 'FINDINGS',
+        head_sha_measured: 'abcdef1234567890',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [],
         ac_verdicts: [{ id: 'AC-SEC-3', verdict: 'FAIL', evidence: 'a secret quoted source line' }],
       },
       'lens-qa': {
         verdict: 'CLEAN',
+        head_sha_measured: 'abcdef1234567890',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [],
         ac_verdicts: [{ id: 'AC-QA-3', verdict: 'PASS', evidence: 'another secret line' }],
@@ -550,6 +575,7 @@ test('review-cycle.js: a finding\'s ac_id survives into open_findings when a len
     agent: baseAgent({
       'lens-security': {
         verdict: 'FINDINGS',
+        head_sha_measured: 'abcdef1234567890',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-3' }],
       },
@@ -637,6 +663,7 @@ test('review-cycle.js: result.open_findings zips this round\'s open finding desc
     agent: baseAgent({
       'lens-security': {
         verdict: 'FINDINGS',
+        head_sha_measured: 'abcdef1234567890',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-1' }],
       },
@@ -659,6 +686,7 @@ test('review-cycle.js: result.open_findings is populated on ROUND ONE too, with 
     agent: baseAgent({
       'lens-qa': {
         verdict: 'FINDINGS',
+        head_sha_measured: 'abcdef1234567890',
         coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
         findings: [{ severity: 'Low', claim: 'a style nit', location: 'bar.js:1', evidence: 'e', consequence: 'c', fix: 'f' }],
       },
@@ -2129,4 +2157,156 @@ test('review-cycle.js: a repo override REPLACES a trigger key rather than extend
   assert.ok(!result.lenses.includes('lens-accessibility'), 'same key, same override')
   assert.ok(!result.lenses.includes('lens-architecture'), 'the UI path into lens-architecture rides the same overridden ui key')
   assert.deepEqual(result.lenses, ['lens-security', 'lens-qa'], 'only the always-on pair should remain')
+})
+
+// ---------------------------------------------------------------------------
+// The reviewed-tip race, fixed 2026-09-05 after Scott chose "fix it properly".
+//
+// Observed in all THREE review runs of 2026-09-04/05: each lens started its
+// worktree on a commit that was not the reviewed tip, noticed, and pinned its
+// own reads to the right SHA. Three for three self-corrected, which is exactly
+// what makes it dangerous -- the only defence was a paragraph of prompt asking
+// the model to check `git rev-parse HEAD` and record any drift. CLAUDE.md
+// section 9: a weaker agent will forget prose, and it cannot get past a command
+// that exits non-zero.
+//
+// A review of the wrong tree reads EXACTLY like a review of the right one. Same
+// shape as everything else this week: an absence that reads as success.
+//
+// So the lens now REPORTS the sha it actually measured, and the ORCHESTRATOR
+// compares it. The model is no longer the thing being trusted; it is the thing
+// being checked. Fails closed, like ScopeStepFailed and the install-consistency
+// refusal, because a silently-wrong review is worse than no review.
+test('review-cycle.js: a lens reporting a head_sha it did not review ABORTS the run, naming the lens and both shas -- the reviewed-tip race is caught by the orchestrator, not by asking the model to notice', async () => {
+  await assert.rejects(
+    () => runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        'lens-qa': { ...QA_CLEAN, head_sha_measured: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' },
+      }),
+    }),
+    (err) => {
+      assert.match(err.message, /lens-qa/, 'must name which lens measured the wrong tree')
+      assert.match(err.message, /abcdef1234567890/, 'must name the tip that was meant to be reviewed')
+      assert.match(err.message, /deadbeefdeadbeef/, 'must name what the lens actually measured')
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: a lens reporting the correct head_sha completes normally, so the guard is not simply refusing everything', async () => {
+  const { result } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-security': { ...SECURITY_CLEAN, head_sha_measured: SCOPE_OK.head_sha },
+      'lens-qa': { ...QA_CLEAN, head_sha_measured: SCOPE_OK.head_sha },
+    }),
+  })
+  assert.equal(result.telemetry.outcome, 'done')
+  assert.deepEqual(result.verdicts, { 'lens-security': 'CLEAN', 'lens-qa': 'CLEAN' })
+})
+
+// A lens that produces NOTHING must not slip through as "no mismatch detected".
+// That is the absence-reads-as-success shape the check exists for, reappearing
+// one level up inside the check's own comparison. Two real shapes, both tested;
+// the first is what actually happens in production, and finding it was an
+// accident of writing the second.
+test('review-cycle.js: a dispatched lens that returns nothing at all ABORTS, rather than leaving a review quietly one opinion short', async () => {
+  await assert.rejects(
+    () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'lens-qa': undefined }) }),
+    (err) => {
+      assert.match(err.message, /lens-qa/, 'must name the lens that vanished')
+      assert.match(err.message, /did not report/i, 'a lens that produced nothing must be named, not silently omitted from the roster')
+      return true
+    }
+  )
+})
+
+// The schema requires the field, so a real runtime cannot deliver a response
+// without it. This pins the workflow's own defence anyway, via the fake
+// runtime's documented bypass, because the check must not depend on the schema
+// being the only thing standing between it and a silent pass.
+test('review-cycle.js: a lens response lacking head_sha_measured ABORTS even if it somehow bypasses schema validation -- the workflow does not rely on the schema alone', async () => {
+  await assert.rejects(
+    () => runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        'lens-qa': { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], __bypassSchemaValidation: true },
+      }),
+    }),
+    (err) => {
+      assert.match(err.message, /lens-qa/)
+      assert.match(err.message, /did not report/i)
+      return true
+    }
+  )
+})
+
+test('review-cycle.js: the lens prompt instructs reporting the measured sha, so the schema field is not asked for silently', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-security': { ...SECURITY_CLEAN, head_sha_measured: SCOPE_OK.head_sha },
+      'lens-qa': { ...QA_CLEAN, head_sha_measured: SCOPE_OK.head_sha },
+    }),
+  })
+  const lensCall = calls.find((c) => c.opts.label === 'lens-qa')
+  assert.ok(lensCall)
+  assert.match(lensCall.prompt, /head_sha_measured/, 'the prompt must name the field the orchestrator will check')
+  assert.ok(lensCall.opts.schema.required.includes('head_sha_measured'), 'and the schema must require it')
+})
+
+// ---------------------------------------------------------------------------
+// AGENT-HARNESS.md sets an eight-week condition for reversing the UI trigger:
+// "if lens-architecture returns no structural finding on any diff where the ui
+// globs are what woke it". Half of that was not computable. The ledger records
+// lenses_run and per-lens findings, so "did it run and did it find anything" is
+// answerable, but it records no changed paths and no rule-group attribution,
+// and trigger_counts['lens-architecture'] is the DEDUPLICATED UNION of the
+// architecture and ui hits -- so a line cannot be classified as ui-triggered
+// alone versus architecture-triggered versus new-module-triggered.
+//
+// A stated condition nobody can compute reads as a commitment already
+// discharged, which is the same failure as no condition at all. All three
+// inputs are already in scope at the trigger site; this records which fired.
+test('review-cycle.js: the ledger records WHICH rule group woke lens-architecture, so the eight-week reversal condition can be computed rather than reconstructed by hand', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/components/Card.tsx', status: 'M' }] } }),
+  })
+  const write = calls.filter((c) => c.opts.label === 'ledger:write').pop()
+  const payload = extractLedgerPayload(write.prompt)
+  assert.deepEqual(
+    payload.architecture_trigger_source,
+    ['ui-glob'],
+    'a UI-only diff woke it through the ui globs alone -- exactly the population the reversal condition counts'
+  )
+})
+
+test('review-cycle.js: a diff matching BOTH surfaces records both sources, so it is excluded from the ui-alone population rather than miscounted into it', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'package.json', status: 'M' }, { path: 'src/components/Card.tsx', status: 'M' }] },
+    }),
+  })
+  const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.deepEqual(payload.architecture_trigger_source.sort(), ['arch-glob', 'ui-glob'])
+})
+
+test('review-cycle.js: a lens-architecture woken only by new_modules records that, and is likewise not counted as ui-triggered', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/newmod/index.js', status: 'A' }], new_modules: true },
+    }),
+  })
+  const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.deepEqual(payload.architecture_trigger_source, ['new-module'])
+})
+
+test('review-cycle.js: when lens-architecture is not triggered at all the field is null, so "not triggered" and "triggered by nothing recorded" stay distinguishable', async () => {
+  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+  const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.equal(payload.architecture_trigger_source, null)
 })

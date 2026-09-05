@@ -280,9 +280,15 @@ function evaluateInstallConsistency(consistency, ownSchema, ownSchemaName, allow
 // text (MED-3) -- the literal object IS what this session executes.
 const REVIEW_SCHEMA = {
   type: 'object',
-  required: ['verdict', 'coverage', 'findings'],
+  required: ['verdict', 'coverage', 'findings', 'head_sha_measured'],
   properties: {
     verdict: { type: 'string', enum: ['CLEAN', 'FINDINGS', 'BLOCKED'] },
+    // The sha the lens ACTUALLY read, checked by the orchestrator against the
+    // reviewed tip below. Added 2026-09-05: worktrees were observed starting on
+    // a different commit in all three runs of 2026-09-04/05, and the only
+    // defence was a prompt paragraph asking the model to notice and say so.
+    // Three for three self-corrected, which is what made it dangerous.
+    head_sha_measured: { type: 'string' },
     coverage: {
       type: 'object',
       required: ['examined', 'verified_by', 'could_not_check'],
@@ -425,6 +431,9 @@ const priorFindings = Array.isArray(opts.prior_findings) ? opts.prior_findings :
 // becomes available, read after run() resolves. Never part of the
 // pre-existing, publicly-documented return shape (AC-ARCH-10).
 const triggerCounts = {}
+// null, not [], when lens-architecture never ran: an empty list would say
+// "triggered by nothing", which is a different and false claim.
+let architectureTriggerSource = null
 let headSha = null
 // 2026-08-18: the sha git reports at SYNTHESIS time, so a checkout that moved
 // mid-run is detectable. Several agent sessions share these checkouts; a
@@ -944,6 +953,17 @@ if (dataHit.length) {
 // replaces"), and architecture's removal duty lives in its review text.
 if (archHit.length || uiHit.length || scope.new_modules || scope.new_dependency_entries) {
   lenses.push('lens-architecture')
+  // WHICH rule group woke it, recorded because trigger_counts cannot answer it:
+  // that number is the deduplicated union of both surfaces, so a ledger line
+  // could not be classified as ui-triggered-alone versus anything else.
+  // AGENT-HARNESS.md's eight-week reversal condition counts exactly the
+  // ui-alone population, and without this it had to be reconstructed from the
+  // diffs by hand, which is another way of saying it would not have been.
+  architectureTriggerSource = [
+    ...(archHit.length ? ['arch-glob'] : []),
+    ...(uiHit.length ? ['ui-glob'] : []),
+    ...(scope.new_modules || scope.new_dependency_entries ? ['new-module'] : []),
+  ]
   // Credits whichever surface actually triggered it, deduplicated: a file
   // matching both globs is one file, not two. Still honestly 0 when triggered
   // purely by new_modules/new_dependency_entries with nothing matching either
@@ -997,9 +1017,14 @@ const qaBudget =
   `an honest skip list beats an unbounded run.\n`
 
 const lensPrompt = (lens) =>
-  `REVIEW mode. The reviewed tip is commit ${scope.head_sha}. First run \`git rev-parse HEAD\` in your worktree; if it ` +
-  `differs, your checkout has drifted from the reviewed tip (a parallel session may have advanced the branch): diff ` +
-  `against the pinned SHA explicitly and record the drift in could_not_check. Review \`git diff ${base}...${scope.head_sha}\`.\n` +
+  `REVIEW mode. The reviewed tip is commit ${scope.head_sha}. FIRST, before anything else, run \`git rev-parse HEAD\` ` +
+  `in your worktree. If it differs, your checkout has drifted from the reviewed tip (a parallel session may have ` +
+  `advanced the branch): check out or diff against the pinned SHA explicitly, and record the drift in could_not_check. ` +
+  `Review \`git diff ${base}...${scope.head_sha}\`.\n` +
+  `Then report, as head_sha_measured, the sha your findings were ACTUALLY derived from -- normally ${scope.head_sha}. ` +
+  `This is checked mechanically: the orchestrator compares it to the reviewed tip and ABORTS the whole run on a ` +
+  `mismatch or an omission. Do not copy the pinned value in without having reviewed that tree; a review of the wrong ` +
+  `tree reads exactly like a review of the right one, which is why this is verified rather than asked.\n` +
   `Changed files (${paths.length} total):\n${fileList}\n\n` +
   `${specClause}\n\n` +
   (lens === 'lens-qa' ? qaBudget : '') +
@@ -1026,6 +1051,45 @@ const reports = await parallel(lenses.map(lens => () =>
 const lensReports = reports.filter(Boolean)
 if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
 lensesRunRaw = lensReports.map(r => r.lens)
+
+// ---- the reviewed-tip check: mechanical, fail-closed ----
+// Every lens must state the sha its findings came from, and it must be the tip
+// this run pinned. An ABSENT value is treated as a mismatch, never as
+// agreement: "no sha reported" and "the right sha" are different claims, and
+// collapsing them is the absence-reads-as-success shape this check exists to
+// stop, reappearing inside the check itself.
+//
+// Fails the whole run rather than dropping one lens, matching ScopeStepFailed
+// and the install-consistency refusal. A review of the wrong tree is not a
+// partial review, it is a confident wrong answer, and the operator needs to
+// know before they act on it rather than find a caveat in a coverage line.
+//
+// Two failure shapes, one check, because they are the same defect wearing
+// different clothes. A lens can measure the WRONG tree, or it can vanish
+// entirely -- a response that fails schema validation is dropped to null by the
+// runtime and filtered out above, so a lens that was dispatched and produced
+// nothing usable leaves a review that simply has one fewer opinion in it, with
+// no sign anything is missing. Found while testing the sha check: the fixture
+// that omitted the field did not trip the mismatch branch, because the lens
+// never made it into lensReports at all.
+const reported = new Set(lensReports.map(r => r.lens))
+const vanished = lenses.filter(l => !reported.has(l))
+const tipMismatches = [
+  ...vanished.map(l => `${l} was dispatched but returned no usable report, so it did not report the sha it measured`),
+  ...lensReports
+    .filter(r => typeof r.head_sha_measured !== 'string' || r.head_sha_measured !== scope.head_sha)
+    .map(r => (typeof r.head_sha_measured !== 'string' || !r.head_sha_measured
+      ? `${r.lens} did not report the sha it measured`
+      : `${r.lens} measured ${r.head_sha_measured}`)),
+]
+if (tipMismatches.length) {
+  throw new Error(
+    `ReviewedTipMismatch: this run pinned ${scope.head_sha}, but ${tipMismatches.join('; ')}. ` +
+    `A review of a different tree reads exactly like a review of the reviewed one, so the run is refused rather ` +
+    `than reported with a caveat. Re-run the review cycle; if a parallel session is advancing this branch, let it ` +
+    `settle first.`
+  )
+}
 
 // H5: capture every finding each lens reported, as-is, before synthesis
 // dedupes/arbitrates them -- this is the "open" (accepted) side that was
@@ -1188,6 +1252,7 @@ const telemetry = {
   lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],
   trigger_counts: triggerCounts,
+  architecture_trigger_source: architectureTriggerSource,
   verdicts: result.verdicts || {},
   spec_bug_count: specBugCount,
   rejected_finding_count: rejectedFindingCount,
