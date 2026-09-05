@@ -1182,7 +1182,7 @@ function validateGlobArray(value) {
 // otherwise incur is capped.
 function globToRe(g) {
   let s = g.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-  s = s.replace(/\*\*/g, '').replace(/\*/g, '[^/]*').replace(//g, '.*')
+  s = s.replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*').replace(/\u0001/g, '.*')
   s = s.replace(/\?/g, '[^/]')
   return new RegExp('^' + s + '$')
 }
@@ -1250,8 +1250,8 @@ export function resolveProductSourceExcludeGlobs(root) {
 // an ordinary commit that really touched nothing (e.g. an --allow-empty
 // commit): paths is `null` for a merge commit, `[]` (or a real list) for
 // everything else.
-const GIT_LOG_RECORD_SEP = ''
-const GIT_LOG_HEADER_SEP = ''
+const GIT_LOG_RECORD_SEP = '\u001e'
+const GIT_LOG_HEADER_SEP = '\u001f'
 export function parseGitLogRaw(raw) {
   const text = typeof raw === 'string' ? raw : ''
   if (!text) return []
