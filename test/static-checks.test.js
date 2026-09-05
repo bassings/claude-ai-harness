@@ -1723,6 +1723,11 @@ const PROSE_DUTIES = [
     why: 'without this the success measure reverts to prose nobody verifies, which is the analytics half of the same defect.',
   },
   {
+    file: 'AGENT-HARNESS.md',
+    re: /### MEASURED AT/,
+    why: 'the published lens output contract must list the field REVIEW_SCHEMA now requires. Review round one, finding H: the schema required head_sha_measured and omitting it aborts the whole run, while the contract adopting users read said "every lens returns exactly this" and never mentioned it. Anyone writing a lens from the published contract produced one that aborts every review it joins.',
+  },
+  {
     file: 'specs/harn-opt-3.md',
     re: /RESIDUAL EXPOSURE, STATED/,
     why: 'the scrub of 2026-09-05 changed the tip only; the material is still reachable on the public default branch. If this declaration is tidied away the repo silently starts claiming a closed item again, which is what AC-SEC-9 did until this round (review HIGH-2).',

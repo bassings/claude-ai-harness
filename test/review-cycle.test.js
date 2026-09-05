@@ -2216,7 +2216,9 @@ test('review-cycle.js: a dispatched lens that returns nothing at all ABORTS, rat
     () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'lens-qa': undefined }) }),
     (err) => {
       assert.match(err.message, /lens-qa/, 'must name the lens that vanished')
-      assert.match(err.message, /did not report/i, 'a lens that produced nothing must be named, not silently omitted from the roster')
+      assert.match(err.message, /LensProducedNoReport/, 'a crashed lens is NOT a checkout problem and must not borrow that error name (review F)')
+      assert.doesNotMatch(err.message, /parallel session/, 'and must not send the operator after a cause that does not exist')
+      assert.match(err.message, /re-dispatch|re-run/i, 'the remedy must name the actual remedy')
       return true
     }
   )
@@ -2236,7 +2238,7 @@ test('review-cycle.js: a lens response lacking head_sha_measured ABORTS even if 
     }),
     (err) => {
       assert.match(err.message, /lens-qa/)
-      assert.match(err.message, /did not report/i)
+      assert.match(err.message, /did not report the sha it measured/)
       return true
     }
   )
@@ -2305,8 +2307,124 @@ test('review-cycle.js: a lens-architecture woken only by new_modules records tha
   assert.deepEqual(payload.architecture_trigger_source, ['new-module'])
 })
 
-test('review-cycle.js: when lens-architecture is not triggered at all the field is null, so "not triggered" and "triggered by nothing recorded" stay distinguishable', async () => {
+// Omitted, not null (review I): ledger-append.mjs has additionalProperties:false,
+// so a new workflow writing to an older installed copy of that library would
+// have its ENTIRE record rejected rather than just this field. "Key absent"
+// already means "the lens did not run", so nothing is lost by omitting it.
+test('review-cycle.js: when lens-architecture is not triggered the key is OMITTED, so an older installed ledger writer still accepts the whole line (review I)', async () => {
   const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
-  assert.equal(payload.architecture_trigger_source, null)
+  assert.ok(!('architecture_trigger_source' in payload), 'the key must be absent entirely, not present as null')
+})
+
+// --- Round-one review A: the gate compared two model-authored strings with
+// raw !==, so four benign formats of the CORRECT sha each aborted the run
+// after the full multi-lens budget had already been spent. That is the flaky
+// shape from CLAUDE.md section 11, built into the guard written to fix a
+// different one: a check that fails for reasons unrelated to the defect
+// teaches people to re-run until green.
+for (const [label, value] of [
+  ['the short sha git log --oneline prints', 'abcdef1'],
+  ['an uppercase sha', 'ABCDEF1234567890'],
+  ['a trailing newline, the literal output of a shell-captured git rev-parse', 'abcdef1234567890\n'],
+  ['a leading space', ' abcdef1234567890'],
+]) {
+  test(`review-cycle.js: ${label} describes the CORRECT reviewed tip and must NOT abort (review A)`, async () => {
+    const { result } = await runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        'lens-security': { ...SECURITY_CLEAN, head_sha_measured: value },
+        'lens-qa': { ...QA_CLEAN, head_sha_measured: value },
+      }),
+    })
+    assert.equal(result.telemetry.outcome, 'done')
+  })
+}
+
+test('review-cycle.js: normalisation does not blunt the gate -- a genuinely different tree still aborts, and so does a too-short prefix that could match many commits (review A)', async () => {
+  for (const bad of ['deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', 'abcde']) {
+    await assert.rejects(
+      () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'lens-qa': { ...QA_CLEAN, head_sha_measured: bad } }) }),
+      (err) => { assert.match(err.message, /lens-qa/); return true },
+      `${bad} must still be refused`
+    )
+  }
+})
+
+// --- Round-one review C: the abort threw ABOVE the findings accumulators, so
+// one lens misreporting destroyed every other lens's findings for the round
+// AND the ledger line read "these lenses ran and found nothing". The exact
+// absence-reads-as-success shape this change exists to close, rebuilt inside
+// the fix. The in-file rule at the accumulator declarations said to set them
+// as soon as lensReports exists; it was a comment, so it did not hold.
+test('review-cycle.js: an aborted run still records the findings the other lenses DID report, so a wrong-tree abort cannot read as "ran and found nothing" (review C)', async () => {
+  let caught
+  try {
+    await runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({
+        'lens-security': {
+          verdict: 'FINDINGS',
+          head_sha_measured: 'abcdef1234567890',
+          coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+          findings: [{ severity: 'Critical', claim: 'remote code execution', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f' }],
+        },
+        'lens-qa': { ...QA_CLEAN, head_sha_measured: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' },
+      }),
+    })
+  } catch (e) { caught = e }
+  assert.ok(caught, 'the wrong-tree abort must still fire')
+  const ledgerCalls = caught.calls.filter((c) => c.opts.label === 'ledger:write')
+  assert.equal(ledgerCalls.length, 2, 'a start write and a terminal write must both have happened')
+  const terminal = extractLedgerPayload(ledgerCalls[1].prompt)
+  assert.deepEqual(terminal.lenses_run, ['lens-security', 'lens-qa'], 'both lenses reported, so both must appear')
+  assert.equal(terminal.open_findings.length, 1, 'the Critical finding lens-security DID report must survive the abort, not be destroyed by another lens misreporting its sha')
+  assert.equal(terminal.open_findings[0].severity, 'Critical')
+})
+
+
+// Review B: head_sha_measured is interpolated verbatim into a thrown error that
+// escapes the workflow, so an unbounded model-authored string was a free text
+// channel out of a reviewed diff. The fix is the schema constraint, not
+// escaping at the interpolation site: hex-only and bounded leaves nothing to
+// neutralise. This pins the constraint, which nothing else does.
+test('review-cycle.js: head_sha_measured is constrained to a bounded hex string, so nothing arbitrary can ride into the thrown error text (review B)', async () => {
+  const schema = (await (async () => {
+    const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
+    return calls.find((c) => c.opts.label === 'lens-qa').opts.schema
+  })())
+  const prop = schema.properties.head_sha_measured
+  assert.ok(prop.pattern, 'the field must carry a pattern')
+  assert.ok(prop.maxLength && prop.maxLength <= 64, 'and a bound')
+  const re = new RegExp(prop.pattern)
+  assert.ok(re.test('abcdef1234567890'), 'a real sha must pass')
+  assert.ok(re.test('  abcdef1234567890\n'), 'surrounding whitespace from a shell capture must pass')
+  for (const hostile of ['`id`', '$(whoami)', '/Users/someone/secret', 'a'.repeat(200), 'not-hex-at-all', '']) {
+    assert.ok(!re.test(hostile), `${JSON.stringify(hostile.slice(0, 20))} must be rejected by the pattern`)
+  }
+})
+
+// Review J: a diff that only adds a package was labelled `new-module` in the
+// durable record, which is not what happened, and that branch had no test.
+test('review-cycle.js: a dependency-only diff records new-dependency, not new-module (review J)', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'package.json', status: 'M' }], new_dependency_entries: true },
+    }),
+  })
+  const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.ok(payload.architecture_trigger_source.includes('new-dependency'), 'a dependency addition must be labelled as one')
+  assert.ok(!payload.architecture_trigger_source.includes('new-module'), 'and must NOT claim a new module was added')
+})
+
+test('review-cycle.js: a genuinely new module still records new-module, so the two labels are not simply swapped (review J)', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/newmod/index.js', status: 'A' }], new_modules: true },
+    }),
+  })
+  const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.deepEqual(payload.architecture_trigger_source, ['new-module'])
 })

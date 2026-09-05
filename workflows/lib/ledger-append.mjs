@@ -193,7 +193,7 @@ export const LEDGER_ENTRY_SCHEMA = {
     // rule group woke lens-architecture, because trigger_counts is the
     // deduplicated union of both surfaces and cannot answer it. Without this,
     // AGENT-HARNESS.md's eight-week reversal condition is not computable.
-    architecture_trigger_source: { type: ['array', 'null'], items: { type: 'string', enum: ['arch-glob', 'ui-glob', 'new-module'] } },
+    architecture_trigger_source: { type: ['array', 'null'], items: { type: 'string', enum: ['arch-glob', 'ui-glob', 'new-module', 'new-dependency'] } },
     rule_source: { type: ['string', 'null'], enum: ['repo-tuned', 'harness defaults'] },
     rule_source_overridden_keys: { type: ['integer', 'null'] },
     findings: {
@@ -585,7 +585,15 @@ function collectErrors(entry, schema, pathParts = []) {
     if (propSchema.pattern && value !== null && value !== undefined && !new RegExp(propSchema.pattern).test(value)) {
       errors.push({ pathParts: keyPath, kind: 'pattern', message: `${keyPrefix}: "${value}" does not match ${propSchema.pattern}` })
     }
-    if (propSchema.type === 'array' && propSchema.items && Array.isArray(value)) {
+    // Array.isArray(value) is the gate, NOT propSchema.type === 'array'.
+    // Review round one, finding D: the strict comparison was false for a
+    // union-typed field (type: ['array','null']), so every item constraint on
+    // such a field was declared and never applied -- enum, type, all of it.
+    // Bogus strings, numbers and whole objects validated with zero errors while
+    // the identical probes against a plain-array field errored correctly.
+    // ['x', 'null'] is this file's house style for "not measured", so this was
+    // not one field's bug: every future nullable array inherited it silently.
+    if (propSchema.items && Array.isArray(value)) {
       const itemsSchema = propSchema.items
       if (itemsSchema.type === 'object' || itemsSchema.properties) {
         // Object-item arrays (e.g. findings): recurse fully, including the
@@ -602,8 +610,22 @@ function collectErrors(entry, schema, pathParts = []) {
         value.forEach((item, i) => {
           const itemPath = [...keyPath, i]
           const itemPrefix = pathPartsToPrefix(itemPath)
-          if (itemsSchema.type && typeof item !== itemsSchema.type) {
-            errors.push({ pathParts: itemPath, kind: 'type', message: `${itemPrefix}: expected ${itemsSchema.type}, got ${typeof item}` })
+          // Union item types ('string' OR ['string','null']) -- review round
+          // one, finding D, second instance. `typeof item !== itemsSchema.type`
+          // is ALWAYS true when the declared type is an array, so a union-typed
+          // item schema rejected every element. It never fired only because the
+          // gate above refused to descend into union-typed arrays at all, so
+          // fixing that gate exposed this immediately: open_finding_ids is
+          // declared items:{type:['string','null']} and every legitimate id
+          // suddenly failed. Two halves of one bug; fixing one without the
+          // other turns a silent hole into a loud false alarm.
+          // typeMatches() already handles unions, null and the number/integer
+          // distinction, and is what every other type check in this file uses.
+          // The original hand-rolled `typeof item !== itemsSchema.type` here
+          // was the only site that did not, which is exactly why it was the
+          // only one that got unions wrong.
+          if (!typeMatches(item, itemsSchema.type)) {
+            errors.push({ pathParts: itemPath, kind: 'type', message: `${itemPrefix}: expected ${Array.isArray(itemsSchema.type) ? itemsSchema.type.join(' or ') : itemsSchema.type}, got ${jsonType(item)}` })
           }
           if (itemsSchema.enum && !itemsSchema.enum.includes(item)) {
             errors.push({ pathParts: itemPath, kind: 'enum', message: `${itemPrefix}: "${item}" is not one of ${JSON.stringify(itemsSchema.enum)}` })

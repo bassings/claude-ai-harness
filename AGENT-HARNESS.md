@@ -116,24 +116,38 @@ structural finding on any diff where the `ui` globs are what woke it, narrow its
 UI trigger to `**/components/**` and `**/ui/**`, or drop it and leave the
 on-screen half to `lens-design`.
 
-**It is computable, as of 2026-09-05.** It was not when this condition was
-written, and that gap is worth recording rather than quietly closing. The ledger
-carried `lenses_run` and per-lens findings, so "did it run and did it find
-anything" was answerable, but it carried no changed paths and no rule-group
-attribution, and `trigger_counts['lens-architecture']` is the deduplicated union
-of the architecture and ui hits, so a line could not be classified as
-ui-triggered-alone versus anything else. The condition read as a commitment
-already discharged, which is the same failure as no condition at all.
+**Restated so the ledger can answer it, and honest about what is still missing.**
+The first version of this condition asked whether the lens "returns no
+STRUCTURAL finding", and the ledger cannot answer that: findings records carry
+`severity` and no category, deliberately, because AC-SEC-2 keeps free text out
+of them. Severity IS recorded and enum-constrained, so the condition is:
 
-Each review line now carries `architecture_trigger_source`: an array of
-`arch-glob`, `ui-glob` and `new-module`, recorded where all three inputs are
-already in scope, and `null` when the lens did not run at all so that "not
-triggered" stays distinguishable from "triggered, source unrecorded". The
-eight-week population is the lines whose only entry is `ui-glob`.
+> Over eight weeks, `lens-architecture` returns no finding above `Low` severity
+> on any `review_cycle` line whose `architecture_trigger_source` is exactly
+> `['ui-glob']` **and** whose `outcome` is `done`. If so, narrow its UI trigger
+> to `**/components/**` and `**/ui/**`, or drop it and leave the on-screen half
+> to `lens-design`.
 
-The general rule this came from: **a retirement or reversal condition justified
-by "the ledger already records X" is not finished until someone has checked that
-X actually answers it.** Nobody had.
+The `outcome` clause is load-bearing: `optimise-read.mjs` iterates every
+`review_cycle` record with no outcome filter, so an aborted round would
+otherwise be counted as a clean one.
+
+Each review line carries `architecture_trigger_source` as of 2026-09-05: an
+array of `arch-glob`, `ui-glob`, `new-module` and `new-dependency`, recorded
+where all those inputs are already in scope, and OMITTED entirely when the lens
+did not run. **No line written before 2026-09-05 carries it, so the earliest
+this window can close is 2026-10-31.**
+
+**What is NOT yet built, stated rather than implied:** nothing reads the field.
+`aggregateTriggerAccuracy` looks at `lenses_run`, `trigger_counts` and
+`verdicts` and never touches it, so today the raw line records the attribution
+and no report aggregates it. Running this condition in eight weeks means either
+adding that aggregation first, or reading the lines by hand.
+
+The general rule, which this paragraph has now broken twice in its own history:
+**a retirement or reversal condition justified by "the ledger already records X"
+is not finished until someone has checked that X answers the question, and that
+something actually reads it.** Writing the field is not that check.
 
 **Specialists, invoked as needed**, not part of the standing set.
 `reviewer-verification` (adversarial fresh-eyes pass on review, no plan
@@ -147,6 +161,12 @@ Every lens returns exactly this. No preamble, no summary of the codebase.
 ```
 ### VERDICT
 CLEAN | FINDINGS | BLOCKED
+
+### MEASURED AT                [review mode only]
+<the sha your findings were actually derived from: `git rev-parse HEAD` in the
+tree you read, or the sha you explicitly diffed against. The orchestrator
+compares it to the reviewed tip and refuses the run if they differ, so report
+what you measured, not what you were told to measure.>
 
 ### COVERAGE
 Examined:      <files, paths, commands: be specific>

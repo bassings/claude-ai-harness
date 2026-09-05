@@ -288,7 +288,13 @@ const REVIEW_SCHEMA = {
     // a different commit in all three runs of 2026-09-04/05, and the only
     // defence was a prompt paragraph asking the model to notice and say so.
     // Three for three self-corrected, which is what made it dangerous.
-    head_sha_measured: { type: 'string' },
+    // Constrained, for two reasons. It is compared to the pinned tip, and an
+    // unconstrained string made four benign formats of the CORRECT sha abort
+    // the run (review A). And it is interpolated into a thrown error that
+    // escapes the workflow, so an unbounded model-authored string was a free
+    // text channel out of a reviewed diff (review B). Hex-only and bounded
+    // closes both: there is nothing left to neutralise.
+    head_sha_measured: { type: 'string', pattern: '^\\s*[0-9a-fA-F]{7,40}\\s*$', maxLength: 48 },
     coverage: {
       type: 'object',
       required: ['examined', 'verified_by', 'could_not_check'],
@@ -962,7 +968,11 @@ if (archHit.length || uiHit.length || scope.new_modules || scope.new_dependency_
   architectureTriggerSource = [
     ...(archHit.length ? ['arch-glob'] : []),
     ...(uiHit.length ? ['ui-glob'] : []),
-    ...(scope.new_modules || scope.new_dependency_entries ? ['new-module'] : []),
+    ...(scope.new_modules ? ['new-module'] : []),
+    // Distinct from new-module (review J): a diff that only adds a package was
+    // being labelled "new-module" in the durable record, which is simply not
+    // what happened, and the enum offered no other value.
+    ...(scope.new_dependency_entries ? ['new-dependency'] : []),
   ]
   // Credits whichever surface actually triggered it, deduplicated: a file
   // matching both globs is one file, not two. Still honestly 0 when triggered
@@ -1021,10 +1031,10 @@ const lensPrompt = (lens) =>
   `in your worktree. If it differs, your checkout has drifted from the reviewed tip (a parallel session may have ` +
   `advanced the branch): check out or diff against the pinned SHA explicitly, and record the drift in could_not_check. ` +
   `Review \`git diff ${base}...${scope.head_sha}\`.\n` +
-  `Then report, as head_sha_measured, the sha your findings were ACTUALLY derived from -- normally ${scope.head_sha}. ` +
-  `This is checked mechanically: the orchestrator compares it to the reviewed tip and ABORTS the whole run on a ` +
-  `mismatch or an omission. Do not copy the pinned value in without having reviewed that tree; a review of the wrong ` +
-  `tree reads exactly like a review of the right one, which is why this is verified rather than asked.\n` +
+  `Then report, as head_sha_measured, the full sha your findings were ACTUALLY derived from: the output of ` +
+  `\`git rev-parse HEAD\` in the tree you actually read, or the sha you explicitly diffed against. Report what you ` +
+  `measured, not what you were told to measure. Deliberately not restating the expected value here: it is in the ` +
+  `first line, and repeating it beside the penalty for any other answer is a copy prompt, not a check.\n` +
   `Changed files (${paths.length} total):\n${fileList}\n\n` +
   `${specClause}\n\n` +
   (lens === 'lens-qa' ? qaBudget : '') +
@@ -1052,6 +1062,30 @@ const lensReports = reports.filter(Boolean)
 if (!lensReports.length) return { report: 'Every lens agent failed or was stopped; no review produced.', __outcome: 'aborted' }
 lensesRunRaw = lensReports.map(r => r.lens)
 
+// These two are set HERE, immediately after lensReports exists and ABOVE every
+// check that can throw. Review round one, finding C: the reviewed-tip check was
+// inserted between lensesRunRaw and these assignments, so one lens misreporting
+// its sha destroyed every OTHER lens's findings for the round -- and the ledger
+// line then read "these lenses ran and found nothing". A probe with a Critical
+// security finding and one foreign sha produced lenses_run of both lenses and
+// open_findings of []. That is the absence-reads-as-success shape this whole
+// change exists to close, rebuilt inside the fix for it, and the file's own
+// rule at the accumulator declarations already said not to do it. The rule was
+// a comment; it is now a test.
+// H5: capture every finding each lens reported, as-is, before synthesis
+// dedupes/arbitrates them -- this is the "open" (accepted) side that was
+// previously never recorded at all.
+openFindingsRaw = lensReports.flatMap(r =>
+  (r.findings || []).map(f => ({ lens: r.lens, location: f.location, claim: f.claim, severity: f.severity, ac_id: f.ac_id || null, recurrence: f.recurrence || null }))
+)
+
+// H4: {ac_id, verdict} ONLY -- evidence text is dropped here, before the
+// payload is ever built, preserving the same AC-SEC-2 exclusion the
+// findings pipeline already holds to.
+acVerdicts = lensReports.flatMap(r =>
+  (r.ac_verdicts || []).map(v => ({ ac_id: v.id, verdict: v.verdict }))
+)
+
 // ---- the reviewed-tip check: mechanical, fail-closed ----
 // Every lens must state the sha its findings came from, and it must be the tip
 // this run pinned. An ABSENT value is treated as a mismatch, never as
@@ -1074,36 +1108,49 @@ lensesRunRaw = lensReports.map(r => r.lens)
 // never made it into lensReports at all.
 const reported = new Set(lensReports.map(r => r.lens))
 const vanished = lenses.filter(l => !reported.has(l))
-const tipMismatches = [
-  ...vanished.map(l => `${l} was dispatched but returned no usable report, so it did not report the sha it measured`),
-  ...lensReports
-    .filter(r => typeof r.head_sha_measured !== 'string' || r.head_sha_measured !== scope.head_sha)
-    .map(r => (typeof r.head_sha_measured !== 'string' || !r.head_sha_measured
-      ? `${r.lens} did not report the sha it measured`
-      : `${r.lens} measured ${r.head_sha_measured}`)),
-]
-if (tipMismatches.length) {
+
+// Both sides are model-transcribed from `git rev-parse HEAD`, so compare them
+// as shas rather than as strings (review A). Raw !== rejected the short sha git
+// log prints, an uppercase sha, a trailing newline (the literal output of a
+// shell capture) and a leading space -- four spellings of the CORRECT commit,
+// each aborting a run after the whole multi-lens budget was already spent.
+// That is the flaky shape from CLAUDE.md section 11, inside a guard written to
+// fix a different one.
+//
+// A prefix of at least 7 hex characters is git's own abbreviation floor, so
+// this accepts what git prints and nothing looser: 'abcde' is still refused,
+// and a genuinely different tree is still refused.
+const normaliseSha = (v) => (typeof v === 'string' ? v.trim().toLowerCase() : null)
+const pinnedSha = normaliseSha(scope.head_sha)
+// Written as a single expression deliberately: `return` inside a helper here is
+// indistinguishable, to the AC-QA-9 static guard, from a new exit path out of
+// run() itself. That guard is a change detector for unpaired exits and is worth
+// more than the readability of an early return.
+const shaAgrees = (v) => ((got) => Boolean(got) && Boolean(pinnedSha) && /^[0-9a-f]{7,40}$/.test(got)
+  && (got.length <= pinnedSha.length ? pinnedSha.startsWith(got) : got.startsWith(pinnedSha)))(normaliseSha(v))
+
+// Split by CAUSE, because the two shapes need different remedies (review F).
+// Telling an operator whose lens merely crashed to "let a parallel session
+// settle" sends them after a cause that does not exist.
+const wrongTree = lensReports.filter(r => !shaAgrees(r.head_sha_measured))
+if (wrongTree.length) {
   throw new Error(
-    `ReviewedTipMismatch: this run pinned ${scope.head_sha}, but ${tipMismatches.join('; ')}. ` +
-    `A review of a different tree reads exactly like a review of the reviewed one, so the run is refused rather ` +
-    `than reported with a caveat. Re-run the review cycle; if a parallel session is advancing this branch, let it ` +
-    `settle first.`
+    `ReviewedTipMismatch: this run pinned ${pinnedSha}, but ` +
+    wrongTree.map(r => (typeof r.head_sha_measured === 'string' && r.head_sha_measured
+      ? `${r.lens} measured ${normaliseSha(r.head_sha_measured)}`
+      : `${r.lens} did not report the sha it measured`)).join('; ') +
+    `. A review of a different tree reads exactly like a review of the reviewed one, so the run is refused rather ` +
+    `than reported with a caveat. If a parallel session is advancing this branch, let it settle and re-run.`
   )
 }
-
-// H5: capture every finding each lens reported, as-is, before synthesis
-// dedupes/arbitrates them -- this is the "open" (accepted) side that was
-// previously never recorded at all.
-openFindingsRaw = lensReports.flatMap(r =>
-  (r.findings || []).map(f => ({ lens: r.lens, location: f.location, claim: f.claim, severity: f.severity, ac_id: f.ac_id || null, recurrence: f.recurrence || null }))
-)
-
-// H4: {ac_id, verdict} ONLY -- evidence text is dropped here, before the
-// payload is ever built, preserving the same AC-SEC-2 exclusion the
-// findings pipeline already holds to.
-acVerdicts = lensReports.flatMap(r =>
-  (r.ac_verdicts || []).map(v => ({ ac_id: v.id, verdict: v.verdict }))
-)
+if (vanished.length) {
+  throw new Error(
+    `LensProducedNoReport: ${vanished.join(', ')} ${vanished.length === 1 ? 'was' : 'were'} dispatched but returned ` +
+    `no usable report, so ${vanished.length === 1 ? 'its' : 'their'} share of this review did not happen and the ` +
+    `remaining verdicts cover less than they appear to. This is a lens failure, NOT a checkout problem: re-dispatch ` +
+    `or re-run. The findings the other lenses did report are already recorded in this round's ledger line.`
+  )
+}
 
 // AC-SIMP constraints are mechanical: checked directly against the diff, not by an agent lens (harness rule)
 let simpCheck = null
@@ -1252,7 +1299,14 @@ const telemetry = {
   lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],
   trigger_counts: triggerCounts,
-  architecture_trigger_source: architectureTriggerSource,
+  // Omitted entirely, not written as null, when lens-architecture did not run
+  // (review I). ledger-append.mjs has additionalProperties:false, so a NEW
+  // workflow writing to an OLDER installed copy of that library has its whole
+  // record rejected, not just this field -- losing 100% of review telemetry,
+  // which this repo has been bitten by before. Omitting keeps an old writer
+  // accepting the line unchanged, and "key absent" already means "the lens did
+  // not run", so nothing is lost.
+  ...(architectureTriggerSource ? { architecture_trigger_source: architectureTriggerSource } : {}),
   verdicts: result.verdicts || {},
   spec_bug_count: specBugCount,
   rejected_finding_count: rejectedFindingCount,
