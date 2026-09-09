@@ -85,7 +85,44 @@ test('conduct-plan prior_findings protection: SKILL.md names at least one WRITE 
   const skill = readSkill()
   const targets = new Set(writeTargets(skill))
   assert.ok(targets.size > 0, 'expected at least one WRITE TARGET tag in SKILL.md')
-  assert.deepEqual([...targets], ['.claude/conductor-prior-findings.json'], `every WRITE TARGET in SKILL.md must be the untracked prior_findings store, got: ${[...targets].join(', ')}`)
+  assert.deepEqual([...targets].sort(), ['.claude/blocked-on-human', '.claude/conductor-prior-findings.json'], `every WRITE TARGET in SKILL.md must be one of the two untracked conductor stores, got: ${[...targets].join(', ')}`)
+})
+
+// Split SKILL.md into its top-level numbered steps. Each WRITE TARGET tag
+// lives inside exactly one of them, which is the unit a conducting agent
+// actually reads and follows before it writes.
+function numberedSteps(text) {
+  return text.split(/(?=^\d+\. \*\*)/m)
+}
+
+test("conduct-plan store protection: the step that instructs a write also instructs the ensure-ignored check, so the protection travels to a delivery repo rather than resting on THIS repo's .gitignore", () => {
+  // Review finding F1, and the mutation that motivated this test: deleting the
+  // ensure-ignored requirement from step 5 left the whole suite green, because
+  // the existing static check only greps the WHOLE file for `check-ignore`,
+  // which the prior_findings section still supplied. A per-step check is what
+  // makes the guard fail when a NEW write instruction is added without it --
+  // and a new write instruction added without it is exactly how this defect
+  // arrived, twice.
+  const skill = readSkill()
+  const stepsWithWrites = numberedSteps(skill).filter((step) => writeTargets(step).length > 0)
+  assert.ok(stepsWithWrites.length >= 2, `expected at least the two write-bearing steps, found ${stepsWithWrites.length}`)
+  for (const step of stepsWithWrites) {
+    const heading = step.split('\n')[0].trim()
+    const targets = writeTargets(step)
+    // Review round two, L2: this was `/ensure-ignored/.test(step)`, a
+    // presence-of-a-phrase check over a whole numbered step. Step 2 runs to
+    // roughly 190 lines and already contains the phrase, so a SECOND write
+    // instruction added there -- the likeliest place, since the prior_findings
+    // machinery lives in it -- would have satisfied the test while carrying no
+    // check of its own. That is the incidentally-passing shape this test's own
+    // comment argues against, in the test written to argue it. Counting is
+    // what the sibling assertion eight lines above already does.
+    const mentions = (step.match(/ensure-ignored/g) || []).length
+    assert.ok(
+      mentions >= targets.length,
+      `the step "${heading}" carries ${targets.length} write instruction(s) (${targets.join(', ')}) but only ${mentions} ensure-ignored requirement(s); each write needs its own, or a second write added here inherits the first one's check without having been given one`,
+    )
+  }
 })
 
 test('conduct-plan prior_findings protection: every WRITE TARGET named in SKILL.md is genuinely git-ignorable via the documented mechanism, in a throwaway repo that starts with no .gitignore entry for it at all (fix round 4, finding 1 -- this is NOT claude-ai-harness, so a protection that only worked here would not be caught)', () => {
@@ -133,6 +170,22 @@ test('conduct-plan prior_findings protection: the Done step (step 6) prunes THIS
   assert.ok(/<plan file>:/.test(doneBlock), 'step 6 must scope the prune to keys prefixed by <plan file>:, not the whole store')
   assert.ok(/untouched|left as is|not.*delete/i.test(doneBlock), 'step 6 must state that another plan\'s entries are left alone, not wiped along with this one')
   assert.equal(writeTargets(doneBlock).filter((t) => t === '.claude/conductor-prior-findings.json').length, 1, 'step 6 must carry its own WRITE TARGET tag for the pruned write-back')
+})
+
+test("conduct-plan store protection: the Done step (step 6) also deletes .claude/blocked-on-human, the instruction the skill itself records as having been missed once already", () => {
+  // Review round two, M4. Step 6 owns two cleanups and only one was guarded.
+  // The note's WRITE TARGET tag lives in step 5, so neither the tag-set
+  // assertion nor the per-step ensure-ignored test can see this instruction:
+  // deleting it changed nothing any test read. The failure it guards against
+  // is a leftover note parking the NEXT plan conducted in this repo, silently,
+  // because the file is ignored and so never appears in `git status`.
+  const skill = readSkill()
+  const doneIdx = skill.indexOf('6. **Done?**')
+  const disciplineIdx = skill.indexOf('## Discipline')
+  assert.ok(doneIdx !== -1 && disciplineIdx > doneIdx, 'could not locate the Done step (step 6)')
+  const doneBlock = skill.slice(doneIdx, disciplineIdx)
+  assert.ok(doneBlock.includes('.claude/blocked-on-human'), 'step 6 must name the blocked-on-human note')
+  assert.ok(/delete/i.test(doneBlock.slice(0, doneBlock.indexOf('.claude/blocked-on-human') + 200)), 'step 6 must instruct a DELETE of the note, not merely mention it')
 })
 
 // Fix round 4, found while verifying the round's own mutation proof: the
