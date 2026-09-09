@@ -485,12 +485,39 @@ force-push and deletion prohibitions are all back on. Verified from a FRESH
 CLONE of the public repository, not from the local copy: zero occurrences across
 every ref, every diff and every commit message.
 
-**What is left, and it is not nothing.** GitHub retains unreferenced objects for
-a period and serves them to anyone who already recorded a specific commit
-identity. Nobody had forked, starred or watched this repository at any point, so
-there is no evidence anyone did, but absence of evidence is the argument this
-harness exists to distrust. A rewrite reduces this exposure; it does not prove
-it closed. Anyone holding a pre-rewrite clone still holds the original.
+**What was left, and it was more than this section said. Corrected 2026-09-10.**
+
+The paragraph here used to say GitHub "retains unreferenced objects for a
+period" and serves them to anyone who "already recorded a specific commit
+identity". Both halves understated it, and the verification above understated
+what it had measured.
+
+Measured on 2026-09-10, three weeks later: the pre-rewrite commit was still
+being served over plain HTTPS, and its version of the file still contained the
+line. Not for a period, and not only to someone who had recorded the identity.
+GitHub keeps every commit that was ever part of a PULL REQUEST alive under
+`refs/pull/*`, which a force-push cannot touch and which a normal clone does
+not fetch. So the fresh-clone check above was true and incomplete, and it read
+as complete: the objects were reachable the whole time by anyone who ran one
+`git fetch` for those refs.
+
+That is the same class of error as the tip-only scrub described below, one
+level up: a check that cannot see the place the data actually survives, whose
+green result was reported as closure. The lesson is not "verify from a fresh
+clone", it is that a clone is a sample of the refs the server chooses to
+advertise, so verifying against it measures the sample and not the store.
+
+**What closed it.** On 2026-09-10 the owner chose to delete and re-create the
+repository, which is the only route that removes `refs/pull/*` without asking
+GitHub Support. Verified afterwards by four independent means: the raw HTTPS
+URL that had returned the line minutes earlier returned 404, the commit API
+returned "No commit found for SHA", the repository advertised zero pull refs,
+and a fresh clone with every ref fetched showed zero occurrences across 353
+blobs and every commit message. A complete archive, including the pull refs,
+was taken first and its restorability checked before anything was deleted.
+
+**Still true:** anyone holding a pre-rewrite clone still holds the original,
+and that cannot be undone by anything done here.
 
 **One unredacted copy exists deliberately**, a local mirror taken before the
 rewrite. It is off the network and is the only rollback path if this rewrite
@@ -498,7 +525,8 @@ turns out to have damaged something. It is not published and must not be.
 
 **The structural cause, which outlives this incident:** every leak guard in this
 repo reads `git ls-files`, so all of them measure the working tree and none has
-ever looked at a commit older than HEAD. A tip-only scrub therefore passes every
+ever looked at a commit older than HEAD, nor at a ref the server holds but a
+clone does not fetch. A tip-only scrub therefore passes every
 check and reads exactly like a redaction. That is why the first attempt at this
 scrub was recorded as complete when it had changed nothing anyone could not
 still read, and it is why the 2026-08-18 redaction this one copied as its
