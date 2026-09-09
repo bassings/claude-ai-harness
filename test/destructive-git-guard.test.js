@@ -718,8 +718,14 @@ test('destructive-git-guard: a leaked GIT_DIR/GIT_WORK_TREE pointed at a second,
 test('destructive-git-guard AC-ARCH-3: every hooks/*.py that shells out to git strips the GIT_* namespace to the SAME allowlist as test/helpers/git-env.js', () => {
   const { GIT_ENV_ALLOWLIST } = require('./helpers/git-env.js')
   const hooksDir = path.join(__dirname, '..', 'hooks')
-  const pyFiles = fs.readdirSync(hooksDir).filter((f) => f.endsWith('.py'))
-  assert.ok(pyFiles.length >= 2, `sanity: expected at least 2 hooks/*.py files, found ${pyFiles.length}`)
+  const allPy = fs.readdirSync(hooksDir).filter((f) => f.endsWith('.py'))
+  // A hook's own TESTS are not hooks. They run git deliberately, in throwaway
+  // repos they created, and a GIT_ENV_ALLOWLIST constant in a test file would
+  // be meaningless. Excluded by name rather than by content so the exclusion
+  // is visible; the floors below stop the filter from quietly emptying out.
+  const pyFiles = allPy.filter((f) => !f.startsWith('test_'))
+  assert.ok(allPy.length > pyFiles.length, 'sanity: expected at least one hooks/test_*.py, so this exclusion is doing something and is not silently a no-op')
+  assert.ok(pyFiles.length >= 2, `sanity: expected at least 2 non-test hooks/*.py files, found ${pyFiles.length}`)
 
   const gitInvoking = pyFiles.filter((f) => {
     const src = fs.readFileSync(path.join(hooksDir, f), 'utf8')

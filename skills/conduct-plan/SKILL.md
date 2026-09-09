@@ -184,7 +184,7 @@ rather than narrating a condition that does not apply here.
      verbatim pass-through is what makes that true), so the two records can
      be joined by a reader -- this is the join, not new proof of repair.
    - `in-review` clean + user's merge policy allows → merge → `merged`,
-     tick the box. If merging needs the user, mark blocked-on-human.
+     tick the box. If merging needs the user, record the block per step 5.
 3. **Log the tick**: append one line to `## Conductor log`: what changed,
    what is armed, what the next wake expects to find.
    Also log task-level state transitions to the run ledger, so wall-clock can
@@ -230,16 +230,75 @@ rather than narrating a condition that does not apply here.
    If nothing external is in flight but tasks remain, act on them now rather
    than stopping. Under /loop, always ScheduleWakeup: match the delay to the
    slowest thing you are waiting on, 1200s+ as a pure heartbeat.
-5. **Blocked on the human?** Add `status: blocked-on-human: <the specific
-   question>` at the start of its own line, ABOVE the `## Conductor log`
-   heading (the plan's frontmatter or just under its title -- never
-   appended to the log itself, which step 3 has you writing to every tick).
-   The plan-guard Stop hook only reads a line-start status above that
-   heading as a LIVE block; one below it, or not at the start of its own
-   line, reads as history and the hook refuses to let you stop. Ask the
-   question in your reply, and stop. Remove that line the moment the answer
-   arrives.
-6. **Done?** All boxes ticked: delete `<repo>/.claude/active-plan`. Also
+
+   **The watcher has to be one the harness can see.** The Stop hook counts a
+   background task as armed only while that task has not yet reported a
+   terminal status; work detached with a bare `&`, or launched from inside
+   another command, arms NOTHING, because there is no task id for the hook
+   to correlate a completion against. If you must detach, wrap it in a
+   tracked background task that blocks until the work is finished, e.g.
+   `while kill -0 <pid> 2>/dev/null; do sleep 10; done`.
+
+   Do NOT write that wait as `pgrep -f "<pattern>"`. Two ways it goes wrong,
+   and both look like success. The watcher's own command line contains the
+   pattern, so `pgrep -f` matches the watcher itself and the loop never
+   ends; the usual dodge, bracketing a character as `[p]attern`, avoids that
+   but then exits instantly the moment the pattern misses -- including
+   before the work has started -- which reads to the hook as a completed
+   watch over work that never ran. A pid is unambiguous; a pattern is not.
+5. **Blocked on the human?** Record the block, ask the question in your
+   reply, and stop. **Delete the file the moment the answer arrives** --
+   while it exists and names this plan, the guard lets every tick stop, so a
+   stale one silently parks the plan.
+
+   **Never put this in the plan file.** The plan lives under `specs/`, which
+   is TRACKED, so a note written there gets committed and shared, and nothing
+   then removes it from the history. Reported 2026-09-10 from a real conducted
+   session: the note merged to master, an hourly status routine read it FROM
+   THE REPOSITORY and told the owner the work was stalled, when the decision
+   had been made and the work had moved on three merges. The agent never
+   noticed; the owner found out from the alert. This repo did the same thing
+   twice on 2026-09-05, to a PUBLIC remote. The plan-guard Stop hook enforces
+   this: a `status: blocked-on-human` line left in the plan file no longer
+   allows a stop, it REFUSES one and names the right location, so the old
+   habit fails loudly rather than quietly doing the wrong thing.
+
+   Mechanical steps, in order:
+
+   a. Run the SAME ensure-ignored check the `prior_findings` section above
+      specifies (its lettered steps a-c), with `.claude/blocked-on-human` as
+      the path instead of `.claude/conductor-prior-findings.json`. The harness
+      install never installs a `.gitignore` into a delivery repo, so a
+      conductor running in an operator's real repo finds this path genuinely
+      untracked but NOT ignored: one ordinary `git add -A` away from being
+      committed, which is the exact mechanism that committed
+      `.claude/active-plan` on 2026-09-05.
+   b. If it does not report `ignored: true`: **do not write the file at all.**
+      Ask the question in your reply and let the guard keep refusing the stop.
+      A nagging guard is a far smaller cost than a note committed to a shared
+      branch. Note the anomaly (`the blocked-on-human note is not gitignored
+      in this repo: <error>`) in this tick's log entry.
+   c. Otherwise write a single line of the form
+      `<plan file>: <the specific question>`, repo-relative plan path first
+      (e.g. `specs/harn-next.md: which control owns the old button?`)
+      (WRITE TARGET: `.claude/blocked-on-human`). **The plan path is not
+      decoration.** The hook ignores a note that names a different plan, and
+      refuses the stop naming the stale file, because this file outlives the
+      plan that wrote it and is ignored, so unlike the old in-plan marker it
+      never shows up in `git status` to prompt anyone. Without the scope, one
+      forgotten note parks every later plan in the repo indefinitely, with an
+      allow message no one can tell apart from a real block.
+
+   The hook also refuses a symlink at that path, ignores an empty or
+   whitespace-only file, reads at most 4096 bytes, and strips control
+   characters before quoting the note back.
+
+6. **Done?** All boxes ticked: delete `<repo>/.claude/active-plan`, and
+   delete `<repo>/.claude/blocked-on-human` if it exists. That second
+   delete is not housekeeping: the note is not scoped to a session and
+   outlives the plan, so a leftover one parks the NEXT plan conducted in
+   this repo, silently. Same diagnosis as the prune below, same file, and
+   it was missed once already. Also
    prune this plan's own entries from `.claude/conductor-prior-findings.json`
    (fix round 4, finding 3): the data exists to bridge the few minutes
    between two review rounds for a task still in flight, but nothing ever
@@ -264,7 +323,7 @@ rather than narrating a condition that does not apply here.
   before advancing the task's state.
 - Never mark `merged` from memory; only from `gh pr view <n>`.
 - **Rework circuit-breaker. Count rounds in the conductor log and obey the
-  count.** Stop and mark `status: blocked-on-human` with the frame question,
+  count.** Stop and record the block (step 5) with the frame question,
   rather than iterating, at whichever of these comes first:
   - **three fix rounds on one task** (the original rule), or
   - **the first time a review round finds a defect that the previous

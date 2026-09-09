@@ -33,3 +33,13 @@ coverage/
 # only the relative path. Untracked from here so the accident cannot recur.
 .claude/active-plan
 .claude/conductor-prior-findings.json
+
+# The conductor's "waiting on a human" note. It used to live in the plan file
+# under specs/, which is TRACKED: reported 2026-09-10 after one merged to a
+# master branch, where an hourly status routine read it FROM THE REPOSITORY
+# and reported work stalled that had in fact moved on three merges. This repo
+# pushed the same marker to a public remote twice on 2026-09-05. It is
+# machine- and moment-specific by construction, so a clone must never carry
+# it, and ignoring it is what makes the mistake impossible rather than
+# discouraged.
+.claude/blocked-on-human

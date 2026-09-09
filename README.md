@@ -354,7 +354,7 @@ conductor pieces make that state unrepresentable:
   mechanically: while `<repo>/.claude/active-plan` points at a plan with
   open tasks, a stop with no wake source armed that turn is blocked with
   instructions. Every allowed stop now states which of ten conditions
-  applied (armed, `status: blocked-on-human`, the `stop_hook_active` escape
+  applied (armed, a live `.claude/blocked-on-human` note, the `stop_hook_active` escape
   hatch, a bystander session, and others) via `systemMessage`, landing in
   the session record; only a stop with no `.claude/active-plan` marker at
   all stays silent, since that path fires on every ordinary stop, plan or
