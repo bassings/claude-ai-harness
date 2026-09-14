@@ -54,6 +54,13 @@ Then run the workflows namespaced:
 
 ```bash
 git clone https://github.com/bassings/claude-ai-harness
+claude-ai-harness/bin/install.sh            # install, then verify
+claude-ai-harness/bin/install.sh --check    # verify only, non-zero on drift
+
+# What that does, if you would rather run it by hand. Prefer the script: it
+# installs exactly what workflows/lib/install-consistency.mjs calls the
+# consumer subset, skips anything the repo does not track (so build output
+# never lands in your harness), and verifies the result. These commands do not.
 cp claude-ai-harness/agents/*.md ~/.claude/agents/
 cp -r claude-ai-harness/workflows/. ~/.claude/workflows/
 cp -r claude-ai-harness/skills/. ~/.claude/skills/
@@ -81,7 +88,14 @@ is invisible to it (see the next section) -- and in any project:
 
 ### Making a change live: copying the files is not deploying them (AC-OPS-4)
 
-`cp -r` distributes **source**. It does not deploy. The two halves of
+The harness RUNS from `~/.claude`, not from your checkout, so a change can
+merge, pass every test and change nothing on a real run. Measured 2026-09-14:
+two merged PRs had not reached the install. Run `bin/install.sh`; `--check`
+writes nothing and exits non-zero when the install is behind, so it suits a
+hook. What it installs is decided by `workflows/lib/install-consistency.mjs`,
+the same module the weekly drift check reads.
+
+Copying **source** is not deploying. The two halves of
 `workflows/` reach a running session by different routes, they go live at
 different moments, and the gap between them is the failure mode this section
 exists to prevent.
@@ -112,11 +126,18 @@ no filesystem access, so it instructs an agent to shell out to
 process starts, so a copied `.mjs` is live on the very next run, in the same
 session.
 
-Nothing detects this for you. The `schema_version` staleness signal described
-further down does **not** detect a stale top-level workflow script: that fix
-class bumps no `SCHEMA_VERSION` and adds no ledger field, so a session running
-last week's `plan-cycle.js` produces a ledger indistinguishable from a current
-one. The restart is the control; there is no alarm behind it.
+`bin/install.sh --check` detects the file-level half of this: it compares every
+file in the consumer subset and exits non-zero when the install is behind. What
+it cannot see is a session that ALREADY loaded a stale script before you
+re-installed; only a restart fixes that.
+
+The `schema_version` staleness signal described further down does **not** detect
+a stale top-level workflow script either: that fix class bumps no
+`SCHEMA_VERSION` and adds no ledger field, so a session running last week's
+`plan-cycle.js` produces a ledger indistinguishable from a current one. So the
+two signals cover different things -- `--check` compares files on disk, the
+schema version compares what a run wrote -- and neither covers an already-loaded
+script. The restart is still the control there.
 
 So there are two rules, and they are not the same rule:
 
