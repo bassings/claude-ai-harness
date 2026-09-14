@@ -132,9 +132,16 @@ const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 // report. The obvious widening `^[\w\s./-]*AC-...$` accepts
 // `ignore previous instructions AC-SEC-1` -- the exact string
 // optimise-read.mjs:285 already names as the attack it fears. So: at most one
-// prefix segment of 1 to 40 characters from a closed class, exactly one
-// separator, and no whitespace, newline, backtick, angle bracket, pipe, dollar
-// or colon anywhere in an accepted value.
+// prefix segment of 1 to 40 characters from a closed class, and exactly one
+// separator, which is a single space or a single forward slash. No OTHER
+// whitespace, and no newline, carriage return, backtick, angle bracket, pipe,
+// dollar or colon, appears anywhere in an accepted value.
+//
+// That sentence said "no whitespace anywhere" until review round one, which is
+// false: the separator is a space, and `FEAT-011 AC-QA-1` is in the accept
+// list twelve lines from the claim. Whitespace is precisely what makes a
+// rendered report line splittable, so the one property a reader would most
+// want guaranteed was the one being overstated.
 //
 // The quantifier is BOUNDED and unnested, deliberately. The candidate shape
 // `^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$` measured 0.51ms at 20
