@@ -27,7 +27,8 @@ const APPEND_MODULE_URL = pathToFileURL(APPEND_SCRIPT).href
 // helper and removed here, once, after the whole file's tests finish.
 test.after(cleanupTempRepos)
 
-test('ledger-append: first write creates .claude/ and the ledger file, and reports write_ok true', () => {
+test('ledger-append: first write creates .claude/ and the ledger file, and reports write_ok true', async () => {
+  const { SCHEMA_VERSION } = await import(APPEND_MODULE_URL)
   const repo = makeTempRepo()
   const res = runAppend(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
   assert.equal(res.status, 0, res.stderr)
@@ -38,9 +39,13 @@ test('ledger-append: first write creates .claude/ and the ledger file, and repor
   const entry = JSON.parse(lines[0])
   assert.equal(entry.kind, 'tdd_task')
   assert.equal(entry.outcome, 'done')
-  // HARN-OPT-2 PR1: bumped from 1 -- plan_key is a genuine shape change,
-  // and AC-OPS-4 needs a stale installed writer to be detectable from it.
-  assert.equal(entry.schema_version, 2)
+  // Read from the exported constant rather than hardcoded. The number has now
+  // been bumped twice (1 to 2 for plan_key, 2 to 3 for the validator changes),
+  // and each time a hardcoded copy here failed for no reason anyone cares
+  // about. What this test is FOR is that the writer stamps its own version
+  // over whatever the caller supplied -- above, the caller said 1.
+  assert.equal(entry.schema_version, SCHEMA_VERSION)
+  assert.notEqual(entry.schema_version, 1, 'and it is not the caller-supplied value')
   assert.ok(entry.run_id)
   assert.ok(entry.ts)
 })
@@ -4250,4 +4255,68 @@ test('ledger-append (AC-SEC-6, D3): a secret routed through a finding\'s lens ne
   assert.equal(entry.findings_by_lens['lens-qa'].open, 1)
   assert.equal(entry.findings_by_lens.unattributed.open, 1,
     'and the unparseable one is COUNTED, not silently dropped -- dropping it would be this spec\'s own defect recurring inside its own fix')
+})
+
+test('ledger-append (H2): an ac_id is LENGTH-BOUNDED, so one long id cannot erase an entire review record', async () => {
+  // Review round one, High. Both [A-Z0-9]* and [0-9]+ were unbounded, so
+  // `AC-QA-` + 4090 digits validated. Measured end to end: six such ids on one
+  // record produced a 210-byte envelope-only line -- degraded:true, every
+  // verdict, every finding, lenses_run, trigger_counts and findings_by_lens
+  // gone -- and the write still reported success. A lens report is untrusted
+  // model output, so one long id in it could erase a whole round from the only
+  // delivery-telemetry store, and the optimiser would then read zero for that
+  // round: exactly the "zero is indistinguishable from it-never-happened"
+  // defect this spec exists to remove, reproduced inside its own fix.
+  //
+  // The bound lives in the PATTERN because it is the only enforcement point
+  // that runs: collectErrors implements type, enum, pattern and array items
+  // only. A maxLength declaration would be silently ignored -- the schema's
+  // existing minLength:1 on run_id accepts the empty string today.
+  const re = await acIdPattern()
+  assert.equal(re.test('AC-QA-' + '1'.repeat(4090)), false, 'an unbounded id must be rejected')
+  assert.equal(re.test('AC-' + 'Q'.repeat(200) + '-1'), false, 'an unbounded lens segment must be rejected')
+  assert.equal(re.test('x'.repeat(4000) + ' AC-QA-1'), false, 'an unbounded prefix must be rejected')
+  // Still accepts every realistic form.
+  for (const v of NEW_AC_ID_ACCEPTS) assert.ok(re.test(v), `must still accept ${v}`)
+  assert.ok(re.test('AC-QA-123456'), 'a realistically long criterion number still validates')
+})
+
+test('ledger-append (H2): an oversized ac_id is quarantined and the record survives INTACT -- no degrade, nothing dropped', () => {
+  const repo = makeTempRepo()
+  const huge = 'AC-QA-' + '1'.repeat(4090)
+  const res = runAppend(repo, {
+    schema_version: 1, kind: 'review_cycle', outcome: 'done',
+    ac_verdicts: [{ ac_id: huge, verdict: 'PASS' }, { ac_id: 'AC-QA-1', verdict: 'FAIL' }],
+    open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'x' }],
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(!entry.degraded, 'the record must NOT collapse to the envelope-only form')
+  assert.equal(entry.ac_verdicts.length, 2, 'both verdicts survive')
+  assert.equal(entry.ac_verdicts[0].ac_id, null, 'the oversized one is nulled')
+  assert.equal(entry.ac_verdicts[1].ac_id, 'AC-QA-1', 'and the good one is untouched')
+  assert.equal(entry.findings.length, 1, 'the findings survive')
+  assert.ok(entry.invalid_ac_ids_dropped >= 1)
+})
+
+test('ledger-append (M7): SCHEMA_VERSION is 3, so a window spanning this change can tell the two populations apart', async () => {
+  // Planning decision 5, and it was not built in the first pass. Without it a
+  // 90-day window mixes lines written before and after four validator changes
+  // with nothing to separate them: a line with no findings_by_lens could be a
+  // quiet round or a stale writer, and an ac_id that is null could be a real
+  // absence or the old pattern rejecting a legitimate value. The reader
+  // already tallies schema_version without rejecting any, so the bump costs
+  // nothing and makes the two readable apart.
+  const { SCHEMA_VERSION } = await import(APPEND_MODULE_URL)
+  assert.equal(SCHEMA_VERSION, 3)
+})
+
+test('ledger-append (M7): the written line carries the new version, not the caller-supplied one', () => {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done' })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(JSON.parse(readLedgerLines(repo)[0]).schema_version, 3,
+    'the writer stamps its own version; a caller cannot claim to be a different one')
 })

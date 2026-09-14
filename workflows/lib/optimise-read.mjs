@@ -222,9 +222,35 @@ export function sortRecordsByTime(records) {
   })
 }
 
-function bumpDisposition(counts, lens, disposition) {
+// H1: `by` defaults to 1 so every existing per-finding call site is unchanged;
+// the pre-truncation tally supplies a real count instead.
+function bumpDisposition(counts, lens, disposition, by = 1) {
   if (!counts[lens]) counts[lens] = { fixed: 0, rejected: 0, spec_bug: 0, open: 0 }
-  if (disposition in counts[lens]) counts[lens][disposition] += 1
+  if (disposition in counts[lens]) counts[lens][disposition] += by
+}
+
+const DISPOSITIONS = new Set(['open', 'rejected', 'spec_bug', 'fixed'])
+
+// H3: strip a leading spec prefix from an ac_id, but ONLY when it names the
+// record's own spec.
+//
+// The prefix is how a lens disambiguates when one review spans several specs,
+// and it is carried inside ac_id deliberately (a separate field would let the
+// same attribution arrive in two shapes). But two citation forms of ONE
+// criterion must aggregate to one bucket, or a criterion that failed under one
+// form is reported as never having failed under the other.
+//
+// Matched against the spec's basename without extension, which is the form a
+// lens actually emits ("FEAT-011 AC-QA-1" for specs/FEAT-011.md). Anything
+// else is left exactly as it arrived: an unrecognised prefix is a different
+// criterion, not a malformed one, and guessing would merge buckets that must
+// stay apart.
+function stripOwnSpecPrefix(acId, planKey) {
+  if (typeof acId !== 'string' || typeof planKey !== 'string') return acId
+  const m = /^(.*)[ /](AC-[A-Z][A-Z0-9]*-[0-9]+)$/.exec(acId)
+  if (!m) return acId
+  const base = planKey.replace(/^.*\//, '').replace(/\.[^.]*$/, '')
+  return base && m[1] === base ? m[2] : acId
 }
 
 // HARN-OPT-2 PR1 (AC-ARCH-1, AC-ARCH-4): the ONE place every plan-keyed
@@ -335,7 +361,44 @@ export function aggregateRework(records, { root = '' } = {}) {
     if (typeof r.invalid_fixed_ids_dropped === 'number') invalidFixedIdsDropped += r.invalid_fixed_ids_dropped
     if (typeof r.duplicate_fixed_ids_dropped === 'number') duplicateFixedIdsDropped += r.duplicate_fixed_ids_dropped
     if (typeof r.invalid_prior_ids_dropped === 'number') invalidPriorIdsDropped += r.invalid_prior_ids_dropped
-    for (const f of r.findings || []) {
+    // H1 (review round one, specs/harn-ledger-validators.md): prefer the
+    // writer's own pre-truncation tally. `r.findings` is capped at
+    // MAX_FINDINGS and shrunk further by the byte loop, so recomputing from it
+    // undercounts by up to 82% on the busiest rounds -- measured: a 40-finding
+    // round reported 15. The writer now records findings_by_lens BEFORE any
+    // truncation; not reading it left the correct number stored in a field
+    // nothing read, which is worse than an open gap because the next reader of
+    // the code concludes the defect is closed.
+    //
+    // The per-finding loop stays as the fallback, not as dead code: every line
+    // already inside a 90-day window predates the field, and skipping those
+    // would replace an undercount with a blank.
+    // M2 (review round one): D4 fixed the WRITER, so lines written from now on
+    // are right. Every line already in a 90-day window is not, and those are
+    // the lines this month's report reads -- so the spec_bug figure stays
+    // conflated for the whole retained history unless the reader applies the
+    // same rule. It can, because the rule is computable from fields the line
+    // already carries. That is precisely why D4's trigger was defined as
+    // observable state rather than a new stored flag: a read-side fix reaches
+    // the history a write-side fix never can.
+    const noSpecWasInPlay = !r.spec && !(Array.isArray(r.ac_verdicts) && r.ac_verdicts.length > 0)
+    const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
+
+    const tally = r.findings_by_lens
+    if (tally && typeof tally === 'object' && !Array.isArray(tally)) {
+      for (const [lens, counts] of Object.entries(tally)) {
+        if (!counts || typeof counts !== 'object') continue
+        // Same value-based lens gate the per-finding loop below applies: the
+        // writer gates these keys too, but a reader must not trust a ledger
+        // line's keys just because a writer should have.
+        if (!LENS_RE.test(lens)) continue
+        for (const [disposition, n] of Object.entries(counts)) {
+          if (!Number.isInteger(n) || n <= 0) continue
+          if (!DISPOSITIONS.has(disposition)) continue
+          bumpDisposition(lensDispositionCounts, lens, reclassify(disposition), n)
+        }
+      }
+    } else for (const f of r.findings || []) {
       // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
       // not shape-based -- see this file's own header comment): a `lens`
       // that is not a real, pattern-matching lens name must not be read
@@ -359,7 +422,7 @@ export function aggregateRework(records, { root = '' } = {}) {
           }
           seenFixedIds.add(dedupeKey)
         }
-        bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
+        bumpDisposition(lensDispositionCounts, f.lens, reclassify(f.disposition))
       }
     }
     const verdicts = r.ac_verdicts || []
@@ -407,8 +470,23 @@ export function aggregateRework(records, { root = '' } = {}) {
         continue
       }
       // Review round-2 M4: same injective-escaping fix as planBucketKey.
-      const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(v.ac_id)}`
-      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0, unattributedVerdicts: 0 })
+      // H3 (review round one): widening the ac_id pattern let the SAME
+      // criterion arrive in two citation forms -- `AC-QA-1` on one round and
+      // `FEAT-011 AC-QA-1` on the next, when a lens disambiguated because the
+      // review spanned several specs. Keyed verbatim, those became two buckets,
+      // and neverFailingAcs then reported the pass-only one as never having
+      // failed while the other held the failure. That feeds a "retire this
+      // check" proposal, so it is an INVERTED conclusion, not a lost
+      // measurement -- strictly worse than the defect it replaced, and created
+      // by this change: before it, both forms were nulled and no bucket existed.
+      //
+      // Only a prefix naming THIS record's own spec is stripped. A prefix
+      // naming a different spec is a different criterion and keeps its bucket:
+      // merging two specs' AC-QA-1 is the inversion in the other direction,
+      // and is why the prefix is carried inside ac_id at all.
+      const canonicalAcId = stripOwnSpecPrefix(v.ac_id, planKey)
+      const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(canonicalAcId)}`
+      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: canonicalAcId, pass: 0, fail: 0, unverifiable: 0, n: 0, unattributedVerdicts: 0 })
       const entry = acVerdicts.get(key)
       // Round-6 H1: the ac_id is known (we are inside this branch because
       // it is), but the VERDICT itself may not be usable evidence -- round-
@@ -946,6 +1024,14 @@ export function aggregateTriggerAccuracy(records) {
   for (const r of records) {
     if (r.kind !== 'review_cycle') continue
     for (const lens of r.lenses_run || []) {
+      // M1 (review round one): this path was ungated while aggregateRework's
+      // equivalent was gated, and these keys reach a RENDERED report line. A
+      // ledger line is untrusted data on disk, so a lens name from it is gated
+      // before it can become a key anywhere. One gated path and one ungated
+      // path reading the same file is the uniformity failure a gate exists to
+      // prevent, and it is the third instance of this exact shape in this
+      // change alone.
+      if (typeof lens !== 'string' || !LENS_RE.test(lens)) continue
       if (!byLens[lens]) byLens[lens] = { cleanWithZeroTrigger: 0, cleanWithMatches: 0, findingsWithMatches: 0, cleanTriggerUnmeasured: 0, total: 0 }
       const bucket = byLens[lens]
       bucket.total += 1

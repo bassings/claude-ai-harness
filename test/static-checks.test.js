@@ -1217,7 +1217,13 @@ test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id 
     // the file has to say which, and only an explicit declaration exempts it.
     // Silence is read as the failure, not as the exemption.
     const declaresNone = /<!--\s*no-acceptance-criteria\b/.test(src)
-    if (/AC-[A-Z]+-\d+/.test(src) && defs.length === 0 && !declaresNone) {
+    // M5 (review round one): this was /AC-[A-Z]+-\d+/, blind to a prefix
+    // containing a digit exactly like the counter above it was. So a spec
+    // written entirely in AC-A11Y-<n> ids did not even register as MENTIONING
+    // acceptance criteria, and the check whose whole job is detecting
+    // blindness was blind in the same way, to the same lens, on the same line
+    // of reasoning. Fixing the counter and not this one is why it survived.
+    if (/AC-[A-Z][A-Z0-9]*-\d+/.test(src) && defs.length === 0 && !declaresNone) {
       problems.push(`${file}: contains AC ids but the definition scan found none -- either the pattern is blind to this file's spelling, or the spec defines no criteria and must say so with an HTML comment marker`)
     }
     const counts = new Map()
@@ -2128,6 +2134,19 @@ test('static: the AC-definition counter recognises every lens prefix the ledger 
   assert.ok(m, 'could not locate the AC-definition counter regex in this file')
   // eslint-disable-next-line no-eval
   const counter = eval(m[1])
+
+  // M5 (review round one): the counter's SIBLING -- the predicate that decides
+  // "this file mentions acceptance criteria but defines none" -- carried the
+  // same blind pattern. So a spec written entirely in AC-A11Y ids did not even
+  // register as mentioning criteria, and the check whose whole job is
+  // detecting blindness was blind in the same way, to the same lens. Fixing
+  // one and not the other is exactly how it survived the first pass.
+  const detector = src.match(/if \(\/(AC-\[[^/]+?)\/\.test\(src\) && defs\.length === 0/)
+  assert.ok(detector, 'could not locate the mentions-criteria detector in this file')
+  const detectorRe = new RegExp(detector[1])
+  assert.ok(detectorRe.test('AC-A11Y-1'),
+    'the blindness detector must itself recognise a lens prefix containing a digit')
+  assert.ok(detectorRe.test('AC-QA-1'), 'and still recognise the ordinary form')
 
   for (const id of ['AC-QA-1', 'AC-SEC-12', 'AC-A11Y-1', 'AC-A11Y-12', 'AC-DESIGN-3']) {
     assert.ok(validator.test(id), `sanity: the ledger validator must accept ${id}`)

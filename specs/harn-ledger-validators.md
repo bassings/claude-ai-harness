@@ -108,11 +108,33 @@ implementation. These are the decisions the criteria below are written against.
    `AC-...` form also accepted); no accepted value may contain a newline,
    carriage return, backtick, `<`, `>`, `|`, `$`, more than one separator
    character, or a leading path separator or drive prefix.
-3. **D3 is fixed by raising `MAX_FINDINGS` (to 60, above the worst round
-   recorded in any local ledger, which is 50), not by adding a ledger field.**
-   A new top-level property is refused wholesale by an older installed writer,
-   which turns a 51% undercount into a 100% loss of that run's telemetry. The
-   raise is conditional on the byte proof in AC-DATA-13 and AC-QA-7.
+3. ~~**D3 is fixed by raising `MAX_FINDINGS` (to 60, above the worst round
+   recorded in any local ledger, which is 50), not by adding a ledger field.**~~
+   **REVERSED AT IMPLEMENTATION, 2026-09-14, on measurement. Recorded here
+   rather than rewritten, because a spec that quietly matches whatever was
+   built verifies nothing.**
+
+   Both figures behind this decision were taken from THIS repo's ledger alone
+   (lens-simplicity's own coverage statement says so). Across all three real
+   ledgers the worst round is 84 findings, not 50, and the largest line ever
+   written is 15,920 bytes against a 16,384 cap, not 5,103. Sixty findings plus
+   200 verdicts needs about 22,980 bytes, which pushes the busiest records into
+   the envelope-only degrade path that discards verdicts and trigger_counts as
+   well -- turning a 51% undercount into total loss for exactly the runs that
+   matter most. AC-DATA-13 made the raise conditional on that byte proof, and
+   the proof fails.
+
+   **What was built instead:** the tally is computed by the WRITER, before any
+   truncation, and stored as `findings_by_lens` (~500 bytes, correct at any
+   volume). This is not the "new payload property" this decision rejected: the
+   caller supplies nothing, a caller-supplied tally is refused explicitly, and
+   schema and writer ship in the same file so no version can have one without
+   the other. `MAX_FINDINGS` stays at 15.
+
+   Review round one then found the other half was missing: the reader was never
+   taught to use the field, so the number an operator reads was still the
+   truncated one. Fixed, with the per-finding loop kept as the fallback for
+   lines written before the field existed.
 4. **D4's trigger is computed in script code, from observable state, not from
    the invocation argument and not from the model's classification.** "No spec
    was in play" means `specPath` is null AND no lens returned any `ac_verdicts`,

@@ -44,7 +44,14 @@ import { fileURLToPath } from 'node:url'
 // change to every written line, and AC-OPS-4 needs a stale installed
 // mirror (~/.claude/workflows/lib/ledger-append.mjs, still writing the old
 // shape) to be detectable from the report rather than failing silently.
-export const SCHEMA_VERSION = 2
+// specs/harn-ledger-validators.md decision 5: bumped from 2. Four validator
+// changes land together, and without a version marker a 90-day window mixes
+// the two populations with nothing to separate them. A line with no
+// findings_by_lens could be a quiet round or a stale installed writer; a null
+// ac_id could be a real absence or the old pattern rejecting a legitimate
+// value. The reader already tallies schema_version and rejects no version, so
+// the bump costs nothing and makes the two readable apart.
+export const SCHEMA_VERSION = 3
 
 // Hard-coded and not configurable (AC-SIMP-2): resolved against the MAIN
 // checkout root (never a worktree's own .claude/) via `git rev-parse
@@ -138,7 +145,17 @@ const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 // EXPORTED so a test can ask for the real pattern. It was not, and two tests
 // written against it passed vacuously: an unexported constant arrives as
 // undefined, and `new RegExp(undefined)` matches every string.
-export const AC_ID_PATTERN_STR = '^(?:[A-Za-z0-9_.-]{1,40}[ /])?AC-[A-Z][A-Z0-9]*-[0-9]+$'
+//
+// Every quantifier is BOUNDED, including the lens segment and the number.
+// Review round one measured `AC-QA-` + 4090 digits validating: six such ids on
+// one record produced a 210-byte envelope-only line with every verdict,
+// finding, lenses_run and trigger_counts gone, and write_ok still true. A lens
+// report is untrusted model output, so one long id could erase a whole round
+// from the only delivery-telemetry store. The bound has to live HERE because
+// collectErrors implements type, enum, pattern and array items only: a
+// maxLength declaration is silently ignored (the schema's own minLength:1 on
+// run_id accepts the empty string today).
+export const AC_ID_PATTERN_STR = '^(?:[A-Za-z0-9_.-]{1,40}[ /])?AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$'
 // M1 (round 4 remainder): the single definition site for the `lens` shape,
 // shared with the schema declaration above. Round-7 review, F1 sweep:
 // EXPORTED so optimise-read.mjs can ask "is this a REAL lens name?"
