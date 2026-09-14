@@ -1205,7 +1205,7 @@ test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id 
     //      the blindness rather than removed it.
     // Line anchoring is what keeps prose mentions out; the alternation is
     // what keeps every file in.
-    const defs = [...src.matchAll(/^(?:[-*]\s+)?(?:\*\*)?(AC-[A-Z]+-\d+)(?::\*\*|\*\*:|:)\s/gm)].map((m) => m[1])
+    const defs = [...src.matchAll(/^(?:[-*]\s+)?(?:\*\*)?(AC-[A-Z][A-Z0-9]*-\d+)(?::\*\*|\*\*:|:)\s/gm)].map((m) => m[1])
     totalDefs += defs.length
     // PER-FILE anti-vacuity: a global floor is satisfied by one large file
     // while every other spec contributes zero forever. Measured: harn-opt-3
@@ -2104,5 +2104,37 @@ test('static: every hooks.json entry actually INVOKES its script -- the command 
     assert.match(target, /hooks\/[a-z0-9-]+\.py$/, `${event}: args must end at a hooks/*.py script, got ${JSON.stringify(target)}`)
     const bare = target.replace(/^.*hooks\//, '')
     assert.ok(fs.existsSync(path.join(ROOT, 'hooks', bare)), `${event}: wired script hooks/${bare} does not exist`)
+  }
+})
+
+// AC-QA-13 (specs/harn-ledger-validators.md): the SECOND copy of the blind
+// pattern. The AC-definition counter above used `AC-[A-Z]+-\d+`, the same
+// shape as the ledger validator's old one and blind in the same way, so a spec
+// whose criteria are all AC-A11Y-<n> counted as zero definitions -- the
+// accessibility lens invisible to the guard as well as to the ledger.
+//
+// Two copies of one rule is why this survived the ledger fix. This test pins
+// that they agree on what a criterion id looks like.
+test('static: the AC-definition counter recognises every lens prefix the ledger validator accepts, including ones containing a digit (AC-QA-13)', async () => {
+  const mod = await import(require('node:url').pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'ledger-append.mjs')).href)
+  assert.equal(typeof mod.AC_ID_PATTERN_STR, 'string',
+    'AC_ID_PATTERN_STR must be exported; without it this test compares against undefined and proves nothing')
+  const validator = new RegExp(mod.AC_ID_PATTERN_STR)
+
+  // The counter's own pattern, read from the source it actually uses, so this
+  // cannot drift into testing a copy of the regex that nothing runs.
+  const src = fs.readFileSync(path.join(__dirname, 'static-checks.test.js'), 'utf8')
+  const m = src.match(/const defs = \[\.\.\.src\.matchAll\((\/[^\n]+\/gm)\)\]/)
+  assert.ok(m, 'could not locate the AC-definition counter regex in this file')
+  // eslint-disable-next-line no-eval
+  const counter = eval(m[1])
+
+  for (const id of ['AC-QA-1', 'AC-SEC-12', 'AC-A11Y-1', 'AC-A11Y-12', 'AC-DESIGN-3']) {
+    assert.ok(validator.test(id), `sanity: the ledger validator must accept ${id}`)
+    const line = `- **${id}:** something the lens requires\n`
+    counter.lastIndex = 0
+    const found = [...line.matchAll(counter)].map((x) => x[1])
+    assert.deepEqual(found, [id],
+      `the definition counter must see ${id}; a prefix containing a digit was invisible to it, so a spec written entirely in that lens's criteria counted as zero`)
   }
 })

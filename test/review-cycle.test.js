@@ -418,8 +418,14 @@ test('review-cycle.js: synthesis missing spec_bugs/rejected_findings fields is t
 })
 
 test('review-cycle.js: spec bugs and rejected findings from a well-formed synthesis are counted in the workflow\'s own telemetry (AC-QA-13)', async () => {
+  // Now passes a spec. It never meant to exercise the no-spec case -- it is
+  // about whether counts are carried through -- but by supplying no spec it
+  // was pinning the D4 conflation as correct: a spec_bug counted on a run that
+  // had no spec to have a bug in. Updated rather than deleted, because the
+  // behaviour it actually guards (counts reach telemetry) is still real, and
+  // the no-spec direction is covered by its own tests below.
   const { result } = await runWorkflow(WF, {
-    args: {},
+    args: { spec: 'specs/example.md' },
     agent: baseAgent({
       synthesis: {
         report: '### VERDICT\nFINDINGS',
@@ -433,8 +439,11 @@ test('review-cycle.js: spec bugs and rejected findings from a well-formed synthe
 })
 
 test('review-cycle.js: the raw spec_bugs/rejected_findings descriptors are sent to the ledger-write step as data, since workflow scripts have no node:crypto to compute finding ids themselves (AC-QA-11) -- ledger-append.mjs computes the actual ids (see its own tests)', async () => {
+  // Passes a spec for the same reason as the telemetry-count test above: this
+  // is about descriptors reaching the ledger step, not about the no-spec case,
+  // and with no spec in play a spec_bug is now correctly reclassified (D4).
   const { calls } = await runWorkflow(WF, {
-    args: {},
+    args: { spec: 'specs/example.md' },
     agent: baseAgent({
       synthesis: {
         report: 'x',
@@ -2940,4 +2949,126 @@ test('review-cycle.js: the scope schema ALSO constrains the base ref, so both la
     () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, base: 'main; id #' } }) }),
     (err) => { assert.match(err.message, /schema|base/i); return true }
   )
+})
+
+// --- specs/harn-ledger-validators.md D4 -----------------------------------
+//
+// The synthesis prompt asks for "spec_bugs (findings with no AC behind them)".
+// On a review where no spec is in play, EVERY finding has no AC behind it, so
+// every one is classified spec_bug. Measured in a delivery repo: 28 of 45
+// findings (62%) filed as spec_bug on runs whose spec is null.
+//
+// A missing spec is a process signal. A spec bug is a quality signal about a
+// spec that EXISTS. Merged, the second is unusable -- which is why the
+// optimiser's "spec bugs by lens" table has been dominated by runs that never
+// had a spec to have a bug in.
+//
+// The trigger is computed in script code from observable state, never from the
+// invocation argument alone: review-cycle tells a lens with no spec passed to
+// go and FIND one (the specClause above), so a run invoked without a spec may
+// still legitimately have verified criteria. "No spec was in play" therefore
+// means specPath is null AND no lens returned any ac_verdicts.
+
+const LENS_WITH_FINDING = {
+  verdict: 'FINDINGS',
+  coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
+  findings: [{ severity: 'Medium', location: 'a.js:1', claim: 'something real', evidence: 'e', consequence: 'c', fix: 'f' }],
+  head_sha_measured: 'abcdef1234567890',
+  head_tree_measured: '1111111111111111111111111111111111111111',
+}
+
+test('review-cycle.js (D4): when NO spec was in play, findings are not recorded as spec_bug', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-qa': LENS_WITH_FINDING,
+      synthesis: {
+        report: '### VERDICT\nFINDINGS',
+        spec_bugs: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'something real' }],
+        rejected_findings: [],
+      },
+    }),
+  })
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  const payload = extractLedgerPayload(ledgerCalls[ledgerCalls.length - 1].prompt)
+  assert.equal(payload.spec, null, 'precondition: no spec path was supplied')
+  assert.deepEqual(payload.ac_verdicts, [], 'precondition: no lens located a spec either')
+  assert.ok(!payload.spec_bugs || payload.spec_bugs.length === 0,
+    'with no spec in play there is no spec to have a bug in; the findings must not be filed against one')
+  assert.equal(payload.spec_bug_count, null,
+    'null (not measured), never 0 (measured as none) -- the codebase distinguishes these everywhere else')
+})
+
+test('review-cycle.js (D4): the finding itself SURVIVES -- reclassified, never dropped', async () => {
+  // The spec_bug named here is SYNTHESIS-ONLY: no lens reported it, so it
+  // exists in the payload solely through the spec_bugs array. An earlier
+  // version of this test reused the lens's own finding, which already reaches
+  // open_findings by another route -- so it passed whether the reclassification
+  // preserved the finding or silently dropped it. Incidentally passing, per
+  // standards section 11.
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-qa': LENS_WITH_FINDING,
+      synthesis: {
+        report: '### VERDICT\nFINDINGS',
+        spec_bugs: [{ lens: 'lens-security', location: 'synthesis-only.js:9', claim: 'seen only by synthesis' }],
+        rejected_findings: [],
+      },
+    }),
+  })
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  const payload = extractLedgerPayload(ledgerCalls[ledgerCalls.length - 1].prompt)
+  const open = payload.open_findings || []
+  assert.ok(open.some((f) => f.location === 'synthesis-only.js:9'),
+    'the finding is real; only its classification was wrong. Dropping it would be this spec\'s own defect recurring inside its own fix')
+  assert.ok(!(payload.spec_bugs || []).some((f) => f.location === 'synthesis-only.js:9'),
+    'and it must not ALSO remain filed as a spec bug -- reclassified means moved, not copied')
+})
+
+test('review-cycle.js (D4): when a spec IS in play, spec_bug classification is untouched', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: { spec: 'specs/example.md' },
+    agent: baseAgent({
+      'lens-qa': LENS_WITH_FINDING,
+      synthesis: {
+        report: '### VERDICT\nFINDINGS',
+        spec_bugs: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'something real' }],
+        rejected_findings: [],
+      },
+    }),
+  })
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  const payload = extractLedgerPayload(ledgerCalls[ledgerCalls.length - 1].prompt)
+  assert.equal(payload.spec_bug_count, 1, 'a real spec CAN have a real bug; this must not be blanket-suppressed')
+  assert.equal((payload.spec_bugs || []).length, 1)
+})
+
+test('review-cycle.js (D4): a run invoked with NO spec argument, where a lens FOUND one, keeps its spec_bug classification', async () => {
+  // Decision 4's whole point, and it was unpinned: a surviving mutation showed
+  // the trigger could be reduced to "no spec argument" with every test still
+  // green. The no-spec branch of specClause tells a lens to go and find a spec
+  // under specs/, so a run invoked without one may legitimately have verified
+  // criteria -- and if criteria were verified, a spec was in play and a spec
+  // bug is a real spec bug.
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      'lens-qa': {
+        ...QA_CLEAN,
+        ac_verdicts: [{ id: 'AC-QA-1', verdict: 'PASS', evidence: 'ran the suite' }],
+      },
+      synthesis: {
+        report: '### VERDICT\nFINDINGS',
+        spec_bugs: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'a real gap in a real spec' }],
+        rejected_findings: [],
+      },
+    }),
+  })
+  const payload = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.equal(payload.spec, null, 'precondition: no spec was passed as an argument')
+  assert.ok(payload.ac_verdicts.length > 0, 'precondition: but a lens located one and verified criteria against it')
+  assert.equal(payload.spec_bug_count, 1,
+    'a spec WAS in play, so the classification stands; suppressing it here would lose a real quality signal')
+  assert.equal((payload.spec_bugs || []).length, 1)
 })

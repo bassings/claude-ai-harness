@@ -1379,6 +1379,39 @@ synthesisHeadSha = synthesis && typeof synthesis.head_sha_at_synthesis === 'stri
 specBugsRaw = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_bugs : null
 rejectedFindingsRaw = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
 specBugCount = specBugsRaw ? specBugsRaw.length : null
+
+// specs/harn-ledger-validators.md D4. The synthesis prompt asks for
+// "spec_bugs (findings with no AC behind them)". On a review where no spec was
+// in play, EVERY finding has no AC behind it, so every one comes back
+// classified spec_bug. Measured in a delivery repo: 28 of 45 findings (62%)
+// filed that way on runs whose spec is null. A missing spec is a PROCESS
+// signal; a spec bug is a QUALITY signal about a spec that exists. Merged, the
+// second is unusable, and the delivery report's "spec bugs by lens" table has
+// been dominated by runs that never had a spec to have a bug in.
+//
+// The trigger is computed HERE, from observable state, rather than from the
+// invocation argument: the no-spec branch of specClause tells a lens to go and
+// FIND a spec under specs/, so a run invoked without one may still legitimately
+// have verified criteria. "No spec was in play" therefore means BOTH that no
+// spec path was supplied AND that no lens returned any ac_verdicts.
+//
+// The findings are real; only the classification was wrong. They move to
+// open_findings rather than being dropped -- dropping what cannot be
+// classified, and reporting the remainder as the whole, is the defect this
+// entire spec exists to fix.
+//
+// specBugCount goes to null, not 0: null is "not measured", 0 is "measured as
+// none", and this codebase distinguishes those everywhere else.
+const noSpecWasInPlay = !specPath && acVerdicts.length === 0
+if (noSpecWasInPlay && specBugsRaw && specBugsRaw.length > 0) {
+  openFindingsRaw = openFindingsRaw.concat(specBugsRaw)
+  // null, not []: ledger-append recomputes spec_bug_count from the array it
+  // receives, so an empty array makes the LEDGER say 0 ("we looked, there were
+  // none") while this file's own telemetry says null ("not measurable"). With
+  // no spec in play the honest answer is the second, in both places.
+  specBugsRaw = null
+  specBugCount = null
+}
 rejectedFindingCount = rejectedFindingsRaw ? rejectedFindingsRaw.length : null
 // specs/record-fixed-findings.md (AC-2): same null-vs-absent handling as
 // spec_bugs/rejected_findings above. The id guard itself (AC-3) runs in

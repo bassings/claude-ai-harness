@@ -101,7 +101,44 @@ const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 // (below) compiles `new RegExp(propSchema.pattern)` generically from the
 // pattern STRING for every patterned field, so a second, field-specific
 // compiled RegExp would be genuinely dead code, not merely unused.
-const AC_ID_PATTERN_STR = '^AC-[A-Z]+-[0-9]+$'
+// specs/harn-ledger-validators.md D1 + D2. Was '^AC-[A-Z]+-[0-9]+$', which
+// silently nulled two legitimate shapes, after which the aggregate reported
+// zero -- indistinguishable from "this never happened":
+//
+//   D1  `AC-A11Y-<n>`, the id agents/lens-accessibility.md INSTRUCTS that lens
+//       to emit. The digits inside A11Y fail [A-Z]+, so every accessibility
+//       criterion and verdict ever written was discarded. The other eight
+//       lenses passed only because their prefixes contain no digit: the
+//       harness's own contract disagreeing with its own validator.
+//   D2  A spec-qualified id (`FEAT-011 AC-QA-1`, `FEAT-010/AC-QA-3`), which a
+//       lens emits when one review spans several specs. 203 verdicts were
+//       nulled in a single measured run, leaving a whole 90-day window with no
+//       verdict data at all.
+//
+// The prefix stays INSIDE ac_id rather than being stripped into a new field.
+// Stripping would merge two different specs' AC-QA-1 into one aggregation
+// bucket and could report a criterion that FAILED as never_failed, which is an
+// inverted conclusion -- worse than the lost measurement it replaces.
+//
+// It is bounded inside the pattern rather than sanitised afterwards, because
+// this value reaches an aggregation key (optimise-read.mjs:410) and a rendered
+// report. The obvious widening `^[\w\s./-]*AC-...$` accepts
+// `ignore previous instructions AC-SEC-1` -- the exact string
+// optimise-read.mjs:285 already names as the attack it fears. So: at most one
+// prefix segment of 1 to 40 characters from a closed class, exactly one
+// separator, and no whitespace, newline, backtick, angle bracket, pipe, dollar
+// or colon anywhere in an accepted value.
+//
+// The quantifier is BOUNDED and unnested, deliberately. The candidate shape
+// `^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$` measured 0.51ms at 20
+// characters, 7.91ms at 24 and 31.67ms at 26 -- doubling per added character,
+// a denial of service inside a validator. This one is flat to 1024 characters;
+// test/ledger-append.test.js pins that.
+//
+// EXPORTED so a test can ask for the real pattern. It was not, and two tests
+// written against it passed vacuously: an unexported constant arrives as
+// undefined, and `new RegExp(undefined)` matches every string.
+export const AC_ID_PATTERN_STR = '^(?:[A-Za-z0-9_.-]{1,40}[ /])?AC-[A-Z][A-Z0-9]*-[0-9]+$'
 // M1 (round 4 remainder): the single definition site for the `lens` shape,
 // shared with the schema declaration above. Round-7 review, F1 sweep:
 // EXPORTED so optimise-read.mjs can ask "is this a REAL lens name?"
@@ -372,6 +409,39 @@ export const LEDGER_ENTRY_SCHEMA = {
     // was dropped) when finding arrays were supplied at all, null when
     // they were not (a kind with no findings concept, e.g. tdd_task).
     findings_truncated: { type: ['integer', 'null'] },
+    // specs/harn-ledger-validators.md D3. Per-lens disposition tallies used to
+    // be built by the READER from the `findings` array above, which is capped
+    // at MAX_FINDINGS and shrunk further by the byte loop. Measured across the
+    // three real ledgers: worst rounds of 50, 79 and 84 findings, so the
+    // delivery report's headline rework attribution was undercounting by 82%
+    // on exactly the busiest rounds, silently, and reporting the remainder as
+    // if it were the whole.
+    //
+    // Computed HERE, by the writer, from every supplied finding before any
+    // truncation. Deliberately NOT a new payload property: an undeclared key
+    // in a payload is refused wholesale by the validator (pinned by a test),
+    // which would turn an undercount into total loss for any caller running a
+    // newer workflow against an older installed writer. Schema and writer ship
+    // in the same file, so no version can have one without the other.
+    //
+    // Raising MAX_FINDINGS instead was the planning cycle's decision and was
+    // refuted on measurement: the largest line ever written is 15,920 bytes
+    // against MAX_LINE_BYTES 16,384, and 60 findings plus 200 verdicts needs
+    // about 22,980, which pushes the busiest records into the envelope-only
+    // degrade path that discards verdicts and trigger_counts as well.
+    findings_by_lens: {
+      type: ['object', 'null'],
+      additionalProperties: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          open: { type: 'integer' },
+          rejected: { type: 'integer' },
+          spec_bug: { type: 'integer' },
+          fixed: { type: 'integer' },
+        },
+      },
+    },
     // Round-6 review M2: ac_verdicts is truncated at MAX_AC_VERDICTS with
     // no counter of its own, unlike findings/findings_truncated -- the
     // same "the surplus was cut and NOTHING records that it happened"
@@ -1096,6 +1166,47 @@ function computeFixedFindings(priorFindings, fixedFindingDescriptors, sameRoundO
 // it gets nothing. The TOTAL kept is unaffected (still min(maxTotal, sum of
 // all categories)), so findings_truncated's own count is unchanged by this
 // -- only WHICH entries survive changes.
+// specs/harn-ledger-validators.md D3: the per-lens disposition tally, taken
+// from EVERY supplied finding before budgetFindings caps the array and before
+// the byte-shrink loop trims it further.
+//
+// Only lenses that actually reported something get a key, so the field costs
+// nothing on a quiet round and stays small on a busy one (~55 bytes per lens
+// against a 16,384-byte line cap). A finding whose lens failed LENS_PATTERN_STR
+// is counted under its sanitised value exactly as the `findings` array records
+// it, so this tally and that array can never disagree about what a lens is.
+// AC-SEC-6, and a defect this function had on its first writing, caught by the
+// pre-existing lens-injection guard rather than by me: the tally's KEYS are
+// caller-supplied strings that reach an aggregation map and a rendered report.
+// Reading `f.lens` directly put a secret routed through `lens` straight into
+// the ledger, which is precisely what that guard exists to stop. Every key is
+// now gated by LENS_PATTERN_STR first.
+//
+// A finding whose lens fails the gate is counted under UNATTRIBUTED_LENS rather
+// than dropped. Dropping it would be this spec's own defect recurring inside
+// its own fix: a count that silently omits what it could not parse, reported
+// as though it were the whole. The sentinel is a fixed string that cannot
+// collide with a real lens name (it fails LENS_PATTERN_STR by construction)
+// and is never attacker-controlled; the rejected value itself survives in the
+// findings array's own lens_raw, as it already did.
+const UNATTRIBUTED_LENS = 'unattributed'
+const LENS_RE_FOR_TALLY = new RegExp(LENS_PATTERN_STR)
+
+function tallyFindingsByLens(categories) {
+  const tally = {}
+  for (const entries of categories) {
+    for (const f of entries) {
+      if (!f || typeof f !== 'object') continue
+      const raw = typeof f.lens === 'string' ? f.lens : null
+      const lens = raw !== null && LENS_RE_FOR_TALLY.test(raw) ? raw : UNATTRIBUTED_LENS
+      if (!tally[lens]) tally[lens] = { open: 0, rejected: 0, spec_bug: 0, fixed: 0 }
+      const d = f.disposition
+      if (d === 'open' || d === 'rejected' || d === 'spec_bug' || d === 'fixed') tally[lens][d] += 1
+    }
+  }
+  return tally
+}
+
 function budgetFindings(categories, maxTotal) {
   const queues = categories.map((c) => c.slice())
   const kept = []
@@ -1797,6 +1908,16 @@ export function main() {
   // by computeFixedFindings, and must never reach the entry directly
   // either -- the entry only ever carries their computed, guarded result
   // inside `findings` (disposition 'fixed'), never the raw descriptors.
+  // D3: findings_by_lens is WRITER-OWNED. Adding it to the schema (so the
+  // written line validates) also made it an allowed PAYLOAD property, which
+  // would let a caller supply a tally that contradicts the findings it sent --
+  // and the spread below would have kept that value on any record with no
+  // findings arrays at all. Refused explicitly rather than silently dropped,
+  // so a caller that believes it is supplying a tally finds out.
+  if ('findings_by_lens' in payload) {
+    return result(run_id, ts, false,
+      'payload failed ledger schema validation: findings_by_lens: not an allowed property (it is computed by the writer from the findings you supply, so a caller-supplied tally could contradict them)')
+  }
   const { spec_bugs, rejected_findings, open_findings, prior_findings, fixed_findings, event_scope, ...restPayload } = payload
   const allFindings = [...specBugs.entries, ...rejected.entries, ...open.entries, ...fixed.entries]
   // M2: bound the findings array at MAX_FINDINGS rather than letting an
@@ -1818,6 +1939,9 @@ export function main() {
       ? {
           findings: budgetFindings([specBugs.entries, rejected.entries, fixed.entries, open.entries], MAX_FINDINGS),
           findings_truncated: Math.max(0, allFindings.length - MAX_FINDINGS),
+          // D3: computed from the same four categories BEFORE the line above
+          // caps them, so a truncated round still reports a true per-lens count.
+          findings_by_lens: tallyFindingsByLens([specBugs.entries, rejected.entries, fixed.entries, open.entries]),
           spec_bug_count: specBugs.count,
           rejected_finding_count: rejected.count,
         }
