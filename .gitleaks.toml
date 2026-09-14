@@ -1,0 +1,53 @@
+# gitleaks configuration.
+#
+# The weekly scheduled sweep walks all history on all refs (the push and
+# pull_request runs only scan a commit range, which is why the same commit can
+# pass on push and fail on the sweep -- see .github/workflows/ci.yml). On
+# 2026-09-14 that sweep reported five findings, all of them false positives in
+# commits from August, and a failing weekly run that everyone learns to ignore
+# is worse than no weekly run at all.
+#
+# RULES FOR ADDING TO THIS FILE, because the standards are explicit that a
+# dismissal is the one action that silently destroys a scanner's value:
+#
+#   1. Allowlist the EXACT VALUE, never a path and never a loose pattern.
+#      A `paths` entry for test/** would blind the scanner to a real secret in
+#      a fixture, and a fixture carrying a real operator username is the ONE
+#      genuine leak this repo has ever found (2026-09-04).
+#   2. Every entry says why it is not a secret, and what would make that
+#      decision expire.
+#   3. If you cannot write those two sentences honestly, it is not a false
+#      positive. Fix the code or leave the finding open.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake values that look like credentials to an entropy check"
+regexTarget = "secret"
+regexes = [
+  # specs/harn-opt-2.md:169. A deliberate canary inside AC-SEC-8, whose whole
+  # purpose is proving a token does NOT escape a slug-only run: the criterion
+  # sets this value and then asserts zero occurrences of it in the output. The
+  # literal string CANARY is inside the value. Not a GitHub token: real ones
+  # are 36 characters after the ghp_ prefix, this is 16, and it is sequential.
+  # EXPIRES IF: this value ever appears outside a test or an acceptance
+  # criterion, or if a real ghp_ token is ever committed, which this allowlist
+  # would NOT hide because the secret text would differ.
+  '''^ghp_CANARY0123456789$''',
+
+  # test/review-cycle.test.js. A stand-in for a git sha in an assertion.
+  # Sequential hex, sixteen characters, no entropy source. EXPIRES IF: the
+  # fixtures move to real shas from a real repository.
+  '''^abcdef1234567890$''',
+
+  # test/ledger-append.test.js. A stand-in for a 40-character git sha:
+  # "a1b2c3d4e5f6" repeated. EXPIRES IF: as above.
+  '''^a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2$''',
+
+  # workflows/optimise-cycle.js:401. Two English words from a prompt sentence
+  # reading "SAST, secret scanning, dependency/vulnerability auditing". The
+  # slash and the length are the whole reason it scored. EXPIRES IF: never;
+  # this string cannot be a credential.
+  '''^dependency/vulnerability$''',
+]
