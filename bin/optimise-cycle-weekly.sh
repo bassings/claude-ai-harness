@@ -437,6 +437,47 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     continue
   fi
 
+  # Stage the workflow script into the repo, so the run does not have to.
+  #
+  # The Workflow tool resolves a workflow by NAME from the repo's own
+  # .claude/workflows/, never from the global $CLAUDE_HOME/workflows/ where a
+  # manual install puts it. Observed every week from 2026-08-30 to 2026-09-14
+  # across all three repos: each run improvised a copy into the repo under an
+  # invented name, then could not remove it, because `rm` is in this script's
+  # own disallowedTools list and deliberately stays there. The result was
+  # three weeks of untracked leftovers and a "delete this when convenient"
+  # note in a log nobody reads.
+  #
+  # Cleanup belongs here, in the runner, which has permission, rather than in
+  # the agent, which does not and should not.
+  #
+  # Two things this must never do: overwrite a repo that deliberately ships
+  # its own tuned copy (repo-local wins on name collision, per the harness
+  # contract), or delete a file it did not create. Both are pinned by tests.
+  staged_workflow=""
+  global_workflow="$CLAUDE_HOME/workflows/optimise-cycle.js"
+  repo_workflow="$repo/.claude/workflows/optimise-cycle.js"
+  staged_workflow_dir=""
+  if [ -e "$repo_workflow" ]; then
+    echo "repo ships its own optimise-cycle.js; leaving it alone" >> "$LOG"
+  elif [ ! -f "$global_workflow" ]; then
+    # A plugin install has no global mirror and still resolves the skill.
+    # Staging is an aid, not a precondition, so this is a note, not a failure.
+    echo "no global optimise-cycle.js to stage ($global_workflow)" >> "$LOG"
+  else
+    if [ ! -d "$repo/.claude/workflows" ]; then
+      staged_workflow_dir="$repo/.claude/workflows"
+    fi
+    if mkdir -p "$repo/.claude/workflows" && cp "$global_workflow" "$repo_workflow"; then
+      staged_workflow="$repo_workflow"
+      echo "staged .claude/workflows/optimise-cycle.js from $global_workflow" >> "$LOG"
+    else
+      staged_workflow=""
+      staged_workflow_dir=""
+      echo "could not stage optimise-cycle.js; the run may copy one itself" >> "$LOG"
+    fi
+  fi
+
   start_epoch=$(date +%s)
   if ! [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
     echo "RESULT FAIL $repo_label reason=\"could not capture a valid run start time (start_epoch)\"" >> "$LOG"
@@ -473,6 +514,17 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     --settings '{"disableAllHooks": true}' \
     > "$transcript_file" 2>&1
   claude_exit=$?
+
+  # Remove ONLY what was staged above, never a pre-existing file, and never a
+  # directory that already existed. Runs on the success path and on every
+  # failure path below, because a failing run is when a leftover is most
+  # likely and least noticed.
+  if [ -n "$staged_workflow" ] && [ -f "$staged_workflow" ]; then
+    rm -f "$staged_workflow"
+  fi
+  if [ -n "$staged_workflow_dir" ] && [ -d "$staged_workflow_dir" ]; then
+    rmdir "$staged_workflow_dir" 2>/dev/null || true
+  fi
 
   # Subtraction round: anchored to the CLI's OWN message rather than a bare
   # grep for the ceiling variable's name (which false-positived on any

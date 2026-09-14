@@ -1141,3 +1141,122 @@ test('weekly runner (anti-vacuity, end to end): a "published" remote that clones
   assert.match(logContents, /STALENESS could-not-check /, `a zero-file comparison must never read as "STALENESS ok":\n${logContents}`)
   assert.ok(!/^STALENESS ok /m.test(logContents), `must not report ok when nothing was actually compared:\n${logContents}`)
 })
+
+// --- staging the workflow script, so no run has to improvise one ----------
+//
+// Observed in the real log every week from 2026-08-30 to 2026-09-14, across
+// all three repos: the Workflow tool resolves a workflow by NAME from the
+// repo's own .claude/workflows/, not from the global ~/.claude/workflows/
+// where the harness installs it. So each run copied the script into the repo
+// under an invented name, then could not delete it -- `rm` is in the runner's
+// own disallowedTools list, deliberately. Three weeks of untracked leftovers
+// and a "delete this when convenient" note in a log nobody reads.
+//
+// The cleanup belongs in the runner, which has permission, not in the agent,
+// which does not.
+
+function stagedPath(repo) {
+  return path.join(repo, '.claude', 'workflows', 'optimise-cycle.js')
+}
+
+function withGlobalWorkflow(home, body) {
+  const dir = path.join(home, 'workflows')
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'optimise-cycle.js'), body)
+  return dir
+}
+
+// A `claude` stub that RECORDS whether the staged script was present at the
+// moment it ran, then behaves like the shared stub's pass/fail markers.
+//
+// Without this witness, three of the tests below were vacuous: with no
+// staging implemented at all, the file never exists, so "the staged copy is
+// gone afterwards" is trivially true and the test passes against an empty
+// implementation. Measured -- reverting the runner change left 3 of these 5
+// green. The separating question is whether the file existed DURING the run,
+// which only something running inside the run can answer.
+const WITNESS_STAGED = '.optimise-weekly-staged-seen'
+function witnessingClaudeStub(outcome) {
+  const dir = fs.mkdtempSync(path.join(RUN_TMPDIR, 'witness-stub-'))
+  const body = `#!/bin/sh
+if [ -f .claude/workflows/optimise-cycle.js ]; then
+  cat .claude/workflows/optimise-cycle.js > ${JSON.stringify(WITNESS_STAGED)}
+fi
+${outcome === 'fail' ? 'exit 1' : `mkdir -p .claude
+cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF
+exit 0`}
+`
+  fs.writeFileSync(path.join(dir, 'claude'), body, { mode: 0o755 })
+  return dir
+}
+function stagedWasSeen(repo) {
+  return fs.existsSync(path.join(repo, WITNESS_STAGED))
+}
+
+test('weekly runner: stages the global workflow script into the repo so the run never has to copy it itself', () => {
+  const repo = makeTempRepo()
+  const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
+  withGlobalWorkflow(home, '// global optimise-cycle script\n')
+  const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
+  assert.match(res.logContents, resultLineRegex('PASS', label(repo)))
+  assert.equal(stagedWasSeen(repo), true,
+    'the script must actually be present WHILE the run happens; asserting only on the log would pass against a runner that logged "staged" and staged nothing')
+  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'),
+    '// global optimise-cycle script\n',
+    'and it must be the global script, not an empty placeholder')
+})
+
+test('weekly runner: removes the script it staged, leaving the repo exactly as it found it', () => {
+  const repo = makeTempRepo()
+  const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
+  withGlobalWorkflow(home, '// global optimise-cycle script\n')
+  runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
+  assert.equal(stagedWasSeen(repo), true,
+    'guard against vacuity: prove it WAS there, or "it is gone" means nothing')
+  assert.equal(fs.existsSync(stagedPath(repo)), false,
+    'the staged copy must be gone; three weeks of leftovers is the defect this closes')
+  assert.equal(fs.existsSync(path.join(repo, '.claude', 'workflows')), false,
+    'and the directory it created with it, since the repo did not have one')
+})
+
+test('weekly runner: cleans up the staged script even when the run FAILS', () => {
+  const repo = makeTempRepo()
+  const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
+  withGlobalWorkflow(home, '// global optimise-cycle script\n')
+  const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('fail') })
+  assert.match(res.logContents, resultLineRegex('FAIL', label(repo)))
+  assert.equal(stagedWasSeen(repo), true, 'guard against vacuity, as above')
+  assert.equal(fs.existsSync(stagedPath(repo)), false,
+    'a failing run is exactly when a leftover is most likely and least noticed')
+})
+
+test("weekly runner: a repo that ships its OWN workflow script keeps it, untouched -- repo-local wins on name collision, per the harness contract", () => {
+  const repo = makeTempRepo()
+  const own = stagedPath(repo)
+  fs.mkdirSync(path.dirname(own), { recursive: true })
+  fs.writeFileSync(own, '// THIS REPO SHIPS ITS OWN TUNED COPY\n')
+  const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
+  withGlobalWorkflow(home, '// global optimise-cycle script\n')
+  const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
+  assert.equal(fs.readFileSync(own, 'utf8'), '// THIS REPO SHIPS ITS OWN TUNED COPY\n',
+    'staging must never overwrite a repo that deliberately ships its own copy')
+  assert.equal(fs.existsSync(own), true, 'and must never delete one it did not create')
+  // Not vacuous: with no implementation this file is also untouched, so pin
+  // that the runner SAW it and skipped staging deliberately.
+  assert.match(res.logContents, /repo ships its own optimise-cycle\.js/)
+  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'),
+    '// THIS REPO SHIPS ITS OWN TUNED COPY\n',
+    "and that the run saw the repo's own copy, not the global one")
+})
+
+test('weekly runner: says so and carries on when there is no global script to stage, rather than failing the repo', () => {
+  const repo = makeTempRepo()
+  const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
+  fs.mkdirSync(path.join(home, 'workflows'), { recursive: true })  // exists, but empty
+  const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
+  assert.match(res.logContents, resultLineRegex('PASS', label(repo)),
+    'a plugin install has no ~/.claude/workflows/ copy and still resolves the skill; staging is an aid, not a precondition')
+  assert.match(res.logContents, /no global optimise-cycle\.js to stage/)
+  assert.equal(stagedWasSeen(repo), false, 'nothing to stage means nothing staged')
+})
