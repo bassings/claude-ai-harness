@@ -4178,6 +4178,723 @@
       ],
       "expect": "block",
       "note": "(round 4, M4) the same repo-global fact crossing a command-substitution boundary"
+    },
+    {
+      "command": "git checkout master tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git checkout -qf",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "echo hi\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git reset --hard > /dev/null 2>&1",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "bash -c 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "echo $(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "HARNESS_ALLOW_DESTRUCTIVE_GIT=1 true; bash -c 'git checkout -- tracked.txt'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "cd nested && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "placeholder.txt",
+          "content": "seed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the nested repo is CLEAN, so the cd target really is measured rather than the command being refused for naming a nested repo at all"
+    },
+    {
+      "command": "git clean -fdx",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "gitignore",
+          "patterns": [
+            ".env",
+            ".codex/"
+          ]
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the same -fdx with the .gitignore committed but no ignored file present, so there is nothing to remove"
+    },
+    {
+      "command": "git clean -fX",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "gitignore",
+          "patterns": [
+            ".env",
+            ".codex/"
+          ]
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): -fX with nothing ignored to remove"
+    },
+    {
+      "command": "git clean -df",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git clean -fx",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git -C . clean --force",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git -c clean.requireForce=false clean -d",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the -c override still reaches the measurement, which finds nothing to remove -- so the override is not itself treated as the risk"
+    },
+    {
+      "command": "git restore README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git checkout -- README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git checkout HEAD -- README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "/usr/bin/git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git -C sub reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "mkdir",
+          "path": "sub"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "env X=1 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "command git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "if git reset --hard; then echo no; fi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "sudo nohup timeout 5 env command git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the clean-tree allow twin this block case had no pair for. Without it, a guard that refused the shape unconditionally would look identical to one that measures."
+    },
+    {
+      "command": "git stash drop 1",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): index 1 with only ONE entry names nothing, so git drops nothing -- the twin for the two-entry block case"
+    },
+    {
+      "command": "git stash drop -q stash@{0}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the flag-before-ref shape with an empty stash"
+    },
+    {
+      "command": "cd \"$SOME_VAR\" && git clean -n -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4) for the whole unresolvable-cd family (clean -fd, clean -d, stash drop, stash clear). A clean-tree twin is impossible for those: the refusal does not depend on the tree at all, it fires because the directory cannot be resolved, so the same command on a clean fixture is refused too and would prove nothing. The honest twin is the same unresolvable cd on a command that destroys nothing whatever the directory holds -- an explicit dry run, still allowed, which shows the refusal is about being unable to MEASURE rather than a blanket ban on a dynamic cd"
+    },
+    {
+      "command": "git switch -f feature",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        },
+        {
+          "op": "branch",
+          "name": "feature"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2 (round 4): git switch -f discards uncommitted changes tree-wide, and the corpus had no case for it at all -- JS-only until now, so the vendored Codex suite did not cover it"
+    },
+    {
+      "command": "git switch -f feature",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "branch",
+          "name": "feature"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): git switch -f on a clean tree"
+    },
+    {
+      "command": "git switch --force feature",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        },
+        {
+          "op": "branch",
+          "name": "feature"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2 (round 4): the --force long spelling of the same shape, also absent from the corpus"
+    },
+    {
+      "command": "git switch --force feature",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "branch",
+          "name": "feature"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): git switch --force on a clean tree"
+    },
+    {
+      "command": "git checkout --force",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2 (round 4): the --force long spelling of checkout -f, absent from the corpus (only the bundled -qf and the bare -f were there)"
+    },
+    {
+      "command": "git checkout --force",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): git checkout --force on a clean tree"
+    },
+    {
+      "command": "git checkout HEAD README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2 (round 4): `<ref> <path>` with NO `--` separator, absent from the corpus. git treats everything after a leading ref as pathspecs, so this discards README.md's uncommitted change exactly as the `--` spelling does"
+    },
+    {
+      "command": "git checkout HEAD README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): `<ref> <path>` with no separator, clean tree"
     }
   ]
 }
