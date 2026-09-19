@@ -460,6 +460,58 @@
       "note": "AC-SEC-1(b): cwd is not a git repository at all, so the measuring `git status` call itself fails -- checkout/reset's fail-open posture allows rather than guessing"
     },
     {
+      "command": "HARNESS_ALLOW_DESTRUCTIVE_GIT=1 true; bash -c 'git checkout -- tracked.txt'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-SEC-3: the escape hatch on an EARLIER segment does not disarm a destructive command inside a LATER bash -c wrapper"
+    },
+    {
+      "command": "bash -c 'HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- tracked.txt'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-SEC-3: the escape hatch set INSIDE the bash -c body does disarm the command it prefixes"
+    },
+    {
       "command": "bash -c 'git checkout -- tracked.txt'",
       "setup": [
         {
