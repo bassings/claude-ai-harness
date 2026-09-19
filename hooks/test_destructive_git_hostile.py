@@ -287,6 +287,97 @@ class TestHostileCommandsAsRealProcesses(unittest.TestCase):
             subprocess.run(['rm', '-rf', cwd])
 
 
+class TestOversizeGitSubstringDecision(unittest.TestCase):
+    """K1 review round 3: refusing EVERY over-cap command blocked ordinary
+    work -- this hook runs on every Bash call, and an agent routinely
+    writes a large file through one (a heredoc, generated test data).
+    Measured: `echo hi ` followed by 70,000 x's was refused with exit 2
+    against b9db050, purely for being long, with no `git` anywhere in it.
+
+    The fix (round 3): over the cap, refuse only when the raw text contains
+    the substring `git`; otherwise allow without parsing. These three cases
+    pin the decision in both directions, plus its accepted cost."""
+
+    def _run(self, command, cwd):
+        payload = json.dumps({
+            'tool_name': 'Bash',
+            'tool_input': {'command': command},
+            'cwd': cwd,
+            'hook_event_name': 'PreToolUse',
+        })
+        start = time.monotonic()
+        result = subprocess.run(
+            [sys.executable, GUARD_PATH], input=payload,
+            capture_output=True, text=True, timeout=10,
+        )
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        return result, elapsed_ms
+
+    def test_a_70000_char_command_with_no_git_substring_is_allowed(self):
+        # The exact shape measured against b9db050: over the cap, no `git`
+        # anywhere, purely a large harmless write. Also fast: the
+        # allow-without-parsing path is a single linear scan, not a parse.
+        command = 'echo hi ' + ('x' * 70000)
+        self.assertGreater(len(command), guard.MAX_COMMAND_LENGTH_CHARS,
+                            'sanity: this command must still be over the cap')
+        self.assertNotIn('git', command, 'sanity: this command must contain no `git` substring at all')
+        cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-oversize-no-git-')
+        try:
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=10)
+            result, elapsed_ms = self._run(command, cwd)
+            self.assertEqual(
+                result.returncode, 0,
+                'a large command with no `git` substring must be ALLOWED without being parsed -- '
+                'this hook runs on every Bash call, and refusing ordinary large writes (a heredoc, '
+                'generated test data) is exactly the noise that gets a guard disabled. '
+                'Got exit %s, stderr: %s' % (result.returncode, result.stderr))
+            self.assertLess(elapsed_ms, 2000,
+                             'the no-git allow path took %.1fms -- it must be a cheap linear scan, never a parse'
+                             % elapsed_ms)
+        finally:
+            subprocess.run(['rm', '-rf', cwd])
+
+    def test_the_1mib_git_reset_hard_case_still_refused_within_budget(self):
+        # The fix must not have reopened round 2's hole: a real destructive
+        # command over the cap stays refused, and stays fast.
+        command = 'git reset --hard ' + ('A' * 1048576)
+        cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-oversize-with-git-')
+        try:
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=10)
+            result, elapsed_ms = self._run(command, cwd)
+            self.assertEqual(result.returncode, 2,
+                              'an over-cap command containing `git reset --hard` must still be refused')
+            self.assertLess(elapsed_ms, 2000, 'refusing an over-cap git command took %.1fms, over budget' % elapsed_ms)
+        finally:
+            subprocess.run(['rm', '-rf', cwd])
+
+    def test_a_70000_char_heredoc_body_mentioning_git_is_refused_accepted_cost(self):
+        # The accepted cost of checking the RAW text (before heredoc-body
+        # stripping): an over-cap heredoc body that merely MENTIONS git,
+        # and would ordinarily be inert text once parsed, is refused
+        # instead of being cheaply parsed to find out it was harmless --
+        # confirming it really is inert needs the same expensive parse the
+        # length cap exists to avoid. Pinned here so this cost stays a
+        # documented choice, not a silent surprise if someone later "fixes"
+        # it by parsing first and cheapens the guarantee round 2 exists for.
+        body_line = 'please never run git reset --hard here\n'
+        command = "cat <<'EOF' > generated-fixture.txt\n" + body_line * 2000 + "EOF\n"
+        self.assertGreater(len(command), guard.MAX_COMMAND_LENGTH_CHARS,
+                            'sanity: this heredoc must still be over the cap')
+        self.assertIn('git', command, 'sanity: the heredoc body must mention git')
+        cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-oversize-heredoc-')
+        try:
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=10)
+            result, elapsed_ms = self._run(command, cwd)
+            self.assertEqual(
+                result.returncode, 2,
+                'an over-cap heredoc whose body mentions `git` is refused -- the accepted cost of '
+                'checking the raw text before heredoc stripping, not a bug')
+            self.assertLess(elapsed_ms, 2000, 'refusing an over-cap heredoc took %.1fms, over budget' % elapsed_ms)
+        finally:
+            subprocess.run(['rm', '-rf', cwd])
+
+
 class TestHostilePayloadShapes(unittest.TestCase):
     """The two categories that are not really "commands" at all: a
     malformed PAYLOAD (empty / non-JSON), and a non-ASCII cwd path."""

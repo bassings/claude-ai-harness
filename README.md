@@ -426,20 +426,34 @@ past it.
   files nor a stash entry has any snapshot anywhere; an unverifiable clean
   or stash-drop is refused, not guessed at.
 - **A command over 65,536 characters (`MAX_COMMAND_LENGTH_CHARS`) is
-  refused UNSEEN**, before any tokenising runs, at every recursion level
-  (the whole command, and each `bash -c` body or `$(...)`/backtick
-  substitution independently) -- K1 review round 2, after CI measured a
-  1 MiB command making Python's `shlex` tokeniser (which reads one
-  character at a time) take roughly 8 seconds on its own, comfortably over
-  a 10-second test budget under ordinary machine contention. This is
-  deliberately NOT the same "a shape the tokenizer cannot parse falls
-  through allowed" rule this guard otherwise uses (see "Deliberately out of
-  scope" below): an over-cap command could still, in principle, be parsed,
-  just not within a safe wall-clock budget, and skipping the parse to
-  answer "allowed" would let a real `git reset --hard` hidden inside enough
-  padding straight through. A harmless over-cap command is refused too --
-  there is no cheap way to tell the difference without doing the expensive
-  parse this cap exists to avoid.
+  handled BEFORE any tokenising runs**, at every recursion level (the whole
+  command, and each `bash -c` body or `$(...)`/backtick substitution
+  independently) -- K1 review round 2, after CI measured a 1 MiB command
+  making Python's `shlex` tokeniser (which reads one character at a time)
+  take roughly 8 seconds on its own, comfortably over a 10-second test
+  budget under ordinary machine contention. If the raw text contains the
+  substring `git` anywhere (a single cheap linear scan, including inside a
+  heredoc body or a quoted string), it is REFUSED unseen -- deliberately
+  NOT the same "a shape the tokenizer cannot parse falls through allowed"
+  rule this guard otherwise uses (see "Deliberately out of scope" below):
+  an over-cap command could still, in principle, be parsed, just not
+  within a safe wall-clock budget, and skipping the parse to answer
+  "allowed" would let a real `git reset --hard` hidden inside enough
+  padding straight through. If the raw text has NO `git` substring at all,
+  it is ALLOWED without being parsed: every rule this guard can ever fire
+  needs a real git invocation, and a git invocation always contains those
+  three letters somewhere, so a command that never mentions `git` cannot
+  possibly match any rule this guard has. **K1 review round 3** added this
+  half: refusing every over-cap command, regardless of content, blocked
+  ordinary work -- this hook runs on every Bash call, and an agent
+  routinely writes a large file through one (a heredoc, generated test
+  data); measured, `echo hi ` followed by 70,000 `x`s was refused purely
+  for being long. **Accepted cost**: because the `git` check runs on the
+  RAW text before heredoc-body stripping, an over-cap heredoc body that
+  only MENTIONS `git` (and would ordinarily be inert once parsed) is still
+  refused -- confirming it is really inert needs the same expensive parse
+  this cap exists to avoid, so this is deliberate, not a bug, and a test
+  pins it so the cost stays a choice.
 - **Registered timeout.** `hooks/hooks.json` gives this hook 60 seconds
   (raised from 10 in K1 review round 1), strictly greater than
   `WORST_CASE_SEGMENT_SECONDS` (30s: `MAX_SUBPROCESS_CALLS_PER_SEGMENT` x

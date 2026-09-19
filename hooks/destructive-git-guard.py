@@ -49,9 +49,11 @@ fails or times out), the command is ALLOWED, because a git-tracked snapshot
 cannot be resolved, the measuring call fails, or it times out), because
 neither untracked/ignored files nor a stash entry has any snapshot anywhere
 -- an unverifiable clean or stash-drop is refused, not guessed at. A
-command over MAX_COMMAND_LENGTH_CHARS fails CLOSED regardless of which rule
-would otherwise have applied, and regardless of whether it is actually
-destructive: see item 0 of the normalisation layer below.
+command over MAX_COMMAND_LENGTH_CHARS that contains the substring `git`
+fails CLOSED regardless of which rule would otherwise have applied, and
+regardless of whether it is actually destructive; one with NO `git`
+substring anywhere is allowed without being parsed at all (K1 review round
+3 -- see item 0 of the normalisation layer below).
 
 Escape hatch: HARNESS_ALLOW_DESTRUCTIVE_GIT=1, set either as this hook
 process's own environment (opts out every segment), or as a genuine
@@ -80,18 +82,24 @@ cause a round-2 review found: eight distinct bypasses were eight symptoms of
 this one missing stage, not eight independent holes). Applied per segment,
 in order:
 
-  0. Refuse UNSEEN, before any of the stages below ever run, a command (or a
-     `bash -c` body, or a `$(...)`/backtick substitution -- this check runs
-     at every recursion level) over MAX_COMMAND_LENGTH_CHARS. CPython's
-     shlex tokenises one character at a time, so a single very long token
-     scales far worse than linearly: a 1 MiB command measured ~8s in
+  0. A command (or a `bash -c` body, or a `$(...)`/backtick substitution --
+     this check runs at every recursion level) over MAX_COMMAND_LENGTH_CHARS
+     is handled BEFORE any of the stages below ever run. CPython's shlex
+     tokenises one character at a time, so a single very long token scales
+     far worse than linearly: a 1 MiB command measured ~8s in
      split_segments() alone on this machine, which exceeded a 10s CI test
-     budget under ordinary contention (K1 review round 2). This is
+     budget under ordinary contention (K1 review round 2). If the raw text
+     contains the substring `git` anywhere (a cheap linear scan, including
+     inside a heredoc body or a quoted string), it is REFUSED UNSEEN --
      deliberately NOT the same "unparseable -> fail open" rule item 9 below
      documents for a shape shlex cannot tokenise at all: an over-cap command
      COULD still be parsed, just not within a safe wall-clock budget, and
      skipping the parse to answer "allowed" would let a real destructive git
-     call hidden in the padding straight through. See REFUSAL_OVERSIZE.
+     call hidden in the padding straight through. If the raw text contains
+     NO `git` substring at all, it is ALLOWED without being parsed (K1
+     review round 3: every rule this guard can ever fire needs a real git
+     invocation, which needs the letters `git` somewhere in the command).
+     See REFUSAL_OVERSIZE.
   1. Segment on `&&`, `||`, `;`, `|`, `&` AND a bare newline -- a multi-line
      Bash call is the ordinary shape of agent tool use, and a destructive
      command on any line but the first must be caught exactly like one
@@ -174,9 +182,12 @@ shlex cannot represent (unbalanced quotes, and anything past
 MAX_UNWRAP_DEPTH levels of wrapper nesting) fall through ALLOWED: this hook
 only ever blocks a pattern it can positively identify, never a command it
 merely failed to parse. The ONE exception is size, not shape: a command
-over MAX_COMMAND_LENGTH_CHARS is refused rather than parsed at all,
-because skipping the parse to answer "allowed" is not the same risk as
-failing to positively identify a shape -- it is choosing not to look. It
+over MAX_COMMAND_LENGTH_CHARS that contains the substring `git` is refused
+rather than parsed at all, because skipping the parse to answer "allowed"
+is not the same risk as failing to positively identify a shape -- it is
+choosing not to look, and a real git invocation always contains those
+three letters somewhere. An over-cap command with NO `git` substring is
+allowed unparsed, since no rule this guard has could ever fire on it. It
 makes no completeness claim -- see README.md's
 "Destructive git guard" section for the measured-open bypass classes and why
 recovery, not detection, is the mechanism this repo actually relies on.
@@ -265,16 +276,28 @@ WORST_CASE_SEGMENT_SECONDS = MAX_SUBPROCESS_CALLS_PER_SEGMENT * SUBPROCESS_TIMEO
 # blocking a local pre-push). A single 65536-char token measured ~38ms
 # uncontended -- comfortably bounded even under heavy contention.
 #
-# The decision on an over-cap command is REFUSE, not allow, and this is
-# deliberate, not the same "unparseable -> fail open" rule this guard uses
-# for a shape shlex cannot tokenise at all (see module docstring). Skipping
-# the expensive tokenising step and then answering "allowed" would let a
-# real `git reset --hard` hidden inside enough padding straight through --
-# exactly the shape a hostile or merely enormous payload could exploit. An
-# over-cap command is refused UNSEEN, before any of the normalisation stages
-# below ever run, at every recursion level (the top-level command, and each
-# `bash -c` body or `$(...)`/backtick substitution independently) -- see
-# evaluate_command_text()'s first check.
+# The decision on an over-cap command that MIGHT be a real git invocation
+# is REFUSE, not allow, and this is deliberate, not the same "unparseable
+# -> fail open" rule this guard uses for a shape shlex cannot tokenise at
+# all (see module docstring). Skipping the expensive tokenising step and
+# then answering "allowed" would let a real `git reset --hard` hidden
+# inside enough padding straight through -- exactly the shape a hostile or
+# merely enormous payload could exploit. An over-cap command that COULD be
+# a git invocation is refused UNSEEN, before any of the normalisation
+# stages below ever run, at every recursion level (the top-level command,
+# and each `bash -c` body or `$(...)`/backtick substitution independently)
+# -- see evaluate_command_text()'s first check.
+#
+# K1 review round 3: refusing EVERY over-cap command blocked ordinary work
+# -- this hook runs on every Bash call, and an agent routinely writes a
+# large file through one (a heredoc, generated test data). Every rule this
+# guard can ever fire needs the literal substring `git` somewhere in the
+# command text (no git binary path, no `git` subcommand, exists without
+# it), so an over-cap command with NO `git` substring anywhere is allowed
+# without being parsed at all -- a single cheap linear scan
+# (`'git' in command`), checked on the raw text before any stripping, so a
+# large, git-free heredoc or generated-data write is no longer refused
+# just for being long.
 MAX_COMMAND_LENGTH_CHARS = 65536
 
 # `bash -c SCRIPT` / `sh -c SCRIPT` / `bash -lc SCRIPT`: matched by binary
@@ -884,16 +907,21 @@ REFUSAL_STASH = (
     "exported for the session."
 )
 
-# K1 review round 2: no `{cmd}` slot -- this refusal fires BEFORE any
+# K1 review round 2/3: no `{cmd}` slot -- this refusal fires BEFORE any
 # tokenising, so there is no parsed `head` to display, and printing the
 # full over-cap text back would itself be wasteful. Shows a bounded prefix
 # instead. Only the process-environment escape hatch (exported for the
 # session) can apply here: the inline, segment-scoped form needs the
 # command tokenised to find it, which is exactly the step this refusal
-# skips.
+# skips. Only ever raised for an over-cap command that DOES contain the
+# substring `git` -- one that does not is allowed without reaching this
+# formatting at all (round 3: refusing every over-cap command blocked
+# ordinary large-file-writing Bash calls that never go near git).
 REFUSAL_OVERSIZE = (
     "destructive-git-guard: refused a {length}-character command (starts "
-    "`{prefix}...`) -- over this guard's {cap}-character parsing cap. "
+    "`{prefix}...`) -- over this guard's {cap}-character parsing cap AND "
+    "containing the substring `git`, which could be a real invocation this "
+    "guard cannot safely check within a bounded wall-clock cost. "
     "Tokenising a command this size cannot be bounded to a safe wall-clock "
     "cost (a single very long token makes the tokeniser scale far worse "
     "than linearly -- measured, see the module docstring), and this guard "
@@ -1061,13 +1089,40 @@ def evaluate_command_text(command, state, depth):
     if depth > MAX_UNWRAP_DEPTH:
         return None  # bounded; fail open past the bound, see module docstring
     if len(command) > MAX_COMMAND_LENGTH_CHARS:
-        # Refused UNSEEN, before strip_heredoc_bodies/extract_command_substitutions/
-        # split_segments ever run on it -- those are exactly the stages whose
-        # cost this cap exists to bound (K1 review round 2). Deliberately the
-        # opposite of "unparseable -> fail open": this command COULD still be
-        # parsed, just not within a safe wall-clock budget, and skipping the
-        # parse to answer "allowed" would let a real destructive git call
-        # hidden in the padding straight through.
+        # K1 review round 3: refusing EVERY over-cap command blocked
+        # ordinary work -- this hook runs on every Bash call, and agents
+        # routinely write large files through one (`cat > file.json <<'EOF'
+        # ... EOF`, generated test data). Every rule this guard can ever
+        # fire needs a real git invocation to match, and a destructive one
+        # needs the literal substring `git` somewhere in the command text --
+        # a variable-expansion trick (`$G reset --hard`) is already outside
+        # this guard's stated scope (an ACCIDENT guard, not a defence against
+        # an adversary -- see the module docstring's own framing). So an
+        # over-cap command with no `git` substring anywhere is ALLOWED
+        # without being parsed at all: `'git' in command` is a single linear
+        # scan, cheap even at MAX_COMMAND_LENGTH_CHARS, and it cannot miss a
+        # real invocation (no git binary path, no `git` subcommand, exists
+        # without the three letters `git` in it somewhere).
+        #
+        # Checked on the RAW text, before strip_heredoc_bodies runs --
+        # deliberately: an over-cap heredoc BODY that merely mentions `git`
+        # is refused too, even though that text is inert and would
+        # ordinarily be stripped before matching. This is an accepted,
+        # deliberate cost (confirming it really is inert needs the same
+        # expensive parse this cap exists to avoid), pinned by
+        # test_destructive_git_hostile.py so it stays a choice, not a
+        # surprise.
+        #
+        # An over-cap command that DOES contain `git` is refused UNSEEN,
+        # before strip_heredoc_bodies/extract_command_substitutions/
+        # split_segments ever run on it -- those are exactly the stages
+        # whose cost this cap exists to bound (K1 review round 2).
+        # Deliberately the opposite of "unparseable -> fail open": this
+        # command COULD still be parsed, just not within a safe wall-clock
+        # budget, and skipping the parse to answer "allowed" would let a
+        # real destructive git call hidden in the padding straight through.
+        if 'git' not in command:
+            return None
         return REFUSAL_OVERSIZE.format(
             length=len(command), prefix=command[:80], cap=MAX_COMMAND_LENGTH_CHARS, var=ESCAPE_VAR)
     command = strip_heredoc_bodies(command)
