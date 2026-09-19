@@ -1187,6 +1187,26 @@ acVerdicts = lensReports.flatMap(r =>
   (r.ac_verdicts || []).map(v => ({ ac_id: v.id, verdict: v.verdict }))
 )
 
+// specs/harn-ledger-validators.md D4/M1 (fix round 3): computed here, before
+// the synthesis prompt is built, so BOTH halves of the fix can use it -- the
+// prompt-shaping half just below, and the post-processing half further down
+// (which used to declare this same boolean a second time). "No spec was in
+// play" means specPath is null AND no lens returned any ac_verdicts
+// (review-cycle.js's own no-spec branch of specClause tells a lens with none
+// to go and find one, so a run invoked without one may still legitimately
+// have verified criteria).
+//
+// This is a workflow script: it cannot import ledger-append.mjs's own
+// wasNoSpecInPlay (this file's own header records that the sandboxed
+// runtime rejects any import before a workflow script even starts), so this
+// is a necessary, documented duplicate of that exported predicate. It now
+// only shapes what is ASKED of synthesis (the prompt clause and required
+// schema entry just below); the actual data guarantee -- spec_bugs and
+// spec_bug_count read null, never a measured zero, on a no-spec run -- is
+// enforced unconditionally further down, regardless of what synthesis
+// actually returned.
+const noSpecWasInPlay = !specPath && acVerdicts.length === 0
+
 // ---- the reviewed-tip check: mechanical, fail-closed ----
 // Every lens must state the sha its findings came from, and it must be the tip
 // this run pinned. An ABSENT value is treated as a mismatch, never as
@@ -1327,9 +1347,20 @@ const synthesis = await agent(
   `4. ${specPath ? 'AC verdict summary, and any finding with no AC behind it flagged as a SPEC BUG.' : 'AC verdict summary if the lenses found a spec; otherwise note that no spec existed, so every finding is unanchored to an AC.'}\n` +
   `5. A closing line: overall CLEAN / FINDINGS / BLOCKED and what must happen before push.\n` +
   `Do not soften findings and do not invent any. If a lens returned BLOCKED, say so prominently. ` +
-  `Also return spec_bugs (findings with no AC behind them) and rejected_findings (findings investigated and shown to be ` +
-  `false alarms) as structured arrays, each item carrying lens, location and claim, so capture is mechanical rather than ` +
-  `left in the prose. ` +
+  // M1 (fix round 3, D4): asking for spec_bugs at all only makes sense when a
+  // spec was actually in play -- with none, EVERY finding has no AC behind
+  // it, so asking synthesis to classify spec bugs here would just re-invite
+  // the exact conflation decision 4 exists to remove, one field upstream of
+  // where it used to be caught.
+  (noSpecWasInPlay
+    ? `Also return rejected_findings (findings investigated and shown to be false alarms) as a structured array, each ` +
+      `item carrying lens, location and claim, so capture is mechanical rather than left in the prose. There is no spec ` +
+      `in play for this run, so do not classify any finding as a spec bug -- report every other finding as an ordinary ` +
+      `open finding instead. `
+    : `Also return spec_bugs (findings with no AC behind them) and rejected_findings (findings investigated and shown to ` +
+      `be false alarms) as structured arrays, each item carrying lens, location and claim, so capture is mechanical ` +
+      `rather than left in the prose. `
+  ) +
   (priorFindings
     ? `Also return fixed_findings: for each PRIOR-ROUND FINDING above that this built change genuinely resolves, echo its ` +
       `lens, location and claim EXACTLY as given above -- copy them, do not paraphrase. Only ever echo an entry that ` +
@@ -1347,7 +1378,11 @@ const synthesis = await agent(
     phase: 'Synthesis',
     schema: {
       type: 'object',
-      required: ['report', 'spec_bugs', 'rejected_findings'],
+      // M1 (fix round 3): spec_bugs is required only when a spec was in
+      // play; the prompt clause above does not even ask for it otherwise, so
+      // requiring it unconditionally would enforce a field this run's own
+      // instructions never mentioned.
+      required: noSpecWasInPlay ? ['report', 'rejected_findings'] : ['report', 'spec_bugs', 'rejected_findings'],
         // Optional: absent means "not reported", which must never be read as
         // "did not move" -- absent evidence is not evidence (see the guard below).
 
@@ -1402,9 +1437,19 @@ specBugCount = specBugsRaw ? specBugsRaw.length : null
 //
 // specBugCount goes to null, not 0: null is "not measured", 0 is "measured as
 // none", and this codebase distinguishes those everywhere else.
-const noSpecWasInPlay = !specPath && acVerdicts.length === 0
-if (noSpecWasInPlay && specBugsRaw && specBugsRaw.length > 0) {
-  openFindingsRaw = openFindingsRaw.concat(specBugsRaw)
+//
+// M1 (fix round 3): this used to be gated on `specBugsRaw.length > 0`, so an
+// EMPTY spec_bugs array on a no-spec run -- the most common no-spec outcome,
+// since there is no spec to have found a bug in -- never reached the null-out
+// below and stayed at the 0 already computed above, reading identically to a
+// run that HAD a spec and found zero bugs in it. Unconditional on
+// noSpecWasInPlay now: an empty array and a populated one are the SAME "not
+// measured" case, so both null out the same way. Only the merge into
+// openFindingsRaw stays conditional on there being anything to merge.
+if (noSpecWasInPlay) {
+  if (specBugsRaw && specBugsRaw.length > 0) {
+    openFindingsRaw = openFindingsRaw.concat(specBugsRaw)
+  }
   // null, not []: ledger-append recomputes spec_bug_count from the array it
   // receives, so an empty array makes the LEDGER say 0 ("we looked, there were
   // none") while this file's own telemetry says null ("not measurable"). With

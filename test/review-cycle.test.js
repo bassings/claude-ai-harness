@@ -394,11 +394,26 @@ test('review-cycle.js: lens-product\'s trigger_counts reflects only the files th
 // DECLARED REQUIRED on the schema itself (mutation: reducing required to
 // just ['report'] left 19/19 green). This reads the real schema object the
 // synthesis agent() call was made with, directly off the recorded call.
-test('review-cycle.js: the synthesis agent() call declares report, spec_bugs and rejected_findings as REQUIRED on its schema, not merely optional properties (M6, AC-QA-13)', async () => {
+//
+// M1 (fix round 3): spec_bugs is required only when a spec was actually in
+// play (specPath supplied, or a lens found one and returned ac_verdicts) --
+// see the D4 tests further below. The default baseAgent() fixture below has
+// neither, so it now exercises the NO-spec half; the spec-in-play half gets
+// its own test right after.
+test('review-cycle.js: the synthesis agent() call declares report and rejected_findings as REQUIRED on its schema when NO spec is in play, and does not require spec_bugs at all (M6, AC-QA-13, M1)', async () => {
   const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
   assert.ok(synthesisCall, 'expected a synthesis call')
+  assert.deepEqual(synthesisCall.opts.schema.required.slice().sort(), ['rejected_findings', 'report'])
+  assert.doesNotMatch(synthesisCall.prompt, /spec_bugs/, 'a prompt built for a spec-less run must not ask synthesis to classify spec bugs at all')
+})
+
+test('review-cycle.js: the synthesis agent() call declares report, spec_bugs and rejected_findings as REQUIRED on its schema when a spec IS in play (M6, AC-QA-13, M1)', async () => {
+  const { calls } = await runWorkflow(WF, { args: { spec: 'specs/example.md' }, agent: baseAgent() })
+  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
+  assert.ok(synthesisCall, 'expected a synthesis call')
   assert.deepEqual(synthesisCall.opts.schema.required.slice().sort(), ['rejected_findings', 'report', 'spec_bugs'])
+  assert.match(synthesisCall.prompt, /spec_bugs/, 'a spec IS in play, so synthesis must still be asked to classify spec bugs')
 })
 
 test('review-cycle.js: synthesis missing spec_bugs/rejected_findings fields is treated as a failed step, not a ledger line with silently empty arrays (AC-QA-13)', async () => {
@@ -2997,6 +3012,29 @@ test('review-cycle.js (D4): when NO spec was in play, findings are not recorded 
     'with no spec in play there is no spec to have a bug in; the findings must not be filed against one')
   assert.equal(payload.spec_bug_count, null,
     'null (not measured), never 0 (measured as none) -- the codebase distinguishes these everywhere else')
+})
+
+// M1 (fix round 3): the round-2 report's own repro. The original guard was
+// `if (noSpecWasInPlay && specBugsRaw && specBugsRaw.length > 0)`, so an
+// EMPTY spec_bugs array on a no-spec run (the most common no-spec outcome:
+// no spec bugs to misclassify because there was no spec to check) never
+// entered the branch that nulls specBugCount -- it stayed at the 0 already
+// computed from specBugsRaw.length, reading exactly like a run that HAD a
+// spec and found zero bugs in it.
+test('review-cycle.js (D4, M1): when NO spec was in play and synthesis returns an EMPTY spec_bugs array, spec_bug_count is null, not a measured zero', async () => {
+  const { calls } = await runWorkflow(WF, {
+    args: {},
+    agent: baseAgent({
+      synthesis: { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [] },
+    }),
+  })
+  const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
+  const payload = extractLedgerPayload(ledgerCalls[ledgerCalls.length - 1].prompt)
+  assert.equal(payload.spec, null, 'precondition: no spec path was supplied')
+  assert.deepEqual(payload.ac_verdicts, [], 'precondition: no lens located a spec either')
+  assert.equal(payload.spec_bug_count, null,
+    'null (not measured), never 0 -- an empty spec_bugs array on a no-spec run is the SAME "not measured" case as a populated one')
+  assert.ok(!payload.spec_bugs || payload.spec_bugs.length === 0)
 })
 
 test('review-cycle.js (D4): the finding itself SURVIVES -- reclassified, never dropped', async () => {
