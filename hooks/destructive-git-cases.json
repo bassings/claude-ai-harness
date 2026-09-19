@@ -4895,6 +4895,58 @@
       ],
       "expect": "allow",
       "note": "AC-QA-2 twin (round 4): `<ref> <path>` with no separator, clean tree"
+    },
+    {
+      "command": "git checkout HEAD README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "other.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the target file is CLEAN while a DIFFERENT file in the same repo is dirty, so this pins that the check is really scoped to the named path and does not fall back to a tree-wide reading. Measured while writing it, and worth recording because it is not obvious: `git status --porcelain -- HEAD README.md` exits 0 with empty output, because git status tolerates an unmatched pathspec rather than rejecting it. So this case does NOT separate ref-vs-pathspec resolution from the tree-wide retry -- see the round-4 report for why no case can, short of one git itself rejects as ambiguous"
+    },
+    {
+      "command": "git checkout HEAD -- README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "other.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4): the target file is CLEAN while a DIFFERENT file in the same repo is dirty, so this pins that the check is really scoped to the named path and does not fall back to a tree-wide reading. Measured while writing it, and worth recording because it is not obvious: `git status --porcelain -- HEAD README.md` exits 0 with empty output, because git status tolerates an unmatched pathspec rather than rejecting it. So this case does NOT separate ref-vs-pathspec resolution from the tree-wide retry -- see the round-4 report for why no case can, short of one git itself rejects as ambiguous"
     }
   ]
 }
