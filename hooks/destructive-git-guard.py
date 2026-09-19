@@ -379,6 +379,13 @@ GIT_ENV_ALLOWLIST = {
 # delimiter lines untouched.
 HEREDOC_START_RE = re.compile(r'<<-?\s*([\'"]?)(\w+)\1')
 
+# A stash ref that names an entry by INDEX, the only shape this guard can
+# reduce to what `git stash list` prints (normalize_stash_ref). Anything
+# else git accepts -- a reflog date such as `stash@{1.hour.ago}`, say --
+# deliberately does NOT match, so it fails closed instead of missing the
+# lookup and reading that miss as "nothing at risk" (round 4, H4).
+STASH_INDEX_REF_RE = re.compile(r'stash@\{(\d+)\}')
+
 
 def sanitized_git_env():
     env = dict(os.environ)
@@ -769,6 +776,9 @@ def classify_stash(rest):
         return None  # bare `git stash` == push; never refused
     sub = rest[0]
     if sub == 'drop':
+        # The FIRST non-flag argument, not rest[1]: `git stash drop -q
+        # stash@{0}` used to read `-q` as "no ref given" and fall back to
+        # stash@{0}, which only happened to be the right answer (round 4, H4).
         ref = rest[1] if len(rest) > 1 and not rest[1].startswith('-') else None
         return ('stash', {'op': 'drop', 'ref': ref})
     if sub == 'clear':
@@ -954,6 +964,27 @@ def stash_list(cwd):
     return [line.split(':', 1)[0].strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def normalize_stash_ref(ref):
+    """`ref` as the `stash@{N}` spelling `git stash list` prints, so a
+    lookup against that list is comparing like with like. Accepts the three
+    index spellings git itself does -- `stash@{N}`, the bare index `N`, and
+    a `refs/`-qualified `refs/stash@{N}` -- and returns None for a ref this
+    guard cannot reduce to an index, which the caller treats as
+    unverifiable, not as "no match" (K1 review round 4, H4).
+
+    None in means the ref was omitted, which git defaults to the most recent
+    entry."""
+    if ref is None:
+        return 'stash@{0}'
+    candidate = ref[len('refs/'):] if ref.startswith('refs/') else ref
+    if candidate.isdigit():
+        return 'stash@{%d}' % int(candidate)
+    indexed = STASH_INDEX_REF_RE.fullmatch(candidate)
+    if indexed:
+        return 'stash@{%d}' % int(indexed.group(1))
+    return None
+
+
 def stash_would_lose_entries(cwd, target):
     """True if `target` (from classify_stash) would actually destroy a real
     stash entry, or if this could not be verified (fails CLOSED -- see
@@ -962,10 +993,12 @@ def stash_would_lose_entries(cwd, target):
     if entries is None:
         return True  # cannot verify; fail CLOSED
     if not entries:
-        return False  # nothing to lose
+        return False  # nothing to lose, whatever the ref says
     if target['op'] == 'clear':
         return True  # at least one real entry exists, and clear destroys all of them
-    ref = target['ref'] or 'stash@{0}'
+    ref = normalize_stash_ref(target['ref'])
+    if ref is None:
+        return True  # ref not reducible to an index while entries exist; fail CLOSED
     return ref in entries
 
 
@@ -1003,7 +1036,9 @@ REFUSAL_STASH = (
     "destructive-git-guard: refused `{cmd}` -- either the stash list is "
     "non-empty (or an earlier `git stash` in this same command would make "
     "it so), or that could not be verified (the directory could not be "
-    "resolved, or the check itself failed or timed out), and this rule "
+    "resolved, the check itself failed or timed out, or the stash "
+    "reference given is not one this guard can reduce to a `stash@{{N}}` "
+    "index), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: `git stash list` "
     "to inspect the stash entries first. If this is deliberate, opt in "
     "explicitly: re-run with {var}=1 set inline (`{var}=1 {cmd}`) or "

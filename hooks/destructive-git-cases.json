@@ -3447,6 +3447,238 @@
       ],
       "expect": "block",
       "note": "AC-QA-2 (round 4, M5): the allow twin for every `stash push then drop` case is IMPOSSIBLE and this records why, rather than leaving the shape half-covered. Whether a push creates an entry depends on the tree at RUN time, which this guard would have to measure separately and could still lose a race on, so it assumes the push succeeds and fails CLOSED. The cost is bounded: on a clean tree with an empty stash the real command does nothing anyway (`git stash` reports `No local changes to save`, the drop then fails with `No stash entries found`), so the refusal falls only on a command that was already a no-op"
+    },
+    {
+      "command": "git stash drop 0",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H4): a stash ref is matched against `git stash list`'s `stash@{N}` spellings, so every OTHER spelling git accepts has to be normalised first. Matching the raw token failed OPEN on a lookup miss: reproduced, the real run printed `Dropped refs/stash@{0}` and left the stash list empty. Bare index shorthand, one entry"
+    },
+    {
+      "command": "git stash drop 0",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H4): bare index shorthand with an empty stash, nothing to lose"
+    },
+    {
+      "command": "git stash drop refs/stash@{0}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H4): a stash ref is matched against `git stash list`'s `stash@{N}` spellings, so every OTHER spelling git accepts has to be normalised first. Matching the raw token failed OPEN on a lookup miss: reproduced, the real run printed `Dropped refs/stash@{0}` and left the stash list empty. Fully-qualified refs/ spelling, one entry"
+    },
+    {
+      "command": "git stash drop refs/stash@{0}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H4): fully-qualified refs/ spelling with an empty stash"
+    },
+    {
+      "command": "git stash drop 1",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty one\n"
+        },
+        {
+          "op": "stash_push"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty two\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H4): a stash ref is matched against `git stash list`'s `stash@{N}` spellings, so every OTHER spelling git accepts has to be normalised first. Matching the raw token failed OPEN on a lookup miss: reproduced, the real run printed `Dropped refs/stash@{0}` and left the stash list empty. Index 1 of two entries: the real run left only stash@{0}, so the second entry was destroyed"
+    },
+    {
+      "command": "git stash drop 5",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty one\n"
+        },
+        {
+          "op": "stash_push"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty two\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H4), the other direction: index 5 names no entry of the two that exist, so git drops nothing and refusing would be a false refusal -- this is what proves the lookup is a real lookup and not a blanket refusal"
+    },
+    {
+      "command": "git stash drop stash@{1.hour.ago}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 / AC-OPS-11 (round 4, H4): a reflog-date ref this guard cannot normalise to an index, while entries exist, fails CLOSED rather than falling through a lookup miss"
+    },
+    {
+      "command": "git stash drop stash@{1.hour.ago}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H4): an uninterpretable ref with an EMPTY stash is still allowed -- there is nothing to lose, so the fail-closed branch must not fire on the ref alone"
+    },
+    {
+      "command": "git stash drop -q stash@{0}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H4): a stash ref is matched against `git stash list`'s `stash@{N}` spellings, so every OTHER spelling git accepts has to be normalised first. Matching the raw token failed OPEN on a lookup miss: reproduced, the real run printed `Dropped refs/stash@{0}` and left the stash list empty. A flag before the ref must not hide it: reading rest[1] blindly saw `-q`, fell back to stash@{0} and only happened to be right"
+    },
+    {
+      "command": "git stash drop -q stash@{5}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H4): the same flag-before-ref shape naming an entry that does not exist -- allowed, which is what proves the ref behind the flag is really being read"
     }
   ]
 }
