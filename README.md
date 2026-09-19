@@ -422,9 +422,15 @@ past it.
   the command is ALLOWED, because the git-tracked snapshot below already
   covers tracked work regardless. `git clean` and `git stash drop`/`clear`
   fail CLOSED on the same three conditions -- an unresolvable directory, a
-  failed measuring call, or a timeout -- because neither untracked/ignored
-  files nor a stash entry has any snapshot anywhere; an unverifiable clean
-  or stash-drop is refused, not guessed at.
+  failed measuring call, or a timeout -- and on two more of their own: the
+  command selecting a DIFFERENT repository (`--git-dir`/`--work-tree`, or a
+  `GIT_DIR=`/`GIT_WORK_TREE=` env prefix), which this guard's own measuring
+  call cannot reach, and a `stash drop` naming a ref that cannot be reduced
+  to a `stash@{N}` index. Neither untracked/ignored files nor a stash entry
+  has any snapshot anywhere, so an unverifiable clean or stash-drop is
+  refused, not guessed at. `git stash` in ANY push spelling (`-u`, `-m`,
+  `-a`, bare) counts as creating the entry a later `drop` would destroy,
+  read off git's grammar rather than a list of literal spellings.
 - **A command over 65,536 characters (`MAX_COMMAND_LENGTH_CHARS`) is
   handled BEFORE any tokenising runs**, at every recursion level (the whole
   command, and each `bash -c` body or `$(...)`/backtick substitution
@@ -492,7 +498,11 @@ past it.
   deep) cannot exhaust Python's own recursion limit; past that bound, the
   command fails open like any other shape this tokenizer cannot positively
   identify. A `cd <path>` earlier in the same command changes which
-  directory later segments are scoped against, so
+  directory later segments are scoped against, and it is PROCESS-LOCAL (a
+  `cd` inside a `bash -c` body or a `$(...)` substitution does not move the
+  outer segments that follow it, while a `git stash` push inside one DOES
+  count against a later `drop`, because that is a fact about the repository
+  rather than about a process), so
   `cd <dir> && git checkout -- <path>` is judged against `<dir>`, not the
   tool call's own working directory -- and when that target cannot be
   resolved without actually running a shell (a variable, `cd -`, a bare
