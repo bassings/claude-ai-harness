@@ -825,7 +825,7 @@ def classify_stash(rest):
     return None
 
 
-def destructive_scope(subcmd, rest, cwd, git_config=None):
+def destructive_scope(subcmd, rest, cwd, git_config=None, unknown_trailing=False):
     """Return ('paths', [paths]), ('tree', None), ('clean', target) or
     ('stash', target) if `subcmd`/`rest` (a git invocation already stripped
     of global options) is one of the guarded shapes, or None if it is not.
@@ -838,6 +838,11 @@ def destructive_scope(subcmd, rest, cwd, git_config=None):
     rest = normalize_rest(rest)
 
     if subcmd == 'checkout':
+        if unknown_trailing:
+            # Arguments arriving at run time could be any pathspec, so the
+            # whole tree is at risk -- the same reading has_pathspec_from_file
+            # already gets for paths that are not on the command line either.
+            return ('tree', None)
         if has_pathspec_from_file(rest):
             # The paths are not on the command line at all, so there is
             # nothing to scope a per-path check against -- treat the whole
@@ -882,7 +887,9 @@ def destructive_scope(subcmd, rest, cwd, git_config=None):
         staged = '--staged' in rest or '-S' in rest
         worktree = '--worktree' in rest or '-W' in rest
         if staged and not worktree:
-            return None  # unstages only; the working tree is never touched
+            return None  # unstages only; the working tree is never touched, whatever the paths
+        if unknown_trailing:
+            return ('tree', None)
         if '--' in rest:
             paths = rest[rest.index('--') + 1:]
         else:
@@ -898,7 +905,12 @@ def destructive_scope(subcmd, rest, cwd, git_config=None):
         return classify_clean(rest, git_config)
 
     if subcmd == 'stash':
-        return classify_stash(rest)
+        target = classify_stash(rest)
+        if target is not None and unknown_trailing and target[1]['op'] == 'drop':
+            # The ref is among the arguments this guard cannot see, so ANY
+            # entry could be the one dropped: read it as a clear.
+            return ('stash', {'op': 'clear'})
+        return target
 
     return None
 
@@ -1203,51 +1215,59 @@ def strip_env_wrapper(head):
 
 
 def strip_xargs_wrapper(head):
-    """`xargs [-flags] <cmd...>` -> `<cmd...>` PLUS one synthetic `.`
-    pathspec token appended at the end. xargs appends items read from its
-    OWN stdin as trailing arguments to the wrapped command by default --
-    content this guard cannot see statically (it is produced by another
-    process at RUN time, never a literal token here). Without the
-    synthetic token, `xargs git checkout --` would unwrap to a bare
-    `checkout --` with an EMPTY path list, which destructive_scope()
-    already (correctly, for that shape alone) treats as nothing to scope --
-    silently under-detecting the real risk. Appending `.` makes the scope
-    tree-wide instead, entirely inside this wrapper-unwrap step:
-    destructive_scope() itself gains no xargs-specific branch (AC-ARCH-4).
+    """`xargs [-flags] <cmd...>` -> `<cmd...>`, VERBATIM. xargs appends
+    items read from its OWN stdin as trailing arguments to the wrapped
+    command by default -- content this guard cannot see statically (another
+    process produces it at RUN time, never a literal token here), which is
+    what strip_prefix_wrapper() reports to its caller as
+    "unknown trailing arguments".
+
+    This used to append a synthetic `.` pathspec instead. That reads as a
+    tree-wide scope for checkout/restore, which was the intent, but it is
+    nonsense for stash, where the trailing argument is a REF and `.` is not
+    one (K1 review round 4, M3): `git stash list --format=%gd | xargs -n1
+    git stash drop` measured `.` against the stash list, missed, and was
+    ALLOWED. It also put a pathspec the agent never typed into the refusal
+    text. Reporting the fact and letting each scope read it its own way
+    keeps the wrapper's semantics out of the matching (AC-ARCH-4).
+
     Does not model a flag that takes a separate value token (e.g. `-I {}`,
     two tokens) -- not a shape this guard's corpus needs."""
     i = 1
     n = len(head)
     while i < n and head[i].startswith('-'):
         i += 1
-    inner = head[i:]
-    if not inner:
-        return None
-    return inner + ['.']
+    return head[i:] or None
 
 
 def strip_prefix_wrapper(head):
     """If `head` begins with a recognised process wrapper (nohup, sudo,
     timeout, env, xargs, command, exec -- matched by binary basename),
-    return the inner command's tokens with the wrapper stripped, to be fed
-    back through evaluate_segment() at depth+1. destructive_scope() gains
-    no wrapper-specific branch for any of this (AC-ARCH-4/5), except
-    xargs's synthetic trailing pathspec (see strip_xargs_wrapper). Returns
-    None if `head` does not start with one of these."""
+    return (inner_tokens, unknown_trailing) with the wrapper stripped, to
+    be fed back through evaluate_segment() at depth+1. `unknown_trailing`
+    is True only for xargs, which supplies arguments this guard cannot see
+    (strip_xargs_wrapper); every scope reads that fact for itself, so
+    destructive_scope() still gains no wrapper-specific branch
+    (AC-ARCH-4/5). Returns None if `head` does not start with one of
+    these."""
     if not head:
         return None
     basename = os.path.basename(head[0])
     if basename in SIMPLE_PREFIX_WRAPPERS:
-        return head[1:] or None
-    if basename == 'sudo':
-        return strip_sudo_wrapper(head)
-    if basename == 'timeout':
-        return strip_timeout_wrapper(head)
-    if basename == 'env':
-        return strip_env_wrapper(head)
-    if basename == 'xargs':
-        return strip_xargs_wrapper(head)
-    return None
+        inner = head[1:] or None
+    elif basename == 'sudo':
+        inner = strip_sudo_wrapper(head)
+    elif basename == 'timeout':
+        inner = strip_timeout_wrapper(head)
+    elif basename == 'env':
+        inner = strip_env_wrapper(head)
+    elif basename == 'xargs':
+        inner = strip_xargs_wrapper(head)
+    else:
+        return None
+    if inner is None:
+        return None
+    return inner, basename == 'xargs'
 
 
 def evaluate(command, cwd):
@@ -1323,7 +1343,7 @@ def evaluate_command_text(command, state, depth):
     return None
 
 
-def evaluate_segment(raw_tokens, state, depth):
+def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
     """Evaluate one already-segmented token list against `state`. Recurses
     (bounded by MAX_UNWRAP_DEPTH) into a `bash -c`/`sh -c`/`bash -lc` body
     or a prefix-wrapped inner command -- see module docstring, AC-ARCH-4/5."""
@@ -1353,11 +1373,15 @@ def evaluate_segment(raw_tokens, state, depth):
             return None  # bounded; fail open past the bound
         return evaluate_command_text(script, state, depth + 1)
 
-    inner = strip_prefix_wrapper(head)
-    if inner is not None:
+    unwrapped = strip_prefix_wrapper(head)
+    if unwrapped is not None:
+        inner, wrapper_unknown_trailing = unwrapped
         if depth >= MAX_UNWRAP_DEPTH:
             return None  # bounded; fail open past the bound
-        return evaluate_segment(inner, state, depth + 1)
+        # Once unknown, always unknown: `xargs nohup git ...` must not lose
+        # the fact on the way through the inner wrapper.
+        return evaluate_segment(inner, state, depth + 1,
+                                unknown_trailing or wrapper_unknown_trailing)
 
     if not state['cwd_known']:
         # AC-DATA-3: `clean`/`stash drop`/`stash clear` fail CLOSED when the
@@ -1369,7 +1393,7 @@ def evaluate_segment(raw_tokens, state, depth):
         if parsed is not None:
             subcmd, rest, _unused_cwd, git_config, _unused_retargeted = parsed
             if subcmd in ('clean', 'stash'):
-                scope = destructive_scope(subcmd, rest, None, git_config)
+                scope = destructive_scope(subcmd, rest, None, git_config, unknown_trailing)
                 if scope is not None:
                     display_cmd = ' '.join(head)
                     template = REFUSAL_CLEAN if scope[0] == 'clean' else REFUSAL_STASH
@@ -1392,7 +1416,7 @@ def evaluate_segment(raw_tokens, state, depth):
         if stash_is_push(rest_n):
             state['stash_created'] = True
 
-    scope = destructive_scope(subcmd, rest, segment_cwd, git_config)
+    scope = destructive_scope(subcmd, rest, segment_cwd, git_config, unknown_trailing)
     if scope is None:
         return None
 

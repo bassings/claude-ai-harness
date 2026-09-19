@@ -3807,6 +3807,144 @@
       ],
       "expect": "allow",
       "note": "AC-DATA-3 (round 4, M1): checkout/restore/reset keep their documented fail-OPEN posture under the same retargeting -- snapshots cover the tracked work they can lose, which is the whole reason clean and stash drop/clear are the two rules that fail closed"
+    },
+    {
+      "command": "git stash list --format=%gd | xargs -n1 git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty one\n"
+        },
+        {
+          "op": "stash_push"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty two\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-ARCH-4 (round 4, M3): xargs supplies trailing arguments this guard cannot see, so the invocation is marked as having UNKNOWN trailing arguments and each scope takes its own conservative reading. Appending a synthetic `.` pathspec instead was wrong for stash, where `.` is not a ref: reproduced, `git stash list --format=%gd | xargs -n1 git stash drop` was ALLOWED and the real run destroyed an entry. An unknown drop target is read as a clear: any entry could be the one named"
+    },
+    {
+      "command": "git stash list --format=%gd | xargs -n1 git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M3): the same xargs-fed drop with an EMPTY stash -- nothing to lose, so the conservative reading must not become a blanket refusal"
+    },
+    {
+      "command": "echo tracked.txt | xargs git restore",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-ARCH-4 (round 4, M3): xargs supplies trailing arguments this guard cannot see, so the invocation is marked as having UNKNOWN trailing arguments and each scope takes its own conservative reading. Appending a synthetic `.` pathspec instead was wrong for stash, where `.` is not a ref: reproduced, `git stash list --format=%gd | xargs -n1 git stash drop` was ALLOWED and the real run destroyed an entry. restore with unknown trailing pathspecs is read tree-wide"
+    },
+    {
+      "command": "echo tracked.txt | xargs git restore",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M3): xargs-fed restore on a clean tree"
+    },
+    {
+      "command": "echo x | xargs git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-ARCH-4 (round 4, M3): xargs supplies trailing arguments this guard cannot see, so the invocation is marked as having UNKNOWN trailing arguments and each scope takes its own conservative reading. Appending a synthetic `.` pathspec instead was wrong for stash, where `.` is not a ref: reproduced, `git stash list --format=%gd | xargs -n1 git stash drop` was ALLOWED and the real run destroyed an entry. clean measures its dry run UNSCOPED, which reports a superset of whatever pathspec xargs would have supplied"
+    },
+    {
+      "command": "echo x | xargs git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M3): xargs-fed clean with nothing to remove"
+    },
+    {
+      "command": "echo tracked.txt | xargs git stash clear",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M3): stash clear takes no ref at all, so unknown trailing arguments change nothing about it -- still allowed on an empty stash"
     }
   ]
 }

@@ -296,6 +296,41 @@ class TestNewRuleRefusalReasons(unittest.TestCase):
             subprocess.run(['rm', '-rf', root])
 
 
+class TestRefusalQuotesTheCommandAsWritten(unittest.TestCase):
+    """AC-ARCH-4 (round 4, M3): unwrapping a process wrapper must not invent
+    arguments that then show up in the refusal. xargs supplies its trailing
+    arguments at RUN time from another process's stdout, so the guard cannot
+    know them; the invocation is marked as having unknown trailing
+    arguments, and each scope takes its own conservative reading, instead of
+    a synthetic `.` pathspec being appended to the token list. A refusal
+    quoting a pathspec the agent never typed sends it looking for a command
+    it did not run."""
+
+    def setUp(self):
+        self._root = tempfile.mkdtemp()
+        run_git(['init', '-q', '-b', 'master'], self._root)
+        write_file(self._root, 'tracked.txt', 'committed\n')
+        run_git(['add', '--', 'tracked.txt'], self._root)
+        run_git(['commit', '-q', '-m', 'seed'], self._root)
+        write_file(self._root, 'scratch-untracked.txt', 'unsaved work\n')
+
+    def tearDown(self):
+        subprocess.run(['rm', '-rf', self._root])
+
+    def test_an_xargs_wrapped_clean_is_quoted_without_a_synthetic_pathspec(self):
+        reason = guard.evaluate('echo x | xargs git clean -fd', self._root)
+        self.assertIsNotNone(reason, 'an xargs-fed clean over an untracked file must still be refused')
+        self.assertIn('`git clean -fd`', reason,
+                      'the refusal must quote the command as written; got: %s' % reason)
+
+    def test_xargs_unwrapping_appends_no_token_of_its_own(self):
+        self.assertEqual(
+            guard.strip_prefix_wrapper(['xargs', '-n1', 'git', 'stash', 'drop']),
+            (['git', 'stash', 'drop'], True),
+            'unwrapping xargs must yield the inner command verbatim plus the '
+            'unknown-trailing-arguments flag, never an invented token')
+
+
 class TestFailClosedOnTimeout(unittest.TestCase):
     """AC-DATA-3's timeout clause: the measuring git call for `clean` and
     `stash drop`/`clear` fails CLOSED when the subprocess call itself times
