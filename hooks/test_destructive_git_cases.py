@@ -198,6 +198,27 @@ class TestCorpusFloor(unittest.TestCase):
         # doesn't silently drift from what the file declares as valid.
         self.assertEqual(set(SETUP_OPS.keys()), DECLARED_SETUP_OPS)
 
+    def test_hostile_setup_op_fails_the_suite_and_creates_no_file(self):
+        # AC-SEC-5, verbatim: a case naming a setup op that is really a
+        # shell command-substitution payload must fail the suite (an
+        # unknown op, never silently skipped or treated as a clean repo)
+        # and must never actually run -- proving apply_setup() never
+        # shells out to a corpus-supplied string.
+        sentinel = os.path.join(tempfile.gettempdir(), 'destructive-git-guard-pwn-sentinel')
+        if os.path.exists(sentinel):
+            os.remove(sentinel)
+        hostile_setup = [{'op': '$(touch %s)' % sentinel}]
+        root = tempfile.mkdtemp()
+        try:
+            with self.assertRaises(ValueError):
+                apply_setup(root, hostile_setup, DECLARED_SETUP_OPS)
+            self.assertFalse(os.path.exists(sentinel),
+                              'the hostile setup op must never be executed -- the sentinel file must not exist')
+        finally:
+            subprocess.run(['rm', '-rf', root])
+            if os.path.exists(sentinel):
+                os.remove(sentinel)
+
 
 class TestCorpusCasesViaEvaluate(unittest.TestCase):
     """The correctness pass: every case, driven in-process against
