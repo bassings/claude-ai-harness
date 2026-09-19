@@ -46,11 +46,11 @@ import { fileURLToPath } from 'node:url'
 // shape) to be detectable from the report rather than failing silently.
 // specs/harn-ledger-validators.md decision 5: bumped from 2. Four validator
 // changes land together, and without a version marker a 90-day window mixes
-// the two populations with nothing to separate them. A line with no
-// findings_by_lens could be a quiet round or a stale installed writer; a null
-// ac_id could be a real absence or the old pattern rejecting a legitimate
-// value. The reader already tallies schema_version and rejects no version, so
-// the bump costs nothing and makes the two readable apart.
+// the two populations with nothing to separate them: a null ac_id could be a
+// real absence or the old pattern rejecting a legitimate value, and a
+// spec_bug count could be a real one or D4's conflation of "no spec" with
+// "the spec has a bug". The reader already tallies schema_version and rejects
+// no version, so the bump costs nothing and makes the two readable apart.
 export const SCHEMA_VERSION = 3
 
 // Hard-coded and not configurable (AC-SIMP-2): resolved against the MAIN
@@ -185,13 +185,11 @@ const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // guard does not match, and it is never recorded fixed: this measure can
 // undercount a genuine fix, never overcount one, which is the safe
 // direction for a number that feeds rework attribution.
-// L4 (round 3 review): EXPORTED so the schema's own enum, tallyFindingsByLens
-// (below) and optimise-read.mjs's aggregation all read the SAME array --
-// before this, the four disposition values were spelled out independently
-// in four places (this array, the findings_by_lens schema, the tally
-// function's own hard-coded checks, and the reader's unexported copy of
-// this same array), and a new disposition would have had to be added
-// correctly in all four or fail silently in whichever one was missed.
+// L4 (round 3 review): EXPORTED so the schema's own enum (below) and
+// optimise-read.mjs's aggregation read the SAME array -- before this, the
+// disposition values were spelled out independently in several places, and
+// a new disposition would have had to be added correctly in all of them or
+// fail silently in whichever one was missed.
 export const DISPOSITIONS = ['open', 'rejected', 'spec_bug', 'fixed']
 
 // The envelope + payload schema for one ledger line. additionalProperties is
@@ -446,36 +444,25 @@ export const LEDGER_ENTRY_SCHEMA = {
     // was dropped) when finding arrays were supplied at all, null when
     // they were not (a kind with no findings concept, e.g. tdd_task).
     findings_truncated: { type: ['integer', 'null'] },
-    // specs/harn-ledger-validators.md D3. Per-lens disposition tallies used to
-    // be built by the READER from the `findings` array above, which is capped
-    // at MAX_FINDINGS and shrunk further by the byte loop. Measured across the
-    // three real ledgers: worst rounds of 50, 79 and 84 findings, so the
-    // delivery report's headline rework attribution was undercounting by 82%
-    // on exactly the busiest rounds, silently, and reporting the remainder as
-    // if it were the whole.
+    // specs/harn-ledger-validators.md D3 was answered for three fix rounds by
+    // a writer-computed per-lens tally, `findings_by_lens`, stored here so a
+    // truncated round still reported true per-lens counts. REMOVED at fix
+    // round 4 (owner's decision) after it produced a defect in every review
+    // round it existed: double-counted fixes, then a whole-record collapse,
+    // then zero fixes on exactly the busy rounds it was built for. Its keys
+    // were lens names taken from synthesis output, so their COUNT was
+    // caller-shaped and unbounded while the byte-rescue loop could shrink
+    // only findings and ac_verdicts -- 400 distinct lens names wrote a
+    // 211-byte degraded line with everything erased and write_ok true.
     //
-    // Computed HERE, by the writer, from every supplied finding before any
-    // truncation. Deliberately NOT a new payload property: an undeclared key
-    // in a payload is refused wholesale by the validator (pinned by a test),
-    // which would turn an undercount into total loss for any caller running a
-    // newer workflow against an older installed writer. Schema and writer ship
-    // in the same file, so no version can have one without the other.
-    //
-    // Raising MAX_FINDINGS instead was the planning cycle's decision and was
-    // refuted on measurement: the largest line ever written is 15,920 bytes
-    // against MAX_LINE_BYTES 16,384, and 60 findings plus 200 verdicts needs
-    // about 22,980, which pushes the busiest records into the envelope-only
-    // degrade path that discards verdicts and trigger_counts as well.
-    findings_by_lens: {
-      type: ['object', 'null'],
-      additionalProperties: {
-        type: 'object',
-        additionalProperties: false,
-        // L4: one property per DISPOSITIONS value, derived rather than
-        // spelled out a second time in this schema.
-        properties: Object.fromEntries(DISPOSITIONS.map((d) => [d, { type: 'integer' }])),
-      },
-    },
+    // The per-finding array above is the one source again, which means a
+    // truncated round undercounts the per-lens attribution exactly as it did
+    // before the field existed. That is stated rather than papered over:
+    // findings_truncated (immediately above) carries the count of what is
+    // missing, and AC-QA-8's reported-shortfall branch is what D3 is now
+    // satisfied by. A reported shortfall is a worse measurement than a
+    // correct tally and a better one than a tally that erases the record it
+    // is describing.
     // Round-6 review M2: ac_verdicts is truncated at MAX_AC_VERDICTS with
     // no counter of its own, unlike findings/findings_truncated -- the
     // same "the surplus was cut and NOTHING records that it happened"
@@ -1200,55 +1187,6 @@ function computeFixedFindings(priorFindings, fixedFindingDescriptors, sameRoundO
 // it gets nothing. The TOTAL kept is unaffected (still min(maxTotal, sum of
 // all categories)), so findings_truncated's own count is unchanged by this
 // -- only WHICH entries survive changes.
-// specs/harn-ledger-validators.md D3: the per-lens disposition tally, taken
-// from EVERY supplied finding before budgetFindings caps the array and before
-// the byte-shrink loop trims it further.
-//
-// Only lenses that actually reported something get a key, so the field costs
-// nothing on a quiet round and stays small on a busy one (~55 bytes per lens
-// against a 16,384-byte line cap). A finding whose lens failed LENS_PATTERN_STR
-// is counted under its sanitised value exactly as the `findings` array records
-// it, so this tally and that array can never disagree about what a lens is.
-// AC-SEC-6, and a defect this function had on its first writing, caught by the
-// pre-existing lens-injection guard rather than by me: the tally's KEYS are
-// caller-supplied strings that reach an aggregation map and a rendered report.
-// Reading `f.lens` directly put a secret routed through `lens` straight into
-// the ledger, which is precisely what that guard exists to stop. Every key is
-// now gated by LENS_PATTERN_STR first.
-//
-// A finding whose lens fails the gate is counted under UNATTRIBUTED_LENS rather
-// than dropped. Dropping it would be this spec's own defect recurring inside
-// its own fix: a count that silently omits what it could not parse, reported
-// as though it were the whole. The sentinel is a fixed string that cannot
-// collide with a real lens name (it fails LENS_PATTERN_STR by construction)
-// and is never attacker-controlled; the rejected value itself survives in the
-// findings array's own lens_raw, as it already did.
-// M3 (round 3 review): EXPORTED so optimise-read.mjs can recognise the
-// EXACT sentinel (a string comparison, never a pattern match -- any other
-// string that merely fails LENS_PATTERN_STR is a genuinely unrecoverable
-// lens value and must stay uncounted, not be folded in here by accident)
-// and count what it tallies, rather than the whole bucket being read by a
-// gate that rejects it because it does not look like a real lens name.
-export const UNATTRIBUTED_LENS = 'unattributed'
-const LENS_RE_FOR_TALLY = new RegExp(LENS_PATTERN_STR)
-
-function tallyFindingsByLens(categories) {
-  const tally = {}
-  for (const entries of categories) {
-    for (const f of entries) {
-      if (!f || typeof f !== 'object') continue
-      const raw = typeof f.lens === 'string' ? f.lens : null
-      const lens = raw !== null && LENS_RE_FOR_TALLY.test(raw) ? raw : UNATTRIBUTED_LENS
-      // L4: DISPOSITIONS-driven, not a hand-spelled four-way check -- see
-      // that export's own comment.
-      if (!tally[lens]) tally[lens] = Object.fromEntries(DISPOSITIONS.map((d) => [d, 0]))
-      const d = f.disposition
-      if (DISPOSITIONS.includes(d)) tally[lens][d] += 1
-    }
-  }
-  return tally
-}
-
 function budgetFindings(categories, maxTotal) {
   const queues = categories.map((c) => c.slice())
   const kept = []
@@ -1972,16 +1910,6 @@ export function main() {
   // by computeFixedFindings, and must never reach the entry directly
   // either -- the entry only ever carries their computed, guarded result
   // inside `findings` (disposition 'fixed'), never the raw descriptors.
-  // D3: findings_by_lens is WRITER-OWNED. Adding it to the schema (so the
-  // written line validates) also made it an allowed PAYLOAD property, which
-  // would let a caller supply a tally that contradicts the findings it sent --
-  // and the spread below would have kept that value on any record with no
-  // findings arrays at all. Refused explicitly rather than silently dropped,
-  // so a caller that believes it is supplying a tally finds out.
-  if ('findings_by_lens' in payload) {
-    return result(run_id, ts, false,
-      'payload failed ledger schema validation: findings_by_lens: not an allowed property (it is computed by the writer from the findings you supply, so a caller-supplied tally could contradict them)')
-  }
   const { spec_bugs, rejected_findings, open_findings, prior_findings, fixed_findings, event_scope, ...restPayload } = payload
   const allFindings = [...specBugs.entries, ...rejected.entries, ...open.entries, ...fixed.entries]
   // M2: bound the findings array at MAX_FINDINGS rather than letting an
@@ -2003,9 +1931,6 @@ export function main() {
       ? {
           findings: budgetFindings([specBugs.entries, rejected.entries, fixed.entries, open.entries], MAX_FINDINGS),
           findings_truncated: Math.max(0, allFindings.length - MAX_FINDINGS),
-          // D3: computed from the same four categories BEFORE the line above
-          // caps them, so a truncated round still reports a true per-lens count.
-          findings_by_lens: tallyFindingsByLens([specBugs.entries, rejected.entries, fixed.entries, open.entries]),
           spec_bug_count: specBugs.count,
           rejected_finding_count: rejected.count,
         }

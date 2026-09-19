@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, DISPOSITIONS as WRITER_DISPOSITIONS, UNATTRIBUTED_LENS, wasNoSpecInPlay } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, DISPOSITIONS as WRITER_DISPOSITIONS, wasNoSpecInPlay } from './ledger-append.mjs'
 
 // Round-7 review F1 (§12 reframe, corrected a second time): round-6's
 // isNeutralised(obj, field) asked a SHAPE question -- "is this value null
@@ -375,8 +375,8 @@ export function aggregateRework(records, { root = '' } = {}) {
   // byte-rescue loop itself produces.
   let findingsTruncated = 0
   let acVerdictsTruncated = 0
-  // M3: the writer's own UNATTRIBUTED_LENS sentinel, tallied but previously
-  // thrown away uncounted by the LENS_RE gate below -- summed separately
+  // M3: a finding whose `lens` is not a real lens name was thrown away
+  // uncounted by the LENS_RE gate below -- summed here instead, separately
   // from lensDispositionCounts (never as a fake lens bucket in that map).
   let unattributedFindings = 0
   // H4: how many review runs had no spec in play, and how many of their
@@ -399,18 +399,20 @@ export function aggregateRework(records, { root = '' } = {}) {
     if (typeof r.invalid_prior_ids_dropped === 'number') invalidPriorIdsDropped += r.invalid_prior_ids_dropped
     if (typeof r.findings_truncated === 'number') findingsTruncated += r.findings_truncated
     if (typeof r.ac_verdicts_truncated === 'number') acVerdictsTruncated += r.ac_verdicts_truncated
-    // H1 (review round one, specs/harn-ledger-validators.md): prefer the
-    // writer's own pre-truncation tally. `r.findings` is capped at
-    // MAX_FINDINGS and shrunk further by the byte loop, so recomputing from it
-    // undercounts by up to 82% on the busiest rounds -- measured: a 40-finding
-    // round reported 15. The writer now records findings_by_lens BEFORE any
-    // truncation; not reading it left the correct number stored in a field
-    // nothing read, which is worse than an open gap because the next reader of
-    // the code concludes the defect is closed.
-    //
-    // The per-finding loop stays as the fallback, not as dead code: every line
-    // already inside a 90-day window predates the field, and skipping those
-    // would replace an undercount with a blank.
+    // Fix round 4: the per-finding loop below is the ONE source of these
+    // counts again. For three fix rounds this branched on the writer's
+    // `findings_by_lens` tally first, to beat the MAX_FINDINGS cap -- and
+    // that branch produced a defect in every review round it existed
+    // (double-counted fixes, then a collapsed record, then zero fixes on the
+    // busy rounds), because a second source for the same number has to
+    // re-implement every rule the first one applies, and the cross-round
+    // `fixed` dedupe below is one it structurally cannot. `r.findings` is
+    // capped at MAX_FINDINGS and shrunk further by the byte loop, so these
+    // counts DO undercount a truncated round -- by up to 82%, measured. What
+    // says so is `findingsTruncated`, summed just above and rendered in the
+    // same report section (AC-QA-8's reported-shortfall branch). A named
+    // shortfall beside a smaller number is honest; a second tally that
+    // silently disagreed with the array beside it was not.
     // M2 (review round one): D4 fixed the WRITER, so lines written from now on
     // are right. Every line already in a 90-day window is not, and those are
     // the lines this month's report reads -- so the spec_bug figure stays
@@ -425,64 +427,7 @@ export function aggregateRework(records, { root = '' } = {}) {
     if (noSpecWasInPlay) noSpecReviewRuns += 1
     const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
 
-    const tally = r.findings_by_lens
-    if (tally && typeof tally === 'object' && !Array.isArray(tally)) {
-      for (const [lens, counts] of Object.entries(tally)) {
-        if (!counts || typeof counts !== 'object') continue
-        // M3: the writer's own exact sentinel, recognised by STRING EQUALITY
-        // -- never by the LENS_RE pattern match below, which this sentinel
-        // is constructed to fail. Any OTHER value that merely fails the
-        // pattern is a genuinely unrecoverable lens value and must stay
-        // uncounted (the `continue` just below), not be folded in here by
-        // coincidence of also failing the same gate.
-        if (lens === UNATTRIBUTED_LENS) {
-          for (const [disposition, n] of Object.entries(counts)) {
-            if (!Number.isInteger(n) || n <= 0) continue
-            if (!DISPOSITIONS.has(disposition)) continue
-            unattributedFindings += n
-            if (noSpecWasInPlay && disposition === 'spec_bug') noSpecFindingsReclassified += n
-          }
-          continue
-        }
-        // Same value-based lens gate the per-finding loop below applies: the
-        // writer gates these keys too, but a reader must not trust a ledger
-        // line's keys just because a writer should have.
-        if (!LENS_RE.test(lens)) continue
-        for (const [disposition, n] of Object.entries(counts)) {
-          if (!Number.isInteger(n) || n <= 0) continue
-          if (!DISPOSITIONS.has(disposition)) continue
-          // H2 (round 3 review): 'fixed' is handled separately, below, from
-          // the per-finding array -- the tally has no per-id data, so it
-          // cannot apply the cross-round dedupe a 'fixed' disposition needs
-          // (the SAME finding confirmed fixed again in a later round is a
-          // repeat, not a new fix; see seenFixedIds below). Reading it from
-          // the tally here would double-count every such repeat on any
-          // schema_version 3 line.
-          if (disposition === 'fixed') continue
-          if (noSpecWasInPlay && disposition === 'spec_bug') noSpecFindingsReclassified += n
-          bumpDisposition(lensDispositionCounts, lens, reclassify(disposition), n)
-        }
-      }
-      // H2: 'fixed' findings still come from the per-finding array (capped
-      // at MAX_FINDINGS, but 'fixed' entries are prioritised ahead of 'open'
-      // by the writer's own budgetFindings ordering, so an uncapped 'fixed'
-      // volume large enough to be truncated away here is not the realistic
-      // case an uncounted double-count on every line was) -- the SAME
-      // dedupe-aware logic the fallback branch below applies.
-      for (const f of r.findings || []) {
-        if (!f || f.disposition !== 'fixed') continue
-        if (typeof f.lens !== 'string' || !LENS_RE.test(f.lens)) continue
-        if (typeof f.id === 'string' && f.id) {
-          const dedupeKey = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(f.id)}`
-          if (seenFixedIds.has(dedupeKey)) {
-            duplicateFixedAcrossRounds += 1
-            continue
-          }
-          seenFixedIds.add(dedupeKey)
-        }
-        bumpDisposition(lensDispositionCounts, f.lens, 'fixed')
-      }
-    } else for (const f of r.findings || []) {
+    for (const f of r.findings || []) {
       // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
       // not shape-based -- see this file's own header comment): a `lens`
       // that is not a real, pattern-matching lens name must not be read
@@ -509,11 +454,11 @@ export function aggregateRework(records, { root = '' } = {}) {
         if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
         bumpDisposition(lensDispositionCounts, f.lens, reclassify(f.disposition))
       } else if (f && typeof f === 'object') {
-        // M3: a pre-schema_version-3 line has no findings_by_lens tally, so
-        // this fallback is the only place a finding whose lens could not be
-        // attributed is ever seen at all -- counted here for parity with the
-        // tally path above, rather than silently vanishing the way it did
-        // before this fix.
+        // M3: a finding whose lens could not be attributed used to vanish
+        // here with nothing recording it -- this spec's own defect class
+        // (a value a check could not parse, discarded, its absence then
+        // reported as a measurement) inside the reader this spec added.
+        // Counted instead, and rendered under its own heading.
         unattributedFindings += 1
         if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
       }

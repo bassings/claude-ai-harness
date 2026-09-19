@@ -1028,9 +1028,9 @@ function buildReport(d) {
     // counters above already use, never a confident 0.
     lines.push(
       `findings dropped from this tally: findings_truncated=${fmtCountOrUnavailable(d.rework.findingsTruncated)} ` +
-      `(a pre-schema_version-3 line's capped findings array; findings_by_lens compensates from schema_version 3 on), ` +
+      `(findings the writer counted but could not fit on the line; the per-lens rows above are short by this many), ` +
       `ac_verdicts_truncated=${fmtCountOrUnavailable(d.rework.acVerdictsTruncated)}, ` +
-      `unattributed (lens value did not match a known lens, or a pre-schema_version-3 line dropped it uncounted)=${fmtCountOrUnavailable(d.rework.unattributedFindings)}.`
+      `unattributed (lens value did not match a known lens)=${fmtCountOrUnavailable(d.rework.unattributedFindings)}.`
     )
     // H4 (round 3 review, AC-PROD-5): the signal "this work was reviewed
     // with no spec" must land somewhere a reader sees, not merely stop
