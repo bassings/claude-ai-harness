@@ -2645,6 +2645,31 @@ test('optimise-read (H3): a prefix naming a DIFFERENT spec is left alone, so two
     'a prefix naming another spec is a different criterion and must stay its own bucket')
 })
 
+// M2 (round 3 review): stripOwnSpecPrefix now extracts via AC_ID_PATTERN_STR's
+// own named groups instead of a second, hand-maintained regex. Exercised
+// through aggregateRework (its only reachable surface) against every
+// prefixed-accept-form shape ledger-append.test.js's own NEW_AC_ID_ACCEPTS
+// fixture uses, not just the two space/slash FEAT- examples the H3 tests
+// above already cover -- including the hyphen-and-digit-bearing prefix a
+// real spec basename ("REMEDIATION-2026-08") actually takes.
+test('optimise-read (M2): stripOwnSpecPrefix strips every accepted prefixed form, derived from the SAME pattern the writer accepts, not a second copy of it', () => {
+  const cases = [
+    { prefix: 'FEAT-011', spec: 'specs/FEAT-011.md', sep: ' ' },
+    { prefix: 'FEAT-010', spec: 'specs/FEAT-010.md', sep: '/' },
+    { prefix: 'REMEDIATION-2026-08', spec: 'specs/REMEDIATION-2026-08.md', sep: ' ' },
+  ]
+  for (const { prefix, spec, sep } of cases) {
+    const rec = {
+      kind: 'review_cycle', repo: 'demo', spec, round_key: 'k', outcome: 'done',
+      findings: [], ac_verdicts: [{ ac_id: `${prefix}${sep}AC-QA-1`, verdict: 'FAIL' }],
+    }
+    const out = mod.aggregateRework([rec])
+    const bucket = [...out.acVerdicts.values()][0]
+    assert.equal(bucket.ac_id, 'AC-QA-1', `the ${JSON.stringify(prefix + sep)} form must strip to the bare id when it names the record's own spec`)
+    assert.equal(bucket.fail, 1)
+  }
+})
+
 test('optimise-read (H1): a hostile key inside findings_by_lens never becomes an aggregate key', () => {
   // The reader gates the tally's keys even though the writer gates them too.
   // A ledger line is data on disk: a reader must not trust its keys because a

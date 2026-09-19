@@ -162,7 +162,13 @@ const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 // collectErrors implements type, enum, pattern and array items only: a
 // maxLength declaration is silently ignored (the schema's own minLength:1 on
 // run_id accepts the empty string today).
-export const AC_ID_PATTERN_STR = '^(?:[A-Za-z0-9_.-]{1,40}[ /])?AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$'
+// M2 (round 3 review): the prefix and the AC id itself are NAMED groups
+// (`prefix`, `ac`) so optimise-read.mjs's stripOwnSpecPrefix can extract
+// them from THIS pattern directly, instead of carrying its own second,
+// looser copy of the same shape. A named group changes nothing about what
+// the pattern matches (RegExp#test ignores group names entirely), so this
+// costs nothing for the schema-validation use below.
+export const AC_ID_PATTERN_STR = '^(?:(?<prefix>[A-Za-z0-9_.-]{1,40})(?<sep>[ /]))?(?<ac>AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6})$'
 // M1 (round 4 remainder): the single definition site for the `lens` shape,
 // shared with the schema declaration above. Round-7 review, F1 sweep:
 // EXPORTED so optimise-read.mjs can ask "is this a REAL lens name?"
@@ -179,7 +185,14 @@ const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // guard does not match, and it is never recorded fixed: this measure can
 // undercount a genuine fix, never overcount one, which is the safe
 // direction for a number that feeds rework attribution.
-const DISPOSITIONS = ['open', 'rejected', 'spec_bug', 'fixed']
+// L4 (round 3 review): EXPORTED so the schema's own enum, tallyFindingsByLens
+// (below) and optimise-read.mjs's aggregation all read the SAME array --
+// before this, the four disposition values were spelled out independently
+// in four places (this array, the findings_by_lens schema, the tally
+// function's own hard-coded checks, and the reader's unexported copy of
+// this same array), and a new disposition would have had to be added
+// correctly in all four or fail silently in whichever one was missed.
+export const DISPOSITIONS = ['open', 'rejected', 'spec_bug', 'fixed']
 
 // The envelope + payload schema for one ledger line. additionalProperties is
 // false at every object level (AC-SEC-2): a field that is not declared here
@@ -458,12 +471,9 @@ export const LEDGER_ENTRY_SCHEMA = {
       additionalProperties: {
         type: 'object',
         additionalProperties: false,
-        properties: {
-          open: { type: 'integer' },
-          rejected: { type: 'integer' },
-          spec_bug: { type: 'integer' },
-          fixed: { type: 'integer' },
-        },
+        // L4: one property per DISPOSITIONS value, derived rather than
+        // spelled out a second time in this schema.
+        properties: Object.fromEntries(DISPOSITIONS.map((d) => [d, { type: 'integer' }])),
       },
     },
     // Round-6 review M2: ac_verdicts is truncated at MAX_AC_VERDICTS with
@@ -1213,7 +1223,13 @@ function computeFixedFindings(priorFindings, fixedFindingDescriptors, sameRoundO
 // collide with a real lens name (it fails LENS_PATTERN_STR by construction)
 // and is never attacker-controlled; the rejected value itself survives in the
 // findings array's own lens_raw, as it already did.
-const UNATTRIBUTED_LENS = 'unattributed'
+// M3 (round 3 review): EXPORTED so optimise-read.mjs can recognise the
+// EXACT sentinel (a string comparison, never a pattern match -- any other
+// string that merely fails LENS_PATTERN_STR is a genuinely unrecoverable
+// lens value and must stay uncounted, not be folded in here by accident)
+// and count what it tallies, rather than the whole bucket being read by a
+// gate that rejects it because it does not look like a real lens name.
+export const UNATTRIBUTED_LENS = 'unattributed'
 const LENS_RE_FOR_TALLY = new RegExp(LENS_PATTERN_STR)
 
 function tallyFindingsByLens(categories) {
@@ -1223,9 +1239,11 @@ function tallyFindingsByLens(categories) {
       if (!f || typeof f !== 'object') continue
       const raw = typeof f.lens === 'string' ? f.lens : null
       const lens = raw !== null && LENS_RE_FOR_TALLY.test(raw) ? raw : UNATTRIBUTED_LENS
-      if (!tally[lens]) tally[lens] = { open: 0, rejected: 0, spec_bug: 0, fixed: 0 }
+      // L4: DISPOSITIONS-driven, not a hand-spelled four-way check -- see
+      // that export's own comment.
+      if (!tally[lens]) tally[lens] = Object.fromEntries(DISPOSITIONS.map((d) => [d, 0]))
       const d = f.disposition
-      if (d === 'open' || d === 'rejected' || d === 'spec_bug' || d === 'fixed') tally[lens][d] += 1
+      if (DISPOSITIONS.includes(d)) tally[lens][d] += 1
     }
   }
   return tally
@@ -1422,6 +1440,28 @@ export function canonicalPlanKey(spec, root) {
   }
   if (segments.length === 0) return REDACTED_PATH_MARKER
   return segments.join('/')
+}
+
+// L3 (round 3 review): specs/harn-ledger-validators.md decision 4's own
+// rule -- "no spec was in play" means no spec path was supplied AND no
+// lens returned any ac_verdicts (review-cycle.js's no-spec branch tells a
+// lens with none to go and find one, so a run invoked without a spec
+// argument may still legitimately have verified criteria). EXPORTED as the
+// single definition site so optimise-read.mjs (a real importable module)
+// reads the identical rule when re-deriving the classification for a
+// historical line.
+//
+// review-cycle.js cannot import this: it is a workflow script, and this
+// file's own header comment records that the runtime statically rejects
+// any import before a workflow script even starts. Its own inline copy of
+// this same boolean therefore remains a necessary, documented duplicate --
+// but it now only decides PROMPT wording (whether to ask synthesis for
+// spec_bugs at all); the actual data-shape guarantee this predicate
+// protects (spec_bugs/spec_bug_count are null, never a measured zero, on a
+// no-spec run) is enforced in review-cycle.js's own post-processing of the
+// synthesis response, which is what this repo's tests exercise directly.
+export function wasNoSpecInPlay(spec, acVerdicts) {
+  return !spec && !(Array.isArray(acVerdicts) && acVerdicts.length > 0)
 }
 
 // Strips every occurrence of `root` (an absolute path) out of free text,

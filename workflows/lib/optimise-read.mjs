@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, DISPOSITIONS as WRITER_DISPOSITIONS, UNATTRIBUTED_LENS, wasNoSpecInPlay } from './ledger-append.mjs'
 
 // Round-7 review F1 (§12 reframe, corrected a second time): round-6's
 // isNeutralised(obj, field) asked a SHAPE question -- "is this value null
@@ -229,7 +229,12 @@ function bumpDisposition(counts, lens, disposition, by = 1) {
   if (disposition in counts[lens]) counts[lens][disposition] += by
 }
 
-const DISPOSITIONS = new Set(['open', 'rejected', 'spec_bug', 'fixed'])
+// M2/L4 (round 3 review): both derived from ledger-append.mjs's own exports
+// (AC_ID_PATTERN_STR, DISPOSITIONS) rather than a second, independently
+// maintained copy of either shape -- see those exports' own comments for
+// why two copies is a real hazard, not merely untidy.
+const DISPOSITIONS = new Set(WRITER_DISPOSITIONS)
+const AC_ID_RE = new RegExp(AC_ID_PATTERN_STR)
 
 // H3: strip a leading spec prefix from an ac_id, but ONLY when it names the
 // record's own spec.
@@ -245,12 +250,21 @@ const DISPOSITIONS = new Set(['open', 'rejected', 'spec_bug', 'fixed'])
 // else is left exactly as it arrived: an unrecognised prefix is a different
 // criterion, not a malformed one, and guessing would merge buckets that must
 // stay apart.
+//
+// M2 (round 3 review): extracted via AC_ID_PATTERN_STR's own named groups
+// (`prefix`, `ac`) rather than a second, looser regex literal -- any ac_id
+// reaching here already passed the writer's validation (or came from a
+// hand-edited/foreign ledger line, per the spec's own documented
+// possibility), so matching it against the SAME pattern that accepted it in
+// the first place cannot be blind to a form the writer itself widened to
+// accept. A value that does not match at all (should not happen for a
+// writer-validated line) is left exactly as it arrived, same as before.
 function stripOwnSpecPrefix(acId, planKey) {
   if (typeof acId !== 'string' || typeof planKey !== 'string') return acId
-  const m = /^(.*)[ /](AC-[A-Z][A-Z0-9]*-[0-9]+)$/.exec(acId)
-  if (!m) return acId
+  const m = AC_ID_RE.exec(acId)
+  if (!m || !m.groups.prefix) return acId
   const base = planKey.replace(/^.*\//, '').replace(/\.[^.]*$/, '')
-  return base && m[1] === base ? m[2] : acId
+  return base && m.groups.prefix === base ? m.groups.ac : acId
 }
 
 // HARN-OPT-2 PR1 (AC-ARCH-1, AC-ARCH-4): the ONE place every plan-keyed
@@ -381,7 +395,9 @@ export function aggregateRework(records, { root = '' } = {}) {
     // already carries. That is precisely why D4's trigger was defined as
     // observable state rather than a new stored flag: a read-side fix reaches
     // the history a write-side fix never can.
-    const noSpecWasInPlay = !r.spec && !(Array.isArray(r.ac_verdicts) && r.ac_verdicts.length > 0)
+    // L3: the shared predicate, imported from ledger-append.mjs rather than
+    // a second copy of decision 4's rule.
+    const noSpecWasInPlay = wasNoSpecInPlay(r.spec, r.ac_verdicts)
     const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
 
     const tally = r.findings_by_lens
