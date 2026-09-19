@@ -194,16 +194,17 @@ above does not do.
 ### Detecting a stale install without running the commands (AC-OPS-11)
 
 A stale `workflows/lib/` mirror is *sometimes* visible in the optimiser's own
-report: `ledger-append.mjs`'s `SCHEMA_VERSION` was bumped (1 to 2) by the
-plan-identity canonicalisation change, and `optimise-read.mjs ledger`'s
+report: `ledger-append.mjs`'s `SCHEMA_VERSION` has been bumped twice, 1 to 2
+by the plan-identity canonicalisation change and 2 to 3 by the validator
+changes described under "Run ledger" below, and `optimise-read.mjs ledger`'s
 `perRepo[].schemaVersionsSeen` reports the schema-version mix actually seen
-per repo, so a stale installed writer still emitting `schema_version: 1`
-surfaces there instead of failing silently.
+per repo, so a stale installed writer still emitting an older
+`schema_version` surfaces there instead of failing silently.
 
 **This signal does not cover every staleness class**, and it covers none of
 the session-snapshot class above. Additive, optional fields
-(the start/terminal exception guard, `invalid_ac_ids_dropped`, `ac_id_raw`)
-bump no `SCHEMA_VERSION` by design, so a stale top-level script or a stale
+(the start/terminal exception guard, `invalid_ac_ids_dropped`, `ac_id_raw`,
+`ac_verdicts_truncated`) bump no `SCHEMA_VERSION` by design, so a stale top-level script or a stale
 `optimise-read.mjs` reading a newer ledger produces no `schemaVersionsSeen`
 difference at all. What covers that gap is the report's own rendering: a
 genuinely stale or absent reader field renders as an explicit "unavailable"
@@ -666,6 +667,42 @@ exhaustive field list (the workflow scripts themselves cannot host this: the
 runtime statically rejects any `import` before execution, so the schema,
 validation and the write itself live in this one real-Node script instead,
 invoked via Bash from each workflow's final step).
+
+**The `schema_version` 3 boundary, and reading a window that spans it.**
+`SCHEMA_VERSION` is 3 from the validator change onward. What changed at that
+boundary, field by field:
+
+- **`ac_id`** (in both `findings[]` and `ac_verdicts[]`) accepts two forms it
+  used to reject: a prefix containing a digit, so `AC-A11Y-<n>` validates at
+  last, and one bounded spec prefix for a review spanning several specs
+  (`FEAT-011 AC-QA-1`, `FEAT-010/AC-QA-3`). Both used to be nulled into
+  `ac_id_raw` and counted in `invalid_ac_ids_dropped`.
+- **`spec_bug_count`** is `null`, not a number, on a review run where no spec
+  was in play at all, and no finding on such a run carries the `spec_bug`
+  disposition. Before, every finding on a spec-less run was classified
+  `spec_bug`, because a finding with no AC behind it is what the synthesis
+  step was asked for.
+- **`findings_truncated`** is unchanged in meaning (findings the writer
+  counted but could not fit on the line) and is now READ: the optimiser sums
+  it across the window and renders it in the Rework attribution section, so a
+  per-lens tally that is short says by how much. Per-lens counts are computed
+  from the line's own `findings` array, which is capped, so on a truncated
+  round those counts are short by exactly this number.
+- **`ac_verdicts_truncated`** is its sibling for `ac_verdicts`, which is
+  bounded separately. It is also summed and rendered, and any criterion in a
+  (repo, plan) bucket whose window contains a truncated `ac_verdicts` array
+  can no longer be reported as confidently never-failing: the surplus could
+  have held the FAIL.
+
+**Interpreting a window that spans the boundary (AC-OPS-8).** On lines
+written BEFORE the boundary, accessibility criteria (`AC-A11Y-<n>`) and every
+cross-spec-prefixed criterion live in `ac_id_raw` with `ac_id` null, and the
+reader does not read `ac_id_raw` back into attribution. So a zero for those
+criteria in a pre-boundary window means **never recorded**, never a measured
+zero: the runs happened and their verdicts were discarded by the validator.
+The report's own Never-failing acceptance criteria section carries this
+caveat inline, and `perRepo[].schemaVersionsSeen` is what tells you which
+population a window is made of.
 
 **Malformed values degrade, they never destroy the line**: `ledger-append.mjs`'s
 `degradeEntry` validates the whole entry once; when every error it finds is
