@@ -23,7 +23,7 @@ guards run the SAME cases -- this file must therefore:
 Run: python3 -m unittest discover -s hooks -p 'test_*.py'
 (the same command CI and .githooks/pre-push already run).
 """
-import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -344,6 +344,8 @@ class TestGitDirLeakDoesNotCorruptASentinelRepo(unittest.TestCase):
             run_git(['commit', '-q', '-m', 'seed'], sentinel)
             write_file(sentinel, 'sentinel.txt', 'dirty\n')
             before_head = run_git(['rev-parse', 'HEAD'], sentinel).stdout
+            with open(os.path.join(sentinel, '.git', 'index'), 'rb') as fh:
+                before_index = hashlib.sha256(fh.read()).hexdigest()
             with open(os.path.join(sentinel, 'sentinel.txt'), 'rb') as fh:
                 before_bytes = fh.read()
 
@@ -362,9 +364,12 @@ class TestGitDirLeakDoesNotCorruptASentinelRepo(unittest.TestCase):
                 os.environ.update(old_environ)
 
             after_head = run_git(['rev-parse', 'HEAD'], sentinel).stdout
+            with open(os.path.join(sentinel, '.git', 'index'), 'rb') as fh:
+                after_index = hashlib.sha256(fh.read()).hexdigest()
             with open(os.path.join(sentinel, 'sentinel.txt'), 'rb') as fh:
                 after_bytes = fh.read()
             self.assertEqual(before_head, after_head, 'the sentinel repo\'s HEAD moved -- a leaked GIT_DIR reached it')
+            self.assertEqual(before_index, after_index, 'the sentinel repo\'s index checksum changed -- a leaked GIT_DIR reached it')
             self.assertEqual(before_bytes, after_bytes, 'the sentinel\'s dirty file changed -- a leaked GIT_DIR/GIT_WORK_TREE reached it')
         finally:
             subprocess.run(['rm', '-rf', sentinel])
