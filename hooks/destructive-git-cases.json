@@ -3945,6 +3945,46 @@
       ],
       "expect": "allow",
       "note": "AC-QA-2 twin (round 4, M3): stash clear takes no ref at all, so unknown trailing arguments change nothing about it -- still allowed on an empty stash"
+    },
+    {
+      "command": "echo stash@{0} | xargs git stash drop stash@{5}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-ARCH-4 (round 4, M3): the only shape in which stash's conservative reading of UNKNOWN trailing arguments changes the answer, and it is here so that reading is observable rather than merely asserted. A ref IS on the command line (stash@{5}, which names no existing entry, so on its own it would be allowed) and xargs appends another the guard cannot see, so any entry could be the one dropped and the drop is read as a clear. Recorded honestly: git itself rejects two revisions (`Too many revisions specified`, measured), so this is a refusal on a malformed command. Every well-formed xargs-fed drop leaves the ref off the command line entirely, where it already defaults to stash@{0} and blocks whenever the list is non-empty"
+    },
+    {
+      "command": "echo stash@{0} | xargs git stash drop stash@{5}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M3): the same shape with an EMPTY stash -- the widened reading must not fire when there is nothing to lose"
     }
   ]
 }
