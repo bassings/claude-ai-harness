@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, DISPOSITIONS as WRITER_DISPOSITIONS, wasNoSpecInPlay } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, wasNoSpecInPlay } from './ledger-append.mjs'
 
 // Round-7 review F1 (§12 reframe, corrected a second time): round-6's
 // isNeutralised(obj, field) asked a SHAPE question -- "is this value null
@@ -222,18 +222,22 @@ export function sortRecordsByTime(records) {
   })
 }
 
-// H1: `by` defaults to 1 so every existing per-finding call site is unchanged;
-// the pre-truncation tally supplies a real count instead.
-function bumpDisposition(counts, lens, disposition, by = 1) {
+// One finding, one increment. The `by` parameter this took while the
+// writer-computed tally existed (which supplied whole counts rather than
+// findings) went with it at fix round 4: a count nothing passes is a
+// parameter the next reader has to prove is unused before touching it.
+function bumpDisposition(counts, lens, disposition) {
   if (!counts[lens]) counts[lens] = { fixed: 0, rejected: 0, spec_bug: 0, open: 0 }
-  if (disposition in counts[lens]) counts[lens][disposition] += by
+  if (disposition in counts[lens]) counts[lens][disposition] += 1
 }
 
-// M2/L4 (round 3 review): both derived from ledger-append.mjs's own exports
-// (AC_ID_PATTERN_STR, DISPOSITIONS) rather than a second, independently
-// maintained copy of either shape -- see those exports' own comments for
-// why two copies is a real hazard, not merely untidy.
-const DISPOSITIONS = new Set(WRITER_DISPOSITIONS)
+// M2 (round 3 review): derived from ledger-append.mjs's own exported
+// AC_ID_PATTERN_STR rather than a second, independently maintained copy of
+// that shape -- see that export's own comment for why two copies is a real
+// hazard, not merely untidy. L4's sibling Set over the writer's DISPOSITIONS
+// went with the tally at fix round 4: only the tally loop needed to ask
+// whether an arbitrary key was a known disposition, because only it read
+// dispositions as map keys rather than from a schema-validated field.
 const AC_ID_RE = new RegExp(AC_ID_PATTERN_STR)
 
 // H3: strip a leading spec prefix from an ac_id, but ONLY when it names the
