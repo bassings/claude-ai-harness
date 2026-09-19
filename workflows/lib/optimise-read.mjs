@@ -518,6 +518,29 @@ export function aggregateRework(records, { root = '' } = {}) {
         }
         continue
       }
+      // M1 (round-3 review): the same VALUE-based gate the lens path applies,
+      // one field over. A ledger line is untrusted data on disk: the writer
+      // validates every ac_id it writes, but the reader also reads lines it
+      // did not write (hand-edited, restored from a backup written by another
+      // version, or produced in any of the several repos it aggregates
+      // across). Ungated, a forged value flowed into the aggregation key and
+      // out into the operator's report verbatim, newlines included -- and
+      // that report drives "retire this check" proposals, so a forged row
+      // there is an INVERTED conclusion, not a lost measurement. Costs a
+      // writer-produced line nothing: every id the writer accepted already
+      // matches this same exported pattern.
+      //
+      // Dropped like the explicit-null case above rather than silently: the
+      // verdict is counted as unattributable, and a FAIL that could not be
+      // attributed taints the bucket, because a discarded FAIL must degrade a
+      // never_failed claim to unknown rather than leave it confidently true.
+      if (typeof v.ac_id !== 'string' || !AC_ID_RE.test(v.ac_id)) {
+        unattributableCount += 1
+        if (v.verdict !== 'PASS' && v.verdict !== 'UNVERIFIABLE') {
+          unattributedFailBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}`)
+        }
+        continue
+      }
       // Review round-2 M4: same injective-escaping fix as planBucketKey.
       // H3 (review round one): widening the ac_id pattern let the SAME
       // criterion arrive in two citation forms -- `AC-QA-1` on one round and
