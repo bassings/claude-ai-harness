@@ -779,7 +779,7 @@ def classify_stash(rest):
         # The FIRST non-flag argument, not rest[1]: `git stash drop -q
         # stash@{0}` used to read `-q` as "no ref given" and fall back to
         # stash@{0}, which only happened to be the right answer (round 4, H4).
-        ref = rest[1] if len(rest) > 1 and not rest[1].startswith('-') else None
+        ref = next((t for t in rest[1:] if not t.startswith('-')), None)
         return ('stash', {'op': 'drop', 'ref': ref})
     if sub == 'clear':
         return ('stash', {'op': 'clear'})
