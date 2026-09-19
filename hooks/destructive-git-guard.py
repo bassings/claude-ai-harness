@@ -315,6 +315,30 @@ SIMPLE_PREFIX_WRAPPERS = ('nohup', 'command', 'exec')
 # boolean parser.
 CLEAN_REQUIRE_FORCE_FALSY = ('false', 'no', 'off', '0')
 
+# `git clean` flags that change WHAT THE DRY RUN REPORTS rather than what a
+# real run would delete, so they must be dropped when mirroring the real
+# invocation into `git clean -n ...` (K1 review round 4, H1):
+#
+#   -q/--quiet    suppresses the "Would remove ..." lines entirely, so the
+#                 dry run prints nothing and clean_would_remove() reads that
+#                 empty stdout as "nothing at risk" -- measured: `git clean
+#                 -n -d` prints `Would remove u.txt` where `git clean -n -d
+#                 -q` prints nothing at all, and `git clean -fdq` then
+#                 deleted the file.
+#   -i/--interactive  turns the measuring call into a PROMPT that reads this
+#                 hook's own stdin, and reformats its output. A real
+#                 interactive clean only ever removes a SUBSET of what the
+#                 non-interactive dry run lists, so dropping it reports a
+#                 superset: conservative, and never a hang.
+#
+# Every OTHER flag is passed through verbatim, `-f` COUNT included: `git
+# clean -n -f -f -d` reports a nested repository that `git clean -n -d` does
+# not (measured, git 2.54), and stripping the second `-f` was H2 -- a
+# nested repository with unpushed commits deleted while the guard reported
+# nothing at risk. `-n` itself still wins over any number of `-f`, measured
+# on the same version: nothing is removed by the measuring call.
+CLEAN_REPORTING_ONLY_FLAGS = ('-q', '--quiet', '-i', '--interactive')
+
 # Same allowlist as test/helpers/git-env.js, deliberately duplicated rather
 # than imported: this is a production hook, not test infrastructure, and
 # must not depend on test/. GIT_DIR and friends can redirect git to a
@@ -669,11 +693,14 @@ def classify_clean(rest, git_config):
     a dry run, and either `-f`/`--force` is present or `clean.requireforce`
     has been set falsy via `-c` (git itself silently does nothing for a
     plain `git clean -d` with neither, so that shape is not guarded at all:
-    nothing destructive happens). `dry_run_args` is `rest` with -f/--force
-    removed, ready to be run as `git clean -n <dry_run_args>` -- AC-DATA-2:
-    judged by what a REAL dry run of the same flags and pathspecs would
-    remove, not by `git status`, since clean's whole purpose is untracked
-    and ignored files status does not track as a change at all."""
+    nothing destructive happens). `dry_run_args` MIRRORS the real
+    invocation -- every flag and pathspec kept verbatim, the `-f` COUNT
+    included, minus only the reporting-only flags
+    (CLEAN_REPORTING_ONLY_FLAGS, whose comment says why each had to go) --
+    ready to be run as `git clean -n <dry_run_args>`. AC-DATA-2: judged by
+    what a REAL dry run of the same flags and pathspecs would remove, not by
+    `git status`, since clean's whole purpose is untracked and ignored files
+    status does not track as a change at all."""
     if '-n' in rest or '--dry-run' in rest:
         return None  # already a dry run; nothing will actually be removed
     forced = '-f' in rest or '--force' in rest
@@ -682,8 +709,20 @@ def classify_clean(rest, git_config):
         forced = override in CLEAN_REQUIRE_FORCE_FALSY
     if not forced:
         return None  # git itself refuses without -f; nothing destructive happens
-    dry_run_args = [t for t in rest if t not in ('-f', '--force')]
-    return ('clean', dry_run_args)
+    return ('clean', clean_dry_run_args(rest))
+
+
+def clean_dry_run_args(rest):
+    """`rest` with the reporting-only flags dropped, ready to follow `git
+    clean -n`. Stops filtering at a `--` pathspec separator: a file
+    genuinely named `-q` must still reach the dry run as a pathspec, exactly
+    as it would reach the real invocation."""
+    if '--' in rest:
+        sep = rest.index('--')
+        head, tail = rest[:sep], rest[sep:]
+    else:
+        head, tail = rest, []
+    return [t for t in head if t not in CLEAN_REPORTING_ONLY_FLAGS] + tail
 
 
 def classify_stash(rest):

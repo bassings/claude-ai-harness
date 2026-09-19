@@ -3065,6 +3065,152 @@
       ],
       "expect": "block",
       "note": "AC-ARCH-4: five stacked prefix wrappers (sudo/nohup/timeout/env/command) reach exactly MAX_UNWRAP_DEPTH and are still caught"
+    },
+    {
+      "command": "git clean -fdq",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2 (round 4, H1): -q/--quiet suppresses the dry run's own output, so the dry run must be run WITHOUT it -- otherwise its empty stdout reads as 'nothing at risk' and the untracked file is deleted"
+    },
+    {
+      "command": "git clean -fdq",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H1): -fdq on a clean tree, nothing to remove"
+    },
+    {
+      "command": "git clean -f --quiet",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2 (round 4, H1): --quiet long spelling, untracked file present"
+    },
+    {
+      "command": "git clean -f --quiet",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H1): --quiet long spelling on a clean tree"
+    },
+    {
+      "command": "git clean -fdi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H1): -i/--interactive is dropped from the dry run too (it turns the measuring call into a prompt that reads stdin), so a clean tree still measures as nothing to remove rather than hanging or over-blocking"
+    },
+    {
+      "command": "git clean -ffd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "placeholder.txt",
+          "content": "seed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2 (round 4, H2): a nested repository needs TWO -f to remove, so the dry run must keep the -f COUNT -- with every -f stripped it reports nothing and sub/, its unpushed commits included, is deleted"
+    },
+    {
+      "command": "git clean -ffd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "placeholder.txt",
+          "content": "seed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, H2): -ffd on a clean tree with no nested repository, nothing to remove"
+    },
+    {
+      "command": "git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "placeholder.txt",
+          "content": "seed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-2 (round 4, H2) twin in the other direction: a SINGLE -f leaves a nested repository alone (measured against git 2.54), so the dry run must not over-report it either"
     }
   ]
 }
