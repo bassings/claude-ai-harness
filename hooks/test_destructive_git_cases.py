@@ -425,6 +425,82 @@ class TestGitDirLeakDoesNotCorruptASentinelRepo(unittest.TestCase):
             subprocess.run(['rm', '-rf', fixture])
 
 
+class TestLeakedGitDirCannotMakeTheGuardReadAnotherRepo(unittest.TestCase):
+    """AC-DATA-15, the half the sentinel test above cannot reach. That one
+    proves a leaked GIT_DIR does not WRITE to another repository. This one
+    proves it does not let the guard READ one: point GIT_DIR/GIT_WORK_TREE
+    at a second, CLEAN repo, judge a destructive command against a DIRTY
+    fixture, and require the refusal.
+
+    Ported from test/destructive-git-guard.test.js deliberately (K1 review
+    round 4, M6). Mutating sanitized_git_env() to return the real
+    environment left all 87 Python tests green and was caught only by that
+    JS file, which codex-ai-harness does not vendor: the vendored runner
+    would have shipped with no test at all for the guard's own GIT_*
+    stripping, while its docstring claimed the protection."""
+
+    def setUp(self):
+        self._dirty = tempfile.mkdtemp(prefix='dirty-fixture-')
+        run_git(['init', '-q', '-b', 'master'], self._dirty)
+        write_file(self._dirty, 'tracked.txt', 'committed\n')
+        run_git(['add', '--', 'tracked.txt'], self._dirty)
+        run_git(['commit', '-q', '-m', 'seed'], self._dirty)
+        write_file(self._dirty, 'tracked.txt', 'dirty\n')
+
+        self._clean = tempfile.mkdtemp(prefix='clean-decoy-')
+        run_git(['init', '-q', '-b', 'master'], self._clean)
+        write_file(self._clean, 'tracked.txt', 'committed\n')
+        run_git(['add', '--', 'tracked.txt'], self._clean)
+        run_git(['commit', '-q', '-m', 'seed'], self._clean)
+
+        self._leaked = {
+            'GIT_DIR': os.path.join(self._clean, '.git'),
+            'GIT_WORK_TREE': self._clean,
+        }
+
+    def tearDown(self):
+        subprocess.run(['rm', '-rf', self._dirty])
+        subprocess.run(['rm', '-rf', self._clean])
+
+    def test_evaluate_still_refuses_with_a_leaked_git_dir_in_the_environment(self):
+        saved = dict(os.environ)
+        os.environ.update(self._leaked)
+        try:
+            reason = guard.evaluate('git checkout -- tracked.txt', self._dirty)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        self.assertIsNotNone(
+            reason,
+            'a leaked GIT_DIR/GIT_WORK_TREE pointing at a clean repo made the guard read '
+            'THAT repo instead of the dirty cwd it was asked about, and allow a command '
+            'that discards uncommitted work -- the GIT_* namespace must be stripped before '
+            'the measuring call (sanitized_git_env)')
+
+    def test_the_deployed_hook_process_still_refuses_with_a_leaked_git_dir(self):
+        # The same thing through main()'s real JSON-in/exit-code-out path,
+        # with the variables in the process environment exactly as a leaked
+        # one would arrive -- NOT via clean_env(), which strips them and
+        # would stop this ever reaching the guard's own stripping.
+        payload = json.dumps({
+            'tool_name': 'Bash',
+            'tool_input': {'command': 'git checkout -- tracked.txt'},
+            'cwd': self._dirty,
+            'hook_event_name': 'PreToolUse',
+        })
+        env = dict(os.environ)
+        env.update(self._leaked)
+        result = subprocess.run(
+            [sys.executable, GUARD_PATH],
+            input=payload, capture_output=True, text=True, env=env, timeout=10,
+        )
+        self.assertEqual(
+            result.returncode, 2,
+            'the deployed hook exited %s with a leaked GIT_DIR/GIT_WORK_TREE pointing at a '
+            'clean repo; it must strip GIT_* and refuse on the dirty cwd. stderr: %s'
+            % (result.returncode, result.stderr))
+
+
 class TestHookProcessContract(unittest.TestCase):
     """AC-QA-7 (timing) plus the exit-code contract, driven as REAL
     subprocesses of the guard (the actual deployed hook path), not just
