@@ -593,6 +593,37 @@ function computeStalenessStatus({ blind, unmatchedPatterns, drift }) {
   return drift.length === 0 ? 'ok' : 'drift'
 }
 
+// M4 (round 3 review): the entry point bin/install.sh calls to decide WHAT
+// TO COPY, so the installer never carries its own second copy of "consumer
+// subset intersected with what git tracks" -- before this it re-derived that
+// intersection inline (a `node --input-type=module -e` block embedded in the
+// shell script), separately from checkStaleness's own internal use of the
+// exact same two functions a few lines below. Two independently-typed copies
+// of one intersection is the "two copies of one rule" shape this repo has
+// hit before (the AC-id pattern, and the AC-definition counter that
+// duplicated it).
+//
+// Also decides, here rather than in the shell script, which of those files
+// are OPTIONAL (CONSUMER_OPTIONAL_PATTERNS) -- an install still copies every
+// one of them when the source file exists (installing what this checkout
+// ships is never itself optional; "optional" describes whether the
+// DESTINATION may legitimately lack it, which is checkStaleness's own
+// question, not this one), but a caller that wants to report what it did can
+// tell required and optional apart without re-deriving the pattern list
+// itself.
+//
+// `blind` mirrors checkStaleness's own convention: git could not be asked
+// what this directory tracks (not a checkout, or git failed), so the caller
+// must refuse rather than report zero files found as "nothing to install".
+export function listInstallFiles(repoDir) {
+  const tracked = listGitTrackedFiles(repoDir)
+  if (tracked === null) return { files: [], required: [], optional: [], blind: true }
+  const files = listConsumerSubsetFiles(repoDir).filter((f) => tracked.has(f))
+  const optional = files.filter((f) => isOptionalConsumerSubsetPath(f))
+  const required = files.filter((f) => !isOptionalConsumerSubsetPath(f))
+  return { files, required, optional, blind: false }
+}
+
 export function checkStaleness(publishedDir, installDir) {
   const candidateFiles = listConsumerSubsetFiles(publishedDir)
   // AC-1: narrow the filesystem walk's candidates to what git actually

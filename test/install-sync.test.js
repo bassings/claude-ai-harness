@@ -140,7 +140,7 @@ test('install.sh: refuses when the consumer subset comes back EMPTY, rather than
   fs.copyFileSync(SCRIPT, path.join(fake, 'bin', 'install.sh'))
   fs.writeFileSync(
     path.join(fake, 'workflows', 'lib', 'install-consistency.mjs'),
-    'export function listConsumerSubsetFiles() { return [] }\n')
+    'export function listInstallFiles() { return { files: [], required: [], optional: [], blind: false } }\n')
   // A real git repo, so this exercises "the module returned nothing" and not
   // the unrelated "this is not a checkout" path.
   spawnSync('git', ['init', '-q'], { cwd: fake })
@@ -154,6 +154,45 @@ test('install.sh: refuses when the consumer subset comes back EMPTY, rather than
   assert.notEqual(res.status, 0, 'an empty subset must be refused, never reported as a successful install')
   assert.match(res.stdout + res.stderr, /refusing to 'install' nothing/i)
   assert.equal(fs.readdirSync(dest).length, 0, 'and nothing may be written')
+})
+
+// M4 (round 2 review): install.sh --check reimplemented drift detection with
+// its own shell cmp -s loop instead of calling checkStaleness(), and the two
+// disagreed about an OPTIONAL file (bin/optimise-cycle-weekly.sh,
+// bin/redact-transcript.mjs, hooks/hooks.json -- CONSUMER_OPTIONAL_PATTERNS):
+// checkStaleness exempts a missing optional file from drift (a manual
+// install that skips the weekly job is a legitimate configuration);
+// install.sh's own loop counted ANY missing destination file as drift.
+test('install.sh (M4): --check does not report drift when an OPTIONAL consumer-subset file is absent from the destination -- a manual install that skips the weekly job is a legitimate configuration, matching checkStaleness', async () => {
+  const dest = tmpInstall()
+  assert.equal(run([], { CLAUDE_HOME: dest }).status, 0)
+
+  const mod = await import(require('node:url').pathToFileURL(
+    path.join(ROOT, 'workflows', 'lib', 'install-consistency.mjs')).href)
+  const optionalPresent = mod.CONSUMER_OPTIONAL_PATTERNS.filter((p) => fs.existsSync(path.join(dest, p)))
+  assert.ok(optionalPresent.length > 0, 'sanity: at least one optional file must actually have been installed')
+  for (const rel of optionalPresent) fs.rmSync(path.join(dest, rel))
+
+  const check = run(['--check'], { CLAUDE_HOME: dest })
+  assert.equal(check.status, 0,
+    `--check must still pass with an optional file missing, matching checkStaleness's own exemption:\n${check.stdout}${check.stderr}`)
+})
+
+test('install.sh (M4): --check calls the SAME checkStaleness() the weekly drift check uses, not a second drift detector', async () => {
+  const dest = tmpInstall()
+  assert.equal(run([], { CLAUDE_HOME: dest }).status, 0)
+  // Corrupt one REQUIRED (non-optional) file's content at the destination.
+  const target = path.join(dest, 'AGENT-HARNESS.md')
+  fs.writeFileSync(target, fs.readFileSync(target, 'utf8') + '\nhand-edited drift\n')
+
+  const mod = await import(require('node:url').pathToFileURL(
+    path.join(ROOT, 'workflows', 'lib', 'install-consistency.mjs')).href)
+  const staleness = mod.checkStaleness(ROOT, dest)
+  assert.equal(staleness.status, 'drift', 'sanity: checkStaleness itself must see this drift')
+
+  const check = run(['--check'], { CLAUDE_HOME: dest })
+  assert.notEqual(check.status, 0, 'install.sh --check must agree with checkStaleness and report drift')
+  assert.match(check.stdout + check.stderr, /AGENT-HARNESS\.md/, 'must name the drifted file')
 })
 
 test('install.sh: installs only files the repo actually TRACKS -- generated artefacts are not part of a release', () => {

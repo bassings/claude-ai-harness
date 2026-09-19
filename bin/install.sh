@@ -12,13 +12,18 @@
 # still differed from this repo's, and the weekly job had reported that drift
 # for three consecutive weeks into a log nobody reads.
 #
-# WHAT IT INSTALLS is decided by workflows/lib/install-consistency.mjs, which
-# already owns the authoritative list and is what the weekly drift check reads.
-# This script asks that module rather than carrying its own copy of the list.
-# Two copies of one rule is the defect this repo hit twice in a single day (the
-# AC-id pattern, and the AC-definition counter that duplicated it), so the
-# installer and the detector are wired to the same source by construction: if
-# they could disagree, following both would still leave you stale.
+# WHAT IT INSTALLS, and what counts as DRIFT, are both decided by
+# workflows/lib/install-consistency.mjs, which already owns the authoritative
+# list and is what the weekly drift check reads. This script calls that
+# module's own exported entry points (listInstallFiles for what to copy,
+# checkStaleness for what counts as drift) rather than carrying a second copy
+# of either. Two copies of one rule is the defect this repo hit twice in a
+# single day (the AC-id pattern, and the AC-definition counter that
+# duplicated it) -- and, M4 (round 2 review), a third time inside this very
+# script: --check used to reimplement drift detection with its own shell
+# loop, and it disagreed with checkStaleness about a missing OPTIONAL file
+# (a manual install that skips the weekly job is a legitimate configuration
+# to checkStaleness; the old loop counted it as drift regardless).
 #
 #   bin/install.sh            install, then verify
 #   bin/install.sh --check    verify only, write nothing, non-zero on drift
@@ -30,6 +35,7 @@ set -eu
 REPO="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 DEST="${CLAUDE_HOME:-$HOME/.claude}"
 LIB="$REPO/workflows/lib/install-consistency.mjs"
+LIB_JS="$(printf '%s' "$LIB" | sed "s/'/\\\\'/g")"
 
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
@@ -39,25 +45,47 @@ if [ ! -f "$LIB" ]; then
   exit 2
 fi
 
-# The one list, read from the module that owns it, intersected with what the
-# repo actually TRACKS.
-#
-# The intersection is not belt and braces. Caught on the first real run: the
-# 'hooks/' pattern walks the whole directory, so the installer copied
+# M4: --check calls checkStaleness() directly -- the SAME function
+# bin/optimise-cycle-weekly.sh uses -- instead of a second, independently
+# maintained drift detector. Exits before the install-only logic below ever
+# runs.
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  exec node --input-type=module -e "
+import { checkStaleness } from '$LIB_JS'
+const [repo, dest] = process.argv.slice(1)
+const r = checkStaleness(repo, dest)
+for (const rel of r.missing) console.log('missing: ' + rel)
+for (const rel of r.drifted) console.log('drift:   ' + rel)
+if (r.blind || r.unmatched_patterns.length > 0) {
+  console.error('install --check: could not verify ' + dest + ' -- ' +
+    (r.blind ? 'no published files were found to compare (not a git checkout?)' : 'pattern(s) matched nothing: ' + r.unmatched_patterns.join(', ')))
+  process.exit(2)
+}
+if (r.status === 'drift') {
+  console.error('install --check: ' + r.drift.length + ' file(s) drifted or missing in ' + dest + '. Run bin/install.sh')
+  process.exit(1)
+}
+console.log('install --check: ' + dest + ' matches this checkout.')
+" "$REPO" "$DEST"
+fi
+
+# M4: the same listInstallFiles() the module exports for exactly this,
+# instead of a `node --input-type=module -e` block re-deriving "consumer
+# subset intersected with what git tracks" inline. The intersection is not
+# belt and braces: caught on the first real run, the 'hooks/' pattern walks
+# the whole directory, so the installer copied
 # hooks/__pycache__/test_plan_guard_stop.cpython-314.pyc into the operator's
-# harness -- compiled bytecode of a test file, gitignored, and guaranteed to go
-# stale against the .py beside it. The same directory tripped the
-# optimiser-reference scan earlier the same day for the same reason: a walk
-# that does not distinguish source from build output. A release contains what
-# the repository publishes, so "tracked" is the right test, and it needs no
-# second list of exclusions to maintain.
+# harness -- compiled bytecode of a test file, gitignored, guaranteed to go
+# stale against the .py beside it. A release contains what the repository
+# publishes, so "tracked" is the right test.
 FILES=$(node --input-type=module -e "
-import { execSync } from 'node:child_process'
-import { listConsumerSubsetFiles } from '$(printf '%s' "$LIB" | sed "s/'/\\\\'/g")'
-const repo = process.argv[1]
-const tracked = new Set(execSync('git ls-files -z', { cwd: repo, maxBuffer: 64 * 1024 * 1024 })
-  .toString('utf8').split('\\0').filter(Boolean))
-for (const f of listConsumerSubsetFiles(repo)) if (tracked.has(f)) console.log(f)
+import { listInstallFiles } from '$LIB_JS'
+const r = listInstallFiles(process.argv[1])
+if (r.blind) {
+  console.error('install: could not determine which files this repo tracks (not a git checkout?).')
+  process.exit(2)
+}
+for (const f of r.files) console.log(f)
 " "$REPO")
 
 if [ -z "$FILES" ]; then
@@ -87,40 +115,20 @@ if [ "$CHECK_ONLY" -eq 0 ] && [ "${HARNESS_INSTALL_REQUIRE_MARKER:-1}" = "1" ]; 
   fi
 fi
 
-drift=0
 installed=0
 for rel in $FILES; do
   src="$REPO/$rel"
   dst="$DEST/$rel"
   [ -f "$src" ] || continue
-  if [ "$CHECK_ONLY" -eq 1 ]; then
-    if [ ! -f "$dst" ]; then
-      echo "missing: $rel"
-      drift=$((drift + 1))
-    elif ! cmp -s "$src" "$dst"; then
-      echo "drift:   $rel"
-      drift=$((drift + 1))
-    fi
-  else
-    mkdir -p "$(dirname -- "$dst")"
-    # Only copy what actually differs, so an install is quiet and its output
-    # says what genuinely moved.
-    if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
-      cp "$src" "$dst"
-      echo "updated: $rel"
-      installed=$((installed + 1))
-    fi
+  mkdir -p "$(dirname -- "$dst")"
+  # Only copy what actually differs, so an install is quiet and its output
+  # says what genuinely moved.
+  if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
+    cp "$src" "$dst"
+    echo "updated: $rel"
+    installed=$((installed + 1))
   fi
 done
-
-if [ "$CHECK_ONLY" -eq 1 ]; then
-  if [ "$drift" -gt 0 ]; then
-    echo "install --check: $drift file(s) drifted or missing in $DEST. Run bin/install.sh" >&2
-    exit 1
-  fi
-  echo "install --check: $DEST matches this checkout."
-  exit 0
-fi
 
 echo "install: $installed file(s) updated in $DEST."
 # Verify what we just did, rather than assuming the copies landed.
