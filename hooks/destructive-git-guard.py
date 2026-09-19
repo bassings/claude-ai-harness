@@ -227,6 +227,22 @@ SHELL_KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'done', 'fi', '{', '(', ')
 GIT_GLOBAL_OPTS_WITH_VALUE = ('-C', '--git-dir', '--work-tree', '-c', '--exec-path')
 GIT_GLOBAL_OPTS_NO_VALUE = ('--no-pager', '-p', '--paginate')
 
+# Global options, and environment variables, that point git at a DIFFERENT
+# repository from the one `cwd` names. This guard measures by running git
+# itself in `cwd` with the GIT_* namespace stripped (sanitized_git_env), so
+# neither reaches its measuring call: it would answer about the wrong
+# repository, confidently. Skipping them and measuring anyway was M1 (K1
+# review round 4) -- reproduced: with a clean cwd and a second repo holding
+# an untracked file, `git --git-dir=O/.git --work-tree=O clean -fd` was
+# ALLOWED and the real run deleted that file; the env-prefix spelling did
+# the same. clean and stash drop/clear now fail CLOSED on either, which is
+# the same posture they already take for an unresolvable `cd` target.
+# checkout/restore/reset keep their documented fail-OPEN posture here, for
+# the same reason they keep it everywhere else: snapshots cover the tracked
+# work they can lose.
+GIT_REPO_RETARGETING_OPTS = ('--git-dir', '--work-tree')
+GIT_REPO_RETARGETING_ENV_VARS = ('GIT_DIR', 'GIT_WORK_TREE')
+
 # Bounds how many wrapper layers (bash -c/sh -c/bash -lc bodies, and the
 # nohup/sudo/timeout/xargs/env/command/exec prefix wrappers) this guard will
 # unwrap in one command, and how many levels of $(...) / backtick command
@@ -563,6 +579,21 @@ def leading_env_assignments(tokens):
     return out
 
 
+def env_prefix_retargets_repo(tokens):
+    """True if THIS segment carries a `GIT_DIR=`/`GIT_WORK_TREE=` env
+    prefix. Read from the segment's own leading assignments, the same run
+    strip_env_prefix() drops, rather than from the process environment: the
+    process environment is already scrubbed by sanitized_git_env(), so the
+    only way one of these can reach the command being judged is as a prefix
+    written on the command itself (K1 review round 4, M1, and see
+    GIT_REPO_RETARGETING_ENV_VARS)."""
+    for assignment in leading_env_assignments(tokens):
+        name, _, _value = assignment.partition('=')
+        if name in GIT_REPO_RETARGETING_ENV_VARS:
+            return True
+    return False
+
+
 def escape_hatch_active_for_segment(tokens):
     """True if HARNESS_ALLOW_DESTRUCTIVE_GIT=1 is a genuine env-prefix
     assignment on THIS segment (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git
@@ -611,19 +642,25 @@ def join_cwd(base, target):
 def parse_git_invocation(tokens, cwd):
     """Given a segment's tokens (already redirect-stripped, env-prefix-
     stripped and shell-keyword-stripped), return (subcmd, rest,
-    effective_cwd, git_config) if `tokens[0]` is a git binary, else None.
+    effective_cwd, git_config, retargeted) if `tokens[0]` is a git binary,
+    else None.
     `effective_cwd` starts as `cwd` (which may itself be None, see
     join_cwd()) and is updated by any `-C <path>` global option
     encountered (chained, exactly like git itself). `git_config` is a dict
     of any `-c key=value` global options seen, lower-cased by key -- the
     only key this guard ever consults is `clean.requireforce`
-    (classify_clean)."""
+    (classify_clean).
+    `retargeted` is True if a GIT_REPO_RETARGETING_OPTS option was seen:
+    the command names a repository this guard's own measurement (which
+    runs in `effective_cwd` with GIT_* stripped) cannot reach, so a
+    measured answer would be about the wrong repository."""
     if not tokens or not is_git_binary(tokens[0]):
         return None
     i = 1
     n = len(tokens)
     effective_cwd = cwd
     git_config = {}
+    retargeted = False
     while i < n:
         tok = tokens[i]
         if tok == '-C':
@@ -646,10 +683,12 @@ def parse_git_invocation(tokens, cwd):
             if tok == opt:
                 i += 2
                 matched = True
-                break
-            if tok.startswith(opt + '='):
+            elif tok.startswith(opt + '='):
                 i += 1
                 matched = True
+            if matched:
+                if opt in GIT_REPO_RETARGETING_OPTS:
+                    retargeted = True
                 break
         if matched:
             continue
@@ -659,7 +698,7 @@ def parse_git_invocation(tokens, cwd):
         break
     if i >= n:
         return None
-    return tokens[i], tokens[i + 1:], effective_cwd, git_config
+    return tokens[i], tokens[i + 1:], effective_cwd, git_config, retargeted
 
 
 def expand_bundled_short_flags(tokens):
@@ -1025,7 +1064,9 @@ REFUSAL_CLEAN = (
     "destructive-git-guard: refused `{cmd}` -- either a real dry run of the "
     "same flags and pathspecs shows untracked or ignored files would be "
     "removed, or that could not be verified (the directory could not be "
-    "resolved, or the check itself failed or timed out), and this rule "
+    "resolved, the check itself failed or timed out, or the command selects "
+    "another repository with --git-dir/--work-tree or GIT_DIR/GIT_WORK_TREE, "
+    "which this guard cannot measure), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: run `git clean "
     "-n` yourself first and inspect the list. If this cleanup is "
     "deliberate, opt in explicitly: re-run with {var}=1 set inline "
@@ -1036,9 +1077,11 @@ REFUSAL_STASH = (
     "destructive-git-guard: refused `{cmd}` -- either the stash list is "
     "non-empty (or an earlier `git stash` in this same command would make "
     "it so), or that could not be verified (the directory could not be "
-    "resolved, the check itself failed or timed out, or the stash "
+    "resolved, the check itself failed or timed out, the stash "
     "reference given is not one this guard can reduce to a `stash@{{N}}` "
-    "index), and this rule "
+    "index, or the command selects another repository with "
+    "--git-dir/--work-tree or GIT_DIR/GIT_WORK_TREE, which this guard "
+    "cannot measure), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: `git stash list` "
     "to inspect the stash entries first. If this is deliberate, opt in "
     "explicitly: re-run with {var}=1 set inline (`{var}=1 {cmd}`) or "
@@ -1324,7 +1367,7 @@ def evaluate_segment(raw_tokens, state, depth):
         # against an unknown directory and risk reading the wrong repo.
         parsed = parse_git_invocation(head, None)
         if parsed is not None:
-            subcmd, rest, _unused_cwd, git_config = parsed
+            subcmd, rest, _unused_cwd, git_config, _unused_retargeted = parsed
             if subcmd in ('clean', 'stash'):
                 scope = destructive_scope(subcmd, rest, None, git_config)
                 if scope is not None:
@@ -1336,7 +1379,8 @@ def evaluate_segment(raw_tokens, state, depth):
     parsed = parse_git_invocation(head, state['cwd'])
     if parsed is None:
         return None
-    subcmd, rest, segment_cwd, git_config = parsed
+    subcmd, rest, segment_cwd, git_config, retargeted = parsed
+    retargeted = retargeted or env_prefix_retargets_repo(tokens)
 
     if subcmd == 'stash':
         # Tracked regardless of whether THIS segment ends up refused: an
@@ -1355,10 +1399,14 @@ def evaluate_segment(raw_tokens, state, depth):
     display_cmd = ' '.join(head)
     kind = scope[0]
     if kind == 'clean':
-        risky = clean_would_remove(segment_cwd, scope[1])
+        # `retargeted` short-circuits the measurement rather than colouring
+        # it: there is nothing useful to measure, since the repository this
+        # command acts on is not the one the measuring call can read.
+        risky = retargeted or clean_would_remove(segment_cwd, scope[1])
         template = REFUSAL_CLEAN
     elif kind == 'stash':
-        risky = state['stash_created'] or stash_would_lose_entries(segment_cwd, scope[1])
+        risky = (retargeted or state['stash_created']
+                 or stash_would_lose_entries(segment_cwd, scope[1]))
         template = REFUSAL_STASH
     else:
         risky = has_uncommitted_change(segment_cwd, scope)

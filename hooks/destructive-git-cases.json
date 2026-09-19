@@ -3679,6 +3679,134 @@
       ],
       "expect": "allow",
       "note": "AC-QA-2 twin (round 4, H4): the same flag-before-ref shape naming an entry that does not exist -- allowed, which is what proves the ref behind the flag is really being read"
+    },
+    {
+      "command": "git --git-dir=other/.git --work-tree=other clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3 (round 4, M1): --git-dir/--work-tree and the GIT_DIR/GIT_WORK_TREE env prefixes select a DIFFERENT repository from the one this guard measures -- the guard strips GIT_* from its own environment and measures `cwd`, so the answer it gets is about the wrong repo. Reproduced: with a clean cwd and a second repo holding an untracked file, the retargeted clean was ALLOWED and the real run deleted that file. clean and stash drop/clear therefore fail CLOSED when either is present, rather than reporting on a repository the command will not touch. --git-dir/--work-tree, clean"
+    },
+    {
+      "command": "git --git-dir=other/.git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3 (round 4, M1): --git-dir/--work-tree and the GIT_DIR/GIT_WORK_TREE env prefixes select a DIFFERENT repository from the one this guard measures -- the guard strips GIT_* from its own environment and measures `cwd`, so the answer it gets is about the wrong repo. Reproduced: with a clean cwd and a second repo holding an untracked file, the retargeted clean was ALLOWED and the real run deleted that file. clean and stash drop/clear therefore fail CLOSED when either is present, rather than reporting on a repository the command will not touch. --git-dir alone, clean"
+    },
+    {
+      "command": "git --work-tree other clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3 (round 4, M1): --git-dir/--work-tree and the GIT_DIR/GIT_WORK_TREE env prefixes select a DIFFERENT repository from the one this guard measures -- the guard strips GIT_* from its own environment and measures `cwd`, so the answer it gets is about the wrong repo. Reproduced: with a clean cwd and a second repo holding an untracked file, the retargeted clean was ALLOWED and the real run deleted that file. clean and stash drop/clear therefore fail CLOSED when either is present, rather than reporting on a repository the command will not touch. --work-tree in its separate-token spelling, clean"
+    },
+    {
+      "command": "GIT_DIR=other/.git GIT_WORK_TREE=other git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3 (round 4, M1): --git-dir/--work-tree and the GIT_DIR/GIT_WORK_TREE env prefixes select a DIFFERENT repository from the one this guard measures -- the guard strips GIT_* from its own environment and measures `cwd`, so the answer it gets is about the wrong repo. Reproduced: with a clean cwd and a second repo holding an untracked file, the retargeted clean was ALLOWED and the real run deleted that file. clean and stash drop/clear therefore fail CLOSED when either is present, rather than reporting on a repository the command will not touch. env-prefix spelling, clean"
+    },
+    {
+      "command": "GIT_DIR=other/.git git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3 (round 4, M1): --git-dir/--work-tree and the GIT_DIR/GIT_WORK_TREE env prefixes select a DIFFERENT repository from the one this guard measures -- the guard strips GIT_* from its own environment and measures `cwd`, so the answer it gets is about the wrong repo. Reproduced: with a clean cwd and a second repo holding an untracked file, the retargeted clean was ALLOWED and the real run deleted that file. clean and stash drop/clear therefore fail CLOSED when either is present, rather than reporting on a repository the command will not touch. env-prefix spelling, stash drop (the stash list read would be the wrong repo's)"
+    },
+    {
+      "command": "git --git-dir=other/.git stash clear",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3 (round 4, M1): --git-dir/--work-tree and the GIT_DIR/GIT_WORK_TREE env prefixes select a DIFFERENT repository from the one this guard measures -- the guard strips GIT_* from its own environment and measures `cwd`, so the answer it gets is about the wrong repo. Reproduced: with a clean cwd and a second repo holding an untracked file, the retargeted clean was ALLOWED and the real run deleted that file. clean and stash drop/clear therefore fail CLOSED when either is present, rather than reporting on a repository the command will not touch. --git-dir, stash clear"
+    },
+    {
+      "command": "git --git-dir=other/.git clean -n -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M1): the allow twin cannot be 'the same command on a clean fixture' -- the whole point is that this guard cannot see the target repo's state at all, so a clean fixture proves nothing. The honest twin is the same retargeting on a command that destroys nothing whatever the target repo holds: an explicit dry run is still allowed, which is what shows the refusal is about MEASUREMENT and not a blanket ban on --git-dir"
+    },
+    {
+      "command": "git --git-dir=other/.git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-3 (round 4, M1): checkout/restore/reset keep their documented fail-OPEN posture under the same retargeting -- snapshots cover the tracked work they can lose, which is the whole reason clean and stash drop/clear are the two rules that fail closed"
     }
   ]
 }
