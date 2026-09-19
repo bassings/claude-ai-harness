@@ -4082,6 +4082,32 @@ test('ledger-append (D2): a spec-qualified ac_id survives, so a review spanning 
   assert.equal(entry.invalid_ac_ids_dropped, 0)
 })
 
+// L2 (round 2 review): NEW_AC_ID_ACCEPTS above is a hand-picked list. A
+// future lens with a prefix over 16 characters, or with a character outside
+// [A-Z0-9], would be nulled by the pattern -- exactly D1's own defect class
+// -- while every test here stayed green, since none of them is DERIVED from
+// what the shipped lenses and specs actually emit. Scans the real files
+// instead, so narrowing the pattern (or a new lens/spec using a prefix the
+// pattern does not cover) fails this test rather than silently nulling
+// that lens's or spec's record.
+test('ledger-append (AC-QA-2, L2): every AC prefix actually used across agents/lens-*.md and specs/*.md is accepted by the writer\'s pattern', async () => {
+  const re = await acIdPattern()
+  const root = path.join(__dirname, '..')
+  const files = [
+    ...fs.readdirSync(path.join(root, 'agents')).filter((f) => f.startsWith('lens-') && f.endsWith('.md')).map((f) => path.join(root, 'agents', f)),
+    ...fs.readdirSync(path.join(root, 'specs')).filter((f) => f.endsWith('.md')).map((f) => path.join(root, 'specs', f)),
+  ]
+  const prefixes = new Set()
+  for (const file of files) {
+    const src = fs.readFileSync(file, 'utf8')
+    for (const m of src.matchAll(/AC-([A-Z][A-Z0-9]*)-\d+/g)) prefixes.add(m[1])
+  }
+  assert.ok(prefixes.size > 5, `sanity: expected to find several distinct AC prefixes across the shipped agents/specs, found ${prefixes.size} -- a pattern that matches nothing proves nothing`)
+  for (const prefix of prefixes) {
+    assert.ok(re.test(`AC-${prefix}-1`), `AC-${prefix}-1 (a prefix actually used in this repo's own agents/specs) must be accepted by AC_ID_PATTERN_STR`)
+  }
+})
+
 test('ledger-append (AC-SEC-2): the widened pattern still rejects every injection, path and metacharacter shape', async () => {
   const re = await acIdPattern()
   for (const v of NEW_AC_ID_ACCEPTS) {
