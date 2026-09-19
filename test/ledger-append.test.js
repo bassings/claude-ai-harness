@@ -4135,6 +4135,58 @@ test('ledger-append (AC-SEC-4): the pattern is linear -- 1024 adversarial charac
   assert.ok(worst < 10, `worst case ${worst.toFixed(3)}ms`)
 })
 
+// M6 (round 2 review): the test above cannot actually catch a nested-
+// quantifier regression. Its hostile input, 'A-'.repeat(n/2), is a CLEAN
+// match for `([A-Za-z0-9]+[-/ ]?)*` at every prefix -- each "A-" chunk is
+// consumed unambiguously (one or more alphanumerics, then exactly the
+// optional separator), so there is nothing for the engine to backtrack
+// over. Measured directly (round-2 report): applying QA's mutation
+// (AC_ID_PATTERN_STR replaced with the nested shape
+// `^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$` the comment above already
+// names) left the existing test green.
+//
+// Catastrophic backtracking needs AMBIGUITY: a run of characters that could
+// be split among repetitions of the outer group in many different ways, with
+// no terminating match to short-circuit the search. A long run of the SAME
+// character with no separator at all (or with a would-be-separator that
+// never lines up with a real boundary), followed by something that breaks
+// the match, is exactly that shape.
+test('ledger-append (AC-SEC-4, M6 round 3): the pattern stays linear against inputs AMBIGUOUS for a nested/optional-separator quantifier, with a growth bound between lengths, not just the original test\'s unambiguous hostile shape', async () => {
+  const re = await acIdPattern()
+  const shapes = [
+    (n) => 'A'.repeat(n) + '!',
+    (n) => 'a1'.repeat(Math.ceil(n / 2)).slice(0, n) + '!',
+    (n) => 'A '.repeat(Math.ceil(n / 2)).slice(0, n) + 'x',
+  ]
+  const lengths = [16, 20, 22, 24, 26, 28]
+  for (const shape of shapes) {
+    const timings = []
+    for (const n of lengths) {
+      const hostile = shape(n)
+      const t0 = process.hrtime.bigint()
+      re.test(hostile)
+      const ms = Number(process.hrtime.bigint() - t0) / 1e6
+      timings.push({ n, ms })
+      assert.ok(ms < 10, `${JSON.stringify(hostile)} (length ${n}) took ${ms.toFixed(3)}ms, over the 10ms bound`)
+    }
+    // A growth bound, not just the absolute one above: a genuinely linear
+    // (or low-polynomial) pattern's time barely moves as length grows a
+    // handful of characters at a time. A catastrophic nested quantifier
+    // multiplies by roughly 4x for every two added characters at exactly
+    // these lengths (measured on the mutation named above). Only compared
+    // once a timing clears a noise floor, so sub-millisecond jitter on the
+    // real (fast) pattern can never itself fail this assertion -- the real
+    // pattern's timings at these lengths never approach the floor at all.
+    for (let i = 1; i < timings.length; i++) {
+      const prev = timings[i - 1]
+      const curr = timings[i]
+      if (curr.ms < 0.5) continue
+      const ratio = curr.ms / Math.max(prev.ms, 0.001)
+      assert.ok(ratio < 3, `growth from ${prev.n} to ${curr.n} characters (input ${JSON.stringify(shape(curr.n))}) was ${ratio.toFixed(1)}x (${prev.ms.toFixed(3)}ms -> ${curr.ms.toFixed(3)}ms) -- looks super-linear`)
+    }
+  }
+})
+
 // --- specs/harn-ledger-validators.md D3 -----------------------------------
 //
 // Per-lens disposition tallies were built by the reader from the ledger's
