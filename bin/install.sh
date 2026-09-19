@@ -68,8 +68,16 @@ fi
 # A destination that contains files but none of the harness's own is probably
 # not ~/.claude. Scattering a harness across someone's home directory is not
 # recoverable by reading a log, so it is refused rather than warned about.
-# Opt in with HARNESS_INSTALL_REQUIRE_MARKER=0 for a genuinely fresh install.
-if [ "$CHECK_ONLY" -eq 0 ] && [ "${HARNESS_INSTALL_REQUIRE_MARKER:-0}" = "1" ]; then
+#
+# L1 (round 2 review): this guard used to default to OFF (${...:-0}), so it
+# only ever ran when an operator or a test explicitly set the variable to 1 --
+# which no real invocation does, so the guard never actually fired in
+# production. Measured: a CLAUDE_HOME pointing at a directory holding only
+# an unrelated file installed 29 files, including executable hooks, and
+# exited 0. The comment above said "opt in with ...=0", which was already
+# describing the opt-OUT direction this now actually implements: the guard
+# is ON by default, and =0 is how a genuinely fresh install opts out of it.
+if [ "$CHECK_ONLY" -eq 0 ] && [ "${HARNESS_INSTALL_REQUIRE_MARKER:-1}" = "1" ]; then
   if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
     if [ ! -e "$DEST/AGENT-HARNESS.md" ] && [ ! -d "$DEST/workflows" ] && [ ! -d "$DEST/skills" ]; then
       echo "install: $DEST is not empty and does not look like a Claude install" >&2

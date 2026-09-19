@@ -103,6 +103,29 @@ test('install.sh: refuses to install over a destination that is not a harness in
   assert.match(res.stdout + res.stderr, /does not look like/i)
 })
 
+// L1 (round 2 review): the guard above only ever ran with the env var
+// explicitly set to 1 -- production never sets it, so the destination-safety
+// guard was off for every real install. Measured (security lens): a
+// CLAUDE_HOME pointing at a directory holding only Documents/taxes.pdf
+// installed 29 files, including executable hooks, and exited 0. The comment
+// said "opt in with ...=0", which was the reverse of what the code did.
+test('install.sh (L1): refuses an unfamiliar destination by DEFAULT -- no environment variable set at all, matching production', () => {
+  const dest = tmpInstall()
+  fs.writeFileSync(path.join(dest, 'taxes.pdf'), 'not a harness install\n')
+  const res = run([], { CLAUDE_HOME: dest })
+  assert.notEqual(res.status, 0, 'the default path (no env var set) must refuse an unfamiliar destination, matching what a real operator actually runs')
+  assert.match(res.stdout + res.stderr, /does not look like/i)
+  assert.equal(fs.readdirSync(dest).length, 1, 'nothing may be written on refusal -- only the pre-existing taxes.pdf remains')
+})
+
+test('install.sh (L1): HARNESS_INSTALL_REQUIRE_MARKER=0 is the documented opt-out for a genuinely fresh install', () => {
+  const dest = tmpInstall()
+  fs.writeFileSync(path.join(dest, 'taxes.pdf'), 'not a harness install\n')
+  const res = run([], { CLAUDE_HOME: dest, HARNESS_INSTALL_REQUIRE_MARKER: '0' })
+  assert.equal(res.status, 0, `=0 must opt out of the guard for a fresh install:\n${res.stdout}${res.stderr}`)
+  assert.ok(fs.existsSync(path.join(dest, 'AGENT-HARNESS.md')), 'the install must actually have happened')
+})
+
 test('install.sh: refuses when the consumer subset comes back EMPTY, rather than reporting a successful install of nothing', () => {
   // The vacuous-success shape: if the module that owns the file list ever
   // returns nothing (a bad refactor, a renamed directory), a naive installer
