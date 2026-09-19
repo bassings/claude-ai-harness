@@ -1,0 +1,3018 @@
+{
+  "_comment": "Shared destructive-git-guard corpus (AC-K1-1). Vendored byte-identical into codex-ai-harness at the pin in hooks/UPSTREAM. setup_ops below is the CLOSED vocabulary hooks/test_destructive_git_cases.py accepts -- an op name outside this set fails the suite (AC-SEC-5).",
+  "setup_ops": {
+    "init": "git init the fixture directory on branch `branch` (default \"master\")",
+    "commit": "write `content` to `path` and commit it",
+    "write": "write `content` to `path` without staging or committing it (creating parent directories as needed) -- dirty if `path` is already tracked, untracked otherwise",
+    "gitignore": "write and commit a .gitignore file containing one line per entry of `patterns`",
+    "mkdir": "create an empty directory at `path`",
+    "nested_repo": "git init a SEPARATE repository inside `path` (creating it if needed), with its own committed-then-dirtied tracked file, independent of the outer fixture repo",
+    "stash_push": "run `git stash push` for real against the fixture's current dirty state, leaving one genuine stash entry and a clean working tree",
+    "branch": "create a branch named `name` off the current HEAD, without switching to it"
+  },
+  "cases": [
+    {
+      "command": "git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #1"
+    },
+    {
+      "command": "git checkout tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #2"
+    },
+    {
+      "command": "git checkout master tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #3 (fixture default branch is master)"
+    },
+    {
+      "command": "git checkout -- other.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "probe #4 (other.txt clean; tracked.txt dirty)"
+    },
+    {
+      "command": "cat <<EOF\ngit reset --hard\nEOF",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "probe #5 (heredoc body is inert text)"
+    },
+    {
+      "command": "git commit -m 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "probe #6 (destructive text stays inside its own quoted argument)"
+    },
+    {
+      "command": "git checkout -qf",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #7"
+    },
+    {
+      "command": "echo hi\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #8 (newline separator)"
+    },
+    {
+      "command": "git reset --hard > /dev/null 2>&1",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #9 (redirect stripped)"
+    },
+    {
+      "command": "bash -c 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #10 (bash -c unwrap)"
+    },
+    {
+      "command": "echo $(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #11 (command substitution unwrap)"
+    },
+    {
+      "command": "nohup git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #12 (nohup unwrap)"
+    },
+    {
+      "command": "echo tracked.txt | xargs git checkout --",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #13 (xargs unwrap)"
+    },
+    {
+      "command": "git stash && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "probe #14 (earlier push in the same command makes the drop non-empty)"
+    },
+    {
+      "command": "git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "probe #15 (nothing untracked; a dry run removes nothing)"
+    },
+    {
+      "command": "git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "probe #16"
+    },
+    {
+      "command": "cd \"$SOME_VAR\" && git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-SEC-1(a): unresolvable cd target -- checkout keeps its fail-open posture"
+    },
+    {
+      "command": "git reset --hard",
+      "setup": [],
+      "expect": "allow",
+      "note": "AC-SEC-1(b): cwd is not a git repository at all, so the measuring `git status` call itself fails -- checkout/reset's fail-open posture allows rather than guessing"
+    },
+    {
+      "command": "bash -c 'git checkout -- tracked.txt'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: bash -c, dirty tree"
+    },
+    {
+      "command": "bash -c 'git checkout -- tracked.txt'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: bash -c, clean tree (twin)"
+    },
+    {
+      "command": "sh -c 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: sh -c, dirty tree"
+    },
+    {
+      "command": "sh -c 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: sh -c, clean tree (twin)"
+    },
+    {
+      "command": "bash -lc 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: bash -lc, dirty tree"
+    },
+    {
+      "command": "bash -lc 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: bash -lc, clean tree (twin)"
+    },
+    {
+      "command": "nohup git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: nohup, dirty tree"
+    },
+    {
+      "command": "nohup git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: nohup, clean tree (twin)"
+    },
+    {
+      "command": "sudo git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: sudo, dirty tree"
+    },
+    {
+      "command": "sudo git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: sudo, clean tree (twin)"
+    },
+    {
+      "command": "sudo -u x git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: sudo -u x, dirty tree"
+    },
+    {
+      "command": "sudo -u x git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: sudo -u x, clean tree (twin)"
+    },
+    {
+      "command": "timeout 5 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: timeout N, dirty tree"
+    },
+    {
+      "command": "timeout 5 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: timeout N, clean tree (twin)"
+    },
+    {
+      "command": "echo tracked.txt | xargs git checkout --",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: xargs, dirty tree"
+    },
+    {
+      "command": "echo tracked.txt | xargs git checkout --",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: xargs, clean tree (twin)"
+    },
+    {
+      "command": "$(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: command substitution, whole command, dirty tree"
+    },
+    {
+      "command": "$(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: command substitution, whole command, clean tree (twin)"
+    },
+    {
+      "command": "`git reset --hard`",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: backtick form, dirty tree"
+    },
+    {
+      "command": "`git reset --hard`",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: backtick form, clean tree (twin)"
+    },
+    {
+      "command": "bash -c \"bash -c 'git reset --hard'\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-4: two-level nested bash -c, dirty tree"
+    },
+    {
+      "command": "bash -c \"bash -c 'git reset --hard'\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: two-level nested bash -c, clean tree (twin)"
+    },
+    {
+      "command": "git commit -m \"bash -c 'git reset --hard'\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: destructive-looking text naming a wrapper stays inert inside a quoted commit message"
+    },
+    {
+      "command": "echo '$(git reset --hard)'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-4: a single-quoted $(...) never expands, so it stays inert text"
+    },
+    {
+      "command": "env git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-1: env wrapper, dirty tree"
+    },
+    {
+      "command": "env git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-1: env wrapper, clean tree (twin)"
+    },
+    {
+      "command": "env -i git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-1: env -i wrapper, dirty tree"
+    },
+    {
+      "command": "env -i git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-1: env -i wrapper, clean tree (twin)"
+    },
+    {
+      "command": "command git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-1: command wrapper, dirty tree"
+    },
+    {
+      "command": "command git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-1: command wrapper, clean tree (twin)"
+    },
+    {
+      "command": "exec git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-1: exec wrapper, dirty tree"
+    },
+    {
+      "command": "exec git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-1: exec wrapper, clean tree (twin)"
+    },
+    {
+      "command": "cd nested && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "placeholder.txt",
+          "content": "seed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-1 / Codex static case: nested dirty repo, destructive check runs against the cd TARGET repo"
+    },
+    {
+      "command": "git clean -fdx",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "gitignore",
+          "patterns": [
+            ".env",
+            ".codex/"
+          ]
+        },
+        {
+          "op": "write",
+          "path": ".env",
+          "content": "secret\n"
+        },
+        {
+          "op": "write",
+          "path": ".codex/harness-ledger.jsonl",
+          "content": "{}\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2: -fdx removes ignored files"
+    },
+    {
+      "command": "git clean -fX",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "gitignore",
+          "patterns": [
+            ".env",
+            ".codex/"
+          ]
+        },
+        {
+          "op": "write",
+          "path": ".env",
+          "content": "secret\n"
+        },
+        {
+          "op": "write",
+          "path": ".codex/harness-ledger.jsonl",
+          "content": "{}\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2: -fX removes only ignored files"
+    },
+    {
+      "command": "git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "gitignore",
+          "patterns": [
+            ".env",
+            ".codex/"
+          ]
+        },
+        {
+          "op": "write",
+          "path": ".env",
+          "content": "secret\n"
+        },
+        {
+          "op": "write",
+          "path": ".codex/harness-ledger.jsonl",
+          "content": "{}\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-2: -fd does not touch ignored files, nothing to remove"
+    },
+    {
+      "command": "git clean -f",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2: -f, untracked file present"
+    },
+    {
+      "command": "git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2: -fd, untracked file present"
+    },
+    {
+      "command": "git clean -df",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2: -df (bundled, reordered), untracked file present"
+    },
+    {
+      "command": "git clean -fx",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2: -fx, untracked file present"
+    },
+    {
+      "command": "git -C . clean --force",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2: --force spelling, via -C"
+    },
+    {
+      "command": "git -c clean.requireForce=false clean -d",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2: -c clean.requireForce=false makes an unforced clean -d destructive"
+    },
+    {
+      "command": "git clean -n -d",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-2: -n is a dry run, never destructive"
+    },
+    {
+      "command": "git clean --dry-run",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-2: --dry-run spelling"
+    },
+    {
+      "command": "git clean -f",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-2: -f with nothing to remove"
+    },
+    {
+      "command": "git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-2 floor: reset --hard still allowed when only an untracked file exists"
+    },
+    {
+      "command": "git checkout -- scratch-untracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-2 floor: checkout -- still allowed for an untracked path"
+    },
+    {
+      "command": "git clean -n --exclude=foo",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "Codex-asserted allow case"
+    },
+    {
+      "command": "cd \"$SOME_VAR\" && git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3: unresolvable cd target -- clean fails closed"
+    },
+    {
+      "command": "cd \"$SOME_VAR\" && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3: unresolvable cd target -- stash drop fails closed"
+    },
+    {
+      "command": "cd \"$SOME_VAR\" && git stash clear",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3: unresolvable cd target -- stash clear fails closed"
+    },
+    {
+      "command": "git clean -fd",
+      "setup": [],
+      "expect": "block",
+      "note": "AC-DATA-3 / AC-OPS-12: cwd is not a git repository -- clean's measuring call fails, so it fails closed"
+    },
+    {
+      "command": "git stash drop",
+      "setup": [],
+      "expect": "block",
+      "note": "AC-DATA-3 / AC-OPS-12: cwd is not a git repository -- stash drop's measuring call fails, so it fails closed"
+    },
+    {
+      "command": "git stash clear",
+      "setup": [],
+      "expect": "block",
+      "note": "AC-DATA-3 / AC-OPS-12: cwd is not a git repository -- stash clear fails closed"
+    },
+    {
+      "command": "cd \"$SOME_VAR\" && git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-3: checkout keeps its fail-open posture (duplicate of AC-SEC-1(a), restated here)"
+    },
+    {
+      "command": "git reset --hard",
+      "setup": [],
+      "expect": "allow",
+      "note": "AC-DATA-3: reset keeps its fail-open posture when cwd is not a repo (duplicate of AC-SEC-1(b), restated here)"
+    },
+    {
+      "command": "git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4: non-empty stash, drop refused"
+    },
+    {
+      "command": "git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-4: empty stash, drop allowed"
+    },
+    {
+      "command": "git stash clear",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4: non-empty stash, clear refused"
+    },
+    {
+      "command": "git stash clear",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-4: empty stash, clear allowed"
+    },
+    {
+      "command": "git stash drop stash@{5}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-4: only stash@{0} exists, dropping stash@{5} is a no-op"
+    },
+    {
+      "command": "git stash",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-4: bare stash (push) is never refused"
+    },
+    {
+      "command": "git stash list",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-4: list is never refused"
+    },
+    {
+      "command": "git stash apply",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-4: apply is never refused"
+    },
+    {
+      "command": "git stash pop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-4: pop is never refused"
+    },
+    {
+      "command": "git checkout tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin: bare pathspec checkout, clean tree"
+    },
+    {
+      "command": "git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2: checkout -- <path>, dirty"
+    },
+    {
+      "command": "git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin: checkout -- <path>, clean"
+    },
+    {
+      "command": "git checkout .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2: checkout ., dirty"
+    },
+    {
+      "command": "git checkout .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin: checkout ., clean"
+    },
+    {
+      "command": "git checkout -f",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2: checkout -f, dirty"
+    },
+    {
+      "command": "git checkout -f",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin: checkout -f, clean"
+    },
+    {
+      "command": "git restore tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2: restore <path>, dirty"
+    },
+    {
+      "command": "git restore tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin: restore <path>, clean"
+    },
+    {
+      "command": "git checkout --pathspec-from-file=paths.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "write",
+          "path": "paths.txt",
+          "content": "tracked.txt\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2: checkout --pathspec-from-file, dirty"
+    },
+    {
+      "command": "git checkout --pathspec-from-file=paths.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "paths.txt",
+          "content": "tracked.txt\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin: checkout --pathspec-from-file, clean"
+    },
+    {
+      "command": "git restore --pathspec-from-file=paths.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "write",
+          "path": "paths.txt",
+          "content": "tracked.txt\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2: restore --pathspec-from-file, dirty"
+    },
+    {
+      "command": "git restore --pathspec-from-file=paths.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "paths.txt",
+          "content": "tracked.txt\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin: restore --pathspec-from-file, clean"
+    },
+    {
+      "command": "git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2 (new shape): clean -fd, untracked present"
+    },
+    {
+      "command": "git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 (new shape) twin: clean -fd, nothing to remove"
+    },
+    {
+      "command": "git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2 (new shape): stash drop, non-empty (duplicate of AC-DATA-4, restated here)"
+    },
+    {
+      "command": "git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 (new shape) twin: stash drop, empty"
+    },
+    {
+      "command": "git stash clear",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2 (new shape): stash clear, non-empty (duplicate of AC-DATA-4, restated here)"
+    },
+    {
+      "command": "git stash clear",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 (new shape) twin: stash clear, empty"
+    },
+    {
+      "command": "git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: git reset --hard"
+    },
+    {
+      "command": "git restore README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: git restore README.md"
+    },
+    {
+      "command": "git checkout -- README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: git checkout -- README.md"
+    },
+    {
+      "command": "git checkout .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: git checkout ."
+    },
+    {
+      "command": "git checkout HEAD -- README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: git checkout HEAD -- README.md"
+    },
+    {
+      "command": "git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        },
+        {
+          "op": "write",
+          "path": "untracked-work.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: git clean -fd with untracked work present"
+    },
+    {
+      "command": "git switch --discard-changes feature",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        },
+        {
+          "op": "branch",
+          "name": "feature"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: git switch --discard-changes feature"
+    },
+    {
+      "command": "git switch --discard-changes feature",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "branch",
+          "name": "feature"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin: git switch --discard-changes feature, clean tree"
+    },
+    {
+      "command": "/usr/bin/git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: absolute git path"
+    },
+    {
+      "command": "git -C sub reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        },
+        {
+          "op": "mkdir",
+          "path": "sub"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: git -C sub reset --hard"
+    },
+    {
+      "command": "env X=1 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: env X=1 git reset --hard"
+    },
+    {
+      "command": "env -i git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: env -i git reset --hard"
+    },
+    {
+      "command": "command git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: command git reset --hard"
+    },
+    {
+      "command": "(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: subshell wrapper"
+    },
+    {
+      "command": "if git reset --hard; then echo no; fi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: if-wrapped"
+    },
+    {
+      "command": "cd nested && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "placeholder.txt",
+          "content": "seed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested"
+        }
+      ],
+      "expect": "block",
+      "note": "Codex: cd nested && git reset --hard (nested dirty repo)"
+    },
+    {
+      "command": "git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "Codex: git status"
+    },
+    {
+      "command": "git restore --staged README.md",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "Codex: git restore --staged README.md"
+    },
+    {
+      "command": "echo git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "Codex: echo git reset --hard"
+    },
+    {
+      "command": "git clean -n --exclude=foo",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "README.md",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "README.md",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "Codex: git clean -n --exclude=foo"
+    },
+    {
+      "command": "git clean -f",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "not tracked\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-OPS-11: clean's refusal must name untracked/ignored files as its reason"
+    },
+    {
+      "command": "git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "stash_push"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-OPS-11: stash drop's refusal must name stash entries as its reason"
+    },
+    {
+      "command": "sudo nohup timeout 5 env command git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-ARCH-4: five stacked prefix wrappers (sudo/nohup/timeout/env/command) reach exactly MAX_UNWRAP_DEPTH and are still caught"
+    }
+  ]
+}

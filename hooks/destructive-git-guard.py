@@ -8,6 +8,16 @@ uncommitted work") and an agent still ran `git checkout -- <file>` on
 uncommitted work three times in one session, destroying its own edits each
 time. Prose did not prevent it. Standard 9 says the rule wants a mechanism.
 
+**This is an accident guard, not a security boundary against an adversary**
+(AC-ARCH-6). It exists to stop an agent destroying its own uncommitted work
+by running a command whose danger it did not notice -- the same class of
+mistake a careful human operator makes under time pressure. It is not a
+sandbox: an adversarial payload with a reason to defeat detection has many
+ways to (see "Measured-open bypass classes" below), and the escape hatch
+itself (HARNESS_ALLOW_DESTRUCTIVE_GIT=1) is deliberately easy to set
+inline -- it exists to let a genuine, deliberate revert through, not to
+resist someone trying to get past it.
+
 Guarded shapes: `git checkout -- <path>`, a bare `git checkout <path>` (no
 `--`, resolved as a pathspec because it does not resolve as a ref -- git's
 own precedence, matched here rather than assumed), `git checkout HEAD
@@ -16,15 +26,29 @@ checkout -f`/`--force` and `git switch -f`/`--force`/`--discard-changes`
 (tree-wide, like `git reset --hard`), `git checkout --pathspec-from-file=...`
 and `git restore --pathspec-from-file=...` (tree-wide: the paths are not on
 the command line to scope against), `git restore <path>` (unless it is
-`--staged` alone, which only unstages), and `git reset --hard`. Nothing else
--- see README.md for the exact list this hook is scoped to and why it
-deliberately does not intercept `git checkout -b` or a bare
-`git checkout <branch>` that resolves as a ref.
+`--staged` alone, which only unstages), `git reset --hard`, non-dry-run
+`git clean` when a real dry run of the same flags/pathspecs shows something
+would actually be removed, and `git stash drop`/`git stash clear` when the
+stash is non-empty (including a stash an earlier segment in the SAME
+command would create). Nothing else -- see README.md for the exact list
+this hook is scoped to and why it deliberately does not intercept
+`git checkout -b` or a bare `git checkout <branch>` that resolves as a ref.
 
 Refuses ONLY when there is something to lose: a clean working tree, or named
 paths with no uncommitted modification, are let through untouched. A guard
 that blocks harmless commands gets disabled, and that is worse than no guard
 (AGENT-HARNESS.md's exit condition makes the same point about noise).
+
+Fail direction differs by rule (AC-DATA-3, AC-OPS-12, settled in
+specs/PLAN-harness-parity.md's "Decisions this section settles"):
+`checkout`/`restore`/`reset` keep the ORIGINAL fail-OPEN posture -- when the
+measuring `git status` call cannot run (cwd is not a repository, the call
+fails or times out), the command is ALLOWED, because a git-tracked snapshot
+(hooks/git-snapshot.py) already covers tracked work. `git clean` and
+`git stash drop`/`clear` fail CLOSED on the same three conditions (cwd
+cannot be resolved, the measuring call fails, or it times out), because
+neither untracked/ignored files nor a stash entry has any snapshot anywhere
+-- an unverifiable clean or stash-drop is refused, not guessed at.
 
 Escape hatch: HARNESS_ALLOW_DESTRUCTIVE_GIT=1, set either as this hook
 process's own environment (opts out every segment), or as a genuine
@@ -33,14 +57,20 @@ env-prefix assignment on the SAME segment as the destructive command
 env-prefix syntax). Deliberately NOT a substring search over the raw command
 string: that would let a quoted mention, a code comment, or an assignment
 scoped to an unrelated segment on the same line disarm a command it was
-never meant to cover. See README.md.
+never meant to cover. Scoped to the segment it prefixes even underneath a
+`bash -c` wrapper: the hatch set on the OUTER segment that invokes `bash -c`
+does not disarm the command inside the wrapped script, and one set INSIDE
+the wrapped script does not leak back out (AC-SEC-3). See README.md.
 
 Contract: PreToolUse, matcher "Bash" (see hooks/hooks.json). Per Claude
 Code's documented hook contract, exit code 2 is the one exit code that
 blocks a PreToolUse tool call, with stderr shown to the agent as the reason;
 any other non-zero exit is silently ignored and the command proceeds -- so
 this hook must exit with exactly 2 to refuse, never 1 or an uncaught
-exception's implicit 1.
+exception's implicit 1. main() wraps the evaluate() call itself in a broad
+except, on top of evaluate()'s own internal fail-open handling, so that
+whatever pathological input reaches this hook, the process contract stays
+exit 0 or 2 and stderr never carries a Python traceback (AC-SEC-4).
 
 Normalisation layer, between the raw shell string and the matcher (the root
 cause a round-2 review found: eight distinct bypasses were eight symptoms of
@@ -64,7 +94,10 @@ in order:
      `-c <kv>`, `--no-pager`, `-p`/`--paginate`, `--exec-path[=]`) so a
      prefixed invocation still reaches the matcher. `-C <path>` also moves
      the effective directory the scope check runs against, chained across
-     repeated `-C`s exactly like git itself.
+     repeated `-C`s exactly like git itself. `-c <key>=<value>` is also
+     captured (not just skipped): `clean.requireforce` is the one key this
+     guard ever consults, to tell whether an unforced `git clean` would
+     actually run (see classify_clean()).
   6. Expand a bundled short-flag cluster (`-fq` -> `-f`, `-q`) on the
      tokens preceding any `--` pathspec separator, never on pathspec tokens
      themselves (a file legitimately named `-abc` must not be shredded).
@@ -74,6 +107,30 @@ in order:
      nothing in a heredoc body executes -- is never read as its own segment
      (AC-PROD-6; a heredoc body mentioning a guarded command used to be
      refused although nothing executed).
+  8. Extract `$(...)` (nesting depth-counted) and backtick command
+     substitutions from the raw text, EXCEPT one sitting inside single
+     quotes (bash never expands either form there), and independently
+     re-evaluate each extracted body through this SAME normalisation and
+     matching pipeline -- a real `$(git reset --hard)` executes regardless
+     of what surrounds it, and `echo '$(git reset --hard)'` must stay inert
+     text (AC-QA-4). The masked-out span is replaced by a single space so
+     the surrounding text still tokenises.
+  9. Unwrap `bash -c`/`sh -c`/`bash -lc SCRIPT` (matched by binary
+     basename) and the `nohup`, `sudo` (including `sudo -u <user>`),
+     `timeout <n>`, `xargs`, `env` (including `env -i`, `env VAR=val`,
+     `env -u NAME`), `command` and `exec` prefix wrappers, feeding the
+     inner command back through the SAME per-segment evaluation --
+     recursively, so a wrapper can stack on another wrapper -- bounded by
+     MAX_UNWRAP_DEPTH so adversarial nesting (a `bash -c` nested a thousand
+     deep) cannot exhaust Python's own recursion limit; past the bound the
+     command simply fails open, exactly like any other shape this
+     tokenizer cannot positively identify (AC-ARCH-4/5, AC-SEC-3, AC-SEC-4,
+     AC-QA-4). `destructive_scope()` gains no wrapper-specific branch for
+     any of this: a wrapper is resolved to an inner token list or an inner
+     command string before matching ever sees it, except `xargs`, which
+     appends one synthetic `.` pathspec token standing in for the
+     arguments it would append from its stdin at run time (unknowable
+     statically) -- see strip_xargs_wrapper()'s own comment.
 
 A `cd <path>` segment updates the effective directory used by every later
 segment in the same command, so `cd <dir> && git ...` is scoped against
@@ -81,14 +138,15 @@ segment in the same command, so `cd <dir> && git ...` is scoped against
 target repo's dirt was invisible) and a false positive (an unrelated repo's
 dirt caused a refusal for a command that never touched it). When the target
 cannot be resolved statically (a variable, a glob, a bare `cd` with no
-argument, `cd -`), later segments are simply ALLOWED rather than judged
-against a directory that might be wrong: this hook no longer refuses on an
-unresolvable `cd` (it used to; that traded a real but rare gap for a false
-positive on every ordinary dynamic `cd`, and guessed wrong about as often as
-it guessed right). specs/harn-fix-2.md's recovery mechanism
-(hooks/git-snapshot.py) is what actually covers that gap now, and it does
-not need to resolve the `cd` at all -- it snapshots the Bash payload's own
-`cwd` unconditionally, before the command runs.
+argument, `cd -`), later segments are ALLOWED for checkout/restore/reset
+(this hook no longer refuses on an unresolvable `cd` for those three; it
+used to, which traded a real but rare gap for a false positive on every
+ordinary dynamic `cd` -- specs/harn-fix-2.md's recovery mechanism,
+hooks/git-snapshot.py, is what actually covers that gap now) but REFUSED for
+`git clean`/`git stash drop`/`git stash clear` specifically, per the
+fail-closed posture above: an unresolvable directory means this rule cannot
+verify anything, and it would rather refuse a possibly-harmless command than
+silently allow a possibly-catastrophic one it never checked.
 
 Parsing is a pragmatic shell tokenizer (shlex with punctuation_chars), not a
 full shell grammar: it splits on unquoted `&&`, `||`, `;`, `|`, `&` and a
@@ -97,12 +155,12 @@ the same line or the next one) is still caught, and it never mistakes a
 quoted string that merely CONTAINS destructive-looking text (e.g. `git
 commit -m "git checkout -- foo"`) for a real invocation, because that text
 stays inside its own token instead of becoming a second command. Shapes
-shlex cannot represent (subshells, backticks, unbalanced quotes) fall
-through ALLOWED: this hook only ever blocks a pattern it can positively
-identify, never a command it merely failed to parse. It makes no
-completeness claim -- see README.md's "Destructive git guard" section for
-the measured-open bypass classes and why recovery, not detection, is the
-mechanism this repo actually relies on.
+shlex cannot represent (unbalanced quotes, and anything past
+MAX_UNWRAP_DEPTH levels of wrapper nesting) fall through ALLOWED: this hook
+only ever blocks a pattern it can positively identify, never a command it
+merely failed to parse. It makes no completeness claim -- see README.md's
+"Destructive git guard" section for the measured-open bypass classes and why
+recovery, not detection, is the mechanism this repo actually relies on.
 """
 import json
 import os
@@ -132,8 +190,39 @@ SHELL_KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'done', 'fi', '{', '(', ')
 
 # Git global options that can appear between the binary and the subcommand.
 # Each entry: does it consume a separate following token as its value?
+# `-C` and `-c` are also listed here for documentation, but both are handled
+# by dedicated branches in parse_git_invocation() (one needs to CHAIN a
+# directory, the other needs to CAPTURE a key=value pair) rather than the
+# generic skip-two-tokens loop below.
 GIT_GLOBAL_OPTS_WITH_VALUE = ('-C', '--git-dir', '--work-tree', '-c', '--exec-path')
 GIT_GLOBAL_OPTS_NO_VALUE = ('--no-pager', '-p', '--paginate')
+
+# Bounds how many wrapper layers (bash -c/sh -c/bash -lc bodies, and the
+# nohup/sudo/timeout/xargs/env/command/exec prefix wrappers) this guard will
+# unwrap in one command, and how many levels of $(...) / backtick command
+# substitution it will recurse into. Named so it can be reasoned about and
+# tested at its own boundary (one corpus case nests exactly this many
+# wrappers and is still caught) rather than left as a magic number -- and so
+# adversarial nesting (a `bash -c` a thousand deep) cannot exhaust Python's
+# own call-stack recursion limit: past this depth the command simply fails
+# open, exactly like any other shape this tokenizer cannot positively
+# identify (AC-ARCH-4, AC-SEC-4).
+MAX_UNWRAP_DEPTH = 5
+
+# `bash -c SCRIPT` / `sh -c SCRIPT` / `bash -lc SCRIPT`: matched by binary
+# basename (wrapper_shell_c()) so `/bin/bash -c ...` is still recognised.
+SHELL_C_BASENAMES = ('bash', 'sh')
+SHELL_C_FLAGS = ('-c', '-lc')
+
+# Prefix wrappers whose ENTIRE effect (for this guard's purposes) is "strip
+# my own name and run what follows" -- no flags of their own worth modelling.
+SIMPLE_PREFIX_WRAPPERS = ('nohup', 'command', 'exec')
+
+# `git clean.requireforce` values git itself treats as boolean false. Only
+# consulted for the exact corpus-asserted shape `-c clean.requireForce=false`
+# (classify_clean()) -- not an attempt to reimplement git's full config
+# boolean parser.
+CLEAN_REQUIRE_FORCE_FALSY = ('false', 'no', 'off', '0')
 
 # Same allowlist as test/helpers/git-env.js, deliberately duplicated rather
 # than imported: this is a production hook, not test infrastructure, and
@@ -192,6 +281,70 @@ def strip_heredoc_bodies(command):
         out.append(command[closing.start():closing.end()])
         i = closing.end()
     return ''.join(out)
+
+
+def extract_command_substitutions(text):
+    """Extract top-level `$(...)`/backtick command substitutions from
+    `text`, skipping any that sit inside single quotes (bash never expands
+    either form there -- `echo '$(git reset --hard)'` must stay inert,
+    AC-QA-4). Nested `$(...)` is depth-counted; a `$(` with no matching `)`,
+    or a backtick with no closing backtick, is left as literal text from
+    that point on rather than raising -- this is normalisation, not a shell
+    parser (see module docstring), and it must never crash on malformed
+    input (AC-SEC-4).
+
+    Returns (masked_text, [substitution_bodies]): each extracted span is
+    replaced by a single space in `masked_text` so the remaining text still
+    tokenises cleanly for split_segments(); each body is independently fed
+    back through the full evaluation pipeline by the caller."""
+    out = []
+    bodies = []
+    i, n = 0, len(text)
+    in_single = False
+    while i < n:
+        ch = text[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == '\\' and i + 1 < n:
+            out.append(ch)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if text[i:i + 2] == '$(':
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if text[j] == '(':
+                    depth += 1
+                elif text[j] == ')':
+                    depth -= 1
+                j += 1
+            bodies.append(text[i + 2:max(i + 2, j - 1)])
+            out.append(' ')
+            i = j
+            continue
+        if ch == '`':
+            j = text.find('`', i + 1)
+            if j == -1:
+                out.append(ch)
+                i += 1
+                continue
+            bodies.append(text[i + 1:j])
+            out.append(' ')
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out), bodies
 
 
 def split_segments(command):
@@ -305,21 +458,32 @@ def is_git_binary(token):
 
 
 def join_cwd(base, target):
-    """Resolve `target` against `base`."""
+    """Resolve `target` against `base`. `base` may be None: a caller probing
+    an invocation's SHAPE while the real effective directory is
+    unresolvable (see evaluate_segment()'s fail-closed branch) passes None
+    rather than guessing -- an absolute `target` still resolves against it,
+    a relative one stays unresolvable (None)."""
+    if base is None:
+        return os.path.normpath(target) if os.path.isabs(target) else None
     return os.path.normpath(os.path.join(base, target))
 
 
 def parse_git_invocation(tokens, cwd):
     """Given a segment's tokens (already redirect-stripped, env-prefix-
     stripped and shell-keyword-stripped), return (subcmd, rest,
-    effective_cwd) if `tokens[0]` is a git binary, else None.
-    `effective_cwd` starts as `cwd` and is updated by any `-C <path>`
-    global option encountered (chained, exactly like git itself)."""
+    effective_cwd, git_config) if `tokens[0]` is a git binary, else None.
+    `effective_cwd` starts as `cwd` (which may itself be None, see
+    join_cwd()) and is updated by any `-C <path>` global option
+    encountered (chained, exactly like git itself). `git_config` is a dict
+    of any `-c key=value` global options seen, lower-cased by key -- the
+    only key this guard ever consults is `clean.requireforce`
+    (classify_clean)."""
     if not tokens or not is_git_binary(tokens[0]):
         return None
     i = 1
     n = len(tokens)
     effective_cwd = cwd
+    git_config = {}
     while i < n:
         tok = tokens[i]
         if tok == '-C':
@@ -328,8 +492,17 @@ def parse_git_invocation(tokens, cwd):
             effective_cwd = join_cwd(effective_cwd, tokens[i + 1])
             i += 2
             continue
+        if tok == '-c':
+            if i + 1 >= n:
+                return None  # malformed global option; nothing to guard
+            key, _, value = tokens[i + 1].partition('=')
+            git_config[key.strip().lower()] = value
+            i += 2
+            continue
         matched = False
         for opt in GIT_GLOBAL_OPTS_WITH_VALUE:
+            if opt in ('-C', '-c'):
+                continue  # handled above, each needs its own capture
             if tok == opt:
                 i += 2
                 matched = True
@@ -346,7 +519,7 @@ def parse_git_invocation(tokens, cwd):
         break
     if i >= n:
         return None
-    return tokens[i], tokens[i + 1:], effective_cwd
+    return tokens[i], tokens[i + 1:], effective_cwd, git_config
 
 
 def expand_bundled_short_flags(tokens):
@@ -399,12 +572,56 @@ def resolve_as_ref(cwd, arg):
     return result.returncode == 0
 
 
-def destructive_scope(subcmd, rest, cwd):
-    """Return ('paths', [paths]) or ('tree', None) if `subcmd`/`rest` (a
-    git invocation already stripped of global options) is one of the
-    guarded shapes, or None if it is not. `cwd` is needed to resolve an
-    ambiguous checkout argument as a ref vs. a pathspec (see
-    resolve_as_ref)."""
+def classify_clean(rest, git_config):
+    """Return ('clean', dry_run_args) if `rest` (already normalize_rest()'d)
+    is a `git clean` invocation that would ACTUALLY delete something -- not
+    a dry run, and either `-f`/`--force` is present or `clean.requireforce`
+    has been set falsy via `-c` (git itself silently does nothing for a
+    plain `git clean -d` with neither, so that shape is not guarded at all:
+    nothing destructive happens). `dry_run_args` is `rest` with -f/--force
+    removed, ready to be run as `git clean -n <dry_run_args>` -- AC-DATA-2:
+    judged by what a REAL dry run of the same flags and pathspecs would
+    remove, not by `git status`, since clean's whole purpose is untracked
+    and ignored files status does not track as a change at all."""
+    if '-n' in rest or '--dry-run' in rest:
+        return None  # already a dry run; nothing will actually be removed
+    forced = '-f' in rest or '--force' in rest
+    if not forced:
+        override = (git_config or {}).get('clean.requireforce', '').strip().lower()
+        forced = override in CLEAN_REQUIRE_FORCE_FALSY
+    if not forced:
+        return None  # git itself refuses without -f; nothing destructive happens
+    dry_run_args = [t for t in rest if t not in ('-f', '--force')]
+    return ('clean', dry_run_args)
+
+
+def classify_stash(rest):
+    """Return ('stash', {'op': 'drop'|'clear', 'ref': str-or-None}) if
+    `rest` is a `git stash drop`/`git stash clear` invocation, else None.
+    `git stash` (push), `list`, `show`, `apply`, `pop`, `branch`, `create`
+    and `store` are all left alone (AC-DATA-4): none of them PERMANENTLY
+    destroys an existing entry the way drop/clear do."""
+    if not rest:
+        return None  # bare `git stash` == push; never refused
+    sub = rest[0]
+    if sub == 'drop':
+        ref = rest[1] if len(rest) > 1 and not rest[1].startswith('-') else None
+        return ('stash', {'op': 'drop', 'ref': ref})
+    if sub == 'clear':
+        return ('stash', {'op': 'clear'})
+    return None
+
+
+def destructive_scope(subcmd, rest, cwd, git_config=None):
+    """Return ('paths', [paths]), ('tree', None), ('clean', dry_run_args) or
+    ('stash', target) if `subcmd`/`rest` (a git invocation already stripped
+    of global options) is one of the guarded shapes, or None if it is not.
+    `cwd` is needed to resolve an ambiguous checkout argument as a ref vs. a
+    pathspec (see resolve_as_ref) -- callers that cannot supply a real `cwd`
+    (the effective directory is unresolvable) must not call this for
+    `checkout`/`switch`/`restore`/`reset` at all; `clean` and `stash` never
+    touch `cwd` here (their OWN measurement step does, separately, and only
+    when `cwd` is known -- see evaluate_segment())."""
     rest = normalize_rest(rest)
 
     if subcmd == 'checkout':
@@ -464,6 +681,12 @@ def destructive_scope(subcmd, rest, cwd):
             return ('tree', None)
         return None  # soft/mixed reset never touches the working tree
 
+    if subcmd == 'clean':
+        return classify_clean(rest, git_config)
+
+    if subcmd == 'stash':
+        return classify_stash(rest)
+
     return None
 
 
@@ -500,6 +723,58 @@ def has_uncommitted_change(cwd, scope):
     return False
 
 
+def clean_would_remove(cwd, dry_run_args):
+    """True if a REAL `git clean -n <dry_run_args>` reports anything would
+    be removed, OR if that check itself could not be trusted (fails CLOSED
+    -- unlike has_uncommitted_change()'s fail-open: clean can destroy
+    untracked and ignored work with no snapshot anywhere, so an
+    unverifiable clean is treated as risky, never as safe -- AC-DATA-3)."""
+    try:
+        result = subprocess.run(
+            ['git', 'clean', '-n'] + dry_run_args,
+            cwd=cwd, env=sanitized_git_env(),
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True  # cannot verify; fail CLOSED
+    if result.returncode != 0:
+        return True  # cannot verify (e.g. cwd is not a git repository); fail CLOSED
+    return bool(result.stdout.strip())
+
+
+def stash_list(cwd):
+    """The repo's stash entries as a list of `stash@{N}` refs (possibly
+    empty), or None if the list itself could not be obtained -- kept
+    distinct from an empty list so the caller can fail CLOSED on None
+    rather than reading "could not check" as "nothing there"."""
+    try:
+        result = subprocess.run(
+            ['git', 'stash', 'list'],
+            cwd=cwd, env=sanitized_git_env(),
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return [line.split(':', 1)[0].strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def stash_would_lose_entries(cwd, target):
+    """True if `target` (from classify_stash) would actually destroy a real
+    stash entry, or if this could not be verified (fails CLOSED -- see
+    clean_would_remove()'s docstring for why)."""
+    entries = stash_list(cwd)
+    if entries is None:
+        return True  # cannot verify; fail CLOSED
+    if not entries:
+        return False  # nothing to lose
+    if target['op'] == 'clear':
+        return True  # at least one real entry exists, and clear destroys all of them
+    ref = target['ref'] or 'stash@{0}'
+    return ref in entries
+
+
 REFUSAL = (
     "destructive-git-guard: refused `{cmd}` -- it would discard uncommitted "
     "work (`git status` shows a tracked, uncommitted change in scope). Safe "
@@ -510,6 +785,35 @@ REFUSAL = (
     "may have a recoverable copy -- list them with: git for-each-ref "
     "--format='%(refname) %(creatordate:iso-strict) %(contents:subject)' "
     "refs/harness-snapshots/"
+)
+
+# AC-OPS-11: each new rule names its OWN reason -- never the "tracked,
+# uncommitted change" wording above, which is specific to what
+# has_uncommitted_change() checks. Both texts also cover the fail-CLOSED
+# trigger (directory unresolvable, or the measuring call failed/timed out)
+# alongside the "measured and found something at risk" trigger, since both
+# reach the same refusal for the same underlying reason: this rule could not
+# confirm the command is safe.
+REFUSAL_CLEAN = (
+    "destructive-git-guard: refused `{cmd}` -- either a real dry run of the "
+    "same flags and pathspecs shows untracked or ignored files would be "
+    "removed, or that could not be verified (the directory could not be "
+    "resolved, or the check itself failed or timed out), and this rule "
+    "fails CLOSED rather than guessing. Safe alternative: run `git clean "
+    "-n` yourself first and inspect the list. If this cleanup is "
+    "deliberate, opt in explicitly: re-run with {var}=1 set inline "
+    "(`{var}=1 {cmd}`) or exported for the session."
+)
+
+REFUSAL_STASH = (
+    "destructive-git-guard: refused `{cmd}` -- either the stash list is "
+    "non-empty (or an earlier `git stash` in this same command would make "
+    "it so), or that could not be verified (the directory could not be "
+    "resolved, or the check itself failed or timed out), and this rule "
+    "fails CLOSED rather than guessing. Safe alternative: `git stash list` "
+    "to inspect the stash entries first. If this is deliberate, opt in "
+    "explicitly: re-run with {var}=1 set inline (`{var}=1 {cmd}`) or "
+    "exported for the session."
 )
 
 
@@ -531,52 +835,245 @@ def classify_cd(tokens):
     return ('static', target)
 
 
+def wrapper_shell_c(head):
+    """If `head` is `bash -c SCRIPT`, `sh -c SCRIPT` or `bash -lc SCRIPT`
+    (matched by binary basename, so `/bin/bash -c ...` also matches),
+    return SCRIPT -- the inner shell script text, already unquoted by shlex
+    during tokenising. The caller feeds this back through
+    evaluate_command_text() as a brand-new command string with its own
+    segments and its own escape-hatch scoping: an escape hatch set on the
+    OUTER segment that invokes `bash -c` does not disarm the command
+    inside, and one set INSIDE the wrapped script does not leak back out
+    (AC-SEC-3). Returns None if `head` is not one of these shapes."""
+    if len(head) < 3:
+        return None
+    if os.path.basename(head[0]) not in SHELL_C_BASENAMES:
+        return None
+    if head[1] not in SHELL_C_FLAGS:
+        return None
+    return head[2]
+
+
+def strip_sudo_wrapper(head):
+    """`sudo [-flags] [-u <user>] <cmd...>` -> `<cmd...>`. Skips any run of
+    dash-prefixed sudo flags, consuming an extra token for `-u`'s value;
+    stops at the first non-flag token, which is the wrapped command."""
+    i = 1
+    n = len(head)
+    while i < n and head[i].startswith('-'):
+        if head[i] == '-u':
+            i += 2
+        else:
+            i += 1
+    return head[i:] or None
+
+
+def strip_timeout_wrapper(head):
+    """`timeout [-flags] <duration> <cmd...>` -> `<cmd...>`. Does not model
+    a timeout flag that itself takes a separate value token (e.g.
+    `-k 10`) -- not a shape this guard's corpus needs, and worth noting as
+    a limitation rather than silently mishandling it."""
+    i = 1
+    n = len(head)
+    while i < n and head[i].startswith('-'):
+        i += 1
+    if i >= n:
+        return None  # no duration argument at all; malformed, nothing to unwrap
+    i += 1  # the duration argument itself
+    return head[i:] or None
+
+
+def strip_env_wrapper(head):
+    """`env [-i] [-u NAME] [VAR=val ...] [--] <cmd...>` -> `<cmd...>`."""
+    i = 1
+    n = len(head)
+    while i < n:
+        tok = head[i]
+        if tok in ('-i', '--ignore-environment'):
+            i += 1
+            continue
+        if tok in ('-u', '--unset'):
+            i += 2
+            continue
+        if tok == '--':
+            i += 1
+            break
+        if ENV_ASSIGNMENT_RE.match(tok):
+            i += 1
+            continue
+        break
+    return head[i:] or None
+
+
+def strip_xargs_wrapper(head):
+    """`xargs [-flags] <cmd...>` -> `<cmd...>` PLUS one synthetic `.`
+    pathspec token appended at the end. xargs appends items read from its
+    OWN stdin as trailing arguments to the wrapped command by default --
+    content this guard cannot see statically (it is produced by another
+    process at RUN time, never a literal token here). Without the
+    synthetic token, `xargs git checkout --` would unwrap to a bare
+    `checkout --` with an EMPTY path list, which destructive_scope()
+    already (correctly, for that shape alone) treats as nothing to scope --
+    silently under-detecting the real risk. Appending `.` makes the scope
+    tree-wide instead, entirely inside this wrapper-unwrap step:
+    destructive_scope() itself gains no xargs-specific branch (AC-ARCH-4).
+    Does not model a flag that takes a separate value token (e.g. `-I {}`,
+    two tokens) -- not a shape this guard's corpus needs."""
+    i = 1
+    n = len(head)
+    while i < n and head[i].startswith('-'):
+        i += 1
+    inner = head[i:]
+    if not inner:
+        return None
+    return inner + ['.']
+
+
+def strip_prefix_wrapper(head):
+    """If `head` begins with a recognised process wrapper (nohup, sudo,
+    timeout, env, xargs, command, exec -- matched by binary basename),
+    return the inner command's tokens with the wrapper stripped, to be fed
+    back through evaluate_segment() at depth+1. destructive_scope() gains
+    no wrapper-specific branch for any of this (AC-ARCH-4/5), except
+    xargs's synthetic trailing pathspec (see strip_xargs_wrapper). Returns
+    None if `head` does not start with one of these."""
+    if not head:
+        return None
+    basename = os.path.basename(head[0])
+    if basename in SIMPLE_PREFIX_WRAPPERS:
+        return head[1:] or None
+    if basename == 'sudo':
+        return strip_sudo_wrapper(head)
+    if basename == 'timeout':
+        return strip_timeout_wrapper(head)
+    if basename == 'env':
+        return strip_env_wrapper(head)
+    if basename == 'xargs':
+        return strip_xargs_wrapper(head)
+    return None
+
+
 def evaluate(command, cwd):
     """Return a refusal message, or None to allow `command`."""
     if os.environ.get(ESCAPE_VAR) == '1':
         return None
+    state = {'cwd': cwd, 'cwd_known': True, 'stash_created': False}
+    return evaluate_command_text(command, state, 0)
+
+
+def evaluate_command_text(command, state, depth):
+    """Evaluate one command STRING: the whole Bash payload at depth 0, or
+    the inner body of a `bash -c`/`sh -c`/`bash -lc` wrapper, or a `$(...)`/
+    backtick command substitution, at a greater depth. `state` (a dict of
+    `cwd`, `cwd_known` and `stash_created`) is threaded through and mutated
+    by reference, since a `cd` or `git stash` push inside a wrapper's body
+    must still be visible to segments that follow it in the OUTER command.
+    Bounded by MAX_UNWRAP_DEPTH so adversarial nesting cannot exhaust
+    Python's own recursion limit (AC-SEC-4/AC-ARCH-4)."""
+    if depth > MAX_UNWRAP_DEPTH:
+        return None  # bounded; fail open past the bound, see module docstring
+    command = strip_heredoc_bodies(command)
+    command, substitutions = extract_command_substitutions(command)
+    for sub_text in substitutions:
+        reason = evaluate_command_text(sub_text, state, depth + 1)
+        if reason:
+            return reason
     try:
-        segments = split_segments(strip_heredoc_bodies(command))
+        segments = split_segments(command)
     except ValueError:
         return None  # unparseable; fail open, see module docstring
-
-    effective_cwd = cwd
-    cwd_known = True
     for raw_tokens in segments:
-        tokens = strip_redirects(raw_tokens)
+        reason = evaluate_segment(raw_tokens, state, depth)
+        if reason:
+            return reason
+    return None
 
-        cd = classify_cd(strip_shell_keywords(strip_env_prefix(tokens)))
-        if cd is not None:
-            kind, target = cd
-            if kind == 'dynamic':
-                # Cannot resolve statically -- ALLOW rather than guess (see
-                # README.md "Destructive git guard": this used to refuse,
-                # which guessed wrong as often as right; the snapshot hook
-                # is what actually covers this gap now, AC-SIMP-10).
-                cwd_known = False
-            else:
-                effective_cwd = join_cwd(effective_cwd, target)
-            continue
 
-        if not cwd_known:
-            continue
+def evaluate_segment(raw_tokens, state, depth):
+    """Evaluate one already-segmented token list against `state`. Recurses
+    (bounded by MAX_UNWRAP_DEPTH) into a `bash -c`/`sh -c`/`bash -lc` body
+    or a prefix-wrapped inner command -- see module docstring, AC-ARCH-4/5."""
+    tokens = strip_redirects(raw_tokens)
 
-        if escape_hatch_active_for_segment(tokens):
-            continue
+    cd = classify_cd(strip_shell_keywords(strip_env_prefix(tokens)))
+    if cd is not None:
+        kind, target = cd
+        if kind == 'dynamic':
+            # Cannot resolve statically -- checkout/restore/reset ALLOW
+            # rather than guess (see module docstring); clean/stash
+            # drop/clear fail CLOSED instead, handled below once we know
+            # what kind of git invocation (if any) follows.
+            state['cwd_known'] = False
+        else:
+            state['cwd'] = join_cwd(state['cwd'], target)
+        return None
 
-        head = strip_shell_keywords(strip_env_prefix(tokens))
-        parsed = parse_git_invocation(head, effective_cwd)
-        if parsed is None:
-            continue
-        subcmd, rest, segment_cwd = parsed
+    if escape_hatch_active_for_segment(tokens):
+        return None
 
-        scope = destructive_scope(subcmd, rest, segment_cwd)
-        if scope is None:
-            continue
+    head = strip_shell_keywords(strip_env_prefix(tokens))
 
-        display_cmd = ' '.join(head)
-        if has_uncommitted_change(segment_cwd, scope):
-            return REFUSAL.format(cmd=display_cmd, var=ESCAPE_VAR)
+    script = wrapper_shell_c(head)
+    if script is not None:
+        if depth >= MAX_UNWRAP_DEPTH:
+            return None  # bounded; fail open past the bound
+        return evaluate_command_text(script, state, depth + 1)
+
+    inner = strip_prefix_wrapper(head)
+    if inner is not None:
+        if depth >= MAX_UNWRAP_DEPTH:
+            return None  # bounded; fail open past the bound
+        return evaluate_segment(inner, state, depth + 1)
+
+    if not state['cwd_known']:
+        # AC-DATA-3: `clean`/`stash drop`/`stash clear` fail CLOSED when the
+        # effective directory cannot be resolved -- checked here by SHAPE
+        # only (cwd=None), never by calling destructive_scope() for
+        # checkout/switch/restore/reset, which would call resolve_as_ref()
+        # against an unknown directory and risk reading the wrong repo.
+        parsed = parse_git_invocation(head, None)
+        if parsed is not None:
+            subcmd, rest, _unused_cwd, git_config = parsed
+            if subcmd in ('clean', 'stash'):
+                scope = destructive_scope(subcmd, rest, None, git_config)
+                if scope is not None:
+                    display_cmd = ' '.join(head)
+                    template = REFUSAL_CLEAN if scope[0] == 'clean' else REFUSAL_STASH
+                    return template.format(cmd=display_cmd, var=ESCAPE_VAR)
+        return None
+
+    parsed = parse_git_invocation(head, state['cwd'])
+    if parsed is None:
+        return None
+    subcmd, rest, segment_cwd, git_config = parsed
+
+    if subcmd == 'stash':
+        # Tracked regardless of whether THIS segment ends up refused: an
+        # earlier `git stash` push in the SAME command makes a LATER `stash
+        # drop`/`clear` non-empty even though it hasn't run yet at the
+        # moment this hook evaluates the whole command (probe case 14,
+        # AC-DATA-4).
+        rest_n = normalize_rest(rest)
+        if not rest_n or rest_n[0] in ('push', 'save'):
+            state['stash_created'] = True
+
+    scope = destructive_scope(subcmd, rest, segment_cwd, git_config)
+    if scope is None:
+        return None
+
+    display_cmd = ' '.join(head)
+    kind = scope[0]
+    if kind == 'clean':
+        risky = clean_would_remove(segment_cwd, scope[1])
+        template = REFUSAL_CLEAN
+    elif kind == 'stash':
+        risky = state['stash_created'] or stash_would_lose_entries(segment_cwd, scope[1])
+        template = REFUSAL_STASH
+    else:
+        risky = has_uncommitted_change(segment_cwd, scope)
+        template = REFUSAL
+    if risky:
+        return template.format(cmd=display_cmd, var=ESCAPE_VAR)
     return None
 
 
@@ -585,6 +1082,8 @@ def main():
         payload = json.load(sys.stdin)
     except Exception:
         sys.exit(0)  # unreadable payload; fail open
+    if not isinstance(payload, dict):
+        sys.exit(0)  # a well-formed but non-object payload (e.g. a JSON array); fail open
     if payload.get('tool_name') != 'Bash':
         sys.exit(0)
     tool_input = payload.get('tool_input') or {}
@@ -592,7 +1091,16 @@ def main():
     if not command or not command.strip():
         sys.exit(0)
     cwd = payload.get('cwd') or os.getcwd()
-    reason = evaluate(command, cwd)
+    try:
+        reason = evaluate(command, cwd)
+    except Exception:
+        # AC-SEC-4: whatever pathological input reaches this point, the
+        # hook contract stays exit 0 or 2, NEVER 1, and stderr never carries
+        # a Python traceback. An exception here is a bug in this module's
+        # own parsing, not evidence the command is unsafe -- but a crashed
+        # hook is worse than a missed detection, since Claude Code treats
+        # any exit code other than 2 as "proceed".
+        sys.exit(0)
     if reason:
         print(reason, file=sys.stderr)
         sys.exit(2)
