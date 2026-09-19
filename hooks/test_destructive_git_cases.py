@@ -142,6 +142,14 @@ def op_branch(root, op):
     run_git(['branch', op['name']], root)
 
 
+def op_config(root, op):
+    # REPOSITORY-local config deliberately: it overrides the invoking
+    # developer's global config, so a case asserting what git would do with
+    # (say) clean.requireForce set one way is not silently answered by a
+    # machine that has it set the other way.
+    run_git(['config', op['key'], op['value']], root)
+
+
 SETUP_OPS = {
     'init': op_init,
     'commit': op_commit,
@@ -151,6 +159,7 @@ SETUP_OPS = {
     'nested_repo': op_nested_repo,
     'stash_push': op_stash_push,
     'branch': op_branch,
+    'config': op_config,
 }
 
 

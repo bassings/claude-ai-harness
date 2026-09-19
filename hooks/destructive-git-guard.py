@@ -250,9 +250,9 @@ SUBPROCESS_TIMEOUT_SECONDS = 10
 # before answering: resolve_as_ref() (checkout's ref-vs-pathspec resolution,
 # at most one call) plus has_uncommitted_change()'s own worst case -- a
 # path-scoped `git status` call that git itself rejects, retried once
-# tree-wide (two calls). clean_would_remove() and stash_list() each make
-# exactly one call, below this ceiling, so checkout/restore/reset's shape
-# sets the bound.
+# tree-wide (two calls). clean_would_remove() makes at most two (reading
+# clean.requireForce, then the dry run itself) and stash_list() exactly one,
+# both below this ceiling, so checkout/restore/reset's shape sets the bound.
 MAX_SUBPROCESS_CALLS_PER_SEGMENT = 3
 
 # The worst-case wall-clock time this guard can take deciding a SINGLE
@@ -688,12 +688,20 @@ def resolve_as_ref(cwd, arg):
 
 
 def classify_clean(rest, git_config):
-    """Return ('clean', dry_run_args) if `rest` (already normalize_rest()'d)
-    is a `git clean` invocation that would ACTUALLY delete something -- not
-    a dry run, and either `-f`/`--force` is present or `clean.requireforce`
-    has been set falsy via `-c` (git itself silently does nothing for a
-    plain `git clean -d` with neither, so that shape is not guarded at all:
-    nothing destructive happens). `dry_run_args` MIRRORS the real
+    """Return ('clean', target) if `rest` (already normalize_rest()'d) is a
+    `git clean` invocation that is not itself a dry run, else None.
+
+    `target` is {'dry_run_args': [...], 'forced': bool}. `forced` is True
+    when the command line ALREADY proves git will delete: `-f`/`--force`, or
+    `clean.requireforce` set falsy via a `-c` global option. It is False
+    when that still depends on the repository's own configuration, which
+    only the measurement step can read (clean_requires_force(), K1 review
+    round 4, M2). Deciding it HERE, as "no -f means git refuses, so nothing
+    to guard", was wrong on any machine whose config sets
+    clean.requireForce=false: reproduced, `git clean -d` was ALLOWED and
+    deleted an untracked file.
+
+    `dry_run_args` MIRRORS the real
     invocation -- every flag and pathspec kept verbatim, the `-f` COUNT
     included, minus only the reporting-only flags
     (CLEAN_REPORTING_ONLY_FLAGS, whose comment says why each had to go) --
@@ -707,9 +715,7 @@ def classify_clean(rest, git_config):
     if not forced:
         override = (git_config or {}).get('clean.requireforce', '').strip().lower()
         forced = override in CLEAN_REQUIRE_FORCE_FALSY
-    if not forced:
-        return None  # git itself refuses without -f; nothing destructive happens
-    return ('clean', clean_dry_run_args(rest))
+    return ('clean', {'dry_run_args': clean_dry_run_args(rest), 'forced': forced})
 
 
 def clean_dry_run_args(rest):
@@ -743,7 +749,7 @@ def classify_stash(rest):
 
 
 def destructive_scope(subcmd, rest, cwd, git_config=None):
-    """Return ('paths', [paths]), ('tree', None), ('clean', dry_run_args) or
+    """Return ('paths', [paths]), ('tree', None), ('clean', target) or
     ('stash', target) if `subcmd`/`rest` (a git invocation already stripped
     of global options) is one of the guarded shapes, or None if it is not.
     `cwd` is needed to resolve an ambiguous checkout argument as a ref vs. a
@@ -853,15 +859,45 @@ def has_uncommitted_change(cwd, scope):
     return False
 
 
-def clean_would_remove(cwd, dry_run_args):
+def clean_requires_force(cwd):
+    """True if this repository's effective `clean.requireForce` leaves git
+    refusing an unforced `git clean` (its default, and the answer whenever
+    the setting is absent). False when the setting is explicitly falsy, and
+    also when the config itself could not be read at all -- the fail-CLOSED
+    direction here, since answering False sends the caller on to the real
+    dry run, which does its own fail-closed check (K1 review round 4, M2)."""
+    try:
+        result = subprocess.run(
+            ['git', 'config', '--bool', 'clean.requireForce'],
+            cwd=cwd, env=sanitized_git_env(),
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False  # cannot read it; measure rather than assume git's default
+    if result.returncode != 0:
+        # Unset (git config exits 1 for a missing key), or a value `--bool`
+        # cannot parse. Either way git falls back to requiring force, and an
+        # unforced clean removes nothing.
+        return True
+    return result.stdout.strip().lower() != 'false'
+
+
+def clean_would_remove(cwd, target):
     """True if a REAL `git clean -n <dry_run_args>` reports anything would
     be removed, OR if that check itself could not be trusted (fails CLOSED
     -- unlike has_uncommitted_change()'s fail-open: clean can destroy
     untracked and ignored work with no snapshot anywhere, so an
-    unverifiable clean is treated as risky, never as safe -- AC-DATA-3)."""
+    unverifiable clean is treated as risky, never as safe -- AC-DATA-3).
+
+    Returns False early for an unforced clean in a repository that still
+    requires force: git itself removes nothing there, so refusing would be a
+    false refusal (see classify_clean() for why this is decided here, where
+    the repository can actually be read, rather than off the command line)."""
+    if not target['forced'] and clean_requires_force(cwd):
+        return False
     try:
         result = subprocess.run(
-            ['git', 'clean', '-n'] + dry_run_args,
+            ['git', 'clean', '-n'] + target['dry_run_args'],
             cwd=cwd, env=sanitized_git_env(),
             capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )

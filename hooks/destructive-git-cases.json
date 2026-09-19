@@ -8,7 +8,8 @@
     "mkdir": "create an empty directory at `path`",
     "nested_repo": "git init a SEPARATE repository inside `path` (creating it if needed), with its own committed-then-dirtied tracked file, independent of the outer fixture repo",
     "stash_push": "run `git stash push` for real against the fixture's current dirty state, leaving one genuine stash entry and a clean working tree",
-    "branch": "create a branch named `name` off the current HEAD, without switching to it"
+    "branch": "create a branch named `name` off the current HEAD, without switching to it",
+    "config": "set the repository-local git config `key` to `value` (repo config, so it overrides whatever the developer's global config happens to say -- the point of every case that uses it)"
   },
   "cases": [
     {
@@ -3211,6 +3212,95 @@
       ],
       "expect": "allow",
       "note": "AC-DATA-2 (round 4, H2) twin in the other direction: a SINGLE -f leaves a nested repository alone (measured against git 2.54), so the dry run must not over-report it either"
+    },
+    {
+      "command": "git clean -d",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "config",
+          "key": "clean.requireForce",
+          "value": "false"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-2 (round 4, M2): an UNFORCED clean -d really does delete on a machine whose clean.requireForce is false, and the repo/global config says so just as much as `-c clean.requireForce=false` does -- so the config is read rather than assumed to be git's default"
+    },
+    {
+      "command": "git clean -d",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "config",
+          "key": "clean.requireForce",
+          "value": "false"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M2): clean.requireForce=false but nothing to remove"
+    },
+    {
+      "command": "git clean -d",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "config",
+          "key": "clean.requireForce",
+          "value": "true"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-DATA-2 (round 4, M2), the other direction: with clean.requireForce at git's default, an unforced clean -d removes nothing, so refusing it would be a false refusal. Set explicitly in the fixture's OWN config so a developer's global setting cannot answer this case for it"
+    },
+    {
+      "command": "cd \"$SOME_VAR\" && git clean -d",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-3 (round 4, M2): an unresolvable cd target means clean.requireForce cannot be read either, so an unforced clean fails CLOSED exactly like a forced one"
     }
   ]
 }
