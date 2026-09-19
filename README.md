@@ -425,6 +425,21 @@ past it.
   failed measuring call, or a timeout -- because neither untracked/ignored
   files nor a stash entry has any snapshot anywhere; an unverifiable clean
   or stash-drop is refused, not guessed at.
+- **A command over 65,536 characters (`MAX_COMMAND_LENGTH_CHARS`) is
+  refused UNSEEN**, before any tokenising runs, at every recursion level
+  (the whole command, and each `bash -c` body or `$(...)`/backtick
+  substitution independently) -- K1 review round 2, after CI measured a
+  1 MiB command making Python's `shlex` tokeniser (which reads one
+  character at a time) take roughly 8 seconds on its own, comfortably over
+  a 10-second test budget under ordinary machine contention. This is
+  deliberately NOT the same "a shape the tokenizer cannot parse falls
+  through allowed" rule this guard otherwise uses (see "Deliberately out of
+  scope" below): an over-cap command could still, in principle, be parsed,
+  just not within a safe wall-clock budget, and skipping the parse to
+  answer "allowed" would let a real `git reset --hard` hidden inside enough
+  padding straight through. A harmless over-cap command is refused too --
+  there is no cheap way to tell the difference without doing the expensive
+  parse this cap exists to avoid.
 - **Registered timeout.** `hooks/hooks.json` gives this hook 60 seconds
   (raised from 10 in K1 review round 1), strictly greater than
   `WORST_CASE_SEGMENT_SECONDS` (30s: `MAX_SUBPROCESS_CALLS_PER_SEGMENT` x

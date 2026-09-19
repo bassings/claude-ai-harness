@@ -34,6 +34,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -234,6 +235,54 @@ class TestHostileCommandsAsRealProcesses(unittest.TestCase):
                                   'process exited %s for %r...' % (result.returncode, command[:80]))
                     self.assertNotIn(TRACEBACK_MARKER, result.stderr,
                                       'process printed a traceback for %r...' % (command[:80]))
+        finally:
+            subprocess.run(['rm', '-rf', cwd])
+
+    def test_the_worst_known_hostile_input_is_fast_and_refused(self):
+        # K1 review round 2: PR #3's CI failure, reproduced locally before
+        # the fix -- HOSTILE_COMMANDS[4] is the 1 MiB command (`git reset
+        # --hard` plus ~1 MiB of trailing padding as one token), and
+        # split_segments() alone took ~8s on this machine BEFORE
+        # MAX_COMMAND_LENGTH_CHARS existed, comfortably over the 10s budget
+        # this test's own subprocess.run() enforces, under any real
+        # contention. This is a NAMED regression test for that exact
+        # command, not just a member of the generated set: an explicit,
+        # tight, STATED budget (2000ms -- roughly 50x the ~36ms measured
+        # after the fix, and 5x tighter than the general 10s subprocess
+        # spawn timeout above), and the SPECIFIC expected outcome (refused,
+        # not merely "0 or 2"), naming the oversize reason.
+        WORST_CASE_BUDGET_MS = 2000
+        oversize_command = HOSTILE_COMMANDS[4]
+        self.assertGreater(len(oversize_command), guard.MAX_COMMAND_LENGTH_CHARS,
+                            'sanity: HOSTILE_COMMANDS[4] must still be the over-cap command this test names')
+        cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-worst-case-')
+        try:
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd,
+                            capture_output=True, timeout=10)
+            payload = json.dumps({
+                'tool_name': 'Bash',
+                'tool_input': {'command': oversize_command},
+                'cwd': cwd,
+                'hook_event_name': 'PreToolUse',
+            })
+            start = time.monotonic()
+            result = subprocess.run(
+                [sys.executable, GUARD_PATH], input=payload,
+                capture_output=True, text=True, timeout=10,
+            )
+            elapsed_ms = (time.monotonic() - start) * 1000.0
+            self.assertLess(
+                elapsed_ms, WORST_CASE_BUDGET_MS,
+                'the 1 MiB command took %.1fms, over the explicit %sms worst-case budget '
+                '(PR #3 measured ~8-9s for this shape before MAX_COMMAND_LENGTH_CHARS existed)'
+                % (elapsed_ms, WORST_CASE_BUDGET_MS))
+            self.assertEqual(
+                result.returncode, 2,
+                'an over-cap command must be REFUSED, not allowed -- it could still hide a real '
+                'destructive git call in the padding (got exit %s, stderr: %s)'
+                % (result.returncode, result.stderr))
+            self.assertIn('parsing cap', result.stderr,
+                           'the refusal must name the oversize reason, not some other rule: %s' % result.stderr)
         finally:
             subprocess.run(['rm', '-rf', cwd])
 

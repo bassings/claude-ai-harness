@@ -48,7 +48,10 @@ fails or times out), the command is ALLOWED, because a git-tracked snapshot
 `git stash drop`/`clear` fail CLOSED on the same three conditions (cwd
 cannot be resolved, the measuring call fails, or it times out), because
 neither untracked/ignored files nor a stash entry has any snapshot anywhere
--- an unverifiable clean or stash-drop is refused, not guessed at.
+-- an unverifiable clean or stash-drop is refused, not guessed at. A
+command over MAX_COMMAND_LENGTH_CHARS fails CLOSED regardless of which rule
+would otherwise have applied, and regardless of whether it is actually
+destructive: see item 0 of the normalisation layer below.
 
 Escape hatch: HARNESS_ALLOW_DESTRUCTIVE_GIT=1, set either as this hook
 process's own environment (opts out every segment), or as a genuine
@@ -77,6 +80,18 @@ cause a round-2 review found: eight distinct bypasses were eight symptoms of
 this one missing stage, not eight independent holes). Applied per segment,
 in order:
 
+  0. Refuse UNSEEN, before any of the stages below ever run, a command (or a
+     `bash -c` body, or a `$(...)`/backtick substitution -- this check runs
+     at every recursion level) over MAX_COMMAND_LENGTH_CHARS. CPython's
+     shlex tokenises one character at a time, so a single very long token
+     scales far worse than linearly: a 1 MiB command measured ~8s in
+     split_segments() alone on this machine, which exceeded a 10s CI test
+     budget under ordinary contention (K1 review round 2). This is
+     deliberately NOT the same "unparseable -> fail open" rule item 9 below
+     documents for a shape shlex cannot tokenise at all: an over-cap command
+     COULD still be parsed, just not within a safe wall-clock budget, and
+     skipping the parse to answer "allowed" would let a real destructive git
+     call hidden in the padding straight through. See REFUSAL_OVERSIZE.
   1. Segment on `&&`, `||`, `;`, `|`, `&` AND a bare newline -- a multi-line
      Bash call is the ordinary shape of agent tool use, and a destructive
      command on any line but the first must be caught exactly like one
@@ -158,7 +173,11 @@ stays inside its own token instead of becoming a second command. Shapes
 shlex cannot represent (unbalanced quotes, and anything past
 MAX_UNWRAP_DEPTH levels of wrapper nesting) fall through ALLOWED: this hook
 only ever blocks a pattern it can positively identify, never a command it
-merely failed to parse. It makes no completeness claim -- see README.md's
+merely failed to parse. The ONE exception is size, not shape: a command
+over MAX_COMMAND_LENGTH_CHARS is refused rather than parsed at all,
+because skipping the parse to answer "allowed" is not the same risk as
+failing to positively identify a shape -- it is choosing not to look. It
+makes no completeness claim -- see README.md's
 "Destructive git guard" section for the measured-open bypass classes and why
 recovery, not detection, is the mechanism this repo actually relies on.
 """
@@ -235,6 +254,28 @@ MAX_SUBPROCESS_CALLS_PER_SEGMENT = 3
 # registered value, and README's note on chained segments summing past any
 # fixed timeout regardless of this constant.
 WORST_CASE_SEGMENT_SECONDS = MAX_SUBPROCESS_CALLS_PER_SEGMENT * SUBPROCESS_TIMEOUT_SECONDS
+
+# K1 review round 2: shlex's tokeniser reads a token ONE CHARACTER AT A TIME
+# (CPython's shlex.read_token loops on self.instream.read(1)), so a single
+# very long token scales far worse than linearly -- measured on this
+# machine: a 1 MiB command (`git reset --hard` plus ~1 MiB of padding as one
+# trailing token) made split_segments() alone take ~8s, which exceeded a 10s
+# CI test budget under ordinary contention (the incident this constant
+# fixes: PR #3, CI red on both Node 22 and Node 26, and the same failure
+# blocking a local pre-push). A single 65536-char token measured ~38ms
+# uncontended -- comfortably bounded even under heavy contention.
+#
+# The decision on an over-cap command is REFUSE, not allow, and this is
+# deliberate, not the same "unparseable -> fail open" rule this guard uses
+# for a shape shlex cannot tokenise at all (see module docstring). Skipping
+# the expensive tokenising step and then answering "allowed" would let a
+# real `git reset --hard` hidden inside enough padding straight through --
+# exactly the shape a hostile or merely enormous payload could exploit. An
+# over-cap command is refused UNSEEN, before any of the normalisation stages
+# below ever run, at every recursion level (the top-level command, and each
+# `bash -c` body or `$(...)`/backtick substitution independently) -- see
+# evaluate_command_text()'s first check.
+MAX_COMMAND_LENGTH_CHARS = 65536
 
 # `bash -c SCRIPT` / `sh -c SCRIPT` / `bash -lc SCRIPT`: matched by binary
 # basename (wrapper_shell_c()) so `/bin/bash -c ...` is still recognised.
@@ -843,6 +884,26 @@ REFUSAL_STASH = (
     "exported for the session."
 )
 
+# K1 review round 2: no `{cmd}` slot -- this refusal fires BEFORE any
+# tokenising, so there is no parsed `head` to display, and printing the
+# full over-cap text back would itself be wasteful. Shows a bounded prefix
+# instead. Only the process-environment escape hatch (exported for the
+# session) can apply here: the inline, segment-scoped form needs the
+# command tokenised to find it, which is exactly the step this refusal
+# skips.
+REFUSAL_OVERSIZE = (
+    "destructive-git-guard: refused a {length}-character command (starts "
+    "`{prefix}...`) -- over this guard's {cap}-character parsing cap. "
+    "Tokenising a command this size cannot be bounded to a safe wall-clock "
+    "cost (a single very long token makes the tokeniser scale far worse "
+    "than linearly -- measured, see the module docstring), and this guard "
+    "refuses rather than skip parsing and risk silently allowing a "
+    "destructive command hidden in the padding. If this command is "
+    "genuinely this large and known safe, opt in explicitly: export "
+    "{var}=1 for the session before retrying (the inline form cannot be "
+    "recognised here, since this refusal happens before any parsing)."
+)
+
 
 def classify_cd(tokens):
     """If `tokens` (already redirect/env/keyword-stripped) is a `cd`
@@ -999,6 +1060,16 @@ def evaluate_command_text(command, state, depth):
     Python's own recursion limit (AC-SEC-4/AC-ARCH-4)."""
     if depth > MAX_UNWRAP_DEPTH:
         return None  # bounded; fail open past the bound, see module docstring
+    if len(command) > MAX_COMMAND_LENGTH_CHARS:
+        # Refused UNSEEN, before strip_heredoc_bodies/extract_command_substitutions/
+        # split_segments ever run on it -- those are exactly the stages whose
+        # cost this cap exists to bound (K1 review round 2). Deliberately the
+        # opposite of "unparseable -> fail open": this command COULD still be
+        # parsed, just not within a safe wall-clock budget, and skipping the
+        # parse to answer "allowed" would let a real destructive git call
+        # hidden in the padding straight through.
+        return REFUSAL_OVERSIZE.format(
+            length=len(command), prefix=command[:80], cap=MAX_COMMAND_LENGTH_CHARS, var=ESCAPE_VAR)
     command = strip_heredoc_bodies(command)
     command, substitutions = extract_command_substitutions(command)
     for sub_text in substitutions:
