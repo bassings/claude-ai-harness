@@ -2100,6 +2100,27 @@ export function main() {
     }
   }
 
+  // H1 (round-2 review): findings reaching zero does not guarantee the line
+  // now fits -- a multi-spec review's ac_verdicts array (bounded separately
+  // at MAX_AC_VERDICTS, not by MAX_LINE_BYTES) can by itself exceed the byte
+  // budget once every finding is already gone. Before this, that case fell
+  // straight through to the envelope-only collapse below, discarding every
+  // verdict AND every finding with write_ok still true -- the exact D2 case
+  // (a multi-spec review, 203 verdicts) this spec was written for. Shrink
+  // ac_verdicts one entry at a time, the same mechanism as findings above,
+  // recording the growing count in ac_verdicts_truncated (an established,
+  // real-measured-zero field already) rather than reaching the collapse.
+  if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES && Array.isArray(entry.ac_verdicts)) {
+    const baseAcTruncated = entry.ac_verdicts_truncated || 0
+    let droppedAc = 0
+    while (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES && entry.ac_verdicts.length > 0) {
+      entry.ac_verdicts = entry.ac_verdicts.slice(0, -1)
+      droppedAc += 1
+      entry.ac_verdicts_truncated = baseAcTruncated + droppedAc
+      line = JSON.stringify(entry)
+    }
+  }
+
   if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
     // Every finding has already been dropped (or there were none to drop)
     // and the record still does not fit -- some other field (an unusually

@@ -4300,6 +4300,50 @@ test('ledger-append (H2): an oversized ac_id is quarantined and the record survi
   assert.ok(entry.invalid_ac_ids_dropped >= 1)
 })
 
+// --- round-2 review H1 ------------------------------------------------
+//
+// The byte-rescue loop (above `line = JSON.stringify(entry)`) only ever
+// shrank `findings`. A busy multi-spec review's `ac_verdicts` -- bounded
+// separately at MAX_AC_VERDICTS, not by MAX_LINE_BYTES -- can by itself push
+// the line over budget once every finding is already gone, and the record
+// fell straight through to the envelope-only collapse: every verdict AND
+// every finding gone, write_ok still true. Measured (round-2 report): 8
+// lenses, 15 findings, 200 verdicts of the form `<prefix> AC-QA-<n>` -- a
+// 24-character prefix wrote in full, but 36-40 characters collapsed to a
+// 211-byte degraded:true line. This is exactly the D2 case (a multi-spec
+// review, 203 verdicts) the spec was written for.
+test('ledger-append (H1, round 3): a worst-case round (8 lenses, MAX_FINDINGS findings, MAX_AC_VERDICTS verdicts of the widest accepted prefixed form) does not collapse to the envelope-only form', async () => {
+  const { MAX_FINDINGS, MAX_AC_VERDICTS } = await import(APPEND_MODULE_URL)
+  const repo = makeTempRepo()
+  const lenses = ['lens-qa', 'lens-security', 'lens-product', 'lens-architecture', 'lens-data', 'lens-operability', 'lens-design', 'lens-accessibility']
+  const open = Array.from({ length: MAX_FINDINGS }, (_, i) => ({
+    lens: lenses[i % lenses.length], location: `f${i}.js:1`, claim: `finding number ${i}, a realistic sentence of prose`,
+  }))
+  // The widest accepted PREFIXED form (decision 2's own bound): a 40-character
+  // prefix, the separator, then an ordinary AC-QA-<n> id -- exactly the shape
+  // the round-2 report's own repro varied.
+  const widePrefix = 'x'.repeat(40)
+  const acVerdicts = Array.from({ length: MAX_AC_VERDICTS }, (_, i) => ({
+    ac_id: `${widePrefix} AC-QA-${i}`,
+    verdict: 'PASS',
+  }))
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    lenses_run: lenses,
+    verdicts: Object.fromEntries(lenses.map((l) => [l, 'FINDINGS'])),
+    open_findings: open,
+    ac_verdicts: acVerdicts,
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(readLedgerLines(repo)[0])
+  assert.ok(!entry.degraded, 'the record must not collapse to the envelope-only form -- lenses_run, verdicts and findings_by_lens must all survive')
+  assert.ok(Array.isArray(entry.lenses_run) && entry.lenses_run.length === 8, 'the envelope-level fields must survive even though findings/ac_verdicts had to shrink')
+  assert.ok(entry.findings_by_lens, 'the pre-truncation tally must still be present')
+})
+
 test('ledger-append (M7): SCHEMA_VERSION is 3, so a window spanning this change can tell the two populations apart', async () => {
   // Planning decision 5, and it was not built in the first pass. Without it a
   // 90-day window mixes lines written before and after four validator changes
