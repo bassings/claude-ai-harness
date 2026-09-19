@@ -369,12 +369,36 @@ export function aggregateRework(records, { root = '' } = {}) {
   // the same treatment as its siblings above, so it does not become the
   // NEXT "written to every line and read by nothing" field.
   let invalidPriorIdsDropped = 0
+  // H3 (round 3 review): findings_truncated/ac_verdicts_truncated were
+  // written to every line and summed by nothing -- the same shape every
+  // counter above already closed, one field over, for the two counters the
+  // byte-rescue loop itself produces.
+  let findingsTruncated = 0
+  let acVerdictsTruncated = 0
+  // M3: the writer's own UNATTRIBUTED_LENS sentinel, tallied but previously
+  // thrown away uncounted by the LENS_RE gate below -- summed separately
+  // from lensDispositionCounts (never as a fake lens bucket in that map).
+  let unattributedFindings = 0
+  // H4: how many review runs had no spec in play, and how many of their
+  // findings were reclassified from spec_bug to open as a result -- the
+  // signal "this round was reviewed with no spec" existed only as an
+  // absence before this, exactly the shape the whole spec exists to close.
+  let noSpecReviewRuns = 0
+  let noSpecFindingsReclassified = 0
+  // H3: which (repo, plan) buckets saw a truncated ac_verdicts array in this
+  // window -- the surplus could have held the FAIL for any criterion in
+  // that bucket, so neverFailingAcs must not report a confident
+  // never_failed:true for any of them. Same shape as unattributedFailBuckets
+  // above, a different cause.
+  const truncatedBuckets = new Set()
   for (const r of reviewRecords) {
     if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
     if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
     if (typeof r.invalid_fixed_ids_dropped === 'number') invalidFixedIdsDropped += r.invalid_fixed_ids_dropped
     if (typeof r.duplicate_fixed_ids_dropped === 'number') duplicateFixedIdsDropped += r.duplicate_fixed_ids_dropped
     if (typeof r.invalid_prior_ids_dropped === 'number') invalidPriorIdsDropped += r.invalid_prior_ids_dropped
+    if (typeof r.findings_truncated === 'number') findingsTruncated += r.findings_truncated
+    if (typeof r.ac_verdicts_truncated === 'number') acVerdictsTruncated += r.ac_verdicts_truncated
     // H1 (review round one, specs/harn-ledger-validators.md): prefer the
     // writer's own pre-truncation tally. `r.findings` is capped at
     // MAX_FINDINGS and shrunk further by the byte loop, so recomputing from it
@@ -398,12 +422,28 @@ export function aggregateRework(records, { root = '' } = {}) {
     // L3: the shared predicate, imported from ledger-append.mjs rather than
     // a second copy of decision 4's rule.
     const noSpecWasInPlay = wasNoSpecInPlay(r.spec, r.ac_verdicts)
+    if (noSpecWasInPlay) noSpecReviewRuns += 1
     const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
 
     const tally = r.findings_by_lens
     if (tally && typeof tally === 'object' && !Array.isArray(tally)) {
       for (const [lens, counts] of Object.entries(tally)) {
         if (!counts || typeof counts !== 'object') continue
+        // M3: the writer's own exact sentinel, recognised by STRING EQUALITY
+        // -- never by the LENS_RE pattern match below, which this sentinel
+        // is constructed to fail. Any OTHER value that merely fails the
+        // pattern is a genuinely unrecoverable lens value and must stay
+        // uncounted (the `continue` just below), not be folded in here by
+        // coincidence of also failing the same gate.
+        if (lens === UNATTRIBUTED_LENS) {
+          for (const [disposition, n] of Object.entries(counts)) {
+            if (!Number.isInteger(n) || n <= 0) continue
+            if (!DISPOSITIONS.has(disposition)) continue
+            unattributedFindings += n
+            if (noSpecWasInPlay && disposition === 'spec_bug') noSpecFindingsReclassified += n
+          }
+          continue
+        }
         // Same value-based lens gate the per-finding loop below applies: the
         // writer gates these keys too, but a reader must not trust a ledger
         // line's keys just because a writer should have.
@@ -419,6 +459,7 @@ export function aggregateRework(records, { root = '' } = {}) {
           // the tally here would double-count every such repeat on any
           // schema_version 3 line.
           if (disposition === 'fixed') continue
+          if (noSpecWasInPlay && disposition === 'spec_bug') noSpecFindingsReclassified += n
           bumpDisposition(lensDispositionCounts, lens, reclassify(disposition), n)
         }
       }
@@ -465,10 +506,30 @@ export function aggregateRework(records, { root = '' } = {}) {
           }
           seenFixedIds.add(dedupeKey)
         }
+        if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
         bumpDisposition(lensDispositionCounts, f.lens, reclassify(f.disposition))
+      } else if (f && typeof f === 'object') {
+        // M3: a pre-schema_version-3 line has no findings_by_lens tally, so
+        // this fallback is the only place a finding whose lens could not be
+        // attributed is ever seen at all -- counted here for parity with the
+        // tally path above, rather than silently vanishing the way it did
+        // before this fix.
+        unattributedFindings += 1
+        if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
       }
     }
     const verdicts = r.ac_verdicts || []
+    // H3: taint this (repo, plan) bucket whenever THIS record's ac_verdicts
+    // were truncated, regardless of whether any verdicts survived the cut --
+    // the dropped surplus could have held the FAIL for any criterion the
+    // bucket contains. Computed before the "nothing to bucket" shortcut
+    // below, since a truncated-to-EMPTY array must still taint.
+    if (typeof r.ac_verdicts_truncated === 'number' && r.ac_verdicts_truncated > 0) {
+      const truncatedPlanKey = planKeyForRecord(r, root)
+      if (truncatedPlanKey !== null && truncatedPlanKey !== REDACTED_PATH_MARKER) {
+        truncatedBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(truncatedPlanKey)}`)
+      }
+    }
     if (!verdicts.length) continue
     const planKey = planKeyForRecord(r, root)
     if (planKey === null || planKey === REDACTED_PATH_MARKER) {
@@ -562,7 +623,7 @@ export function aggregateRework(records, { root = '' } = {}) {
       else entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets, findingsTruncated, acVerdictsTruncated, unattributedFindings, noSpecReviewRuns, noSpecFindingsReclassified, truncatedBuckets }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -576,11 +637,18 @@ export function aggregateRework(records, { root = '' } = {}) {
 // `entry` by construction never saw the hidden FAIL. Defaults to an empty
 // Set so every pre-existing call site (none of which knows this option
 // exists) behaves identically to before: no tainted buckets, no change.
-export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set() } = {}) {
+export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set(), truncatedBuckets = new Set() } = {}) {
   const out = []
   for (const [key, entry] of acVerdicts.entries()) {
     const insufficient_data = entry.n < minRuns
-    const unattributed_fail_in_window = unattributedFailBuckets.has(`${escapeKeyComponent(entry.repo)}|${escapeKeyComponent(entry.spec)}`)
+    const bucketKey = `${escapeKeyComponent(entry.repo)}|${escapeKeyComponent(entry.spec)}`
+    const unattributed_fail_in_window = unattributedFailBuckets.has(bucketKey)
+    // H3 (round 3 review): a truncated ac_verdicts array in this (repo,
+    // plan) window could have dropped the FAIL for THIS criterion -- the
+    // same inversion class unattributed_fail_in_window already closes for
+    // a sanitised ac_id, one cause over. Defaults to an empty Set so every
+    // pre-existing call site behaves identically to before.
+    const truncated_in_window = truncatedBuckets.has(bucketKey)
     // Round-6 H1: this ac_id's OWN entry saw at least one neutralised
     // verdict (aggregateRework's unattributedVerdicts, above) -- a
     // DIFFERENT taint reason from unattributed_fail_in_window (that one
@@ -598,7 +666,8 @@ export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILE
       insufficient_data,
       unattributed_fail_in_window,
       unattributed_verdict_in_entry,
-      never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry ? null : entry.fail === 0,
+      truncated_in_window,
+      never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry || truncated_in_window ? null : entry.fail === 0,
     })
   }
   return out
@@ -1579,7 +1648,7 @@ function runLedgerCommand(roots, window) {
   // unaffected.
   const canonicalRoot = roots[0] || ''
   const rework = aggregateRework(windowed, { root: canonicalRoot })
-  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets, truncatedBuckets: rework.truncatedBuckets })
   const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
   const trigger = aggregateTriggerAccuracy(windowed)
   const proposalOutcomes = aggregateProposalOutcomes(windowed)
@@ -1589,7 +1658,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecFindingsReclassified: rework.noSpecFindingsReclassified },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
