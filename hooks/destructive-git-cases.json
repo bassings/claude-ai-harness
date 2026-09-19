@@ -3985,6 +3985,199 @@
       ],
       "expect": "allow",
       "note": "AC-QA-2 twin (round 4, M3): the same shape with an EMPTY stash -- the widened reading must not fire when there is nothing to lose"
+    },
+    {
+      "command": "bash -c 'cd nested' && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "(round 4, M4, no AC -- spec bug) `cwd` is PROCESS-LOCAL: a `cd` inside a child process cannot move the shell that runs the segments after it. Threading one mutable state dict through every context let it, so a later outer segment was measured against the child's directory. The cd is inside bash -c and the nested repo is CLEAN, so the leak turned a dirty outer repo into an allow"
+    },
+    {
+      "command": "bash -c 'cd nested' && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": true
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M4): the same shape with the dirt in the NESTED repo instead -- the leak turned this one into a false refusal, so the pair pins the scoping in both directions rather than only the unsafe one"
+    },
+    {
+      "command": "echo $(cd nested) && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "(round 4, M4, no AC -- spec bug) `cwd` is PROCESS-LOCAL: a `cd` inside a child process cannot move the shell that runs the segments after it. Threading one mutable state dict through every context let it, so a later outer segment was measured against the child's directory. Same leak through a command substitution instead of bash -c"
+    },
+    {
+      "command": "echo $(cd nested) && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": true
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M4): substitution form, dirt in the nested repo"
+    },
+    {
+      "command": "cd nested && echo $(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": true
+        }
+      ],
+      "expect": "block",
+      "note": "(round 4, M4, no AC -- spec bug) a command substitution runs in its own child process at the point its SEGMENT runs, so it sees every earlier segment's `cd`. Extracting every substitution up front and evaluating them all before any segment meant it saw none of them. The substitution must be measured against `nested`, where the preceding cd has already moved to, not against the outer repo"
+    },
+    {
+      "command": "cd nested && echo $(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 4, M4): the same ordering with the dirt in the OUTER repo -- measuring the substitution too early made this a false refusal"
+    },
+    {
+      "command": "bash -c 'git stash' && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": true
+        }
+      ],
+      "expect": "block",
+      "note": "(round 4, M4) the counterweight to the two cases above: a stash PUSH is a repo-global fact, not a process-local one, so it must still be visible to a later outer segment even though the push happened inside a child process. This is what the split between process-local context and shared facts has to keep working"
+    },
+    {
+      "command": "echo $(git stash) && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "nested",
+          "dirty": true
+        }
+      ],
+      "expect": "block",
+      "note": "(round 4, M4) the same repo-global fact crossing a command-substitution boundary"
     }
   ]
 }

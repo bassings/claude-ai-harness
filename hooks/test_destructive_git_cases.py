@@ -131,7 +131,12 @@ def op_nested_repo(root, op):
     write_file(nested, 'inner.txt', 'committed\n')
     run_git(['add', '--', 'inner.txt'], nested)
     run_git(['commit', '-q', '-m', 'seed: inner.txt'], nested)
-    write_file(nested, 'inner.txt', 'dirty\n')
+    # `dirty` defaults to true, which is what every case predating the
+    # cwd-scoping ones wants. A CLEAN nested repo is what lets a case tell
+    # "the guard measured the outer repo" apart from "the guard measured the
+    # nested one" in BOTH directions, rather than only one.
+    if op.get('dirty', True):
+        write_file(nested, 'inner.txt', 'dirty\n')
 
 
 def op_stash_push(root, op):

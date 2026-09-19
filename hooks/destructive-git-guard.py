@@ -395,6 +395,20 @@ GIT_ENV_ALLOWLIST = {
 # delimiter lines untouched.
 HEREDOC_START_RE = re.compile(r'<<-?\s*([\'"]?)(\w+)\1')
 
+# What a `$(...)`/backtick command substitution is replaced by in the text
+# handed to split_segments(), so the substitution stays attached to the
+# SEGMENT it was written in. It used to be replaced by a single space, which
+# discarded that association: every substitution was then evaluated before
+# any segment, and so never saw a `cd` written earlier in the same command
+# (round 4, M4). Word characters only, so shlex tokenises it as one ordinary
+# word wherever it lands, quoted or not. A command whose own literal text
+# contains this exact string, with an index a real substitution also used,
+# would have it stripped -- accepted, for an accident guard, over a
+# nondeterministic nonce that would make the same input parse differently
+# from run to run.
+SUBSTITUTION_PLACEHOLDER_FMT = '__harness_subst_%d__'
+SUBSTITUTION_PLACEHOLDER_RE = re.compile(r'__harness_subst_(\d+)__')
+
 # A stash ref that names an entry by INDEX, the only shape this guard can
 # reduce to what `git stash list` prints (normalize_stash_ref). Anything
 # else git accepts -- a reflog date such as `stash@{1.hour.ago}`, say --
@@ -450,9 +464,10 @@ def extract_command_substitutions(text):
     input (AC-SEC-4).
 
     Returns (masked_text, [substitution_bodies]): each extracted span is
-    replaced by a single space in `masked_text` so the remaining text still
-    tokenises cleanly for split_segments(); each body is independently fed
-    back through the full evaluation pipeline by the caller."""
+    replaced by SUBSTITUTION_PLACEHOLDER_FMT %% its index in `masked_text`,
+    so the remaining text still tokenises cleanly for split_segments() AND
+    each body stays attached to the segment it was written in -- see
+    SUBSTITUTION_PLACEHOLDER_FMT for why that matters."""
     out = []
     bodies = []
     i, n = 0, len(text)
@@ -484,8 +499,8 @@ def extract_command_substitutions(text):
                 elif text[j] == ')':
                     depth -= 1
                 j += 1
+            out.append(SUBSTITUTION_PLACEHOLDER_FMT % len(bodies))
             bodies.append(text[i + 2:max(i + 2, j - 1)])
-            out.append(' ')
             i = j
             continue
         if ch == '`':
@@ -494,13 +509,52 @@ def extract_command_substitutions(text):
                 out.append(ch)
                 i += 1
                 continue
+            out.append(SUBSTITUTION_PLACEHOLDER_FMT % len(bodies))
             bodies.append(text[i + 1:j])
-            out.append(' ')
             i = j + 1
             continue
         out.append(ch)
         i += 1
     return ''.join(out), bodies
+
+
+def take_substitution_placeholders(tokens, substitution_count):
+    """Split `tokens` into (tokens_without_placeholders, [indices]) -- the
+    substitution indices written in this segment, in the order they appear.
+    A placeholder may sit INSIDE a larger token (`git commit -m "built
+    $(date)"` tokenises as one word), so it is removed by substring, and a
+    token left empty by that removal is dropped entirely. An index past
+    `substitution_count` is not one this evaluation produced, so that token
+    is left exactly as written."""
+    out = []
+    indices = []
+    for tok in tokens:
+        matches = [m for m in SUBSTITUTION_PLACEHOLDER_RE.finditer(tok)
+                   if int(m.group(1)) < substitution_count]
+        if not matches:
+            out.append(tok)
+            continue
+        indices.extend(int(m.group(1)) for m in matches)
+        stripped = ''
+        last = 0
+        for m in matches:
+            stripped += tok[last:m.start()]
+            last = m.end()
+        stripped += tok[last:]
+        if stripped:
+            out.append(stripped)
+    return out, indices
+
+
+def child_context(state):
+    """`state` as a CHILD PROCESS sees it: `cwd`/`cwd_known` COPIED, so a
+    `cd` the child performs cannot move the shell that runs the segments
+    after it, and the `shared` dict passed BY REFERENCE, so a repo-global
+    fact the child establishes (a `git stash` push) is still visible
+    outside. Threading one mutable dict through every context conflated the
+    two, and a `cd` inside `bash -c` or `$(...)` leaked outward (round 4,
+    M4)."""
+    return {'cwd': state['cwd'], 'cwd_known': state['cwd_known'], 'shared': state['shared']}
 
 
 def split_segments(command):
@@ -1274,17 +1328,17 @@ def evaluate(command, cwd):
     """Return a refusal message, or None to allow `command`."""
     if os.environ.get(ESCAPE_VAR) == '1':
         return None
-    state = {'cwd': cwd, 'cwd_known': True, 'stash_created': False}
+    state = {'cwd': cwd, 'cwd_known': True, 'shared': {'stash_created': False}}
     return evaluate_command_text(command, state, 0)
 
 
 def evaluate_command_text(command, state, depth):
     """Evaluate one command STRING: the whole Bash payload at depth 0, or
     the inner body of a `bash -c`/`sh -c`/`bash -lc` wrapper, or a `$(...)`/
-    backtick command substitution, at a greater depth. `state` (a dict of
-    `cwd`, `cwd_known` and `stash_created`) is threaded through and mutated
-    by reference, since a `cd` or `git stash` push inside a wrapper's body
-    must still be visible to segments that follow it in the OUTER command.
+    backtick command substitution, at a greater depth. `state` holds the
+    process-local context (`cwd`, `cwd_known`) plus a `shared` dict of
+    repo-global facts (`stash_created`); child_context() says which of the
+    two crosses a process boundary, and why.
     Bounded by MAX_UNWRAP_DEPTH so adversarial nesting cannot exhaust
     Python's own recursion limit (AC-SEC-4/AC-ARCH-4)."""
     if depth > MAX_UNWRAP_DEPTH:
@@ -1328,16 +1382,22 @@ def evaluate_command_text(command, state, depth):
             length=len(command), prefix=command[:80], cap=MAX_COMMAND_LENGTH_CHARS, var=ESCAPE_VAR)
     command = strip_heredoc_bodies(command)
     command, substitutions = extract_command_substitutions(command)
-    for sub_text in substitutions:
-        reason = evaluate_command_text(sub_text, state, depth + 1)
-        if reason:
-            return reason
     try:
         segments = split_segments(command)
     except ValueError:
         return None  # unparseable; fail open, see module docstring
     for raw_tokens in segments:
-        reason = evaluate_segment(raw_tokens, state, depth)
+        tokens, substitution_indices = take_substitution_placeholders(
+            raw_tokens, len(substitutions))
+        # A substitution runs in its own child process at the point ITS
+        # segment runs: after every segment before it, so it sees their
+        # `cd`, and before the segment it sits in.
+        for index in substitution_indices:
+            reason = evaluate_command_text(
+                substitutions[index], child_context(state), depth + 1)
+            if reason:
+                return reason
+        reason = evaluate_segment(tokens, state, depth)
         if reason:
             return reason
     return None
@@ -1371,7 +1431,7 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
     if script is not None:
         if depth >= MAX_UNWRAP_DEPTH:
             return None  # bounded; fail open past the bound
-        return evaluate_command_text(script, state, depth + 1)
+        return evaluate_command_text(script, child_context(state), depth + 1)
 
     unwrapped = strip_prefix_wrapper(head)
     if unwrapped is not None:
@@ -1414,7 +1474,7 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
         # AC-DATA-4).
         rest_n = normalize_rest(rest)
         if stash_is_push(rest_n):
-            state['stash_created'] = True
+            state['shared']['stash_created'] = True
 
     scope = destructive_scope(subcmd, rest, segment_cwd, git_config, unknown_trailing)
     if scope is None:
@@ -1429,7 +1489,7 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
         risky = retargeted or clean_would_remove(segment_cwd, scope[1])
         template = REFUSAL_CLEAN
     elif kind == 'stash':
-        risky = (retargeted or state['stash_created']
+        risky = (retargeted or state['shared']['stash_created']
                  or stash_would_lose_entries(segment_cwd, scope[1]))
         template = REFUSAL_STASH
     else:
