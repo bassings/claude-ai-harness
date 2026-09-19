@@ -1590,11 +1590,24 @@ test('static AC-SEC-7: README\'s guard section states the detector is a best-eff
 })
 
 // AC-QA-19: table-driven -- every spelling README documents as covered by
-// the detector is refused on a genuinely dirty file; every spelling it
-// documents as deliberately out of scope is allowed. Fails in BOTH
-// directions, so neither a closed hole nor a stopped guard leaves the
-// documentation stale.
-test('static AC-QA-19: every GUARDED shape is refused and every OUT-OF-SCOPE shape is allowed against a genuinely dirty file', () => {
+// the detector is refused on a genuinely dirty file; every spelling that is
+// allowed against THIS fixture stays allowed. Fails in BOTH directions, so
+// neither a closed hole nor a stopped guard leaves the documentation stale.
+//
+// K1 review round 1: `git clean -fd` and `git stash drop` used to live in an
+// `OUT_OF_SCOPE` list here, which stopped being true the day the guard grew
+// a `git clean`/`git stash drop` rule (hooks/destructive-git-cases.json now
+// carries block cases for both). They are allowed on THIS SPECIFIC fixture
+// only because it has nothing for either rule to catch: README.md is a
+// TRACKED file made dirty, which `git clean` never touches (clean only
+// removes untracked/ignored paths), and no `git stash` has ever run, so the
+// stash list is empty. Renamed to say exactly that, rather than repeat the
+// stale "out of scope" claim -- see ALLOWED_HERE_NOTHING_TO_LOSE below.
+// TRULY_OUT_OF_SCOPE keeps the two shapes this hook never intercepts on ANY
+// fixture: branch deletion and branch creation are not guarded shapes at
+// all, dirty tree or not. Every assertion below is unchanged from before
+// this rename -- only the grouping and its comment changed.
+test('static AC-QA-19: every GUARDED shape is refused, and every shape allowed against this fixture stays allowed', () => {
   const { makeTempRepo, cleanupTempRepos, sh, sanitizedGitEnv: sge } = require('./helpers/temp-repo.js')
   const HOOK_PATH = path.join(ROOT, 'hooks', 'destructive-git-guard.py')
   const fsMod = require('node:fs')
@@ -1615,9 +1628,16 @@ test('static AC-QA-19: every GUARDED shape is refused and every OUT-OF-SCOPE sha
     'git restore README.md',
     'git reset --hard',
   ]
-  const OUT_OF_SCOPE = [
+  // Guarded commands (see hooks/destructive-git-cases.json for their block
+  // cases on an at-risk fixture) that this fixture's own dirty-tracked-file
+  // shape happens never to trigger.
+  const ALLOWED_HERE_NOTHING_TO_LOSE = [
     'git clean -fd',
     'git stash drop',
+  ]
+  // Never a guarded shape on ANY fixture -- branch deletion and branch
+  // creation are not restore/discard operations this hook models at all.
+  const TRULY_OUT_OF_SCOPE = [
     'git branch -D other',
     'git checkout -b newbranch',
   ]
@@ -1630,12 +1650,12 @@ test('static AC-QA-19: every GUARDED shape is refused and every OUT-OF-SCOPE sha
       const res = runHook(command, dir)
       assert.equal(res.status, 2, `GUARDED "${command}" must be refused (exit 2), got ${res.status}; stderr: ${res.stderr}`)
     }
-    for (const command of OUT_OF_SCOPE) {
+    for (const command of [...ALLOWED_HERE_NOTHING_TO_LOSE, ...TRULY_OUT_OF_SCOPE]) {
       const dir = makeTempRepo()
       sh('git branch other', dir)
       fsMod.writeFileSync(path.join(dir, 'README.md'), 'dirty\n')
       const res = runHook(command, dir)
-      assert.equal(res.status, 0, `OUT-OF-SCOPE "${command}" must be allowed (exit 0), got ${res.status}; stderr: ${res.stderr}`)
+      assert.equal(res.status, 0, `"${command}" must be allowed (exit 0) against this fixture, got ${res.status}; stderr: ${res.stderr}`)
     }
   } finally {
     cleanupTempRepos()
