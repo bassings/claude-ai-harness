@@ -76,6 +76,9 @@ reporting confident zeroes.
 - `workflows/review-cycle.js` (the spec_bug prompt and the no-spec case)
 - `agents/lens-*.md` only if the contract, not the validator, turns out to be
   the thing that should change
+- `bin/install.sh` and `workflows/lib/install-consistency.mjs` (decision 7,
+  added to the branch after this list was written; recorded under AC-SIMP-3's
+  amended confinement clause and AC-ARCH-1 rather than folded in silently)
 
 ## Acceptance criteria
 
@@ -85,6 +88,12 @@ Written by `/plan-cycle` 2026-09-14 at `d05d10b`. Six lenses ran:
 the change alters a stored schema and a sanitiser, and it reaches production
 behaviour). `lens-design`, `lens-accessibility` and `lens-architecture` were
 skipped: no UI surface, no new module, no new dependency.
+
+**That skip stopped being true mid-branch, and nothing re-ran planning.** The
+installer commit (decision 7) added a new entry point and a new shell-to-ESM
+boundary, which is `AGENT-HARNESS.md`'s own trigger for `lens-architecture`.
+An `AC-ARCH` section was added at fix round 4, after the code, and says so in
+its own text.
 
 ### Decisions settled at planning
 
@@ -124,17 +133,40 @@ implementation. These are the decisions the criteria below are written against.
    matter most. AC-DATA-13 made the raise conditional on that byte proof, and
    the proof fails.
 
-   **What was built instead:** the tally is computed by the WRITER, before any
-   truncation, and stored as `findings_by_lens` (~500 bytes, correct at any
-   volume). This is not the "new payload property" this decision rejected: the
-   caller supplies nothing, a caller-supplied tally is refused explicitly, and
-   schema and writer ship in the same file so no version can have one without
-   the other. `MAX_FINDINGS` stays at 15.
+   **What was built instead, fix rounds 1 to 3:** the tally computed by the
+   WRITER, before any truncation, and stored as `findings_by_lens`.
 
-   Review round one then found the other half was missing: the reader was never
-   taught to use the field, so the number an operator reads was still the
-   truncated one. Fixed, with the per-finding loop kept as the fallback for
-   lines written before the field existed.
+   **REMOVED AT FIX ROUND 4, 2026-09-20, on the owner's decision, and this is
+   the second reversal recorded under one decision.** The tally produced a
+   defect in every review round it existed: double-counted `fixed` findings
+   (round 2), then a whole-record collapse and zero fixes on busy rounds
+   (round 3's H1 and H2), with M2 and L4 tracing to it as well. Its keys were
+   lens names taken from the synthesis model's structured output, so the key
+   COUNT was caller-shaped and unbounded while the byte-rescue loop could
+   shrink only `findings` and then `ac_verdicts`. Measured at `ec94e0a`: 400
+   findings carrying 400 distinct, well-formed lens names wrote a 211-byte
+   `degraded: true` line with every finding, `lenses_run`, `verdicts` and
+   `trigger_counts` erased and `write_ok` true. The same payload writes 2,037
+   bytes intact both on `main` and after the removal.
+
+   **So D3 is now answered by `AC-QA-8`'s reported-shortfall branch, and
+   nothing else.** The per-finding array is the one source of the per-lens
+   counts again, which means a truncated round undercounts them exactly as it
+   did before any of this: `findings_truncated` carries the number missing and
+   is rendered in the same report section. Measured cost of the removal, one
+   identical window per ledger, 2026-09-20: this repo 329 findings reaching
+   the tally before, 264 after, with 349 reported as `findings_truncated`
+   beside them; SaidOfYou 381 before, 305 after, with 866 reported;
+   CouchPotatoServer identical either way (37), since its window holds no line
+   the tally ever covered. `MAX_FINDINGS` stays at 15.
+
+   Three mechanisms have now been tried for D3 and two were withdrawn on
+   measurement. What the third round should have asked, and did not, is
+   whether an exactly-correct per-lens count is worth a second source for a
+   number: every attempt to carry one has had to re-implement the rules the
+   first source applies (the cross-round `fixed` dedupe is the one it could
+   not), and each re-implementation was the defect. A named shortfall beside a
+   smaller number is a worse measurement and a much cheaper one.
 4. **D4's trigger is computed in script code, from observable state, not from
    the invocation argument and not from the model's classification.** "No spec
    was in play" means `specPath` is null AND no lens returned any `ac_verdicts`,
@@ -208,16 +240,38 @@ implementation. These are the decisions the criteria below are written against.
 - **AC-SIMP-1:** No new dependency: the diff adds no `package.json` or lockfile, and adds no import/require whose specifier is neither `node:`-prefixed nor a repo-relative path.
 - **AC-SIMP-2:** No new configuration knob: the diff adds no new `process.env.<NAME>` read and no new key to the harness trigger defaults or to any `.claude/harness-triggers.json`.
 - **AC-SIMP-3:** No new module: the diff creates no new file under `workflows/` or `agents/`. Production changes are confined to `workflows/lib/ledger-append.mjs`, `workflows/lib/optimise-read.mjs`, `workflows/optimise-cycle.js` and `workflows/review-cycle.js` (test, spec, docs and README files excluded from this count).
+
+  **CONFINEMENT CLAUSE AMENDED, fix round 4 (round-3 review L8), overrun recorded rather than pretended away.** Six production files are changed, not four: the two the veto list below already sanctions plus `bin/install.sh` (new, 135 lines) and `workflows/lib/install-consistency.mjs` (+31), which are decision 7's installer pair. That pair is a **sanctioned widening** on the same reasoning decision 7 gives for keeping the installer in this branch at all (AC-OPS-2 needs the install story working, and AC-OPS-7's rollback procedure names the installer as the tool that re-installs the pre-change writer) -- but it is sanctioned after the fact, by the owner on review, not by the simplicity veto at planning, which never saw it. The new-file half of the criterion still passes on its own terms: no file was added under `workflows/` or `agents/`. Recorded here so AC-SIMP-3 is not left nominally green while the clause it turns on is false; see AC-ARCH-1 for the boundary that pair creates.
 - **AC-SIMP-4:** `LEDGER_ENTRY_SCHEMA.properties` gains at most one new top-level property across the whole change. (The original clause freezing `SCHEMA_VERSION` was overruled at planning; see the veto list.)
 - **AC-SIMP-6:** D1 is fixed in the validator, not in the contract: the diff modifies no file under `agents/`, and no lens's AC prefix (including `AC-A11Y` in `agents/lens-accessibility.md`) changes.
 - **AC-SIMP-7:** `AC_ID_PATTERN_STR` remains the single definition site of the ac_id shape: the diff adds no second AC-id regular expression literal to `workflows/lib/ledger-append.mjs`, `workflows/lib/optimise-read.mjs`, `workflows/optimise-cycle.js` or `workflows/review-cycle.js`. The separate copy in `test/static-checks.test.js` (AC-QA-13) is a test-side guard and is out of this count.
 - ~~**AC-SIMP-8:** D3 is fixed by changing the existing bound, not by adding a mechanism: `optimise-read.mjs`'s `lensDispositionCounts` is still derived from each record's `findings` array, and the diff adds no writer-supplied per-lens counts field and no branch that selects between two sources for the same tally.~~
   **AMENDED AT FIX ROUND 3, on round 2's own review arbitration, kept struck through rather than deleted, per this spec's own standard for a decision recorded and then reversed (the same standard decision 3, above, already uses).** `AC-DATA-13`'s conditional raise of `MAX_FINDINGS` was refuted on measurement (decision 3), and the tally-field route this criterion vetoed is what was actually built instead, already in fix round 1: `findings_by_lens`, a writer-supplied per-lens counts field, with the reader selecting between it and the per-finding fallback for exactly the "does this line have the field yet" reason AC-DATA-1 makes normal for a new field on old data. The spec text was never corrected to match what shipped, which is the round-2 review's own H2 finding: "a branch that selects between two sources for the same tally" is precisely the shape that let the tally path skip the per-finding path's cross-round `fixed` dedupe. Overruled the same way decision 3's simplicity clause was: this sits on the irrecoverable-data-loss line (a truncated `findings` array silently undercounts the busiest rounds by up to 82%, measured), which the simplicity veto cannot override. `AC-QA-8`, `AC-DATA-7` and H2's fix (fix round 3: the tally path now routes `fixed` through the same dedupe-aware per-finding logic) are what actually govern this mechanism now.
+
+  **REINSTATED AT FIX ROUND 4, in its original wording, because the mechanism it vetoed has been removed.** The criterion as first written now describes what ships: `lensDispositionCounts` is derived from each record's `findings` array, there is no writer-supplied per-lens counts field, and no branch selects between two sources for the same tally. The veto was overruled at fix round 3 on the irrecoverable-data-loss line, and the measurement that overruled it (an 82% undercount on the busiest rounds) still stands -- what changed is that the mechanism bought to fix that undercount cost an entire review record, which is the same line, higher up. Recording both directions rather than rewriting either: the veto was right about the shape and wrong about the severity ranking at the time it was overruled, and three rounds of defects in one field is the evidence that settled it.
 - **AC-SIMP-9:** No new disposition value: the `DISPOSITIONS` array in `workflows/lib/ledger-append.mjs` is exactly `['open', 'rejected', 'spec_bug', 'fixed']` after the change.
 - **AC-SIMP-10:** Removal, D4: the unconditional `spec_bugs` request is gone from the no-spec path. In `workflows/review-cycle.js` the synthesis prompt asks for `spec_bugs` only inside a branch conditional on a spec being in play, so a prompt built for a spec-less run contains the string `spec_bugs` nowhere.
 - **AC-SIMP-11:** The spec's three deliberately-excluded items are absent from the diff: no dedupe (Set or otherwise) at `review-cycle.js`'s `lenses.push('reviewer-verification')`, no new `ci_wait`/`human_wait` event emission, and no `ac_id_raw` fallback or re-attribution logic in `optimise-read.mjs`.
 - ~~**AC-SIMP-12:** The whole change touches no more than 10 files: `git diff --name-only <base>...<sha> | wc -l` is 10 or fewer.~~ (Raised from the lens's original 8 to cover `workflows/optimise-cycle.js`, `test/static-checks.test.js` and the mutation-proofs document that AC-PROD-7, AC-QA-13 and AC-QA-14 add.)
   **AMENDED, fix round 3 (M5), overrun recorded rather than pretended away.** Round-2 review measured 13 against this bound (11 with the installer removed), and it was never brought back under 10 -- the installer commit was scope drift the lens veto had no chance to see, because it landed without going through planning at all (decision 7). Fix round 3 adds `bin/install.sh` and `workflows/lib/install-consistency.mjs` return to the diff (they were already present from the installer commit), plus `docs/harn-ledger-validators-mutation-proofs.md` (AC-QA-14) and further test-file edits across the H1-through-M4 fixes: `git diff --name-only main...HEAD | wc -l` is 18 at the close of this fix round. The bound is not re-raised to match: doing so would make it a number that trails whatever was built rather than a constraint that ever said no. Recorded as an accepted overrun instead, on the same reasoning decision 7 gives for keeping the installer here at all -- splitting it out now would not bring this branch under 10 either, since the validator fix alone (ledger-append.mjs, optimise-read.mjs, optimise-cycle.js, review-cycle.js, README.md, specs/harn-ledger-validators.md, and their five-plus test files) already exceeds it.
+
+### lens-architecture
+
+**Added at fix round 4 (round-3 review L7), and the lateness is the point.**
+No `AC-ARCH-<n>` criterion existed while this change added a new entry point
+(`bin/install.sh`, now the documented install path in README) and a new
+shell-to-ESM call boundary. `AGENT-HARNESS.md` triggers `lens-architecture`
+on exactly that, but the installer arrived mid-branch, after planning, so the
+lens had nothing pre-specified to verify against and had to find everything
+freehand -- and both of its highest-severity round-3 findings sat inside that
+ungoverned surface. A criterion written after the code verifies nothing about
+whether the code should exist; what it can still do is state the boundary so
+the NEXT change to it has something to fail against, and record honestly
+which half holds today.
+
+- **AC-ARCH-1:** The installer's boundary is one seam, crossed one way. `bin/install.sh` is the only shell entry point that calls into `workflows/lib/`; it computes both "what to copy" and "what counts as drift" exclusively through `install-consistency.mjs`'s exported entry points, never a second shelled implementation of either (that half is `AC-OPS-10`, and it holds); and every path it hands to node crosses the seam as a `process.argv` entry rather than being escaped and interpolated into a JavaScript string literal.
+
+  **Status at fix round 4: the last clause FAILS, and is recorded as open debt rather than fixed in this round.** `bin/install.sh:38` escapes single quotes only and interpolates the result into `import { … } from '<specifier>'` at `:54` and `:82`, while `$REPO` and `$DEST` on the same command lines already go through `process.argv` and need no escaping at all. Three lenses independently broke out of that string literal with a checkout path containing a backslash and an apostrophe (both legal on any Unix filesystem); none achieved code execution, because a static `import` specifier must be a literal, and the observed failure is an unhandled node stack trace from the one tool whose job is telling an operator whether their install is current. The fix is to delete the escaping question rather than answer it, and it is enforceable afterwards as a grep in `test/static-checks.test.js`, where this repo already puts that kind of guard.
 
 ### lens-product
 
@@ -233,14 +287,24 @@ implementation. These are the decisions the criteria below are written against.
 
   **After-numbers, fix round 3 (L6), measured 2026-09-19 against the fully implemented rule** (`node workflows/lib/optimise-read.mjs ledger <repo>` against each operator's real, unmodified ledger under `.claude/harness-ledger.jsonl`, read-only -- no ledger was written to): claude-ai-harness 274 attributed / 10 nulled verdicts (across 92 distinct AC-id buckets), 250 findings reaching the per-lens tally, 66 spec_bug; CouchPotatoServer 0 attributed / 204 nulled, 37 findings tallied, 28 spec_bug; SaidOfYou 697 attributed / 113 nulled, 381 findings tallied, 168 spec_bug. The window grew between the two measurements (this repo alone from 63 to roughly 64 review_cycle records over the five days), so these are not a controlled before/after on an IDENTICAL window -- they are what an operator re-running the same command today actually sees, which is the claim AC-PROD-8 makes. CouchPotatoServer's "0 attributed" is expected, not a fresh failure: every `ac_verdicts` line in its ledger predates this repo's own fix being installed there, so `ac_id_raw` retention (AC-QA-12), not this measurement, is what would recover them, and re-deriving lost history is explicitly out of scope (see above).
 
+  **Re-measured at fix round 4, 2026-09-20, and this time as a CONTROLLED comparison**: the round-3 code (`ec94e0a`) and the fix-round-4 code were each run over the SAME unmodified ledger file, minutes apart, so the only variable is the code. Every ledger's sha256 was taken before and after each run and was unchanged, so all six passes were genuinely read-only. Per ledger, `ec94e0a` then fix round 4 -- attributed verdicts / findings reaching the per-lens counts / spec_bug, with the `findings_truncated` figure the report renders beside them:
+  - claude-ai-harness: 370 / **329** / 80, then 370 / **264** / 78, `findings_truncated` 349 either way.
+  - SaidOfYou: 697 / **381** / 168, then 697 / **305** / 162, `findings_truncated` 866 either way.
+  - CouchPotatoServer: 0 / 37 / 28, identical under both, since its window holds no line the removed tally ever covered.
+
+  Read plainly: removing the tally costs 65 findings of per-lens attribution on this repo's window and 76 on SaidOfYou, and changes nothing else. Attributed verdicts -- the number D1 and D2 exist to move, and the one this spec is really about -- are identical under both, so the validator fix's own measured gain is untouched by the removal. The figures recorded in the fix-round-3 paragraph above (274 attributed, 250 tallied, 66 spec_bug) were measured on a smaller window five days earlier and are kept as the record of what was measured then, not corrected to today's window.
+
 ### lens-data
 
 - **AC-DATA-1:** No existing ledger line is rewritten, reordered, truncated or deleted by this change. Proof: take a byte-for-byte copy of a real multi-line ledger into a temp repo, run the changed writer through a full `review_cycle` append against the copy, and assert that every pre-existing byte is unchanged (the first N bytes of the file are identical to the original's sha256-verified content) and the new record is appended after them. This change ships no migration and no rewrite of past lines.
 - **AC-DATA-3:** Nothing that validates today is rejected after the widening. Replay this repo's real ledger (a copy) through the new validator and assert all 206 currently-accepted `ac_id` values are still accepted, and that the count of pattern errors across the file falls from 10 to 0 rather than moving in any other direction.
 - **AC-DATA-4:** Identity rule, different-spec half: two criteria that differ only in their spec prefix stay two criteria. Insert two `review_cycle` records whose `ac_verdicts` are `FEAT-010 AC-QA-1` (verdict FAIL) and `FEAT-011 AC-QA-1` (verdict PASS) and assert `aggregateRework` returns two acVerdicts entries, and that `neverFailingAcs` reports `never_failed` false for the FEAT-010 entry only. A single merged entry, or a FAIL moving the FEAT-011 row, fails this criterion. Read with AC-QA-4, which is the same-spec half.
 - **AC-DATA-6:** A payload emitted by the changed `review-cycle.js` is accepted by the previous version of the writer. Run `git show <pre-change-sha>:workflows/lib/ledger-append.mjs` into a temp location, pipe the new `review_cycle` payload through it against a temp-repo ledger, and assert `write_ok` is true and every field the pre-change writer already recorded is present in the written line. A result of `write_ok: false`, or a line missing `lenses_run`/`verdicts`/`trigger_counts`/`findings`, fails this criterion. Measured today: one undeclared top-level key returns `{ok: false}` and the entire record is refused, and `review-cycle.js:576-578` tells every lens to prefer the installed mirror at `~/.claude/workflows/lib/ledger-append.mjs` over the repo copy.
-- **AC-DATA-7:** Per-lens disposition counts equal the round's true totals and are counted once. Drive a `review_cycle` write whose round produced 40 findings and assert `aggregateRework`'s `lensDispositionCounts` total for that line is exactly 40, not 15 (today's behaviour) and not 55 (double counting the entries that survived).
-- **AC-DATA-9:** Pre-change lines are not read as zero. Replay this repo's real review_cycle lines (a copy) through the changed reader and assert the per-lens disposition totals are non-zero and at least the 264 findings currently present, and that the report distinguishes figures derived from a post-change line from figures derived by counting a truncated findings array on a pre-change line.
+- ~~**AC-DATA-7:** Per-lens disposition counts equal the round's true totals and are counted once. Drive a `review_cycle` write whose round produced 40 findings and assert `aggregateRework`'s `lensDispositionCounts` total for that line is exactly 40, not 15 (today's behaviour) and not 55 (double counting the entries that survived).~~
+  **AMENDED AT FIX ROUND 4, when the mechanism it describes was removed (decision 3's second reversal). Struck through rather than deleted, per this spec's own standard for a decision recorded and then reversed.** The "equal the round's true totals" half cannot hold without a second source for the count, and every attempt at one produced a defect, ending in a whole review record being erasable by its own tally. What survives of this criterion, and is asserted today: the counts are counted ONCE (the cross-round `fixed` dedupe and `duplicateFixedAcrossRounds`, which is the half that was always about correctness rather than completeness), and the shortfall on a truncated round is reported rather than silent -- `findings.length + findings_truncated` accounts for every supplied finding on the written line, and the window's `findings_truncated` sum is rendered in the same report section as the per-lens rows it qualifies. `AC-QA-8`'s second branch is what governs the completeness half now.
+- **AC-DATA-9:** Pre-change lines are not read as zero. Replay this repo's real review_cycle lines (a copy) through the changed reader and assert the per-lens disposition totals are non-zero and at least the 264 findings currently present.
+
+  **Second clause withdrawn at fix round 4** ("the report distinguishes figures derived from a post-change line from figures derived by counting a truncated findings array on a pre-change line"). With the tally removed there is no such distinction to draw: every line's per-lens counts, pre- or post-boundary, come from its own `findings` array, and every line's shortfall is reported the same way through `findings_truncated`. Uniform treatment is what the clause was reaching for; it asked for a distinction only because two sources existed. Measured at fix round 4 against this repo's real ledger, read-only: 264 findings reach the per-lens counts, so the "not read as zero" half holds on the same number it was written against.
 - **AC-DATA-11:** On a review run with no spec in play, zero findings are written with disposition `spec_bug`, the same findings are written with disposition `open` so the line's total finding count is unchanged (nothing is lost by the reclassification), and `spec_bug_count` is null rather than a number. Assert on the written line, not on the synthesis prompt.
 - **AC-DATA-13:** The byte budget is not spent by this change, and raising `MAX_FINDINGS` is conditional on proving it. With the largest realistic round fixture plus prefixed ac_ids of the widest accepted form, the written line is under `MAX_LINE_BYTES` with the headroom stated as a measured number, and no line in the fixture set reaches the minimal-degrade path (`degraded: true`). Additionally: when the byte-rescue loop fires, the findings array shrinks FIRST; `lenses_run`, `verdicts` and `trigger_counts` survive intact regardless. If findings shrinking to nothing is not enough, `ac_verdicts` shrinks SECOND (fix round 3, H1), counted in `ac_verdicts_truncated` -- amended from the original "ac_verdicts survives intact" wording, which round 2's own review measured false: a multi-spec review's prefixed ac_verdicts can by themselves exceed the byte budget once every finding is already gone, and the original wording would have required falling straight to the envelope-only collapse in exactly that case, discarding every verdict AND every finding together. `findings_truncated`/`ac_verdicts_truncated` record whichever losses actually occurred. If the headroom cannot be proven, `MAX_FINDINGS` stays at 15 and D3 is satisfied by AC-QA-8's reported-shortfall branch instead.
 - **AC-DATA-14:** Concurrent appends of the larger line still land whole. Run 20 concurrent writers of the new, larger `review_cycle` record against one temp-repo ledger and assert 20 lines, all JSON-parseable, none interleaved and none torn.
