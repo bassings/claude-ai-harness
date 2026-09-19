@@ -2140,6 +2140,62 @@ test('optimise-read: aggregateRework counts a finding id confirmed fixed once, P
   assert.equal(result.lensDispositionCounts['lens-security'].fixed, 2, 'two genuinely different finding ids must both count')
 })
 
+// H2 (round 2 review): findings_by_lens has no per-id data, so the fixed-id
+// cross-round dedupe above (which the per-finding fallback path applies) was
+// never reached for a record that carried the tally -- every schema_version
+// 3 line double-counted a fixed finding confirmed again in a later round.
+test('optimise-read (H2): a fixed disposition read via findings_by_lens is deduped across rounds the same way the per-finding fallback path is, not double-counted', () => {
+  const records = [
+    {
+      kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'sha1', outcome: 'done',
+      findings: [{ id: 'fid-1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }],
+      findings_by_lens: { 'lens-security': { open: 0, rejected: 0, spec_bug: 0, fixed: 1 } },
+    },
+    {
+      kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'sha2', outcome: 'done',
+      findings: [{ id: 'fid-1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }],
+      findings_by_lens: { 'lens-security': { open: 0, rejected: 0, spec_bug: 0, fixed: 1 } },
+    },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.lensDispositionCounts['lens-security'].fixed, 1,
+    'the same finding id confirmed fixed twice across rounds must count once, even when both lines carry findings_by_lens')
+  assert.equal(result.duplicateFixedAcrossRounds, 1, 'the skip must be visible, not silently swallowed')
+})
+
+test('optimise-read (H2): a findings_by_lens tally with a GENUINELY DIFFERENT fixed finding id on each record still counts both -- the dedupe must not over-collapse distinct findings', () => {
+  const records = [
+    {
+      kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'sha1', outcome: 'done',
+      findings: [{ id: 'fid-1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }],
+      findings_by_lens: { 'lens-security': { open: 0, rejected: 0, spec_bug: 0, fixed: 1 } },
+    },
+    {
+      kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'sha2', outcome: 'done',
+      findings: [{ id: 'fid-2', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }],
+      findings_by_lens: { 'lens-security': { open: 0, rejected: 0, spec_bug: 0, fixed: 1 } },
+    },
+  ]
+  const result = mod.aggregateRework(records)
+  assert.equal(result.lensDispositionCounts['lens-security'].fixed, 2, 'two genuinely different finding ids must both count')
+})
+
+// H2, other dispositions: open/rejected/spec_bug have no cross-round dedupe
+// concept (only a confirmed FIX can be re-confirmed against a later round),
+// so the tally path must still read them straight from findings_by_lens, not
+// route them through the per-finding path too.
+test('optimise-read (H2): open/rejected/spec_bug counts still come from findings_by_lens (the pre-truncation tally), unaffected by the fixed-disposition fix', () => {
+  const rec = {
+    kind: 'review_cycle', repo: 'demo', spec: 'specs/a.md', round_key: 'k1', outcome: 'done',
+    findings: [{ id: 'f1', lens: 'lens-qa', severity: 'Low', ac_id: null, disposition: 'open' }],
+    findings_by_lens: { 'lens-qa': { open: 40, rejected: 3, spec_bug: 2, fixed: 0 } },
+  }
+  const out = mod.aggregateRework([rec])
+  assert.equal(out.lensDispositionCounts['lens-qa'].open, 40, 'open must still come from the pre-truncation tally, not the capped findings array')
+  assert.equal(out.lensDispositionCounts['lens-qa'].rejected, 3)
+  assert.equal(out.lensDispositionCounts['lens-qa'].spec_bug, 2)
+})
+
 test('optimise-read: aggregateRework does NOT dedupe the same finding id across TWO DIFFERENT repos -- distinct repos are distinct evidence, even on the astronomically unlikely id collision (fix round 1, finding 2, scope check)', () => {
   const records = [
     { kind: 'review_cycle', repo: 'demo-a', spec: 'specs/a.md', round_key: 'sha1', outcome: 'done', findings: [{ id: 'f1', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'fixed' }] },

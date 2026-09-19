@@ -411,8 +411,35 @@ export function aggregateRework(records, { root = '' } = {}) {
         for (const [disposition, n] of Object.entries(counts)) {
           if (!Number.isInteger(n) || n <= 0) continue
           if (!DISPOSITIONS.has(disposition)) continue
+          // H2 (round 3 review): 'fixed' is handled separately, below, from
+          // the per-finding array -- the tally has no per-id data, so it
+          // cannot apply the cross-round dedupe a 'fixed' disposition needs
+          // (the SAME finding confirmed fixed again in a later round is a
+          // repeat, not a new fix; see seenFixedIds below). Reading it from
+          // the tally here would double-count every such repeat on any
+          // schema_version 3 line.
+          if (disposition === 'fixed') continue
           bumpDisposition(lensDispositionCounts, lens, reclassify(disposition), n)
         }
+      }
+      // H2: 'fixed' findings still come from the per-finding array (capped
+      // at MAX_FINDINGS, but 'fixed' entries are prioritised ahead of 'open'
+      // by the writer's own budgetFindings ordering, so an uncapped 'fixed'
+      // volume large enough to be truncated away here is not the realistic
+      // case an uncounted double-count on every line was) -- the SAME
+      // dedupe-aware logic the fallback branch below applies.
+      for (const f of r.findings || []) {
+        if (!f || f.disposition !== 'fixed') continue
+        if (typeof f.lens !== 'string' || !LENS_RE.test(f.lens)) continue
+        if (typeof f.id === 'string' && f.id) {
+          const dedupeKey = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(f.id)}`
+          if (seenFixedIds.has(dedupeKey)) {
+            duplicateFixedAcrossRounds += 1
+            continue
+          }
+          seenFixedIds.add(dedupeKey)
+        }
+        bumpDisposition(lensDispositionCounts, f.lens, 'fixed')
       }
     } else for (const f of r.findings || []) {
       // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
