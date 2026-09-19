@@ -4346,7 +4346,79 @@ test('ledger-append (H2): an oversized ac_id is quarantined and the record survi
   assert.ok(entry.invalid_ac_ids_dropped >= 1)
 })
 
-// --- round-2 review H1 ------------------------------------------------
+// --- AC-QA-7: the byte budget, and where it actually runs out ----------
+//
+// H3 (round-3 review): the guard that stood here asserted none of the three
+// properties AC-QA-7 states. It checked that the record did not fully
+// collapse, that lenses_run still had 8 entries, and that the per-lens tally
+// was present -- while the stored line it produced had ZERO of 15 findings,
+// 189 of 200 ac_verdicts and 32 bytes of headroom, against a criterion
+// requiring all three intact and citing 12,200 bytes. It passed because it
+// asked easier questions than its criterion did.
+//
+// Two guards replace it, because there are two separate facts and the old
+// one blurred them.
+//
+// 1. AC-QA-7 proper: the largest round that must fit, DOES fit, with the
+//    headroom stated as a measured number. Measured 2026-09-20 at this
+//    commit, every figure from a real written line: 8 lenses, 15 findings,
+//    200 verdicts carrying a 25-character prefix serialise to 15,360 bytes
+//    against MAX_LINE_BYTES 16,384 -- 1,024 bytes of headroom, everything
+//    intact, both truncation counters a real measured 0.
+// 2. The boundary, below: where the budget genuinely runs out, and that
+//    what happens there is the documented ladder rather than a collapse.
+//    Measured over the prefix width the criterion calls widest-accepted:
+//    30 characters fits whole with 24 bytes to spare; 31 shed 2 findings;
+//    40 (the widest the pattern accepts at all) shed all 15 findings and 7
+//    verdicts. So the criterion's original "widest accepted form" fixture
+//    was never satisfiable, which is the half AC-QA-7 has now been amended
+//    to say.
+test('ledger-append (AC-QA-7): the largest round that must fit is written WHOLE -- no degrade, MAX_FINDINGS findings, MAX_AC_VERDICTS verdicts, with measured headroom', async () => {
+  const { MAX_FINDINGS, MAX_AC_VERDICTS, MAX_LINE_BYTES } = await import(APPEND_MODULE_URL)
+  const repo = makeTempRepo()
+  const lenses = ['lens-qa', 'lens-security', 'lens-product', 'lens-architecture', 'lens-data', 'lens-operability', 'lens-design', 'lens-accessibility']
+  const open = Array.from({ length: MAX_FINDINGS }, (_, i) => ({
+    lens: lenses[i % lenses.length], location: `f${i}.js:1`, claim: `finding number ${i}, a realistic sentence of prose`,
+  }))
+  // A 25-character spec prefix: the realistic multi-spec citation form the
+  // spec's own byte measurement is taken against, not the 40-character
+  // pattern maximum (which the boundary guard below measures instead).
+  const prefix = 'x'.repeat(25)
+  const acVerdicts = Array.from({ length: MAX_AC_VERDICTS }, (_, i) => ({ ac_id: `${prefix} AC-QA-${i}`, verdict: 'PASS' }))
+  const res = runAppend(repo, {
+    schema_version: 1,
+    kind: 'review_cycle',
+    outcome: 'done',
+    lenses_run: lenses,
+    verdicts: Object.fromEntries(lenses.map((l) => [l, 'FINDINGS'])),
+    trigger_counts: Object.fromEntries(lenses.map((l) => [l, 1])),
+    open_findings: open,
+    ac_verdicts: acVerdicts,
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const raw = readLedgerLines(repo)[0]
+  const entry = JSON.parse(raw)
+  const bytes = Buffer.byteLength(raw, 'utf8')
+
+  // Property 1 of the criterion: no degrade.
+  assert.ok(!entry.degraded, `degraded must be absent; the line was ${bytes} bytes against a ${MAX_LINE_BYTES} cap`)
+  // Property 2: every finding is in the stored line, and the counter agrees.
+  assert.equal(entry.findings.length, MAX_FINDINGS, `all ${MAX_FINDINGS} findings must be in the stored line, got ${entry.findings.length} (${bytes} bytes)`)
+  assert.equal(entry.findings_truncated, 0, 'and findings_truncated must be a real measured 0, not a loss reported as a caveat')
+  // Property 3: every verdict is in the stored line, and its counter agrees.
+  assert.equal(entry.ac_verdicts.length, MAX_AC_VERDICTS, `all ${MAX_AC_VERDICTS} verdicts must be in the stored line, got ${entry.ac_verdicts.length} (${bytes} bytes)`)
+  assert.equal(entry.ac_verdicts_truncated, 0, 'and ac_verdicts_truncated must be a real measured 0')
+  // The headroom itself, as a number rather than an adjective. 1,024 bytes
+  // measured at this commit; the floor is half of it, so a change that eats
+  // most of the remaining budget fails HERE, with a number, instead of
+  // silently shedding findings on the next busy round.
+  const headroom = MAX_LINE_BYTES - bytes
+  assert.ok(headroom >= 512,
+    `measured headroom was ${headroom} bytes (line ${bytes} of ${MAX_LINE_BYTES}); 1,024 was measured 2026-09-20 and the floor is 512, so this change has spent more than half the remaining byte budget`)
+})
+
+// --- round-2 review H1: the degrade ladder at the boundary --------------
 //
 // The byte-rescue loop (above `line = JSON.stringify(entry)`) only ever
 // shrank `findings`. A busy multi-spec review's `ac_verdicts` -- bounded
@@ -4358,7 +4430,7 @@ test('ledger-append (H2): an oversized ac_id is quarantined and the record survi
 // 24-character prefix wrote in full, but 36-40 characters collapsed to a
 // 211-byte degraded:true line. This is exactly the D2 case (a multi-spec
 // review, 203 verdicts) the spec was written for.
-test('ledger-append (H1, round 3): a worst-case round (8 lenses, MAX_FINDINGS findings, MAX_AC_VERDICTS verdicts of the widest accepted prefixed form) does not collapse to the envelope-only form', async () => {
+test('ledger-append (H1, round 3): past the byte budget (the widest accepted 40-character prefix) the record sheds in the documented order and COUNTS what it shed, rather than collapsing', async () => {
   const { MAX_FINDINGS, MAX_AC_VERDICTS } = await import(APPEND_MODULE_URL)
   const repo = makeTempRepo()
   const lenses = ['lens-qa', 'lens-security', 'lens-product', 'lens-architecture', 'lens-data', 'lens-operability', 'lens-design', 'lens-accessibility']
@@ -4387,6 +4459,13 @@ test('ledger-append (H1, round 3): a worst-case round (8 lenses, MAX_FINDINGS fi
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.ok(!entry.degraded, 'the record must not collapse to the envelope-only form -- lenses_run and verdicts must survive')
   assert.ok(Array.isArray(entry.lenses_run) && entry.lenses_run.length === 8, 'the envelope-level fields must survive even though findings/ac_verdicts had to shrink')
+  // The ladder: findings go first and every one of them is counted.
+  assert.ok(entry.findings.length < MAX_FINDINGS, `precondition: this fixture must actually exceed the budget, got ${entry.findings.length} findings kept`)
+  assert.equal(entry.findings.length + entry.findings_truncated, MAX_FINDINGS,
+    'kept plus dropped must account for every finding: nothing may be shed with no counter recording it')
+  // Verdicts go second, and their own counter accounts for them the same way.
+  assert.equal(entry.ac_verdicts.length + entry.ac_verdicts_truncated, MAX_AC_VERDICTS,
+    'kept plus dropped must account for every verdict too')
 })
 
 // --- round-3 review H1, fix round 4 ------------------------------------
