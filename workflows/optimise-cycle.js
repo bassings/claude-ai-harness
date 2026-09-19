@@ -1019,6 +1019,26 @@ function buildReport(d) {
       const c = d.rework.lensDispositionCounts[lens]
       lines.push(`- ${lens}: fixed=${c.fixed}, rejected=${c.rejected}, spec_bug=${c.spec_bug}, open=${c.open}`)
     }
+    // H3 (round 3 review, AC-PROD-7): a section that can be reduced by
+    // discarded or reclassified data must name, in the SAME section, how
+    // much was discarded -- otherwise a future zero here reads exactly like
+    // "this did not happen" again, inside the report this defect class
+    // exists to fix. `undefined` (a stale installed optimise-read.mjs that
+    // predates these fields) renders the same explicit marker the other
+    // counters above already use, never a confident 0.
+    lines.push(
+      `findings dropped from this tally: findings_truncated=${fmtCountOrUnavailable(d.rework.findingsTruncated)} ` +
+      `(a pre-schema_version-3 line's capped findings array; findings_by_lens compensates from schema_version 3 on), ` +
+      `ac_verdicts_truncated=${fmtCountOrUnavailable(d.rework.acVerdictsTruncated)}, ` +
+      `unattributed (lens value did not match a known lens, or a pre-schema_version-3 line dropped it uncounted)=${fmtCountOrUnavailable(d.rework.unattributedFindings)}.`
+    )
+    // H4 (round 3 review, AC-PROD-5): the signal "this work was reviewed
+    // with no spec" must land somewhere a reader sees, not merely stop
+    // being mislabelled as a spec bug.
+    lines.push(
+      `No-spec review runs in window: ${fmtCountOrUnavailable(d.rework.noSpecReviewRuns)} ` +
+      `(findings reclassified from spec_bug to open on those runs: ${fmtCountOrUnavailable(d.rework.noSpecFindingsReclassified)}).`
+    )
   } else {
     lines.push('No rework data (ledger unavailable).')
   }
@@ -1039,17 +1059,27 @@ function buildReport(d) {
       // reason -- this specific ac_id's own verdict values were
       // neutralised (see invalid_record_values_dropped), not merely an
       // unattributed ac_id somewhere else in the window.
+      // H3 (round 3 review): truncated_in_window is a FOURTH distinct
+      // reason -- a truncated ac_verdicts array in this (repo, plan) window
+      // could have dropped the FAIL for this exact criterion.
       const reasonSuffix = a.insufficient_data
         ? ' (insufficient data)'
         : a.unattributed_fail_in_window
           ? ' (unattributed FAIL in window -- see invalid_ac_ids_dropped)'
           : a.unattributed_verdict_in_entry
             ? ' (unattributed verdict for this criterion -- see invalid_record_values_dropped)'
-            : `, never_failed=${a.never_failed}`
+            : a.truncated_in_window
+              ? ' (truncated ac_verdicts in window -- see ac_verdicts_truncated)'
+              : `, never_failed=${a.never_failed}`
       lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}`)
     }
   } else {
-    lines.push('None recorded.')
+    // H3 (round 3 review, AC-PROD-7): "None recorded." on its own reads
+    // like "no data ever entered this window" -- indistinguishable from
+    // "every value that could have populated this section was discarded".
+    // Naming invalid_ac_ids_dropped on the SAME line is what makes a future
+    // zero here readable as a genuine zero.
+    lines.push(`None recorded (invalid_ac_ids_dropped in window: ${fmtCountOrUnavailable(d.rework && d.rework.invalidAcIdsDropped)}).`)
   }
   lines.push('')
 
