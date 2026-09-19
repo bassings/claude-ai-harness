@@ -3301,6 +3301,152 @@
       ],
       "expect": "block",
       "note": "AC-DATA-3 (round 4, M2): an unresolvable cd target means clean.requireForce cannot be read either, so an unforced clean fails CLOSED exactly like a forced one"
+    },
+    {
+      "command": "git stash -u && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H3): every `git stash` spelling that is not one of list/show/apply/pop/drop/clear/branch/create/store is a PUSH, so an earlier one in the same command makes a later drop destructive. Recognising only bare `stash`, `push` and `save` let this through: reproduced, the real run left the stash list empty and deleted the untracked file (twin: see the `git stash && git stash drop` clean-tree case, where the deliberate over-block is recorded)"
+    },
+    {
+      "command": "git stash --include-untracked && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H3): every `git stash` spelling that is not one of list/show/apply/pop/drop/clear/branch/create/store is a PUSH, so an earlier one in the same command makes a later drop destructive. Recognising only bare `stash`, `push` and `save` let this through: reproduced, the real run left the stash list empty and deleted the untracked file (twin: see the `git stash && git stash drop` clean-tree case, where the deliberate over-block is recorded)"
+    },
+    {
+      "command": "git stash -m msg && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H3): every `git stash` spelling that is not one of list/show/apply/pop/drop/clear/branch/create/store is a PUSH, so an earlier one in the same command makes a later drop destructive. Recognising only bare `stash`, `push` and `save` let this through: reproduced, the real run left the stash list empty (twin: see the `git stash && git stash drop` clean-tree case, where the deliberate over-block is recorded)"
+    },
+    {
+      "command": "git stash -k && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H3): every `git stash` spelling that is not one of list/show/apply/pop/drop/clear/branch/create/store is a PUSH, so an earlier one in the same command makes a later drop destructive. Recognising only bare `stash`, `push` and `save` let this through: reproduced, the real run left the stash list empty (twin: see the `git stash && git stash drop` clean-tree case, where the deliberate over-block is recorded)"
+    },
+    {
+      "command": "git stash -a && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch-untracked.txt",
+          "content": "unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-DATA-4 (round 4, H3): every `git stash` spelling that is not one of list/show/apply/pop/drop/clear/branch/create/store is a PUSH, so an earlier one in the same command makes a later drop destructive. Recognising only bare `stash`, `push` and `save` let this through: reproduced, the real run left the stash list empty and deleted the untracked file (twin: see the `git stash && git stash drop` clean-tree case, where the deliberate over-block is recorded)"
+    },
+    {
+      "command": "git stash && git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        }
+      ],
+      "expect": "block",
+      "note": "AC-QA-2 (round 4, M5): the allow twin for every `stash push then drop` case is IMPOSSIBLE and this records why, rather than leaving the shape half-covered. Whether a push creates an entry depends on the tree at RUN time, which this guard would have to measure separately and could still lose a race on, so it assumes the push succeeds and fails CLOSED. The cost is bounded: on a clean tree with an empty stash the real command does nothing anyway (`git stash` reports `No local changes to save`, the drop then fails with `No stash entries found`), so the refusal falls only on a command that was already a no-op"
     }
   ]
 }

@@ -339,6 +339,24 @@ CLEAN_REQUIRE_FORCE_FALSY = ('false', 'no', 'off', '0')
 # on the same version: nothing is removed by the measuring call.
 CLEAN_REPORTING_ONLY_FLAGS = ('-q', '--quiet', '-i', '--interactive')
 
+# `git stash`'s subcommands that do NOT create a stash entry. Everything
+# else is a push, INCLUDING the bare `git stash` and every flag-led spelling
+# (`git stash -u`, `--include-untracked`, `-m msg`, `-k`, `-a`, `-p`): git's
+# own grammar is "the first argument is a subcommand, or else this is a push
+# and the arguments are push's own options", and matching the literal
+# spellings `push` and `save` instead was H3 (K1 review round 4) -- `git
+# stash -u && git stash drop` was ALLOWED and the real run destroyed the
+# untracked files it had just stashed, leaving the stash list empty.
+#
+# Known gap, recorded rather than silently widened: `git stash store
+# <commit>` DOES add an entry to the list, so it belongs on the
+# entry-creating side of this split on the merits. It is listed here as a
+# non-push because the round-4 brief names it explicitly among the nine
+# non-push subcommands. It is plumbing an agent effectively never emits.
+STASH_NON_PUSH_SUBCOMMANDS = frozenset({
+    'list', 'show', 'apply', 'pop', 'drop', 'clear', 'branch', 'create', 'store',
+})
+
 # Same allowlist as test/helpers/git-env.js, deliberately duplicated rather
 # than imported: this is a production hook, not test infrastructure, and
 # must not depend on test/. GIT_DIR and friends can redirect git to a
@@ -729,6 +747,16 @@ def clean_dry_run_args(rest):
     else:
         head, tail = rest, []
     return [t for t in head if t not in CLEAN_REPORTING_ONLY_FLAGS] + tail
+
+
+def stash_is_push(rest_n):
+    """True if a `git stash` invocation (`rest_n` = its arguments, already
+    normalize_rest()'d) creates a stash entry. Read off git's grammar rather
+    than a list of spellings: anything whose first argument is not one of
+    the non-push subcommands is a push, so a flag-led `git stash -u` counts
+    exactly like `git stash push -u` -- see
+    STASH_NON_PUSH_SUBCOMMANDS."""
+    return not rest_n or rest_n[0] not in STASH_NON_PUSH_SUBCOMMANDS
 
 
 def classify_stash(rest):
@@ -1282,7 +1310,7 @@ def evaluate_segment(raw_tokens, state, depth):
         # moment this hook evaluates the whole command (probe case 14,
         # AC-DATA-4).
         rest_n = normalize_rest(rest)
-        if not rest_n or rest_n[0] in ('push', 'save'):
+        if stash_is_push(rest_n):
             state['stash_created'] = True
 
     scope = destructive_scope(subcmd, rest, segment_cwd, git_config)
