@@ -209,6 +209,33 @@ GIT_GLOBAL_OPTS_NO_VALUE = ('--no-pager', '-p', '--paginate')
 # identify (AC-ARCH-4, AC-SEC-4).
 MAX_UNWRAP_DEPTH = 5
 
+# Every subprocess call this guard makes (resolve_as_ref, has_uncommitted_change,
+# clean_would_remove, stash_list) shares this one timeout ceiling. Named
+# rather than left as a literal `10` at each call site so a test can compute
+# the guard's worst-case wall-clock time from these constants instead of a
+# hard-coded number (K1 review round 1) -- see WORST_CASE_SEGMENT_SECONDS.
+SUBPROCESS_TIMEOUT_SECONDS = 10
+
+# The most subprocess calls a SINGLE segment's measurement step can make
+# before answering: resolve_as_ref() (checkout's ref-vs-pathspec resolution,
+# at most one call) plus has_uncommitted_change()'s own worst case -- a
+# path-scoped `git status` call that git itself rejects, retried once
+# tree-wide (two calls). clean_would_remove() and stash_list() each make
+# exactly one call, below this ceiling, so checkout/restore/reset's shape
+# sets the bound.
+MAX_SUBPROCESS_CALLS_PER_SEGMENT = 3
+
+# The worst-case wall-clock time this guard can take deciding a SINGLE
+# segment. hooks/hooks.json's registered timeout for this hook MUST be
+# strictly greater than this: a Claude Code PreToolUse hook that times out
+# does not block the tool call, it lets it PROCEED -- so a hook timeout at
+# or below this figure turns a genuinely slow (not hung) git call into a
+# silent allow of the exact command this guard exists to refuse. See
+# hooks/test_hook_timeout_budget.py, which asserts this against the
+# registered value, and README's note on chained segments summing past any
+# fixed timeout regardless of this constant.
+WORST_CASE_SEGMENT_SECONDS = MAX_SUBPROCESS_CALLS_PER_SEGMENT * SUBPROCESS_TIMEOUT_SECONDS
+
 # `bash -c SCRIPT` / `sh -c SCRIPT` / `bash -lc SCRIPT`: matched by binary
 # basename (wrapper_shell_c()) so `/bin/bash -c ...` is still recognised.
 SHELL_C_BASENAMES = ('bash', 'sh')
@@ -565,7 +592,7 @@ def resolve_as_ref(cwd, arg):
         result = subprocess.run(
             ['git', 'rev-parse', '--verify', '--quiet', '%s^{commit}' % arg],
             cwd=cwd, env=sanitized_git_env(),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -709,7 +736,7 @@ def has_uncommitted_change(cwd, scope):
     try:
         result = subprocess.run(
             cmd, cwd=cwd, env=sanitized_git_env(),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return False  # cannot confirm risk; fail open, see module docstring
@@ -733,7 +760,7 @@ def clean_would_remove(cwd, dry_run_args):
         result = subprocess.run(
             ['git', 'clean', '-n'] + dry_run_args,
             cwd=cwd, env=sanitized_git_env(),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return True  # cannot verify; fail CLOSED
@@ -751,7 +778,7 @@ def stash_list(cwd):
         result = subprocess.run(
             ['git', 'stash', 'list'],
             cwd=cwd, env=sanitized_git_env(),
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return None

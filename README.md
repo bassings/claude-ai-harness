@@ -425,6 +425,21 @@ past it.
   failed measuring call, or a timeout -- because neither untracked/ignored
   files nor a stash entry has any snapshot anywhere; an unverifiable clean
   or stash-drop is refused, not guessed at.
+- **Registered timeout.** `hooks/hooks.json` gives this hook 60 seconds
+  (raised from 10 in K1 review round 1), strictly greater than
+  `WORST_CASE_SEGMENT_SECONDS` (30s: `MAX_SUBPROCESS_CALLS_PER_SEGMENT` x
+  `SUBPROCESS_TIMEOUT_SECONDS`, the most subprocess calls a SINGLE segment's
+  measurement step can make) -- checked by `hooks/test_hook_timeout_budget.py`
+  against those named constants, not a hard-coded number. This matters
+  because a Claude Code PreToolUse hook that TIMES OUT does not block the
+  tool call, it lets it PROCEED: a registered timeout at or below the
+  guard's own worst case would turn a genuinely slow (not hung) git call
+  into a silent allow of exactly the command this guard exists to refuse.
+  **This is a documented limit, not a closed gap**: a single Bash command
+  with many `&&`/`;`/newline-chained segments, or many sibling `$(...)`
+  substitutions, sums EACH segment's own worst case -- there is no ceiling
+  on how many segments one command can contain, so a sufficiently long
+  chain can still exceed any fixed timeout regardless of this constant.
 - **Normalisation layer**, between the raw shell string and the matcher
   above (added after a review found eight distinct spellings of the same
   guarded commands walking straight past it): a bare newline separates
