@@ -237,6 +237,19 @@ const EXEMPTIONS = [
     why: 'Fixtures deliberately contain hostile-looking absolute paths (path traversal, injection) and repo names, as test DATA. They are never installed anywhere. Still: use a synthetic account name (some-operator, victim) rather than a real one. A fixture using this operator\'s actual username is how the one real leak in this repo was found, on 2026-09-04.',
   },
   {
+    // ONE named file, not docs/. The measurement is only re-takeable if it
+    // says WHICH ledger each figure came from, so the repo names are the
+    // content rather than an accident -- the same reasoning the specs/ entry
+    // below records, under the same owner ruling of 2026-09-04, applied to
+    // one file rather than a directory. Every other pattern stays enforced on
+    // it: it contains no absolute path, and it fails this guard the moment it
+    // does. docs/ as a whole stays scanned.
+    paths: ['docs/harn-ledger-validators-measurements.md'],
+    skip: ['target-repo'],
+    placeholder: false,
+    why: 'AC-PROD-8 requires the optimiser re-run over the operator\'s real ledgers with three headline numbers per ledger, before and after. A table that will not name which ledger is which cannot be re-taken or checked, so naming CouchPotatoServer (public) and SaidOfYou (owner-ruled non-confidential, 2026-09-04) is the point of the file. Scoped to this one file so docs/ keeps its scan, and the /Users/, /Volumes/ and /home/ clauses are NOT waived here.',
+  },
+  {
     paths: ['specs/'],
     skip: ['target-repo'],
     placeholder: true,
