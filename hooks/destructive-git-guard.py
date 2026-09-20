@@ -1560,11 +1560,24 @@ def main():
         sys.exit(0)  # a well-formed but non-object payload (e.g. a JSON array); fail open
     if payload.get('tool_name') != 'Bash':
         sys.exit(0)
-    tool_input = payload.get('tool_input') or {}
-    command = tool_input.get('command')
-    if not command or not command.strip():
+    # Every field is checked for TYPE, not just presence. A well-formed JSON
+    # payload of the wrong shape (`tool_input` a string or a list, `command`
+    # a number or a list, `cwd` not a string) used to reach `.get`/`.strip`
+    # on the wrong kind of object and exit 1 with a traceback -- and exit 1
+    # is not a third option in this contract, it is "proceed", so a crashed
+    # hook is an unguarded command (K1 review round 5, M2). Unpacking sits
+    # OUTSIDE the try below deliberately: this is a payload this hook has no
+    # business judging, which is exit 0, not the same thing as the guard's
+    # own parsing throwing while judging a real command.
+    tool_input = payload.get('tool_input')
+    if not isinstance(tool_input, dict):
         sys.exit(0)
-    cwd = payload.get('cwd') or os.getcwd()
+    command = tool_input.get('command')
+    if not isinstance(command, str) or not command.strip():
+        sys.exit(0)
+    cwd = payload.get('cwd')
+    if not isinstance(cwd, str) or not cwd:
+        cwd = os.getcwd()
     try:
         reason = evaluate(command, cwd)
     except Exception:

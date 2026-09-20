@@ -405,6 +405,30 @@ class TestHostilePayloadShapes(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertNotIn(TRACEBACK_MARKER, result.stderr)
 
+    def test_well_formed_json_of_the_wrong_shape_never_exits_1(self):
+        # K1 review round 5, M2 (round 2's L1): the exit contract is 0 or 2
+        # for WHATEVER reaches main(), and exit 1 is not a third option --
+        # Claude Code treats any code but 2 as "proceed", so a crashed hook
+        # is an unguarded command, announced with a Python traceback on
+        # stderr. Measured before the fix: each of these exited 1 with an
+        # AttributeError or a TypeError.
+        for payload in ('{"tool_name": "Bash", "tool_input": "git reset --hard"}',
+                        '{"tool_name": "Bash", "tool_input": ["git", "reset", "--hard"]}',
+                        '{"tool_name": "Bash", "tool_input": 7}',
+                        '{"tool_name": "Bash", "tool_input": {"command": 5}}',
+                        '{"tool_name": "Bash", "tool_input": {"command": ["git", "reset"]}}',
+                        '{"tool_name": "Bash", "tool_input": {"command": {"a": 1}}}',
+                        '{"tool_name": ["Bash"], "tool_input": {"command": "git reset --hard"}}',
+                        '{"tool_name": "Bash", "tool_input": {"command": "git reset --hard"}, "cwd": 42}',
+                        '{"tool_name": "Bash", "tool_input": {"command": "git reset --hard"}, "cwd": ["/tmp"]}'):
+            with self.subTest(payload=payload):
+                result = self._run_raw(payload)
+                self.assertIn(result.returncode, (0, 2),
+                              'exit %s for %s; the contract is 0 or 2, and 1 means the '
+                              'command PROCEEDS unguarded' % (result.returncode, payload))
+                self.assertNotIn(TRACEBACK_MARKER, result.stderr,
+                                 'a traceback reached stderr for %s' % payload)
+
     def test_non_ascii_cwd_path(self):
         base = tempfile.mkdtemp(prefix='destructive-git-hostile-unicode-')
         weird = os.path.join(base, '日本語-repo-​')
