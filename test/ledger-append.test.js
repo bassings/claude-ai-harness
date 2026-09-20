@@ -4521,6 +4521,36 @@ test('ledger-append (H1, fix round 4): 400 findings with 400 DISTINCT lens names
   assert.equal(entry.rejected_finding_count, 400, 'the round\'s true total is still recorded')
 })
 
+// --- round-4 review M1: the no-spec predicate's single definition site ---
+//
+// The rule is exported so the reader re-derives the classification for a
+// historical line from the same source the writer's own workflow uses. The
+// defect was inside the rule, not at the call site: "no verdicts survive on
+// this record" was treated as "no verdicts existed", which is only true when
+// the record still holds every verdict it was written with. The third
+// argument carries the two facts that say otherwise, so the rule keeps
+// owning what counts as evidence rather than a caller deciding it.
+test('ledger-append module (M1): wasNoSpecInPlay treats an EMPTIED ac_verdicts array as evidence a spec WAS in play, and an untouched empty one as evidence it was not', async () => {
+  const { wasNoSpecInPlay } = await import(APPEND_MODULE_URL)
+  // The rule as it always was, unchanged.
+  assert.equal(wasNoSpecInPlay(null, []), true, 'no spec, no verdicts, nothing said about truncation: a no-spec run')
+  assert.equal(wasNoSpecInPlay(null, [{ ac_id: 'AC-QA-1', verdict: 'PASS' }]), false, 'a lens found a spec and returned verdicts')
+  assert.equal(wasNoSpecInPlay('specs/a.md', []), false, 'a named spec is a spec in play whatever the verdicts say')
+  assert.equal(wasNoSpecInPlay(null, [], {}), true, 'an options object with nothing in it changes nothing')
+  assert.equal(wasNoSpecInPlay(null, [], { acVerdictsTruncated: 0, degraded: false }), true, 'real measured zeros are still a no-spec run')
+  // The fix.
+  assert.equal(wasNoSpecInPlay(null, [], { acVerdictsTruncated: 3 }), false,
+    'verdicts that were cut to fit the line are proof they existed: an emptied array is not an empty one')
+  assert.equal(wasNoSpecInPlay(null, undefined, { acVerdictsTruncated: 7 }), false,
+    'and the counter carries the same proof when the array is absent entirely')
+  assert.equal(wasNoSpecInPlay(null, [], { degraded: true }), false,
+    'a collapsed record lost its spec and its verdicts together, so it is evidence of neither')
+  // Hostile/garbage values in the evidence fields must not be read as evidence.
+  assert.equal(wasNoSpecInPlay(null, [], { acVerdictsTruncated: 'lots' }), true,
+    'a non-numeric counter is not a count; it must not flip the classification on a string')
+  assert.equal(wasNoSpecInPlay(null, [], { acVerdictsTruncated: -1 }), true, 'nor a negative one')
+})
+
 test('ledger-append (M7): SCHEMA_VERSION is 3, so a window spanning this change can tell the two populations apart', async () => {
   // Planning decision 5, and it was not built in the first pass. Without it a
   // 90-day window mixes lines written before and after four validator changes

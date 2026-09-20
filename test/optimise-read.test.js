@@ -2248,6 +2248,85 @@ test('optimise-read (H3): neverFailingAcs called with no truncatedBuckets option
   assert.equal(never[0].truncated_in_window, false)
 })
 
+// --- round-4 review M1 --------------------------------------------------
+//
+// "No spec was in play" was derived from `ac_verdicts` being empty. An
+// EMPTIED array is not an empty one: a record whose verdicts were cut to
+// make the line fit is a record that HAD verdicts, so reading the gap as
+// "there was no spec" is this spec's own defect class -- a discarded value
+// read as a measurement of absence -- reproduced inside the reader this
+// spec added, and it inverts a classification rather than shrinking a
+// count.
+//
+// Two record shapes carry that evidence, and both were measured through the
+// real writer before these tests were written (see the fix round 5 section
+// of docs/harn-ledger-validators-mutation-proofs.md):
+//   - `ac_verdicts_truncated > 0`: verdicts existed and were cut.
+//   - `degraded: true`: the record collapsed to the envelope, so it carries
+//     no evidence about verdicts, spec or findings at all. A degraded line
+//     has no `spec` for the same reason, which is exactly why it used to
+//     satisfy the no-spec rule by accident.
+test('optimise-read (M1): a record whose ac_verdicts were TRUNCATED away is not read as a no-spec run, and its spec_bug findings keep their classification', () => {
+  const rec = {
+    kind: 'review_cycle', repo: 'demo', spec: null, round_key: 'k1', outcome: 'done',
+    ac_verdicts: [], ac_verdicts_truncated: 3,
+    findings: [{ id: 'f1', lens: 'lens-qa', severity: 'Low', ac_id: null, disposition: 'spec_bug' }],
+  }
+  const out = mod.aggregateRework([rec])
+  assert.equal(out.noSpecReviewRuns, 0,
+    'verdicts that were cut are evidence a spec WAS in play; an emptied array must not be read as an empty one')
+  assert.equal(out.noSpecFindingsReclassified, 0)
+  assert.deepEqual(out.lensDispositionCounts, { 'lens-qa': { fixed: 0, rejected: 0, spec_bug: 1, open: 0 } },
+    'the finding keeps its spec_bug disposition -- reclassifying it here inverts a quality signal on the strength of a value that was discarded')
+})
+
+test('optimise-read (M1): a DEGRADED record is not read as a no-spec run either -- an envelope that lost everything carries no evidence about anything', () => {
+  // Measured through the real writer at fix round 5: an oversized payload
+  // whose ladder runs out collapses to a 211-byte envelope with spec,
+  // ac_verdicts, findings AND ac_verdicts_truncated all gone. Before this
+  // fix the reader counted every such line as a no-spec review run, which
+  // is the count-only half of the same defect and the half reachable
+  // through the ordinary writer path.
+  const rec = { kind: 'review_cycle', repo: 'demo', outcome: 'done', degraded: true }
+  const out = mod.aggregateRework([rec])
+  assert.equal(out.noSpecReviewRuns, 0, 'a collapsed record proves nothing about whether a spec was in play')
+})
+
+test('optimise-read (M1, not over-broad): a GENUINE no-spec run -- no verdicts, nothing truncated, not degraded -- still reclassifies exactly as before', () => {
+  const rec = {
+    kind: 'review_cycle', repo: 'demo', spec: null, round_key: 'k1', outcome: 'done',
+    ac_verdicts: [], ac_verdicts_truncated: 0,
+    findings: [{ id: 'f1', lens: 'lens-qa', severity: 'Low', ac_id: null, disposition: 'spec_bug' }],
+  }
+  const out = mod.aggregateRework([rec])
+  assert.equal(out.noSpecReviewRuns, 1, 'a real measured zero is still a no-spec run')
+  assert.equal(out.noSpecFindingsReclassified, 1)
+  assert.equal(out.lensDispositionCounts['lens-qa'].open, 1, 'and D4 still reclassifies it')
+  assert.equal(out.lensDispositionCounts['lens-qa'].spec_bug, 0)
+})
+
+test('optimise-read (M1): end to end -- a line the REAL writer produced carrying ac_verdicts_truncated and spec_bug findings is not reclassified', () => {
+  // The route the fix-round-5 measurement found: the writer recomputes
+  // ac_verdicts_truncated only `if (Array.isArray(entry.ac_verdicts))`, so a
+  // payload supplying the counter with no verdicts array keeps it, and the
+  // line is written with write_ok true and nothing degraded. Measured
+  // before the fix: three spec_bug findings reclassified to open.
+  const repo = makeTempRepo()
+  const res = runAppend(repo, {
+    schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: null,
+    ac_verdicts_truncated: 7,
+    spec_bugs: Array.from({ length: 3 }, (_, i) => ({ lens: 'lens-qa', location: `s${i}.js:1`, claim: `spec bug ${i}` })),
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const entry = JSON.parse(fs.readFileSync(path.join(repo, LEDGER_REL), 'utf8').trim().split('\n')[0])
+  assert.equal(entry.ac_verdicts_truncated, 7, 'precondition: the written line really does carry the counter')
+  assert.equal(entry.findings.filter((f) => f.disposition === 'spec_bug').length, 3, 'precondition: and the spec_bug findings really did survive')
+  const agg = mod.aggregateRework([{ ...entry, repo: 'demo' }])
+  assert.equal(agg.noSpecReviewRuns, 0)
+  assert.equal(agg.lensDispositionCounts['lens-qa'].spec_bug, 3, 'all three keep their classification')
+})
+
 // H4 (round 3 review): a no-spec run's spec_bug findings are reclassified to
 // open (D4), but nothing counted that this happened -- the signal "this
 // round was reviewed with no spec" existed only as an absence, exactly the

@@ -427,7 +427,15 @@ export function aggregateRework(records, { root = '' } = {}) {
     // the history a write-side fix never can.
     // L3: the shared predicate, imported from ledger-append.mjs rather than
     // a second copy of decision 4's rule.
-    const noSpecWasInPlay = wasNoSpecInPlay(r.spec, r.ac_verdicts)
+    // M1 (round-4 review): the record's own evidence about whether its
+    // ac_verdicts can be read at face value is handed to the predicate, which
+    // owns what that evidence means. `r.ac_verdicts_truncated` is the same
+    // field this loop already summed twenty-five lines above and used to taint
+    // truncatedBuckets -- it was in hand and simply not consulted here.
+    const noSpecWasInPlay = wasNoSpecInPlay(r.spec, r.ac_verdicts, {
+      acVerdictsTruncated: r.ac_verdicts_truncated,
+      degraded: r.degraded,
+    })
     if (noSpecWasInPlay) noSpecReviewRuns += 1
     const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
 

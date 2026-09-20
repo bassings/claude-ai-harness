@@ -1398,7 +1398,32 @@ export function canonicalPlanKey(spec, root) {
 // protects (spec_bugs/spec_bug_count are null, never a measured zero, on a
 // no-spec run) is enforced in review-cycle.js's own post-processing of the
 // synthesis response, which is what this repo's tests exercise directly.
-export function wasNoSpecInPlay(spec, acVerdicts) {
+// M1 (round-4 review): the third argument is the record's own evidence about
+// whether its `acVerdicts` can be read at face value, and it lives HERE rather
+// than at the call site so the rule keeps one definition. "No verdicts on this
+// record" only means "no verdicts existed" when the record still holds
+// everything it was written with, and two shapes say it does not:
+//
+//   - acVerdictsTruncated > 0: verdicts existed and were cut to fit the byte
+//     budget. Reading the gap they left as "there was no spec" is this spec's
+//     own defect class (a discarded value read as a measurement of absence),
+//     and unlike the truncation cases the reader merely undercounts, this one
+//     INVERTS a classification: a spec_bug finding, the quality signal D4
+//     exists to keep usable, is reclassified to open on the strength of data
+//     that was thrown away.
+//   - degraded: the record collapsed to the bare envelope, which drops spec,
+//     ac_verdicts, findings and the truncation counters together. It satisfied
+//     the old rule by accident, for the same reason it satisfies nothing else:
+//     it carries no evidence at all. Measured at fix round 5 through the real
+//     writer -- an oversized payload writes a 211-byte degraded line, and
+//     every one of them was being counted as a no-spec review run.
+//
+// Both fields are validated as evidence rather than trusted: a ledger line is
+// untrusted data on disk, so a non-integer or negative counter is not a count
+// and must not flip a classification.
+export function wasNoSpecInPlay(spec, acVerdicts, { acVerdictsTruncated = 0, degraded = false } = {}) {
+  if (degraded === true) return false
+  if (Number.isInteger(acVerdictsTruncated) && acVerdictsTruncated > 0) return false
   return !spec && !(Array.isArray(acVerdicts) && acVerdicts.length > 0)
 }
 
