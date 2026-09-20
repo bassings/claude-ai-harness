@@ -558,7 +558,7 @@ argument for running them.
 ## Full-suite result after all restores
 
 **Fix round 5, measured:** `node --test test/*.test.js` -- 1285/1285
-passing, three consecutive runs (49.6s, 50.1s, 49.8s), with `python3 -m unittest discover -s hooks
+passing, three consecutive runs at the final tip (54.9s, 53.1s, 52.3s), with `python3 -m unittest discover -s hooks
 -p 'test_*.py'` at 64 tests OK. The M5 flake (a wall-clock assertion under
 parallel load) is recorded debt and did not fire in these runs, which proves
 nothing about it either way: it is load-dependent and these runs were not
