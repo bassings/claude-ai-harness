@@ -103,7 +103,14 @@ test('seam: review_cycle terminal payload, captured from a real run with a non-e
   const entry = pipeAndAssertWritten(payload, 'review_cycle')
   assert.equal(entry.kind, 'review_cycle')
   assert.deepEqual(entry.lenses_run, ['lens-security', 'lens-qa'])
-  assert.equal(entry.spec_bug_count, 1)
+  // This asserted spec_bug_count === 1. That was incidental to what the test
+  // is for (a real captured payload surviving the seam), and it pinned the D4
+  // conflation as correct: this run has no spec, so its "spec bug" was a
+  // finding with no spec to be a bug in. Supplying a spec instead would change
+  // which lenses trigger and so change what the seam carries. Asserting the
+  // synthesis rider reached the writer keeps the original intent exactly.
+  assert.equal(entry.spec_bug_count, null, 'no spec was in play, so the count is unmeasured, not zero')
+  assert.equal(entry.findings.length, 1, 'and the finding itself still made it through the seam')
 })
 
 // specs/record-fixed-findings.md AC-2: a full run with args.prior_findings

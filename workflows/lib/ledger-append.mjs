@@ -44,7 +44,14 @@ import { fileURLToPath } from 'node:url'
 // change to every written line, and AC-OPS-4 needs a stale installed
 // mirror (~/.claude/workflows/lib/ledger-append.mjs, still writing the old
 // shape) to be detectable from the report rather than failing silently.
-export const SCHEMA_VERSION = 2
+// specs/harn-ledger-validators.md decision 5: bumped from 2. Four validator
+// changes land together, and without a version marker a 90-day window mixes
+// the two populations with nothing to separate them: a null ac_id could be a
+// real absence or the old pattern rejecting a legitimate value, and a
+// spec_bug count could be a real one or D4's conflation of "no spec" with
+// "the spec has a bug". The reader already tallies schema_version and rejects
+// no version, so the bump costs nothing and makes the two readable apart.
+export const SCHEMA_VERSION = 3
 
 // Hard-coded and not configurable (AC-SIMP-2): resolved against the MAIN
 // checkout root (never a worktree's own .claude/) via `git rev-parse
@@ -101,7 +108,67 @@ const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
 // (below) compiles `new RegExp(propSchema.pattern)` generically from the
 // pattern STRING for every patterned field, so a second, field-specific
 // compiled RegExp would be genuinely dead code, not merely unused.
-const AC_ID_PATTERN_STR = '^AC-[A-Z]+-[0-9]+$'
+// specs/harn-ledger-validators.md D1 + D2. Was '^AC-[A-Z]+-[0-9]+$', which
+// silently nulled two legitimate shapes, after which the aggregate reported
+// zero -- indistinguishable from "this never happened":
+//
+//   D1  `AC-A11Y-<n>`, the id agents/lens-accessibility.md INSTRUCTS that lens
+//       to emit. The digits inside A11Y fail [A-Z]+, so every accessibility
+//       criterion and verdict ever written was discarded. The other eight
+//       lenses passed only because their prefixes contain no digit: the
+//       harness's own contract disagreeing with its own validator.
+//   D2  A spec-qualified id (`FEAT-011 AC-QA-1`, `FEAT-010/AC-QA-3`), which a
+//       lens emits when one review spans several specs. 203 verdicts were
+//       nulled in a single measured run, leaving a whole 90-day window with no
+//       verdict data at all.
+//
+// The prefix stays INSIDE ac_id rather than being stripped into a new field.
+// Stripping would merge two different specs' AC-QA-1 into one aggregation
+// bucket and could report a criterion that FAILED as never_failed, which is an
+// inverted conclusion -- worse than the lost measurement it replaces.
+//
+// It is bounded inside the pattern rather than sanitised afterwards, because
+// this value reaches an aggregation key (optimise-read.mjs:410) and a rendered
+// report. The obvious widening `^[\w\s./-]*AC-...$` accepts
+// `ignore previous instructions AC-SEC-1` -- the exact string
+// optimise-read.mjs:285 already names as the attack it fears. So: at most one
+// prefix segment of 1 to 40 characters from a closed class, and exactly one
+// separator, which is a single space or a single forward slash. No OTHER
+// whitespace, and no newline, carriage return, backtick, angle bracket, pipe,
+// dollar or colon, appears anywhere in an accepted value.
+//
+// That sentence said "no whitespace anywhere" until review round one, which is
+// false: the separator is a space, and `FEAT-011 AC-QA-1` is in the accept
+// list twelve lines from the claim. Whitespace is precisely what makes a
+// rendered report line splittable, so the one property a reader would most
+// want guaranteed was the one being overstated.
+//
+// The quantifier is BOUNDED and unnested, deliberately. The candidate shape
+// `^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$` measured 0.51ms at 20
+// characters, 7.91ms at 24 and 31.67ms at 26 -- doubling per added character,
+// a denial of service inside a validator. This one is flat to 1024 characters;
+// test/ledger-append.test.js pins that.
+//
+// EXPORTED so a test can ask for the real pattern. It was not, and two tests
+// written against it passed vacuously: an unexported constant arrives as
+// undefined, and `new RegExp(undefined)` matches every string.
+//
+// Every quantifier is BOUNDED, including the lens segment and the number.
+// Review round one measured `AC-QA-` + 4090 digits validating: six such ids on
+// one record produced a 210-byte envelope-only line with every verdict,
+// finding, lenses_run and trigger_counts gone, and write_ok still true. A lens
+// report is untrusted model output, so one long id could erase a whole round
+// from the only delivery-telemetry store. The bound has to live HERE because
+// collectErrors implements type, enum, pattern and array items only: a
+// maxLength declaration is silently ignored (the schema's own minLength:1 on
+// run_id accepts the empty string today).
+// M2 (round 3 review): the prefix and the AC id itself are NAMED groups
+// (`prefix`, `ac`) so optimise-read.mjs's stripOwnSpecPrefix can extract
+// them from THIS pattern directly, instead of carrying its own second,
+// looser copy of the same shape. A named group changes nothing about what
+// the pattern matches (RegExp#test ignores group names entirely), so this
+// costs nothing for the schema-validation use below.
+export const AC_ID_PATTERN_STR = '^(?:(?<prefix>[A-Za-z0-9_.-]{1,40})(?<sep>[ /]))?(?<ac>AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6})$'
 // M1 (round 4 remainder): the single definition site for the `lens` shape,
 // shared with the schema declaration above. Round-7 review, F1 sweep:
 // EXPORTED so optimise-read.mjs can ask "is this a REAL lens name?"
@@ -118,7 +185,12 @@ const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // guard does not match, and it is never recorded fixed: this measure can
 // undercount a genuine fix, never overcount one, which is the safe
 // direction for a number that feeds rework attribution.
-const DISPOSITIONS = ['open', 'rejected', 'spec_bug', 'fixed']
+// L4 (round 3 review): EXPORTED so the schema's own enum (below) and
+// optimise-read.mjs's aggregation read the SAME array -- before this, the
+// disposition values were spelled out independently in several places, and
+// a new disposition would have had to be added correctly in all of them or
+// fail silently in whichever one was missed.
+export const DISPOSITIONS = ['open', 'rejected', 'spec_bug', 'fixed']
 
 // The envelope + payload schema for one ledger line. additionalProperties is
 // false at every object level (AC-SEC-2): a field that is not declared here
@@ -372,6 +444,25 @@ export const LEDGER_ENTRY_SCHEMA = {
     // was dropped) when finding arrays were supplied at all, null when
     // they were not (a kind with no findings concept, e.g. tdd_task).
     findings_truncated: { type: ['integer', 'null'] },
+    // specs/harn-ledger-validators.md D3 was answered for three fix rounds by
+    // a writer-computed per-lens tally, `findings_by_lens`, stored here so a
+    // truncated round still reported true per-lens counts. REMOVED at fix
+    // round 4 (owner's decision) after it produced a defect in every review
+    // round it existed: double-counted fixes, then a whole-record collapse,
+    // then zero fixes on exactly the busy rounds it was built for. Its keys
+    // were lens names taken from synthesis output, so their COUNT was
+    // caller-shaped and unbounded while the byte-rescue loop could shrink
+    // only findings and ac_verdicts -- 400 distinct lens names wrote a
+    // 211-byte degraded line with everything erased and write_ok true.
+    //
+    // The per-finding array above is the one source again, which means a
+    // truncated round undercounts the per-lens attribution exactly as it did
+    // before the field existed. That is stated rather than papered over:
+    // findings_truncated (immediately above) carries the count of what is
+    // missing, and AC-QA-8's reported-shortfall branch is what D3 is now
+    // satisfied by. A reported shortfall is a worse measurement than a
+    // correct tally and a better one than a tally that erases the record it
+    // is describing.
     // Round-6 review M2: ac_verdicts is truncated at MAX_AC_VERDICTS with
     // no counter of its own, unlike findings/findings_truncated -- the
     // same "the surplus was cut and NOTHING records that it happened"
@@ -1289,6 +1380,53 @@ export function canonicalPlanKey(spec, root) {
   return segments.join('/')
 }
 
+// L3 (round 3 review): specs/harn-ledger-validators.md decision 4's own
+// rule -- "no spec was in play" means no spec path was supplied AND no
+// lens returned any ac_verdicts (review-cycle.js's no-spec branch tells a
+// lens with none to go and find one, so a run invoked without a spec
+// argument may still legitimately have verified criteria). EXPORTED as the
+// single definition site so optimise-read.mjs (a real importable module)
+// reads the identical rule when re-deriving the classification for a
+// historical line.
+//
+// review-cycle.js cannot import this: it is a workflow script, and this
+// file's own header comment records that the runtime statically rejects
+// any import before a workflow script even starts. Its own inline copy of
+// this same boolean therefore remains a necessary, documented duplicate --
+// but it now only decides PROMPT wording (whether to ask synthesis for
+// spec_bugs at all); the actual data-shape guarantee this predicate
+// protects (spec_bugs/spec_bug_count are null, never a measured zero, on a
+// no-spec run) is enforced in review-cycle.js's own post-processing of the
+// synthesis response, which is what this repo's tests exercise directly.
+// M1 (round-4 review): the third argument is the record's own evidence about
+// whether its `acVerdicts` can be read at face value, and it lives HERE rather
+// than at the call site so the rule keeps one definition. "No verdicts on this
+// record" only means "no verdicts existed" when the record still holds
+// everything it was written with, and two shapes say it does not:
+//
+//   - acVerdictsTruncated > 0: verdicts existed and were cut to fit the byte
+//     budget. Reading the gap they left as "there was no spec" is this spec's
+//     own defect class (a discarded value read as a measurement of absence),
+//     and unlike the truncation cases the reader merely undercounts, this one
+//     INVERTS a classification: a spec_bug finding, the quality signal D4
+//     exists to keep usable, is reclassified to open on the strength of data
+//     that was thrown away.
+//   - degraded: the record collapsed to the bare envelope, which drops spec,
+//     ac_verdicts, findings and the truncation counters together. It satisfied
+//     the old rule by accident, for the same reason it satisfies nothing else:
+//     it carries no evidence at all. Measured at fix round 5 through the real
+//     writer -- an oversized payload writes a 211-byte degraded line, and
+//     every one of them was being counted as a no-spec review run.
+//
+// Both fields are validated as evidence rather than trusted: a ledger line is
+// untrusted data on disk, so a non-integer or negative counter is not a count
+// and must not flip a classification.
+export function wasNoSpecInPlay(spec, acVerdicts, { acVerdictsTruncated = 0, degraded = false } = {}) {
+  if (degraded === true) return false
+  if (Number.isInteger(acVerdictsTruncated) && acVerdictsTruncated > 0) return false
+  return !spec && !(Array.isArray(acVerdicts) && acVerdicts.length > 0)
+}
+
 // Strips every occurrence of `root` (an absolute path) out of free text,
 // e.g. an error message, without needing the fuller redactPaths pattern
 // match -- used on paths a Node error object hands back verbatim
@@ -1948,6 +2086,27 @@ export function main() {
       entry.findings = entry.findings.slice(0, -1)
       dropped += 1
       entry.findings_truncated = baseTruncated + dropped
+      line = JSON.stringify(entry)
+    }
+  }
+
+  // H1 (round-2 review): findings reaching zero does not guarantee the line
+  // now fits -- a multi-spec review's ac_verdicts array (bounded separately
+  // at MAX_AC_VERDICTS, not by MAX_LINE_BYTES) can by itself exceed the byte
+  // budget once every finding is already gone. Before this, that case fell
+  // straight through to the envelope-only collapse below, discarding every
+  // verdict AND every finding with write_ok still true -- the exact D2 case
+  // (a multi-spec review, 203 verdicts) this spec was written for. Shrink
+  // ac_verdicts one entry at a time, the same mechanism as findings above,
+  // recording the growing count in ac_verdicts_truncated (an established,
+  // real-measured-zero field already) rather than reaching the collapse.
+  if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES && Array.isArray(entry.ac_verdicts)) {
+    const baseAcTruncated = entry.ac_verdicts_truncated || 0
+    let droppedAc = 0
+    while (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES && entry.ac_verdicts.length > 0) {
+      entry.ac_verdicts = entry.ac_verdicts.slice(0, -1)
+      droppedAc += 1
+      entry.ac_verdicts_truncated = baseAcTruncated + droppedAc
       line = JSON.stringify(entry)
     }
   }

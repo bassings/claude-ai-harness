@@ -112,6 +112,19 @@ test('shell-injection: the same hostile claim still lands intact as DATA in the 
   const ledgerPath = path.join(repo, '.claude', 'harness-ledger.jsonl')
   assert.ok(fs.existsSync(ledgerPath), 'expected the ledger line to be written')
   const entry = JSON.parse(fs.readFileSync(ledgerPath, 'utf8').trim().split('\n')[0])
-  assert.equal(entry.findings.some((f) => f.disposition === 'spec_bug'), true, 'the hostile claim was still recorded as a spec-bug finding, just safely')
+  // Asserted disposition === 'spec_bug'. This run supplies no spec, so that
+  // classification was the D4 conflation and is now 'open'. The disposition was
+  // never what this test is about: it is about a hostile claim reaching the
+  // ledger INTACT AS DATA rather than executing or being silently dropped. So
+  // it now asserts that, which is stronger and does not depend on how the
+  // finding happens to be filed.
+  // The ledger's findings deliberately carry NO free text (AC-SEC-2), so the
+  // claim string itself is not observable here and never was: the original
+  // assertion could only see the disposition. What it proves is that the
+  // hostile input produced a RECORDED finding rather than executing or being
+  // dropped, which is exactly the property this test is named for.
+  assert.equal(entry.findings.length, 1, 'the hostile claim must still be recorded, just safely')
+  assert.equal(entry.findings[0].disposition, 'open',
+    'this run supplies no spec, so the finding is open; it was filed as spec_bug before D4, which was the conflation')
   fs.rmSync(marker, { force: true })
 })

@@ -35,7 +35,15 @@ function ledgerFixture(overrides = {}) {
     // real CLI now actually emits, not the pre-round-2 raw-path shape.
     perRepo: [{ root: 'demo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false }],
     skipped: [],
-    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }], invalidAcIdsDropped: 0, invalidRecordValuesDropped: 0, invalidFixedIdsDropped: 0, duplicateFixedIdsDropped: 0, duplicateFixedAcrossRounds: 0, invalidPriorIdsDropped: 0 },
+    // H3/H4 (round 3 review): findingsTruncated/acVerdictsTruncated/
+    // unattributedFindings/noSpecReviewRuns/noSpecFindingsReclassified
+    // included as real zeros here, matching the surrounding convention --
+    // this default fixture represents an UP-TO-DATE reader that genuinely
+    // computed "nothing dropped", distinguishable from a stale reader that
+    // never computed these fields at all (undefined). The "renders the
+    // unavailable marker" test below builds its own rework object omitting
+    // them.
+    rework: { n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } }, acVerdicts: [{ repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', pass: 5, fail: 1, unverifiable: 0, n: 6 }], invalidAcIdsDropped: 0, invalidRecordValuesDropped: 0, invalidFixedIdsDropped: 0, duplicateFixedIdsDropped: 0, duplicateFixedAcrossRounds: 0, invalidPriorIdsDropped: 0, findingsTruncated: 0, acVerdictsTruncated: 0, unattributedFindings: 0, noSpecReviewRuns: 0, noSpecFindingsReclassified: 0 },
     neverFailingAcs: [{ key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false }],
     // Review round-2 H-1: the orphan/aborted fields are included here as
     // explicit real zeros -- representing an UP-TO-DATE reader that
@@ -315,6 +323,105 @@ test('optimise-cycle: the report renders real ZEROS for the orphan counts on a c
   assert.ok(line, `expected a line starting with "Orphaned agent-compute runs" even when every count is zero, report was: ${result.report}`)
   assert.ok(line.includes('start-only=0'), `got: ${line}`)
   assert.ok(line.includes('terminal-only=0'), `got: ${line}`)
+})
+
+// ---- H3 (round 3 review, specs/harn-ledger-validators.md): the report
+// layer AC-PROD-7 promised was never built. "None recorded." on Never-
+// failing acceptance criteria carried no count of what was DROPPED to get
+// there, and Rework attribution carried no count of findings dropped from
+// its own tally -- so a future zero reads exactly like "this did not
+// happen" once again, inside the very report meant to close that class. ----
+
+test('optimise-cycle (H3, AC-PROD-7): "None recorded." on Never-failing acceptance criteria carries the window\'s invalid_ac_ids_dropped beside it', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      neverFailingAcs: [],
+      rework: { n: 0, lensDispositionCounts: {}, acVerdicts: [], unattributableCount: 0, invalidAcIdsDropped: 7 },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const idx = result.report.split('\n').findIndex((l) => l.trim() === 'None recorded.')
+  assert.equal(idx, -1, `"None recorded." must now carry the drop count on the SAME line, report was: ${result.report}`)
+  const lines = result.report.split('\n')
+  const neverFailingHeadingIdx = lines.findIndex((l) => l.startsWith('## Never-failing acceptance criteria'))
+  assert.ok(neverFailingHeadingIdx !== -1, 'expected the Never-failing acceptance criteria heading')
+  const noneLine = lines.slice(neverFailingHeadingIdx, neverFailingHeadingIdx + 5).find((l) => l.startsWith('None recorded'))
+  assert.ok(noneLine, `expected a "None recorded" line under the heading, report was: ${result.report}`)
+  assert.ok(noneLine.includes('invalid_ac_ids_dropped'), `must name the counter, got: ${noneLine}`)
+  assert.ok(noneLine.includes('7'), `must carry the actual window figure, got: ${noneLine}`)
+})
+
+test('optimise-cycle (H3): "Rework attribution" carries findings dropped from the tally -- findings_truncated, ac_verdicts_truncated and unattributed findings', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      rework: {
+        n: 6, lensDispositionCounts: { 'lens-qa': { fixed: 0, rejected: 1, spec_bug: 0, open: 2 } },
+        acVerdicts: [], unattributableCount: 0,
+        findingsTruncated: 12, acVerdictsTruncated: 4, unattributedFindings: 9,
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n')
+  const headingIdx = lines.findIndex((l) => l.startsWith('## Rework attribution'))
+  assert.ok(headingIdx !== -1, 'expected the Rework attribution heading')
+  const section = lines.slice(headingIdx, headingIdx + 12).join('\n')
+  assert.ok(section.includes('findings_truncated') && section.includes('12'), `expected findings_truncated=12 in the section, got:\n${section}`)
+  assert.ok(section.includes('ac_verdicts_truncated') && section.includes('4'), `expected ac_verdicts_truncated=4 in the section, got:\n${section}`)
+  assert.ok(section.includes('unattributed') && section.includes('9'), `expected the unattributed findings count in the section, got:\n${section}`)
+})
+
+test('optimise-cycle (H3): Rework attribution renders real zeros for the drop counters on a clean fixture, never omitting the line', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const lines = result.report.split('\n')
+  const headingIdx = lines.findIndex((l) => l.startsWith('## Rework attribution'))
+  const section = lines.slice(headingIdx, headingIdx + 12).join('\n')
+  assert.ok(/findings_truncated[^\n]*\b0\b/.test(section), `expected a real zero for findings_truncated, got:\n${section}`)
+  assert.ok(/ac_verdicts_truncated[^\n]*\b0\b/.test(section), `expected a real zero for ac_verdicts_truncated, got:\n${section}`)
+})
+
+test('optimise-cycle (H3): Rework attribution renders the unavailable marker (not a false zero) when the installed reader predates these fields', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      rework: { n: 6, lensDispositionCounts: {}, acVerdicts: [], unattributableCount: 0 },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n')
+  const headingIdx = lines.findIndex((l) => l.startsWith('## Rework attribution'))
+  const section = lines.slice(headingIdx, headingIdx + 12).join('\n')
+  assert.ok(section.includes('unavailable (installed optimise-read.mjs predates this field)'),
+    `a stale installed reader (no findingsTruncated key at all) must render the explicit marker, not a confident 0, got:\n${section}`)
+})
+
+// H4 (round 3 review): no-spec review runs and the findings reclassified on
+// them get their own rendered line in Rework attribution -- the signal
+// "this work was reviewed with no spec" must land somewhere a reader sees.
+test('optimise-cycle (H4, AC-PROD-5): Rework attribution names no-spec review runs and the findings reclassified on them, as their own line', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      rework: {
+        n: 6, lensDispositionCounts: {}, acVerdicts: [], unattributableCount: 0,
+        noSpecReviewRuns: 3, noSpecFindingsReclassified: 11,
+      },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n')
+  const headingIdx = lines.findIndex((l) => l.startsWith('## Rework attribution'))
+  const line = lines.slice(headingIdx, headingIdx + 12).find((l) => /no-spec review runs/i.test(l))
+  assert.ok(line, `expected a line naming no-spec review runs, report was:\n${result.report}`)
+  assert.ok(line.includes('3'), `must carry the run count, got: ${line}`)
+  assert.ok(line.includes('11'), `must carry the reclassified-findings count, got: ${line}`)
+})
+
+test('optimise-cycle (H4): the no-spec line renders real zeros on a clean fixture, never omitted', async () => {
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const lines = result.report.split('\n')
+  const headingIdx = lines.findIndex((l) => l.startsWith('## Rework attribution'))
+  const line = lines.slice(headingIdx, headingIdx + 12).find((l) => /no-spec review runs/i.test(l))
+  assert.ok(line, `expected the no-spec line even when clean, report was:\n${result.report}`)
+  assert.ok(/\b0\b/.test(line), `expected a real zero, got: ${line}`)
 })
 
 // H1's aborted-pairs counter (a crashed run's agent-compute time, excluded

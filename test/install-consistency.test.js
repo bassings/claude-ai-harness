@@ -905,6 +905,34 @@ test('install-consistency: checkStaleness (HIGH-2) -- an optional bin/ file that
   assert.equal(result.status, 'drift')
 })
 
+// M4 (round 3 review): listInstallFiles() is bin/install.sh's own entry
+// point for "what to copy" -- the same tracked-and-consumer-subset
+// intersection checkStaleness computes internally, exported once so the
+// installer never carries a second, independently maintained copy of it.
+test('install-consistency (M4): listInstallFiles returns the tracked consumer subset, split into required and optional', async () => {
+  const { listInstallFiles } = await loadModule()
+  const repo = publishedSubsetTree()
+  const result = listInstallFiles(repo)
+  assert.equal(result.blind, false)
+  assert.ok(result.files.includes('AGENT-HARNESS.md'))
+  assert.ok(result.files.includes('bin/optimise-cycle-weekly.sh'), 'optional files are still returned for install -- shipping them is never itself optional')
+  assert.ok(result.required.includes('AGENT-HARNESS.md'))
+  assert.ok(!result.required.includes('bin/optimise-cycle-weekly.sh'), 'an optional file must not also appear in required')
+  assert.ok(result.optional.includes('bin/optimise-cycle-weekly.sh'))
+  assert.ok(result.optional.includes('hooks/hooks.json'))
+  assert.equal(result.required.length + result.optional.length, result.files.length)
+  assert.ok(!result.files.includes('README.md'), 'a file outside the consumer subset must not be returned')
+})
+
+test('install-consistency (M4): listInstallFiles reports blind (never an empty list read as "nothing to install") when the directory is not a git checkout', async () => {
+  const { listInstallFiles } = await loadModule()
+  const dir = fs.mkdtempSync(path.join(TMP_ROOT, 'notgit-'))
+  fs.writeFileSync(path.join(dir, 'AGENT-HARNESS.md'), 'harness contract\n')
+  const result = listInstallFiles(dir)
+  assert.equal(result.blind, true)
+  assert.deepEqual(result.files, [])
+})
+
 // L-4 (harn-fix-3, promoted 2026-08-24 after being measured against a real
 // install, not merely argued). hooks/hooks.json is the plugin manifest --
 // used only when the harness is installed via `/plugin install`. README.md's
