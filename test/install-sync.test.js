@@ -258,9 +258,16 @@ test('install.sh (M2): --help prints usage, writes nothing, and exits 0 -- askin
 })
 
 test('install.sh (M2): a second argument is refused rather than silently ignored', () => {
+  // Asserted on the DIAGNOSTIC, not merely on a non-zero exit: `--check
+  // extra` against an empty destination exits non-zero anyway (it is
+  // drifted), so an exit-status-only assertion passes whether the extra
+  // argument was refused or silently dropped. Measured -- deleting the arity
+  // check left the exit-status version of this test green.
   const dest = tmpInstall()
   const res = run(['--check', 'extra'], { CLAUDE_HOME: dest, HARNESS_INSTALL_REQUIRE_MARKER: '0' })
   assert.notEqual(res.status, 0, 'an argument the script cannot act on must not be dropped on the floor')
+  assert.match(res.stderr, /too many arguments/i,
+    'the refusal must name the reason: an argument the script cannot act on is an error, not a no-op')
   assert.equal(fs.readdirSync(dest).length, 0)
 })
 
