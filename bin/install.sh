@@ -35,10 +35,48 @@ set -eu
 REPO="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 DEST="${CLAUDE_HOME:-$HOME/.claude}"
 LIB="$REPO/workflows/lib/install-consistency.mjs"
-LIB_JS="$(printf '%s' "$LIB" | sed "s/'/\\\\'/g")"
 
+usage() {
+  cat >&2 <<'USAGE'
+usage: bin/install.sh [--check]
+
+  (no argument)  install this checkout into $CLAUDE_HOME (default ~/.claude),
+                 then verify what was written
+  --check        verify only: writes nothing, non-zero exit on drift
+  --help, -h     print this message
+
+CLAUDE_HOME overrides the destination.
+USAGE
+}
+
+# M2 (round 4 review): the parse was `[ "${1:-}" = "--check" ] && CHECK_ONLY=1`
+# and everything else fell through to the install branch, so `--dry-run`,
+# `--verify`, `-n` and every near-miss spelling of --check wrote 29 files into
+# the operator's ~/.claude. Each of those spellings means "tell me, do not
+# change anything", and this is the only path in this change that writes
+# outside the repo -- on a machine where the workflows are re-read from disk on
+# the very next run, so the currently checked-out branch goes live immediately.
+# The marker guard below does not cover it: that refuses a destination which
+# does not LOOK like a Claude install, and a real ~/.claude does.
+#
+# Writing is now reachable only by asking for nothing, which is the one
+# spelling that cannot be a typo of something else.
 CHECK_ONLY=0
-[ "${1:-}" = "--check" ] && CHECK_ONLY=1
+if [ "$#" -gt 1 ]; then
+  echo "install: too many arguments (expected at most one)." >&2
+  usage
+  exit 2
+fi
+case "${1:-}" in
+  '') ;;
+  --check) CHECK_ONLY=1 ;;
+  -h|--help) usage; exit 0 ;;
+  *)
+    echo "install: unrecognised argument '$1'." >&2
+    usage
+    exit 2
+    ;;
+esac
 
 if [ ! -f "$LIB" ]; then
   echo "install: cannot find $LIB; run this from a claude-ai-harness checkout." >&2
@@ -49,10 +87,48 @@ fi
 # bin/optimise-cycle-weekly.sh uses -- instead of a second, independently
 # maintained drift detector. Exits before the install-only logic below ever
 # runs.
+#
+# M6 (round 4 review): the library path crosses into node as an ARGUMENT, like
+# $REPO and $DEST on the same line, never as part of the program text. It used
+# to be escaped for a JavaScript string literal by a sed that handled the
+# single quote and nothing else, and pasted into `import ... from '...'`.
+# Measured: a checkout path containing a backslash and an apostrophe died with
+# `SyntaxError: Unexpected identifier`, and a backslash alone was worse than a
+# crash -- the backslash was consumed as a JS escape, so node resolved a
+# DIFFERENT path and reported ERR_MODULE_NOT_FOUND from the one tool whose job
+# is telling an operator whether their install is current. pathToFileURL does
+# the encoding correctly, which is the point of passing data as data: there is
+# no escaping question left to get wrong.
+#
+# RESIDUAL, measured and bounded rather than claimed closed: node's ESM
+# resolver REFUSES any file URL holding an encoded backslash
+# (ERR_INVALID_MODULE_SPECIFIER, "must not include encoded / or \\
+# characters"), so a checkout path containing a backslash cannot be imported
+# however it is passed -- as an argument, as a relative specifier, or as
+# source. What changes here is that such a path is no longer MANGLED into a
+# different one, and the failure is the installer's own diagnostic naming the
+# real path instead of an unhandled node stack trace. Every other shape the
+# old sed could not handle (an apostrophe, a double quote, a dollar sign, a
+# backtick, a space) now works. Recorded as debt in the spec.
+#
+# The library path goes LAST, and that position is load-bearing: the module
+# decides whether it is being run as a CLI by comparing its own path against
+# process.argv[1] (the same check bin/optimise-cycle-weekly.sh relies on to run
+# it deliberately as main). Handing it its own path first therefore makes it
+# execute its CLI and exit instead of being imported -- which is what happened
+# on the first attempt at this fix, and what the installer's existing tests
+# caught.
 if [ "$CHECK_ONLY" -eq 1 ]; then
   exec node --input-type=module -e "
-import { checkStaleness } from '$LIB_JS'
-const [repo, dest] = process.argv.slice(1)
+import { pathToFileURL } from 'node:url'
+const [repo, dest, lib] = process.argv.slice(1)
+let checkStaleness
+try {
+  ;({ checkStaleness } = await import(pathToFileURL(lib).href))
+} catch (e) {
+  console.error('install --check: cannot load ' + lib + ' -- ' + e.message)
+  process.exit(2)
+}
 const r = checkStaleness(repo, dest)
 for (const rel of r.missing) console.log('missing: ' + rel)
 for (const rel of r.drifted) console.log('drift:   ' + rel)
@@ -66,7 +142,7 @@ if (r.status === 'drift') {
   process.exit(1)
 }
 console.log('install --check: ' + dest + ' matches this checkout.')
-" "$REPO" "$DEST"
+" "$REPO" "$DEST" "$LIB"
 fi
 
 # M4: the same listInstallFiles() the module exports for exactly this,
@@ -79,14 +155,22 @@ fi
 # stale against the .py beside it. A release contains what the repository
 # publishes, so "tracked" is the right test.
 FILES=$(node --input-type=module -e "
-import { listInstallFiles } from '$LIB_JS'
-const r = listInstallFiles(process.argv[1])
+import { pathToFileURL } from 'node:url'
+const [repo, lib] = process.argv.slice(1)
+let listInstallFiles
+try {
+  ;({ listInstallFiles } = await import(pathToFileURL(lib).href))
+} catch (e) {
+  console.error('install: cannot load ' + lib + ' -- ' + e.message)
+  process.exit(2)
+}
+const r = listInstallFiles(repo)
 if (r.blind) {
   console.error('install: could not determine which files this repo tracks (not a git checkout?).')
   process.exit(2)
 }
 for (const f of r.files) console.log(f)
-" "$REPO")
+" "$REPO" "$LIB")
 
 if [ -z "$FILES" ]; then
   echo "install: the consumer subset came back empty; refusing to 'install' nothing." >&2

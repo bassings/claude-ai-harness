@@ -219,3 +219,160 @@ test('install.sh: installs only files the repo actually TRACKS -- generated arte
   assert.deepEqual(generated, [], `generated artefacts must never be installed, got: ${generated.join(', ')}`)
   assert.ok(found.length > 10, 'sanity: a real install happened, so the assertion above is not vacuous')
 })
+
+// --- round-4 review M2: the write path was reachable by any spelling ------
+//
+// The whole argument parse was `CHECK_ONLY=0` then
+// `[ "${1:-}" = "--check" ] && CHECK_ONLY=1`; everything else fell through
+// to the install branch. So `--dry-run`, `--verify`, `--checks`, `-n` and
+// every typo of `--check` wrote 29 files into the operator's ~/.claude --
+// the opposite of what each of those spellings asks for, from the only path
+// in this change that writes outside the repo, and (per README) the
+// workflows are re-read from disk on the very next run.
+//
+// The marker guard does not help: it refuses a destination that does not
+// LOOK like a Claude install, and a real ~/.claude does.
+
+for (const arg of ['--dry-run', '--verify', '--checks', '--check-only', '-n', '-check', 'check']) {
+  test(`install.sh (M2): the unrecognised argument ${arg} is refused, writes nothing, and exits non-zero`, () => {
+    const dest = tmpInstall()
+    // Marker guard explicitly disabled, so nothing but the argument parse
+    // itself can be what stops the write. With the guard left on, a passing
+    // test would not distinguish "refused the argument" from "refused the
+    // destination".
+    const res = run([arg], { CLAUDE_HOME: dest, HARNESS_INSTALL_REQUIRE_MARKER: '0' })
+    assert.notEqual(res.status, 0, `${arg} must not be treated as a request to install`)
+    assert.equal(fs.readdirSync(dest).length, 0,
+      `${arg} must write nothing: every one of these spellings means "tell me, do not change anything"`)
+    assert.match(res.stderr, /unrecognised argument/i, 'and it must say which argument it did not understand')
+    assert.match(res.stderr, /--check/, 'the usage message must name the spelling that does work')
+  })
+}
+
+test('install.sh (M2): --help prints usage, writes nothing, and exits 0 -- asking is not an error', () => {
+  const dest = tmpInstall()
+  const res = run(['--help'], { CLAUDE_HOME: dest, HARNESS_INSTALL_REQUIRE_MARKER: '0' })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.equal(fs.readdirSync(dest).length, 0, '--help must never install')
+  assert.match(res.stdout + res.stderr, /usage/i)
+})
+
+test('install.sh (M2): a second argument is refused rather than silently ignored', () => {
+  const dest = tmpInstall()
+  const res = run(['--check', 'extra'], { CLAUDE_HOME: dest, HARNESS_INSTALL_REQUIRE_MARKER: '0' })
+  assert.notEqual(res.status, 0, 'an argument the script cannot act on must not be dropped on the floor')
+  assert.equal(fs.readdirSync(dest).length, 0)
+})
+
+test('install.sh (M2, not over-broad): no argument still installs, and --check still verifies', () => {
+  const dest = tmpInstall()
+  const install = run([], { CLAUDE_HOME: dest })
+  assert.equal(install.status, 0, install.stdout + install.stderr)
+  assert.ok(fs.existsSync(path.join(dest, 'AGENT-HARNESS.md')), 'the default path must still be a real install')
+  assert.equal(run(['--check'], { CLAUDE_HOME: dest }).status, 0, 'and --check must still pass against it')
+})
+
+function makeFakeCheckout(dirName) {
+  // A real checkout is not needed: what is under test is whether the script
+  // can hand node its own library path at all. Copying the two files the seam
+  // touches gets past "cannot find $LIB" and into the node invocation, which
+  // is where every measured failure was.
+  const checkout = path.join(tmpInstall(), dirName)
+  fs.mkdirSync(path.join(checkout, 'workflows', 'lib'), { recursive: true })
+  fs.mkdirSync(path.join(checkout, 'bin'), { recursive: true })
+  fs.copyFileSync(SCRIPT, path.join(checkout, 'bin', 'install.sh'))
+  fs.copyFileSync(
+    path.join(ROOT, 'workflows', 'lib', 'install-consistency.mjs'),
+    path.join(checkout, 'workflows', 'lib', 'install-consistency.mjs'))
+  return checkout
+}
+
+// --- round-4 review M6: the shell-to-ESM seam ----------------------------
+//
+// `LIB_JS="$(printf '%s' "$LIB" | sed "s/'/\\\\'/g")"` escaped a single
+// quote and nothing else, and the result was pasted inside a single-quoted
+// JavaScript string literal at two `import ... from '<specifier>'` sites.
+// Measured by two lenses: a checkout path containing a backslash and an
+// apostrophe dies with `SyntaxError: Unexpected identifier`, and a
+// backslash-only path is WORSE than a crash -- the backslash is consumed as
+// a JS escape, so node resolves a DIFFERENT path and reports
+// ERR_MODULE_NOT_FOUND, from the one tool whose job is telling an operator
+// whether their install is current.
+//
+// Not code execution: a static import specifier resolves before any injected
+// statement could run. The fix is to stop interpolating rather than to
+// escape better -- $REPO and $DEST already cross the same seam as argv
+// entries, and bin/optimise-cycle-weekly.sh:351 already uses that convention
+// for this very module.
+
+// Paths node CAN load: every shape the old sed either mangled or could not
+// see at all. These are the cases the fix genuinely closes.
+for (const [label, dirName] of [
+  ['an apostrophe', "q'dir"],
+  ['a double quote', 'dq"dir'],
+  ['a dollar sign and a backtick', 'sh$`dir'],
+  ['a space and a paren', 'sp ace(dir)'],
+]) {
+  test(`install.sh (M6): a checkout path containing ${label} loads the library and runs -- the path crosses the seam as an argument, not as source`, () => {
+    const checkout = makeFakeCheckout(dirName)
+    const dest = tmpInstall()
+    const res = spawnSync('/bin/sh', [path.join(checkout, 'bin', 'install.sh'), '--check'], {
+      encoding: 'utf8', env: { ...process.env, CLAUDE_HOME: dest }, cwd: checkout,
+    })
+    const output = res.stdout + res.stderr
+    assert.ok(!/SyntaxError/.test(output), `the path must not be parsed as JavaScript; got:\n${output}`)
+    assert.ok(!/ERR_MODULE_NOT_FOUND|ERR_INVALID_MODULE_SPECIFIER|Cannot find module/.test(output),
+      `node must resolve the library at the path the script actually has; got:\n${output}`)
+    // The copied tree is not a git checkout, so the honest outcome is the
+    // script's own "could not verify" diagnostic: reached only if the
+    // library loaded and ran.
+    assert.ok(/could not verify|matches this checkout|drift|missing/i.test(output),
+      `expected the installer's own diagnostic, got:\n${output}`)
+  })
+}
+
+// Paths node CANNOT load, stated as a measured limit rather than claimed
+// closed: the ESM resolver refuses any file URL holding an encoded backslash
+// (ERR_INVALID_MODULE_SPECIFIER, "must not include encoded / or \\
+// characters"), so a backslash in a checkout path is unloadable however it is
+// passed -- argument, relative specifier or source. What the fix changes is
+// that the path is no longer MANGLED (the old sed ate the backslash, so node
+// reported a module missing from a path the operator does not have) and the
+// failure is the installer's own diagnostic naming the real path.
+for (const [label, dirName] of [
+  ['a backslash and an apostrophe', "bs\\q'dir"],
+  ['a backslash alone', 'bs\\dir'],
+]) {
+  test(`install.sh (M6): a checkout path containing ${label} fails with the installer's OWN diagnostic naming the REAL path, never a mangled one`, () => {
+    const checkout = makeFakeCheckout(dirName)
+    const dest = tmpInstall()
+    const res = spawnSync('/bin/sh', [path.join(checkout, 'bin', 'install.sh'), '--check'], {
+      encoding: 'utf8', env: { ...process.env, CLAUDE_HOME: dest }, cwd: checkout,
+    })
+    const output = res.stdout + res.stderr
+    assert.notEqual(res.status, 0, 'an install that cannot verify itself must not report success')
+    assert.ok(!/SyntaxError/.test(output), `the path must never be parsed as JavaScript; got:\n${output}`)
+    assert.match(output, /install --check: cannot load /,
+      `expected the installer's own diagnostic rather than an unhandled node stack trace; got:\n${output}`)
+    // The mangling is the half that made the old failure a lie: node used to
+    // report a path with the backslash eaten, which no operator could act on.
+    assert.ok(output.includes(checkout),
+      `the diagnostic must name the path the operator actually has (${checkout}); got:\n${output}`)
+  })
+}
+
+test('install.sh (M6): no path is interpolated into JavaScript source -- the seam is argv, enforced rather than remembered', () => {
+  // AC-ARCH-1's third clause, as a check rather than a sentence. A future
+  // shell-to-node call site that pastes a path into the program text fails
+  // here instead of at an operator's terminal. Comments are stripped first:
+  // the guard is about what the script DOES, and the history of this defect
+  // is written in the comments right above the code it describes.
+  const code = fs.readFileSync(SCRIPT, 'utf8')
+    .split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')
+  assert.ok(!/\bsed\b/.test(code),
+    'install.sh must not escape a path for JavaScript: pass it through process.argv instead')
+  assert.ok(!/from\s+'\$/.test(code) && !/from\s+"\$/.test(code),
+    'no import specifier may be built from a shell variable')
+  assert.ok(/pathToFileURL/.test(code),
+    'the library path must be resolved from an argv entry via pathToFileURL, the convention bin/optimise-cycle-weekly.sh already uses')
+})
