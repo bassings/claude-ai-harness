@@ -1171,11 +1171,15 @@ test('static: every CI guarantee is asserted by COUNT or by structure, because p
 // were. The id is the join key between the planning cycle, the review cycle
 // and the ledger's ac_verdicts, so a duplicate silently merges two unrelated
 // criteria and a verdict citing one cannot be resolved.
-test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id is the join key between planning, review and the ledger', () => {
-  const specsDir = path.join(ROOT, 'specs')
+// AC-QA-13 names a proof this guard never had: "a fixture spec defining
+// AC-A11Y-3 twice being reported as a duplicate". Without it the detector
+// could not be shown to FAIL -- measured at fix round 5, changing `n > 1` to
+// `n > 99` left the whole suite green, so by AC-QA-14's own wording the
+// guard was unproven. The scan is a function so the fixture test below can
+// drive the SAME code the real one does, rather than a second copy of the
+// counting rule.
+function scanSpecsForDuplicateAcIds(specsDir) {
   const files = fs.readdirSync(specsDir).filter((f) => f.endsWith('.md'))
-  assert.ok(files.length > 0, 'sanity: expected spec files under specs/')
-
   const problems = []
   let totalDefs = 0
   for (const file of files) {
@@ -1230,11 +1234,56 @@ test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id 
     for (const id of defs) counts.set(id, (counts.get(id) || 0) + 1)
     for (const [id, n] of counts) if (n > 1) problems.push(`${file}: ${id} defined ${n} times`)
   }
+  return { problems, totalDefs, fileCount: files.length }
+}
+
+test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id is the join key between planning, review and the ledger', () => {
+  const { problems, totalDefs, fileCount } = scanSpecsForDuplicateAcIds(path.join(ROOT, 'specs'))
+  assert.ok(fileCount > 0, 'sanity: expected spec files under specs/')
   assert.ok(
     totalDefs > 200,
     `sanity: expected the scan to find many AC definitions across specs/, found ${totalDefs} -- a pattern that matches nothing reports no duplicates forever. The per-file check above is the real anti-vacuity guard; this is a coarse backstop, set just under the 245 currently present.`
   )
   assert.deepEqual(problems, [], `duplicate acceptance-criterion definitions: ${problems.join('; ')}`)
+})
+
+test('static (AC-QA-13): a fixture spec defining AC-A11Y-3 TWICE is reported as a duplicate -- the detector can actually fire, and it fires on the prefix that used to be invisible to it', () => {
+  // The criterion's own named proof. Two properties at once: the counting
+  // rule reports a repeat at all, and it does so for an accessibility id,
+  // whose digit-bearing prefix the pre-change pattern could not see -- so a
+  // spec written entirely in that lens's criteria was scanned as empty and
+  // could never report a duplicate.
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ac-dup-fixture-'))
+  test.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(dir, 'fixture.md'), [
+    '# fixture',
+    '',
+    '- **AC-A11Y-3:** the first definition of this criterion',
+    '- **AC-A11Y-3:** a second, contradictory definition of the same id',
+    '- **AC-QA-1:** an ordinary criterion defined once',
+    '',
+  ].join('\n'))
+  const { problems, totalDefs } = scanSpecsForDuplicateAcIds(dir)
+  assert.equal(totalDefs, 3, 'sanity: all three definitions were seen, including both A11Y spellings')
+  assert.deepEqual(problems, ['fixture.md: AC-A11Y-3 defined 2 times'],
+    'the duplicate must be reported, and the singly-defined criterion must not be')
+})
+
+test('static (AC-QA-13, not over-broad): a fixture spec defining each id ONCE reports nothing', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ac-dup-clean-'))
+  test.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(dir, 'fixture.md'), [
+    '# fixture',
+    '',
+    '- **AC-A11Y-3:** defined once',
+    '- **AC-QA-1:** also defined once, and mentioned again in prose below',
+    '',
+    'The criterion AC-QA-1 is discussed here, which is a MENTION and must not',
+    'count as a second definition.',
+    '',
+  ].join('\n'))
+  const { problems } = scanSpecsForDuplicateAcIds(dir)
+  assert.deepEqual(problems, [], 'a prose mention is not a definition')
 })
 
 // H2 from review round 2: the assertions above match TEXT in the hook, and
