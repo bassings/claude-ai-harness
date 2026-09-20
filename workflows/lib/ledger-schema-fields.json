@@ -1,0 +1,116 @@
+{
+  "ac_verdicts": "array",
+  "ac_verdicts_truncated": [
+    "integer",
+    "null"
+  ],
+  "architecture_trigger_source": [
+    "array",
+    "null"
+  ],
+  "budget_spent": [
+    "number",
+    "null"
+  ],
+  "degraded": [
+    "boolean",
+    "null"
+  ],
+  "degraded_raw": "array",
+  "duplicate_fixed_ids_dropped": [
+    "integer",
+    "null"
+  ],
+  "event": [
+    "string",
+    "null"
+  ],
+  "event_key": [
+    "string",
+    "null"
+  ],
+  "findings": "array",
+  "findings_truncated": [
+    "integer",
+    "null"
+  ],
+  "invalid_ac_ids_dropped": [
+    "integer",
+    "null"
+  ],
+  "invalid_finding_fields_dropped": [
+    "integer",
+    "null"
+  ],
+  "invalid_fixed_ids_dropped": [
+    "integer",
+    "null"
+  ],
+  "invalid_prior_ids_dropped": [
+    "integer",
+    "null"
+  ],
+  "invalid_record_values_dropped": [
+    "integer",
+    "null"
+  ],
+  "kind": "string",
+  "lens_checkout_drift": [
+    "object",
+    "null"
+  ],
+  "lenses_run": "array",
+  "lenses_skipped": "array",
+  "outcome": "string",
+  "plan_key": [
+    "string",
+    "null"
+  ],
+  "rejected_finding_count": [
+    "integer",
+    "null"
+  ],
+  "repo": "string",
+  "round_key": [
+    "string",
+    "null"
+  ],
+  "rounds": [
+    "object",
+    "null"
+  ],
+  "rule_source": [
+    "string",
+    "null"
+  ],
+  "rule_source_overridden_keys": [
+    "integer",
+    "null"
+  ],
+  "run_id": "string",
+  "schema_version": "integer",
+  "spec": [
+    "string",
+    "null"
+  ],
+  "spec_bug_count": [
+    "integer",
+    "null"
+  ],
+  "spec_raw": [
+    "string",
+    "null"
+  ],
+  "task": [
+    "string",
+    "null"
+  ],
+  "trigger_counts": "object",
+  "ts": "string",
+  "verdicts": "object",
+  "write_error": [
+    "string",
+    "null"
+  ],
+  "write_ok": "boolean"
+}

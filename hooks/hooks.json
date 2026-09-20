@@ -21,7 +21,7 @@
             "type": "command",
             "command": "python3",
             "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/destructive-git-guard.py"],
-            "timeout": 10,
+            "timeout": 60,
             "statusMessage": "Checking for a destructive git restore on uncommitted work"
           },
           {
