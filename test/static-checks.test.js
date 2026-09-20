@@ -1544,7 +1544,9 @@ test('static: H3 drift guard -- every colon-labeled field in AGENT-HARNESS.md\'s
   assert.ok(result.consistent, 'sanity: no direction-1 or direction-2 mismatch was reported above, so the overall verdict must be consistent')
 })
 
-// --- specs/harn-fix-2.md: AC-OPS-14, AC-PROD-4, AC-SEC-7, AC-QA-19. ---
+// --- specs/harn-fix-2.md: AC-OPS-14, AC-PROD-4, AC-SEC-7, AC-QA-19.
+// Criterion ids in this block belong to THAT spec, not to the active
+// specs/PLAN-harness-parity.md, whose numbering is independent. ---
 
 test('static AC-OPS-14: hooks.json\'s registered PreToolUse/Bash scripts and README\'s manual-install settings.json snippet register the SAME set, so adding one and not the other fails here', () => {
   const hooksJson = JSON.parse(readAll('hooks', 'hooks.json'))
@@ -1589,10 +1591,16 @@ test('static AC-SEC-7: README\'s guard section states the detector is a best-eff
   }
 })
 
-// AC-QA-19: table-driven -- every spelling README documents as covered by
+// specs/harn-fix-2.md AC-QA-19: table-driven -- every spelling README
+// documents as covered by
 // the detector is refused on a genuinely dirty file; every spelling that is
 // allowed against THIS fixture stays allowed. Fails in BOTH directions, so
 // neither a closed hole nor a stopped guard leaves the documentation stale.
+//
+// The spec is named in the title because the ACTIVE spec
+// (specs/PLAN-harness-parity.md) has its own AC-QA-19, about the tdd-task
+// gate refusing a green run whose test files changed. A bare "AC-QA-19"
+// here read as that one (K1 review round 5, L6).
 //
 // K1 review round 1: `git clean -fd` and `git stash drop` used to live in an
 // `OUT_OF_SCOPE` list here, which stopped being true the day the guard grew
@@ -1607,7 +1615,7 @@ test('static AC-SEC-7: README\'s guard section states the detector is a best-eff
 // fixture: branch deletion and branch creation are not guarded shapes at
 // all, dirty tree or not. Every assertion below is unchanged from before
 // this rename -- only the grouping and its comment changed.
-test('static AC-QA-19: every GUARDED shape is refused, and every shape allowed against this fixture stays allowed', () => {
+test('static harn-fix-2 AC-QA-19: every GUARDED shape is refused, and every shape allowed against this fixture stays allowed', () => {
   const { makeTempRepo, cleanupTempRepos, sh, sanitizedGitEnv: sge } = require('./helpers/temp-repo.js')
   const HOOK_PATH = path.join(ROOT, 'hooks', 'destructive-git-guard.py')
   const fsMod = require('node:fs')

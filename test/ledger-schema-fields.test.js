@@ -56,10 +56,33 @@ test('the export holds every field the schema requires unconditionally', async (
   }
 })
 
-test('mutation guard: a field added to the live schema but not to the export is caught', async () => {
+// K1 review round 5, L5: this used to doctor the LIVE copy and assert it
+// differed from the export, which cannot fail -- a field named
+// `a_field_the_export_does_not_have` is never in the export, whatever the
+// export says, so the assertion held even with the export file emptied.
+// It now doctors the REAL EXPORT FILE's contents, three ways, and asserts
+// the drift check above rejects each. Measured: removing one field from the
+// real export turns that check red and left the old version of this test
+// green, which is what a mutation guard exists to notice.
+test('mutation guard: the drift check rejects a doctored EXPORT, in each way an export can drift', async () => {
   const { LEDGER_ENTRY_SCHEMA } = await import(APPEND_MODULE_URL)
   const live = fieldTypesFromSchema(LEDGER_ENTRY_SCHEMA)
-  live.a_field_the_export_does_not_have = 'string'
-  const exported = JSON.parse(fs.readFileSync(EXPORT_PATH, 'utf8'))
-  assert.notDeepEqual(exported, live, 'sanity: a deliberately drifted comparison must not read as equal')
+  const real = JSON.parse(fs.readFileSync(EXPORT_PATH, 'utf8'))
+  assert.deepEqual(real, live, 'precondition: the real export is in step with the live schema')
+
+  const field = Object.keys(real).sort()[0]
+  assert.ok(field, 'sanity: the export must hold at least one field to doctor')
+
+  const dropped = { ...real }
+  delete dropped[field]
+  assert.throws(() => assert.deepEqual(dropped, live),
+    `a field dropped from the export (${field}) must fail the drift check`)
+
+  const retyped = { ...real, [field]: 'a-type-the-schema-does-not-declare' }
+  assert.throws(() => assert.deepEqual(retyped, live),
+    `a field retyped in the export (${field}) must fail the drift check`)
+
+  const extra = { ...real, a_field_the_schema_does_not_declare: 'string' }
+  assert.throws(() => assert.deepEqual(extra, live),
+    'a field present only in the export must fail the drift check')
 })
