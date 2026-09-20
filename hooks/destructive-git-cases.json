@@ -5177,6 +5177,111 @@
       ],
       "expect": "block",
       "note": "(round 5, H3) the counterweight: an ORDINARY `cd x && ...` is not a subshell, and must keep moving the directory for the rest of the command"
+    },
+    {
+      "command": "(cd sub) && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 5, H3): nothing dirty in either repo, so restoring the outer directory after the subshell must not become a blanket refusal"
+    },
+    {
+      "command": "(cd sub; git clean -fd)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 5, H3): the subshell's own scoping with nothing to remove in the nested repo"
+    },
+    {
+      "command": "(cd sub; true) ; git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 5, H3): the outer stash is empty, so there is nothing for the drop to lose"
+    },
+    {
+      "command": "cd sub && git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 5, H3): the ordinary cd counterweight with nothing to remove at the target"
+    },
+    {
+      "command": "cd sub | cat ; git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 5, H3): the pipeline shape with an empty outer stash"
     }
   ]
 }
