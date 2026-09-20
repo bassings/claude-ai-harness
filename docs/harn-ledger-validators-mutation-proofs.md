@@ -487,7 +487,82 @@ left behind. Commit before mutating: `58d2d09`.
 13.3 and 13.5 each turn exactly one test red, which is worth reading as a
 result rather than a reassurance: a rule with one guard is proven and thin.
 
+## 14. Fix round 5 -- the final round's guards
+
+Eleven mutations. Commit before mutating: `d4453d6` for 5.1 to 5.4, `19a3485`
+for 5.5 to 5.7, `ef1fc05` for 5.8 to 5.11. Restored with `git checkout --`
+and `git diff --quiet` each time, as section 12 describes.
+
+### M1, the no-spec predicate (`5.1` to `5.4`)
+
+| # | Mutation | Observed failure |
+|---|---|---|
+| 5.1 | the `acVerdictsTruncated` evidence dropped from the predicate | `verdicts that were cut to fit the line are proof they existed: an emptied array is not an empty one` (3 tests) |
+| 5.2 | the `degraded` evidence dropped | `a collapsed record lost its spec and its verdicts together, so it is evidence of neither` (2 tests) |
+| 5.3 | evidence trusted rather than validated (`if (acVerdictsTruncated)` in place of the integer check) | `a non-numeric counter is not a count; it must not flip the classification on a string` |
+| 5.4 | the reader's call site stops handing the predicate its evidence | the two aggregate tests plus the end-to-end writer test |
+
+The not-over-broad control ("a GENUINE no-spec run still reclassifies exactly
+as before") stayed green under all four, which is what separates this from
+switching D4 off.
+
+### M2 and M6, the installer (`5.5` to `5.7`)
+
+| # | Mutation | Observed failure |
+|---|---|---|
+| 5.5 | the argument `case` loses its `''` and `*` arms, so anything unrecognised falls through to the install branch again | `--dry-run must not be treated as a request to install` (7 tests, one per spelling) |
+| 5.6 | the too-many-arguments check deleted | **SURVIVED at first.** See below. |
+| 5.7 | the `--check` seam restored to `sed`-escaping the path into a JS string literal | `the path must not be parsed as JavaScript` and `expected the installer's own diagnostic rather than an unhandled node stack trace` (4 tests) |
+
+**5.6 is the one worth reading.** The test asserted a non-zero exit and an
+unwritten destination, and `--check extra` satisfies both whether the extra
+argument is refused or silently dropped -- an empty destination is drifted, so
+`--check` exits non-zero on its own. The guard was incidentally passing.
+Strengthened to assert the diagnostic (`too many arguments`), re-mutated, and
+it now fails. This is the shape standard §11 calls the hardest to spot,
+because the test looks specific.
+
+**5.7 had a second lesson.** Four of the seven M6 tests passed under it,
+because the old `sed` did escape an apostrophe and the other shapes never
+reached it -- so those cases proved the new seam works without proving it is
+better. A newline in a directory name is the discriminator: legal on any Unix
+filesystem, impossible to escape into a single-quoted JS literal, and it
+imports cleanly across the argv seam. Added, and it goes red under 5.7.
+
+### M4, the guards that had no record (`5.8` to `5.11`)
+
+| # | Mutation | Observed failure |
+|---|---|---|
+| 5.8 | the AC-definition counter narrowed back to `AC-[A-Z]+-\d+` | `the definition counter must see AC-A11Y-1; a prefix containing a digit was invisible to it, so a spec written entirely in that lens's criteria counted as zero` |
+| 5.9 | the blindness detector narrowed the same way | `the blindness detector must itself recognise a lens prefix containing a digit` |
+| 5.10 | the duplicate-definition rule changed from `n > 1` to `n > 99` | **SURVIVED.** See below. |
+| 5.11 | `SCHEMA_VERSION` set back to 2 | `the writer stamps its own version; a caller cannot claim to be a different one` (2 tests) |
+
+**5.10 survived the entire suite**, which means the duplicate-AC detector --
+the guard `AC-QA-13` exists for -- could not be shown to fail, and by
+`AC-QA-14`'s own wording was unproven. The criterion names the proof it wants
+("a fixture spec defining `AC-A11Y-3` twice being reported as a duplicate")
+and it had never been written. The scan is now a function so a fixture test
+drives the same code the real one does, with a second fixture pinning that a
+prose mention is not a definition (the direction this pattern has already been
+wrong in once). Re-mutated with the proof in place:
+
+```
+AssertionError [ERR_ASSERTION]: the duplicate must be reported, and the
+singly-defined criterion must not be
+```
+
+A surviving mutant found a real hole in the guard estate, which is the whole
+argument for running them.
+
 ## Full-suite result after all restores
+
+**Fix round 5, measured:** `node --test test/*.test.js` -- 1285/1285
+passing, three consecutive runs (49.6s, 50.1s, 49.8s), with `python3 -m unittest discover -s hooks
+-p 'test_*.py'` at 64 tests OK. The M5 flake (a wall-clock assertion under
+parallel load) is recorded debt and did not fire in these runs, which proves
+nothing about it either way: it is load-dependent and these runs were not
+loaded.
 
 **Fix round 4, measured:** `node --test test/*.test.js` -- 1260/1260
 passing, three consecutive runs (53.9s, 54.9s, 54.1s), no failure and no
