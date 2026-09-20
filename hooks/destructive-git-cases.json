@@ -4947,6 +4947,236 @@
       ],
       "expect": "allow",
       "note": "AC-QA-2 twin (round 4): the target file is CLEAN while a DIFFERENT file in the same repo is dirty, so this pins that the check is really scoped to the named path and does not fall back to a tree-wide reading. Measured while writing it, and worth recording because it is not obvious: `git status --porcelain -- HEAD README.md` exits 0 with empty output, because git status tolerates an unmatched pathspec rather than rejecting it. So this case does NOT separate ref-vs-pathspec resolution from the tree-wide retry -- see the round-4 report for why no case can, short of one git itself rejects as ambiguous"
+    },
+    {
+      "command": "(cd sub; git clean -fd) ; git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "u.txt",
+          "content": "unsaved work\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "(round 5, H3) a `cd` inside `( ... )` runs in a SUBSHELL, so it cannot move the directory that the segments after the closing paren are measured against. Reproduced: the guard measured `sub` for the rest of the command and allowed a clean that deleted the outer repo's untracked file"
+    },
+    {
+      "command": "(cd sub; true) ; git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "stashme\n"
+        },
+        {
+          "op": "stash_push"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "(round 5, H3) a `cd` inside `( ... )` runs in a SUBSHELL, so it cannot move the directory that the segments after the closing paren are measured against. Reproduced: the guard measured `sub` for the rest of the command and allowed a drop that emptied the outer repo's stash list"
+    },
+    {
+      "command": "cd sub | cat ; git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "u.txt",
+          "content": "unsaved work\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "(round 5, H3) every component of a pipeline runs in its own subshell, so `cd x | ...` never moves the shell's directory at all. Reproduced: the guard measured `sub` for the rest of the command and allowed a clean that deleted the outer repo's untracked file"
+    },
+    {
+      "command": "cd sub | cat ; git stash drop",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "stashme\n"
+        },
+        {
+          "op": "stash_push"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "(round 5, H3) every component of a pipeline runs in its own subshell, so `cd x | ...` never moves the shell's directory at all. Reproduced: the guard measured `sub` for the rest of the command and allowed a drop that emptied the outer repo's stash list"
+    },
+    {
+      "command": "(cd sub) && git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "(round 5, H3) a `cd` inside `( ... )` runs in a SUBSHELL, so it cannot move the directory that the segments after the closing paren are measured against. Reproduced: the guard measured `sub` for the rest of the command and the pre-existing shape of the same leak, where the subshell holds only the cd"
+    },
+    {
+      "command": "(cd sub; git clean -fd)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        },
+        {
+          "op": "write",
+          "path": "sub/inner-untracked.txt",
+          "content": "nested unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "(round 5, H3) the other direction: a cd inside a subshell MUST still scope the segments that follow it INSIDE that subshell, so the nested repo's untracked file is what gets measured. A fix that simply ignored the cd would pass the five cases above and fail this one"
+    },
+    {
+      "command": "(cd sub; git clean -fd) ; git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 5, H3): nothing at risk in either repo, so subshell scoping must not become a blanket refusal"
+    },
+    {
+      "command": "cd sub | cat ; git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "allow",
+      "note": "AC-QA-2 twin (round 5, H3): the pipeline shape with nothing at risk"
+    },
+    {
+      "command": "cd sub && git clean -fd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        },
+        {
+          "op": "write",
+          "path": "sub/inner-untracked.txt",
+          "content": "nested unsaved work\n"
+        }
+      ],
+      "expect": "block",
+      "note": "(round 5, H3) the counterweight: an ORDINARY `cd x && ...` is not a subshell, and must keep moving the directory for the rest of the command"
     }
   ]
 }

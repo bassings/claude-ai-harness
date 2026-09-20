@@ -546,6 +546,27 @@ def take_substitution_placeholders(tokens, substitution_count):
     return out, indices
 
 
+def take_subshell_parens(tokens):
+    """Split `tokens` into (tokens, opened, closed): the leading `(` and
+    trailing `)` grouping tokens counted and removed. shlex makes each its
+    own token (they are in PUNCTUATION_CHARS) but they never split a
+    segment, so `(cd sub; git clean -fd)` arrives as two segments, the first
+    starting with `(` and the second ending with `)`. Counting them is what
+    lets evaluate_command_text() give the subshell its own directory (K1
+    review round 5, H3). Unbalanced parens are simply counted as they come;
+    this is normalisation, not a shell parser, and the caller never pops
+    past its own root context."""
+    opened = 0
+    closed = 0
+    while tokens and tokens[0] == '(':
+        opened += 1
+        tokens = tokens[1:]
+    while tokens and tokens[-1] == ')':
+        closed += 1
+        tokens = tokens[:-1]
+    return tokens, opened, closed
+
+
 def child_context(state):
     """`state` as a CHILD PROCESS sees it: `cwd`/`cwd_known` COPIED, so a
     `cd` the child performs cannot move the shell that runs the segments
@@ -562,9 +583,12 @@ def split_segments(command):
     INCLUDING a bare newline (see module docstring: a multi-line Bash call
     is the ordinary shape of agent tool use, and a destructive command on
     any line but the first must be caught exactly like one chained with
-    `&&`). Returns a list of token lists, one per sub-command. Raises
-    ValueError (via shlex) on unparseable input such as unbalanced quotes,
-    which the caller treats as fail-open."""
+    `&&`). Returns a list of (tokens, is_pipeline_component) pairs, one per
+    sub-command. A segment on either side of a `|` runs in its OWN subshell,
+    so a `cd` in it cannot move the shell that runs the rest of the command
+    (K1 review round 5, H3), and the caller needs to know which segments
+    those are. Raises ValueError (via shlex) on unparseable input such as
+    unbalanced quotes, which the caller treats as fail-open."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=PUNCTUATION_CHARS)
     lexer.whitespace_split = True
     # shlex's default `whitespace` includes '\n' and would silently consume
@@ -576,12 +600,23 @@ def split_segments(command):
     lexer.whitespace = ' \t'
     tokens = list(lexer)
     segments = [[]]
+    # separators[i] is the control operator that PRECEDES segments[i];
+    # None for the first, which nothing precedes.
+    separators = [None]
     for tok in tokens:
         if tok in CONTROL_OPERATORS:
             segments.append([])
+            separators.append(tok)
         else:
             segments[-1].append(tok)
-    return [seg for seg in segments if seg]
+    out = []
+    for index, segment in enumerate(segments):
+        if not segment:
+            continue  # e.g. a trailing `;`, or two operators in a row
+        before = separators[index]
+        after = separators[index + 1] if index + 1 < len(separators) else None
+        out.append((segment, before == '|' or after == '|'))
+    return out
 
 
 def strip_redirects(tokens):
@@ -1386,20 +1421,36 @@ def evaluate_command_text(command, state, depth):
         segments = split_segments(command)
     except ValueError:
         return None  # unparseable; fail open, see module docstring
-    for raw_tokens in segments:
+    # A stack of process contexts. `( ... )` pushes one, so the segments
+    # inside the subshell share a directory with each other but cannot move
+    # the one outside it; the closing paren pops back. A pipeline component
+    # gets a context of its own for that segment alone, for the same reason
+    # (K1 review round 5, H3). Both reuse child_context(), so repo-global
+    # facts still cross either boundary -- see its docstring.
+    contexts = [state]
+    for raw_tokens, is_pipeline_component in segments:
+        tokens, opened, closed = take_subshell_parens(raw_tokens)
+        for _ in range(opened):
+            contexts.append(child_context(contexts[-1]))
+        segment_state = contexts[-1]
+        if is_pipeline_component:
+            segment_state = child_context(segment_state)
         tokens, substitution_indices = take_substitution_placeholders(
-            raw_tokens, len(substitutions))
+            tokens, len(substitutions))
         # A substitution runs in its own child process at the point ITS
         # segment runs: after every segment before it, so it sees their
         # `cd`, and before the segment it sits in.
         for index in substitution_indices:
             reason = evaluate_command_text(
-                substitutions[index], child_context(state), depth + 1)
+                substitutions[index], child_context(segment_state), depth + 1)
             if reason:
                 return reason
-        reason = evaluate_segment(tokens, state, depth)
+        reason = evaluate_segment(tokens, segment_state, depth)
         if reason:
             return reason
+        for _ in range(closed):
+            if len(contexts) > 1:
+                contexts.pop()  # popped AFTER the segment, which is inside it
     return None
 
 
