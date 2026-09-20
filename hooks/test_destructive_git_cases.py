@@ -27,6 +27,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -88,8 +89,24 @@ def run_git(args, cwd):
     return result
 
 
+def resolve_inside(root, rel_path):
+    """`rel_path` joined onto `root`, refusing anything that would land
+    outside it. Belt and braces beside validate_setup_op()'s allowlist: the
+    allowlist is a claim about the spelling, this is a check on the answer,
+    and it is the one that cannot be reasoned wrong. os.path.join DISCARDS
+    `root` entirely when the second argument is absolute, which is how an
+    absolute `path` in a corpus case wrote outside the fixture (K1 review
+    round 5, H4)."""
+    root_real = os.path.realpath(root)
+    full = os.path.realpath(os.path.join(root_real, rel_path))
+    if full != root_real and not full.startswith(root_real + os.sep):
+        raise ValueError('setup path %r resolves to %r, outside the fixture directory %r'
+                          % (rel_path, full, root_real))
+    return full
+
+
 def write_file(root, rel_path, content):
-    full = os.path.join(root, rel_path)
+    full = resolve_inside(root, rel_path)
     parent = os.path.dirname(full)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -121,11 +138,11 @@ def op_gitignore(root, op):
 
 
 def op_mkdir(root, op):
-    os.makedirs(os.path.join(root, op['path']), exist_ok=True)
+    os.makedirs(resolve_inside(root, op['path']), exist_ok=True)
 
 
 def op_nested_repo(root, op):
-    nested = os.path.join(root, op['path'])
+    nested = resolve_inside(root, op['path'])
     os.makedirs(nested, exist_ok=True)
     run_git(['init', '-q', '-b', 'master'], nested)
     write_file(nested, 'inner.txt', 'committed\n')
@@ -168,12 +185,159 @@ SETUP_OPS = {
 }
 
 
+# --- The closed vocabulary's ARGUMENTS (AC-SEC-5, K1 review round 5, H4) ---
+#
+# Bounding the op NAMES above bounds nothing on its own: the arguments were
+# handed straight to `git` and to file writes, so editing this repo's JSON
+# corpus alone reached arbitrary command execution on the machine running
+# the tests, and wrote files outside the fixture. codex-ai-harness vendors
+# this runner, so it shipped there too. Everything below is an allowlist: a
+# spelling that is not positively recognised is refused, never sanitised and
+# never passed on.
+
+MAX_SETUP_ARG_CHARS = 256
+MAX_SETUP_CONTENT_CHARS = 65536
+
+# A path inside the fixture. No absolute paths, no `..`, no `.`, no leading
+# dash (which git would read as an option), and no character outside this
+# set -- which excludes every shell metacharacter, whitespace, quote,
+# backslash, NUL and `~`, none of which any real case needs.
+FIXTURE_PATH_RE = re.compile(r'^[A-Za-z0-9._][A-Za-z0-9._/-]*$')
+
+# A branch name. Same shape, and the leading-character rule is what stops
+# `--help` or `-D` being passed where a name belongs.
+GIT_NAME_RE = re.compile(r'^[A-Za-z0-9._][A-Za-z0-9._/-]*$')
+
+# git config keys a case may set, each with the exact values it may be set
+# to. An allowlist rather than a denylist BY DESIGN: git itself executes the
+# value of core.fsmonitor, core.sshCommand, core.pager, core.editor,
+# core.hooksPath, sequence.editor, diff.external, credential.helper,
+# uploadpack.packObjectsHook and gpg.program; include.path pulls in another
+# config file; and that list grows with every git release. Naming the
+# handful of keys the corpus actually needs is the only form of this rule
+# that stays correct without being maintained.
+CONFIG_KEY_ALLOWLIST = {
+    'clean.requireforce': ('true', 'false'),
+}
+
+
+def _reject(message):
+    raise ValueError('rejected setup op: %s -- the corpus is DATA, and a case may not '
+                      'reach outside its own fixture or make git run a command '
+                      '(hooks/test_destructive_git_cases.py, AC-SEC-5)' % message)
+
+
+def _check_str(value, label, limit=MAX_SETUP_ARG_CHARS):
+    if not isinstance(value, str):
+        _reject('%s must be a string, got %s' % (label, type(value).__name__))
+    if not value or len(value) > limit:
+        _reject('%s must be 1 to %d characters, got %d' % (label, limit, len(value)))
+    return value
+
+
+def _check_fixture_path(value, label='path'):
+    _check_str(value, label)
+    if not FIXTURE_PATH_RE.match(value):
+        _reject('%s %r is not a plain relative path of [A-Za-z0-9._/-] starting with an '
+                'alphanumeric, dot or underscore' % (label, value))
+    if any(part in ('', '.', '..') for part in value.split('/')):
+        _reject('%s %r contains an empty, `.` or `..` segment' % (label, value))
+
+
+def _check_git_name(value, label):
+    _check_str(value, label)
+    if not GIT_NAME_RE.match(value):
+        _reject('%s %r is not a plain git name of [A-Za-z0-9._/-] starting with an '
+                'alphanumeric, dot or underscore (a leading dash would be read by git '
+                'as an option)' % (label, value))
+
+
+def _check_content(value, label='content'):
+    if not isinstance(value, str):
+        _reject('%s must be a string, got %s' % (label, type(value).__name__))
+    if len(value) > MAX_SETUP_CONTENT_CHARS:
+        _reject('%s is %d characters, over the %d cap'
+                % (label, len(value), MAX_SETUP_CONTENT_CHARS))
+
+
+def _check_patterns(value, label='patterns'):
+    # .gitignore lines are file CONTENT, never an argv entry, so the
+    # characters a gitignore pattern legitimately uses (`*`, `!`, `/`) are
+    # fine here. The line separator is not, since they are joined by newline.
+    if not isinstance(value, list) or not value:
+        _reject('%s must be a non-empty list' % label)
+    for entry in value:
+        _check_str(entry, '%s entry' % label)
+        if '\n' in entry or '\r' in entry or '\0' in entry:
+            _reject('%s entry %r contains a line separator or NUL' % (label, entry))
+
+
+def _check_bool(value, label):
+    if not isinstance(value, bool):
+        _reject('%s must be true or false, got %r' % (label, value))
+
+
+def _check_config(op):
+    key = _check_str(op['key'], 'config key')
+    value = _check_str(op['value'], 'config value')
+    allowed = CONFIG_KEY_ALLOWLIST.get(key.strip().lower())
+    if allowed is None:
+        _reject('config key %r is not one of the keys a case may set (%s)'
+                % (key, ', '.join(sorted(CONFIG_KEY_ALLOWLIST))))
+    if value not in allowed:
+        _reject('config value %r is not one of the values %r may be set to (%s)'
+                % (value, key, ', '.join(allowed)))
+
+
+# Per op: (required argument names, optional argument names, validator). An
+# op present in SETUP_OPS but absent here would be unvalidated, which
+# TestSetupArgumentsAreBoundedNotJustOpNames asserts cannot happen.
+SETUP_OP_SCHEMA = {
+    'init': ((), ('branch',),
+             lambda op: 'branch' in op and _check_git_name(op['branch'], 'branch')),
+    'commit': (('path', 'content'), (),
+               lambda op: (_check_fixture_path(op['path']), _check_content(op['content']))),
+    'write': (('path', 'content'), (),
+              lambda op: (_check_fixture_path(op['path']), _check_content(op['content']))),
+    'gitignore': (('patterns',), (), lambda op: _check_patterns(op['patterns'])),
+    'mkdir': (('path',), (), lambda op: _check_fixture_path(op['path'])),
+    'nested_repo': (('path',), ('dirty',),
+                    lambda op: (_check_fixture_path(op['path']),
+                                'dirty' in op and _check_bool(op['dirty'], 'dirty'))),
+    'stash_push': ((), (), lambda op: None),
+    'branch': (('name',), (), lambda op: _check_git_name(op['name'], 'branch name')),
+    'config': (('key', 'value'), (), _check_config),
+}
+
+
+def validate_setup_op(op):
+    """Raise ValueError unless `op` is a well-formed instance of its declared
+    operation: a known name, exactly the argument names that operation takes,
+    and every argument inside its own allowlist."""
+    if not isinstance(op, dict):
+        _reject('a setup step must be an object, got %s' % (type(op).__name__,))
+    name = op.get('op')
+    schema = SETUP_OP_SCHEMA.get(name) if isinstance(name, str) else None
+    if schema is None:
+        _reject('unknown op %r' % (name,))
+    required, optional, check = schema
+    given = set(op) - {'op'}
+    missing = set(required) - given
+    if missing:
+        _reject('op %r is missing %s' % (name, ', '.join(sorted(missing))))
+    unknown = given - set(required) - set(optional)
+    if unknown:
+        _reject('op %r does not take %s' % (name, ', '.join(sorted(unknown))))
+    check(op)
+
+
 def apply_setup(root, setup, declared_ops):
     for op in setup:
-        name = op.get('op')
+        name = op.get('op') if isinstance(op, dict) else None
         if name not in declared_ops:
             raise ValueError('unknown setup op %r -- not in the closed vocabulary declared '
                               'by destructive-git-cases.json\'s own setup_ops key' % (name,))
+        validate_setup_op(op)
         SETUP_OPS[name](root, op)
 
 
@@ -232,6 +396,143 @@ class TestCorpusFloor(unittest.TestCase):
             subprocess.run(['rm', '-rf', root])
             if os.path.exists(sentinel):
                 os.remove(sentinel)
+
+
+class TestSetupArgumentsAreBoundedNotJustOpNames(unittest.TestCase):
+    """AC-SEC-5, the half the op-name check never covered (K1 review round 5,
+    H4). Bounding the op NAMES bounds nothing if their ARGUMENTS go straight
+    to `git` or to a file write: editing the JSON corpus alone reached
+    arbitrary command execution on the machine running the tests, and wrote
+    files outside the fixture. Measured against the unvalidated runner:
+
+      * {"op": "config", "key": "core.fsmonitor", "value": "touch <path>"}
+        applied without complaint, and the NEXT git call in that fixture ran
+        the command, because git runs core.fsmonitor itself. core.sshCommand,
+        core.pager, core.hooksPath, include.path and others do the same.
+      * {"op": "write", "path": "<absolute path>"} wrote outside the
+        fixture: os.path.join discards `root` when the second argument is
+        absolute.
+      * {"op": "write", "path": "../<name>"} wrote into the fixture's parent.
+      * {"op": "branch", "name": "--help"} passed a git OPTION where a branch
+        name belongs.
+
+    codex-ai-harness vendors this runner, so each of those shipped there
+    too. Every hostile setup below must raise loudly and leave no trace."""
+
+    def setUp(self):
+        self._root = tempfile.mkdtemp(prefix='hostile-fixture-')
+        run_git(['init', '-q', '-b', 'master'], self._root)
+        self._sentinels = []
+
+    def tearDown(self):
+        subprocess.run(['rm', '-rf', self._root])
+        for path in self._sentinels:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def _sentinel(self, name):
+        path = os.path.join(tempfile.gettempdir(), 'destructive-git-cases-%s' % name)
+        if os.path.exists(path):
+            os.remove(path)
+        self._sentinels.append(path)
+        return path
+
+    def _refuses(self, setup, sentinel=None, also_run_git=False):
+        with self.assertRaises(ValueError):
+            apply_setup(self._root, setup, DECLARED_SETUP_OPS)
+        if also_run_git:
+            # Anything the setup managed to plant in the repo's config would
+            # fire on the next git call, so make one before checking.
+            run_git(['status', '--porcelain'], self._root)
+        if sentinel is not None:
+            self.assertFalse(
+                os.path.exists(sentinel),
+                'the hostile setup left %s behind -- it must never take effect' % sentinel)
+
+    def test_a_config_key_that_makes_git_run_a_command_is_refused(self):
+        sentinel = self._sentinel('fsmonitor-pwn')
+        self._refuses(
+            [{'op': 'config', 'key': 'core.fsmonitor', 'value': 'touch %s' % sentinel}],
+            sentinel=sentinel, also_run_git=True)
+
+    def test_other_command_running_config_keys_are_refused_too(self):
+        for key in ('core.sshCommand', 'core.pager', 'core.editor', 'core.hooksPath',
+                    'include.path', 'diff.external', 'sequence.editor', 'credential.helper',
+                    'uploadpack.packObjectsHook', 'gpg.program'):
+            with self.subTest(key=key):
+                sentinel = self._sentinel('config-pwn')
+                self._refuses([{'op': 'config', 'key': key, 'value': 'touch %s' % sentinel}],
+                              sentinel=sentinel, also_run_git=True)
+
+    def test_a_config_value_outside_the_allowlist_is_refused(self):
+        self._refuses([{'op': 'config', 'key': 'clean.requireForce', 'value': 'touch /tmp/x'}])
+
+    def test_an_absolute_write_path_is_refused(self):
+        sentinel = self._sentinel('absolute-write')
+        self._refuses([{'op': 'write', 'path': sentinel, 'content': 'outside\n'}],
+                      sentinel=sentinel)
+
+    def test_a_dot_dot_write_path_is_refused(self):
+        sibling = os.path.join(os.path.dirname(self._root), 'destructive-git-cases-escaped')
+        if os.path.exists(sibling):
+            os.remove(sibling)
+        self._sentinels.append(sibling)
+        self._refuses([{'op': 'write', 'path': '../destructive-git-cases-escaped',
+                        'content': 'escaped\n'}], sentinel=sibling)
+
+    def test_escaping_paths_are_refused_for_every_op_that_takes_one(self):
+        for op_name, extra in (('write', {'content': 'x\n'}), ('commit', {'content': 'x\n'}),
+                               ('mkdir', {}), ('nested_repo', {})):
+            for path in ('/etc/passwd', '../escaped', 'a/../../escaped', './../escaped',
+                         'a/b/../../../escaped'):
+                with self.subTest(op=op_name, path=path):
+                    op = {'op': op_name, 'path': path}
+                    op.update(extra)
+                    with self.assertRaises(ValueError):
+                        apply_setup(self._root, [op], DECLARED_SETUP_OPS)
+
+    def test_a_name_that_is_a_git_option_is_refused(self):
+        for name in ('--help', '-D', '--edit-description'):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    apply_setup(self._root, [{'op': 'branch', 'name': name}], DECLARED_SETUP_OPS)
+        with self.assertRaises(ValueError):
+            apply_setup(self._root, [{'op': 'init', 'branch': '--bare'}], DECLARED_SETUP_OPS)
+
+    def test_an_argument_of_the_wrong_type_is_refused(self):
+        for op in ({'op': 'write', 'path': 5, 'content': 'x'},
+                   {'op': 'write', 'path': 'a.txt', 'content': None},
+                   {'op': 'gitignore', 'patterns': '.env'},
+                   {'op': 'gitignore', 'patterns': ['.env', 7]},
+                   {'op': 'nested_repo', 'path': 'n', 'dirty': 'false'}):
+            with self.subTest(op=op):
+                with self.assertRaises(ValueError):
+                    apply_setup(self._root, [op], DECLARED_SETUP_OPS)
+
+    def test_an_unknown_or_missing_argument_is_refused(self):
+        for op in ({'op': 'write', 'path': 'a.txt'},
+                   {'op': 'write', 'content': 'x'},
+                   {'op': 'branch'},
+                   {'op': 'config', 'key': 'clean.requireForce'},
+                   {'op': 'write', 'path': 'a.txt', 'content': 'x', 'mode': '777'},
+                   {'op': 'stash_push', 'path': '../escaped'}):
+            with self.subTest(op=op):
+                with self.assertRaises(ValueError):
+                    apply_setup(self._root, [op], DECLARED_SETUP_OPS)
+
+    def test_the_argument_schema_covers_exactly_the_declared_vocabulary(self):
+        # The drift guard the op-name check already has, one level down: an op
+        # added to SETUP_OPS with no argument schema would otherwise be
+        # unvalidated, and nothing would say so.
+        self.assertEqual(set(SETUP_OP_SCHEMA.keys()), set(SETUP_OPS.keys()))
+
+    def test_every_real_corpus_case_passes_the_same_validation(self):
+        # The validation is only worth having if the corpus lives inside it: a
+        # rule the real cases cannot satisfy is a rule that gets loosened.
+        for index, case in enumerate(CASES):
+            with self.subTest(index=index, command=case['command']):
+                for op in case['setup']:
+                    validate_setup_op(op)
 
 
 class TestCorpusCasesViaEvaluate(unittest.TestCase):
