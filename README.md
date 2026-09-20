@@ -519,49 +519,67 @@ past it.
   env-prefix syntax). This is deliberately not a text search over the whole
   command: a quoted mention, a code comment, or an assignment that prefixes
   a different, unrelated segment on the same line must not disarm a refusal
-  it was never meant to cover -- and this scoping holds underneath a
-  `bash -c` wrapper too: the hatch set on the OUTER segment that invokes
-  `bash -c` does not disarm the command inside the wrapped script, and one
-  set INSIDE the wrapped script does not leak back out.
+  it was never meant to cover. **The hatch covers everything the segment it
+  prefixes goes on to run**, its wrapped bodies included: measured,
+  `HARNESS_ALLOW_DESTRUCTIVE_GIT=1 bash -c 'git checkout -- f.txt'` and
+  `HARNESS_ALLOW_DESTRUCTIVE_GIT=1 sudo git checkout -- f.txt` both exit 0.
+  That follows from where the check sits, before the wrapper is unwrapped,
+  and it is the behaviour to rely on. What it does NOT do is cross into a
+  different segment in either direction: an earlier segment's hatch leaves a
+  later `bash -c` refused (exit 2, measured), and one set inside a wrapped
+  body does not leak back out. Three places here and in the guard used to
+  claim the opposite for the first case; the code is right and the sentences
+  were wrong.
 - **Deliberately out of scope**: `git worktree remove --force`,
   `git branch -D`, and any command reached through an unbalanced quote or
   wrapper nesting past the depth bound (fails open by design -- see the
   module docstring). Both can destroy content with no copy anywhere in git.
   A `(...)` subshell IS caught (it is stripped as a grouping token like
-  `if`/`then`, not treated as an opaque shape), and so are `$(...)` and
-  backtick substitution, per the normalisation layer above -- an earlier
-  version of this section claimed those fell through allowed, which was
-  wrong even before this guard grew a `git clean` rule, and is corrected
-  here rather than repeated. Untracked files generally are outside
-  this guard's scope: none of the commands it DOES intercept can lose an
-  untracked file, but that is not the same claim as "nothing here can lose
-  one" -- know the boundary before relying on it.
+  `if`/`then`, not treated as an opaque shape, and since K1 it also gets its
+  own working directory, so a `cd` inside it does not move the segments
+  after it), and so are `$(...)` and backtick substitution, per the
+  normalisation layer above.
 
-**This detector is a best-effort early catch, not a boundary.** It is a
-blocklist over a Turing-complete input language (the set of shell spellings
-that reach the same destructive `git` call is unbounded), and three review
-rounds each closed a batch of bypasses only for the next round to find more
-(see `specs/harn-fix-2.md`'s Problem section for the round-by-round count).
-It makes no completeness claim. `env`/`command`/`exec`/`sudo`/`nohup`/
-`timeout`/`xargs` prefixes, `bash -c`/`sh -c`/`bash -lc`, and `$(...)`/
-backtick command substitution are now unwrapped and matched (closed since
-the corpus in `hooks/destructive-git-cases.json` was written) -- an EARLIER
-version of this paragraph listed them as open. Measured-open bypass
-classes, none of them guarded and none of them planned to be (the recovery
-mechanism below is what actually closes this): `eval`, a
-command-substitution used as the BINARY PATH itself (`$(which git)
-checkout -- file` -- the guard cannot resolve what the substitution would
-print, so it never recognises the resulting invocation as `git` at all),
-wrapper or substitution nesting past `MAX_UNWRAP_DEPTH`, a here-document fed
-to `bash`/`sh` as an executable script rather than to a command (`cat`,
-`grep`, ...) that treats it as inert data -- this guard blanks every
-heredoc BODY uniformly before matching, which is correct for the inert case
-and a genuine gap for the executable-script case, and any input the
-tokenizer cannot parse (unbalanced quotes). Writing or quoting a guarded
-command as inert TEXT -- inside a here-document body, a quoted string, or a
-`grep`/`echo` argument -- is deliberately not refused: nothing there
-executes, and refusing it is exactly the noise failure that gets a guard
-switched off.
+  Untracked and stashed work IS in scope, and that is the whole point of the
+  `git clean` and `git stash drop`/`clear` rules: they are the two shapes
+  this guard covers that snapshots cannot. Earlier versions of this section
+  said the opposite -- "none of the commands it DOES intercept can lose an
+  untracked file" -- which stopped being true the day those rules landed.
+
+### What this guard does not stop
+
+**This guard stops accidents. It does not stop a determined attempt to hide
+a command from it, and it is not trying to.** It is a blocklist over a
+Turing-complete input language: the set of shell spellings that reach the
+same destructive `git` call is unbounded, so no list of spellings can ever
+be complete. Five review rounds each closed the bypasses they were shown and
+each next round found more, which is the behaviour of the approach and not
+of the effort. What actually covers the gap is recovery, not detection: the
+snapshot mechanism below, for the work it can reach.
+
+Read the list below as the boundary, not as a to-do list. Every entry is
+measured, none is guarded, and none is planned to be.
+
+| Bypass | Spelling | What it costs you |
+|---|---|---|
+| Repository retargeting through a wrapper | `env GIT_DIR=<other>/.git git clean -fd` | The clean/stash fail-closed rule reads the env prefix on the segment itself, and `env` hides it one level down. The other repository's untracked files or stash entries go, unmeasured. |
+| Repository retargeting already in the environment | `export GIT_DIR=...` in the shell that launched the session, then `git clean -fd` | The guard scrubs `GIT_*` from its own measuring call, which is what stops a leaked variable making it read the wrong repo -- but the real command still obeys the variable, so the two look at different repositories. Measured with a clean cwd and untracked work in the target: ALLOWED, and the real run deleted it. |
+| A pathspec that is not a literal token | `git checkout -- $(cat list)`, `git checkout -- "$FILES"` | The substitution or variable is not a path this guard can resolve, and it is dropped rather than read as "unknown", so the scope narrows to nothing and a dirty file is reverted. |
+| An apostrophe inside a double-quoted string | `git commit -m "don't" && echo $(git reset --hard)` | Substitution extraction flips into single-quote mode at the apostrophe, so every `$(...)` and backtick after it on the line is never looked at. |
+| `-n` where it is not a flag | `git clean -f -e -n`, `git clean -f -- -n` | Any `-n` token anywhere reads as `--dry-run`, so the invocation is treated as harmless and never measured. Measured: `git clean -f -e -n` was ALLOWED and the real run deleted every untracked file in the tree. |
+| Nesting past `MAX_UNWRAP_DEPTH` | six or more stacked `bash -c` / `$(...)` layers | Past the bound everything fails OPEN, the clean and stash rules included, so these two lose their fail-closed posture exactly where an adversary would put them. |
+| `git stash store` | `C=$(git stash create) && git stash store "$C" && git stash drop` | `store` is treated as a non-push, so the entry it adds is not counted and the following drop is allowed. The working tree survives, so this one costs a dangling commit rather than live work. |
+| `eval` | `eval 'git reset --hard'` | Never unwrapped at all. |
+| A substitution as the binary path | `$(which git) checkout -- file` | The guard cannot resolve what the substitution prints, so it never recognises the invocation as `git`. |
+| Shell and wrapper flags not modelled | `sh -ec`, `bash -xc`, `timeout -k 5 5`, `xargs -I {}` | The wrapper is not recognised, so the inner command is never reached. |
+| A here-document fed to a shell | `bash <<'EOF'` ... `EOF` | Heredoc bodies are blanked uniformly before matching, which is right for the inert case (`cat <<EOF`) and wrong for this one. |
+| Input the tokeniser cannot parse | an unbalanced quote | Fails open by design; the guard only ever refuses a shape it positively identifies. |
+| The oversize shortcut's `git` test | 65,536+ characters containing `g''it` but not `git` | Over the parsing cap, a command with no literal `git` substring is allowed unparsed. Quote removal defeats the substring test. |
+
+Writing or quoting a guarded command as inert TEXT -- inside a here-document
+body, a quoted string, or a `grep`/`echo` argument -- is deliberately not
+refused: nothing there executes, and refusing it is the noise failure that
+gets a guard switched off.
 
 Installing as a plugin wires the hook automatically. For manual installs,
 copy the hooks and add to `~/.claude/settings.json` (this repo writes only
@@ -1472,7 +1490,7 @@ invoking real subagents.
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `skills/optimise-cycle/` | Usage, cadence, report format and the proposal-decision recording protocol for the delivery optimiser |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |
-| `hooks/destructive-git-guard.py` | PreToolUse hook refusing the enumerated `git checkout`/`switch`/`restore`/`reset --hard` shapes (see "Destructive git guard" above) that would discard uncommitted TRACKED work -- a best-effort early catch, not a boundary: `git clean`, `stash drop` and any spelling it cannot parse are explicitly out of scope |
+| `hooks/destructive-git-guard.py` | PreToolUse hook refusing the enumerated `git checkout`/`switch`/`restore`/`reset --hard` shapes that would discard uncommitted TRACKED work, plus `git clean` and `git stash drop`/`clear`, which are the two rules covering UNTRACKED and STASHED work (see "Destructive git guard" above) -- a best-effort early catch, not a boundary: it stops accidents, not a determined attempt to hide a command from it, and the measured bypass classes are listed in "What this guard does not stop" |
 | `hooks/git-snapshot.py` | Independent PreToolUse hook snapshotting uncommitted TRACKED changes before every Bash call, so destroyed work is recoverable regardless of how the destroying command was spelled (see "Recovering destroyed work" above) |
 | `test/` | This repo's own test suite (`node --test test/*.test.js`); see "Tests" above |
 

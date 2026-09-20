@@ -62,10 +62,21 @@ env-prefix assignment on the SAME segment as the destructive command
 env-prefix syntax). Deliberately NOT a substring search over the raw command
 string: that would let a quoted mention, a code comment, or an assignment
 scoped to an unrelated segment on the same line disarm a command it was
-never meant to cover. Scoped to the segment it prefixes even underneath a
-`bash -c` wrapper: the hatch set on the OUTER segment that invokes `bash -c`
-does not disarm the command inside the wrapped script, and one set INSIDE
-the wrapped script does not leak back out (AC-SEC-3). See README.md.
+never meant to cover. The hatch covers everything the segment it prefixes
+goes on to RUN, wrapped bodies included, because it is checked before the
+wrapper is unwrapped: `HARNESS_ALLOW_DESTRUCTIVE_GIT=1 bash -c 'git checkout
+-- f'` and the same with a `sudo` prefix both exit 0 (measured). What it
+does not do is cross into a DIFFERENT segment in either direction: an
+earlier segment's hatch leaves a later `bash -c` refused, and one set inside
+a wrapped body does not leak back out (AC-SEC-3). Three docstrings including
+this one used to claim the first case worked the other way; the code is
+right and the sentences were wrong (K1 review round 5, M9). See README.md.
+
+This guard stops ACCIDENTS. It does not stop a determined attempt to hide a
+command from it, and it is not trying to: it is a blocklist over a
+Turing-complete input language, so no list of spellings can be complete.
+README.md's "What this guard does not stop" table is the measured boundary,
+kept as one list rather than restated per function.
 
 Contract: PreToolUse, matcher "Bash" (see hooks/hooks.json). Per Claude
 Code's documented hook contract, exit code 2 is the one exit code that
@@ -688,7 +699,10 @@ def escape_hatch_active_for_segment(tokens):
     assignment on THIS segment (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git
     checkout -- file`). Deliberately does not search the raw command text:
     a quoted mention, a code comment, or an assignment prefixed to a
-    DIFFERENT segment on the same line must not disarm this one. The
+    DIFFERENT segment on the same line must not disarm this one. It is
+    checked BEFORE any wrapper is unwrapped, so a hatch on this segment
+    covers whatever this segment goes on to run, a `bash -c` body or a
+    prefix-wrapped command included -- see the module docstring. The
     process-environment form (exported for the session) is checked once in
     evaluate(), not here, since it is not segment-scoped."""
     for assignment in leading_env_assignments(tokens):
@@ -1239,10 +1253,12 @@ def wrapper_shell_c(head):
     return SCRIPT -- the inner shell script text, already unquoted by shlex
     during tokenising. The caller feeds this back through
     evaluate_command_text() as a brand-new command string with its own
-    segments and its own escape-hatch scoping: an escape hatch set on the
-    OUTER segment that invokes `bash -c` does not disarm the command
-    inside, and one set INSIDE the wrapped script does not leak back out
-    (AC-SEC-3). Returns None if `head` is not one of these shapes."""
+    segments. Escape-hatch scoping: a hatch set on the OUTER segment that
+    invokes `bash -c` DOES disarm the command inside, because the hatch is
+    checked before this unwrap happens; one set INSIDE the wrapped script
+    does not leak back out, and one on a different segment does not reach
+    here at all (AC-SEC-3, and the module docstring for what was measured).
+    Returns None if `head` is not one of these shapes."""
     if len(head) < 3:
         return None
     if os.path.basename(head[0]) not in SHELL_C_BASENAMES:
