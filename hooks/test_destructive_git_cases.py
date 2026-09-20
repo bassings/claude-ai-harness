@@ -520,6 +520,26 @@ class TestSetupArgumentsAreBoundedNotJustOpNames(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     apply_setup(self._root, [op], DECLARED_SETUP_OPS)
 
+    def test_resolve_inside_contains_a_path_even_if_the_allowlist_were_wrong(self):
+        # resolve_inside() is the SECOND layer, and apply_setup() never
+        # reaches it with a hostile path because the allowlist rejects those
+        # first -- so mutating it away leaves every test above green, and it
+        # has to be exercised directly or it is a guard nobody has watched
+        # fail. The allowlist is a claim about the spelling; this is a check
+        # on the answer, and it is what would still hold if the regex were
+        # ever loosened.
+        outside = os.path.join(tempfile.gettempdir(), 'destructive-git-cases-never-written')
+        self._sentinels.append(outside)
+        for path in (outside, '../escaped', 'a/../../escaped', '/etc/passwd',
+                     'ok/../../../escaped'):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    resolve_inside(self._root, path)
+        # ...while an ordinary fixture-relative path still resolves.
+        self.assertEqual(resolve_inside(self._root, 'a/b.txt'),
+                          os.path.join(os.path.realpath(self._root), 'a', 'b.txt'))
+        self.assertFalse(os.path.exists(outside))
+
     def test_the_argument_schema_covers_exactly_the_declared_vocabulary(self):
         # The drift guard the op-name check already has, one level down: an op
         # added to SETUP_OPS with no argument schema would otherwise be
