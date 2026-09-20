@@ -319,6 +319,12 @@ for (const [label, dirName] of [
   ['a double quote', 'dq"dir'],
   ['a dollar sign and a backtick', 'sh$`dir'],
   ['a space and a paren', 'sp ace(dir)'],
+  // The discriminator: a newline in a directory name is legal on any Unix
+  // filesystem, and it is a shape the old sed could not have escaped at all
+  // -- it escaped the apostrophe and nothing else, so a raw newline inside a
+  // single-quoted JS literal was a syntax error before the specifier was even
+  // read. Measured to import cleanly across the argv seam.
+  ['a newline', 'nl\ndir'],
 ]) {
   test(`install.sh (M6): a checkout path containing ${label} loads the library and runs -- the path crosses the seam as an argument, not as source`, () => {
     const checkout = makeFakeCheckout(dirName)
