@@ -54,6 +54,13 @@ Then run the workflows namespaced:
 
 ```bash
 git clone https://github.com/bassings/claude-ai-harness
+claude-ai-harness/bin/install.sh            # install, then verify
+claude-ai-harness/bin/install.sh --check    # verify only, non-zero on drift
+
+# What that does, if you would rather run it by hand. Prefer the script: it
+# installs exactly what workflows/lib/install-consistency.mjs calls the
+# consumer subset, skips anything the repo does not track (so build output
+# never lands in your harness), and verifies the result. These commands do not.
 cp claude-ai-harness/agents/*.md ~/.claude/agents/
 cp -r claude-ai-harness/workflows/. ~/.claude/workflows/
 cp -r claude-ai-harness/skills/. ~/.claude/skills/
@@ -81,7 +88,14 @@ is invisible to it (see the next section) -- and in any project:
 
 ### Making a change live: copying the files is not deploying them (AC-OPS-4)
 
-`cp -r` distributes **source**. It does not deploy. The two halves of
+The harness RUNS from `~/.claude`, not from your checkout, so a change can
+merge, pass every test and change nothing on a real run. Measured 2026-09-14:
+two merged PRs had not reached the install. Run `bin/install.sh`; `--check`
+writes nothing and exits non-zero when the install is behind, so it suits a
+hook. What it installs is decided by `workflows/lib/install-consistency.mjs`,
+the same module the weekly drift check reads.
+
+Copying **source** is not deploying. The two halves of
 `workflows/` reach a running session by different routes, they go live at
 different moments, and the gap between them is the failure mode this section
 exists to prevent.
@@ -112,11 +126,18 @@ no filesystem access, so it instructs an agent to shell out to
 process starts, so a copied `.mjs` is live on the very next run, in the same
 session.
 
-Nothing detects this for you. The `schema_version` staleness signal described
-further down does **not** detect a stale top-level workflow script: that fix
-class bumps no `SCHEMA_VERSION` and adds no ledger field, so a session running
-last week's `plan-cycle.js` produces a ledger indistinguishable from a current
-one. The restart is the control; there is no alarm behind it.
+`bin/install.sh --check` detects the file-level half of this: it compares every
+file in the consumer subset and exits non-zero when the install is behind. What
+it cannot see is a session that ALREADY loaded a stale script before you
+re-installed; only a restart fixes that.
+
+The `schema_version` staleness signal described further down does **not** detect
+a stale top-level workflow script either: that fix class bumps no
+`SCHEMA_VERSION` and adds no ledger field, so a session running last week's
+`plan-cycle.js` produces a ledger indistinguishable from a current one. So the
+two signals cover different things -- `--check` compares files on disk, the
+schema version compares what a run wrote -- and neither covers an already-loaded
+script. The restart is still the control there.
 
 So there are two rules, and they are not the same rule:
 
@@ -173,16 +194,17 @@ above does not do.
 ### Detecting a stale install without running the commands (AC-OPS-11)
 
 A stale `workflows/lib/` mirror is *sometimes* visible in the optimiser's own
-report: `ledger-append.mjs`'s `SCHEMA_VERSION` was bumped (1 to 2) by the
-plan-identity canonicalisation change, and `optimise-read.mjs ledger`'s
+report: `ledger-append.mjs`'s `SCHEMA_VERSION` has been bumped twice, 1 to 2
+by the plan-identity canonicalisation change and 2 to 3 by the validator
+changes described under "Run ledger" below, and `optimise-read.mjs ledger`'s
 `perRepo[].schemaVersionsSeen` reports the schema-version mix actually seen
-per repo, so a stale installed writer still emitting `schema_version: 1`
-surfaces there instead of failing silently.
+per repo, so a stale installed writer still emitting an older
+`schema_version` surfaces there instead of failing silently.
 
 **This signal does not cover every staleness class**, and it covers none of
 the session-snapshot class above. Additive, optional fields
-(the start/terminal exception guard, `invalid_ac_ids_dropped`, `ac_id_raw`)
-bump no `SCHEMA_VERSION` by design, so a stale top-level script or a stale
+(the start/terminal exception guard, `invalid_ac_ids_dropped`, `ac_id_raw`,
+`ac_verdicts_truncated`) bump no `SCHEMA_VERSION` by design, so a stale top-level script or a stale
 `optimise-read.mjs` reading a newer ledger produces no `schemaVersionsSeen`
 difference at all. What covers that gap is the report's own rendering: a
 genuinely stale or absent reader field renders as an explicit "unavailable"
@@ -770,6 +792,42 @@ exhaustive field list (the workflow scripts themselves cannot host this: the
 runtime statically rejects any `import` before execution, so the schema,
 validation and the write itself live in this one real-Node script instead,
 invoked via Bash from each workflow's final step).
+
+**The `schema_version` 3 boundary, and reading a window that spans it.**
+`SCHEMA_VERSION` is 3 from the validator change onward. What changed at that
+boundary, field by field:
+
+- **`ac_id`** (in both `findings[]` and `ac_verdicts[]`) accepts two forms it
+  used to reject: a prefix containing a digit, so `AC-A11Y-<n>` validates at
+  last, and one bounded spec prefix for a review spanning several specs
+  (`FEAT-011 AC-QA-1`, `FEAT-010/AC-QA-3`). Both used to be nulled into
+  `ac_id_raw` and counted in `invalid_ac_ids_dropped`.
+- **`spec_bug_count`** is `null`, not a number, on a review run where no spec
+  was in play at all, and no finding on such a run carries the `spec_bug`
+  disposition. Before, every finding on a spec-less run was classified
+  `spec_bug`, because a finding with no AC behind it is what the synthesis
+  step was asked for.
+- **`findings_truncated`** is unchanged in meaning (findings the writer
+  counted but could not fit on the line) and is now READ: the optimiser sums
+  it across the window and renders it in the Rework attribution section, so a
+  per-lens tally that is short says by how much. Per-lens counts are computed
+  from the line's own `findings` array, which is capped, so on a truncated
+  round those counts are short by exactly this number.
+- **`ac_verdicts_truncated`** is its sibling for `ac_verdicts`, which is
+  bounded separately. It is also summed and rendered, and any criterion in a
+  (repo, plan) bucket whose window contains a truncated `ac_verdicts` array
+  can no longer be reported as confidently never-failing: the surplus could
+  have held the FAIL.
+
+**Interpreting a window that spans the boundary (AC-OPS-8).** On lines
+written BEFORE the boundary, accessibility criteria (`AC-A11Y-<n>`) and every
+cross-spec-prefixed criterion live in `ac_id_raw` with `ac_id` null, and the
+reader does not read `ac_id_raw` back into attribution. So a zero for those
+criteria in a pre-boundary window means **never recorded**, never a measured
+zero: the runs happened and their verdicts were discarded by the validator.
+The report's own Never-failing acceptance criteria section carries this
+caveat inline, and `perRepo[].schemaVersionsSeen` is what tells you which
+population a window is made of.
 
 **Malformed values degrade, they never destroy the line**: `ledger-append.mjs`'s
 `degradeEntry` validates the whole entry once; when every error it finds is

@@ -237,6 +237,19 @@ const EXEMPTIONS = [
     why: 'Fixtures deliberately contain hostile-looking absolute paths (path traversal, injection) and repo names, as test DATA. They are never installed anywhere. Still: use a synthetic account name (some-operator, victim) rather than a real one. A fixture using this operator\'s actual username is how the one real leak in this repo was found, on 2026-09-04.',
   },
   {
+    // ONE named file, not docs/. The measurement is only re-takeable if it
+    // says WHICH ledger each figure came from, so the repo names are the
+    // content rather than an accident -- the same reasoning the specs/ entry
+    // below records, under the same owner ruling of 2026-09-04, applied to
+    // one file rather than a directory. Every other pattern stays enforced on
+    // it: it contains no absolute path, and it fails this guard the moment it
+    // does. docs/ as a whole stays scanned.
+    paths: ['docs/harn-ledger-validators-measurements.md'],
+    skip: ['target-repo'],
+    placeholder: false,
+    why: 'AC-PROD-8 requires the optimiser re-run over the operator\'s real ledgers with three headline numbers per ledger, before and after. A table that will not name which ledger is which cannot be re-taken or checked, so naming CouchPotatoServer (public) and SaidOfYou (owner-ruled non-confidential, 2026-09-04) is the point of the file. Scoped to this one file so docs/ keeps its scan, and the /Users/, /Volumes/ and /home/ clauses are NOT waived here.',
+  },
+  {
     paths: ['specs/'],
     skip: ['target-repo'],
     placeholder: true,
@@ -1171,11 +1184,15 @@ test('static: every CI guarantee is asserted by COUNT or by structure, because p
 // were. The id is the join key between the planning cycle, the review cycle
 // and the ledger's ac_verdicts, so a duplicate silently merges two unrelated
 // criteria and a verdict citing one cannot be resolved.
-test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id is the join key between planning, review and the ledger', () => {
-  const specsDir = path.join(ROOT, 'specs')
+// AC-QA-13 names a proof this guard never had: "a fixture spec defining
+// AC-A11Y-3 twice being reported as a duplicate". Without it the detector
+// could not be shown to FAIL -- measured at fix round 5, changing `n > 1` to
+// `n > 99` left the whole suite green, so by AC-QA-14's own wording the
+// guard was unproven. The scan is a function so the fixture test below can
+// drive the SAME code the real one does, rather than a second copy of the
+// counting rule.
+function scanSpecsForDuplicateAcIds(specsDir) {
   const files = fs.readdirSync(specsDir).filter((f) => f.endsWith('.md'))
-  assert.ok(files.length > 0, 'sanity: expected spec files under specs/')
-
   const problems = []
   let totalDefs = 0
   for (const file of files) {
@@ -1205,7 +1222,7 @@ test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id 
     //      the blindness rather than removed it.
     // Line anchoring is what keeps prose mentions out; the alternation is
     // what keeps every file in.
-    const defs = [...src.matchAll(/^(?:[-*]\s+)?(?:\*\*)?(AC-[A-Z]+-\d+)(?::\*\*|\*\*:|:)\s/gm)].map((m) => m[1])
+    const defs = [...src.matchAll(/^(?:[-*]\s+)?(?:\*\*)?(AC-[A-Z][A-Z0-9]*-\d+)(?::\*\*|\*\*:|:)\s/gm)].map((m) => m[1])
     totalDefs += defs.length
     // PER-FILE anti-vacuity: a global floor is satisfied by one large file
     // while every other spec contributes zero forever. Measured: harn-opt-3
@@ -1217,18 +1234,69 @@ test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id 
     // the file has to say which, and only an explicit declaration exempts it.
     // Silence is read as the failure, not as the exemption.
     const declaresNone = /<!--\s*no-acceptance-criteria\b/.test(src)
-    if (/AC-[A-Z]+-\d+/.test(src) && defs.length === 0 && !declaresNone) {
+    // M5 (review round one): this was /AC-[A-Z]+-\d+/, blind to a prefix
+    // containing a digit exactly like the counter above it was. So a spec
+    // written entirely in AC-A11Y-<n> ids did not even register as MENTIONING
+    // acceptance criteria, and the check whose whole job is detecting
+    // blindness was blind in the same way, to the same lens, on the same line
+    // of reasoning. Fixing the counter and not this one is why it survived.
+    if (/AC-[A-Z][A-Z0-9]*-\d+/.test(src) && defs.length === 0 && !declaresNone) {
       problems.push(`${file}: contains AC ids but the definition scan found none -- either the pattern is blind to this file's spelling, or the spec defines no criteria and must say so with an HTML comment marker`)
     }
     const counts = new Map()
     for (const id of defs) counts.set(id, (counts.get(id) || 0) + 1)
     for (const [id, n] of counts) if (n > 1) problems.push(`${file}: ${id} defined ${n} times`)
   }
+  return { problems, totalDefs, fileCount: files.length }
+}
+
+test('static: no spec defines the same AC-<LENS>-<n> identifier twice -- the id is the join key between planning, review and the ledger', () => {
+  const { problems, totalDefs, fileCount } = scanSpecsForDuplicateAcIds(path.join(ROOT, 'specs'))
+  assert.ok(fileCount > 0, 'sanity: expected spec files under specs/')
   assert.ok(
     totalDefs > 200,
     `sanity: expected the scan to find many AC definitions across specs/, found ${totalDefs} -- a pattern that matches nothing reports no duplicates forever. The per-file check above is the real anti-vacuity guard; this is a coarse backstop, set just under the 245 currently present.`
   )
   assert.deepEqual(problems, [], `duplicate acceptance-criterion definitions: ${problems.join('; ')}`)
+})
+
+test('static (AC-QA-13): a fixture spec defining AC-A11Y-3 TWICE is reported as a duplicate -- the detector can actually fire, and it fires on the prefix that used to be invisible to it', () => {
+  // The criterion's own named proof. Two properties at once: the counting
+  // rule reports a repeat at all, and it does so for an accessibility id,
+  // whose digit-bearing prefix the pre-change pattern could not see -- so a
+  // spec written entirely in that lens's criteria was scanned as empty and
+  // could never report a duplicate.
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ac-dup-fixture-'))
+  test.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(dir, 'fixture.md'), [
+    '# fixture',
+    '',
+    '- **AC-A11Y-3:** the first definition of this criterion',
+    '- **AC-A11Y-3:** a second, contradictory definition of the same id',
+    '- **AC-QA-1:** an ordinary criterion defined once',
+    '',
+  ].join('\n'))
+  const { problems, totalDefs } = scanSpecsForDuplicateAcIds(dir)
+  assert.equal(totalDefs, 3, 'sanity: all three definitions were seen, including both A11Y spellings')
+  assert.deepEqual(problems, ['fixture.md: AC-A11Y-3 defined 2 times'],
+    'the duplicate must be reported, and the singly-defined criterion must not be')
+})
+
+test('static (AC-QA-13, not over-broad): a fixture spec defining each id ONCE reports nothing', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'ac-dup-clean-'))
+  test.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(dir, 'fixture.md'), [
+    '# fixture',
+    '',
+    '- **AC-A11Y-3:** defined once',
+    '- **AC-QA-1:** also defined once, and mentioned again in prose below',
+    '',
+    'The criterion AC-QA-1 is discussed here, which is a MENTION and must not',
+    'count as a second definition.',
+    '',
+  ].join('\n'))
+  const { problems } = scanSpecsForDuplicateAcIds(dir)
+  assert.deepEqual(problems, [], 'a prose mention is not a definition')
 })
 
 // H2 from review round 2: the assertions above match TEXT in the hook, and
@@ -2132,5 +2200,50 @@ test('static: every hooks.json entry actually INVOKES its script -- the command 
     assert.match(target, /hooks\/[a-z0-9-]+\.py$/, `${event}: args must end at a hooks/*.py script, got ${JSON.stringify(target)}`)
     const bare = target.replace(/^.*hooks\//, '')
     assert.ok(fs.existsSync(path.join(ROOT, 'hooks', bare)), `${event}: wired script hooks/${bare} does not exist`)
+  }
+})
+
+// AC-QA-13 (specs/harn-ledger-validators.md): the SECOND copy of the blind
+// pattern. The AC-definition counter above used `AC-[A-Z]+-\d+`, the same
+// shape as the ledger validator's old one and blind in the same way, so a spec
+// whose criteria are all AC-A11Y-<n> counted as zero definitions -- the
+// accessibility lens invisible to the guard as well as to the ledger.
+//
+// Two copies of one rule is why this survived the ledger fix. This test pins
+// that they agree on what a criterion id looks like.
+test('static: the AC-definition counter recognises every lens prefix the ledger validator accepts, including ones containing a digit (AC-QA-13)', async () => {
+  const mod = await import(require('node:url').pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'ledger-append.mjs')).href)
+  assert.equal(typeof mod.AC_ID_PATTERN_STR, 'string',
+    'AC_ID_PATTERN_STR must be exported; without it this test compares against undefined and proves nothing')
+  const validator = new RegExp(mod.AC_ID_PATTERN_STR)
+
+  // The counter's own pattern, read from the source it actually uses, so this
+  // cannot drift into testing a copy of the regex that nothing runs.
+  const src = fs.readFileSync(path.join(__dirname, 'static-checks.test.js'), 'utf8')
+  const m = src.match(/const defs = \[\.\.\.src\.matchAll\((\/[^\n]+\/gm)\)\]/)
+  assert.ok(m, 'could not locate the AC-definition counter regex in this file')
+  // eslint-disable-next-line no-eval
+  const counter = eval(m[1])
+
+  // M5 (review round one): the counter's SIBLING -- the predicate that decides
+  // "this file mentions acceptance criteria but defines none" -- carried the
+  // same blind pattern. So a spec written entirely in AC-A11Y ids did not even
+  // register as mentioning criteria, and the check whose whole job is
+  // detecting blindness was blind in the same way, to the same lens. Fixing
+  // one and not the other is exactly how it survived the first pass.
+  const detector = src.match(/if \(\/(AC-\[[^/]+?)\/\.test\(src\) && defs\.length === 0/)
+  assert.ok(detector, 'could not locate the mentions-criteria detector in this file')
+  const detectorRe = new RegExp(detector[1])
+  assert.ok(detectorRe.test('AC-A11Y-1'),
+    'the blindness detector must itself recognise a lens prefix containing a digit')
+  assert.ok(detectorRe.test('AC-QA-1'), 'and still recognise the ordinary form')
+
+  for (const id of ['AC-QA-1', 'AC-SEC-12', 'AC-A11Y-1', 'AC-A11Y-12', 'AC-DESIGN-3']) {
+    assert.ok(validator.test(id), `sanity: the ledger validator must accept ${id}`)
+    const line = `- **${id}:** something the lens requires\n`
+    counter.lastIndex = 0
+    const found = [...line.matchAll(counter)].map((x) => x[1])
+    assert.deepEqual(found, [id],
+      `the definition counter must see ${id}; a prefix containing a digit was invisible to it, so a spec written entirely in that lens's criteria counted as zero`)
   }
 })

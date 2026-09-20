@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, wasNoSpecInPlay } from './ledger-append.mjs'
 
 // Round-7 review F1 (§12 reframe, corrected a second time): round-6's
 // isNeutralised(obj, field) asked a SHAPE question -- "is this value null
@@ -222,9 +222,53 @@ export function sortRecordsByTime(records) {
   })
 }
 
+// One finding, one increment. The `by` parameter this took while the
+// writer-computed tally existed (which supplied whole counts rather than
+// findings) went with it at fix round 4: a count nothing passes is a
+// parameter the next reader has to prove is unused before touching it.
 function bumpDisposition(counts, lens, disposition) {
   if (!counts[lens]) counts[lens] = { fixed: 0, rejected: 0, spec_bug: 0, open: 0 }
   if (disposition in counts[lens]) counts[lens][disposition] += 1
+}
+
+// M2 (round 3 review): derived from ledger-append.mjs's own exported
+// AC_ID_PATTERN_STR rather than a second, independently maintained copy of
+// that shape -- see that export's own comment for why two copies is a real
+// hazard, not merely untidy. L4's sibling Set over the writer's DISPOSITIONS
+// went with the tally at fix round 4: only the tally loop needed to ask
+// whether an arbitrary key was a known disposition, because only it read
+// dispositions as map keys rather than from a schema-validated field.
+const AC_ID_RE = new RegExp(AC_ID_PATTERN_STR)
+
+// H3: strip a leading spec prefix from an ac_id, but ONLY when it names the
+// record's own spec.
+//
+// The prefix is how a lens disambiguates when one review spans several specs,
+// and it is carried inside ac_id deliberately (a separate field would let the
+// same attribution arrive in two shapes). But two citation forms of ONE
+// criterion must aggregate to one bucket, or a criterion that failed under one
+// form is reported as never having failed under the other.
+//
+// Matched against the spec's basename without extension, which is the form a
+// lens actually emits ("FEAT-011 AC-QA-1" for specs/FEAT-011.md). Anything
+// else is left exactly as it arrived: an unrecognised prefix is a different
+// criterion, not a malformed one, and guessing would merge buckets that must
+// stay apart.
+//
+// M2 (round 3 review): extracted via AC_ID_PATTERN_STR's own named groups
+// (`prefix`, `ac`) rather than a second, looser regex literal -- any ac_id
+// reaching here already passed the writer's validation (or came from a
+// hand-edited/foreign ledger line, per the spec's own documented
+// possibility), so matching it against the SAME pattern that accepted it in
+// the first place cannot be blind to a form the writer itself widened to
+// accept. A value that does not match at all (should not happen for a
+// writer-validated line) is left exactly as it arrived, same as before.
+function stripOwnSpecPrefix(acId, planKey) {
+  if (typeof acId !== 'string' || typeof planKey !== 'string') return acId
+  const m = AC_ID_RE.exec(acId)
+  if (!m || !m.groups.prefix) return acId
+  const base = planKey.replace(/^.*\//, '').replace(/\.[^.]*$/, '')
+  return base && m.groups.prefix === base ? m.groups.ac : acId
 }
 
 // HARN-OPT-2 PR1 (AC-ARCH-1, AC-ARCH-4): the ONE place every plan-keyed
@@ -329,12 +373,72 @@ export function aggregateRework(records, { root = '' } = {}) {
   // the same treatment as its siblings above, so it does not become the
   // NEXT "written to every line and read by nothing" field.
   let invalidPriorIdsDropped = 0
+  // H3 (round 3 review): findings_truncated/ac_verdicts_truncated were
+  // written to every line and summed by nothing -- the same shape every
+  // counter above already closed, one field over, for the two counters the
+  // byte-rescue loop itself produces.
+  let findingsTruncated = 0
+  let acVerdictsTruncated = 0
+  // M3: a finding whose `lens` is not a real lens name was thrown away
+  // uncounted by the LENS_RE gate below -- summed here instead, separately
+  // from lensDispositionCounts (never as a fake lens bucket in that map).
+  let unattributedFindings = 0
+  // H4: how many review runs had no spec in play, and how many of their
+  // findings were reclassified from spec_bug to open as a result -- the
+  // signal "this round was reviewed with no spec" existed only as an
+  // absence before this, exactly the shape the whole spec exists to close.
+  let noSpecReviewRuns = 0
+  let noSpecFindingsReclassified = 0
+  // H3: which (repo, plan) buckets saw a truncated ac_verdicts array in this
+  // window -- the surplus could have held the FAIL for any criterion in
+  // that bucket, so neverFailingAcs must not report a confident
+  // never_failed:true for any of them. Same shape as unattributedFailBuckets
+  // above, a different cause.
+  const truncatedBuckets = new Set()
   for (const r of reviewRecords) {
     if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
     if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
     if (typeof r.invalid_fixed_ids_dropped === 'number') invalidFixedIdsDropped += r.invalid_fixed_ids_dropped
     if (typeof r.duplicate_fixed_ids_dropped === 'number') duplicateFixedIdsDropped += r.duplicate_fixed_ids_dropped
     if (typeof r.invalid_prior_ids_dropped === 'number') invalidPriorIdsDropped += r.invalid_prior_ids_dropped
+    if (typeof r.findings_truncated === 'number') findingsTruncated += r.findings_truncated
+    if (typeof r.ac_verdicts_truncated === 'number') acVerdictsTruncated += r.ac_verdicts_truncated
+    // Fix round 4: the per-finding loop below is the ONE source of these
+    // counts again. For three fix rounds this branched on the writer's
+    // `findings_by_lens` tally first, to beat the MAX_FINDINGS cap -- and
+    // that branch produced a defect in every review round it existed
+    // (double-counted fixes, then a collapsed record, then zero fixes on the
+    // busy rounds), because a second source for the same number has to
+    // re-implement every rule the first one applies, and the cross-round
+    // `fixed` dedupe below is one it structurally cannot. `r.findings` is
+    // capped at MAX_FINDINGS and shrunk further by the byte loop, so these
+    // counts DO undercount a truncated round -- by up to 82%, measured. What
+    // says so is `findingsTruncated`, summed just above and rendered in the
+    // same report section (AC-QA-8's reported-shortfall branch). A named
+    // shortfall beside a smaller number is honest; a second tally that
+    // silently disagreed with the array beside it was not.
+    // M2 (review round one): D4 fixed the WRITER, so lines written from now on
+    // are right. Every line already in a 90-day window is not, and those are
+    // the lines this month's report reads -- so the spec_bug figure stays
+    // conflated for the whole retained history unless the reader applies the
+    // same rule. It can, because the rule is computable from fields the line
+    // already carries. That is precisely why D4's trigger was defined as
+    // observable state rather than a new stored flag: a read-side fix reaches
+    // the history a write-side fix never can.
+    // L3: the shared predicate, imported from ledger-append.mjs rather than
+    // a second copy of decision 4's rule.
+    // M1 (round-4 review): the record's own evidence about whether its
+    // ac_verdicts can be read at face value is handed to the predicate, which
+    // owns what that evidence means. `r.ac_verdicts_truncated` is the same
+    // field this loop already summed twenty-five lines above and used to taint
+    // truncatedBuckets -- it was in hand and simply not consulted here.
+    const noSpecWasInPlay = wasNoSpecInPlay(r.spec, r.ac_verdicts, {
+      acVerdictsTruncated: r.ac_verdicts_truncated,
+      degraded: r.degraded,
+    })
+    if (noSpecWasInPlay) noSpecReviewRuns += 1
+    const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
+
     for (const f of r.findings || []) {
       // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
       // not shape-based -- see this file's own header comment): a `lens`
@@ -359,10 +463,30 @@ export function aggregateRework(records, { root = '' } = {}) {
           }
           seenFixedIds.add(dedupeKey)
         }
-        bumpDisposition(lensDispositionCounts, f.lens, f.disposition)
+        if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
+        bumpDisposition(lensDispositionCounts, f.lens, reclassify(f.disposition))
+      } else if (f && typeof f === 'object') {
+        // M3: a finding whose lens could not be attributed used to vanish
+        // here with nothing recording it -- this spec's own defect class
+        // (a value a check could not parse, discarded, its absence then
+        // reported as a measurement) inside the reader this spec added.
+        // Counted instead, and rendered under its own heading.
+        unattributedFindings += 1
+        if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
       }
     }
     const verdicts = r.ac_verdicts || []
+    // H3: taint this (repo, plan) bucket whenever THIS record's ac_verdicts
+    // were truncated, regardless of whether any verdicts survived the cut --
+    // the dropped surplus could have held the FAIL for any criterion the
+    // bucket contains. Computed before the "nothing to bucket" shortcut
+    // below, since a truncated-to-EMPTY array must still taint.
+    if (typeof r.ac_verdicts_truncated === 'number' && r.ac_verdicts_truncated > 0) {
+      const truncatedPlanKey = planKeyForRecord(r, root)
+      if (truncatedPlanKey !== null && truncatedPlanKey !== REDACTED_PATH_MARKER) {
+        truncatedBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(truncatedPlanKey)}`)
+      }
+    }
     if (!verdicts.length) continue
     const planKey = planKeyForRecord(r, root)
     if (planKey === null || planKey === REDACTED_PATH_MARKER) {
@@ -406,9 +530,47 @@ export function aggregateRework(records, { root = '' } = {}) {
         }
         continue
       }
+      // M1 (round-3 review): the same VALUE-based gate the lens path applies,
+      // one field over. A ledger line is untrusted data on disk: the writer
+      // validates every ac_id it writes, but the reader also reads lines it
+      // did not write (hand-edited, restored from a backup written by another
+      // version, or produced in any of the several repos it aggregates
+      // across). Ungated, a forged value flowed into the aggregation key and
+      // out into the operator's report verbatim, newlines included -- and
+      // that report drives "retire this check" proposals, so a forged row
+      // there is an INVERTED conclusion, not a lost measurement. Costs a
+      // writer-produced line nothing: every id the writer accepted already
+      // matches this same exported pattern.
+      //
+      // Dropped like the explicit-null case above rather than silently: the
+      // verdict is counted as unattributable, and a FAIL that could not be
+      // attributed taints the bucket, because a discarded FAIL must degrade a
+      // never_failed claim to unknown rather than leave it confidently true.
+      if (typeof v.ac_id !== 'string' || !AC_ID_RE.test(v.ac_id)) {
+        unattributableCount += 1
+        if (v.verdict !== 'PASS' && v.verdict !== 'UNVERIFIABLE') {
+          unattributedFailBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}`)
+        }
+        continue
+      }
       // Review round-2 M4: same injective-escaping fix as planBucketKey.
-      const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(v.ac_id)}`
-      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: v.ac_id, pass: 0, fail: 0, unverifiable: 0, n: 0, unattributedVerdicts: 0 })
+      // H3 (review round one): widening the ac_id pattern let the SAME
+      // criterion arrive in two citation forms -- `AC-QA-1` on one round and
+      // `FEAT-011 AC-QA-1` on the next, when a lens disambiguated because the
+      // review spanned several specs. Keyed verbatim, those became two buckets,
+      // and neverFailingAcs then reported the pass-only one as never having
+      // failed while the other held the failure. That feeds a "retire this
+      // check" proposal, so it is an INVERTED conclusion, not a lost
+      // measurement -- strictly worse than the defect it replaced, and created
+      // by this change: before it, both forms were nulled and no bucket existed.
+      //
+      // Only a prefix naming THIS record's own spec is stripped. A prefix
+      // naming a different spec is a different criterion and keeps its bucket:
+      // merging two specs' AC-QA-1 is the inversion in the other direction,
+      // and is why the prefix is carried inside ac_id at all.
+      const canonicalAcId = stripOwnSpecPrefix(v.ac_id, planKey)
+      const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(canonicalAcId)}`
+      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: canonicalAcId, pass: 0, fail: 0, unverifiable: 0, n: 0, unattributedVerdicts: 0 })
       const entry = acVerdicts.get(key)
       // Round-6 H1: the ac_id is known (we are inside this branch because
       // it is), but the VERDICT itself may not be usable evidence -- round-
@@ -441,7 +603,7 @@ export function aggregateRework(records, { root = '' } = {}) {
       else entry.unverifiable += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets, findingsTruncated, acVerdictsTruncated, unattributedFindings, noSpecReviewRuns, noSpecFindingsReclassified, truncatedBuckets }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -455,11 +617,18 @@ export function aggregateRework(records, { root = '' } = {}) {
 // `entry` by construction never saw the hidden FAIL. Defaults to an empty
 // Set so every pre-existing call site (none of which knows this option
 // exists) behaves identically to before: no tainted buckets, no change.
-export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set() } = {}) {
+export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set(), truncatedBuckets = new Set() } = {}) {
   const out = []
   for (const [key, entry] of acVerdicts.entries()) {
     const insufficient_data = entry.n < minRuns
-    const unattributed_fail_in_window = unattributedFailBuckets.has(`${escapeKeyComponent(entry.repo)}|${escapeKeyComponent(entry.spec)}`)
+    const bucketKey = `${escapeKeyComponent(entry.repo)}|${escapeKeyComponent(entry.spec)}`
+    const unattributed_fail_in_window = unattributedFailBuckets.has(bucketKey)
+    // H3 (round 3 review): a truncated ac_verdicts array in this (repo,
+    // plan) window could have dropped the FAIL for THIS criterion -- the
+    // same inversion class unattributed_fail_in_window already closes for
+    // a sanitised ac_id, one cause over. Defaults to an empty Set so every
+    // pre-existing call site behaves identically to before.
+    const truncated_in_window = truncatedBuckets.has(bucketKey)
     // Round-6 H1: this ac_id's OWN entry saw at least one neutralised
     // verdict (aggregateRework's unattributedVerdicts, above) -- a
     // DIFFERENT taint reason from unattributed_fail_in_window (that one
@@ -477,7 +646,8 @@ export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILE
       insufficient_data,
       unattributed_fail_in_window,
       unattributed_verdict_in_entry,
-      never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry ? null : entry.fail === 0,
+      truncated_in_window,
+      never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry || truncated_in_window ? null : entry.fail === 0,
     })
   }
   return out
@@ -946,6 +1116,14 @@ export function aggregateTriggerAccuracy(records) {
   for (const r of records) {
     if (r.kind !== 'review_cycle') continue
     for (const lens of r.lenses_run || []) {
+      // M1 (review round one): this path was ungated while aggregateRework's
+      // equivalent was gated, and these keys reach a RENDERED report line. A
+      // ledger line is untrusted data on disk, so a lens name from it is gated
+      // before it can become a key anywhere. One gated path and one ungated
+      // path reading the same file is the uniformity failure a gate exists to
+      // prevent, and it is the third instance of this exact shape in this
+      // change alone.
+      if (typeof lens !== 'string' || !LENS_RE.test(lens)) continue
       if (!byLens[lens]) byLens[lens] = { cleanWithZeroTrigger: 0, cleanWithMatches: 0, findingsWithMatches: 0, cleanTriggerUnmeasured: 0, total: 0 }
       const bucket = byLens[lens]
       bucket.total += 1
@@ -1450,7 +1628,7 @@ function runLedgerCommand(roots, window) {
   // unaffected.
   const canonicalRoot = roots[0] || ''
   const rework = aggregateRework(windowed, { root: canonicalRoot })
-  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets })
+  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets, truncatedBuckets: rework.truncatedBuckets })
   const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
   const trigger = aggregateTriggerAccuracy(windowed)
   const proposalOutcomes = aggregateProposalOutcomes(windowed)
@@ -1460,7 +1638,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecFindingsReclassified: rework.noSpecFindingsReclassified },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
