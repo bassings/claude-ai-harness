@@ -2269,3 +2269,42 @@ test('ledger-append.mjs ROSTER_LENSES matches the lens files in agents/ in both 
   assert.deepEqual(missing, [], `agents/ has lens file(s) missing from ROSTER_LENSES in ledger-append.mjs: ${missing.join(', ')}`)
   assert.deepEqual(extra, [], `ROSTER_LENSES in ledger-append.mjs names lens(es) with no file in agents/: ${extra.join(', ')}`)
 })
+
+// HARN-OPT-4 T4 (AC-QA-14): the conductor's review-invocation step must name
+// both `spec` and `round`. The skill is prose, so this proves the instruction
+// is present in the awaiting-ci green bullet, not that a conductor obeys it.
+// The bullet already says "round two" in the prior_findings steps, so the
+// assertions anchor on the backticked argument names inside a paragraph that
+// also names /review-cycle, never on the bare word "round".
+test('static: conduct-plan/SKILL.md awaiting-ci green step instructs passing `spec` (repo-relative) and `round` on every /review-cycle invocation (HARN-OPT-4 T4, AC-QA-14)', () => {
+  const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
+  const lines = skill.split('\n')
+  // The step bullets in SKILL.md sit at three spaces (under the numbered
+  // list); the first draft of this test anchored at four, which no real line
+  // matched, and the implementer re-indented the skill to fit the test. The
+  // test anchors on the file as it is written.
+  const start = lines.findIndex((l) => /^ {3}- `awaiting-ci` green/.test(l))
+  assert.ok(start >= 0, 'expected the awaiting-ci green bullet')
+  let end = lines.findIndex((l, i) => i > start && /^ {3}- `/.test(l))
+  if (end === -1) end = lines.length
+  const paragraphs = lines.slice(start, end).join('\n').split(/\n\s*\n/)
+  const invocation = paragraphs.filter((p) => /review-cycle/.test(p) && p.includes('`spec`') && p.includes('`round`'))
+  assert.ok(invocation.length > 0, 'a paragraph of the awaiting-ci green step must name /review-cycle together with both `spec` and `round`')
+  assert.ok(invocation.some((p) => /repo-relative/.test(p) && /never absolute/i.test(p)), 'the spec argument must be stated as repo-relative, never absolute')
+})
+
+// Round 2 L3 (AC-PROD-4): "a positive integer" alone left a conductor to guess
+// the literal call, and a round passed as a quoted string is nulled by the
+// writer and read as a direct review. The step must show the unquoted call and
+// say what a quoted number does.
+test('static: conduct-plan/SKILL.md review step shows a literal /review-cycle call with an unquoted round and warns that a quoted number reads as direct (round 2 L3)', () => {
+  const lines = readAll('skills', 'conduct-plan', 'SKILL.md').split('\n')
+  const start = lines.findIndex((l) => /^ {3}- `awaiting-ci` green/.test(l))
+  assert.ok(start >= 0, 'expected the awaiting-ci green bullet')
+  let end = lines.findIndex((l, i) => i > start && /^ {3}- `/.test(l))
+  if (end === -1) end = lines.length
+  const step = lines.slice(start, end).join('\n')
+  assert.match(step, /\/review-cycle \{[^}\n]*"spec": "[^"\n]+"[^}\n]*"round": \d+[^}\n]*\}/, 'expected a literal /review-cycle call with an unquoted numeric round')
+  const warn = step.split(/\n\s*\n/).find((p) => /quoted/i.test(p) && /null/i.test(p) && /direct/i.test(p))
+  assert.ok(warn, 'expected a sentence saying a quoted number is nulled by the writer and read as a direct review')
+})

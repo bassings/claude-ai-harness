@@ -146,14 +146,14 @@ test('T3 split: figures are computed for schema_version >= 4 rows alone, with ol
   const v4 = review('b', [V('AC-QA-1', 'PASS'), V('AC-QA-1', 'PASS'), V('AC-QA-2', 'PASS'), V('AC-QA-2', 'FAIL'), V('AC-QA-3', 'PASS')], { findings_truncated: 2, findings: [{ id: 'y', lens: 'lens-qa+lens-security', disposition: 'open' }] })
   const v4NoSpec = review('c', [], { spec: null })
   const rework = mod.aggregateRework([v3, v4, v4NoSpec])
-  assert.deepEqual(rework.schemaV4, { rows: 2, excludedRows: 1, findingsTruncated: 2, unattributedFindings: 1, duplicateVerdictPairs: 2, noSpecReviewRuns: 1 })
+  assert.deepEqual(rework.schemaV4, { rows: 2, excludedRows: 1, findingsTruncated: 2, unattributedFindings: 1, duplicateVerdictPairs: 2, noSpecReviewRuns: 1, noSpecReviewRunsConducted: null, noSpecReviewRunsDirect: null, noSpecReviewRunsRoundNotRecorded: 1, reviewRunsWithRound: null })
   // The window-wide figure is untouched: it still includes the v3 row.
   assert.equal(rework.findingsTruncated, 7)
 })
 
 test('T3 split: with no schema_version >= 4 rows every figure is null and the older rows are counted as excluded, never a measured 0', () => {
   const rework = mod.aggregateRework([review('a', [V('AC-QA-1', 'PASS')], { schema_version: 3 }), review('b', [V('AC-QA-1', 'PASS')], { schema_version: 1 })])
-  assert.deepEqual(rework.schemaV4, { rows: 0, excludedRows: 2, findingsTruncated: null, unattributedFindings: null, duplicateVerdictPairs: null, noSpecReviewRuns: null })
+  assert.deepEqual(rework.schemaV4, { rows: 0, excludedRows: 2, findingsTruncated: null, unattributedFindings: null, duplicateVerdictPairs: null, noSpecReviewRuns: null, noSpecReviewRunsConducted: null, noSpecReviewRunsDirect: null, noSpecReviewRunsRoundNotRecorded: null, reviewRunsWithRound: null })
 })
 
 // ---- (6) old rows through the real CLI (AC-QA-30) ----
@@ -173,7 +173,7 @@ test('T3 old rows: a ledger of pre-change rows, one per kind, aggregates without
   assert.equal(res.status, 0, res.stderr)
   const out = JSON.parse(res.stdout.trim())
   assert.ok(!out.error, JSON.stringify(out.error))
-  assert.deepEqual(out.rework.schemaV4, { rows: 0, excludedRows: 1, findingsTruncated: null, unattributedFindings: null, duplicateVerdictPairs: null, noSpecReviewRuns: null })
+  assert.deepEqual(out.rework.schemaV4, { rows: 0, excludedRows: 1, findingsTruncated: null, unattributedFindings: null, duplicateVerdictPairs: null, noSpecReviewRuns: null, noSpecReviewRunsConducted: null, noSpecReviewRunsDirect: null, noSpecReviewRunsRoundNotRecorded: null, reviewRunsWithRound: null })
 })
 
 test('T3 CLI: the ledger command carries the v4 split and per-AC verdict_disagreements across its output whitelist', () => {

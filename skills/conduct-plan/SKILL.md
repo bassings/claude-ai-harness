@@ -67,6 +67,27 @@ rather than narrating a condition that does not apply here.
      installed); fix findings or record evidenced rejections → `in-review`.
      CI red → fix, push, re-arm the watch.
 
+     **Mechanical steps for every `/review-cycle` invocation (HARN-OPT-4 T4,
+     AC-QA-14), first round and later rounds alike -- the SAME shape of
+     instruction as the `prior_findings` one below:** pass BOTH of these
+     arguments, every time.
+     1. `spec`: the task's own spec path if the task line in the plan names
+        one, otherwise the plan file itself. Always
+        **repo-relative, never absolute** (an absolute path would put the machine's directory layout
+        into a durable record; the ledger writer strips it, but do not rely on
+        that). Omitting `spec` makes the run a no-spec review, whose findings
+        are not anchored to any acceptance criterion.
+     2. `round`: a positive integer. `1` for the first review of the task, then
+        one more for each subsequent review of the SAME task (the counter
+        restarts at `1` for the next task). Keep the current value in the
+        `## Conductor log` beside the task's other state, so a re-tick reads it
+        rather than guessing. Without it a conducted review is
+        indistinguishable from a direct one in the run ledger. Pass it as an
+        unquoted number, for example
+        `/review-cycle {"spec": "specs/<plan>.md", "round": 2}`. A quoted
+        number (`"round": "2"`) is nulled by the writer and read as a direct
+        review.
+
      **Mechanical steps for `prior_findings` (specs/record-fixed-findings.md
      AC-1/AC-3), the SAME shape of instruction as the ledger-write one
      below, not prose describing intent -- round two of review for the same

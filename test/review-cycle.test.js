@@ -1856,7 +1856,9 @@ test('review-cycle.js: round three -- the override is named in the RETURNED REPO
 
 test('review-cycle.js: round three -- a report that is NOT overridden leaves the returned report untouched (the banner must not appear on every run)', async () => {
   const { result } = await runWorkflow(WF, { args: { allow_inconsistent_install: true }, agent: baseAgent() })
-  assert.equal(result.report, '### VERDICT\nCLEAN', 'a consistent install must produce the synthesis report verbatim, with no override banner')
+  // HARN-OPT-4 T4 (AC-QA-12): this run has no spec, so the script appends the
+  // no-spec consequence sentence. Still exact equality: nothing else, and no banner.
+  assert.equal(result.report, '### VERDICT\nCLEAN\n\nNo spec was supplied, so findings are not anchored to any acceptance criterion.', 'a consistent install must produce the synthesis report with only the no-spec sentence appended, and no override banner')
 })
 
 test('review-cycle.js: round three -- a PROVEN mismatch with NO flag on args still refuses (the override must not be active by default)', async () => {

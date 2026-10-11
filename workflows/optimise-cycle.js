@@ -897,6 +897,10 @@ function buildReport(d) {
   function fmtCountOrUnavailable(value) {
     return value === undefined ? UNAVAILABLE_STALE_READER : String(value)
   }
+  function fmtSplit(value) {
+    if (value === undefined) return UNAVAILABLE_STALE_READER
+    return value === null ? 'not recorded' : String(value)
+  }
   const wallTotalsForExclusions = (d.wallClock && d.wallClock.totals) || {}
   lines.push(
     `Excluded from attribution (never silently dropped): unattributable runs=${wallTotalsForExclusions.unattributableRuns ?? 0}, ` +
@@ -1037,7 +1041,14 @@ function buildReport(d) {
     // being mislabelled as a spec bug.
     lines.push(
       `No-spec review runs in window: ${fmtCountOrUnavailable(d.rework.noSpecReviewRuns)} ` +
-      `(findings reclassified from spec_bug to open on those runs: ${fmtCountOrUnavailable(d.rework.noSpecFindingsReclassified)}).`
+      // Round 1 M1 (AC-PROD-4): null means no row recorded a round, so say so
+      // rather than print a count nobody measured.
+      `(conducted=${fmtSplit(d.rework.noSpecReviewRunsConducted)}, direct=${fmtSplit(d.rework.noSpecReviewRunsDirect)}, round not recorded=${fmtSplit(d.rework.noSpecReviewRunsRoundNotRecorded)}) ` +
+      `(findings reclassified from spec_bug to open on those runs: ${fmtCountOrUnavailable(d.rework.noSpecFindingsReclassified)}). ` +
+      // T4 round 3 L2/L3 (AC-PROD-4): its own clause, outside the no-spec
+      // parentheses, because it counts completed review rows with ANY spec and
+      // read as a subset of the no-spec figure when printed inside them.
+      `Completed review runs carrying a conductor round, any spec: ${fmtSplit(d.rework.reviewRunsWithRound)}.`
     )
     // HARN-OPT-4 T3 (AC-PROD-10, AC-QA-30): the completeness figures exist
     // only on schema_version >= 4 rows, so they are labelled by version and
@@ -1049,7 +1060,7 @@ function buildReport(d) {
         v4.rows
           ? `Completeness, schema_version >= 4 rows only (${v4.rows} rows; ${v4.excludedRows} older rows excluded): ` +
             `findings_truncated=${fmtV4(v4.findingsTruncated)}, unattributed findings=${fmtV4(v4.unattributedFindings)}, ` +
-            `duplicate verdict groups collapsed=${fmtV4(v4.duplicateVerdictPairs)}, no-spec review runs=${fmtV4(v4.noSpecReviewRuns)}.`
+            `duplicate verdict groups collapsed=${fmtV4(v4.duplicateVerdictPairs)}, no-spec review runs=${fmtV4(v4.noSpecReviewRuns)}, no-spec review runs conducted=${fmtV4(v4.noSpecReviewRunsConducted)}, direct=${fmtV4(v4.noSpecReviewRunsDirect)}, round not recorded=${fmtV4(v4.noSpecReviewRunsRoundNotRecorded)}. Completed review runs carrying a conductor round, any spec: ${fmtV4(v4.reviewRunsWithRound)}.`
           : `Completeness, schema_version >= 4 rows only: not recorded (no such rows; ${v4.excludedRows} older rows excluded).`
       )
     }

@@ -512,6 +512,15 @@ export const LEDGER_ENTRY_SCHEMA = {
     ac_verdicts_truncated: { type: ['integer', 'null'] },
     rounds: { type: ['object', 'null'], additionalProperties: { type: 'integer' } },
     budget_spent: { type: ['number', 'null'] },
+    // HARN-OPT-4 T4 (AC-QA-13, AC-QA-29): the conductor's review round for this
+    // task. Only review-cycle.js sends it and only the reader's review-row
+    // paths count it; the schema is global, so a round on another kind is
+    // accepted here, not rejected (T4 round 3 L6). A positive integer or null; 0, a negative,
+    // a fraction, a string or anything else is neutralised and counted in
+    // invalid_record_values_dropped by the existing degrade path, and the
+    // line still writes. null means "no round was supplied" (a direct review),
+    // never 0.
+    round: { type: ['integer', 'null'], minimum: 1 },
     // conduct_plan_event only: which state transition this line records, and
     // an idempotency key (run_id + event) so a re-tick that replays an
     // already-recorded event does not double-count it (AC-QA-9).
@@ -746,6 +755,12 @@ function collectErrors(entry, schema, pathParts = []) {
           errors.push({ pathParts: dictPath, kind: 'enum', message: `${dictPrefix}: "${dictValue}" is not one of ${JSON.stringify(valueSchema.enum)}` })
         }
       }
+    }
+    // HARN-OPT-4 T4: `minimum` applies to numbers only; null (the declared
+    // "not supplied" value) is exempt.
+    if (typeof propSchema.minimum === 'number' && typeof value === 'number' && value < propSchema.minimum) {
+      errors.push({ pathParts: keyPath, kind: 'minimum', message: `${keyPrefix}: ${value} is below the minimum ${propSchema.minimum}` })
+      continue
     }
     if (propSchema.enum && value !== null && value !== undefined && !propSchema.enum.includes(value)) {
       errors.push({ pathParts: keyPath, kind: 'enum', message: `${keyPrefix}: "${value}" is not one of ${JSON.stringify(propSchema.enum)}` })
@@ -994,6 +1009,14 @@ export function degradeEntry(entry, redactRawField = (v) => v) {
         container[last] = null
         const bucket = last === 'ac_id' ? 'ac_id' : err.pathParts[0] === 'findings' && (last === 'lens' || last === 'severity') ? 'finding_field' : 'general'
         neutralisations.push({ pathParts: err.pathParts, bucket, kind: 'siblingField' })
+      } else if (err.pathParts.length === 1 && last === 'round') {
+        // HARN-OPT-4 T4 (AC-QA-13): round is a bare counter. Nothing about a
+        // rejected value is worth retaining, and the caller's free text (the
+        // spec's "2; rm -rf" case) must not reach the durable line, so it is
+        // nulled with NO degraded_raw entry. Still counted: bucket 'general'
+        // feeds invalid_record_values_dropped.
+        container[last] = null
+        neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'siblingField' })
       } else {
         delete container[last]
         neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'generic', raw: rawValue })
@@ -2130,6 +2153,10 @@ export function main() {
   if (!degraded.ok) {
     return result(run_id, ts, false, 'payload failed ledger schema validation: ' + degraded.errors.join('; '))
   }
+  // HARN-OPT-4 T4 (AC-QA-13): degradeEntry deletes a neutralised value, so a
+  // dropped or never-supplied round would read as "key absent". Normalise to
+  // an explicit null on review_cycle rows so the reader sees one shape.
+  if (entry.kind === 'review_cycle' && entry.round === undefined) entry.round = null
   if (explicitNullAcVerdictAcId > 0) {
     entry.invalid_ac_ids_dropped = (entry.invalid_ac_ids_dropped || 0) + explicitNullAcVerdictAcId
   }
