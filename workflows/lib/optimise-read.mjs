@@ -1341,6 +1341,8 @@ const FETCH_MODES = ['rate_limited', 'unauthenticated', 'other']
 // something with its own, unexamined failure history -- either way, "never
 // failed" oversells what is actually known). Any one of the three nulls the
 // claim.
+const CI_FAILURE_CONCLUSIONS = new Set(['failure', 'timed_out', 'startup_failure'])
+const CI_NON_FAILURE_UNSETTLED = new Set(['skipped', 'cancelled', 'neutral'])
 export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAILED, requestedLimit = null, partialWorkflows = new Set() } = {}) {
   const byJob = new Map()
   for (const run of runs || []) {
@@ -1358,7 +1360,12 @@ export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAIL
     const reRun = jobRuns.some((r) => r.rerun === true)
     const partialFetch = partialWorkflows.has(`${group.repo}::${group.workflow}`)
     const rawNeverFailed = insufficientData || reRun || partialFetch ? null : jobRuns.every((r) => r.conclusion === 'success')
-    const failed = jobRuns.filter((r) => r.conclusion !== 'success')
+    // Round 1 L1 (AC-OPS-9): only a real failure conclusion counts as a
+    // failure. skipped, cancelled and neutral are reported separately
+    // (`skipped`) and still withhold the never-failed claim (rawNeverFailed
+    // above requires every run to be a success).
+    const failed = jobRuns.filter((r) => CI_FAILURE_CONCLUSIONS.has(r.conclusion))
+    const skipped = jobRuns.filter((r) => CI_NON_FAILURE_UNSETTLED.has(r.conclusion)).length
     const durations = jobRuns.map((r) => r.duration_s).filter((d) => typeof d === 'number' && Number.isFinite(d))
     const meanDurationS = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null
     const entry = {
@@ -1366,6 +1373,7 @@ export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAIL
       job: group.job,
       n,
       failureCount: failed.length,
+      skipped,
       failedRunIds: failed.filter((r) => r.run_id !== undefined).map((r) => String(r.run_id)),
       windowStart: jobRuns.length ? jobRuns[0].started_at : null,
       windowEnd: jobRuns.length ? jobRuns[jobRuns.length - 1].started_at : null,
@@ -1991,7 +1999,10 @@ function runCiCommand(payload) {
   // aggregate needs, so an actor, title, branch or commit field fed in (or a
   // step name) cannot come back out (AC-SEC-14).
   const flat = []
-  const repoStats = {}
+  // Round 1 L3 (AC-OPS-11): keyed by an agent-supplied repo string, so a
+  // null-prototype object; `__proto__`, `constructor` and `toString` are then
+  // ordinary keys and nothing reaches Object.prototype.
+  const repoStats = Object.create(null)
   const partialWorkflows = new Set()
   const seen = new Set()
   const ciCitationPool = []
@@ -2015,7 +2026,11 @@ function runCiCommand(payload) {
       partialWorkflows.add(`${run.repo}::${run.workflow}`)
       continue
     }
-    const rerun = typeof run.attempt === 'number' && run.attempt > 1
+    // Round 1 L4 (AC-OPS-10): a digit-string attempt is read the way
+    // validRunId reads ids, and any other present-but-unreadable attempt
+    // fails closed as a re-run. Only an absent attempt, or a first one, is not.
+    const attemptN = typeof run.attempt === 'number' ? run.attempt : typeof run.attempt === 'string' && /^[0-9]+$/.test(run.attempt) ? Number(run.attempt) : null
+    const rerun = run.attempt === undefined ? false : attemptN === null ? true : attemptN > 1
     for (const job of Array.isArray(run.jobs) ? run.jobs : []) {
       if (!job || typeof job.name !== 'string' || !job.name) continue
       flat.push({ repo: run.repo, workflow: run.workflow, job: normaliseJobName(job.name), run_id: id, rerun, conclusion: job.conclusion, started_at: run.started_at, duration_s: job.duration_s })

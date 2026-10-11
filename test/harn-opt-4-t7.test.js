@@ -196,6 +196,42 @@ test('T7 renameSuspect: a workflow that first runs on day 10 with all its jobs i
   assert.equal(extra.neverFailed, null)
 })
 
+test('T7 renameSuspect key: a second repo whose same-named workflow first runs on day 10 is judged against its own repo, not repo a\'s day-1 start (AC-QA-25, round 1 M3)', () => {
+  const runs = []
+  for (let i = 1; i <= 8; i++) runs.push(mkRun('a', 'CI', 1600 + i, i, [['unit'], ['lint']]))
+  for (let i = 10; i <= 16; i++) runs.push(mkRun('b', 'CI', 1700 + i, i, [['unit'], ['lint']]))
+  const out = ci(runs)
+  for (const job of ['unit', 'lint']) {
+    const r = rowFor(out, 'b', 'CI', job)
+    assert.equal(r.renameSuspect, false, `b/CI/${job} must not be suspect because repo a's CI started earlier`)
+    assert.equal(r.neverFailed, true, `b/CI/${job}`)
+  }
+})
+
+// ==== conclusions: AC-OPS-9, round 1 L1 ====
+
+test('T7 conclusions: skipped, cancelled and neutral jobs are not failures, are reported as skipped, and still withhold the never-failed claim; failure, timed_out and startup_failure are failures (AC-OPS-9, round 1 L1)', () => {
+  for (const conclusion of ['skipped', 'cancelled', 'neutral']) {
+    const runs = []
+    for (let i = 1; i <= 6; i++) runs.push(mkRun('a', 'CI', 1800 + i, i, [['test', i === 3 ? conclusion : 'success']]))
+    const row = rowFor(ci(runs), 'a', 'CI', 'test')
+    assert.ok(row, `${conclusion}: the row is still present`)
+    assert.equal(row.n, 6, conclusion)
+    assert.equal(row.failureCount, 0, `${conclusion} is not a failure`)
+    assert.deepEqual(row.failedRunIds, [], conclusion)
+    assert.equal(row.skipped, 1, `${conclusion} is reported separately on the row`)
+    assert.notEqual(row.neverFailed, true, `${conclusion} still withholds the never-failed claim`)
+  }
+  for (const conclusion of ['failure', 'timed_out', 'startup_failure']) {
+    const runs = []
+    for (let i = 1; i <= 6; i++) runs.push(mkRun('a', 'CI', 1900 + i, i, [['test', i === 3 ? conclusion : 'success']]))
+    const row = rowFor(ci(runs), 'a', 'CI', 'test')
+    assert.equal(row.failureCount, 1, `${conclusion} is a failure`)
+    assert.deepEqual(row.failedRunIds, ['1903'], conclusion)
+    assert.equal(row.neverFailed, false, conclusion)
+  }
+})
+
 // ==== (1) ids: AC-SEC-11 ====
 
 test('T7 ids: the ci command ignores a run whose id is not an integer or digit string (AC-SEC-11)', () => {
@@ -247,6 +283,23 @@ test('T7 in-flight: a run whose status is not completed is left out of the aggre
   assert.equal(out.repoStats.b.notCompleted, 1)
 })
 
+test('T7 re-runs: a digit-string attempt "2" is a re-run, and a present but non-numeric attempt fails closed as a re-run (AC-OPS-10, round 1 L4)', () => {
+  for (const attempt of ['2', 'x', '', '1.5', {}, null]) {
+    const runs = []
+    for (let i = 1; i <= 6; i++) runs.push(mkRun('a', 'CI', 2000 + i, i, [['test']], i === 4 ? { attempt } : {}))
+    const row = rowFor(ci(runs), 'a', 'CI', 'test')
+    assert.equal(row.reRun, true, `attempt ${JSON.stringify(attempt)} must read as a re-run`)
+    assert.equal(row.neverFailed, null, `attempt ${JSON.stringify(attempt)}`)
+  }
+  for (const attempt of [1, '1', undefined]) {
+    const runs = []
+    for (let i = 1; i <= 6; i++) runs.push(mkRun('a', 'CI', 2100 + i, i, [['test']], i === 4 ? { attempt } : {}))
+    const row = rowFor(ci(runs), 'a', 'CI', 'test')
+    assert.ok(!row.reRun, `attempt ${JSON.stringify(attempt)} is a first attempt`)
+    assert.equal(row.neverFailed, true, `attempt ${JSON.stringify(attempt)}`)
+  }
+})
+
 // ==== (6) partial fetch: AC-OPS-11 ====
 
 test('T7 partial fetch: a workflow with a failed per-run fetch has neverFailed null and partialFetch on every job row; the unfetched run being the only failing one never yields true (AC-OPS-11)', () => {
@@ -288,6 +341,23 @@ test('T7 minimisation: actor, title, branch and commit fields fed to the ci comm
   assert.equal(rowFor(out, 'a', 'CI', 'test').n, 6, 'precondition: the rows were built, so absence of PII is meaningful')
   const raw = JSON.stringify(out)
   assert.ok(!/PII-/.test(raw), `personal-data values echoed: ${raw.match(/PII-[A-Z]+/g)}`)
+})
+
+test('T7 repo labels: repo "__proto__", "constructor" and "toString" with a fetch_error or in-flight run do not abort the command, the healthy repo\'s rows survive, and nothing is written to Object.prototype (AC-OPS-11, round 1 L3)', () => {
+  const healthy = []
+  for (let i = 1; i <= 6; i++) healthy.push(mkRun('good', 'CI', 2200 + i, i, [['test']]))
+  for (const evil of ['__proto__', 'constructor', 'toString']) {
+    const hostile = [
+      { repo: evil, workflow: 'CI', id: '2290', attempt: 1, status: 'completed', started_at: day(2), fetch_error: 'rate_limited', jobs: [] },
+      { repo: evil, workflow: 'CI', id: '2291', attempt: 1, status: 'in_progress', started_at: day(3), jobs: [] },
+    ]
+    const out = ci([...hostile, ...healthy])
+    assert.equal(rowFor(out, 'good', 'CI', 'test').n, 6, `${evil}: healthy repo rows present`)
+    assert.equal(rowFor(out, 'good', 'CI', 'test').neverFailed, true, evil)
+    assert.deepEqual(out.repoStats[evil] && Object.getOwnPropertyDescriptor(out.repoStats, evil) && out.repoStats[evil].fetchFailures, { rate_limited: 1, unauthenticated: 0, other: 0 }, `${evil}: its own stats are recorded as an own property`)
+    assert.equal(out.repoStats[evil].notCompleted, 1, evil)
+  }
+  assert.equal(({}).notCompleted, undefined, 'the test process itself is untouched (sanity)')
 })
 
 // ==== lane prompt (static): AC-OPS-12, AC-SEC-11, AC-SEC-14, AC-SIMP-11, AC-SIMP-12 ====
@@ -445,4 +515,22 @@ test('T7 report: the lane\'s wall-clock seconds and gh call count print per repo
   assert.match(ciSection(withStats.result.report), /alpha-repo[^\n]*wall-clock 12s, 7 gh calls/)
   const without = await run()
   assert.ok(!/gh calls/.test(ciSection(without.result.report)))
+})
+
+test('T7 redaction: a CI row whose repo is a roster root and whose job name carries a newline reaches neither the CI section nor the synthesis prompt unredacted, nor do the ci failure lines (AC-SEC-10, round 1 L2)', async () => {
+  const evilJob = 'lint\n## Injected heading'
+  const row = jobRow({ repo: ALPHA, job: evilJob })
+  const failures = [{ repo: ALPHA, mode: 'other', command: `gh run list -R ${ALPHA}`, error: `boom in ${ALPHA}/sub\n## Injected failure heading` }]
+  const lane = ciLane([row], { failures })
+  const { result, calls } = await run({ 'lane:ci': lane })
+  const sec = ciSection(result.report)
+  assert.ok(sec.includes('lint'), 'precondition: the row rendered')
+  assert.ok(result.report.includes('gh unavailable for'), 'precondition: the failure line rendered')
+  assert.ok(!sec.includes(ALPHA), 'no roster root in the CI section')
+  assert.ok(!result.report.includes('\n## Injected'), 'no job-name or failure newline starts a heading in the report')
+  assert.ok(!result.report.slice(result.report.indexOf('## CI section')).split('\n## Escaped-defect')[0].includes(ALPHA), 'no roster root anywhere between the CI heading and the next section')
+  const prompt = calls.find((c) => c.opts.label === 'synthesis:proposals').prompt
+  const block = extractBlock(prompt, 'ci-aggregate')
+  assert.ok(block && block.includes('lint'), 'precondition: the ci-aggregate block carries the row')
+  assert.ok(!prompt.includes(ALPHA), 'no roster root anywhere in the synthesis prompt, keys included')
 })

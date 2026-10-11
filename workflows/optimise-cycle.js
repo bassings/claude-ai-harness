@@ -550,6 +550,22 @@ phase('Synthesis')
 const ledgerN = ledgerAgg && typeof ledgerAgg.n === 'number' ? ledgerAgg.n : 0
 const ledgerSufficient = ledgerN >= MIN_RECORDS_FOR_PROPOSALS
 const ledgerCitations = new Set((ledgerAgg && ledgerAgg.citationPool) || [])
+// Round 1 L2 (AC-SEC-10): the CI aggregate is agent-supplied, so the copy that
+// reaches the synthesis prompt and the report is redacted, keys included
+// (redactDeep leaves keys alone, and the key carries the repo and job name).
+// The brake below keeps reading the raw ciAgg: it only compares, never echoes.
+// Only roster roots are removed here, not the absolute-path pattern: a job
+// name such as 'build</UNTRUSTED-DATA>' is inert data inside the nonce-fenced
+// block, and the path pattern would rewrite it (pinned by the AC-SEC-8 M3
+// breakout test). The report line applies the full flattener on top.
+const redactRoots = (v) => {
+  let t = String(v)
+  for (const r of rootsLongestFirst) if (r) t = t.split(r).join(REDACTED_PATH_MARKER)
+  return t
+}
+const redactRootsDeep = (v) => (typeof v === 'string' ? redactRoots(v) : Array.isArray(v) ? v.map(redactRootsDeep) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactRootsDeep(x)])) : v)
+const ciByJobSafe = ciAgg ? Object.fromEntries(Object.entries(ciAgg.byJob || {}).map(([k, v]) => [redactRoots(k), redactRootsDeep(v)])) : {}
+const ciFailuresSafe = ciAgg ? redactRootsDeep(ciAgg.failures) : []
 const ciCitations = new Set((ciAgg && ciAgg.citationPool) || [])
 const allCitations = new Set([...ledgerCitations, ...ciCitations])
 
@@ -590,7 +606,7 @@ const synthesisPrompt =
     : `Ledger data is INSUFFICIENT (n=${ledgerN}, minimum required=${MIN_RECORDS_FOR_PROPOSALS}): do not draft any ` +
       `proposal citing ledger data -- it will be mechanically discarded if you do.`) +
   `\n\n` +
-  wrapAsData(dataNonce, 'ci-aggregate', { byJob: ciAgg ? ciAgg.byJob : {}, citationPool: ciAgg ? ciAgg.citationPool : [], failures: ciAgg ? ciAgg.failures : [] }) +
+  wrapAsData(dataNonce, 'ci-aggregate', { byJob: ciByJobSafe, citationPool: ciAgg ? ciAgg.citationPool : [], failures: ciAgg ? ciFailuresSafe : [] }) +
   `\n\n` +
   wrapAsData(dataNonce, 'escaped-defect-heuristic', gitPerRepo.map((g, i) => (g.figures ? { ...g.figures, repo: flat(g.figures.repo), root_index: undefined } : { repo: flat(ledgerRepoLabel(i) || scope.resolved[i].label), count: null, method: 'unavailable' }))) +
   `\n\n` +
@@ -818,7 +834,12 @@ function isWeakCiEvidenceRemoval(p) {
   // not know cannot claim "never failed". With the same job in several repos
   // (AC-DATA-13) one weak row is enough: the target names no repo.
   if (!entries.length) return true
-  return entries.some((entry) => !!(entry.insufficientData || entry.truncated || entry.renameSuspect))
+  // Round 1 M1 (AC-OPS-10/11): reRun and partialFetch null neverFailed, so a
+  // removal resting on such a row was ranked as strong evidence beside a
+  // report line saying 'jobs partially fetched'. They join the brake. Keying on
+  // `neverFailed !== true` would close the class for future flags, but the
+  // T6 brake controls (null with every flag false must pass) pin the opposite.
+  return entries.some((entry) => !!(entry.insufficientData || entry.truncated || entry.renameSuspect || entry.reRun || entry.partialFetch))
 }
 const droppedWeakCiEvidence = proposals.filter(isWeakCiEvidenceRemoval)
 proposals = proposals.filter((p) => !isWeakCiEvidenceRemoval(p))
@@ -929,8 +950,8 @@ const reportMarkdown = buildReport({
   blockedUnresolved: ledgerAgg ? ledgerAgg.blockedUnresolved : undefined,
   wallClock: ledgerAgg ? ledgerAgg.wallClock : null,
   triggerAccuracy: ledgerAgg ? ledgerAgg.triggerAccuracy : null,
-  ciByJob: ciAgg ? ciAgg.byJob : {},
-  ciFailures: ciAgg ? ciAgg.failures : [],
+  ciByJob: ciByJobSafe,
+  ciFailures: ciAgg ? ciFailuresSafe : [],
   ciRepoStats: ciAgg && ciAgg.repoStats ? ciAgg.repoStats : {},
   ciGhStats: ciAgg && Array.isArray(ciAgg.ghStats) ? ciAgg.ghStats : [],
   escapedDefects: gitPerRepo.map((g, i) => ({ ...g, label: ledgerRepoLabel(i) || scope.resolved[i].label })),
@@ -1409,6 +1430,7 @@ function buildReport(d) {
   lines.push('')
 
   lines.push('## CI section (source: gh)')
+  const ciFlat = d.flatten || ((v) => String(v).replace(/\s+/g, ' ').slice(0, 120))
   const jobKeys = Object.keys(d.ciByJob || {})
   if (!jobKeys.length && (!d.ciFailures || !d.ciFailures.length)) lines.push('No CI data available.')
   for (const key of jobKeys) {
@@ -1425,9 +1447,8 @@ function buildReport(d) {
     const ids = Array.isArray(j.failedRunIds) ? j.failedRunIds : []
     const idText = ids.length ? ` (run ids ${ids.slice(0, 10).join(', ')}${ids.length > 10 ? `, +${ids.length - 10} more` : ''})` : ''
     const mean = typeof j.meanDurationS === 'number' ? `${Math.round(j.meanDurationS)}s` : 'n/a'
-    lines.push(`- ${key}: n=${j.n}, failed=${j.failureCount == null ? 'n/a' : j.failureCount}${idText}, mean ${mean}${qualifiers.length ? ` (${qualifiers.join(', ')})` : ''}`)
+    lines.push(`- ${ciFlat(key)}: n=${j.n}, failed=${j.failureCount == null ? 'n/a' : j.failureCount}${j.skipped ? `, skipped=${j.skipped}` : ''}${idText}, mean ${mean}${qualifiers.length ? ` (${qualifiers.join(', ')})` : ''}`)
   }
-  const ciFlat = d.flatten || ((v) => String(v).replace(/\s+/g, ' ').slice(0, 120))
   // AC-OPS-10, AC-OPS-11: per repo, runs left out as not completed and failed per-run fetches by mode.
   for (const [repo, st] of Object.entries(d.ciRepoStats || {})) {
     const ff = (st && st.fetchFailures) || {}
@@ -1435,7 +1456,7 @@ function buildReport(d) {
   }
   // AC-QA-32: the lane's own cost, so the first run after shipping records the baseline.
   for (const g of d.ciGhStats || []) lines.push(`- ${ciFlat(g.repo)}: wall-clock ${g.wall_clock_s == null ? 'n/a' : g.wall_clock_s}s, ${g.gh_calls == null ? 'n/a' : g.gh_calls} gh calls`)
-  for (const f of d.ciFailures || []) lines.push(`- gh unavailable for ${f.repo}: ${f.mode} (${f.command}): ${f.error || 'n/a'}`)
+  for (const f of d.ciFailures || []) lines.push(`- gh unavailable for ${ciFlat(f.repo)}: ${ciFlat(f.mode)} (${ciFlat(f.command)}): ${ciFlat(f.error || 'n/a')}`)
   lines.push('')
   lines.push('## Escaped-defect counter-metric')
   // HARN-OPT-4 T6 (AC-DATA-11, AC-PROD-7, AC-SEC-10): one block per roster
