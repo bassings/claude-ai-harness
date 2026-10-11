@@ -1013,3 +1013,82 @@ test('T6 round 2 F8: SKILL.md no longer describes the old target shape, and docu
   assert.ok(reading.includes('.claude/optimise-proposal-targets.json'), 'the sidecar is documented under Reading the report')
   assert.ok(reading.includes('rm .claude/optimise-proposal-targets.json'), 'its retention and removal are stated')
 })
+
+// ==== (6) Review round 3, conductor fix pass (the owner chose option (a) on 2026-10-12) ====
+//
+// Round 3 found two Mediums that fix round 2 introduced and four cheap Lows.
+// Each test here pins one of them. Guard-only tests pass against code that is
+// already right, so each was proven by mutation (see the PR body) rather than
+// by a RED run.
+
+test('T6 round 3 M1: the prior-proposal-targets block carries only the six identity fields, and the instruction says the two gate booleans are set from the proposal itself, never copied (AC-SEC-9, AC-PROD-8)', async () => {
+  const rejected = fixedTarget({ kind: 'lens_demote', component: 'gitleaks-step', concern: 'noise', security_purposed: true })
+  const id = reader.stableProposalId(rejected)
+  const repo = repoWithOutcomes([[id, 'proposal_rejected']], { [id]: rejected })
+  const real = runCli('ledger', {}, [repo]).out
+  const { calls } = await run({ 'lane:ledger': { ...ledgerFixture(), proposalOutcomes: real.proposalOutcomes } })
+  const prompt = calls.find((c) => c.opts.label === 'synthesis:proposals').prompt
+  const block = extractBlock(prompt, 'prior-proposal-targets')
+  assert.ok(block && block.includes('"component":"gitleaks-step"'), 'the identity fields are still shown')
+  assert.ok(!block.includes('security_purposed') && !block.includes('touches_always_on_lens'), `a prior target's gate booleans are not offered for reuse:\n${block}`)
+  assert.match(prompt, /six identity fields/i, 'the instruction names the six identity fields as what to reuse')
+  assert.match(prompt, /touches_always_on_lens[\s\S]{0,200}security_purposed[\s\S]{0,400}never copied/i, 'the instruction says the gate booleans are never copied from a prior target')
+})
+
+test('T6 round 3 M2: the sidecar the run writes is seeded with every prior outcome target the reader supplied, so a decided target survives a cycle in which the drafter does not re-raise it (AC-PROD-8, AC-QA-20)', async () => {
+  const decided = fixedTarget({ kind: 'trigger_tune', component: 'kappa-decided', concern: 'glob' })
+  const id = reader.stableProposalId(decided)
+  const repo = repoWithOutcomes([[id, 'proposal_adopted']], { [id]: decided })
+  const real = runCli('ledger', {}, [repo]).out
+  const { calls } = await run({ 'lane:ledger': { ...ledgerFixture(), proposalOutcomes: real.proposalOutcomes }, 'synthesis:proposals': { proposals: [] } })
+  const sidecar = JSON.parse(extractBlock(calls.find((c) => c.opts.label === 'report:write').prompt, 'proposal-targets-sidecar-to-write-verbatim'))
+  assert.deepEqual(sidecar[id], decided, `the decided target is carried forward with the full fixed key set:\n${JSON.stringify(sidecar)}`)
+})
+
+test("T6 round 3 M2: the sidecar is written under the roster's first repo root, where the reader looks first, not under whichever repo the cycle was invoked from (AC-PROD-8)", async () => {
+  const { calls } = await run()
+  const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
+  assert.ok(prompt.includes(`"${ALPHA}" ".claude/optimise-proposal-targets.json"`), `the ensure-ignored check for the sidecar names roster root 1:\n${prompt.slice(0, 2500)}`)
+  assert.ok(prompt.includes(`${ALPHA}/.claude/optimise-proposal-targets.json`), 'the write target is the sidecar path under roster root 1')
+  assert.ok(prompt.includes('"$(git rev-parse --show-toplevel)" ".claude/optimise-cycle-report.md"'), 'the report still goes to the current repo')
+})
+
+test('T6 round 3 L1: a ledger label that is a roster root path is redacted in the escaped-defect header, not printed (AC-SEC-10)', async () => {
+  const { result } = await run({ 'lane:ledger': ledgerFixture([ALPHA, 'beta-repo']) })
+  const section = escapedSection(result.report)
+  assert.ok(!section.includes(ALPHA), `the root path never reaches the report:\n${section}`)
+  assert.ok(section.includes(`Repo 1 (${REDACTED})`), `the header shows the redaction marker:\n${section}`)
+})
+
+test('T6 round 3 L2: when the ledger lane fails, a measured git figure is reported as not measured because the ledger identity is unavailable, never as a "repo mismatch" against null (AC-QA-19)', async () => {
+  const res = responses(); delete res['lane:ledger'] // fake-runtime convention: a missing response is a lane that failed
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: res })
+  const section = escapedSection(result.report)
+  assert.doesNotMatch(section, /repo mismatch/, `no mismatch is claimed against a ledger that never answered:\n${section}`)
+  assert.match(section, /ledger (lane |identity )?(unavailable|failed)/i, `the real reason is named:\n${section}`)
+})
+
+test('T6 round 3 L3: the escaped-defect-heuristic data block carries the flattened repo label, not the raw one (the flat() used to be overwritten by the spread)', async () => {
+  const messy = 'alpha\n   repo'
+  const perRoot = { [ALPHA]: { repos: [entry(0, messy, { count: 3, n_commits_examined: 480 })] }, [BETA]: goodPair()[BETA] }
+  const { calls } = await run({ 'lane:ledger': ledgerFixture([messy, 'beta-repo']), 'lane:git': gitResponder(perRoot) })
+  const block = JSON.parse(extractBlock(calls.find((c) => c.opts.label === 'synthesis:proposals').prompt, 'escaped-defect-heuristic'))
+  assert.equal(block[0].count, 3, 'the figure matched its repo')
+  assert.equal(block[0].repo, 'alpha repo', `the repo label is flattened:\n${JSON.stringify(block[0])}`)
+})
+
+test('T6 round 3 L4: `ids` with legacy_targets also returns a sidecar_entry in the fixed key set for every mappable target, null otherwise, and the real reader accepts it once written beside an outcome event (AC-PROD-8, AC-DATA-14)', () => {
+  const [r, bad] = legacy([{ kind: 'ci_demote', component: 'lens-operability', concern: 'trigger glob', security_purposed: true }, { cycle: 5, change: 'x' }])
+  assert.deepEqual(r.sidecar_entry, { kind: 'ci_demote', component: 'lens-operability', concern: 'trigger glob', lens: '', workflow: '', job: '', touches_always_on_lens: false, security_purposed: true })
+  assert.equal(bad.proposal_id, null); assert.equal(bad.sidecar_entry, null)
+  const repo = repoWithOutcomes([[r.proposal_id, 'proposal_adopted']], { [r.proposal_id]: r.sidecar_entry })
+  const out = runCli('ledger', {}, [repo]).out
+  assert.deepEqual(out.proposalOutcomes[r.proposal_id].target, r.sidecar_entry, 'the reader attaches the seeded target')
+})
+
+test("T6 round 3 L4: the skill tells the conductor to seed the sidecar under the roster's first repo root from sidecar_entry when it re-records outcome events, and says the sidecar carries prior targets forward (AC-PROD-8)", () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
+  assert.match(skill, /sidecar_entry/, 'names the field the ids command returns')
+  assert.match(skill, /first (roster )?repo root|roster'?s first repo/i, 'names where the sidecar lives')
+  assert.match(skill, /carried forward|carries forward|survives/i, 'states that prior targets are carried forward')
+})

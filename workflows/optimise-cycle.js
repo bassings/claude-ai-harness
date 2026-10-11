@@ -505,7 +505,15 @@ gitResults.forEach((res, k) => {
   } else if (claims.length === 1) {
     const e = claims[0]
     const ledgerRepo = ledgerRepoLabel(k)
-    if (ledgerRepo === null || e.repo !== ledgerRepo) {
+    if (ledgerRepo === null) {
+      // Round 3 L2 (AC-QA-19): with no ledger identity to confirm against,
+      // the figure is unconfirmed, not mismatched. Still not used (AC-SEC-10
+      // matches by identity, never by position alone), but the reason says
+      // what actually happened.
+      const why = ledgerAgg ? 'the ledger lane has no entry for this root' : 'the ledger lane failed'
+      gitUnmatched.push(`roster repo ${k + 1}: ledger identity unavailable (${why}); result repo ${flat(e.repo)} could not be confirmed and was not used`)
+      gitPerRepo[k] = { status: 'unmatched', reason: `ledger identity unavailable (${why}); the figure could not be confirmed as this repo's`, figures: null }
+    } else if (e.repo !== ledgerRepo) {
       gitUnmatched.push(`roster repo ${k + 1}: result repo ${flat(e.repo)} does not match ledger repo ${flat(ledgerRepo)}; not used`)
       gitPerRepo[k] = { status: 'unmatched', reason: `repo mismatch (result ${flat(e.repo)}, ledger ${flat(ledgerRepo)})`, figures: null }
     } else if (e.rejected === true || !Number.isInteger(e.count)) {
@@ -539,14 +547,20 @@ const allCitations = new Set([...ledgerCitations, ...ciCitations])
 // invented.
 const priorTargetEntries = Object.entries((ledgerAgg && ledgerAgg.proposalOutcomes) || {}).slice(0, 50).map(([id, o]) => (
   o && o.target && typeof o.target === 'object'
-    ? { proposal_id: redact(id), target: redactDeep(o.target) }
+    // Round 3 M1 (AC-SEC-9): only the six identity fields are offered for
+    // reuse. The two gate booleans describe what THIS proposal does to a
+    // security check; copying a prior target's `security_purposed: false`
+    // onto a new removal would walk it past the gate.
+    ? { proposal_id: redact(id), target: redactDeep(Object.fromEntries(PROPOSAL_TARGET_STRING_KEYS.map((k) => [k, o.target[k]]))) }
     : { proposal_id: redact(id), target: null, note: `target not known; only the id is known${o && typeof o.targetUnavailableReason === 'string' ? ` (${flat(o.targetUnavailableReason)})` : ''}` }
 ))
 const priorTargetsSection = priorTargetEntries.length
   ? wrapAsData(dataNonce, 'prior-proposal-targets', priorTargetEntries) +
     `\nThe prior-proposal-targets block above lists proposals that already have a recorded outcome (adopted, rejected or ` +
     `reverted). If one of your proposals is about the same target as one listed there, you must reuse that target's ` +
-    `eight fields exactly as listed, so the stable id matches and the report can annotate it instead of ranking it as new.\n\n`
+    `six identity fields (kind, component, concern, lens, workflow, job) exactly as listed, so the stable id matches and the ` +
+    `report can annotate it instead of ranking it as new. Set touches_always_on_lens and security_purposed from what YOUR ` +
+    `proposal does to a security check: they are gate inputs, not identity, and are never copied from a prior target.\n\n`
   : ''
 
 const synthesisPrompt =
@@ -562,7 +576,7 @@ const synthesisPrompt =
   `\n\n` +
   wrapAsData(dataNonce, 'ci-aggregate', { byJob: ciAgg ? ciAgg.byJob : {}, citationPool: ciAgg ? ciAgg.citationPool : [], failures: ciAgg ? ciAgg.failures : [] }) +
   `\n\n` +
-  wrapAsData(dataNonce, 'escaped-defect-heuristic', gitPerRepo.map((g, i) => (g.figures ? { repo: flat(g.figures.repo), ...g.figures, root_index: undefined } : { repo: flat(ledgerRepoLabel(i) || scope.resolved[i].label), count: null, method: 'unavailable' }))) +
+  wrapAsData(dataNonce, 'escaped-defect-heuristic', gitPerRepo.map((g, i) => (g.figures ? { ...g.figures, repo: flat(g.figures.repo), root_index: undefined } : { repo: flat(ledgerRepoLabel(i) || scope.resolved[i].label), count: null, method: 'unavailable' }))) +
   `\n\n` +
   wrapAsData(dataNonce, 'plan-labels', scope.plan_labels) +
   `\n\n` +
@@ -866,7 +880,16 @@ const previouslyAdopted = ranked.filter(isAdoptedElsewhere)
 // under the same ensure-ignored check and read by optimise-read.mjs's ledger
 // command. A per-run output like the report (overwritten each run), not a cache
 // of gh or ledger reads. Redacted like everything else this step writes.
+// Round 3 M2 (AC-PROD-8, AC-QA-20): seeded with every prior outcome target the
+// reader supplied this run, then overlaid with this run's proposals, so a
+// decided target survives cycles in which the drafter does not re-raise it.
+// Bounded: an outcome without a target is skipped, and at most
+// SIDECAR_CARRY_MAX prior entries are carried.
+const SIDECAR_CARRY_MAX = 500
 const proposalTargetsSidecar = {}
+for (const [id, o] of Object.entries((ledgerAgg && ledgerAgg.proposalOutcomes) || {}).slice(0, SIDECAR_CARRY_MAX)) {
+  if (o && o.target && typeof o.target === 'object' && /^[0-9a-f]{16}$/.test(id)) proposalTargetsSidecar[id] = redactDeep(o.target)
+}
 for (const p of [...ranked, ...insufficientDataProposals]) if (p.proposal_id) proposalTargetsSidecar[p.proposal_id] = redactDeep(p.target)
 
 // Review round-1 M5: keyed by POSITION (matching `roots`, and therefore
@@ -954,13 +977,14 @@ const reportWrite = await agent(
   `.git/info/exclude if not already present, then verifies with \`git check-ignore -q\`, printing {ignored, error}.\n` +
   `If ignored is NOT true: do NOT write the report at all -- return written:false and error naming this reason ` +
   `(e.g. "the report path is not gitignored: <the script's own error>"), and stop here.\n` +
-  `Then run the same script once more for the sidecar path, exactly: \`node <path-to-optimise-report-ignore.mjs> ` +
-  `"$(git rev-parse --show-toplevel)" "${PROPOSAL_TARGETS_RELATIVE_PATH}"\`. If ITS ignored is not true, do NOT write the ` +
+  `Then run the same script once more for the sidecar path, under the roster's FIRST repo root (round 3 M2: the reader ` +
+  `looks there first; the invoking repo need not be on the roster at all), exactly: \`node <path-to-optimise-report-ignore.mjs> ` +
+  `"${roots[0]}" "${PROPOSAL_TARGETS_RELATIVE_PATH}"\`. If ITS ignored is not true, do NOT write the ` +
   `sidecar (still write the report) and say so in error.\n` +
   `Only once ignored is true, write EXACTLY the content below, verbatim, to the file "${REPORT_RELATIVE_PATH}" at ` +
   `the CURRENT repo's root (create the .claude/ directory first if it does not exist; overwrite the file if it ` +
   `already exists). Once the sidecar path is ignored, also write EXACTLY the second data block below, verbatim, to ` +
-  `"${PROPOSAL_TARGETS_RELATIVE_PATH}" at the same root (overwrite it if it exists). Apart from that sidecar, the report is the only file you may create or modify in this step. Do NOT run \`git add\`, ` +
+  `"${roots[0]}/${PROPOSAL_TARGETS_RELATIVE_PATH}" (create its .claude/ directory first if needed; overwrite it if it exists). Apart from that sidecar, the report is the only file you may create or modify in this step. Do NOT run \`git add\`, ` +
   `\`git commit\`, \`git push\`, any \`gh\` command with \`-X POST/PATCH/PUT/DELETE\`, or any other command that ` +
   `changes repo or remote state.\n\n` +
   wrapAsData(dataNonce, 'report-content-to-write-verbatim', reportMarkdown) +
@@ -1385,10 +1409,13 @@ function buildReport(d) {
   // uninstrumented repos share the redaction marker as a label), never the
   // root path. Every echoed value is flattened and bounded.
   const oneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)
+  // Round 3 L1 (AC-SEC-10): the label is ledger-supplied text; oneLine flattens
+  // but does not redact, and the run's flattener does both.
+  const flattenLabel = d.flatten || oneLine
   const gitRepos = Array.isArray(d.escapedDefects) ? d.escapedDefects : []
   if (!gitRepos.length) lines.push('Escaped defects are not currently captured (git-lane unavailable).')
   gitRepos.forEach((g, i) => {
-    lines.push(`Repo ${i + 1} (${oneLine(g.label)}):`)
+    lines.push(`Repo ${i + 1} (${flattenLabel(g.label)}):`)
     const f = g.figures
     if (g.status !== 'ok' || !f || typeof f.count !== 'number') {
       lines.push(`Not measured: ${oneLine(g.reason || 'git lane unavailable')}`)

@@ -1724,8 +1724,14 @@ export function stableProposalId(target) {
 // identity and are ignored here.
 const LEGACY_RENAMES = { workflow_component: 'component', feature: 'concern' }
 const LEGACY_IGNORED = ['touches_always_on_lens', 'security_purposed', 'repo']
+// Round 3 L4 (AC-PROD-8): alongside the id, a `sidecar_entry` in the fixed key
+// set, so the conductor can seed the proposal-target sidecar when it
+// re-records outcome events under the new ids; otherwise the first post-ship
+// cycle would show the drafter no prior targets at all. Identity strings as
+// given (the drafter must reuse them exactly), missing ones empty; the gate
+// booleans kept only when the legacy target carried them as booleans.
 export function mapLegacyTarget(target) {
-  if (!target || typeof target !== 'object' || Array.isArray(target)) return { proposal_id: null, reason: 'target is not an object' }
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return { proposal_id: null, reason: 'target is not an object', sidecar_entry: null }
   const mapped = {}
   const unmappable = []
   for (const [k, v] of Object.entries(target)) {
@@ -1735,8 +1741,10 @@ export function mapLegacyTarget(target) {
     if (to in mapped && identityValue(mapped[to]) !== identityValue(v)) { unmappable.push(`${k} (conflicts with ${to})`); continue }
     mapped[to] = v
   }
-  if (unmappable.length) return { proposal_id: null, reason: `fields the fixed key set cannot hold: ${unmappable.join(', ')}` }
-  return { proposal_id: stableProposalId(mapped), reason: null }
+  if (unmappable.length) return { proposal_id: null, reason: `fields the fixed key set cannot hold: ${unmappable.join(', ')}`, sidecar_entry: null }
+  const sidecar_entry = Object.fromEntries(PROPOSAL_IDENTITY_KEYS.map((k) => [k, typeof mapped[k] === 'string' ? mapped[k] : mapped[k] === null || mapped[k] === undefined ? '' : String(mapped[k])]))
+  for (const k of ['touches_always_on_lens', 'security_purposed']) sidecar_entry[k] = target[k] === true
+  return { proposal_id: stableProposalId(mapped), reason: null, sidecar_entry }
 }
 
 // ---- CLI ----

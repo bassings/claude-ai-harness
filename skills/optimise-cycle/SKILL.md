@@ -131,7 +131,11 @@ is found for the same target proposed in another. To map an older
 free-shape target onto the new id (the conductor does this once, when it
 re-records outcome events), pipe `{"legacy_targets": [...]}` into
 `optimise-read.mjs ids`: each comes back with its new id, or null and the
-fields the fixed set cannot hold.
+fields the fixed set cannot hold, plus a `sidecar_entry` in the fixed key
+set. When re-recording, merge each `sidecar_entry` under its new id into
+`.claude/optimise-proposal-targets.json` under the roster's first repo root
+(create it if absent, keep existing entries), so the first cycle after the
+change shows the drafter those prior targets rather than bare ids.
 
 ## The escaped-defect counter-metric
 
@@ -311,12 +315,16 @@ It states, every run, in this order:
 It is the durable artefact (AC-PROD-5): read it after the run, do not
 rely on the conversation transcript.
 
-Beside the report the run writes `.claude/optimise-proposal-targets.json`, a
-map from every proposal id it computed to that proposal's target. The ledger
-holds only ids, so a later run reads this file (through the `ledger` command
-of `optimise-read.mjs`) to show the drafter the target behind an id that has an
-outcome, and to reuse it exactly. It is a per-run output like the report, not
-a cache: it is gitignored by the same check, refused if that check fails,
-overwritten on every cycle run, otherwise kept indefinitely, and deleted with
+The run also writes `.claude/optimise-proposal-targets.json` under the
+roster's first repo root (the reader looks there first; the invoking repo need
+not be on the roster), a map from proposal id to that proposal's fixed-key
+target. The ledger holds only ids, so a later run reads this file (through the
+`ledger` command of `optimise-read.mjs`) to show the drafter the six identity
+fields behind an id that has an outcome, and to reuse them exactly. Every
+prior outcome target the reader supplied is carried forward into the new
+file before this run's proposals are added, so a decided target survives
+cycles in which the drafter does not re-raise it. It is gitignored by the
+same check as the report, refused if that check fails, rewritten on every
+cycle run, otherwise kept indefinitely, and deleted with
 `rm .claude/optimise-proposal-targets.json`. When it is missing or malformed
 the drafter gets the bare id and the reason instead.
