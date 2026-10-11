@@ -118,6 +118,51 @@ test('T7 rows: the same workflow and job in two repos gives two rows, and the sa
   assert.equal(rowFor(out, 'b', 'CI', 'test').failureCount, 1)
 })
 
+// Round 2 M1 (spec bug, AC-QA-23): gh emits runs NEWEST first and the lane
+// sends several repos, so array position is not time. The citation pool must be
+// built by failure and recency, not by slicing the tail of the array.
+const hour = (h) => new Date(Date.UTC(2026, 8, 1) + h * 3600e3).toISOString()
+function newestFirst(repo, base, count, failAt = []) {
+  const runs = []
+  for (let h = count; h >= 1; h--) runs.push(mkRun(repo, 'CI', base + h, 1, [['test', failAt.includes(h) ? 'failure' : 'success']], { started_at: hour(h) }))
+  return runs
+}
+
+test('T7 rows: two repos listed newest-first (as gh emits) give the same rows as oldest-first, with failed ids, window ends and renameSuspect order-independent (AC-QA-23, round 2 M1)', () => {
+  const a = newestFirst('a', 4000, 8, [3])
+  const b = newestFirst('b', 5000, 8)
+  const fwd = ci([...a, ...b])
+  const rev = ci([...a].reverse().concat([...b].reverse()))
+  for (const out of [fwd, rev]) {
+    const ra = rowFor(out, 'a', 'CI', 'test')
+    assert.equal(ra.n, 8)
+    assert.deepEqual(ra.failedRunIds.map(String), ['4003'])
+    assert.equal(ra.windowStart, hour(1))
+    assert.equal(ra.windowEnd, hour(8))
+    assert.equal(ra.neverFailed, false)
+    assert.equal(rowFor(out, 'b', 'CI', 'test').neverFailed, true)
+    assert.equal(rowFor(out, 'b', 'CI', 'test').windowEnd, hour(8))
+  }
+})
+
+test('T7 citation pool: with two repos newest-first, every failed run id of every row is in the pool, the failed ids come first, and the rest is the most recent runs (AC-QA-23, round 2 M1)', () => {
+  const a = newestFirst('a', 6000, 60, [58, 20])
+  const b = newestFirst('b', 7000, 60, [57])
+  const out = ci([...a, ...b])
+  const failed = rowsOf(out).flatMap((r) => r.failedRunIds.map(String))
+  assert.deepEqual([...failed].sort(), ['6020', '6058', '7057'], 'precondition: the failures were read')
+  const pool = out.citationPool
+  assert.ok(pool.length <= 50, `pool is capped: ${pool.length}`)
+  assert.equal(new Set(pool).size, pool.length, 'no duplicates')
+  assert.ok(pool.every((id) => /^[0-9]+$/.test(id)), 'digits only')
+  for (const id of failed) assert.ok(pool.includes(id), `failed run ${id} must be citable; pool starts ${pool.slice(0, 5)}`)
+  assert.deepEqual(pool.slice(0, failed.length).sort(), [...failed].sort(), 'failed ids lead the pool')
+  // The newest completed run of EACH repo is citable, not just the last-listed repo's oldest.
+  assert.ok(pool.includes('6060'), 'repo a\'s newest run is in the pool')
+  assert.ok(pool.includes('7060'), 'repo b\'s newest run is in the pool')
+  assert.ok(!pool.includes('6001'), 'repo a\'s oldest run is not preferred over newer ones')
+})
+
 // ==== (3) normaliser: AC-QA-24, AC-SEC-12 ====
 
 test('T7 normaliser: per-PR and per-update suffixes collapse, matrix legs and other hashes do not (AC-QA-24)', () => {
@@ -154,6 +199,12 @@ test('T7 normaliser: instance names merge into one row through the ci command, m
   assert.ok(rowFor(out, 'a', 'CI', 'test (18.x)'))
   assert.ok(rowFor(out, 'a', 'CI', 'test (20.x)'))
   assert.ok(!rowsOf(out).some((r) => r.job === ''), 'no empty-string job key')
+  // Round 2 L2 (AC-QA-24): the absence check above cannot fail, because
+  // aggregateCi drops a falsy job. Assert the positive outcome: a name that
+  // would be empty is kept whole, under its original name, and aggregated.
+  const kept = rowFor(out, 'a', 'CI', ' - Update #5')
+  assert.ok(kept, 'the all-suffix name survives under its original name')
+  assert.equal(kept.n, 2)
 })
 
 test('T7 normaliser: a 10,000-character name of repeated " - Update #1" normalises in under 50 ms, and so does a hostile digit run (AC-SEC-12)', () => {
@@ -182,7 +233,9 @@ test('T7 normaliser: the source regex is anchored at the end and carries no nest
 
 test('T7 renameSuspect: a workflow that first runs on day 10 with all its jobs in every run is not suspect, a job first seen in an older workflow\'s day-5 run is (AC-QA-25)', () => {
   const runs = []
-  for (let i = 1; i <= 8; i++) runs.push(mkRun('a', 'A', 800 + i, i, i >= 5 ? [['unit'], ['extra']] : [['unit']]))
+  // Round 2 L3 (AC-QA-25): A runs 9 times and `extra` appears from day 5, so
+  // `extra` has n=5 (the minimum), and only renameSuspect can null neverFailed.
+  for (let i = 1; i <= 9; i++) runs.push(mkRun('a', 'A', 800 + i, i, i >= 5 ? [['unit'], ['extra']] : [['unit']]))
   for (let i = 10; i <= 16; i++) runs.push(mkRun('a', 'B', 900 + i, i, [['pack'], ['publish']]))
   const out = ci(runs)
   for (const job of ['pack', 'publish']) {
@@ -193,6 +246,8 @@ test('T7 renameSuspect: a workflow that first runs on day 10 with all its jobs i
   assert.equal(rowFor(out, 'a', 'A', 'unit').renameSuspect, false)
   const extra = rowFor(out, 'a', 'A', 'extra')
   assert.equal(extra.renameSuspect, true)
+  assert.equal(extra.insufficientData, false, 'n is at the minimum, so insufficientData is not what nulls neverFailed')
+  assert.ok(extra.n >= 5, `extra.n=${extra.n}`)
   assert.equal(extra.neverFailed, null)
 })
 
@@ -515,6 +570,33 @@ test('T7 report: the lane\'s wall-clock seconds and gh call count print per repo
   assert.match(ciSection(withStats.result.report), /alpha-repo[^\n]*wall-clock 12s, 7 gh calls/)
   const without = await run()
   assert.ok(!/gh calls/.test(ciSection(without.result.report)))
+})
+
+test('T7 report: the skipped, cancelled and neutral bucket is labelled "not settled", never "skipped" (AC-OPS-9, round 2 L4)', async () => {
+  const { result } = await run({ 'lane:ci': ciLane([jobRow({ job: 'flaky', n: 10, skipped: 3, neverFailed: null })]) })
+  const line = ciSection(result.report).split('\n').find((l) => l.includes('flaky'))
+  assert.ok(line, 'precondition: the row rendered')
+  assert.match(line, /not settled=3 \(skipped, cancelled or neutral\)/)
+  assert.ok(!/\bskipped=3/.test(line), 'a cancelled job is not mislabelled as a conditional skip')
+})
+
+test('T7 redaction: numeric fields, failed run ids and repo stats from a confused lane cannot carry a roster root or a heading into the report (AC-SEC-10, round 2 L1)', async () => {
+  const evil = `${ALPHA}\n## Injected heading`
+  const row = jobRow({ n: evil, failureCount: evil, skipped: evil, failedRunIds: [evil, '205', `${ALPHA}`] })
+  const repoStats = { 'alpha-repo': { notCompleted: evil, fetchFailures: { rate_limited: evil, unauthenticated: evil, other: evil } } }
+  const ghStats = [{ repo: 'alpha-repo', wall_clock_s: evil, gh_calls: evil }]
+  const { result } = await run({ 'lane:ci': ciLane([row], { repoStats, ghStats, __bypassSchemaValidation: true }) })
+  const report = result.report
+  assert.ok(report.includes('## CI section'), 'precondition: the report rendered')
+  assert.ok(!report.includes(ALPHA), 'no roster root anywhere in the report')
+  assert.ok(!/Injected/.test(report), 'no injected text anywhere in the report')
+  assert.ok(!report.includes('\n## Injected'), 'no heading started by a lane value')
+  const line = ciSection(report).split('\n').find((l) => l.startsWith('- ') && l.includes('test:'))
+  assert.ok(line, 'precondition: the row line rendered')
+  assert.match(line, /n=n\/a/)
+  assert.match(line, /205/, 'a clean digits-only id survives')
+  const repoLine = ciSection(report).split('\n').find((l) => l.includes('runs not completed'))
+  assert.ok(repoLine && /n\/a|0 runs not completed/.test(repoLine), `repo stats value is n/a or dropped: ${repoLine}`)
 })
 
 test('T7 redaction: a CI row whose repo is a roster root and whose job name carries a newline reaches neither the CI section nor the synthesis prompt unredacted, nor do the ci failure lines (AC-SEC-10, round 1 L2)', async () => {

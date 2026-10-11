@@ -2005,7 +2005,9 @@ function runCiCommand(payload) {
   const repoStats = Object.create(null)
   const partialWorkflows = new Set()
   const seen = new Set()
-  const ciCitationPool = []
+  // Round 2 M1 (AC-QA-23): the pool is built by failure and recency, not array
+  // position (gh lists newest first and the lane sends several repos).
+  const poolRuns = []
   for (const run of runs) {
     if (!run || typeof run.repo !== 'string' || typeof run.workflow !== 'string' || !run.repo || !run.workflow) continue
     if (!validRunId(run.id)) continue
@@ -2013,7 +2015,7 @@ function runCiCommand(payload) {
     const id = String(run.id)
     if (!seen.has(id)) {
       seen.add(id)
-      ciCitationPool.push(id)
+      poolRuns.push({ id, repo: run.repo, completed: run.status === 'completed', t: typeof run.started_at === 'string' ? Date.parse(run.started_at) : NaN })
     }
     // AC-OPS-10: an in-flight run has unsettled conclusions.
     if (run.status !== 'completed') {
@@ -2037,7 +2039,19 @@ function runCiCommand(payload) {
     }
   }
   const { byJob } = aggregateCi(flat, { minRunsNeverFailed, requestedLimit, partialWorkflows })
-  return { byJob: mapToObject(byJob), citationPool: ciCitationPool.slice(-CITATION_POOL_SIZE).reverse(), repoStats }
+  // Every failed run id first (all repos), then each repo's most recent
+  // completed runs by started_at descending (id tie-break), deduplicated.
+  const pool = []
+  const inPool = new Set()
+  const add = (id) => { if (/^[0-9]+$/.test(id) && !inPool.has(id) && pool.length < CITATION_POOL_SIZE) { inPool.add(id); pool.push(id) } }
+  for (const row of Object.values(mapToObject(byJob))) for (const id of Array.isArray(row.failedRunIds) ? row.failedRunIds : []) add(String(id))
+  const byRepo = new Map()
+  for (const r of poolRuns) if (r.completed) (byRepo.get(r.repo) || byRepo.set(r.repo, []).get(r.repo)).push(r)
+  const newest = (a, b) => (Number.isNaN(b.t) ? -Infinity : b.t) - (Number.isNaN(a.t) ? -Infinity : a.t) || (BigInt(b.id) > BigInt(a.id) ? 1 : BigInt(b.id) < BigInt(a.id) ? -1 : 0)
+  const lists = [...byRepo.values()].map((l) => l.sort(newest))
+  // Round-robin across repos so no repo's recent runs crowd out another's.
+  for (let i = 0; pool.length < CITATION_POOL_SIZE && lists.some((l) => i < l.length); i++) for (const l of lists) if (i < l.length) add(l[i].id)
+  return { byJob: mapToObject(byJob), citationPool: pool, repoStats }
 }
 
 export function main() {

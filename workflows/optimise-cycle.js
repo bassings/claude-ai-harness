@@ -566,6 +566,11 @@ const redactRoots = (v) => {
 const redactRootsDeep = (v) => (typeof v === 'string' ? redactRoots(v) : Array.isArray(v) ? v.map(redactRootsDeep) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactRootsDeep(x)])) : v)
 const ciByJobSafe = ciAgg ? Object.fromEntries(Object.entries(ciAgg.byJob || {}).map(([k, v]) => [redactRoots(k), redactRootsDeep(v)])) : {}
 const ciFailuresSafe = ciAgg ? redactRootsDeep(ciAgg.failures) : []
+// Round 2 L1 (AC-SEC-10): repoStats keys and ghStats repos are lane-supplied
+// strings, so they take the same roots redactor as the other CI inputs; the
+// numeric values are coerced where they are printed (buildReport).
+const ciRepoStatsSafe = ciAgg && ciAgg.repoStats && typeof ciAgg.repoStats === 'object' ? Object.fromEntries(Object.entries(ciAgg.repoStats).map(([k, v]) => [redactRoots(k), redactRootsDeep(v)])) : {}
+const ciGhStatsSafe = ciAgg && Array.isArray(ciAgg.ghStats) ? redactRootsDeep(ciAgg.ghStats) : []
 const ciCitations = new Set((ciAgg && ciAgg.citationPool) || [])
 const allCitations = new Set([...ledgerCitations, ...ciCitations])
 
@@ -952,8 +957,8 @@ const reportMarkdown = buildReport({
   triggerAccuracy: ledgerAgg ? ledgerAgg.triggerAccuracy : null,
   ciByJob: ciByJobSafe,
   ciFailures: ciAgg ? ciFailuresSafe : [],
-  ciRepoStats: ciAgg && ciAgg.repoStats ? ciAgg.repoStats : {},
-  ciGhStats: ciAgg && Array.isArray(ciAgg.ghStats) ? ciAgg.ghStats : [],
+  ciRepoStats: ciRepoStatsSafe,
+  ciGhStats: ciGhStatsSafe,
   escapedDefects: gitPerRepo.map((g, i) => ({ ...g, label: ledgerRepoLabel(i) || scope.resolved[i].label })),
   escapedDefectsUnmatched: gitUnmatched,
   draftedCount,
@@ -1431,6 +1436,7 @@ function buildReport(d) {
 
   lines.push('## CI section (source: gh)')
   const ciFlat = d.flatten || ((v) => String(v).replace(/\s+/g, ' ').slice(0, 120))
+  const ciNum = (x) => (Number.isFinite(+x) ? +x : 'n/a')
   const jobKeys = Object.keys(d.ciByJob || {})
   if (!jobKeys.length && (!d.ciFailures || !d.ciFailures.length)) lines.push('No CI data available.')
   for (const key of jobKeys) {
@@ -1444,18 +1450,20 @@ function buildReport(d) {
     if (j.partialFetch) qualifiers.push('jobs partially fetched')
     if (!qualifiers.length && j.neverFailed) qualifiers.push('never failed in this window')
     // AC-OPS-9: n, failure count, failed run ids and mean duration on every row.
-    const ids = Array.isArray(j.failedRunIds) ? j.failedRunIds : []
+    // Round 2 L1 (AC-SEC-10): every number is coerced and every run id is
+    // digits-only, so a confused lane cannot print text outside the flattener.
+    const ids = (Array.isArray(j.failedRunIds) ? j.failedRunIds : []).map(String).filter((x) => /^[0-9]+$/.test(x))
     const idText = ids.length ? ` (run ids ${ids.slice(0, 10).join(', ')}${ids.length > 10 ? `, +${ids.length - 10} more` : ''})` : ''
     const mean = typeof j.meanDurationS === 'number' ? `${Math.round(j.meanDurationS)}s` : 'n/a'
-    lines.push(`- ${ciFlat(key)}: n=${j.n}, failed=${j.failureCount == null ? 'n/a' : j.failureCount}${j.skipped ? `, skipped=${j.skipped}` : ''}${idText}, mean ${mean}${qualifiers.length ? ` (${qualifiers.join(', ')})` : ''}`)
+    lines.push(`- ${ciFlat(key)}: n=${ciNum(j.n)}, failed=${j.failureCount == null ? 'n/a' : ciNum(j.failureCount)}${j.skipped ? `, not settled=${ciNum(j.skipped)} (skipped, cancelled or neutral)` : ''}${idText}, mean ${mean}${qualifiers.length ? ` (${qualifiers.join(', ')})` : ''}`)
   }
   // AC-OPS-10, AC-OPS-11: per repo, runs left out as not completed and failed per-run fetches by mode.
   for (const [repo, st] of Object.entries(d.ciRepoStats || {})) {
     const ff = (st && st.fetchFailures) || {}
-    lines.push(`- ${ciFlat(repo)}: ${(st && st.notCompleted) || 0} runs not completed (left out); per-run fetch failures: rate_limited ${ff.rate_limited || 0}, unauthenticated ${ff.unauthenticated || 0}, other ${ff.other || 0}`)
+    lines.push(`- ${ciFlat(repo)}: ${ciNum((st && st.notCompleted) || 0)} runs not completed (left out); per-run fetch failures: rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}`)
   }
   // AC-QA-32: the lane's own cost, so the first run after shipping records the baseline.
-  for (const g of d.ciGhStats || []) lines.push(`- ${ciFlat(g.repo)}: wall-clock ${g.wall_clock_s == null ? 'n/a' : g.wall_clock_s}s, ${g.gh_calls == null ? 'n/a' : g.gh_calls} gh calls`)
+  for (const g of d.ciGhStats || []) lines.push(`- ${ciFlat(g.repo)}: wall-clock ${g.wall_clock_s == null ? 'n/a' : ciNum(g.wall_clock_s)}s, ${g.gh_calls == null ? 'n/a' : ciNum(g.gh_calls)} gh calls`)
   for (const f of d.ciFailures || []) lines.push(`- gh unavailable for ${ciFlat(f.repo)}: ${ciFlat(f.mode)} (${ciFlat(f.command)}): ${ciFlat(f.error || 'n/a')}`)
   lines.push('')
   lines.push('## Escaped-defect counter-metric')
