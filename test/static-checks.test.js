@@ -2279,9 +2279,13 @@ test('ledger-append.mjs ROSTER_LENSES matches the lens files in agents/ in both 
 test('static: conduct-plan/SKILL.md awaiting-ci green step instructs passing `spec` (repo-relative) and `round` on every /review-cycle invocation (HARN-OPT-4 T4, AC-QA-14)', () => {
   const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
   const lines = skill.split('\n')
-  const start = lines.findIndex((l) => /^ {4}- `awaiting-ci` green/.test(l))
+  // The step bullets in SKILL.md sit at three spaces (under the numbered
+  // list); the first draft of this test anchored at four, which no real line
+  // matched, and the implementer re-indented the skill to fit the test. The
+  // test anchors on the file as it is written.
+  const start = lines.findIndex((l) => /^ {3}- `awaiting-ci` green/.test(l))
   assert.ok(start >= 0, 'expected the awaiting-ci green bullet')
-  let end = lines.findIndex((l, i) => i > start && /^ {4}- `/.test(l))
+  let end = lines.findIndex((l, i) => i > start && /^ {3}- `/.test(l))
   if (end === -1) end = lines.length
   const paragraphs = lines.slice(start, end).join('\n').split(/\n\s*\n/)
   const invocation = paragraphs.filter((p) => /review-cycle/.test(p) && p.includes('`spec`') && p.includes('`round`'))

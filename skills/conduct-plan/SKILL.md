@@ -63,7 +63,7 @@ rather than narrating a condition that does not apply here.
    - `building` complete → run the local gate, raise the PR → `pr-open`.
    - `pr-open` → arm `gh pr checks <n> --watch` as a BACKGROUND task →
      `awaiting-ci`.
-    - `awaiting-ci` green → run the review cycle (/review-cycle where
+   - `awaiting-ci` green → run the review cycle (/review-cycle where
      installed); fix findings or record evidenced rejections → `in-review`.
      CI red → fix, push, re-arm the watch.
 
