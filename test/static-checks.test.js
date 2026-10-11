@@ -2269,3 +2269,22 @@ test('ledger-append.mjs ROSTER_LENSES matches the lens files in agents/ in both 
   assert.deepEqual(missing, [], `agents/ has lens file(s) missing from ROSTER_LENSES in ledger-append.mjs: ${missing.join(', ')}`)
   assert.deepEqual(extra, [], `ROSTER_LENSES in ledger-append.mjs names lens(es) with no file in agents/: ${extra.join(', ')}`)
 })
+
+// HARN-OPT-4 T4 (AC-QA-14): the conductor's review-invocation step must name
+// both `spec` and `round`. The skill is prose, so this proves the instruction
+// is present in the awaiting-ci green bullet, not that a conductor obeys it.
+// The bullet already says "round two" in the prior_findings steps, so the
+// assertions anchor on the backticked argument names inside a paragraph that
+// also names /review-cycle, never on the bare word "round".
+test('static: conduct-plan/SKILL.md awaiting-ci green step instructs passing `spec` (repo-relative) and `round` on every /review-cycle invocation (HARN-OPT-4 T4, AC-QA-14)', () => {
+  const skill = readAll('skills', 'conduct-plan', 'SKILL.md')
+  const lines = skill.split('\n')
+  const start = lines.findIndex((l) => /^ {4}- `awaiting-ci` green/.test(l))
+  assert.ok(start >= 0, 'expected the awaiting-ci green bullet')
+  let end = lines.findIndex((l, i) => i > start && /^ {4}- `/.test(l))
+  if (end === -1) end = lines.length
+  const paragraphs = lines.slice(start, end).join('\n').split(/\n\s*\n/)
+  const invocation = paragraphs.filter((p) => /review-cycle/.test(p) && p.includes('`spec`') && p.includes('`round`'))
+  assert.ok(invocation.length > 0, 'a paragraph of the awaiting-ci green step must name /review-cycle together with both `spec` and `round`')
+  assert.ok(invocation.some((p) => /repo-relative/.test(p) && /never absolute/i.test(p)), 'the spec argument must be stated as repo-relative, never absolute')
+})

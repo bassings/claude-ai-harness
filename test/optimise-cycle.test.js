@@ -1705,3 +1705,19 @@ test('optimise-cycle: a never-failing AC whose verdict array was truncated rende
   assert.ok(line.includes('verdict_disagreements=not measured'), `got: ${line}`)
   assert.ok(!/verdict_disagreements=(0|null)\b/.test(line), `got: ${line}`)
 })
+
+// HARN-OPT-4 T4 (AC-OPS-4, AC-PROD-4): the existing no-spec line separates
+// conducted reviews (no spec, a conductor-recorded round) from direct ones.
+// Values 7 and 9 collide with neither the fixture's run count 3 nor its
+// reclassified count 11, and each is asserted as an exact label=value pair.
+test('optimise-cycle (HARN-OPT-4 T4, AC-OPS-4): the no-spec line prints conducted=7, direct=9 as separate labelled counts', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({
+      rework: { ...ledgerFixture().rework, noSpecReviewRuns: 3, noSpecFindingsReclassified: 11, noSpecReviewRunsConducted: 7, noSpecReviewRunsDirect: 9 },
+    }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n').filter((l) => /No-spec review runs in window/.test(l))
+  assert.equal(lines.length, 1, `expected exactly one no-spec line, report was:\n${result.report}`)
+  assert.ok(lines[0].includes('conducted=7, direct=9'), `got: ${lines[0]}`)
+})

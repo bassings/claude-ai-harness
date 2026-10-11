@@ -1037,6 +1037,7 @@ function buildReport(d) {
     // being mislabelled as a spec bug.
     lines.push(
       `No-spec review runs in window: ${fmtCountOrUnavailable(d.rework.noSpecReviewRuns)} ` +
+      `(conducted=${fmtCountOrUnavailable(d.rework.noSpecReviewRunsConducted)}, direct=${fmtCountOrUnavailable(d.rework.noSpecReviewRunsDirect)}) ` +
       `(findings reclassified from spec_bug to open on those runs: ${fmtCountOrUnavailable(d.rework.noSpecFindingsReclassified)}).`
     )
     // HARN-OPT-4 T3 (AC-PROD-10, AC-QA-30): the completeness figures exist

@@ -1,7 +1,7 @@
 export const meta = {
   name: 'review-cycle',
   description: 'Multi-lens review of the branch diff per AGENT-HARNESS.md: single-focus lenses in parallel, one synthesised report',
-  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one), prior_findings?: array (round two onward: findings reported open going into this round, as {id, lens, location, claim, severity?, ac_id?} -- id is REQUIRED and must be the exact value THIS workflow returned as open_findings[].id in an earlier round (verified by recomputing the hash from lens/location/claim; a mismatched or missing id is dropped, counted, and produces no fixed entry) -- a synthesis confirmation matching one gets recorded disposition "fixed" in the ledger, guarded so an unmatched claim is dropped, never recorded; absent, behaviour is unchanged)}',
+  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one), round?: integer (the review round for this task as counted by the conductor, 1 for the first; recorded on the ledger rows; absent for a direct review), prior_findings?: array (round two onward: findings reported open going into this round, as {id, lens, location, claim, severity?, ac_id?} -- id is REQUIRED and must be the exact value THIS workflow returned as open_findings[].id in an earlier round (verified by recomputing the hash from lens/location/claim; a mismatched or missing id is dropped, counted, and produces no fixed entry) -- a synthesis confirmation matching one gets recorded disposition "fixed" in the ledger, guarded so an unmatched claim is dropped, never recorded; absent, behaviour is unchanged)}',
   phases: [
     { title: 'Scope', detail: 'diff the branch, classify the change surface' },
     { title: 'Lenses', detail: 'triggered lenses review in parallel, isolated worktrees' },
@@ -424,6 +424,10 @@ if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts
 opts = opts || {}
 
 const specPath = opts.spec || null
+// HARN-OPT-4 T4 (AC-QA-13, AC-SIMP-11): passed through RAW. ledger-append.mjs owns
+// validation (integer >= 1 or null) and counts what it neutralises, so this file
+// never decides what a valid round is. Absent is null, never 0.
+const reviewRound = opts.round === undefined ? null : opts.round
 // specs/record-fixed-findings.md (AC-1/AC-3): the caller's own findings,
 // reported open going into this round -- {id, lens, location, claim,
 // severity?, ac_id?}. Fix round 3, finding 3: `id` is REQUIRED, not
@@ -1206,6 +1210,7 @@ acVerdicts = lensReports.flatMap(r =>
 // enforced unconditionally further down, regardless of what synthesis
 // actually returned.
 const noSpecWasInPlay = !specPath && acVerdicts.length === 0
+const NO_SPEC_SENTENCE = 'No spec was supplied, so findings are not anchored to any acceptance criterion.'
 
 // ---- the reviewed-tip check: mechanical, fail-closed ----
 // Every lens must state the sha its findings came from, and it must be the tip
@@ -1344,7 +1349,7 @@ const synthesis = await agent(
   `3. Conflicts between lenses arbitrated by the precedence order: irrecoverable data loss, security, accessibility floor, ` +
   `operability, product and design intent, performance. A tie ABOVE the accessibility line is marked ESCALATE for the human, ` +
   `never resolved silently.\n` +
-  `4. ${specPath ? 'AC verdict summary, and any finding with no AC behind it flagged as a SPEC BUG.' : 'AC verdict summary if the lenses found a spec; otherwise note that no spec existed, so every finding is unanchored to an AC.'}\n` +
+  `4. ${specPath ? 'AC verdict summary, and any finding with no AC behind it flagged as a SPEC BUG.' : 'AC verdict summary if the lenses found a spec; otherwise state this sentence verbatim: "' + NO_SPEC_SENTENCE + '"'}\n` +
   `5. A closing line: overall CLEAN / FINDINGS / BLOCKED and what must happen before push.\n` +
   `Do not soften findings and do not invent any. If a lens returned BLOCKED, say so prominently. ` +
   // M1 (fix round 3, D4): asking for spec_bugs at all only makes sense when a
@@ -1479,7 +1484,9 @@ return {
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: reportOk ? (installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) : '',
+  // HARN-OPT-4 T4 (AC-QA-12, AC-OPS-4): appended in code so the guarantee does
+  // not rest on synthesis obeying its prompt. Only when the run produced a report.
+  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay ? `\n\n${NO_SPEC_SENTENCE}` : '')) : '',
   __outcome: outcome,
 }
 
@@ -1487,7 +1494,7 @@ return {
 
 // Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
 // pattern and its rationale.
-const startWrite = await writeLedger({ kind: 'review_cycle', outcome: 'started', spec: specPath })
+const startWrite = await writeLedger({ kind: 'review_cycle', outcome: 'started', spec: specPath, round: reviewRound })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
 // PR 2 (AC-QA-8, AC-ARCH-9): an exception escaping run() must still
@@ -1517,6 +1524,7 @@ const { __outcome, ...result } = raw
 const telemetry = {
   outcome: __outcome || 'aborted',
   spec: specPath,
+  round: reviewRound,
   round_key: headSha,
   lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],
