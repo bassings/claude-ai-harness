@@ -472,20 +472,22 @@ test('ledger-append: truncation is BYTE-based, not character-based, so three mul
   assert.doesNotThrow(() => Buffer.from(entry.spec_raw, 'utf8').toString('utf8'))
 })
 
-test('ledger-append: a findings array beyond the stated bound is truncated, with findings_truncated recording exactly how many were dropped (M2)', () => {
+test('ledger-append: a findings array beyond the stated bound is truncated, with findings_truncated recording exactly how many were dropped (M2)', async () => {
+  const { MAX_FINDINGS } = await import(APPEND_MODULE_URL)
+  const total = MAX_FINDINGS + 5
   const repo = makeTempRepo()
   // A minimal envelope (no verdicts/trigger_counts padding) so the bounded
   // result reliably fits under MAX_LINE_BYTES and this test proves the
   // bounding behaviour distinctly from the separate degrade-to-minimal path.
-  const many = Array.from({ length: 20 }, () => ({ lens: 'lens-qa', location: 'f.js:1', claim: 'x' }))
+  const many = Array.from({ length: total }, () => ({ lens: 'lens-qa', location: 'f.js:1', claim: 'x' }))
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: many })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.ok(!entry.degraded, 'this fixture must fit within MAX_LINE_BYTES once bounded, proving the bounding path distinctly from the degrade path')
-  assert.ok(entry.findings.length < 20, 'the findings array must be bounded, not all 20 entries')
+  assert.ok(entry.findings.length < total, `the findings array must be bounded, not all ${total} entries`)
   assert.equal(typeof entry.findings_truncated, 'number')
-  assert.equal(entry.findings.length + entry.findings_truncated, 20, 'kept + dropped must account for every finding')
+  assert.equal(entry.findings.length + entry.findings_truncated, total, 'kept + dropped must account for every finding')
   assert.ok(entry.findings_truncated > 0)
 })
 
@@ -498,11 +500,11 @@ test('ledger-append: a findings array beyond the stated bound is truncated, with
 // exists to measure. Round-robin budgeting must give every present
 // disposition SOME representation rather than fully favouring one over
 // another.
-test('ledger-append: MAX_FINDINGS truncation is budgeted fairly across dispositions -- 15 open findings (already at the cap by itself) plus 20 validly-confirmed fixed findings still records SOME fixed, never zero (fix round 1, finding 4, coordinator repro: 15+ open findings previously starved fixed entirely)', async () => {
+test('ledger-append: MAX_FINDINGS truncation is budgeted fairly across dispositions -- MAX_FINDINGS open findings (already at the cap by itself) plus 20 validly-confirmed fixed findings still records SOME fixed, never zero (fix round 1, finding 4, coordinator repro: 15+ open findings previously starved fixed entirely)', async () => {
   const repo = makeTempRepo()
-  const { findingId } = await import(APPEND_MODULE_URL)
+  const { findingId, MAX_FINDINGS } = await import(APPEND_MODULE_URL)
   const priorFindings = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-security', location: `fixed${i}.js:1`, claim: `fixed finding ${i}`, id: findingId('lens-security', `fixed${i}.js:1`, `fixed finding ${i}`) }))
-  const openFindings = Array.from({ length: 15 }, (_, i) => ({ lens: 'lens-qa', location: `open${i}.js:1`, claim: `open finding ${i}` }))
+  const openFindings = Array.from({ length: MAX_FINDINGS }, (_, i) => ({ lens: 'lens-qa', location: `open${i}.js:1`, claim: `open finding ${i}` }))
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
@@ -514,17 +516,18 @@ test('ledger-append: MAX_FINDINGS truncation is budgeted fairly across dispositi
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const fixedCount = entry.findings.filter((f) => f.disposition === 'fixed').length
   const openCount = entry.findings.filter((f) => f.disposition === 'open').length
-  assert.equal(entry.findings.length, 15, 'sanity: MAX_FINDINGS still bounds the total')
-  assert.equal(entry.findings_truncated, 20, 'sanity: 35 submitted, 15 kept, 20 dropped -- the total truncated count is unaffected by fairness, only WHICH entries survive')
+  assert.equal(entry.findings.length, MAX_FINDINGS, 'sanity: MAX_FINDINGS still bounds the total')
+  assert.equal(entry.findings_truncated, 20, 'sanity: MAX_FINDINGS + 20 submitted, MAX_FINDINGS kept, 20 dropped -- the total truncated count is unaffected by fairness, only WHICH entries survive')
   assert.ok(fixedCount > 0, `zero fixed entries recorded despite 20 valid confirmations and open ALONE already at the MAX_FINDINGS cap -- the exact defect this test exists to catch (got fixedCount=${fixedCount}, openCount=${openCount})`)
   assert.ok(openCount > 0, `zero open entries recorded -- fairness must not simply invert which disposition is starved (got fixedCount=${fixedCount}, openCount=${openCount})`)
 })
 
-test('ledger-append: MAX_FINDINGS truncation fairness -- with 10 open findings and 20 validly-confirmed fixed findings (the coordinator\'s own smaller repro), both dispositions get real representation, not a 15/0 split (fix round 1, finding 4)', async () => {
+test('ledger-append: MAX_FINDINGS truncation fairness -- with fewer open findings than the cap and more fixed findings than the rest of it (the coordinator\'s own smaller repro, scaled to MAX_FINDINGS), both dispositions get real representation, not a cap/0 split (fix round 1, finding 4)', async () => {
   const repo = makeTempRepo()
-  const { findingId } = await import(APPEND_MODULE_URL)
-  const priorFindings = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-security', location: `fixed${i}.js:1`, claim: `fixed finding ${i}`, id: findingId('lens-security', `fixed${i}.js:1`, `fixed finding ${i}`) }))
-  const openFindings = Array.from({ length: 10 }, (_, i) => ({ lens: 'lens-qa', location: `open${i}.js:1`, claim: `open finding ${i}` }))
+  const { findingId, MAX_FINDINGS } = await import(APPEND_MODULE_URL)
+  const openN = Math.floor(MAX_FINDINGS * 2 / 3)
+  const priorFindings = Array.from({ length: MAX_FINDINGS * 2 }, (_, i) => ({ lens: 'lens-security', location: `fixed${i}.js:1`, claim: `fixed finding ${i}`, id: findingId('lens-security', `fixed${i}.js:1`, `fixed finding ${i}`) }))
+  const openFindings = Array.from({ length: openN }, (_, i) => ({ lens: 'lens-qa', location: `open${i}.js:1`, claim: `open finding ${i}` }))
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
@@ -536,7 +539,7 @@ test('ledger-append: MAX_FINDINGS truncation fairness -- with 10 open findings a
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const fixedCount = entry.findings.filter((f) => f.disposition === 'fixed').length
   const openCount = entry.findings.filter((f) => f.disposition === 'open').length
-  assert.equal(fixedCount + openCount, 15)
+  assert.equal(fixedCount + openCount, MAX_FINDINGS)
   // The naive concat-then-slice order (spec_bugs, rejected, open, fixed)
   // gave open ALL 10 of its entries and fixed only 5 of its 20 -- both
   // "represented", but a 10/5 split, not a fair one. Round-robin gives 8/7:
@@ -2151,21 +2154,23 @@ test('ledger-append: open_finding_ids is absent/null on the CLI result when open
 // other 5 next round would write a 'fixed' entry with NO open counterpart
 // anywhere in the ledger -- exactly the false-join AC-1 exists to prevent,
 // one layer up from the guard that already checks id authenticity.
-test('ledger-append: open_finding_ids only ever returns ids that actually survived into the written entry.findings -- a truncated-out open finding\'s id comes back null, never a phantom id nothing was recorded under (fix round 3, finding 2)', () => {
+test('ledger-append: open_finding_ids only ever returns ids that actually survived into the written entry.findings -- a truncated-out open finding\'s id comes back null, never a phantom id nothing was recorded under (fix round 3, finding 2)', async () => {
+  const { MAX_FINDINGS } = await import(APPEND_MODULE_URL)
+  const total = MAX_FINDINGS + 5
   const repo = makeTempRepo()
-  const many = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-qa', location: `f${i}.js:1`, claim: `finding ${i}` }))
+  const many = Array.from({ length: total }, (_, i) => ({ lens: 'lens-qa', location: `f${i}.js:1`, claim: `finding ${i}` }))
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: many })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const writtenOpenIds = new Set(entry.findings.filter((f) => f.disposition === 'open').map((f) => f.id))
   assert.ok(Array.isArray(out.open_finding_ids), 'expected open_finding_ids on the CLI result')
-  assert.equal(out.open_finding_ids.length, 20, 'positional alignment with the 20 supplied descriptors must be preserved')
+  assert.equal(out.open_finding_ids.length, total, `positional alignment with the ${total} supplied descriptors must be preserved`)
   const nonNullReturned = out.open_finding_ids.filter((id) => id !== null)
   assert.equal(nonNullReturned.length, writtenOpenIds.size, 'every non-null returned id must correspond to something genuinely written')
   for (const id of nonNullReturned) {
     assert.ok(writtenOpenIds.has(id), `returned id ${id} was never actually written to entry.findings -- exactly the phantom-id defect this test exists to catch`)
   }
-  assert.ok(nonNullReturned.length < 20, 'sanity: this fixture must genuinely exceed MAX_FINDINGS to prove anything -- otherwise every id trivially survives')
+  assert.ok(nonNullReturned.length < total, 'sanity: this fixture must genuinely exceed MAX_FINDINGS to prove anything -- otherwise every id trivially survives')
 })
 
 test('ledger-append: a reworded finding (same lens/location, different claim text) does not match prior_findings -- the safe, undercounting direction, not an overcount (specs/record-fixed-findings.md)', () => {
@@ -4240,8 +4245,9 @@ test('ledger-append (AC-SEC-4, M6 round 3): the pattern stays linear against inp
 test('ledger-append (D3): every finding that did not fit the array is counted in findings_truncated, so the shortfall is reported rather than silent', async () => {
   const { MAX_FINDINGS } = await import(APPEND_MODULE_URL)
   const repo = makeTempRepo()
-  // 40 findings from two lenses, well past MAX_FINDINGS.
-  const open = Array.from({ length: 40 }, (_, i) => ({
+  // Findings from two lenses, well past MAX_FINDINGS.
+  const total = MAX_FINDINGS + 40
+  const open = Array.from({ length: total }, (_, i) => ({
     lens: i % 2 === 0 ? 'lens-qa' : 'lens-security',
     location: `f${i}.js:1`,
     claim: `finding ${i}`,
@@ -4252,9 +4258,9 @@ test('ledger-append (D3): every finding that did not fit the array is counted in
   const entry = JSON.parse(readLedgerLines(repo)[0])
 
   assert.equal(entry.findings.length, MAX_FINDINGS, 'precondition: the findings array really is capped, or this test proves nothing')
-  assert.equal(entry.findings_truncated, 40 - MAX_FINDINGS,
+  assert.equal(entry.findings_truncated, total - MAX_FINDINGS,
     'the count of findings NOT in the array is the number a reader needs to know the tally is short')
-  assert.equal(entry.findings.length + entry.findings_truncated, 40,
+  assert.equal(entry.findings.length + entry.findings_truncated, total,
     'kept plus dropped must account for every supplied finding: no finding may be lost with nothing recording it')
 })
 
@@ -4373,18 +4379,26 @@ test('ledger-append (H2): an oversized ac_id is quarantined and the record survi
 //    verdicts. So the criterion's original "widest accepted form" fixture
 //    was never satisfiable, which is the half AC-QA-7 has now been amended
 //    to say.
-test('ledger-append (AC-QA-7): the largest round that must fit is written WHOLE -- no degrade, MAX_FINDINGS findings, MAX_AC_VERDICTS verdicts, with measured headroom', async () => {
-  const { MAX_FINDINGS, MAX_AC_VERDICTS, MAX_LINE_BYTES } = await import(APPEND_MODULE_URL)
+test('ledger-append (AC-QA-7): the largest round that must fit is written WHOLE -- no degrade, 50 findings, 96 verdicts, with measured headroom', async () => {
+  const { MAX_FINDINGS, MAX_LINE_BYTES } = await import(APPEND_MODULE_URL)
+  // HARN-OPT-4 T2: MAX_FINDINGS rose from 15 to 60, and 60 findings beside
+  // 200 verdicts was never a round that exists (it does not fit, by design:
+  // the byte-rescue loop sheds findings). The busiest round measured in this
+  // repo's ledger is 50 findings and 96 verdicts, so that is the round that
+  // must fit whole, and it must be within the cap.
+  const N_FINDINGS = 50
+  const N_VERDICTS = 96
+  assert.ok(N_FINDINGS <= MAX_FINDINGS, 'the busiest measured round must be within the cap')
   const repo = makeTempRepo()
   const lenses = ['lens-qa', 'lens-security', 'lens-product', 'lens-architecture', 'lens-data', 'lens-operability', 'lens-design', 'lens-accessibility']
-  const open = Array.from({ length: MAX_FINDINGS }, (_, i) => ({
+  const open = Array.from({ length: N_FINDINGS }, (_, i) => ({
     lens: lenses[i % lenses.length], location: `f${i}.js:1`, claim: `finding number ${i}, a realistic sentence of prose`,
   }))
   // A 25-character spec prefix: the realistic multi-spec citation form the
   // spec's own byte measurement is taken against, not the 40-character
   // pattern maximum (which the boundary guard below measures instead).
   const prefix = 'x'.repeat(25)
-  const acVerdicts = Array.from({ length: MAX_AC_VERDICTS }, (_, i) => ({ ac_id: `${prefix} AC-QA-${i}`, verdict: 'PASS' }))
+  const acVerdicts = Array.from({ length: N_VERDICTS }, (_, i) => ({ ac_id: `${prefix} AC-QA-${i}`, verdict: 'PASS' }))
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
@@ -4404,10 +4418,10 @@ test('ledger-append (AC-QA-7): the largest round that must fit is written WHOLE 
   // Property 1 of the criterion: no degrade.
   assert.ok(!entry.degraded, `degraded must be absent; the line was ${bytes} bytes against a ${MAX_LINE_BYTES} cap`)
   // Property 2: every finding is in the stored line, and the counter agrees.
-  assert.equal(entry.findings.length, MAX_FINDINGS, `all ${MAX_FINDINGS} findings must be in the stored line, got ${entry.findings.length} (${bytes} bytes)`)
+  assert.equal(entry.findings.length, N_FINDINGS, `all ${N_FINDINGS} findings must be in the stored line, got ${entry.findings.length} (${bytes} bytes)`)
   assert.equal(entry.findings_truncated, 0, 'and findings_truncated must be a real measured 0, not a loss reported as a caveat')
   // Property 3: every verdict is in the stored line, and its counter agrees.
-  assert.equal(entry.ac_verdicts.length, MAX_AC_VERDICTS, `all ${MAX_AC_VERDICTS} verdicts must be in the stored line, got ${entry.ac_verdicts.length} (${bytes} bytes)`)
+  assert.equal(entry.ac_verdicts.length, N_VERDICTS, `all ${N_VERDICTS} verdicts must be in the stored line, got ${entry.ac_verdicts.length} (${bytes} bytes)`)
   assert.equal(entry.ac_verdicts_truncated, 0, 'and ac_verdicts_truncated must be a real measured 0')
   // The headroom itself, as a number rather than an adjective. 1,024 bytes
   // measured at this commit; the floor is half of it, so a change that eats
@@ -4551,7 +4565,7 @@ test('ledger-append module (M1): wasNoSpecInPlay treats an EMPTIED ac_verdicts a
   assert.equal(wasNoSpecInPlay(null, [], { acVerdictsTruncated: -1 }), true, 'nor a negative one')
 })
 
-test('ledger-append (M7): SCHEMA_VERSION is 3, so a window spanning this change can tell the two populations apart', async () => {
+test('ledger-append (M7): SCHEMA_VERSION is 4 (HARN-OPT-4 T1: compound lens labels now attributed), so a window spanning this change can tell the two populations apart', async () => {
   // Planning decision 5, and it was not built in the first pass. Without it a
   // 90-day window mixes lines written before and after four validator changes
   // with nothing to separate them: an ac_id that is null could be a real
@@ -4560,7 +4574,7 @@ test('ledger-append (M7): SCHEMA_VERSION is 3, so a window spanning this change 
   // already tallies schema_version without rejecting any, so the bump costs
   // nothing and makes the two readable apart.
   const { SCHEMA_VERSION } = await import(APPEND_MODULE_URL)
-  assert.equal(SCHEMA_VERSION, 3)
+  assert.equal(SCHEMA_VERSION, 4)
 })
 
 test('ledger-append (M7): the written line carries the new version, not the caller-supplied one', () => {
@@ -4568,6 +4582,6 @@ test('ledger-append (M7): the written line carries the new version, not the call
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done' })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
-  assert.equal(JSON.parse(readLedgerLines(repo)[0]).schema_version, 3,
+  assert.equal(JSON.parse(readLedgerLines(repo)[0]).schema_version, 4,
     'the writer stamps its own version; a caller cannot claim to be a different one')
 })

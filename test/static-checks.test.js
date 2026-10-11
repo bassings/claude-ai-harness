@@ -2247,3 +2247,25 @@ test('static: the AC-definition counter recognises every lens prefix the ledger 
       `the definition counter must see ${id}; a prefix containing a digit was invisible to it, so a spec written entirely in that lens's criteria counted as zero`)
   }
 })
+
+// Review round 2 L2: ROSTER_LENSES in workflows/lib/ledger-append.mjs is a
+// hand-copied list of the agents/ files, and its own comment says a name
+// missing there silently costs attribution (a compound label resolves to
+// null and the finding reads as unattributed) rather than failing anything.
+// A new lens file added without touching that list would therefore drift
+// unnoticed. Checked in BOTH directions: a lens file the set lacks, and a set
+// entry with no file behind it. implementer.md is the one agents/ file that
+// is not a reviewing lens.
+test('ledger-append.mjs ROSTER_LENSES matches the lens files in agents/ in both directions (review round 2 L2)', async () => {
+  const { pathToFileURL } = require('node:url')
+  const { ROSTER_LENSES } = await import(pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'ledger-append.mjs')).href)
+  const expected = new Set(
+    fs.readdirSync(path.join(ROOT, 'agents'))
+      .filter((f) => f.endsWith('.md') && f !== 'implementer.md')
+      .map((f) => f.slice(0, -'.md'.length)),
+  )
+  const missing = [...expected].filter((n) => !ROSTER_LENSES.has(n))
+  const extra = [...ROSTER_LENSES].filter((n) => !expected.has(n))
+  assert.deepEqual(missing, [], `agents/ has lens file(s) missing from ROSTER_LENSES in ledger-append.mjs: ${missing.join(', ')}`)
+  assert.deepEqual(extra, [], `ROSTER_LENSES in ledger-append.mjs names lens(es) with no file in agents/: ${extra.join(', ')}`)
+})
