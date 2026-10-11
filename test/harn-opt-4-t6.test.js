@@ -156,7 +156,11 @@ test('T6 git lane: runs once per scope.resolved entry, each prompt naming only t
   for (const [i, root] of ROOTS.entries()) {
     const others = ROOTS.filter((r) => r !== root)
     const p = gitCalls[i].prompt
-    assert.ok(new RegExp(`cd[^\\n]{0,20}${root.replace(/[/.]/g, '\\$&')}`).test(p), `prompt ${i} uses ${root} as a literal cd target`)
+    // Full regex escape (CodeQL js/incomplete-sanitization on the first draft,
+    // which escaped only dots and slashes): a root is a filesystem path and
+    // may carry any metacharacter, backslash included.
+    const literal = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    assert.ok(new RegExp(`cd[^\\n]{0,20}${literal}`).test(p), `prompt ${i} uses ${root} as a literal cd target`)
     for (const o of others) assert.ok(!p.includes(o), `prompt ${i} must not name another roster root`)
     assert.ok(!/CURRENT repo/.test(p), 'no CURRENT repo instruction')
   }
