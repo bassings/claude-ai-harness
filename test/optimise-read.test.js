@@ -538,18 +538,29 @@ test('optimise-read: aggregateCi reports neverFailed:null (not true) when the wi
   assert.equal(job.neverFailed, null, 'a truncated window must never back a never-failed claim, regardless of sample size')
 })
 
-test('optimise-read: aggregateCi flags a job whose first observed run starts AFTER the window\'s true earliest run as renameSuspect, and does not emit a never-failed claim for it -- PROBE3 from the review, reproduced as a fixture', () => {
+// HARN-OPT-4 T7 (AC-QA-25): PROBE3 is rewritten in place, not deleted. It used
+// to compare each job's first run against the earliest run in the WHOLE window,
+// so any workflow that simply started later than another (release.yml below,
+// first run 1 Feb) had every one of its jobs flagged renameSuspect and lost its
+// never-failed claim. The comparison is now per workflow: a job is suspect only
+// when it is missing from its OWN workflow's earliest run in the window.
+test('optimise-read: aggregateCi flags a job whose first observed run starts AFTER its own workflow\'s earliest run as renameSuspect, and does not flag a workflow that merely started later than another -- PROBE3, per-workflow (AC-QA-25)', () => {
   const runs = []
   // "unit" ran across the whole window (the true earliest history).
   for (let i = 0; i < 8; i++) runs.push({ workflow: 'ci.yml', job: 'unit', conclusion: 'success', started_at: `2026-01-0${i + 1}T00:00:00Z`, duration_s: 10 })
-  // "unit-tests" is the renamed job: its own history starts well AFTER "unit"'s earliest run.
+  // "unit-tests" is the renamed job: its own history starts well AFTER "unit"'s earliest run, in the SAME workflow.
   for (let i = 0; i < 8; i++) runs.push({ workflow: 'ci.yml', job: 'unit-tests', conclusion: 'success', started_at: `2026-02-0${i + 1}T00:00:00Z`, duration_s: 10 })
+  // A second workflow that first ran in February with its only job present in every run: not a rename.
+  for (let i = 0; i < 8; i++) runs.push({ workflow: 'release.yml', job: 'publish', conclusion: 'success', started_at: `2026-02-0${i + 1}T00:00:00Z`, duration_s: 10 })
   const result = mod.aggregateCi(runs, { minRunsNeverFailed: 5, requestedLimit: 100 })
   const renamed = result.byJob.get('ci.yml::unit-tests')
   const original = result.byJob.get('ci.yml::unit')
+  const publish = result.byJob.get('release.yml::publish')
   assert.equal(renamed.renameSuspect, true)
   assert.equal(renamed.neverFailed, null, 'a rename-suspect job must not carry a never-failed claim, even with a clean run history under its own name')
-  assert.equal(original.renameSuspect, false, 'the job whose history reaches back to the window\'s true earliest run is not itself a rename suspect')
+  assert.equal(original.renameSuspect, false, 'the job whose history reaches back to its workflow\'s earliest run is not itself a rename suspect')
+  assert.equal(publish.renameSuspect, false, 'a workflow that started later than another is not a rename suspect (window-wide comparison removed)')
+  assert.equal(publish.neverFailed, true)
 })
 
 test('optimise-read: aggregateCi does NOT flag renameSuspect for the only job in the dataset (nothing to compare its start against)', () => {
