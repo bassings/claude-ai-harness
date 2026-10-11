@@ -965,7 +965,12 @@ test('T6 round 2 F3: rejected true wins over a stale integer count, and a null c
   assert.match(b1, /Not measured: rejected upstream/)
   assert.doesNotMatch(b1, /\b7 of 350\b/)
   const nulled = goodPair()
-  nulled[BETA] = { repos: [rejectedEntry(1, 'beta-repo', 'unused', { rejected: undefined, reason: undefined })] }
+  // An ordinary (accepted) entry OMITS the rejection keys; a key present with
+  // an undefined value is not JSON and would need a non-standard schema type.
+  const accepted = rejectedEntry(1, 'beta-repo', 'unused')
+  delete accepted.rejected
+  delete accepted.reason
+  nulled[BETA] = { repos: [accepted] }
   const r2 = await run({ 'lane:git': gitResponder(nulled) })
   const b2 = blockFor(escapedSection(r2.result.report), ['alpha-repo', 'beta-repo'], 1)
   assert.match(b2, /Not measured: .+/, `a non-integer count is a failed lane, not zero:\n${b2}`)

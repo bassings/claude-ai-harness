@@ -344,11 +344,10 @@ const GIT_LANE_ENTRY_SCHEMA = {
     // schema could not represent it before, so a lane had to invent figures.
     count: { type: ['integer', 'null'] },
     n_commits_examined: { type: ['integer', 'null'] },
-    // 'undefined' in the unions below is the in-repo validator's name for an
-    // omitted-but-present key (the T6 fixtures build entries that way); it keeps
-    // `rejected`/`reason` optional while a non-boolean or non-string still fails.
-    rejected: { type: ['boolean', 'null', 'undefined'] },
-    reason: { type: ['string', 'null', 'undefined'], maxLength: 300 },
+    // Optional: a lane that relays a reader-side rejection sets these; an
+    // ordinary entry omits them (never undefined-valued, which is not JSON).
+    rejected: { type: ['boolean', 'null'] },
+    reason: { type: ['string', 'null'], maxLength: 300 },
     method: { type: 'string' },
     window_note: { type: 'string' },
     scoped_count: { type: ['integer', 'null'] },
