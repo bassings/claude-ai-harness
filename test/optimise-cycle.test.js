@@ -1594,6 +1594,71 @@ test('optimise-cycle: a removal-shaped proposal citing a CI job with a solid (no
   assert.equal(result.proposals_ranked.length, 1)
 })
 
+// ---- HARN-OPT-4 T7 round 1 M1/M2 (AC-OPS-10, AC-OPS-11, AC-QA-21): the brake keys on "no solid never-failed claim", across every repo's row ----
+
+const t7LintRow = (o = {}) => ({ repo: 'a', workflow: 'ci.yml', job: 'lint', n: 20, failureCount: 0, failedRunIds: [], meanDurationS: 1, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: true, reRun: false, partialFetch: false, ...o })
+const t7LintRemoval = () => ({ proposals: [proposal({ target: { category: 'ci_remove', workflow: 'ci.yml', job: 'lint' }, statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 20 })] })
+const t7Rows = (...rows) => ciFixture({ byJob: Object.fromEntries(rows.map((r) => [`${r.repo}::${r.workflow}::${r.job}`, r])) })
+const T7_WEAK = {
+  insufficientData: { insufficientData: true, neverFailed: null },
+  truncated: { truncated: true, neverFailed: null },
+  renameSuspect: { renameSuspect: true, neverFailed: null },
+  reRun: { reRun: true, neverFailed: null },
+  partialFetch: { partialFetch: true, neverFailed: null },
+}
+
+for (const flag of ['reRun', 'partialFetch']) {
+  test(`optimise-cycle: a lint removal whose only row is ${flag} (neverFailed null) is dropped as weak CI evidence (AC-OPS-10, AC-OPS-11, round 1 M1)`, async () => {
+    const responses = baseResponses({ 'lane:ci': t7Rows(t7LintRow(T7_WEAK[flag])), 'synthesis:proposals': t7LintRemoval() })
+    const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+    assert.equal(result.proposals_ranked.length, 0, `${flag} must brake the removal`)
+    assert.match(result.report, /insufficient-data\/truncated\/rename-suspect/i)
+  })
+}
+
+test('optimise-cycle: a lint removal is dropped if ANY repo\'s row for the job is weak, whichever flag, and survives when every repo\'s row is solid (AC-QA-21, round 1 M2)', async () => {
+  for (const flag of Object.keys(T7_WEAK)) {
+    for (const order of [['solid', 'weak'], ['weak', 'solid']]) {
+      const rows = order.map((kind, i) => t7LintRow({ repo: i === 0 ? 'a' : 'b', ...(kind === 'weak' ? T7_WEAK[flag] : {}) }))
+      const responses = baseResponses({ 'lane:ci': t7Rows(...rows), 'synthesis:proposals': t7LintRemoval() })
+      const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+      assert.equal(result.proposals_ranked.length, 0, `${flag} (${order.join('/')}): one weak row in either repo brakes the removal`)
+    }
+  }
+  const solid = baseResponses({ 'lane:ci': t7Rows(t7LintRow({ repo: 'a' }), t7LintRow({ repo: 'b' })), 'synthesis:proposals': t7LintRemoval() })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: solid })
+  assert.equal(result.proposals_ranked.length, 1, 'two solid rows pass')
+})
+
+// ---- HARN-OPT-4 T7 (AC-SEC-13): per-job rows make the scheduled gitleaks job visible with its own failures; the security-removal gate must not depend on the weak-CI flags ----
+
+const t7GitleaksRow = (o = {}) => ({ repo: 'demo', workflow: 'Security', job: 'gitleaks', n: 20, failureCount: 1, failedRunIds: ['309'], meanDurationS: 7, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: false, reRun: false, partialFetch: false, ...o })
+const t7CiWith = (row) => ciFixture({ byJob: { [`demo::${row.workflow}::${row.job}`]: row } })
+
+test('optimise-cycle: a gitleaks removal whose aggregate is neither insufficientData, truncated nor renameSuspect is still flagged security_removal_flagged (AC-SEC-13)', async () => {
+  const responses = baseResponses({
+    'lane:ci': t7CiWith(t7GitleaksRow()),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'Security', job: 'gitleaks' }, statement: 'Remove the scheduled gitleaks job', citations: ['1001'], reinstatement_evidence: 'reinstate if any secret ever leaks', n: 20 })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+  assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
+})
+
+// Round 3 L2: this case is dropped by the reinstatement-evidence filter, not
+// by the security keyword gate (removing `gitleaks` from the keyword regex
+// leaves it green), so the assertion names that reason rather than claiming
+// the gate. The gate itself is pinned by the test above.
+test('optimise-cycle: the same gitleaks removal with no reinstatement_evidence is dropped by the reinstatement-evidence filter even with a clean aggregate (AC-SEC-13, round 3 L2)', async () => {
+  const responses = baseResponses({
+    'lane:ci': t7CiWith(t7GitleaksRow()),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'Security', job: 'gitleaks' }, statement: 'Remove the scheduled gitleaks job', citations: ['1001'], reinstatement_evidence: null, n: 20 })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+  assert.match(result.report, /Dropped \(removal without reinstatement evidence\): 1\b/, 'dropped for the stated reason, not by some other filter')
+})
+
 // ---- Review round-1 M7 (AC-DATA-10): a prior rejection is annotated (not silently re-raised); reverted-twice is flagged ----
 
 test('optimise-cycle: a proposal whose target matches a prior proposal_rejected event is annotated with the rejection date, not silently re-raised (M7)', async () => {

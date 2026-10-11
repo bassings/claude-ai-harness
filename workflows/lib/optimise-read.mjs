@@ -1300,27 +1300,55 @@ export function aggregateTriggerAccuracy(records) {
   return { byLens }
 }
 
+// HARN-OPT-4 T7 (AC-SEC-12, AC-QA-24): strips a per-instance suffix so
+// `Deploy on PR #301` and `Deploy on PR #302` are one job. One regex literal,
+// anchored at the end, no quantified group, digits capped: it cannot backtrack
+// badly on a hostile 10,000-character name. A `#` anywhere else, and matrix
+// legs such as `test (18.x)`, are left alone. A name that would be empty
+// after stripping is returned unchanged, never merged into an empty key.
+export function normaliseJobName(name) {
+  const stripped = name.replace(/(?: on PR| - Update) #\d{1,10}$/, '')
+  return stripped.trim() === '' ? name : stripped
+}
+
+// HARN-OPT-4 T7 (AC-SEC-11): a run id is interpolated into
+// `gh run view <id>` by the lane, so only an integer or an all-digit string
+// is ever accepted; anything else is ignored and never echoed.
+const RUN_ID_RE = /^[0-9]+$/
+const validRunId = (id) => (typeof id === 'number' ? Number.isSafeInteger(id) && id >= 0 : typeof id === 'string' && RUN_ID_RE.test(id))
+const FETCH_MODES = ['rate_limited', 'unauthenticated', 'other']
+
 // CI waste (spec item 3): expects an array of {workflow, job, conclusion,
 // started_at, duration_s} already extracted by the agent step from `gh`
 // output (this script never calls gh itself -- agents do I/O, per the
 // runtime facts). Tolerant of missing fields on an individual run (skips
 // that run from the aggregate rather than throwing).
 //
+// HARN-OPT-4 T7: each entry may also carry `repo`, `run_id` and `rerun`
+// (AC-DATA-13: rows are keyed by repo as well, so two repos never pool), and
+// `partialWorkflows` names the `repo::workflow` pairs with a failed per-run
+// fetch (AC-OPS-11). A re-run (AC-OPS-10) or a partial fetch nulls
+// neverFailed: the unseen or superseded attempt may be the failing one.
+//
 // Review round-1 M6 (AC-DATA-8): a "never failed" claim is gated on THREE
 // conditions, not just the sample-size floor -- insufficientData (too few
 // runs), truncated (the window boundary was hit, so history older than
 // what was fetched is invisible: a failure at run 101 of a 100-run fetch
 // cannot be seen), and renameSuspect (this job's own first observed run
-// starts strictly after the dataset's true earliest run, suggesting either
-// a genuinely new job or one renamed from something with its own,
-// unexamined failure history -- either way, "never failed" oversells what
-// is actually known). Any one of the three nulls the claim.
-export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAILED, requestedLimit = null } = {}) {
+// starts strictly after its WORKFLOW's earliest run in the window (AC-QA-25:
+// per workflow, so a workflow that merely started later than another is not
+// suspect), suggesting either a genuinely new job or one renamed from
+// something with its own, unexamined failure history -- either way, "never
+// failed" oversells what is actually known). Any one of the three nulls the
+// claim.
+const CI_FAILURE_CONCLUSIONS = new Set(['failure', 'timed_out', 'startup_failure'])
+const CI_NON_FAILURE_UNSETTLED = new Set(['skipped', 'cancelled', 'neutral'])
+export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAILED, requestedLimit = null, partialWorkflows = new Set() } = {}) {
   const byJob = new Map()
   for (const run of runs || []) {
     if (!run || !run.workflow || !run.job) continue
-    const key = `${run.workflow}::${run.job}`
-    if (!byJob.has(key)) byJob.set(key, { workflow: run.workflow, job: run.job, runs: [] })
+    const key = run.repo ? `${run.repo}::${run.workflow}::${run.job}` : `${run.workflow}::${run.job}`
+    if (!byJob.has(key)) byJob.set(key, { repo: run.repo, workflow: run.workflow, job: run.job, runs: [] })
     byJob.get(key).runs.push(run)
   }
   const out = new Map()
@@ -1329,32 +1357,49 @@ export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAIL
     const n = jobRuns.length
     const insufficientData = n < minRunsNeverFailed
     const truncated = requestedLimit !== null && n >= requestedLimit
-    const rawNeverFailed = insufficientData ? null : jobRuns.every((r) => r.conclusion === 'success')
+    const reRun = jobRuns.some((r) => r.rerun === true)
+    const partialFetch = partialWorkflows.has(`${group.repo}::${group.workflow}`)
+    const rawNeverFailed = insufficientData || reRun || partialFetch ? null : jobRuns.every((r) => r.conclusion === 'success')
+    // Round 1 L1 (AC-OPS-9): only a real failure conclusion counts as a
+    // failure. skipped, cancelled and neutral are reported separately
+    // (`skipped`) and still withhold the never-failed claim (rawNeverFailed
+    // above requires every run to be a success).
+    const failed = jobRuns.filter((r) => CI_FAILURE_CONCLUSIONS.has(r.conclusion))
+    const skipped = jobRuns.filter((r) => CI_NON_FAILURE_UNSETTLED.has(r.conclusion)).length
     const durations = jobRuns.map((r) => r.duration_s).filter((d) => typeof d === 'number' && Number.isFinite(d))
     const meanDurationS = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null
-    out.set(key, {
+    const entry = {
       workflow: group.workflow,
       job: group.job,
       n,
+      failureCount: failed.length,
+      skipped,
+      failedRunIds: failed.filter((r) => r.run_id !== undefined).map((r) => String(r.run_id)),
       windowStart: jobRuns.length ? jobRuns[0].started_at : null,
       windowEnd: jobRuns.length ? jobRuns[jobRuns.length - 1].started_at : null,
       truncated,
       insufficientData,
       renameSuspect: false, // filled in below, once every job's windowStart is known
+      reRun,
+      partialFetch,
       neverFailed: truncated ? null : rawNeverFailed,
       meanDurationS,
-    })
+    }
+    if (group.repo) entry.repo = group.repo
+    out.set(key, entry)
   }
-  // renameSuspect needs every job's windowStart computed first, to find the
-  // dataset's true earliest run to compare each job's own start against.
-  let overallEarliestMs = null
+  // renameSuspect needs every job's windowStart computed first, to find each
+  // workflow's earliest run to compare its jobs' own starts against.
+  const earliestByWorkflow = new Map()
   for (const entry of out.values()) {
     const ms = tsMs(entry.windowStart)
-    if (ms !== null && (overallEarliestMs === null || ms < overallEarliestMs)) overallEarliestMs = ms
+    const wk = `${entry.repo}::${entry.workflow}`
+    if (ms !== null && (!earliestByWorkflow.has(wk) || ms < earliestByWorkflow.get(wk))) earliestByWorkflow.set(wk, ms)
   }
   for (const entry of out.values()) {
     const ms = tsMs(entry.windowStart)
-    entry.renameSuspect = overallEarliestMs !== null && ms !== null && ms > overallEarliestMs
+    const earliest = earliestByWorkflow.get(`${entry.repo}::${entry.workflow}`)
+    entry.renameSuspect = earliest !== undefined && ms !== null && ms > earliest
     if (entry.renameSuspect) entry.neverFailed = null
   }
   return { byJob: out }
@@ -1949,17 +1994,67 @@ function runCiCommand(payload) {
   const runs = Array.isArray(payload && payload.runs) ? payload.runs : []
   const requestedLimit = payload && typeof payload.requestedLimit === 'number' ? payload.requestedLimit : null
   const minRunsNeverFailed = payload && typeof payload.minRunsNeverFailed === 'number' ? payload.minRunsNeverFailed : MIN_RUNS_FOR_NEVER_FAILED
-  const { byJob } = aggregateCi(runs, { minRunsNeverFailed, requestedLimit })
+  // HARN-OPT-4 T7: the payload is one entry per RUN with its jobs nested
+  // (AC-OPS-12). Flatten to one row per job here, copying only the fields the
+  // aggregate needs, so an actor, title, branch or commit field fed in (or a
+  // step name) cannot come back out (AC-SEC-14).
+  const flat = []
+  // Round 1 L3 (AC-OPS-11): keyed by an agent-supplied repo string, so a
+  // null-prototype object; `__proto__`, `constructor` and `toString` are then
+  // ordinary keys and nothing reaches Object.prototype.
+  const repoStats = Object.create(null)
+  const partialWorkflows = new Set()
   const seen = new Set()
-  const ciCitationPool = []
-  for (let i = runs.length - 1; i >= 0 && ciCitationPool.length < CITATION_POOL_SIZE; i--) {
-    const id = runs[i] && runs[i].id
-    if ((typeof id === 'string' || typeof id === 'number') && !seen.has(id)) {
-      seen.add(id)
-      ciCitationPool.push(String(id))
+  // Round 2 M1 (AC-QA-23): the pool is built by failure and recency, not array
+  // position (gh lists newest first and the lane sends several repos).
+  const poolRuns = []
+  for (const run of runs) {
+    if (!run || typeof run.repo !== 'string' || typeof run.workflow !== 'string' || !run.repo || !run.workflow) continue
+    if (!validRunId(run.id)) continue
+    const stats = repoStats[run.repo] || (repoStats[run.repo] = { notCompleted: 0, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } })
+    const id = String(run.id)
+    // Round 3 L1 (AC-QA-23): a run the lane emits twice (a retry after a rate
+    // limit, overlapping pages, a re-listing) counts once everywhere, not only
+    // in the pool; otherwise three real runs could clear the minimum-runs floor
+    // and read as never failed, and the removal brake trusts that floor.
+    if (seen.has(id)) continue
+    seen.add(id)
+    poolRuns.push({ id, repo: run.repo, completed: run.status === 'completed', t: typeof run.started_at === 'string' ? Date.parse(run.started_at) : NaN })
+    // AC-OPS-10: an in-flight run has unsettled conclusions.
+    if (run.status !== 'completed') {
+      stats.notCompleted += 1
+      continue
+    }
+    // AC-OPS-11: a failed per-run fetch is counted by mode; an unknown mode is "other".
+    if (run.fetch_error) {
+      stats.fetchFailures[FETCH_MODES.includes(run.fetch_error) ? run.fetch_error : 'other'] += 1
+      partialWorkflows.add(`${run.repo}::${run.workflow}`)
+      continue
+    }
+    // Round 1 L4 (AC-OPS-10): a digit-string attempt is read the way
+    // validRunId reads ids, and any other present-but-unreadable attempt
+    // fails closed as a re-run. Only an absent attempt, or a first one, is not.
+    const attemptN = typeof run.attempt === 'number' ? run.attempt : typeof run.attempt === 'string' && /^[0-9]+$/.test(run.attempt) ? Number(run.attempt) : null
+    const rerun = run.attempt === undefined ? false : attemptN === null ? true : attemptN > 1
+    for (const job of Array.isArray(run.jobs) ? run.jobs : []) {
+      if (!job || typeof job.name !== 'string' || !job.name) continue
+      flat.push({ repo: run.repo, workflow: run.workflow, job: normaliseJobName(job.name), run_id: id, rerun, conclusion: job.conclusion, started_at: run.started_at, duration_s: job.duration_s })
     }
   }
-  return { byJob: mapToObject(byJob), citationPool: ciCitationPool }
+  const { byJob } = aggregateCi(flat, { minRunsNeverFailed, requestedLimit, partialWorkflows })
+  // Every failed run id first (all repos), then each repo's most recent
+  // completed runs by started_at descending (id tie-break), deduplicated.
+  const pool = []
+  const inPool = new Set()
+  const add = (id) => { if (/^[0-9]+$/.test(id) && !inPool.has(id) && pool.length < CITATION_POOL_SIZE) { inPool.add(id); pool.push(id) } }
+  for (const row of Object.values(mapToObject(byJob))) for (const id of Array.isArray(row.failedRunIds) ? row.failedRunIds : []) add(String(id))
+  const byRepo = new Map()
+  for (const r of poolRuns) if (r.completed) (byRepo.get(r.repo) || byRepo.set(r.repo, []).get(r.repo)).push(r)
+  const newest = (a, b) => (Number.isNaN(b.t) ? -Infinity : b.t) - (Number.isNaN(a.t) ? -Infinity : a.t) || (BigInt(b.id) > BigInt(a.id) ? 1 : BigInt(b.id) < BigInt(a.id) ? -1 : 0)
+  const lists = [...byRepo.values()].map((l) => l.sort(newest))
+  // Round-robin across repos so no repo's recent runs crowd out another's.
+  for (let i = 0; pool.length < CITATION_POOL_SIZE && lists.some((l) => i < l.length); i++) for (const l of lists) if (i < l.length) add(l[i].id)
+  return { byJob: mapToObject(byJob), citationPool: pool, repoStats }
 }
 
 export function main() {
