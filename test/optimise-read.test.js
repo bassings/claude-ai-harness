@@ -595,6 +595,76 @@ test('optimise-read CLI: the ledger command\'s output includes proposalOutcomes,
   assert.equal(out.proposalOutcomes['abc123'].rejectedCount, 1)
 })
 
+// Round 2 F2 (AC-PROD-8): the optimiser writes a per-run sidecar of proposal
+// targets beside its report; the ledger command reads it (when present) and
+// attaches `target` to each outcome's entry. It is a per-run output, not a
+// cache. A missing, unreadable or malformed sidecar gives the id-only form
+// with a reason, never a throw.
+const SIDECAR_REL = '.claude/optimise-proposal-targets.json'
+const sidecarTarget = (overrides = {}) => ({ kind: 'trigger_tune', component: 'lens-operability', concern: 'trigger glob', lens: 'lens-operability', workflow: '', job: '', touches_always_on_lens: false, security_purposed: false, ...overrides })
+function ledgerWithSidecar(sidecar, ids = ['abc123']) {
+  const repo = makeTempRepo()
+  for (const id of ids) assert.equal(runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event: 'proposal_adopted', event_scope: `${id}:proposal_adopted` }).status, 0)
+  if (sidecar !== undefined) {
+    fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+    if (sidecar === 'DIRECTORY') fs.mkdirSync(path.join(repo, SIDECAR_REL))
+    else fs.writeFileSync(path.join(repo, SIDECAR_REL), typeof sidecar === 'string' ? sidecar : JSON.stringify(sidecar))
+  }
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  return { out: JSON.parse(res.stdout.trim()), raw: res.stdout, repo }
+}
+
+test('optimise-read CLI: the ledger command attaches a valid sidecar target to the outcome of every id that has an outcome event, and only those (AC-PROD-8, round 2 F2)', () => {
+  const t = sidecarTarget()
+  const { out } = ledgerWithSidecar({ abc123: t, neverdecided99: sidecarTarget({ component: 'other' }) })
+  assert.deepEqual(out.proposalOutcomes.abc123.target, t)
+  assert.equal(out.proposalOutcomes.abc123.targetUnavailableReason, undefined, 'no reason when the target is known')
+  assert.deepEqual(Object.keys(out.proposalOutcomes), ['abc123'], 'a sidecar id with no outcome event creates no outcome')
+})
+
+for (const [name, sidecar] of [
+  ['missing', undefined],
+  ['malformed JSON', '{not json'],
+  ['not an object', '[1,2,3]'],
+  ['unreadable (a directory)', 'DIRECTORY'],
+]) {
+  test(`optimise-read CLI: a ${name} sidecar gives the id-only form with a reason and never throws (AC-PROD-8, round 2 F2)`, () => {
+    const { out, raw, repo } = ledgerWithSidecar(sidecar)
+    const o = out.proposalOutcomes.abc123
+    assert.equal(o.adoptedCount, 1, 'the outcome itself is still reported')
+    assert.ok(o.target == null, 'no target')
+    assert.equal(typeof o.targetUnavailableReason, 'string'); assert.ok(o.targetUnavailableReason.length > 0 && o.targetUnavailableReason.length <= 200)
+    assert.ok(!raw.includes(repo), 'the reason echoes no path')
+  })
+}
+
+test('optimise-read CLI: a sidecar entry whose shape is not the fixed key set is refused on its own with a reason, and a valid neighbour is kept (AC-PROD-8, round 2 F2)', () => {
+  const good = sidecarTarget()
+  const { security_purposed: _drop, ...missing } = sidecarTarget({ component: 'missing-key' })
+  const cases = {
+    ok1: good,
+    extra1: { ...sidecarTarget(), note: 'smuggled' },
+    miss1: missing,
+    bool1: { ...sidecarTarget(), security_purposed: 'yes' },
+    str1: { ...sidecarTarget(), kind: 7 },
+    long1: { ...sidecarTarget(), component: 'x'.repeat(5000) },
+  }
+  const { out } = ledgerWithSidecar(cases, Object.keys(cases))
+  assert.deepEqual(out.proposalOutcomes.ok1.target, good)
+  for (const id of ['extra1', 'miss1', 'bool1', 'str1', 'long1']) {
+    assert.ok(out.proposalOutcomes[id].target == null, `${id} must not carry a target`)
+    assert.ok(out.proposalOutcomes[id].targetUnavailableReason, `${id} must say why`)
+  }
+})
+
+test('optimise-read CLI: a hostile sidecar cannot reach the reader as anything but data: a target value is flattened and bounded, and the reader spawns nothing (AC-SEC-10, round 2 F2)', () => {
+  const evil = sidecarTarget({ component: 'a\n## Injected\nb' })
+  const { out } = ledgerWithSidecar({ abc123: evil })
+  const t = out.proposalOutcomes.abc123.target
+  assert.ok(t == null || (!/\n/.test(t.component) && t.component.length <= 200), 'either refused or flattened, never passed through raw')
+})
+
 // Review round-2 M-3: aggregateRework's invalidAcIdsDropped total was
 // computed (previous test file section) but the CLI's `ledger` command
 // explicitly whitelists which rework fields reach its JSON output --
@@ -1020,7 +1090,10 @@ test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal 
 // agent's own text handling can never misattribute a changed path.
 test('optimise-read CLI: `node optimise-read.mjs escaped-defects` parses raw git log output (git_log_raw) and returns both the raw fix: count and a scoped count (AC-1, AC-2)', () => {
   const gitLogRaw = '\x1eparent1\x1ffix: repair a heal\nsrc/heal.js\ntest/heal.test.js\n' + '\x1eparent2\x1ffeat: add a thing\nsrc/thing.js\n'
-  const payload = { git_log_raw: gitLogRaw, root: '/nonexistent-root-no-override-xyz' }
+  // Round 2 F3: the toplevel check fails closed, so the root must be a real
+  // directory and the toplevel must name it (a root with no override file).
+  const noOverrideRoot = fs.realpathSync(fs.mkdtempSync(path.join(SUITE_TMPDIR, 'no-override-')))
+  const payload = { git_log_raw: gitLogRaw, root: noOverrideRoot, toplevel: noOverrideRoot }
   const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify(payload), encoding: 'utf8' })
   assert.equal(res.status, 0, res.stderr)
   const out = JSON.parse(res.stdout.trim())
@@ -1033,7 +1106,8 @@ test('optimise-read CLI: `node optimise-read.mjs escaped-defects` parses raw git
 })
 
 test('optimise-read CLI: `escaped-defects` with an empty/missing git_log_raw reports zero commits, never throwing', () => {
-  const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify({}), encoding: 'utf8' })
+  const cwdDir = fs.realpathSync(fs.mkdtempSync(path.join(SUITE_TMPDIR, 'empty-log-')))
+  const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify({ toplevel: cwdDir }), encoding: 'utf8', cwd: cwdDir })
   assert.equal(res.status, 0, res.stderr)
   const out = JSON.parse(res.stdout.trim())
   assert.equal(out.count, 0)
@@ -1042,7 +1116,7 @@ test('optimise-read CLI: `escaped-defects` with an empty/missing git_log_raw rep
 })
 
 test('optimise-read CLI: `escaped-defects` with no root falls back to process.cwd() (does not crash, uses defaults when cwd has no override)', () => {
-  const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify({ git_log_raw: '\x1ep\x1ffix: x\na.js\n' }), encoding: 'utf8', cwd: os.tmpdir() })
+  const res = spawnSync('node', [MODULE_PATH, 'escaped-defects'], { input: JSON.stringify({ git_log_raw: '\x1ep\x1ffix: x\na.js\n', toplevel: fs.realpathSync(os.tmpdir()) }), encoding: 'utf8', cwd: os.tmpdir() })
   assert.equal(res.status, 0, res.stderr)
   const out = JSON.parse(res.stdout.trim())
   assert.equal(out.count, 1)

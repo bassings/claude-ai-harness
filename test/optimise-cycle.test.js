@@ -72,14 +72,38 @@ function ledgerFixture(overrides = {}) {
 function ciFixture(overrides = {}) {
   return { byJob: { 'ci.yml::test': { workflow: 'ci.yml', job: 'test', n: 5, windowStart: '2026-08-01T00:00:00Z', windowEnd: '2026-08-05T00:00:00Z', truncated: false, insufficientData: false, neverFailed: true, meanDurationS: 100 } }, citationPool: ['1001', '1002'], failures: [], ...overrides }
 }
+// HARN-OPT-4 T6 (AC-DATA-11): the git lane returns { repos: [...] }, one entry
+// per roster repo, each carrying the root_index the script asked about and the
+// ledger repo identity ('demo', matching ledgerFixture's perRepo[0].root).
 function gitFixture(overrides = {}) {
+  return { repos: [{ root_index: 0, repo: 'demo', ...gitFigures(overrides) }] }
+}
+function gitFigures(overrides = {}) {
   return {
     count: 3, n_commits_examined: 500, method: 'heuristic proxy: conventional-commit fix: prefix count, not a verified causal attribution', window_note: 'most recent 500 commits',
     scoped_count: 2, scoped_excluded_count: 1, scoped_unavailable_count: 0, scoped_config_source: 'default', scoped_exclude_globs: ['.github/**'], scoped_method: 'scoped heuristic: counts only fix: commits touching product source',
     ...overrides,
   }
 }
+// HARN-OPT-4 T6 (AC-QA-20): a proposal target is the FIXED key set. The legacy
+// free-shape fixtures below ({category, lens, job, workflow, security_purposed,
+// touches_always_on_lens, segment}) are mapped onto it here, so each existing
+// test keeps its original input meaning and assertion: category -> kind, the
+// two gate booleans and lens/workflow/job carried as given, everything else
+// empty. `segment` is not a key of the fixed set; the script now reads the
+// segment from the proposal's own text, so a legacy segment tag is appended to
+// the statement by name.
+function fixedTargetFrom(t) {
+  return { kind: t.category || '', component: '', concern: '', lens: t.lens || '', workflow: t.workflow || '', job: t.job || '', touches_always_on_lens: t.touches_always_on_lens === true, security_purposed: t.security_purposed === true }
+}
 function proposal(overrides = {}) {
+  const p = proposalLegacy(overrides)
+  const legacy = p.target
+  const out = { ...p, target: fixedTargetFrom(legacy) }
+  if (legacy.segment) out.statement = `${p.statement} (${legacy.segment})`
+  return out
+}
+function proposalLegacy(overrides = {}) {
   return { target: { category: 'trigger_tune', lens: 'lens-operability' }, statement: 'Narrow the lens-operability trigger glob', motivating_measurement: '3 of 5 runs were CLEAN with zero trigger matches (run-1..run-3)', confirming_measurement: 'trigger accuracy improves next cycle', n: 6, citations: ['run-1'], reinstatement_evidence: null, ...overrides }
 }
 
@@ -1180,7 +1204,7 @@ test('optimise-cycle: a proposal with n below the minimum is excluded from the r
 
 // ---- Review round-1 M4 (AC-OPS-3): a proposal motivated by an unmeasured wall-clock segment is dropped ----
 
-test('optimise-cycle: a proposal whose target.segment is agent_compute is dropped when that segment has >=1 unmeasured run in the window, naming the field and count in the report (M4)', async () => {
+test('optimise-cycle: a proposal whose statement names the literal token agent_compute (the legacy target.segment tag is appended to the statement by the fixture, so this proves the text path, not a typed tag) is dropped when that segment has >=1 unmeasured run in the window, naming the field and count in the report (M4)', async () => {
   const responses = baseResponses({
     'lane:ledger': ledgerFixture({
       wallClock: {
@@ -1206,6 +1230,36 @@ test('optimise-cycle: a proposal whose target.segment is agent_compute is droppe
   // the Filtering line.
   assert.match(result.report, /agent_compute \(4 unmeasured runs\)/, 'the Filtering line must name the segment AND its exact unmeasured-run count in its own distinct phrasing')
 })
+
+// Round 2 F4 (AC-OPS-3, spec bug): the text path matched only the literal
+// token, so a statement written in plain words ("Agent compute is a small share
+// of wall-clock") walked straight past the unmeasured-segment brake. Each
+// spelling below must be gated, and each has a control (the same words with
+// the segment fully measured) so a drop is for the measurement, not the words.
+function wallClockWith(segment, measured, unmeasured) {
+  const totals = { ciWaitSeconds: 0, ciWaitMeasuredRuns: 3, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 3, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 0, agentComputeMeasuredRuns: 3, agentComputeUnmeasuredRuns: 0, unterminatedWaits: 0 }
+  const camel = { ci_wait: 'ciWait', human_wait: 'humanWait', agent_compute: 'agentCompute' }[segment]
+  totals[`${camel}MeasuredRuns`] = measured
+  totals[`${camel}UnmeasuredRuns`] = unmeasured
+  return { byPlan: {}, totals, source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' } }
+}
+for (const [segment, statement] of [
+  ['agent_compute', 'Agent compute is a small share of wall-clock; add concurrency'],
+  ['agent_compute', 'agent-compute dominates; add a lane'],
+  ['ci_wait', 'CI wait dominates the cycle; shard the suite'],
+  ['ci_wait', 'ci-wait is the long pole'],
+  ['human_wait', 'Human wait is the bottleneck; batch the reviews'],
+  ['human_wait', 'Pre-approve plans to shorten human-wait'],
+]) {
+  test(`optimise-cycle: a plain-words statement "${statement}" is gated on ${segment} having unmeasured runs, and is kept when that segment is fully measured (AC-OPS-3, round 2 F4)`, async () => {
+    const drafted = { 'synthesis:proposals': { proposals: [proposal({ statement, citations: ['run-1'] })] } }
+    const gated = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses({ ...drafted, 'lane:ledger': ledgerFixture({ wallClock: wallClockWith(segment, 0, 4) }) }) })
+    assert.equal(gated.result.proposals_ranked.length, 0, 'plain words must not walk past the brake')
+    assert.match(gated.result.report, new RegExp(`${segment} \\(4 unmeasured runs\\)`), 'the Filtering line names the canonical segment and its count')
+    const control = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses({ ...drafted, 'lane:ledger': ledgerFixture({ wallClock: wallClockWith(segment, 4, 0) }) }) })
+    assert.equal(control.result.proposals_ranked.length, 1, 'the same words survive when the segment is measured')
+  })
+}
 
 // Round-2 L2, self-caught vacuous-mutant fix: the assertion above can pass
 // purely from the FILTERING line's drop-reason detail even if the wall-

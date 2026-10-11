@@ -102,8 +102,8 @@ wrote:
    stated minimum `n` is excluded from the ranked list and reported
    separately as insufficient data, never hidden.
 5. **Unmeasured wall-clock segment (AC-OPS-3)**: a proposal motivated by a
-   wall-clock segment (`target.segment`) that has at least one unmeasured
-   run in the window is dropped -- a small-looking total can be small
+   wall-clock segment (named in its statement or motivating measurement)
+   that has at least one unmeasured run in the window is dropped -- a small-looking total can be small
    because it genuinely was, or because most of it could not be measured;
    the gate does not let the latter pass as evidence.
 6. **Weak CI evidence (AC-DATA-8)**: a removal-shaped proposal citing a
@@ -116,6 +116,26 @@ wrote:
    rejection's date rather than re-raised silently; one matching two or
    more `proposal_reverted` events is flagged (§12: a change reverted
    twice for being worse keeps the original).
+
+**The proposal target is a fixed key set.** Every drafted `target` carries
+exactly `kind`, `component`, `concern`, `lens`, `workflow`, `job`,
+`touches_always_on_lens` and `security_purposed`, and no other key. A
+target with a key missing or an extra key is rejected before any gate reads
+it or any id is minted, and the report names the keys under "Proposals
+rejected: malformed target". The `proposal_id` is derived from the six
+string fields only, each case-folded and trimmed, in that fixed order, so
+key order, letter case and stray spacing cannot mint a second id for one
+target. The two booleans are inputs to the security gates, not part of
+identity, and neither is the repo: a rejection recorded in one roster repo
+is found for the same target proposed in another. To map an older
+free-shape target onto the new id (the conductor does this once, when it
+re-records outcome events), pipe `{"legacy_targets": [...]}` into
+`optimise-read.mjs ids`: each comes back with its new id, or null and the
+fields the fixed set cannot hold, plus a `sidecar_entry` in the fixed key
+set. When re-recording, merge each `sidecar_entry` under its new id into
+`.claude/optimise-proposal-targets.json` under the roster's first repo root
+(create it if absent, keep existing entries), so the first cycle after the
+change shows the drafter those prior targets rather than bare ids.
 
 ## The escaped-defect counter-metric
 
@@ -177,9 +197,13 @@ either one for a precise, causally attributed count.
 
 ## Recording a proposal's outcome (AC-DATA-10)
 
-A proposal carries a stable `proposal_id`, derived from its **target**
-(workflow file, job name, lens, trigger glob), never its wording, so the
-same target re-proposed across cycles is recognisable as the same proposal.
+A proposal carries a stable `proposal_id`, derived from its **target**, never
+its wording, so the same target re-proposed across cycles is recognisable as
+the same proposal. The target is a fixed key set: `kind`, `component`,
+`concern`, `lens`, `workflow` and `job` (the six fields the id is derived
+from), plus the two gate flags `touches_always_on_lens` and
+`security_purposed`. A drafted target with a key missing or an extra key is
+rejected and listed in the report, never given an id.
 
 **The optimiser itself never writes this.** When a human (or the conductor,
 merging a change that adopts, rejects, or reverts a proposal) makes that
@@ -210,7 +234,11 @@ that rejection's date in the report rather than re-raised silently, and
 one with two or more `proposal_reverted` events is flagged (§12: a change
 reverted twice for being worse keeps the original). This needs no new
 ledger kind or schema change -- it reads exactly the `conduct_plan_event`
-shape documented above.
+shape documented above. A proposal whose id has a recorded `proposal_adopted`
+is annotated "Already adopted on <date>" and listed under its own heading
+rather than ranked as new, with one exception: a security-purposed removal,
+or a proposal reverted at least twice, stays in the ranked list with the
+adoption annotated, so its flag is never moved out of sight.
 
 ## Install verification (both paths work)
 
@@ -266,10 +294,19 @@ It states, every run, in this order:
 5. **CI section** (source: `gh`), with any `gh` failure named distinctly
    and non-fatally (never silently dropped), and a job named
    insufficient-data/truncated/rename-suspect where applicable.
-6. **Escaped-defect counter-metric** and its heuristic caveat.
-7. **Ranked proposals**, each with citations, confirming measurement, any
-   security-removal flag, and any prior-rejection or reverted-twice
-   annotation (AC-DATA-10).
+6. **Escaped-defect counter-metric** and its heuristic caveat, one block
+   per roster repo (labelled by its ledger label and numbered by roster
+   position, never its path). The git lane runs once per repo, and the script
+   accepts a result only if its roster index and its ledger repo identity both
+   match; any other result is listed as unmatched with the reason, and a repo
+   whose lane failed says "Not measured" rather than borrowing another
+   repo's figure.
+7. **Ranked proposals**, each with citations, confirming measurement, a
+   one-line `Target:` showing its six identity fields, any security-removal
+   flag, and any prior-adoption, prior-rejection or reverted-twice
+   annotation (AC-DATA-10). **Proposals previously adopted** are listed in
+   their own section, and the insufficient-data section below, with the same
+   annotations.
 8. **Proposals excluded for insufficient data**, and a **filtering
    summary** naming how many were dropped and why (uncited, always-on
    security removal, missing reinstatement evidence, unmeasured wall-clock
@@ -277,3 +314,17 @@ It states, every run, in this order:
 
 It is the durable artefact (AC-PROD-5): read it after the run, do not
 rely on the conversation transcript.
+
+The run also writes `.claude/optimise-proposal-targets.json` under the
+roster's first repo root (the reader looks there first; the invoking repo need
+not be on the roster), a map from proposal id to that proposal's fixed-key
+target. The ledger holds only ids, so a later run reads this file (through the
+`ledger` command of `optimise-read.mjs`) to show the drafter the six identity
+fields behind an id that has an outcome, and to reuse them exactly. Every
+prior outcome target the reader supplied is carried forward into the new
+file before this run's proposals are added, so a decided target survives
+cycles in which the drafter does not re-raise it. It is gitignored by the
+same check as the report, refused if that check fails, rewritten on every
+cycle run, otherwise kept indefinitely, and deleted with
+`rm .claude/optimise-proposal-targets.json`. When it is missing or malformed
+the drafter gets the bare id and the reason instead.
