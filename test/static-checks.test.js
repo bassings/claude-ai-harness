@@ -646,6 +646,46 @@ test('static: L5 -- the inlined run-ledger invocation block (readBudgetSpent, le
   assert.equal(plan, tdd, 'plan-cycle.js\'s run-ledger helper block has drifted from tdd-task.js\'s')
 })
 
+// HARN-OPT-4 T8 fix round 1 M1 (AC-QA-28 names L5 as half its proof, and L5's
+// slice ends before this code): the budget start-read and delta pair is
+// necessarily hand-copied into all three workflows, the C1 failure class L5
+// exists to prevent. Pin it byte-for-byte, comment included.
+test('static: T8 round 1 M1 -- the budget start-read and budgetSpentDelta block is byte-identical across all three workflow files', () => {
+  function extractBlock(fileName) {
+    const lines = readAll('workflows', fileName).split('\n')
+    const start = lines.findIndex((l) => l.startsWith('// HARN-OPT-4 T8 (AC-QA-28, AC-DATA-17)'))
+    const read = lines.findIndex((l, i) => i > start && l.includes('const budgetAtStart = readBudgetSpent()'))
+    const fn = lines.findIndex((l, i) => i > read && l.startsWith('function budgetSpentDelta()'))
+    const close = lines.findIndex((l, i) => i > fn && l === '}')
+    assert.ok(start >= 0 && read > start && fn > read && close > fn, `${fileName}: could not locate the T8 budget block markers`)
+    return lines.slice(start, close + 1).join('\n')
+  }
+  const tdd = extractBlock('tdd-task.js')
+  const review = extractBlock('review-cycle.js')
+  const plan = extractBlock('plan-cycle.js')
+  assert.ok(tdd.length > 400, 'sanity: the extracted block should be substantial, not an empty match')
+  assert.equal(review, tdd, 'review-cycle.js\'s T8 budget block has drifted from tdd-task.js\'s')
+  assert.equal(plan, tdd, 'plan-cycle.js\'s T8 budget block has drifted from tdd-task.js\'s')
+})
+
+// The generic terminal-write retry is duplicated in plan-cycle.js and
+// review-cycle.js. tdd-task.js is deliberately EXCLUDED: its T5 retry is
+// specific to one key (task_id handling), so it differs on purpose and must not
+// be forced into this pin.
+test('static: T8 round 1 M1 -- the generic terminal-write retry block (refusedKey .. end of its if-block) is byte-identical between plan-cycle.js and review-cycle.js (tdd-task.js excluded: its T5 retry is key-specific)', () => {
+  function extractRetry(fileName) {
+    const lines = readAll('workflows', fileName).split('\n')
+    const start = lines.findIndex((l) => l.includes('const refusedKey ='))
+    const close = lines.findIndex((l, i) => i > start && l === '}')
+    assert.ok(start >= 0 && close > start, `${fileName}: could not locate the retry block`)
+    return lines.slice(start, close + 1).join('\n')
+  }
+  const review = extractRetry('review-cycle.js')
+  const plan = extractRetry('plan-cycle.js')
+  assert.ok(review.includes('Object.hasOwn') && review.length > 300, 'sanity: the extract must be the whole retry block')
+  assert.equal(plan, review, 'plan-cycle.js\'s generic retry block has drifted from review-cycle.js\'s')
+})
+
 // specs/harn-fix-3.md AC-QA-1..4: the install-consistency preflight block
 // (INSTALL_CONSISTENCY_INSTRUCTION, INSTALL_CONSISTENCY_SCHEMA,
 // installConsistencyError) is necessarily duplicated between plan-cycle.js

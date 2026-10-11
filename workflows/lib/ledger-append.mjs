@@ -51,7 +51,13 @@ import { fileURLToPath } from 'node:url'
 // spec_bug count could be a real one or D4's conflation of "no spec" with
 // "the spec has a bug". The reader already tallies schema_version and rejects
 // no version, so the bump costs nothing and makes the two readable apart.
-export const SCHEMA_VERSION = 4
+// HARN-OPT-4 T8 (AC-OPS-3): bumped from 4. budget_spent changes meaning from a
+// session-cumulative running total (what budget.spent() returns) to a per-run
+// delta, end minus start. No field was added or removed, so the shape check is
+// unchanged, but a window spanning this change would otherwise mix the two
+// populations under one name. No reader may add or average budget_spent across
+// rows of different schema versions.
+export const SCHEMA_VERSION = 5
 
 // Hard-coded and not configurable (AC-SIMP-2): resolved against the MAIN
 // checkout root (never a worktree's own .claude/) via `git rev-parse

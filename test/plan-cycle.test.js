@@ -204,7 +204,8 @@ test('plan-cycle.js: a ledger:write response with invalid_ac_ids_dropped 0 (or a
 test('plan-cycle.js: telemetry.budget_spent is null when no budget is supplied, and reflects budget.spent() when supplied (AC-QA-15)', async () => {
   const noBudget = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
   assert.equal(noBudget.result.telemetry.budget_spent, null)
-  const withBudget = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent(), budget: { spent: () => 999 } })
+  const withBudget = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent(), budget: { spent: (() => { const r = [1000, 1999]; let i = 0; return () => r[Math.min(i++, 1)] })() } })
+  // HARN-OPT-4 T8: budget_spent is a per-run delta (end minus start), so a stateful stub is needed.
   assert.equal(withBudget.result.telemetry.budget_spent, 999)
 })
 

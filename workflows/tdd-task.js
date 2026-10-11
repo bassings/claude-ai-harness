@@ -394,6 +394,17 @@ const OUTCOME_BY_VERDICT = { DONE: 'done', BLOCKED: 'blocked', ABORTED: 'aborted
 // so a run killed mid-flight is recorded as incomplete rather than absent.
 // If the start write itself fails, the terminal write below simply gets its
 // own fresh run_id (AC-QA-7: a ledger write failure never blocks the run).
+// HARN-OPT-4 T8 (AC-QA-28, AC-DATA-17): budget.spent() is SESSION-CUMULATIVE
+// (probe recorded in the plan's Conductor log, tick 33), so a running total
+// written as budget_spent says nothing about this run. Read it once here,
+// BEFORE the started write, and once for the terminal row; the row carries end
+// minus start. Null (never the end reading, never a negative number) when
+// either reading is unmeasured or the counter went backwards (a reset).
+const budgetAtStart = readBudgetSpent()
+function budgetSpentDelta() {
+  const end = readBudgetSpent()
+  return budgetAtStart !== null && end !== null && end >= budgetAtStart ? end - budgetAtStart : null
+}
 const startWrite = await writeLedger({ kind: 'tdd_task', outcome: 'started', task: opts.task, spec: opts.spec || null })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
@@ -424,7 +435,7 @@ const result = raw
 const telemetry = {
   outcome: OUTCOME_BY_VERDICT[result.verdict] || 'aborted',
   spec: opts.spec || null,
-  budget_spent: readBudgetSpent(),
+  budget_spent: budgetSpentDelta(),
   rounds: { test_attempts: rounds.test_attempts, implement_attempts: rounds.implement_attempts },
 }
 const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
