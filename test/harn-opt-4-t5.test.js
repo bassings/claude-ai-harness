@@ -331,7 +331,7 @@ const T = (n) => `2026-10-11T0${n}:00:00.000Z`
 test('T5 reader: a blocked row alone is unresolved (1) and the list names its spec, task and reason (AC-QA-18, shaped like a blocked task finished by hand)', () => {
   const r = reader.aggregateBlockedUnresolved([tdd('blocked', 'A11Y-002 contrast tokens', T(1), { blocked_reason: 'implement_attempt_cap' })])
   assert.strictEqual(r.count, 1)
-  assert.deepEqual(r.unresolved, [{ repo: 'demo', spec: 'specs/a.md', task: 'A11Y-002 contrast tokens', reason: 'implement_attempt_cap' }])
+  assert.deepEqual(r.unresolved, [{ repo: 'demo', spec: 'specs/a.md', task: 'A11Y-002 contrast tokens', reason: 'implement_attempt_cap', laterDoneSameSpec: false, laterDoneSameSpecTs: null }])
 })
 
 test('T5 reader: a blocked row then a LATER done row for the same (repo, spec, task) gives 0 (AC-QA-18)', () => {

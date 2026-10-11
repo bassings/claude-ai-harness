@@ -330,9 +330,9 @@ export function aggregateBlockedUnresolved(records, { root = '' } = {}) {
   }
   const unresolved = [...open.values()].map(({ seq: blockedSeq, ...u }) => {
     const later = doneRows.find((d) => d.seq > blockedSeq && d.repo === u.repo && d.spec === u.spec && d.task !== u.task)
-    // The existing "blocked row alone" test deep-equals the bare entry, so the
-    // hint fields appear only once the window holds a done row to compare to.
-    if (doneRows.length === 0) return u
+    // One shape, always: the hint fields are present on every entry, false
+    // and null when no later done row for the spec exists, so a consumer
+    // never has to test for the key (conductor edit after fix round 1).
     return { ...u, laterDoneSameSpec: !!later, laterDoneSameSpecTs: later ? later.ts : null }
   })
   const byReason = Object.fromEntries(BLOCKED_REASONS.map((x) => [x, 0]))
