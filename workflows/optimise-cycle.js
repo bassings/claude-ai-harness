@@ -1039,6 +1039,20 @@ function buildReport(d) {
       `No-spec review runs in window: ${fmtCountOrUnavailable(d.rework.noSpecReviewRuns)} ` +
       `(findings reclassified from spec_bug to open on those runs: ${fmtCountOrUnavailable(d.rework.noSpecFindingsReclassified)}).`
     )
+    // HARN-OPT-4 T3 (AC-PROD-10, AC-QA-30): the completeness figures exist
+    // only on schema_version >= 4 rows, so they are labelled by version and
+    // say "not recorded" when no such row exists, never a measured 0.
+    const v4 = d.rework.schemaV4
+    if (v4) {
+      const fmtV4 = (n) => (n === null || n === undefined ? 'not recorded' : String(n))
+      lines.push(
+        v4.rows
+          ? `Completeness, schema_version >= 4 rows only (${v4.rows} rows; ${v4.excludedRows} older rows excluded): ` +
+            `findings_truncated=${fmtV4(v4.findingsTruncated)}, unattributed findings=${fmtV4(v4.unattributedFindings)}, ` +
+            `duplicate verdict pairs collapsed=${fmtV4(v4.duplicateVerdictPairs)}, no-spec review runs=${fmtV4(v4.noSpecReviewRuns)}.`
+          : `Completeness, schema_version >= 4 rows only: not recorded (no such rows; ${v4.excludedRows} older rows excluded).`
+      )
+    }
   } else {
     lines.push('No rework data (ledger unavailable).')
   }
@@ -1071,7 +1085,10 @@ function buildReport(d) {
             : a.truncated_in_window
               ? ' (truncated ac_verdicts in window -- see ac_verdicts_truncated)'
               : `, never_failed=${a.never_failed}`
-      lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}`)
+      // AC-PROD-3: runs where this criterion's own verdicts disagreed, a
+      // figure of its own beside the never-failed claim.
+      const disagreements = a.verdict_disagreements === undefined ? '' : `, verdict_disagreements=${a.verdict_disagreements}`
+      lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}${disagreements}`)
     }
   } else {
     // H3 (round 3 review, AC-PROD-7): "None recorded." on its own reads

@@ -1659,3 +1659,36 @@ test('optimise-cycle: the synthesis prompt stays bounded even when the ledger ci
   // would cost.
   assert.ok(synthesisCall.prompt.length < 20000, `synthesis prompt was ${synthesisCall.prompt.length} chars, expected a bounded aggregate, not raw ledger content`)
 })
+
+// ---- HARN-OPT-4 T3 (AC-PROD-3, AC-PROD-10, AC-QA-30): the report names the
+// verdict-disagreement figure beside the never-failing AC, and renders the
+// schema_version >= 4 completeness figures as one labelled line. ----
+
+test('optimise-cycle: the never-failing AC section renders verdict_disagreements as its own named figure (HARN-OPT-4 T3, AC-PROD-3)', async () => {
+  const row = { key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false, verdict_disagreements: 2 }
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ neverFailingAcs: [row] }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('specs/a.md AC-QA-1'))
+  assert.ok(line, `expected the AC line, report was: ${result.report}`)
+  assert.ok(line.includes('verdict_disagreements=2'), `got: ${line}`)
+})
+
+test('optimise-cycle: Sample completeness renders one line of schema_version >= 4 figures with real numbers and the excluded older-row count (HARN-OPT-4 T3, AC-PROD-10)', async () => {
+  const schemaV4 = { rows: 2, excludedRows: 3, findingsTruncated: 4, unattributedFindings: 5, duplicateVerdictPairs: 6, noSpecReviewRuns: 7 }
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { ...ledgerFixture().rework, schemaV4 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n').filter((l) => l.includes('schema_version >= 4'))
+  assert.equal(lines.length, 1, `expected exactly one labelled line, report was: ${result.report}`)
+  for (const n of ['4', '5', '6', '7']) assert.ok(new RegExp(`\\b${n}\\b`).test(lines[0]), `missing ${n} in: ${lines[0]}`)
+  assert.ok(/\b3\b/.test(lines[0]), `excluded older-row count missing in: ${lines[0]}`)
+})
+
+test('optimise-cycle: with no schema_version >= 4 rows the line says "not recorded" and never a measured 0 (HARN-OPT-4 T3, AC-QA-30)', async () => {
+  const schemaV4 = { rows: 0, excludedRows: 3, findingsTruncated: null, unattributedFindings: null, duplicateVerdictPairs: null, noSpecReviewRuns: null }
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { ...ledgerFixture().rework, schemaV4 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('schema_version >= 4'))
+  assert.ok(line, `expected the line, report was: ${result.report}`)
+  assert.ok(line.includes('not recorded'), `got: ${line}`)
+  assert.ok(!/=\s*0\b/.test(line), `must not render a measured zero: ${line}`)
+})

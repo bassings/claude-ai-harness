@@ -395,7 +395,25 @@ export function aggregateRework(records, { root = '' } = {}) {
   // never_failed:true for any of them. Same shape as unattributedFailBuckets
   // above, a different cause.
   const truncatedBuckets = new Set()
+  // HARN-OPT-4 T3 (AC-QA-10, AC-DATA-7): per-key count of runs in which two
+  // usable verdicts for one canonical ac_id differed. Kept apart from the
+  // verdict counts so worst-of collapsing never hides that a run disagreed
+  // with itself (AC-PROD-3).
+  const verdictDisagreements = new Map()
+  // AC-PROD-10: the completeness figures for schema_version >= 4 rows alone.
+  // Older rows cannot have recorded them, so they are excluded by count and
+  // never folded in as a measured zero (AC-QA-30).
+  let v4Rows = 0
+  let v4FindingsTruncated = 0
+  let v4UnattributedFindings = 0
+  let v4DuplicateVerdictPairs = 0
+  let v4NoSpecReviewRuns = 0
   for (const r of reviewRecords) {
+    const isV4 = typeof r.schema_version === 'number' && r.schema_version >= 4
+    if (isV4) {
+      v4Rows += 1
+      if (typeof r.findings_truncated === 'number') v4FindingsTruncated += r.findings_truncated
+    }
     if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
     if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
     if (typeof r.invalid_fixed_ids_dropped === 'number') invalidFixedIdsDropped += r.invalid_fixed_ids_dropped
@@ -437,6 +455,7 @@ export function aggregateRework(records, { root = '' } = {}) {
       degraded: r.degraded,
     })
     if (noSpecWasInPlay) noSpecReviewRuns += 1
+    if (isV4 && noSpecWasInPlay) v4NoSpecReviewRuns += 1
     const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
 
     for (const f of r.findings || []) {
@@ -472,6 +491,7 @@ export function aggregateRework(records, { root = '' } = {}) {
         // reported as a measurement) inside the reader this spec added.
         // Counted instead, and rendered under its own heading.
         unattributedFindings += 1
+        if (isV4) v4UnattributedFindings += 1
         if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
       }
     }
@@ -493,6 +513,10 @@ export function aggregateRework(records, { root = '' } = {}) {
       unattributableCount += verdicts.length
       continue
     }
+    // AC-QA-10: usable verdicts are gathered per canonical key for this ONE
+    // record and resolved after the loop, so a run counts at most once per
+    // (repo, run, ac_id) however many times a lens repeated it.
+    const runVerdicts = new Map()
     for (const v of verdicts) {
       // Review round-2 M-3: a sanitised entry (ac_id nulled by the writer,
       // AC-DATA-4-style ac_id_raw retained instead) must never reach the
@@ -597,13 +621,33 @@ export function aggregateRework(records, { root = '' } = {}) {
         entry.unattributedVerdicts += 1
         continue
       }
+      if (!runVerdicts.has(key)) runVerdicts.set(key, [])
+      runVerdicts.get(key).push(v.verdict)
+    }
+    // Worst-of: FAIL over UNVERIFIABLE over PASS. Best-of would let a PASS
+    // mask a FAIL and feed a "retire this check" proposal (AC-DATA-7).
+    for (const [key, seen] of runVerdicts) {
+      const entry = acVerdicts.get(key)
+      const worst = seen.includes('FAIL') ? 'FAIL' : seen.includes('UNVERIFIABLE') ? 'UNVERIFIABLE' : 'PASS'
       entry.n += 1
-      if (v.verdict === 'PASS') entry.pass += 1
-      else if (v.verdict === 'FAIL') entry.fail += 1
+      if (worst === 'PASS') entry.pass += 1
+      else if (worst === 'FAIL') entry.fail += 1
       else entry.unverifiable += 1
+      if (new Set(seen).size > 1) verdictDisagreements.set(key, (verdictDisagreements.get(key) || 0) + 1)
+      if (isV4 && seen.length > 1) v4DuplicateVerdictPairs += 1
     }
   }
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets, findingsTruncated, acVerdictsTruncated, unattributedFindings, noSpecReviewRuns, noSpecFindingsReclassified, truncatedBuckets }
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets, findingsTruncated, acVerdictsTruncated, unattributedFindings, noSpecReviewRuns, noSpecFindingsReclassified, truncatedBuckets, verdictDisagreements,
+    // AC-QA-30: null, never 0, when no row could have recorded the figure.
+    schemaV4: {
+      rows: v4Rows,
+      excludedRows: reviewRecords.length - v4Rows,
+      findingsTruncated: v4Rows ? v4FindingsTruncated : null,
+      unattributedFindings: v4Rows ? v4UnattributedFindings : null,
+      duplicateVerdictPairs: v4Rows ? v4DuplicateVerdictPairs : null,
+      noSpecReviewRuns: v4Rows ? v4NoSpecReviewRuns : null,
+    },
+  }
 }
 
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
@@ -617,7 +661,7 @@ export function aggregateRework(records, { root = '' } = {}) {
 // `entry` by construction never saw the hidden FAIL. Defaults to an empty
 // Set so every pre-existing call site (none of which knows this option
 // exists) behaves identically to before: no tainted buckets, no change.
-export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set(), truncatedBuckets = new Set() } = {}) {
+export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set(), truncatedBuckets = new Set(), verdictDisagreements = new Map() } = {}) {
   const out = []
   for (const [key, entry] of acVerdicts.entries()) {
     const insufficient_data = entry.n < minRuns
@@ -647,6 +691,7 @@ export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILE
       unattributed_fail_in_window,
       unattributed_verdict_in_entry,
       truncated_in_window,
+      verdict_disagreements: verdictDisagreements.get(key) || 0,
       never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry || truncated_in_window ? null : entry.fail === 0,
     })
   }
@@ -1628,7 +1673,7 @@ function runLedgerCommand(roots, window) {
   // unaffected.
   const canonicalRoot = roots[0] || ''
   const rework = aggregateRework(windowed, { root: canonicalRoot })
-  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets, truncatedBuckets: rework.truncatedBuckets })
+  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets, truncatedBuckets: rework.truncatedBuckets, verdictDisagreements: rework.verdictDisagreements })
   const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
   const trigger = aggregateTriggerAccuracy(windowed)
   const proposalOutcomes = aggregateProposalOutcomes(windowed)
@@ -1638,7 +1683,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecFindingsReclassified: rework.noSpecFindingsReclassified },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecFindingsReclassified: rework.noSpecFindingsReclassified, schemaV4: rework.schemaV4 },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
