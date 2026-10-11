@@ -116,16 +116,33 @@ test('T5 tdd-task: the three BLOCKED exits carry three different codes, each fro
   for (const r of seen) assert.ok(REASONS.includes(r))
 })
 
+// Round 2 L4 (AC-DATA-2 as amended: a new field is sent only when supplied): the
+// payload omits the key on done and aborted rows, so a stale installed writer
+// accepts the common path first time. The WRITTEN line still carries null,
+// carries no blocked_reason other than null: the real writer, unchanged in this
+// task, leaves an absent key absent (it does not default it to null the way it
+// does for round), and the reader reads a missing key as "not recorded", so the
+// line is checked as "null or absent", never as a string.
+function writtenBlockedReason(payload) {
+  const repo = makeTempRepo()
+  const res = runAppend(repo, payload)
+  assert.equal(JSON.parse(res.stdout.trim().split('\n').pop()).write_ok, true, res.stderr)
+  const [raw] = readLedgerLines(repo)
+  const entry = JSON.parse(raw)
+  assert.equal(entry.write_ok, true, raw)
+  return entry.blocked_reason ?? null
+}
+
 test('T5 tdd-task: a done row and an aborted row carry the key, with the value null (not omitted, not a string)', async () => {
   const done = await runTdd(DONE)
   assert.equal(done.terminal.outcome, 'done')
-  assert.ok('blocked_reason' in done.terminal, 'key must be present on a done row')
-  assert.strictEqual(done.terminal.blocked_reason, null)
+  assert.ok(!('blocked_reason' in done.terminal), 'round 2 L4: the done payload must NOT send the key')
+  assert.strictEqual(writtenBlockedReason(done.terminal), null)
 
   const aborted = await runTdd({})
   assert.equal(aborted.terminal.outcome, 'aborted')
-  assert.ok('blocked_reason' in aborted.terminal, 'key must be present on an aborted row')
-  assert.strictEqual(aborted.terminal.blocked_reason, null)
+  assert.ok(!('blocked_reason' in aborted.terminal), 'round 2 L4: the aborted payload must NOT send the key')
+  assert.strictEqual(writtenBlockedReason(aborted.terminal), null)
 })
 
 test('T5 tdd-task: an aborted row from a THROWN exception also carries blocked_reason null, and the error still propagates', async () => {
@@ -137,7 +154,8 @@ test('T5 tdd-task: an aborted row from a THROWN exception also carries blocked_r
   const writes = thrown.calls.filter((c) => c.opts.label === 'ledger:write').map((c) => extractLedgerPayload(c.prompt))
   const terminal = writes[writes.length - 1]
   assert.equal(terminal.outcome, 'aborted')
-  assert.strictEqual(terminal.blocked_reason, null)
+  assert.ok(!('blocked_reason' in terminal), 'round 2 L4: the key is sent only when supplied')
+  assert.strictEqual(writtenBlockedReason(terminal), null)
 })
 
 // AC-SIMP-5: visibility only. No escalated attempt, no second field.
@@ -220,10 +238,10 @@ test('T5 AC-DATA-2: a terminal write refused for blocked_reason is retried ONCE 
   assert.ok(logs.some((l) => /blocked_reason/.test(l) && /retr/i.test(l)), `the retry must be logged, logs: ${JSON.stringify(logs)}`)
 })
 
-test('T5 AC-DATA-2: a done row refused for the key is also retried once without it, and stays done', async () => {
+test('T5 AC-DATA-2: a done row does not send the key, so a stale writer accepts it first time with no retry and it stays done', async () => {
   const accepted = []
   const { result, writes } = await runTdd(DONE, staleWriter(accepted))
-  assert.equal(writes.filter((w) => w.outcome !== 'started').length, 2)
+  assert.equal(writes.filter((w) => w.outcome !== 'started').length, 1, 'round 2 L4: no retry needed on the common path')
   assert.equal(accepted.filter((p) => p.outcome === 'done').length, 1)
   assert.equal(result.verdict, 'DONE')
 })
@@ -234,6 +252,20 @@ test('T5 AC-DATA-2: never a second retry; a writer that refuses even the retry l
   assert.equal(writes.filter((w) => w.outcome !== 'started').length, 2)
   assert.equal(accepted.filter((p) => p.outcome !== 'started').length, 0)
   assert.equal(result.verdict, 'BLOCKED')
+  assert.equal(result.ledger_write_failed, true)
+})
+
+// Round 2 L2 (spec bug): each conjunct of the retry predicate needs its own
+// negative case, or deleting either one stays green.
+test('T5 AC-DATA-2 (round 2 L2): the right phrase about the wrong key is NOT retried', async () => {
+  const { result, writes } = await runTdd(implementCap(), staleWriter([], { otherError: 'spec_raw: not an allowed property' }))
+  assert.equal(writes.filter((w) => w.outcome !== 'started').length, 1)
+  assert.equal(result.ledger_write_failed, true)
+})
+
+test('T5 AC-DATA-2 (round 2 L2): the right key with the wrong phrase is NOT retried', async () => {
+  const { result, writes } = await runTdd(implementCap(), staleWriter([], { otherError: 'blocked_reason: must be equal to one of the allowed values' }))
+  assert.equal(writes.filter((w) => w.outcome !== 'started').length, 1)
   assert.equal(result.ledger_write_failed, true)
 })
 

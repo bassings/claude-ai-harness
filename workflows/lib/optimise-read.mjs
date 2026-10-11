@@ -1886,5 +1886,8 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolv
 if (isMain) {
   const out = main()
   process.stdout.write(JSON.stringify(out) + '\n')
-  process.exit(0)
+  // Round 2 M1: process.exit() straight after a large write cut the JSON at
+  // the 64 KB pipe buffer about half the time. Set the code and let the
+  // event loop drain stdout before the process ends naturally.
+  process.exitCode = 0
 }

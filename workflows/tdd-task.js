@@ -426,12 +426,14 @@ const telemetry = {
   spec: opts.spec || null,
   budget_spent: readBudgetSpent(),
   rounds: { test_attempts: rounds.test_attempts, implement_attempts: rounds.implement_attempts },
-  // Always present, null unless the run ended blocked (AC-OPS-5). Only the
-  // enum code goes on the line: never verifier evidence or test output
-  // (AC-SEC-8).
-  blocked_reason: OUTCOME_BY_VERDICT[result.verdict] === 'blocked' ? blockedReason : null,
 }
 const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
+// Round 2 L4 (AC-DATA-2 as amended): a new field is sent only when supplied.
+// blocked_reason rides the terminal row only for a blocked outcome, so done
+// and aborted rows never depend on the retry below against a stale writer
+// (the writer records an absent key as null). Only the enum code goes on the
+// line: never verifier evidence or test output (AC-SEC-8).
+if (OUTCOME_BY_VERDICT[result.verdict] === 'blocked') terminalEntry.blocked_reason = blockedReason
 if (startRunId) terminalEntry.run_id = startRunId
 let terminalWrite = await writeLedger(terminalEntry)
 // HARN-OPT-4 T5 (AC-DATA-2, as amended): an installed writer older than this

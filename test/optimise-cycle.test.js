@@ -1877,7 +1877,7 @@ test('optimise-cycle (HARN-OPT-4 T5, round 1 M1): an entry with laterDoneSameSpe
   const lines = result.report.split('\n')
   const hit = lines.filter((l) => l.includes('BUG-018 brief'))
   assert.equal(hit.length, 1, `report was:\n${result.report}`)
-  assert.ok(hit[0].includes('(a later done run exists for this spec at 2026-10-11T23:08:00.000Z; may be the same task re-briefed)'), `got: ${hit[0]}`)
+  assert.ok(hit[0].includes('(a later done run exists for this spec at 2026-10-11T23:08:00.000Z; under a multi-task plan this may be another task)'), `got: ${hit[0]}`)
   const miss = lines.filter((l) => l.includes('OTHER-001 brief'))
   assert.equal(miss.length, 1)
   assert.ok(!miss[0].includes('a later done run exists'), `got: ${miss[0]}`)
@@ -1927,4 +1927,33 @@ test('optimise-cycle (HARN-OPT-4 T5, round 1 L2): a task string with a newline a
   const headings = (text) => text.split('\n').filter((l) => l.startsWith('## Proposals')).length
   assert.equal(headings(result.report), headings(base.result.report), 'the injected heading must not become a report line of its own')
   assert.ok(taskLines[0].length <= BLOCKED_LABEL.length + 3 * 120 + 64, `line length ${taskLines[0].length}`)
+})
+
+// Round 2 L1 (AC-QA-18): the 120-character bound was not load-bearing at 200
+// characters. The task segment sits between "demo specs/a.md " and ": <reason>".
+test('optimise-cycle (HARN-OPT-4 T5, round 2 L1): a 2000-character task is cut so its segment of the line is at most 120 characters', async () => {
+  const hostile = 'T' + 'y'.repeat(1999)
+  const bu = { count: 1, unresolved: [{ repo: 'demo', spec: 'specs/a.md', task: hostile, reason: 'tests_modified', laterDoneSameSpec: false, laterDoneSameSpecTs: null }], byReason: { test_attempt_cap: 0, implement_attempt_cap: 0, tests_modified: 1 }, reasonNotRecorded: 0 }
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses({ 'lane:ledger': ledgerFixture({ blockedUnresolved: bu }) }) })
+  const line = result.report.split('\n').find((l) => l.startsWith('- demo specs/a.md '))
+  assert.ok(line, `report was:\n${result.report}`)
+  const seg = line.slice('- demo specs/a.md '.length, line.lastIndexOf(': tests_modified'))
+  assert.ok(seg.startsWith('Tyyy'), `got: ${seg.slice(0, 20)}`)
+  assert.ok(seg.length <= 120, `task segment was ${seg.length} characters`)
+})
+
+// Round 2 L3 (AC-QA-18): the count > 0 guard on the re-briefed caveat.
+test('optimise-cycle (HARN-OPT-4 T5, round 2 L3): a measured zero prints no re-briefed caveat line', async () => {
+  const bu = { count: 0, unresolved: [], byReason: { test_attempt_cap: 0, implement_attempt_cap: 0, tests_modified: 0 }, reasonNotRecorded: 0 }
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses({ 'lane:ledger': ledgerFixture({ blockedUnresolved: bu }) }) })
+  assert.ok(!result.report.split('\n').some((l) => /re-briefed/.test(l)), `report was:\n${result.report}`)
+})
+
+// Round 2 L5 (spec bug): every tdd_task row under a multi-task plan shares one
+// spec, so the later-done hint fires for any other task. The skill must say so
+// and must no longer call the hinted line "the likely re-briefed case".
+test('optimise-cycle (HARN-OPT-4 T5, round 2 L5): SKILL.md softens the later-done sentence and names the multi-task caveat', () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8').replace(/\s+/g, ' ')
+  assert.ok(skill.includes('under a multi-task plan'), 'the skill must name the multi-task caveat')
+  assert.ok(!/is the likely re-briefed case/.test(skill), 'the confident "likely re-briefed" claim must go')
 })

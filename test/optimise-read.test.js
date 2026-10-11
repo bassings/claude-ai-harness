@@ -3014,3 +3014,44 @@ test('optimise-read (M2): a line invoked without a spec where a lens FOUND one k
   assert.equal(out.lensDispositionCounts['lens-qa'].spec_bug, 1,
     'criteria were verified, so a spec WAS in play: the same trigger the writer uses')
 })
+
+// HARN-OPT-4 T5 fix round 2 M1 (AC-PROD-10): the CLI called process.exit(0)
+// straight after a large stdout write, and through a pipe the JSON was cut at
+// the pipe buffer (64 KB), so the ledger lane failed to parse about half the
+// time on this repo. spawn with stdout piped and read to completion; a file
+// redirect hides the bug, so this must not use one.
+test('optimise-read CLI (round 2 M1, AC-PROD-10): a ledger output over 70 KB arrives whole through a pipe and parses', async () => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const { spawn } = require('node:child_process')
+  const repo = makeTempRepo()
+  const file = path.join(repo, LEDGER_REL)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const rows = []
+  for (let i = 0; i < 400; i++) {
+    rows.push(JSON.stringify({ schema_version: 4, kind: 'review_cycle', run_id: `run${i}`, ts: new Date().toISOString(), repo: 'demo', spec: `specs/s${i}.md`, round_key: `s${i}`, outcome: 'done', findings: [], ac_verdicts: [{ ac_id: `AC-QA-${i + 1}`, verdict: i % 3 ? 'PASS' : 'FAIL' }] }))
+  }
+  fs.appendFileSync(file, rows.join('\n') + '\n')
+  // Precondition measured through a file redirect, which cannot truncate: the
+  // piped length cannot be used, since it is exactly what the bug shortens.
+  const outFile = path.join(repo, 'full-output.json')
+  const fd = fs.openSync(outFile, 'w')
+  const ref = spawnSync('node', [MODULE_PATH, 'ledger', repo], { stdio: ['ignore', fd, 'pipe'] })
+  fs.closeSync(fd)
+  assert.equal(ref.status, 0)
+  const fullBytes = fs.statSync(outFile).size
+  assert.ok(fullBytes > 70 * 1024, `precondition: the fixture must exceed 70 KB, got ${fullBytes}`)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const chunks = []
+    const code = await new Promise((resolve, reject) => {
+      const child = spawn('node', [MODULE_PATH, 'ledger', repo], { stdio: ['ignore', 'pipe', 'pipe'] })
+      child.stdout.on('data', (c) => chunks.push(c))
+      child.on('error', reject)
+      child.on('close', resolve)
+    })
+    const text = Buffer.concat(chunks).toString('utf8')
+    assert.equal(code, 0)
+    assert.equal(Buffer.byteLength(text), fullBytes, `attempt ${attempt}: output cut at ${text.length} of ${fullBytes} bytes`)
+    assert.doesNotThrow(() => JSON.parse(text), `attempt ${attempt}: output did not parse`)
+  }
+})

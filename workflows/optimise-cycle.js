@@ -1089,7 +1089,7 @@ function buildReport(d) {
     for (const u of Array.isArray(bu.unresolved) ? bu.unresolved : []) {
       // Round 1 M1: non-clearing hint for a re-briefed retry.
       const hint = u.laterDoneSameSpec === true
-        ? ` (a later done run exists for this spec at ${oneLine(u.laterDoneSameSpecTs)}; may be the same task re-briefed)`
+        ? ` (a later done run exists for this spec at ${oneLine(u.laterDoneSameSpecTs)}; under a multi-task plan this may be another task)`
         : ''
       lines.push(`- ${oneLine(u.repo)} ${oneLine(u.spec)} ${oneLine(u.task)}: ${oneLine(u.reason)}${hint}`)
     }

@@ -252,7 +252,8 @@ It states, every run, in this order:
    by hand, or re-briefed with different wording and then finished by the
    harness, leaves no resolution row under its original text, so a listed
    task may already be done. A line ending "a later done run exists for
-   this spec" is the likely re-briefed case. Next step: for each line, check whether the task landed
+   this spec" means only that some done run under the same spec exists;
+   under a multi-task plan this says nothing about this task. Next step: for each line, check whether the task landed
    (git log, the plan file); if it did not, that task is waiting on a
    decision, and the reason code says which kind. A count that stays high
    week on week is the signal, not a single line.
