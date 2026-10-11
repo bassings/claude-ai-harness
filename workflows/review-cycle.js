@@ -428,6 +428,11 @@ const specPath = opts.spec || null
 // validation (integer >= 1 or null) and counts what it neutralises, so this file
 // never decides what a valid round is. Absent is null, never 0.
 const reviewRound = opts.round === undefined ? null : opts.round
+// Round 2 L1 (spec bug S5): spread onto the payloads ONLY when supplied. A
+// stale installed writer that predates the field rejects an unknown key
+// structurally (the whole line is refused), so a direct review must not send
+// `round: null`; the current writer normalises absent to null itself.
+const roundField = opts.round === undefined ? {} : { round: opts.round }
 // specs/record-fixed-findings.md (AC-1/AC-3): the caller's own findings,
 // reported open going into this round -- {id, lens, location, claim,
 // severity?, ac_id?}. Fix round 3, finding 3: `id` is REQUIRED, not
@@ -1494,7 +1499,7 @@ return {
 
 // Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
 // pattern and its rationale.
-const startWrite = await writeLedger({ kind: 'review_cycle', outcome: 'started', spec: specPath, round: reviewRound })
+const startWrite = await writeLedger({ kind: 'review_cycle', outcome: 'started', spec: specPath, ...roundField })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
 // PR 2 (AC-QA-8, AC-ARCH-9): an exception escaping run() must still
@@ -1524,7 +1529,7 @@ const { __outcome, ...result } = raw
 const telemetry = {
   outcome: __outcome || 'aborted',
   spec: specPath,
-  round: reviewRound,
+  ...roundField,
   round_key: headSha,
   lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],

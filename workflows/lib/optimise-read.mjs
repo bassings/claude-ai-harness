@@ -406,6 +406,14 @@ export function aggregateRework(records, { root = '' } = {}) {
   let v4NoSpecReviewRunsConducted = 0
   let v4NoSpecReviewRunsDirect = 0
   let v4NoSpecReviewRunsRoundNotRecorded = 0
+  // Round 2 M1 (AC-PROD-4): terminal rows with a positive-integer round
+  // REGARDLESS of spec, so the amended success measure (rows carrying a round
+  // equal the conducted reviews in the conductor log) is readable from the
+  // report. The *Seen flags make "no terminal row carried the key" null, not 0.
+  let reviewRunsWithRound = 0
+  let roundKeySeen = false
+  let v4ReviewRunsWithRound = 0
+  let v4RoundKeySeen = false
   // H3: which (repo, plan) buckets saw a truncated ac_verdicts array in this
   // window -- the surplus could have held the FAIL for any criterion in
   // that bucket, so neverFailingAcs must not report a confident
@@ -485,6 +493,10 @@ export function aggregateRework(records, { root = '' } = {}) {
       acVerdictsTruncated: r.ac_verdicts_truncated,
       degraded: r.degraded,
     })
+    if (isTerminal && 'round' in r) roundKeySeen = true
+    if (isV4 && 'round' in r) v4RoundKeySeen = true
+    if (isTerminal && Number.isInteger(r.round) && r.round >= 1) reviewRunsWithRound += 1
+    if (isV4 && Number.isInteger(r.round) && r.round >= 1) v4ReviewRunsWithRound += 1
     if (isTerminal && noSpecWasInPlay) noSpecReviewRuns += 1
     if (isV4 && noSpecWasInPlay) v4NoSpecReviewRuns += 1
     if (isTerminal && noSpecWasInPlay) {
@@ -687,7 +699,7 @@ export function aggregateRework(records, { root = '' } = {}) {
   const splitUnmeasured = (runs, notRecorded) => runs > 0 && notRecorded === runs
   const windowUnmeasured = splitUnmeasured(noSpecReviewRuns, noSpecReviewRunsRoundNotRecorded)
   const v4Unmeasured = splitUnmeasured(v4NoSpecReviewRuns, v4NoSpecReviewRunsRoundNotRecorded)
-  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets, findingsTruncated, acVerdictsTruncated, unattributedFindings, noSpecReviewRuns, noSpecReviewRunsConducted: windowUnmeasured ? null : noSpecReviewRunsConducted, noSpecReviewRunsDirect: windowUnmeasured ? null : noSpecReviewRunsDirect, noSpecReviewRunsRoundNotRecorded, noSpecFindingsReclassified, truncatedBuckets, verdictDisagreements,
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets, findingsTruncated, acVerdictsTruncated, unattributedFindings, noSpecReviewRuns, noSpecReviewRunsConducted: windowUnmeasured ? null : noSpecReviewRunsConducted, noSpecReviewRunsDirect: windowUnmeasured ? null : noSpecReviewRunsDirect, noSpecReviewRunsRoundNotRecorded, reviewRunsWithRound: roundKeySeen ? reviewRunsWithRound : null, noSpecFindingsReclassified, truncatedBuckets, verdictDisagreements,
     // AC-QA-30: null, never 0, when no row could have recorded the figure.
     schemaV4: {
       rows: v4Rows,
@@ -699,6 +711,7 @@ export function aggregateRework(records, { root = '' } = {}) {
       noSpecReviewRunsConducted: v4Rows && !v4Unmeasured ? v4NoSpecReviewRunsConducted : null,
       noSpecReviewRunsDirect: v4Rows && !v4Unmeasured ? v4NoSpecReviewRunsDirect : null,
       noSpecReviewRunsRoundNotRecorded: v4Rows ? v4NoSpecReviewRunsRoundNotRecorded : null,
+      reviewRunsWithRound: v4RoundKeySeen ? v4ReviewRunsWithRound : null,
     },
   }
 }
@@ -1738,7 +1751,7 @@ function runLedgerCommand(roots, window) {
     windowDroppedCount: droppedCount,
     perRepo,
     skipped: combinedSkipped,
-    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecReviewRunsConducted: rework.noSpecReviewRunsConducted, noSpecReviewRunsDirect: rework.noSpecReviewRunsDirect, noSpecReviewRunsRoundNotRecorded: rework.noSpecReviewRunsRoundNotRecorded, noSpecFindingsReclassified: rework.noSpecFindingsReclassified, schemaV4: rework.schemaV4 },
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecReviewRunsConducted: rework.noSpecReviewRunsConducted, noSpecReviewRunsDirect: rework.noSpecReviewRunsDirect, noSpecReviewRunsRoundNotRecorded: rework.noSpecReviewRunsRoundNotRecorded, reviewRunsWithRound: rework.reviewRunsWithRound, noSpecFindingsReclassified: rework.noSpecFindingsReclassified, schemaV4: rework.schemaV4 },
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },

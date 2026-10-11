@@ -19,6 +19,7 @@ const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
+const { assertAppendPreservesPrefix } = require('./helpers/ledger-prefix.js')
 const { makeTempRepo, runAppend, readLedgerLines, cleanupTempRepos, APPEND_SCRIPT, LEDGER_REL } = require('./helpers/temp-repo.js')
 
 const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
@@ -76,11 +77,24 @@ test('T4 round: round 2 is written on BOTH the started and the terminal row', as
   assert.equal(terminal.round, 2)
 })
 
-test('T4 round: absent writes null on both rows, never 0 and never omitted', async () => {
+// Round 2 L1 (AC-QA-13, spec bug S5): the payload carries `round` ONLY when one
+// was supplied, so a stale installed writer that predates the field (and
+// rejects unknown keys structurally) still accepts the row. The null-on-the-line
+// guarantee belongs to the WRITTEN line, asserted below through the real writer.
+test('T4 round: with no round supplied neither payload carries a round key (round 2 L1)', async () => {
+  const { started, terminal } = await review({})
+  for (const p of [started, terminal]) assert.ok(!('round' in p), `payload must omit round, got ${JSON.stringify(p)}`)
+})
+
+test('T4 round: absent writes null on the WRITTEN line for both rows, never 0 and never omitted (AC-QA-13, relocated from the payload by round 2 L1)', async () => {
   const { started, terminal } = await review({})
   for (const p of [started, terminal]) {
-    assert.ok('round' in p, 'the key must be present')
-    assert.strictEqual(p.round, null)
+    const repo = makeTempRepo()
+    const res = runAppend(repo, p)
+    assert.equal(JSON.parse(res.stdout.trim().split('\n').pop()).write_ok, true, res.stderr)
+    const entry = JSON.parse(readLedgerLines(repo)[0])
+    assert.ok('round' in entry, 'the key must be present on the line')
+    assert.strictEqual(entry.round, null)
   }
 })
 
@@ -291,4 +305,56 @@ test('T4 reader: both figures survive the CLI output whitelist', () => {
   assert.strictEqual(out.rework.schemaV4.noSpecReviewRunsRoundNotRecorded, 0)
   assert.strictEqual(out.rework.schemaV4.noSpecReviewRunsConducted, 3)
   assert.strictEqual(out.rework.schemaV4.noSpecReviewRunsDirect, 1)
+})
+
+// ---- (6) round 2 additions ----
+
+// Round 2 L2 (AC-DATA-19): the byte-prefix property, executed through the real
+// writer against a ledger whose last line was truncated by a crash.
+test('T4 schema: a write with round 2 or a hostile round leaves the original ledger bytes as a prefix and adds exactly one line (round 2 L2, AC-DATA-19)', () => {
+  const base = { schema_version: 4, kind: 'review_cycle', outcome: 'done', spec: 'specs/a.md', lenses_run: ['lens-qa'] }
+  for (const round of [2, '2; rm -rf']) {
+    const { added } = assertAppendPreservesPrefix(makeTempRepo(), { ...base, round })
+    const entry = JSON.parse(added)
+    assert.strictEqual(entry.round, round === 2 ? 2 : null)
+  }
+})
+
+test('T4 round: a supplied round of 2 is on BOTH the started and terminal payloads (round 2 L1)', async () => {
+  const { started, terminal } = await review({ round: 2 })
+  assert.ok('round' in started && 'round' in terminal)
+  assert.strictEqual(started.round, 2)
+  assert.strictEqual(terminal.round, 2)
+})
+
+// Round 2 M1 (AC-PROD-4): terminal rows with a positive-integer round,
+// regardless of spec. mixedRows(): c1, c2, c3 (no spec) and s1 (spec, round 4)
+// = 4, which collides with none of the 3/1/3 figures above. Started rows and
+// the round null row are excluded; old rows carry no key.
+test('T4 reader: reviewRunsWithRound counts terminal rows with a round >= 1 regardless of spec, window-wide and in schemaV4 (round 2 M1)', () => {
+  const rework = reader.aggregateRework(mixedRows())
+  assert.strictEqual(rework.reviewRunsWithRound, 4)
+  assert.strictEqual(rework.schemaV4.reviewRunsWithRound, 4)
+})
+
+test('T4 reader: reviewRunsWithRound ignores non-positive and non-integer rounds and started rows (round 2 M1)', () => {
+  const rows = [row('a', { round: 0 }), row('b', { round: -1 }), row('c', { round: 1.5 }), row('d', { round: '2' }), row('e', { round: 5 }), row('e', { round: 5, outcome: 'started' })]
+  assert.strictEqual(reader.aggregateRework(rows).reviewRunsWithRound, 1)
+})
+
+test('T4 reader: reviewRunsWithRound is null, not 0, when no terminal row carries the round key at all (round 2 M1)', () => {
+  const rework = reader.aggregateRework([row('o1', { schema_version: 3 }), row('o2', { schema_version: 3, spec: 'specs/a.md' }), row('n1')])
+  assert.strictEqual(rework.reviewRunsWithRound, null)
+  assert.strictEqual(rework.schemaV4.reviewRunsWithRound, null)
+})
+
+test('T4 reader: reviewRunsWithRound survives the CLI output whitelist (round 2 M1)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.dirname(path.join(repo, LEDGER_REL)), { recursive: true })
+  fs.writeFileSync(path.join(repo, LEDGER_REL), mixedRows().map((r) => JSON.stringify(r)).join('\n') + '\n')
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.strictEqual(out.rework.reviewRunsWithRound, 4)
+  assert.strictEqual(out.rework.schemaV4.reviewRunsWithRound, 4)
 })

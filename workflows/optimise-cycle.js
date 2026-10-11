@@ -1043,7 +1043,7 @@ function buildReport(d) {
       `No-spec review runs in window: ${fmtCountOrUnavailable(d.rework.noSpecReviewRuns)} ` +
       // Round 1 M1 (AC-PROD-4): null means no row recorded a round, so say so
       // rather than print a count nobody measured.
-      `(conducted=${fmtSplit(d.rework.noSpecReviewRunsConducted)}, direct=${fmtSplit(d.rework.noSpecReviewRunsDirect)}, round not recorded=${fmtSplit(d.rework.noSpecReviewRunsRoundNotRecorded)}) ` +
+      `(conducted=${fmtSplit(d.rework.noSpecReviewRunsConducted)}, direct=${fmtSplit(d.rework.noSpecReviewRunsDirect)}, round not recorded=${fmtSplit(d.rework.noSpecReviewRunsRoundNotRecorded)}, review runs with round=${fmtSplit(d.rework.reviewRunsWithRound)}) ` +
       `(findings reclassified from spec_bug to open on those runs: ${fmtCountOrUnavailable(d.rework.noSpecFindingsReclassified)}).`
     )
     // HARN-OPT-4 T3 (AC-PROD-10, AC-QA-30): the completeness figures exist
@@ -1056,7 +1056,7 @@ function buildReport(d) {
         v4.rows
           ? `Completeness, schema_version >= 4 rows only (${v4.rows} rows; ${v4.excludedRows} older rows excluded): ` +
             `findings_truncated=${fmtV4(v4.findingsTruncated)}, unattributed findings=${fmtV4(v4.unattributedFindings)}, ` +
-            `duplicate verdict groups collapsed=${fmtV4(v4.duplicateVerdictPairs)}, no-spec review runs=${fmtV4(v4.noSpecReviewRuns)}, no-spec review runs conducted=${fmtV4(v4.noSpecReviewRunsConducted)}, direct=${fmtV4(v4.noSpecReviewRunsDirect)}, round not recorded=${fmtV4(v4.noSpecReviewRunsRoundNotRecorded)}.`
+            `duplicate verdict groups collapsed=${fmtV4(v4.duplicateVerdictPairs)}, no-spec review runs=${fmtV4(v4.noSpecReviewRuns)}, no-spec review runs conducted=${fmtV4(v4.noSpecReviewRunsConducted)}, direct=${fmtV4(v4.noSpecReviewRunsDirect)}, round not recorded=${fmtV4(v4.noSpecReviewRunsRoundNotRecorded)}, review runs with round=${fmtV4(v4.reviewRunsWithRound)}.`
           : `Completeness, schema_version >= 4 rows only: not recorded (no such rows; ${v4.excludedRows} older rows excluded).`
       )
     }

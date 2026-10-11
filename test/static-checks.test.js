@@ -2292,3 +2292,19 @@ test('static: conduct-plan/SKILL.md awaiting-ci green step instructs passing `sp
   assert.ok(invocation.length > 0, 'a paragraph of the awaiting-ci green step must name /review-cycle together with both `spec` and `round`')
   assert.ok(invocation.some((p) => /repo-relative/.test(p) && /never absolute/i.test(p)), 'the spec argument must be stated as repo-relative, never absolute')
 })
+
+// Round 2 L3 (AC-PROD-4): "a positive integer" alone left a conductor to guess
+// the literal call, and a round passed as a quoted string is nulled by the
+// writer and read as a direct review. The step must show the unquoted call and
+// say what a quoted number does.
+test('static: conduct-plan/SKILL.md review step shows a literal /review-cycle call with an unquoted round and warns that a quoted number reads as direct (round 2 L3)', () => {
+  const lines = readAll('skills', 'conduct-plan', 'SKILL.md').split('\n')
+  const start = lines.findIndex((l) => /^ {3}- `awaiting-ci` green/.test(l))
+  assert.ok(start >= 0, 'expected the awaiting-ci green bullet')
+  let end = lines.findIndex((l, i) => i > start && /^ {3}- `/.test(l))
+  if (end === -1) end = lines.length
+  const step = lines.slice(start, end).join('\n')
+  assert.match(step, /\/review-cycle \{[^}\n]*"spec": "[^"\n]+"[^}\n]*"round": \d+[^}\n]*\}/, 'expected a literal /review-cycle call with an unquoted numeric round')
+  const warn = step.split(/\n\s*\n/).find((p) => /quoted/i.test(p) && /null/i.test(p) && /direct/i.test(p))
+  assert.ok(warn, 'expected a sentence saying a quoted number is nulled by the writer and read as a direct review')
+})

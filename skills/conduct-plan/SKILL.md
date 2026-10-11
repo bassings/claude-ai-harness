@@ -82,7 +82,11 @@ rather than narrating a condition that does not apply here.
         restarts at `1` for the next task). Keep the current value in the
         `## Conductor log` beside the task's other state, so a re-tick reads it
         rather than guessing. Without it a conducted review is
-        indistinguishable from a direct one in the run ledger.
+        indistinguishable from a direct one in the run ledger. Pass it as an
+        unquoted number, for example
+        `/review-cycle {"spec": "specs/<plan>.md", "round": 2}`. A quoted
+        number (`"round": "2"`) is nulled by the writer and read as a direct
+        review.
 
      **Mechanical steps for `prior_findings` (specs/record-fixed-findings.md
      AC-1/AC-3), the SAME shape of instruction as the ledger-write one

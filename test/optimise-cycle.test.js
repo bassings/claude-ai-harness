@@ -1766,3 +1766,37 @@ test('optimise-cycle (HARN-OPT-4 T4, round 1 M2): null v4 conducted and direct r
   const line = result.report.split('\n').find((l) => l.includes('schema_version >= 4'))
   assert.ok(line.includes('no-spec review runs conducted=not recorded, direct=not recorded, round not recorded=74'), `got: ${line}`)
 })
+
+// Round 2 M1 (AC-PROD-4): the amended success measure (rows carrying a round
+// equal the conducted reviews in the conductor log) must be readable from the
+// report, on the window-wide no-spec line and on the schema_version >= 4 line.
+test('optimise-cycle (HARN-OPT-4 T4, round 2 M1): the no-spec line prints review runs with round=31', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({ rework: { ...ledgerFixture().rework, noSpecReviewRuns: 3, noSpecReviewRunsConducted: 7, noSpecReviewRunsDirect: 9, reviewRunsWithRound: 31 } }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n').filter((l) => /No-spec review runs in window/.test(l))
+  assert.equal(lines.length, 1, `report was:\n${result.report}`)
+  assert.ok(lines[0].includes('review runs with round=31'), `got: ${lines[0]}`)
+})
+
+test('optimise-cycle (HARN-OPT-4 T4, round 2 M1): the no-spec line renders a null reviewRunsWithRound as "not recorded", never 0', async () => {
+  const responses = baseResponses({
+    'lane:ledger': ledgerFixture({ rework: { ...ledgerFixture().rework, noSpecReviewRuns: 12, reviewRunsWithRound: null } }),
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => /No-spec review runs in window/.test(l))
+  assert.ok(line, `report was:\n${result.report}`)
+  assert.ok(line.includes('review runs with round=not recorded'), `got: ${line}`)
+})
+
+test('optimise-cycle (HARN-OPT-4 T4, round 2 M1): the schema_version >= 4 line prints review runs with round=41, null as "not recorded"', async () => {
+  const v4 = { rows: 2, excludedRows: 3, findingsTruncated: 41, unattributedFindings: 52, duplicateVerdictPairs: 63, noSpecReviewRuns: 74, noSpecReviewRunsConducted: 21, noSpecReviewRunsDirect: 22, noSpecReviewRunsRoundNotRecorded: 23 }
+  for (const [val, want] of [[47, 'review runs with round=47'], [null, 'review runs with round=not recorded']]) {
+    const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { ...ledgerFixture().rework, schemaV4: { ...v4, reviewRunsWithRound: val } } }) })
+    const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+    const lines = result.report.split('\n').filter((l) => l.includes('schema_version >= 4'))
+    assert.equal(lines.length, 1, `report was: ${result.report}`)
+    assert.ok(lines[0].includes(want), `got: ${lines[0]}`)
+  }
+})
