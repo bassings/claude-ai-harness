@@ -24,6 +24,14 @@ const MAX_ATTEMPTS = 3
 // part of the existing, publicly-documented return shape (AC-ARCH-10).
 const rounds = { test_attempts: 0, implement_attempts: 0 }
 
+// HARN-OPT-4 T5 (AC-OPS-5, AC-QA-17): why the run ended BLOCKED, one closed-enum
+// code per BLOCKED exit, set immediately before that exit's return. Kept
+// outside run() like `rounds`, so the publicly-documented return shapes are
+// untouched and no new return path appears (AC-QA-9). Stays null for a done or
+// aborted run. Visibility only: no escalated attempt, MAX_ATTEMPTS stays 3
+// (AC-SIMP-5).
+let blockedReason = null
+
 // harn-fix-4: both the Test and Implement phases below dispatch
 // agentType: 'implementer', and a null agent() result at either site
 // previously aborted with a bare "test-writer agent failed" / "implementer
@@ -285,6 +293,7 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   if (red.red && red.right_reason) break
   log(`RED gate rejected attempt ${attempt}: ${red.evidence.slice(0, 200)}`)
   if (attempt === MAX_ATTEMPTS) {
+    blockedReason = 'test_attempt_cap'
     return { verdict: 'BLOCKED', reason: 'Could not produce a test that fails for the right reason after ' + MAX_ATTEMPTS + ' attempts. The task may be untestable as stated; that is a design finding, not a retry candidate.', last_evidence: red.evidence }
   }
 }
@@ -343,11 +352,15 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   )
   if (!green) return { verdict: 'ABORTED', reason: 'GREEN verifier failed' }
   if (green.hashes_match === false) {
+    // Checked before the attempt-cap exit below, so a mismatch on the last
+    // attempt is tests_modified, never the cap value (AC-QA-17).
+    blockedReason = 'tests_modified'
     return { verdict: 'BLOCKED', reason: 'Test files changed between RED and GREEN: the test was altered to pass. Nothing is committed; review the working tree by hand.', evidence: green.evidence }
   }
   if (green.green && green.suite_green) break
   log(`GREEN gate rejected attempt ${attempt}: ${green.evidence.slice(0, 200)}`)
   if (attempt === MAX_ATTEMPTS) {
+    blockedReason = 'implement_attempt_cap'
     return { verdict: 'BLOCKED', reason: MAX_ATTEMPTS + ' implementation attempts did not go green. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.', last_evidence: green.evidence }
   }
 }
@@ -413,10 +426,25 @@ const telemetry = {
   spec: opts.spec || null,
   budget_spent: readBudgetSpent(),
   rounds: { test_attempts: rounds.test_attempts, implement_attempts: rounds.implement_attempts },
+  // Always present, null unless the run ended blocked (AC-OPS-5). Only the
+  // enum code goes on the line: never verifier evidence or test output
+  // (AC-SEC-8).
+  blocked_reason: OUTCOME_BY_VERDICT[result.verdict] === 'blocked' ? blockedReason : null,
 }
 const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
-const terminalWrite = await writeLedger(terminalEntry)
+let terminalWrite = await writeLedger(terminalEntry)
+// HARN-OPT-4 T5 (AC-DATA-2, as amended): an installed writer older than this
+// file refuses blocked_reason as "not an allowed property", which would cost
+// the whole terminal row. Retry ONCE without the new key so the blocked or done
+// row still lands; any other refusal, and a refusal of the retry, is final and
+// reported through the write_ok:false consumer below. Placed after the
+// byte-identical exception guard, not inside it. T8 copies this shape.
+if (!terminalWrite.write_ok && /blocked_reason/.test(String(terminalWrite.write_error)) && /not an allowed property/.test(String(terminalWrite.write_error))) {
+  log(`Terminal ledger write refused blocked_reason (installed writer predates it); retrying once without it: ${redactLogText(String(terminalWrite.write_error))}`)
+  const { blocked_reason, ...retryEntry } = terminalEntry
+  terminalWrite = await writeLedger(retryEntry)
+}
 // 2026-08-18: give write_ok:false a CONSUMER -- see plan-cycle.js for the
 // full rationale. It was computed, logged and returned to nobody, so the
 // ledger stopped recording on 2026-08-12 and nothing noticed for six days.

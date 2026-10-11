@@ -298,6 +298,9 @@ const LEDGER_LANE_SCHEMA = {
     perRepo: { type: 'array', items: { type: 'object' } },
     skipped: { type: 'array', items: { type: 'object' } },
     rework: { type: 'object' },
+    // HARN-OPT-4 T5 (AC-QA-18): not in `required`, so a stale installed reader
+    // that predates it still passes the lane; the report then says "not measured".
+    blockedUnresolved: { type: 'object' },
     neverFailingAcs: { type: 'array', items: { type: 'object' } },
     wallClock: { type: 'object' },
     triggerAccuracy: { type: 'object' },
@@ -695,6 +698,7 @@ const reportMarkdown = buildReport({
   repoLabels,
   rework: ledgerAgg ? ledgerAgg.rework : null,
   neverFailingAcs: ledgerAgg ? ledgerAgg.neverFailingAcs : [],
+  blockedUnresolved: ledgerAgg ? ledgerAgg.blockedUnresolved : undefined,
   wallClock: ledgerAgg ? ledgerAgg.wallClock : null,
   triggerAccuracy: ledgerAgg ? ledgerAgg.triggerAccuracy : null,
   ciByJob: ciAgg ? ciAgg.byJob : {},
@@ -1066,6 +1070,23 @@ function buildReport(d) {
     }
   } else {
     lines.push('No rework data (ledger unavailable).')
+  }
+  // HARN-OPT-4 T5 (AC-QA-18, AC-DATA-9): blocked TDD runs with no later
+  // done row for the same (repo, spec, task), from ledger rows alone. An upper
+  // bound: a task finished by hand leaves no resolution row. A missing object
+  // is a stale reader and prints "not measured", never a confident 0.
+  const bu = d.blockedUnresolved
+  const BLOCKED_LABEL = 'Blocked TDD runs unresolved in window (upper bound: a task finished by hand leaves no resolution row)'
+  if (bu && typeof bu.count === 'number') {
+    lines.push(`${BLOCKED_LABEL}: ${bu.count}`)
+    // Task text is ledger free text: collapse whitespace and bound it so a
+    // hostile task string cannot add lines or bulk to the report.
+    const oneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)
+    for (const u of Array.isArray(bu.unresolved) ? bu.unresolved : []) {
+      lines.push(`- ${oneLine(u.repo)} ${oneLine(u.spec)} ${oneLine(u.task)}: ${oneLine(u.reason)}`)
+    }
+  } else {
+    lines.push(`${BLOCKED_LABEL}: not measured (installed reader predates this metric)`)
   }
   lines.push('')
 

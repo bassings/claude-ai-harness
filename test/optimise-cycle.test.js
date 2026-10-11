@@ -3,6 +3,7 @@
 // responses, exactly like the three PR1 workflows' own test files.
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
@@ -1799,4 +1800,63 @@ test('optimise-cycle (HARN-OPT-4 T4, round 2 M1): the schema_version >= 4 line p
     assert.equal(lines.length, 1, `report was: ${result.report}`)
     assert.ok(lines[0].includes(want), `got: ${lines[0]}`)
   }
+})
+
+// HARN-OPT-4 T5 (AC-QA-18, AC-DATA-9, AC-OPS-17): the blocked-unresolved
+// section. The reader hands the report `blockedUnresolved` at the top level of
+// the ledger lane: { count, unresolved: [{ repo, spec, task, reason }], ... },
+// where reason is an enum code or the string 'not recorded' for a pre-T5 row.
+const BLOCKED_LABEL = 'Blocked TDD runs unresolved in window (upper bound: a task finished by hand leaves no resolution row)'
+function blockedFixture() {
+  return {
+    count: 3,
+    unresolved: [
+      // Shaped like a blocked task finished by hand: a blocked row, no further row.
+      { repo: 'demo', spec: 'specs/a11y.md', task: 'A11Y-002 contrast tokens', reason: 'implement_attempt_cap' },
+      { repo: 'demo', spec: 'specs/a11y.md', task: 'A11Y-003 focus ring', reason: 'tests_modified' },
+      { repo: 'demo', spec: 'specs/old.md', task: 'legacy pre-T5 task', reason: 'not recorded' },
+    ],
+    byReason: { test_attempt_cap: 0, implement_attempt_cap: 1, tests_modified: 1 },
+    reasonNotRecorded: 1,
+  }
+}
+
+test('optimise-cycle (HARN-OPT-4 T5, AC-QA-18): prints the labelled unresolved count as an exact label: value line', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ blockedUnresolved: blockedFixture() }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n').filter((l) => l.includes(BLOCKED_LABEL))
+  assert.equal(lines.length, 1, `expected exactly one label line, report was:\n${result.report}`)
+  assert.ok(lines[0].endsWith(`${BLOCKED_LABEL}: 3`), `got: ${lines[0]}`)
+})
+
+test('optimise-cycle (HARN-OPT-4 T5, AC-QA-18): one line per unresolved task names its spec, task and reason; a pre-T5 row reads "not recorded", never a code', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ blockedUnresolved: blockedFixture() }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n')
+  const a11y = lines.filter((l) => l.includes('A11Y-002 contrast tokens'))
+  assert.equal(a11y.length, 1, `report was:\n${result.report}`)
+  assert.ok(a11y[0].includes('specs/a11y.md') && a11y[0].includes('implement_attempt_cap'), `got: ${a11y[0]}`)
+  assert.ok(!a11y[0].includes('tests_modified'), `got: ${a11y[0]}`)
+  const focus = lines.filter((l) => l.includes('A11Y-003 focus ring'))
+  assert.equal(focus.length, 1)
+  assert.ok(focus[0].includes('tests_modified') && !focus[0].includes('implement_attempt_cap'), `got: ${focus[0]}`)
+  const legacy = lines.filter((l) => l.includes('legacy pre-T5 task'))
+  assert.equal(legacy.length, 1)
+  assert.ok(legacy[0].includes('specs/old.md') && legacy[0].includes('not recorded'), `got: ${legacy[0]}`)
+  assert.ok(!/test_attempt_cap|implement_attempt_cap|tests_modified/.test(legacy[0]), `got: ${legacy[0]}`)
+})
+
+test('optimise-cycle (HARN-OPT-4 T5, AC-QA-18): a measured zero prints ": 0" with no task lines', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ blockedUnresolved: { count: 0, unresolved: [], byReason: { test_attempt_cap: 0, implement_attempt_cap: 0, tests_modified: 0 }, reasonNotRecorded: 0 } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n').filter((l) => l.includes(BLOCKED_LABEL))
+  assert.equal(lines.length, 1, `report was:\n${result.report}`)
+  assert.ok(lines[0].endsWith(`${BLOCKED_LABEL}: 0`), `got: ${lines[0]}`)
+})
+
+test('optimise-cycle (HARN-OPT-4 T5): the ledger lane output schema declares blockedUnresolved', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8')
+  const start = src.indexOf('const LEDGER_LANE_SCHEMA')
+  const block = src.slice(start, src.indexOf('\n}\n', start))
+  assert.ok(block.includes('blockedUnresolved'), 'the lane schema must carry blockedUnresolved')
 })

@@ -244,7 +244,16 @@ It states, every run, in this order:
    one unmeasured attempt reports `null`, not a misleadingly measured-
    looking zero (AC-OPS-3).
 3. **Rework attribution** and **never-failing acceptance criteria**
-   (source: ledger).
+   (source: ledger). The rework section ends with **blocked unresolved**:
+   TDD runs that ended blocked and have no later done run for the same
+   repo, spec and task, one line each with the reason code (`test_attempt_cap`,
+   `implement_attempt_cap` or `tests_modified`), or "not recorded" for a run
+   from before the code existed. It is an **upper bound**: a task finished
+   by hand leaves no resolution row in the ledger, so a listed task may
+   already be done. Next step: for each line, check whether the task landed
+   (git log, the plan file); if it did not, that task is waiting on a
+   decision, and the reason code says which kind. A count that stays high
+   week on week is the signal, not a single line.
 4. **Trigger accuracy** (source: ledger), with an unmeasured `trigger_count`
    bucketed separately from both "nothing in scope" and "examined and
    found nothing".
