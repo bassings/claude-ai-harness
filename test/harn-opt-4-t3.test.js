@@ -143,7 +143,7 @@ test('T3 truncation: a truncated verdict array taints its bucket and no never-fa
 
 test('T3 split: figures are computed for schema_version >= 4 rows alone, with older rows reported as excluded by count', () => {
   const v3 = review('a', [V('AC-QA-1', 'PASS'), V('AC-QA-1', 'FAIL')], { schema_version: 3, findings_truncated: 5, findings: [{ id: 'x', lens: 'lens-qa+lens-security', disposition: 'open' }] })
-  const v4 = review('b', [V('AC-QA-1', 'PASS'), V('AC-QA-1', 'PASS'), V('AC-QA-2', 'PASS'), V('AC-QA-2', 'FAIL')], { findings_truncated: 2, findings: [{ id: 'y', lens: 'lens-qa+lens-security', disposition: 'open' }] })
+  const v4 = review('b', [V('AC-QA-1', 'PASS'), V('AC-QA-1', 'PASS'), V('AC-QA-2', 'PASS'), V('AC-QA-2', 'FAIL'), V('AC-QA-3', 'PASS')], { findings_truncated: 2, findings: [{ id: 'y', lens: 'lens-qa+lens-security', disposition: 'open' }] })
   const v4NoSpec = review('c', [], { spec: null })
   const rework = mod.aggregateRework([v3, v4, v4NoSpec])
   assert.deepEqual(rework.schemaV4, { rows: 2, excludedRows: 1, findingsTruncated: 2, unattributedFindings: 1, duplicateVerdictPairs: 2, noSpecReviewRuns: 1 })
@@ -239,4 +239,48 @@ test('T3 round 1 L2: three identical verdicts for one (run, ac_id) are one dupli
   const src = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8')
   assert.ok(src.includes('duplicate verdict groups collapsed='))
   assert.ok(!src.includes('duplicate verdict pairs collapsed'))
+})
+
+// ---- round 2 fix: singleton groups, conducted-review outcomes, cross-record dedup ----
+
+test('T3 round 2 M1: a v4 row with one singleton ac_id and one duplicated ac_id gives exactly one duplicate group (AC-QA-30)', () => {
+  const rework = mod.aggregateRework([review('r1', [V('AC-QA-3', 'PASS'), V('AC-QA-15', 'PASS'), V('AC-QA-15', 'FAIL')])])
+  assert.equal(rework.schemaV4.duplicateVerdictPairs, 1)
+  const onlySingle = mod.aggregateRework([review('r2', [V('AC-QA-3', 'PASS')])])
+  assert.equal(onlySingle.schemaV4.duplicateVerdictPairs, 0)
+})
+
+test('T3 round 2 L1: only done and blocked rows are conducted reviews; started, aborted and no-op rows count in no v4 figure and not in the window-wide no-spec count (AC-QA-30)', () => {
+  const rows = ['started', 'done', 'blocked', 'aborted', 'no-op'].map((outcome) => review(`run-${outcome}`, [], { spec: null, outcome }))
+  const rework = mod.aggregateRework(rows)
+  assert.equal(rework.schemaV4.rows, 2)
+  assert.equal(rework.schemaV4.excludedRows, 0)
+  assert.equal(rework.schemaV4.noSpecReviewRuns, 2)
+  assert.equal(rework.noSpecReviewRuns, 2)
+})
+
+test('T3 round 2 L2: two terminal rows for one (repo, run_id) carrying PASS and FAIL for one ac_id are one run: n=1, fail=1, one disagreement, one duplicate group (AC-QA-10, AC-DATA-7)', () => {
+  const rework = mod.aggregateRework([
+    review('same', [V('AC-QA-15', 'PASS')]),
+    review('same', [V('AC-QA-15', 'FAIL')], { outcome: 'blocked' }),
+  ])
+  const e = rework.acVerdicts.get(KEY)
+  assert.equal(e.n, 1)
+  assert.equal(e.fail, 1)
+  assert.equal(e.pass, 0)
+  assert.equal(rework.verdictDisagreements.get(KEY), 1)
+  assert.equal(rework.schemaV4.duplicateVerdictPairs, 1)
+})
+
+test('T3 round 2 L2: two rows with a null run_id are two runs, never merged: n=2, no disagreement, no duplicate group', () => {
+  const rework = mod.aggregateRework([
+    review(null, [V('AC-QA-15', 'PASS')]),
+    review(null, [V('AC-QA-15', 'FAIL')]),
+  ])
+  const e = rework.acVerdicts.get(KEY)
+  assert.equal(e.n, 2)
+  assert.equal(e.fail, 1)
+  assert.equal(e.pass, 1)
+  assert.equal(rework.verdictDisagreements.get(KEY) || 0, 0)
+  assert.equal(rework.schemaV4.duplicateVerdictPairs, 0)
 })
