@@ -367,7 +367,8 @@ test('tdd-task.js: telemetry.budget_spent is null (not 0) when no budget is supp
 })
 
 test('tdd-task.js: telemetry.budget_spent reflects budget.spent() when supplied', async () => {
-  const { result } = await runWorkflow(WF, { args: { task: 'x' }, agent: DONE_AGENT, budget: { spent: () => 5000 } })
+  const { result } = await runWorkflow(WF, { args: { task: 'x' }, agent: DONE_AGENT, budget: { spent: (() => { const r = [1000, 6000]; let i = 0; return () => r[Math.min(i++, 1)] })() } })
+  // HARN-OPT-4 T8: budget_spent is a per-run delta (end minus start), so a stateful stub is needed.
   assert.equal(result.telemetry.budget_spent, 5000)
 })
 
