@@ -71,6 +71,10 @@
     "null"
   ],
   "repo": "string",
+  "round": [
+    "integer",
+    "null"
+  ],
   "round_key": [
     "string",
     "null"
