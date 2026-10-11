@@ -1394,11 +1394,15 @@ export function aggregateProposalOutcomes(records) {
     // comparison (which would be wrong across a DST boundary or a mixed
     // timestamp format) -- ledger append order is the correct ordering.
     const lastRejectionTs = bucket.rejected.length ? bucket.rejected[bucket.rejected.length - 1] : null
+    // Round 1 F1 (AC-PROD-8, AC-DATA-14): adoption was recorded but never
+    // read; the report needs its date. Same append-order rule as above.
+    const lastAdoptionTs = bucket.adopted.length ? bucket.adopted[bucket.adopted.length - 1] : null
     out.set(id, {
       adoptedCount: bucket.adopted.length,
       rejectedCount: bucket.rejected.length,
       revertedCount: bucket.reverted.length,
       lastRejectionTs,
+      lastAdoptionTs,
       revertedTwiceOrMore: bucket.reverted.length >= 2,
     })
   }
@@ -1915,6 +1919,16 @@ export function main() {
     // changed path to the wrong commit.
     const commits = parseGitLogRaw(typeof payload.git_log_raw === 'string' ? payload.git_log_raw : '')
     const root = typeof payload.root === 'string' && payload.root ? payload.root : process.cwd()
+    // Round 1 F5 (AC-SEC-10 integrity): the lane reports `git -C <root>
+    // rev-parse --show-toplevel`; if that is not this root (after realpath on
+    // both, fs only), git read an enclosing or different repo, so the figures
+    // are about the wrong history. Rejected with a reason, never figures, and
+    // the reason echoes no path.
+    if (typeof payload.toplevel === 'string' && payload.toplevel) {
+      let same = false
+      try { same = fs.realpathSync(payload.toplevel) === fs.realpathSync(root) } catch (e) { same = false }
+      if (!same) return { rejected: true, reason: 'git toplevel does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null }
+    }
     const config = resolveProductSourceExcludeGlobs(root)
     // HARN-OPT-4 T6 (AC-DATA-11, AC-SEC-10): attach the ledger repo identity
     // for this root, derived exactly as the ledger command derives perRepo[].root,

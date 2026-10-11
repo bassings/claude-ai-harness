@@ -149,7 +149,7 @@ function blockFor(section, labels, k) {
 
 // ==== (1) git lane per roster repo ====
 
-test('T6 git lane: runs once per scope.resolved entry, each prompt naming only that root as a literal cd target, never the CURRENT repo (AC-DATA-12, AC-SEC-10, AC-OPS-13)', async () => {
+test('T6 git lane: runs once per scope.resolved entry, each prompt naming only that root as a double-quoted git -C target, never the CURRENT repo (AC-DATA-12, AC-SEC-10, AC-OPS-13)', async () => {
   const { calls } = await run()
   const gitCalls = calls.filter((c) => c.opts.label === 'lane:git')
   assert.equal(gitCalls.length, 2, 'one git lane call per roster entry')
@@ -160,7 +160,10 @@ test('T6 git lane: runs once per scope.resolved entry, each prompt naming only t
     // which escaped only dots and slashes): a root is a filesystem path and
     // may carry any metacharacter, backslash included.
     const literal = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    assert.ok(new RegExp(`cd[^\\n]{0,20}${literal}`).test(p), `prompt ${i} uses ${root} as a literal cd target`)
+    // Round 1 F5: ONE command with the root double-quoted, not a cd step whose
+    // directory change a later step could silently lose.
+    assert.ok(new RegExp(`git -C "${literal}" log`).test(p), `prompt ${i} runs git -C "${root}" log as one command`)
+    assert.ok(!/\bcd\s/.test(p), `prompt ${i} must not use a separate cd step`)
     for (const o of others) assert.ok(!p.includes(o), `prompt ${i} must not name another roster root`)
     assert.ok(!/CURRENT repo/.test(p), 'no CURRENT repo instruction')
   }
@@ -446,13 +449,35 @@ for (const flag of ['truncated', 'insufficientData', 'renameSuspect']) {
   })
 }
 
-test('T6 brake: the same fixed-key removal against a solid CI entry survives, and case or spacing in workflow/job does not defeat the lookup the gate relies on (AC-QA-21)', async () => {
-  const solid = { 'ci.yml::lint': { workflow: 'ci.yml', job: 'lint', n: 20, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: true, meanDurationS: 1 } }
-  const { result } = await run({
-    'lane:ci': ciFixture(solid),
-    'synthesis:proposals': { proposals: [proposal({ target: fixedTarget({ kind: 'ci_remove', workflow: 'ci.yml', job: 'lint' }), statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 20 })] },
+const removal = (job, extra = {}) => proposal({ target: fixedTarget({ kind: 'ci_remove', workflow: 'ci.yml', job, ...extra }), statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 20 })
+const ciEntry = (job, overrides = {}) => ({ workflow: 'ci.yml', job, n: 20, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: true, meanDurationS: 1, ...overrides })
+
+test('T6 brake: the CI lookup folds case and surrounding whitespace on the proposal side, so a weak entry still drops a removal that spells the job differently, and a solid entry still lets it through (AC-QA-21, round 1 F2)', async () => {
+  const weak = await run({
+    'lane:ci': ciFixture({ 'ci.yml::Lint': ciEntry('Lint', { insufficientData: true }) }),
+    'synthesis:proposals': { proposals: [removal(' LINT ')] },
   })
-  assert.equal(result.proposals_ranked.length, 1)
+  assert.equal(weak.result.proposals_ranked.length, 0, 'the fold must find the weak entry; an exact-key lookup waves the removal through')
+  assert.match(weak.result.report, /Dropped \(cited CI job is insufficient-data\/truncated\/rename-suspect\): 1\b/)
+  const workflowCase = await run({
+    'lane:ci': ciFixture({ 'CI.yml::Lint': ciEntry('Lint', { workflow: 'CI.yml', truncated: true }) }),
+    'synthesis:proposals': { proposals: [removal(' lint\t')] },
+  })
+  assert.equal(workflowCase.result.proposals_ranked.length, 0, 'the entry side is folded too, workflow included')
+  const solid = await run({
+    'lane:ci': ciFixture({ 'ci.yml::Lint': ciEntry('Lint') }),
+    'synthesis:proposals': { proposals: [removal(' LINT ')] },
+  })
+  assert.equal(solid.result.proposals_ranked.length, 1, 'a solid entry found through the fold lets the removal survive')
+})
+
+test('T6 brake: a removal-shaped proposal whose workflow/job names no CI aggregate entry fails closed into the weak-evidence count (AC-QA-21, round 1 F2)', async () => {
+  const { result } = await run({
+    'lane:ci': ciFixture({ 'ci.yml::lint': ciEntry('lint') }),
+    'synthesis:proposals': { proposals: [removal('no-such-job')] },
+  })
+  assert.equal(result.proposals_ranked.length, 0, 'no evidence is weak evidence for a removal')
+  assert.match(result.report, /Dropped \(cited CI job is insufficient-data\/truncated\/rename-suspect\): 1\b/)
 })
 
 // ==== stableProposalId over the fixed key set ====
@@ -557,4 +582,158 @@ test('T6 scope: no install-consistency check in optimise-cycle.js, no new workfl
   assert.deepEqual(argNames, ['repos', 'window'], 'no new workflow argument')
   const readerSrc = fs.readFileSync(MODULE_PATH, 'utf8')
   assert.ok(!/child_process|execSync|execFileSync|spawnSync|\bspawn\(/.test(readerSrc), 'reader functions run no subprocess')
+})
+
+// ==== review round 1 fixes (PR #9): F1 to F6 ====
+
+const outcome = (overrides = {}) => ({ adoptedCount: 0, rejectedCount: 0, revertedCount: 0, lastRejectionTs: null, lastAdoptionTs: null, revertedTwiceOrMore: false, ...overrides })
+// An ids step that returns the REAL derived id for each target, so a ledger
+// fixture keyed by stableProposalId(target) is found by the annotation.
+const realIdsResponder = (prompt) => ({ ids: extractTargets(prompt).map((t) => ({ target: t, proposal_id: reader.stableProposalId(t) })) })
+function rankedSection(report) {
+  const start = report.indexOf('## Proposals (ranked)')
+  assert.ok(start >= 0, 'report has the ranked proposals section')
+  const rest = report.slice(start)
+  const end = rest.indexOf('\n## ', 5)
+  return end < 0 ? rest : rest.slice(0, end)
+}
+function extractBlock(prompt, label) {
+  const m = new RegExp(`<UNTRUSTED-DATA-([^\\s>]+) label="${label}">\\n([\\s\\S]*?)\\n</UNTRUSTED-DATA-\\1>`).exec(prompt)
+  return m ? m[2] : null
+}
+
+// ---- F1 (AC-PROD-8 clause 2, AC-DATA-14): adoption is read, not just recorded ----
+
+test('T6 round 1 F1: aggregateProposalOutcomes exports lastAdoptionTs, the last adoption in append order, null when none (AC-PROD-8)', () => {
+  const ev = (event, n, ts) => ({ kind: 'conduct_plan_event', event, event_key: `pid1:${event}:${n}`, ts })
+  const out = reader.aggregateProposalOutcomes([
+    ev('proposal_adopted', 1, '2026-09-01T00:00:00.000Z'),
+    ev('proposal_adopted', 2, '2026-08-01T00:00:00.000Z'), // appended later, so it is the last by ledger order
+    { ...ev('proposal_rejected', 1, '2026-10-01T00:00:00.000Z'), event_key: 'pid2:proposal_rejected:1' },
+  ])
+  assert.equal(out.get('pid1').lastAdoptionTs, '2026-08-01T00:00:00.000Z')
+  assert.equal(out.get('pid2').lastAdoptionTs, null, 'a rejection-only proposal has no adoption date')
+})
+
+test('T6 round 1 F1: a re-proposed target whose id already has a proposal_adopted event is reported "Already adopted on <ts>" under its own heading and is not ranked as new (AC-PROD-8, AC-DATA-14)', async () => {
+  const adopted = fixedTarget({ kind: 'trigger_tune', component: 'lens-operability', concern: 'trigger glob', lens: 'lens-operability' })
+  const fresh = fixedTarget({ kind: 'ci_note', component: 'fresh-thing', concern: 'noise' })
+  const id = reader.stableProposalId(adopted)
+  const { result } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: '2026-09-01T00:00:00.000Z' }) } },
+    'synthesis:proposals': { proposals: [proposal({ target: adopted, statement: 'Narrow the lens-operability trigger glob' }), proposal({ target: fresh, statement: 'Silence the noisy note' })] },
+    'synthesis:ids': realIdsResponder,
+  })
+  assert.match(result.report, /Already adopted on 2026-09-01T00:00:00\.000Z/)
+  assert.match(result.report, /^## Proposals previously adopted \(not ranked as new\)$/m)
+  const ranked = rankedSection(result.report)
+  assert.ok(!ranked.includes(id), 'the adopted proposal is not in the ranked list')
+  assert.ok(ranked.includes('Silence the noisy note'), 'precondition: an unadopted proposal is still ranked')
+  const afterHeading = result.report.slice(result.report.indexOf('## Proposals previously adopted (not ranked as new)'))
+  assert.ok(afterHeading.split('\n## ')[0].includes(id), 'the adopted proposal is listed under the separate heading')
+})
+
+// ---- F3 (AC-PROD-8 clause 2): the drafter is shown prior targets so it can reuse one exactly ----
+
+test('T6 round 1 F3: the synthesis prompt carries the fixed-key target of every proposal with an outcome event inside its own nonce-wrapped prior-proposal-targets block, with the reuse-exactly instruction (AC-PROD-8)', async () => {
+  const adopted = fixedTarget({ kind: 'trigger_tune', component: 'zeta-prior', concern: 'glob', lens: 'lens-operability' })
+  const rejected = fixedTarget({ kind: 'ci_note', component: 'eta-prior', concern: 'noise' })
+  const { calls } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: {
+      [reader.stableProposalId(adopted)]: outcome({ adoptedCount: 1, lastAdoptionTs: '2026-09-01T00:00:00.000Z', target: adopted }),
+      [reader.stableProposalId(rejected)]: outcome({ rejectedCount: 1, lastRejectionTs: '2026-09-02T00:00:00.000Z', target: rejected }),
+    } },
+  })
+  const prompt = calls.find((c) => c.opts.label === 'synthesis:proposals').prompt
+  const block = extractBlock(prompt, 'prior-proposal-targets')
+  assert.ok(block, 'the prompt has a nonce-wrapped prior-proposal-targets block')
+  for (const t of [adopted, rejected]) {
+    assert.ok(block.includes(`"component":"${t.component}"`), `the block carries ${t.component}'s fixed-key target`)
+    assert.ok(block.includes(`"concern":"${t.concern}"`))
+  }
+  assert.ok(!prompt.replace(block, '').includes('zeta-prior'), 'the prior target appears only inside the data block, never as bare instruction text')
+  assert.match(prompt, /prior-proposal-targets[\s\S]*reuse[\s\S]*exactly|reuse[\s\S]*exactly[\s\S]*prior-proposal-targets/i, 'the prompt tells the drafter to reuse a prior target exactly so the id matches')
+})
+
+test('T6 round 1 F3: an outcome whose target is not known carries the id and says so, and no outcomes means no empty-claim block content (AC-PROD-8)', async () => {
+  const { calls } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { abcdef0123456789: outcome({ adoptedCount: 1, lastAdoptionTs: '2026-09-01T00:00:00.000Z' }) } },
+  })
+  const block = extractBlock(calls.find((c) => c.opts.label === 'synthesis:proposals').prompt, 'prior-proposal-targets')
+  assert.ok(block && block.includes('abcdef0123456789'), 'the id is carried')
+  assert.match(block, /target[^"]*unknown|unknown[^"]*target|not recorded|not known/i, 'the block says the target is not known')
+})
+
+// ---- F4 (AC-SEC-10): agent text is redacted before it reaches the report or the synthesis block ----
+
+test('T6 round 1 F4: a forged entry whose repo is another roster root, and a matched entry whose method text carries a root or an absolute path, leave no root string in the report or the synthesis prompt (AC-SEC-10)', async () => {
+  const perRoot = goodPair()
+  // Forged: lane alpha answers about index 1 and names beta's ROOT as its repo.
+  perRoot[ALPHA] = { repos: [entry(1, BETA, { count: 999, n_commits_examined: 888 })] }
+  // Matched: beta's genuine entry, but the agent-supplied prose names both roots and a home path.
+  perRoot[BETA] = { repos: [entry(1, 'beta-repo', { count: 7, n_commits_examined: 350, method: `heuristic, see ${ALPHA} and /Users/someone/secret/dir`, scoped_method: `scoped in ${BETA}/sub` })] }
+  const { result, calls } = await run({ 'lane:git': gitResponder(perRoot) })
+  const section = escapedSection(result.report)
+  assert.match(blockFor(section, ['alpha-repo', 'beta-repo'], 1), /\b7 of 350\b/, 'precondition: the matched entry rendered, so the method lines ran')
+  assert.match(section, /unmatched/i, 'precondition: the forged entry was reported')
+  assert.ok(section.includes(REDACTED), 'the redaction marker stands where the path was')
+  for (const root of ROOTS) assert.ok(!result.report.includes(root), `${root} leaked into the report`)
+  assert.ok(!result.report.includes('/Users/someone'), 'an arbitrary absolute path is redacted too')
+  const prompt = calls.find((c) => c.opts.label === 'synthesis:proposals').prompt
+  const block = extractBlock(prompt, 'escaped-defect-heuristic')
+  assert.ok(block, 'precondition: the synthesis data block exists')
+  for (const root of ROOTS) assert.ok(!block.includes(root), `${root} leaked into the synthesis data block`)
+  assert.ok(!block.includes('/Users/someone'))
+})
+
+// ---- F5 (AC-SEC-10 integrity): one quoted command, and a toplevel check in the script ----
+
+test('T6 round 1 F5: the git lane prompt is ONE git -C "<root>" command per step and asks for the toplevel to pass through (AC-SEC-10)', async () => {
+  const { calls } = await run()
+  const p = calls.find((c) => c.opts.label === 'lane:git').prompt
+  assert.ok(p.includes(`git -C "${ALPHA}" rev-parse --show-toplevel`), 'the lane also reports the repo toplevel of that root')
+  assert.ok(p.includes('"toplevel"'), 'the toplevel is passed to the script in the JSON payload')
+  assert.ok(!/\bcd\s/.test(p), 'no separate cd step')
+})
+
+test('T6 round 1 F5: escaped-defects rejects a toplevel that is not the root (after realpath on both), as a rejected result with a reason and no figures; a matching or symlinked root still passes (AC-SEC-10)', () => {
+  const a = makeTempRepo(); const b = makeTempRepo()
+  commitFixes(a, 2)
+  assert.equal(runAppend(a, { schema_version: 1, kind: 'tdd_task', outcome: 'done' }).status, 0)
+  const raw = gitLogRaw(a)
+  const topOf = (d) => sh('git rev-parse --show-toplevel', d).trim()
+  // A different repo's toplevel: rejected.
+  const wrong = runCli('escaped-defects', { git_log_raw: raw, root: a, toplevel: topOf(b) })
+  assert.equal(wrong.out.rejected, true)
+  assert.equal(typeof wrong.out.reason, 'string'); assert.ok(wrong.out.reason.length > 0)
+  assert.ok(wrong.out.count == null && wrong.out.scoped_count == null, `no figures on a rejection: ${wrong.raw}`)
+  assert.ok(!wrong.raw.includes(a) && !wrong.raw.includes(b), 'the reason echoes no path')
+  // A root that is a subdirectory of the repo: git -C would have read the enclosing repo.
+  const sub = path.join(a, 'sub'); fs.mkdirSync(sub)
+  const nested = runCli('escaped-defects', { git_log_raw: raw, root: sub, toplevel: topOf(a) })
+  assert.equal(nested.out.rejected, true)
+  assert.ok(nested.out.count == null)
+  // Matching toplevel: figures as before.
+  const ok = runCli('escaped-defects', { git_log_raw: raw, root: a, toplevel: topOf(a) })
+  assert.ok(!ok.out.rejected); assert.equal(ok.out.count, 2)
+  // A symlinked root resolving to the same toplevel is equal after realpath.
+  const link = path.join(path.dirname(a), path.basename(a) + '-link')
+  fs.symlinkSync(a, link)
+  const viaLink = runCli('escaped-defects', { git_log_raw: raw, root: link, toplevel: topOf(a) })
+  assert.ok(!viaLink.out.rejected, `a symlinked root is the same directory: ${viaLink.raw}`); assert.equal(viaLink.out.count, 2)
+  fs.unlinkSync(link)
+})
+
+// ---- F6: the malformed-target line used a dead regex ----
+
+test('T6 round 1 F6: the malformed-target report line flattens through oneLine: one line, no injected heading, and a literal backslash-s in a key survives (the old /\\\\s+/ matched that, not whitespace)', async () => {
+  const evilKey = 'x\n## Injected heading\n' + 'K'.repeat(300)
+  const slashKey = 'a\\ssb'
+  const bad = { ...fixedTarget(), [evilKey]: 'v', [slashKey]: 'v' }
+  const { result } = await run({ 'synthesis:proposals': { proposals: [proposal({ target: bad })] } })
+  const lines = result.report.split('\n')
+  const line = lines.find((l) => l.startsWith('Proposals rejected: malformed target: 1'))
+  assert.ok(line, 'precondition: the malformed-target line rendered')
+  assert.ok(!lines.some((l) => l.startsWith('## Injected')), 'agent text must not open a heading')
+  assert.ok(line.includes(slashKey), `a literal backslash-s is not whitespace and must survive: ${line}`)
 })

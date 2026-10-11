@@ -425,15 +425,20 @@ const ciLanePrompt =
 const ciLane = () => agent(ciLanePrompt, { label: 'lane:ci', phase: 'Lanes', schema: CI_LANE_SCHEMA })
 
 // HARN-OPT-4 T6 (AC-DATA-12, AC-SEC-10, AC-OPS-13): one lane call per roster
-// entry, each naming exactly that entry's root as a literal `cd` target (the
-// roots have already passed SHELL_METACHAR_RE above), never "the CURRENT
-// repo", which reported the invoking repo's figure for every roster repo.
+// entry, each naming exactly that entry's root as a double-quoted `git -C`
+// target (the roots have already passed SHELL_METACHAR_RE above, which is
+// what makes the double quotes safe), never "the CURRENT repo", which
+// reported the invoking repo's figure for every roster repo.
+// Round 1 F5 (AC-SEC-10 integrity): ONE command, not a cd step whose failure
+// a later step would silently run past in the wrong directory; the lane also
+// reports the repo toplevel so the script can reject a root that is only a
+// subdirectory of, or a different repo from, what git actually read.
 const gitLanePrompt = (root, rootIndex) =>
-  `Run these in order: \`cd ${root}\`, then \`git log --max-count=500 --name-only --pretty=format:'%x1e%P%x1f%s'\`, and ` +
-  `capture its ENTIRE stdout verbatim, unmodified, character-for-character (never the diff, never file contents ` +
+  `Run these two commands, each exactly as written: \`git -C "${root}" log --max-count=500 --name-only --pretty=format:'%x1e%P%x1f%s'\`, and ` +
+  `\`git -C "${root}" rev-parse --show-toplevel\` (capture its stdout as the toplevel). Capture the log's ENTIRE stdout verbatim, unmodified, character-for-character (never the diff, never file contents ` +
   `-- this is metadata only: parent hashes, subject lines, and the paths of files each commit changed; this lane ` +
   `reads only this one repo's history and never another's). Find optimise-read.mjs the same way the other lanes do. Pipe exactly ` +
-  `\`{"git_log_raw": "<the entire git log output above, verbatim>", "root": "${root}"}\` as JSON ` +
+  `\`{"git_log_raw": "<the entire git log output above, verbatim>", "root": "${root}", "toplevel": "<the rev-parse output, verbatim>"}\` as JSON ` +
   `into \`node <path> escaped-defects\` -- do not parse, reformat, or summarise the git log output yourself; the ` +
   `script does all parsing and scoring, deterministically, from the raw text you pass it. Return a single-element ` +
   `\`repos\` array whose entry is exactly what it printed (including its \`repo\` field), plus root_index ${rootIndex} ` +
@@ -449,7 +454,22 @@ const [ledgerAgg, ciAgg, ...gitResults] = await parallel([ledgerLane, ciLane, ..
 // (never a path the agent supplies) AND by the ledger identity label the
 // ledger lane derived for that root. Anything else is reported as unmatched
 // with the reason, never merged into another repo's figure (AC-DATA-11).
-const flat = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)
+// Round 1 F4 (AC-SEC-10): every agent-supplied string is redacted BEFORE it is
+// flattened, bounded, or echoed: any substring equal to a roster root, and any
+// absolute path, becomes the same marker the reader uses for an unidentified
+// repo. ABSOLUTE_PATH_RE mirrors the one in workflows/lib/ledger-append.mjs
+// (a workflow script cannot import it). Redacting before the 120-char slice
+// stops a truncation leaving a root half-visible.
+const REDACTED_PATH_MARKER = '<redacted-path>'
+const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+const rootsLongestFirst = [...roots].sort((a, b) => b.length - a.length)
+const redact = (v) => {
+  let t = String(v)
+  for (const r of rootsLongestFirst) if (r) t = t.split(r).join(REDACTED_PATH_MARKER)
+  return t.replace(ABSOLUTE_PATH_RE, (whole, prefix) => `${prefix}${REDACTED_PATH_MARKER}`)
+}
+const redactDeep = (v) => (typeof v === 'string' ? redact(v) : Array.isArray(v) ? v.map(redactDeep) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactDeep(x)])) : v)
+const flat = (v) => redact(v).replace(/\s+/g, ' ').slice(0, 120)
 const gitPerRepo = scope.resolved.map(() => ({ status: 'failed', reason: 'git lane returned no result', figures: null }))
 const gitUnmatched = []
 const ledgerRepoLabel = (i) => (ledgerAgg && ledgerAgg.perRepo && ledgerAgg.perRepo[i] && typeof ledgerAgg.perRepo[i].root === 'string' ? ledgerAgg.perRepo[i].root : null)
@@ -477,7 +497,7 @@ gitResults.forEach((res, k) => {
       gitUnmatched.push(`roster repo ${k + 1}: result repo ${flat(e.repo)} does not match ledger repo ${flat(ledgerRepo)}; not used`)
       gitPerRepo[k] = { status: 'unmatched', reason: `repo mismatch (result ${flat(e.repo)}, ledger ${flat(ledgerRepo)})`, figures: null }
     } else {
-      gitPerRepo[k] = { status: 'ok', reason: null, figures: e }
+      gitPerRepo[k] = { status: 'ok', reason: null, figures: redactDeep(e) }
     }
   }
 })
@@ -490,6 +510,25 @@ const ledgerSufficient = ledgerN >= MIN_RECORDS_FOR_PROPOSALS
 const ledgerCitations = new Set((ledgerAgg && ledgerAgg.citationPool) || [])
 const ciCitations = new Set((ciAgg && ciAgg.citationPool) || [])
 const allCitations = new Set([...ledgerCitations, ...ciCitations])
+
+// Round 1 F3 (AC-PROD-8 clause 2): the id is stable only for identical target
+// words, so a drafter that has never seen an adopted or rejected target will
+// reword it and mint a new id. It is shown the fixed-key target of every
+// proposal with any outcome event, in its own nonce-wrapped data block, and
+// told to reuse one exactly. The ledger carries no target field (no schema
+// change this round), so a target the reader could not supply is carried as
+// its id with the fact stated, never invented.
+const priorTargetEntries = Object.entries((ledgerAgg && ledgerAgg.proposalOutcomes) || {}).slice(0, 50).map(([id, o]) => (
+  o && o.target && typeof o.target === 'object'
+    ? { proposal_id: redact(id), target: redactDeep(o.target) }
+    : { proposal_id: redact(id), target: null, note: 'target not recorded in the ledger; only the id is known' }
+))
+const priorTargetsSection = priorTargetEntries.length
+  ? wrapAsData(dataNonce, 'prior-proposal-targets', priorTargetEntries) +
+    `\nThe prior-proposal-targets block above lists proposals that already have a recorded outcome (adopted, rejected or ` +
+    `reverted). If one of your proposals is about the same target as one listed there, you must reuse that target's ` +
+    `eight fields exactly as listed, so the stable id matches and the report can annotate it instead of ranking it as new.\n\n`
+  : ''
 
 const synthesisPrompt =
   `You are drafting proposals for the harness delivery optimiser. Every proposal you draft is a HYPOTHESIS the ` +
@@ -508,6 +547,7 @@ const synthesisPrompt =
   `\n\n` +
   wrapAsData(dataNonce, 'plan-labels', scope.plan_labels) +
   `\n\n` +
+  priorTargetsSection +
   `Draft a ranked list of proposed changes to the harness, the pipelines, or the process (never apply anything -- ` +
   `you only propose). For EACH proposal, return: target (an object with EXACTLY these eight keys and no others, ` +
   `used to derive a stable id, never wording -- and mechanically checked by the orchestrator, so set them ` +
@@ -704,15 +744,28 @@ proposals = proposals.filter((p) => !isUnmeasuredSegmentMotivated(p))
 // removal case built on a window that could not have seen a failure, or a
 // job that may be a renamed continuation of one with its own unexamined
 // history, is exactly the unbraked-removal risk AC-DATA-8 exists to catch.
+// Round 1 F2 (AC-QA-21, spec bug): the lookup was an exact-key match, so a
+// case or spacing difference between the drafted workflow/job and the
+// aggregate's returned a null entry and waved a weakly evidenced removal
+// through. Both sides are folded with the same trim-plus-case-fold the
+// reader's identityValue uses (the entry's own workflow/job fields, not its
+// key), and a removal that names a job with NO entry fails closed below.
+const foldCiName = (v) => String(v == null ? '' : v).trim().toLowerCase()
 function ciJobEntryFor(target) {
   if (!target || !target.workflow || !target.job) return null
-  const key = `${target.workflow}::${target.job}`
-  return (ciAgg && ciAgg.byJob && ciAgg.byJob[key]) || null
+  const wf = foldCiName(target.workflow)
+  const job = foldCiName(target.job)
+  const entries = Object.values((ciAgg && ciAgg.byJob) || {})
+  return entries.find((e) => e && foldCiName(e.workflow) === wf && foldCiName(e.job) === job) || null
 }
 function isWeakCiEvidenceRemoval(p) {
   if (!isRemovalShaped(p)) return false
+  if (!p.target || !p.target.workflow || !p.target.job) return false
   const entry = ciJobEntryFor(p.target)
-  return !!(entry && (entry.insufficientData || entry.truncated || entry.renameSuspect))
+  // No evidence is weak evidence: a removal citing a job the aggregate does
+  // not know cannot claim "never failed".
+  if (!entry) return true
+  return !!(entry.insufficientData || entry.truncated || entry.renameSuspect)
 }
 const droppedWeakCiEvidence = proposals.filter(isWeakCiEvidenceRemoval)
 proposals = proposals.filter((p) => !isWeakCiEvidenceRemoval(p))
@@ -771,11 +824,16 @@ function annotateProposalOutcome(p) {
   const outcome = p.proposal_id && ledgerAgg && ledgerAgg.proposalOutcomes ? ledgerAgg.proposalOutcomes[p.proposal_id] : null
   if (!outcome) return p
   if (outcome.rejectedCount > 0) p.prior_rejection_ts = outcome.lastRejectionTs
+  // Round 1 F1 (AC-PROD-8, AC-DATA-14): adoption was recorded but never read.
+  if (outcome.adoptedCount > 0 && outcome.lastAdoptionTs) p.prior_adoption_ts = outcome.lastAdoptionTs
   if (outcome.revertedTwiceOrMore) p.reverted_twice = true
   return p
 }
 ranked.forEach(annotateProposalOutcome)
 insufficientDataProposals.forEach(annotateProposalOutcome)
+// An already-adopted target is reported under its own heading, not ranked as new.
+const rankedNew = ranked.filter((p) => !p.prior_adoption_ts)
+const previouslyAdopted = ranked.filter((p) => p.prior_adoption_ts)
 
 // Review round-1 M5: keyed by POSITION (matching `roots`, and therefore
 // `ledgerAgg.perRepo[].rootIndex`), not by the raw absolute root path --
@@ -846,7 +904,8 @@ const reportMarkdown = buildReport({
   })),
   droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
   malformedTargetReasons,
-  ranked,
+  ranked: rankedNew,
+  previouslyAdopted,
   insufficientDataProposals,
 })
 
@@ -898,7 +957,8 @@ return {
   report_written: !!(reportWrite && reportWrite.written),
   report_write_error: reportWriteError,
   proposal_ids_computed: proposalIdsComputed,
-  proposals_ranked: ranked,
+  proposals_ranked: rankedNew,
+  proposals_previously_adopted: previouslyAdopted,
   proposals_insufficient_data: insufficientDataProposals,
   report: reportMarkdown,
   __outcome: 'done',
@@ -1316,6 +1376,13 @@ function buildReport(d) {
     if (p.reverted_twice) lines.push('**Flagged: adopted and reverted at least twice previously (§12: keep the original).**')
   }
   lines.push('')
+  lines.push('## Proposals previously adopted (not ranked as new)')
+  if (!(d.previouslyAdopted || []).length) lines.push('None.')
+  for (const p of d.previouslyAdopted || []) {
+    lines.push(`### ${p.proposal_id || '(no id)'}: ${p.statement}`)
+    lines.push(`Already adopted on ${p.prior_adoption_ts}.`)
+  }
+  lines.push('')
   lines.push('## Proposals (insufficient data, excluded from ranking)')
   if (!d.insufficientDataProposals.length) lines.push('None.')
   for (const p of d.insufficientDataProposals) lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
@@ -1367,8 +1434,9 @@ function buildReport(d) {
     `Dropped (motivating wall-clock segment has unmeasured runs${unmeasuredSegmentDetail ? ` -- ${unmeasuredSegmentDetail}` : ''}): ${d.droppedUnmeasuredSegmentCount || 0}. ` +
     `Dropped (cited CI job is insufficient-data/truncated/rename-suspect): ${d.droppedWeakCiEvidenceCount || 0}.`
   )
-  // HARN-OPT-4 T6 (AC-QA-20): named, not merely counted.
-  lines.push(`Proposals rejected: malformed target: ${(d.malformedTargetReasons || []).length}${(d.malformedTargetReasons || []).length ? ` (${d.malformedTargetReasons.map((r) => r.replace(/\\s+/g, ' ').slice(0, 160)).join(' | ')})` : ''}`)
+  // HARN-OPT-4 T6 (AC-QA-20): named, not merely counted. Round 1 F6: this used
+  // a dead /\\s+/g (a literal backslash-s), so multi-line reasons passed through.
+  lines.push(`Proposals rejected: malformed target: ${(d.malformedTargetReasons || []).length}${(d.malformedTargetReasons || []).length ? ` (${d.malformedTargetReasons.map((r) => oneLine(r)).join(' | ')})` : ''}`)
   return lines.join('\n')
 }
 
