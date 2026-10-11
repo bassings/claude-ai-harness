@@ -51,7 +51,7 @@ import { fileURLToPath } from 'node:url'
 // spec_bug count could be a real one or D4's conflation of "no spec" with
 // "the spec has a bug". The reader already tallies schema_version and rejects
 // no version, so the bump costs nothing and makes the two readable apart.
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 
 // Hard-coded and not configurable (AC-SIMP-2): resolved against the MAIN
 // checkout root (never a worktree's own .claude/) via `git rev-parse
@@ -82,7 +82,14 @@ export const MAX_LINE_BYTES = 16384
 // findings that DID fit are kept and findings_truncated records the rest,
 // rather than the whole line silently failing to write once the count
 // alone pushes it over MAX_LINE_BYTES.
-export const MAX_FINDINGS = 15
+//
+// HARN-OPT-4 T2: raised from 15 to 60. The busiest review measured in this
+// repo's ledger carried 50 findings at a maximum of about 144 bytes each,
+// which with 96 ac_verdicts still sits well inside MAX_LINE_BYTES, so the
+// old cap was discarding attributed findings the line had room for. The
+// byte-rescue loop in main() is untouched and still bounds the line when
+// findings are larger than that.
+export const MAX_FINDINGS = 60
 
 // H4: a defensive bound on ac_verdicts, mirroring MAX_FINDINGS's shape
 // rather than its expected frequency of use.
@@ -98,6 +105,39 @@ export const MAX_AC_VERDICTS = 200
 // considered, bounded exposure, not the zero-free-text guarantee the field
 // otherwise holds.
 export const AC_ID_RAW_MAX_BYTES = 32
+
+// HARN-OPT-4 T1: the lens names a compound label may be resolved to. These
+// mirror the files in agents/; a name missing here costs attribution (the
+// finding reads as unattributed), never the record.
+const ROSTER_LENSES = new Set([
+  'lens-security', 'lens-qa', 'lens-simplicity', 'lens-product', 'lens-design',
+  'lens-accessibility', 'lens-architecture', 'lens-data', 'lens-operability',
+  'reviewer-verification', 'reviewer-experience',
+])
+
+// Longest label the compound parser will look at, in characters. Applied
+// BEFORE any regex (AC-SEC-2): a 100,000-character label of repeated
+// separators must cost a bounded amount of work, so everything past this is
+// simply never read. Far longer than any real compound of roster names.
+export const LENS_LABEL_PARSE_MAX_CHARS = 256
+
+// HARN-OPT-4 T1 (AC-QA-1, AC-QA-2, AC-SEC-1): resolves a compound lens label
+// ('a + b', 'a, b', 'a and b') to the FIRST roster lens it names, or null.
+// Without it every such finding wrote lens null and was counted as
+// unattributed. A control character, backtick or pipe anywhere in the
+// inspected text yields null (the label is not trusted at all); otherwise
+// only an exact roster name, once trimmed, can win, so the text of any other
+// segment (an injected instruction, say) is never copied anywhere.
+export function parseCompoundLensLabel(label) {
+  if (typeof label !== 'string') return null
+  const s = label.slice(0, LENS_LABEL_PARSE_MAX_CHARS)
+  if (/[\u0000-\u001f\u007f`|]/.test(s)) return null
+  for (const segment of s.split(/\+|,|\s+and\s+/)) {
+    const name = segment.trim()
+    if (ROSTER_LENSES.has(name)) return name
+  }
+  return null
+}
 
 const KINDS = ['tdd_task', 'review_cycle', 'plan_cycle', 'conduct_plan_event']
 const OUTCOMES = ['done', 'blocked', 'aborted', 'no-op', 'started']
@@ -1031,9 +1071,24 @@ function computeFindings(descriptors, disposition) {
   if (!Array.isArray(descriptors)) return { entries: [], count: null }
   const entries = descriptors.map((f) => {
     if (!f || typeof f !== 'object') return null
+    // HARN-OPT-4 T1: a label that is not itself a valid lens name but names
+    // a roster lens in a compound is attributed to the first one. The id is
+    // still hashed from the ORIGINAL label (AC-QA-3), so a pre-T1 id keeps
+    // matching; the original label rides in lens_raw, which main() redacts
+    // and bounds exactly as degradeEntry does for any other nulled lens.
+    let lens = f.lens
+    let lensRaw
+    if (typeof lens === 'string' && !new RegExp(LENS_PATTERN_STR).test(lens)) {
+      const primary = parseCompoundLensLabel(lens)
+      if (primary !== null) {
+        lensRaw = lens.slice(0, LENS_LABEL_PARSE_MAX_CHARS)
+        lens = primary
+      }
+    }
     return {
       id: findingId(f.lens, f.location, f.claim),
-      lens: f.lens,
+      lens,
+      ...(lensRaw === undefined ? {} : { lens_raw: lensRaw }),
       severity: f.severity || 'Low',
       ac_id: f.ac_id || null,
       disposition,
@@ -2052,6 +2107,15 @@ export function main() {
       if (!v || typeof v !== 'object') continue
       if (v.ac_id === null) explicitNullAcVerdictAcId += 1
       if (v.verdict === null) explicitNullVerdict += 1
+    }
+  }
+
+  // HARN-OPT-4 T1: a compound label resolved by computeFindings carries its
+  // original text in lens_raw; redact then bound it here, where redactRawField
+  // is available, so it is no more exposed than a lens_raw degradeEntry writes.
+  if (Array.isArray(entry.findings)) {
+    for (const f of entry.findings) {
+      if (f && typeof f.lens_raw === 'string') f.lens_raw = truncateBytes(redactRawField(f.lens_raw), AC_ID_RAW_MAX_BYTES)
     }
   }
 
