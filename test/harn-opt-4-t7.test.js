@@ -616,3 +616,25 @@ test('T7 redaction: a CI row whose repo is a roster root and whose job name carr
   assert.ok(block && block.includes('lint'), 'precondition: the ci-aggregate block carries the row')
   assert.ok(!prompt.includes(ALPHA), 'no roster root anywhere in the synthesis prompt, keys included')
 })
+
+// ==== Review round 3 (conductor adjudication, 2026-10-12): three Lows fixed in place ====
+
+test('T7 duplicates (round 3 L1, AC-QA-23): a run the lane emits twice counts once, so three real runs cannot clear the minimum-runs floor and read as never failed', () => {
+  const runs = []
+  for (let i = 1; i <= 3; i++) {
+    const r = mkRun('a', 'CI', 100 + i, i, [['test', 'success', 5]])
+    runs.push(r, { ...r, jobs: r.jobs.map((j) => ({ ...j })) })
+  }
+  const out = ci(runs, { minRunsNeverFailed: 5 })
+  const row = rowFor(out, 'a', 'CI', 'test')
+  assert.ok(row, 'the row exists')
+  assert.equal(row.n, 3, `each run counts once: ${JSON.stringify(row)}`)
+  assert.equal(row.insufficientData, true, 'three runs are below the floor of five')
+  assert.equal(row.neverFailed, null, 'no never-failed claim on three runs')
+})
+
+test('T7 prompt (round 3 L5, AC-QA-32): the lane is told how to measure wall-clock, with `date +%s` before the first and after the last gh call per repo, not to estimate it', async () => {
+  const prompt = await lanePrompt()
+  assert.match(prompt, /date \+%s/, 'names the measurement')
+  assert.match(prompt, /before[^.]{0,80}first[^.]{0,40}gh[^.]{0,120}after[^.]{0,80}last/i, 'before the first gh call and after the last, per repo')
+})

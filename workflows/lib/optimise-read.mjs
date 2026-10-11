@@ -2013,10 +2013,13 @@ function runCiCommand(payload) {
     if (!validRunId(run.id)) continue
     const stats = repoStats[run.repo] || (repoStats[run.repo] = { notCompleted: 0, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } })
     const id = String(run.id)
-    if (!seen.has(id)) {
-      seen.add(id)
-      poolRuns.push({ id, repo: run.repo, completed: run.status === 'completed', t: typeof run.started_at === 'string' ? Date.parse(run.started_at) : NaN })
-    }
+    // Round 3 L1 (AC-QA-23): a run the lane emits twice (a retry after a rate
+    // limit, overlapping pages, a re-listing) counts once everywhere, not only
+    // in the pool; otherwise three real runs could clear the minimum-runs floor
+    // and read as never failed, and the removal brake trusts that floor.
+    if (seen.has(id)) continue
+    seen.add(id)
+    poolRuns.push({ id, repo: run.repo, completed: run.status === 'completed', t: typeof run.started_at === 'string' ? Date.parse(run.started_at) : NaN })
     // AC-OPS-10: an in-flight run has unsettled conclusions.
     if (run.status !== 'completed') {
       stats.notCompleted += 1

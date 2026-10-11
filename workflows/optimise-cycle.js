@@ -436,7 +436,8 @@ const ciLanePrompt =
   `For each run in a repo's own list, run \`gh run view <id> --json jobs\` from inside that repo's root, where <id> ` +
   `is that run's \`databaseId\` and MUST be all digits (0-9 and nothing else) and MUST come from THAT repo's own ` +
   `list; skip any run whose databaseId is not all digits, and never put any other text into the command. Count every ` +
-  `\`gh\` call you make per repo, and note each repo's elapsed wall-clock seconds. From each response keep only each ` +
+  `\`gh\` call you make per repo, and MEASURE each repo's wall-clock seconds rather than estimating them: run \`date +%s\` ` +
+  `before that repo's first gh call and again after its last, and report the difference (round 3 L5, AC-QA-32). From each response keep only each ` +
   `job's name, its conclusion, and its duration in seconds (completedAt minus startedAt). Build one entry per run: ` +
   `{repo: <the label>, workflow: <workflowName>, id: <databaseId>, attempt, status, started_at: <startedAt>, ` +
   `jobs: [{name, conclusion, duration_s}]}. If a per-run \`gh run view\` fails, still emit that run with \`jobs: []\` ` +

@@ -1645,13 +1645,18 @@ test('optimise-cycle: a gitleaks removal whose aggregate is neither insufficient
   assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
 })
 
-test('optimise-cycle: the same gitleaks removal with no reinstatement_evidence is dropped even with a clean aggregate (AC-SEC-13)', async () => {
+// Round 3 L2: this case is dropped by the reinstatement-evidence filter, not
+// by the security keyword gate (removing `gitleaks` from the keyword regex
+// leaves it green), so the assertion names that reason rather than claiming
+// the gate. The gate itself is pinned by the test above.
+test('optimise-cycle: the same gitleaks removal with no reinstatement_evidence is dropped by the reinstatement-evidence filter even with a clean aggregate (AC-SEC-13, round 3 L2)', async () => {
   const responses = baseResponses({
     'lane:ci': t7CiWith(t7GitleaksRow()),
     'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'Security', job: 'gitleaks' }, statement: 'Remove the scheduled gitleaks job', citations: ['1001'], reinstatement_evidence: null, n: 20 })] },
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 0)
+  assert.match(result.report, /Dropped \(removal without reinstatement evidence\): 1\b/, 'dropped for the stated reason, not by some other filter')
 })
 
 // ---- Review round-1 M7 (AC-DATA-10): a prior rejection is annotated (not silently re-raised); reverted-twice is flagged ----
