@@ -298,6 +298,9 @@ const LEDGER_LANE_SCHEMA = {
     perRepo: { type: 'array', items: { type: 'object' } },
     skipped: { type: 'array', items: { type: 'object' } },
     rework: { type: 'object' },
+    // HARN-OPT-4 T5 (AC-QA-18): not in `required`, so a stale installed reader
+    // that predates it still passes the lane; the report then says "not measured".
+    blockedUnresolved: { type: 'object' },
     neverFailingAcs: { type: 'array', items: { type: 'object' } },
     wallClock: { type: 'object' },
     triggerAccuracy: { type: 'object' },
@@ -695,6 +698,7 @@ const reportMarkdown = buildReport({
   repoLabels,
   rework: ledgerAgg ? ledgerAgg.rework : null,
   neverFailingAcs: ledgerAgg ? ledgerAgg.neverFailingAcs : [],
+  blockedUnresolved: ledgerAgg ? ledgerAgg.blockedUnresolved : undefined,
   wallClock: ledgerAgg ? ledgerAgg.wallClock : null,
   triggerAccuracy: ledgerAgg ? ledgerAgg.triggerAccuracy : null,
   ciByJob: ciAgg ? ciAgg.byJob : {},
@@ -1066,6 +1070,43 @@ function buildReport(d) {
     }
   } else {
     lines.push('No rework data (ledger unavailable).')
+  }
+  // HARN-OPT-4 T5 (AC-QA-18, AC-DATA-9): blocked TDD runs with no later
+  // done row for the same (repo, spec, task), from ledger rows alone. An upper
+  // bound: a task finished by hand leaves no resolution row. A missing object
+  // is a stale reader and prints "not measured", never a confident 0.
+  const bu = d.blockedUnresolved
+  const BLOCKED_LABEL = 'Blocked TDD runs unresolved in window (upper bound: a task finished by hand leaves no resolution row)'
+  if (bu && typeof bu.count === 'number') {
+    // Round 1 M1: the caveat also names re-briefed retries. The count line
+    // must stay the exact pinned `label: n` string, so the extra caveat is its
+    // own line ahead of it, and only when there is something listed.
+    if (bu.count > 0) lines.push('Blocked TDD runs unresolved in window may include a task re-briefed after a block and then finished (see the hint on each line); two briefs identical in their first 500 bytes can falsely clear each other (round 3 F4).')
+    lines.push(`${BLOCKED_LABEL}: ${bu.count}`)
+    // Round 3 F1 (AC-PROD-6): legacy rows (no blocked_reason key) can never
+    // resolve retroactively, so the headline alone reads as a trend that is
+    // stuck. The reader already splits recorded from not-recorded; render it
+    // on its own line so the pinned `label: n` line stays exact.
+    const recorded = bu.byReason && typeof bu.byReason === 'object'
+      ? Object.values(bu.byReason).reduce((acc, v) => acc + (typeof v === 'number' ? v : 0), 0)
+      : null
+    const notRecorded = typeof bu.reasonNotRecorded === 'number' ? bu.reasonNotRecorded : null
+    lines.push(`Blocked TDD runs unresolved, reason recorded (post-T5): ${recorded === null ? 'not recorded' : recorded}; not recorded (pre-T5): ${notRecorded === null ? 'not recorded' : notRecorded}.`)
+    // Task text is ledger free text: collapse whitespace and bound it so a
+    // hostile task string cannot add lines or bulk to the report.
+    const oneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)
+    for (const u of Array.isArray(bu.unresolved) ? bu.unresolved : []) {
+      // Round 1 M1: non-clearing hint for a re-briefed retry.
+      const hint = u.laterDoneSameSpec === true
+        ? ` (a later done run exists for this spec at ${oneLine(u.laterDoneSameSpecTs)}; under a multi-task plan this may be another task)`
+        : ''
+      lines.push(`- ${oneLine(u.repo)} ${oneLine(u.spec)} ${oneLine(u.task)}: ${oneLine(u.reason)}${hint}`)
+    }
+  } else if (d.ledgerLaneFailed) {
+    // Round 1 L3: a missing ledger lane is not a stale reader.
+    lines.push(`${BLOCKED_LABEL}: not measured (ledger unavailable)`)
+  } else {
+    lines.push(`${BLOCKED_LABEL}: not measured (installed reader predates this metric)`)
   }
   lines.push('')
 

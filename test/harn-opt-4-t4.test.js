@@ -155,7 +155,7 @@ test('T4 schema: round is declared integer-or-null in LEDGER_ENTRY_SCHEMA and ex
   assert.deepEqual(LEDGER_ENTRY_SCHEMA.properties.round && LEDGER_ENTRY_SCHEMA.properties.round.type, ['integer', 'null'])
   const fields = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'workflows', 'lib', 'ledger-schema-fields.json'), 'utf8'))
   assert.deepEqual(fields.round, ['integer', 'null'])
-  assert.ok(!('blocked_reason' in fields), 'AC-SIMP-9 reserves blocked_reason for T5')
+  // T5 (AC-SIMP-9) owns blocked_reason; test/harn-opt-4-t5.test.js now pins it.
   assert.ok(!('spec_absent' in fields), 'AC-SIMP-4')
 })
 

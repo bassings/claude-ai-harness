@@ -299,6 +299,55 @@ function planKeyForRecord(record, root = '') {
   return canonicalPlanKey(record.spec, root)
 }
 
+// HARN-OPT-4 T5 (AC-QA-18, AC-DATA-9, AC-SIMP-6): tdd_task runs that ended
+// blocked and have no LATER done tdd_task row for the same (repo, canonical
+// spec, task), from ledger rows alone (each entry also carries a non-clearing
+// laterDoneSameSpec hint, round 1 M1). The join key includes the task, so a
+// done row for task B never clears a blocked task A under the same spec. An
+// upper bound: a task finished by hand leaves no resolution row. Classifies on
+// key presence (T4 round 1 M1): a pre-T5 row has no blocked_reason key, still
+// joins by outcome, and its reason is 'not recorded', never a value; a
+// non-enum value (hand-edited ledger) is likewise never echoed. byReason counts
+// the unresolved rows that carry a recorded enum reason.
+const BLOCKED_REASONS = ['test_attempt_cap', 'implement_attempt_cap', 'tests_modified']
+export function aggregateBlockedUnresolved(records, { root = '' } = {}) {
+  const open = new Map()
+  // Round 1 M1 (AC-PROD-6, AC-DATA-9): every done row in time order, so an
+  // unresolved entry can carry a NON-clearing hint. The join key is the full
+  // task text, so a task re-briefed after a block and then finished is never
+  // cleared (BUG-018 on the real ledger); per-task clearing stays, the hint
+  // tells the operator a later done run exists for the same spec.
+  const doneRows = []
+  let seq = 0
+  for (const r of sortRecordsByTime(records)) {
+    if (!r || r.kind !== 'tdd_task' || r.degraded || typeof r.task !== 'string') continue
+    if (r.outcome !== 'blocked' && r.outcome !== 'done') continue
+    seq += 1
+    const key = JSON.stringify([r.repo, planKeyForRecord(r, root), r.task])
+    if (r.outcome === 'done') { open.delete(key); doneRows.push({ seq, repo: r.repo, spec: planKeyForRecord(r, root), task: r.task, ts: r.ts }); continue }
+    const recorded = 'blocked_reason' in r && BLOCKED_REASONS.includes(r.blocked_reason)
+    open.set(key, { repo: r.repo, spec: planKeyForRecord(r, root), task: r.task, reason: recorded ? r.blocked_reason : 'not recorded', seq })
+  }
+  const unresolved = [...open.values()].map(({ seq: blockedSeq, ...u }) => {
+    // Round 3 F3: every spec-null run canonicalises to the one no-spec bucket,
+    // where a later done run says nothing about this task, so the hint is
+    // never offered there.
+    const noSpecKey = planKeyForRecord({ spec: null }, root)
+    const later = u.spec === noSpecKey ? undefined : doneRows.find((d) => d.seq > blockedSeq && d.repo === u.repo && d.spec === u.spec && d.task !== u.task)
+    // One shape, always: the hint fields are present on every entry, false
+    // and null when no later done row for the spec exists, so a consumer
+    // never has to test for the key (conductor edit after fix round 1).
+    return { ...u, laterDoneSameSpec: !!later, laterDoneSameSpecTs: later ? later.ts : null }
+  })
+  const byReason = Object.fromEntries(BLOCKED_REASONS.map((x) => [x, 0]))
+  let reasonNotRecorded = 0
+  for (const u of unresolved) {
+    if (u.reason === 'not recorded') reasonNotRecorded += 1
+    else byReason[u.reason] += 1
+  }
+  return { count: unresolved.length, unresolved, byReason, reasonNotRecorded }
+}
+
 // Rework attribution (spec item 1) + AC-verdict aggregation keyed by
 // (repo, spec, ac_id) -- AC-DATA-7: never by AC id alone, so the same AC id
 // in two different specs (or the same spec name reused across two repos)
@@ -1743,6 +1792,7 @@ function runLedgerCommand(roots, window) {
   const rework = aggregateRework(windowed, { root: canonicalRoot })
   const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets, truncatedBuckets: rework.truncatedBuckets, verdictDisagreements: rework.verdictDisagreements })
   const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
+  const blockedUnresolved = aggregateBlockedUnresolved(windowed, { root: canonicalRoot })
   const trigger = aggregateTriggerAccuracy(windowed)
   const proposalOutcomes = aggregateProposalOutcomes(windowed)
   return {
@@ -1752,6 +1802,7 @@ function runLedgerCommand(roots, window) {
     perRepo,
     skipped: combinedSkipped,
     rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecReviewRunsConducted: rework.noSpecReviewRunsConducted, noSpecReviewRunsDirect: rework.noSpecReviewRunsDirect, noSpecReviewRunsRoundNotRecorded: rework.noSpecReviewRunsRoundNotRecorded, reviewRunsWithRound: rework.reviewRunsWithRound, noSpecFindingsReclassified: rework.noSpecFindingsReclassified, schemaV4: rework.schemaV4 },
+    blockedUnresolved,
     neverFailingAcs: neverFailing,
     proposalOutcomes: mapToObject(proposalOutcomes),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
@@ -1839,5 +1890,8 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolv
 if (isMain) {
   const out = main()
   process.stdout.write(JSON.stringify(out) + '\n')
-  process.exit(0)
+  // Round 2 M1: process.exit() straight after a large write cut the JSON at
+  // the 64 KB pipe buffer about half the time. Set the code and let the
+  // event loop drain stdout before the process ends naturally.
+  process.exitCode = 0
 }
