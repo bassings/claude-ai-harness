@@ -8,6 +8,10 @@
     "array",
     "null"
   ],
+  "blocked_reason": [
+    "string",
+    "null"
+  ],
   "budget_spent": [
     "number",
     "null"

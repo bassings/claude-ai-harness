@@ -244,7 +244,22 @@ It states, every run, in this order:
    one unmeasured attempt reports `null`, not a misleadingly measured-
    looking zero (AC-OPS-3).
 3. **Rework attribution** and **never-failing acceptance criteria**
-   (source: ledger).
+   (source: ledger). The rework section ends with **blocked unresolved**:
+   TDD runs that ended blocked and have no later done run for the same
+   repo, spec and task, one line each with the reason code (`test_attempt_cap`,
+   `implement_attempt_cap` or `tests_modified`), or "not recorded" for a run
+   from before the code existed. It is an **upper bound**: a task finished
+   by hand, or re-briefed with different wording and then finished by the
+   harness, leaves no resolution row under its original text, so a listed
+   task may already be done. A line ending "a later done run exists for
+   this spec" means only that some done run under the same spec exists;
+   under a multi-task plan this says nothing about this task. Next step: for each line, check whether the task landed
+   (git log, the plan file); if it did not, that task is waiting on a
+   decision, and the reason code says which kind. The headline count mixes
+   rows from before the reason code existed ("not recorded", which can never
+   resolve retroactively) with real post-change blocks, so read the
+   "reason recorded" figure on the line beneath it: that figure staying high
+   week on week is the signal, not a single line and not the headline.
 4. **Trigger accuracy** (source: ledger), with an unmeasured `trigger_count`
    bucketed separately from both "nothing in scope" and "examined and
    found nothing".

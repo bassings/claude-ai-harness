@@ -521,6 +521,13 @@ export const LEDGER_ENTRY_SCHEMA = {
     // line still writes. null means "no round was supplied" (a direct review),
     // never 0.
     round: { type: ['integer', 'null'], minimum: 1 },
+    // HARN-OPT-4 T5 (AC-OPS-5, AC-QA-17): why a tdd_task run ended BLOCKED, one
+    // code per BLOCKED exit; null on a done or aborted row. A closed enum so
+    // free text can never reach the durable line: anything outside it is
+    // neutralised to null and counted in invalid_record_values_dropped, and the
+    // line still writes. The schema is global, so the writer (not this
+    // declaration) refuses the field on any kind but tdd_task (T4 round 3 L6).
+    blocked_reason: { type: ['string', 'null'], enum: ['test_attempt_cap', 'implement_attempt_cap', 'tests_modified', null] },
     // conduct_plan_event only: which state transition this line records, and
     // an idempotency key (run_id + event) so a re-tick that replays an
     // already-recorded event does not double-count it (AC-QA-9).
@@ -1009,6 +1016,11 @@ export function degradeEntry(entry, redactRawField = (v) => v) {
         container[last] = null
         const bucket = last === 'ac_id' ? 'ac_id' : err.pathParts[0] === 'findings' && (last === 'lens' || last === 'severity') ? 'finding_field' : 'general'
         neutralisations.push({ pathParts: err.pathParts, bucket, kind: 'siblingField' })
+      } else if (err.pathParts.length === 1 && last === 'blocked_reason') {
+        // HARN-OPT-4 T5 (AC-OPS-5): same treatment as round, below. A rejected
+        // reason is caller text; none of it is retained, only counted.
+        container[last] = null
+        neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'siblingField' })
       } else if (err.pathParts.length === 1 && last === 'round') {
         // HARN-OPT-4 T4 (AC-QA-13): round is a bare counter. Nothing about a
         // rejected value is worth retaining, and the caller's free text (the
@@ -2149,6 +2161,15 @@ export function main() {
     }
   }
 
+  // HARN-OPT-4 T5 (T4 round 3 L6): blocked_reason means something only on a
+  // tdd_task row. The schema is global, so on any other kind it is removed here
+  // and counted below (degradeEntry overwrites the counter, so the add happens
+  // after it), rather than written as a reason that row cannot have.
+  let strayBlockedReason = 0
+  if (entry.kind !== 'tdd_task' && 'blocked_reason' in entry) {
+    delete entry.blocked_reason
+    strayBlockedReason = 1
+  }
   const degraded = degradeEntry(entry, redactRawField)
   if (!degraded.ok) {
     return result(run_id, ts, false, 'payload failed ledger schema validation: ' + degraded.errors.join('; '))
@@ -2157,6 +2178,14 @@ export function main() {
   // dropped or never-supplied round would read as "key absent". Normalise to
   // an explicit null on review_cycle rows so the reader sees one shape.
   if (entry.kind === 'review_cycle' && entry.round === undefined) entry.round = null
+  // HARN-OPT-4 T5 round 3 F2 (AC-OPS-5, AC-QA-17): same rule for blocked_reason
+  // on tdd_task rows. The workflow sends it only when the run blocked
+  // (AC-DATA-2 as amended), and the line still reads null on a done or
+  // aborted row, so key presence tells a post-T5 row from a pre-T5 one.
+  if (entry.kind === 'tdd_task' && entry.blocked_reason === undefined) entry.blocked_reason = null
+  if (strayBlockedReason > 0) {
+    entry.invalid_record_values_dropped = (entry.invalid_record_values_dropped || 0) + strayBlockedReason
+  }
   if (explicitNullAcVerdictAcId > 0) {
     entry.invalid_ac_ids_dropped = (entry.invalid_ac_ids_dropped || 0) + explicitNullAcVerdictAcId
   }
