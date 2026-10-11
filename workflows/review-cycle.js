@@ -426,12 +426,11 @@ opts = opts || {}
 const specPath = opts.spec || null
 // HARN-OPT-4 T4 (AC-QA-13, AC-SIMP-11): passed through RAW. ledger-append.mjs owns
 // validation (integer >= 1 or null) and counts what it neutralises, so this file
-// never decides what a valid round is. Absent is null, never 0.
-const reviewRound = opts.round === undefined ? null : opts.round
-// Round 2 L1 (spec bug S5): spread onto the payloads ONLY when supplied. A
-// stale installed writer that predates the field rejects an unknown key
-// structurally (the whole line is refused), so a direct review must not send
-// `round: null`; the current writer normalises absent to null itself.
+// never decides what a valid round is. Round 2 L1 (spec bug S5): spread onto
+// the payloads ONLY when supplied. A stale installed writer that predates the
+// field rejects an unknown key structurally (the whole line is refused), so a
+// direct review must not send `round: null`; the writer normalises absent to
+// null itself, which is why absent reads as null on the line, never 0.
 const roundField = opts.round === undefined ? {} : { round: opts.round }
 // specs/record-fixed-findings.md (AC-1/AC-3): the caller's own findings,
 // reported open going into this round -- {id, lens, location, claim,

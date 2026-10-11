@@ -513,7 +513,9 @@ export const LEDGER_ENTRY_SCHEMA = {
     rounds: { type: ['object', 'null'], additionalProperties: { type: 'integer' } },
     budget_spent: { type: ['number', 'null'] },
     // HARN-OPT-4 T4 (AC-QA-13, AC-QA-29): the conductor's review round for this
-    // task, review_cycle rows only. A positive integer or null; 0, a negative,
+    // task. Only review-cycle.js sends it and only the reader's review-row
+    // paths count it; the schema is global, so a round on another kind is
+    // accepted here, not rejected (T4 round 3 L6). A positive integer or null; 0, a negative,
     // a fraction, a string or anything else is neutralised and counted in
     // invalid_record_values_dropped by the existing degrade path, and the
     // line still writes. null means "no round was supplied" (a direct review),
