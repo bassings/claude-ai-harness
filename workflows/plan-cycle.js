@@ -672,6 +672,17 @@ return {
 
 // Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
 // pattern and its rationale.
+// HARN-OPT-4 T8 (AC-QA-28, AC-DATA-17): budget.spent() is SESSION-CUMULATIVE
+// (probe recorded in the plan's Conductor log, tick 33), so a running total
+// written as budget_spent says nothing about this run. Read it once here,
+// BEFORE the started write, and once for the terminal row; the row carries end
+// minus start. Null (never the end reading, never a negative number) when
+// either reading is unmeasured or the counter went backwards (a reset).
+const budgetAtStart = readBudgetSpent()
+function budgetSpentDelta() {
+  const end = readBudgetSpent()
+  return budgetAtStart !== null && end !== null && end >= budgetAtStart ? end - budgetAtStart : null
+}
 const startWrite = await writeLedger({ kind: 'plan_cycle', outcome: 'started', spec: specPath })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
 
@@ -705,11 +716,24 @@ const telemetry = {
   lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],
   verdicts: result.verdicts || {},
-  budget_spent: readBudgetSpent(),
+  budget_spent: budgetSpentDelta(),
 }
 const terminalEntry = { kind: 'plan_cycle', ...telemetry }
 if (startRunId) terminalEntry.run_id = startRunId
-const terminalWrite = await writeLedger(terminalEntry)
+// HARN-OPT-4 T8 (T4 round 3 L1, AC-DATA-2): same shape as tdd-task.js's T5
+// retry. An installed writer older than this file refuses a key it does not
+// know as "not an allowed property", which would cost the whole terminal row.
+// Retry ONCE without that key (never kind, outcome or run_id) so the row still
+// lands; any other refusal, and a refusal of the retry, is final and reported
+// by the write_ok:false consumer below. budget_spent needs no such retry: it
+// is an existing field and null is already accepted by every installed writer.
+let terminalWrite = await writeLedger(terminalEntry)
+const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.\[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
+if (refusedKey && !['kind', 'outcome', 'run_id'].includes(refusedKey) && Object.hasOwn(terminalEntry, refusedKey)) {
+  log(`Terminal ledger write refused ${refusedKey} (installed writer predates it); retrying once without it: ${redactLogText(String(terminalWrite.write_error))}`)
+  const { [refusedKey]: _refused, ...retryEntry } = terminalEntry
+  terminalWrite = await writeLedger(retryEntry)
+}
 
 // 2026-08-18: give write_ok:false a CONSUMER. It was already computed,
 // already logged and already returned -- to nobody. The ledger stopped
