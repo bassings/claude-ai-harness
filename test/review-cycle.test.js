@@ -9,8 +9,11 @@ const assert = require('node:assert/strict')
 const path = require('node:path')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
+const { makeTempRepo, runAppend, readLedgerLines, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
 const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
+
+test.after(cleanupTempRepos)
 
 const LEDGER_OK = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
 
@@ -3109,4 +3112,49 @@ test('review-cycle.js (D4): a run invoked with NO spec argument, where a lens FO
   assert.equal(payload.spec_bug_count, 1,
     'a spec WAS in play, so the classification stands; suppressing it here would lose a real quality signal')
   assert.equal((payload.spec_bugs || []).length, 1)
+})
+
+// Review round 2 L3 (AC-QA-3, integration half): the unit tests pin that the
+// writer attributes a compound label's fixed row to its primary lens, but
+// nothing proved the join through review-cycle.js itself -- a prior_findings
+// entry handed in verbatim, plus a matching fixed_findings confirmation.
+// The ledger:write step is the REAL ledger-append.mjs (same shape as the
+// round trip in test/ledger-seam.test.js).
+//
+// Round one is NOT driven here, deliberately: review-cycle.js stamps every
+// open finding with the workflow's own lens label, last, so a lens report
+// cannot introduce a compound label (see the `{ ...r, lens }` spread, round-two
+// review F1). A round-one run therefore returns the id of the plain
+// 'lens-security' finding, never 7c35753185a55bf1. A compound label can only
+// reach a prior_findings entry from outside the workflow (a hand-built or
+// legacy entry, or a synthesis-sourced one), so that is what this seeds; its
+// id is the one the writer itself recomputes and verifies.
+test('review-cycle.js: a prior_findings entry with a compound lens label, confirmed fixed by synthesis, is written fixed under its primary lens with the same id through the real writer (review round 2 L3, AC-QA-3)', async () => {
+  const repo = makeTempRepo()
+  const label = 'lens-security + lens-architecture'
+  const prior = [{ id: '7c35753185a55bf1', lens: label, location: 'a.js:1', claim: 'c' }]
+  const realWriter = (prompt) => {
+    const res = runAppend(repo, extractLedgerPayload(prompt))
+    assert.equal(res.status, 0, `real ledger-append.mjs exited non-zero: ${res.stderr}`)
+    return JSON.parse(res.stdout.trim().split('\n').pop())
+  }
+  const { calls } = await runWorkflow(WF, {
+    args: { prior_findings: prior },
+    agent: baseAgent({
+      synthesis: { ...SYNTHESIS_OK, fixed_findings: [{ lens: label, location: 'a.js:1', claim: 'c' }] },
+      'ledger:write': realWriter,
+    }),
+  })
+  const terminal = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
+  assert.deepEqual(terminal.prior_findings, prior, 'sanity: the entry must reach the terminal payload verbatim')
+  assert.deepEqual(terminal.fixed_findings, [{ lens: label, location: 'a.js:1', claim: 'c' }], 'sanity: so must the confirmation')
+
+  const lines = readLedgerLines(repo)
+  const entry = JSON.parse(lines[lines.length - 1])
+  const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
+  assert.equal(fixed.length, 1, `expected exactly one fixed entry, got: ${JSON.stringify(entry.findings)}`)
+  assert.equal(fixed[0].lens, 'lens-security')
+  assert.equal(fixed[0].id, '7c35753185a55bf1')
+  assert.equal(entry.invalid_prior_ids_dropped, 0)
+  assert.equal(entry.invalid_fixed_ids_dropped, 0)
 })

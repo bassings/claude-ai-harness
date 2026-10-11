@@ -109,7 +109,7 @@ export const AC_ID_RAW_MAX_BYTES = 32
 // HARN-OPT-4 T1: the lens names a compound label may be resolved to. These
 // mirror the files in agents/; a name missing here costs attribution (the
 // finding reads as unattributed), never the record.
-const ROSTER_LENSES = new Set([
+export const ROSTER_LENSES = new Set([
   'lens-security', 'lens-qa', 'lens-simplicity', 'lens-product', 'lens-design',
   'lens-accessibility', 'lens-architecture', 'lens-data', 'lens-operability',
   'reviewer-verification', 'reviewer-experience',
