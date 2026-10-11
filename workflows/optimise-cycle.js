@@ -1078,13 +1078,24 @@ function buildReport(d) {
   const bu = d.blockedUnresolved
   const BLOCKED_LABEL = 'Blocked TDD runs unresolved in window (upper bound: a task finished by hand leaves no resolution row)'
   if (bu && typeof bu.count === 'number') {
+    // Round 1 M1: the caveat also names re-briefed retries. The count line
+    // must stay the exact pinned `label: n` string, so the extra caveat is its
+    // own line ahead of it, and only when there is something listed.
+    if (bu.count > 0) lines.push('Blocked TDD runs unresolved in window may include a task re-briefed after a block and then finished (see the hint on each line).')
     lines.push(`${BLOCKED_LABEL}: ${bu.count}`)
     // Task text is ledger free text: collapse whitespace and bound it so a
     // hostile task string cannot add lines or bulk to the report.
     const oneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)
     for (const u of Array.isArray(bu.unresolved) ? bu.unresolved : []) {
-      lines.push(`- ${oneLine(u.repo)} ${oneLine(u.spec)} ${oneLine(u.task)}: ${oneLine(u.reason)}`)
+      // Round 1 M1: non-clearing hint for a re-briefed retry.
+      const hint = u.laterDoneSameSpec === true
+        ? ` (a later done run exists for this spec at ${oneLine(u.laterDoneSameSpecTs)}; may be the same task re-briefed)`
+        : ''
+      lines.push(`- ${oneLine(u.repo)} ${oneLine(u.spec)} ${oneLine(u.task)}: ${oneLine(u.reason)}${hint}`)
     }
+  } else if (d.ledgerLaneFailed) {
+    // Round 1 L3: a missing ledger lane is not a stale reader.
+    lines.push(`${BLOCKED_LABEL}: not measured (ledger unavailable)`)
   } else {
     lines.push(`${BLOCKED_LABEL}: not measured (installed reader predates this metric)`)
   }

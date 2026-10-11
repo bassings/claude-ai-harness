@@ -301,7 +301,8 @@ function planKeyForRecord(record, root = '') {
 
 // HARN-OPT-4 T5 (AC-QA-18, AC-DATA-9, AC-SIMP-6): tdd_task runs that ended
 // blocked and have no LATER done tdd_task row for the same (repo, canonical
-// spec, task), from ledger rows alone. The join key includes the task, so a
+// spec, task), from ledger rows alone (each entry also carries a non-clearing
+// laterDoneSameSpec hint, round 1 M1). The join key includes the task, so a
 // done row for task B never clears a blocked task A under the same spec. An
 // upper bound: a task finished by hand leaves no resolution row. Classifies on
 // key presence (T4 round 1 M1): a pre-T5 row has no blocked_reason key, still
@@ -311,15 +312,29 @@ function planKeyForRecord(record, root = '') {
 const BLOCKED_REASONS = ['test_attempt_cap', 'implement_attempt_cap', 'tests_modified']
 export function aggregateBlockedUnresolved(records, { root = '' } = {}) {
   const open = new Map()
+  // Round 1 M1 (AC-PROD-6, AC-DATA-9): every done row in time order, so an
+  // unresolved entry can carry a NON-clearing hint. The join key is the full
+  // task text, so a task re-briefed after a block and then finished is never
+  // cleared (BUG-018 on the real ledger); per-task clearing stays, the hint
+  // tells the operator a later done run exists for the same spec.
+  const doneRows = []
+  let seq = 0
   for (const r of sortRecordsByTime(records)) {
     if (!r || r.kind !== 'tdd_task' || r.degraded || typeof r.task !== 'string') continue
     if (r.outcome !== 'blocked' && r.outcome !== 'done') continue
+    seq += 1
     const key = JSON.stringify([r.repo, planKeyForRecord(r, root), r.task])
-    if (r.outcome === 'done') { open.delete(key); continue }
+    if (r.outcome === 'done') { open.delete(key); doneRows.push({ seq, repo: r.repo, spec: planKeyForRecord(r, root), task: r.task, ts: r.ts }); continue }
     const recorded = 'blocked_reason' in r && BLOCKED_REASONS.includes(r.blocked_reason)
-    open.set(key, { repo: r.repo, spec: planKeyForRecord(r, root), task: r.task, reason: recorded ? r.blocked_reason : 'not recorded' })
+    open.set(key, { repo: r.repo, spec: planKeyForRecord(r, root), task: r.task, reason: recorded ? r.blocked_reason : 'not recorded', seq })
   }
-  const unresolved = [...open.values()]
+  const unresolved = [...open.values()].map(({ seq: blockedSeq, ...u }) => {
+    const later = doneRows.find((d) => d.seq > blockedSeq && d.repo === u.repo && d.spec === u.spec && d.task !== u.task)
+    // The existing "blocked row alone" test deep-equals the bare entry, so the
+    // hint fields appear only once the window holds a done row to compare to.
+    if (doneRows.length === 0) return u
+    return { ...u, laterDoneSameSpec: !!later, laterDoneSameSpecTs: later ? later.ts : null }
+  })
   const byReason = Object.fromEntries(BLOCKED_REASONS.map((x) => [x, 0]))
   let reasonNotRecorded = 0
   for (const u of unresolved) {

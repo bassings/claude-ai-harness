@@ -444,3 +444,66 @@ test('T5 AC-OPS-17: the optimise-cycle SKILL.md "Reading the report" names "bloc
   assert.match(section, /by hand/i)
   assert.match(section, /ledger/i)
 })
+
+// ---- fix round 1 (PR #8 review): M1, L1 ----
+
+// Round 1 L1 (AC-QA-18): the fixtures above are already in time order, so
+// removing sortRecordsByTime left them green. These are supplied OUT of file
+// order, so only a time sort gets the right answer.
+test('T5 reader (round 1 L1): resolution follows ts, not file order -- [blocked at T2, done at T1] is unresolved, [done at T2, blocked at T1] is resolved', () => {
+  const lateBlock = reader.aggregateBlockedUnresolved([tdd('blocked', 'A', T(2), { blocked_reason: 'tests_modified' }), tdd('done', 'A', T(1))])
+  assert.strictEqual(lateBlock.count, 1)
+  const lateDone = reader.aggregateBlockedUnresolved([tdd('done', 'A', T(2)), tdd('blocked', 'A', T(1), { blocked_reason: 'tests_modified' })])
+  assert.strictEqual(lateDone.count, 0)
+})
+
+// Round 1 M1 (AC-PROD-6, AC-DATA-9): BUG-018 on the real CouchPotato ledger was
+// blocked, re-briefed with different task text, then finished by the harness.
+// Per-task clearing stays (AC-DATA-9), so it is still listed, but carries a
+// non-clearing hint so the operator is not told it is simply abandoned.
+test('T5 reader (round 1 M1): a blocked task later finished under re-briefed text for the same spec is listed once, with laterDoneSameSpec true and the done row ts', () => {
+  const r = reader.aggregateBlockedUnresolved([
+    tdd('blocked', 'BUG-018 fix the thing. Brief version one with context', T(1), { blocked_reason: 'implement_attempt_cap' }),
+    tdd('done', 'BUG-018 fix the thing. Brief version two, reworded after the block', T(3), { blocked_reason: null }),
+  ])
+  assert.strictEqual(r.count, 1)
+  assert.strictEqual(r.unresolved.length, 1)
+  assert.strictEqual(r.unresolved[0].laterDoneSameSpec, true)
+  assert.strictEqual(r.unresolved[0].laterDoneSameSpecTs, T(3))
+})
+
+test('T5 reader (round 1 M1): the hint carries the EARLIEST later done ts, and a done row for a different spec, repo or an earlier ts gives no hint', () => {
+  const earliest = reader.aggregateBlockedUnresolved([
+    tdd('done', 'other early', T(0)),
+    tdd('blocked', 'A', T(1), { blocked_reason: 'tests_modified' }),
+    tdd('done', 'other late', T(5)),
+    tdd('done', 'other mid', T(3)),
+  ])
+  assert.strictEqual(earliest.unresolved[0].laterDoneSameSpecTs, T(3))
+  const none = reader.aggregateBlockedUnresolved([
+    tdd('blocked', 'A', T(1), { blocked_reason: 'tests_modified' }),
+    tdd('done', 'B', T(2), { spec: 'specs/b.md' }),
+    tdd('done', 'C', T(3), { repo: 'other' }),
+  ])
+  assert.strictEqual(none.count, 1)
+  assert.strictEqual(none.unresolved[0].laterDoneSameSpec, false)
+  assert.strictEqual(none.unresolved[0].laterDoneSameSpecTs, null)
+})
+
+test('T5 reader (round 1 M1): the hint is non-clearing -- count and byReason are unchanged by it', () => {
+  const r = reader.aggregateBlockedUnresolved([
+    tdd('blocked', 'A', T(1), { blocked_reason: 'tests_modified' }),
+    tdd('done', 'A reworded', T(2)),
+  ])
+  assert.strictEqual(r.count, 1)
+  assert.deepEqual(r.byReason, { test_attempt_cap: 0, implement_attempt_cap: 0, tests_modified: 1 })
+})
+
+test('T5 SKILL.md (round 1 M1): the blocked unresolved item names re-briefed retries alongside hand-finished tasks', () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
+  const start = skill.indexOf('## Reading the report')
+  const after = skill.slice(start + 5)
+  const end = after.search(/\n## /)
+  const section = end === -1 ? after : after.slice(0, end)
+  assert.match(section, /re-briefed/i)
+})
