@@ -51,6 +51,9 @@ const UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD = 0.2
 // configurable (AC-SIMP-2): a single hard-coded path, same discipline as
 // LEDGER_RELATIVE_PATH in workflows/lib/ledger-append.mjs.
 const REPORT_RELATIVE_PATH = '.claude/optimise-cycle-report.md'
+// Round 2 F2: the per-run sidecar beside the report (proposal id -> fixed-key
+// target); read back by optimise-read.mjs's ledger command. Same one-path discipline.
+const PROPOSAL_TARGETS_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
 
 // AC-SEC-8: every place untrusted text (a ledger free-text field, a gh
 // workflow/job name, a commit subject, a repo root path or display label)
@@ -324,12 +327,27 @@ const CI_LANE_SCHEMA = {
 // are nullable (AC-4): null means the scoped figure is unavailable (a
 // broken or invalid .claude/harness-triggers.json override), reported via
 // scoped_method rather than guessed at.
-const GIT_LANE_SCHEMA = {
+// HARN-OPT-4 T6 (AC-DATA-11): one entry per roster repo. `root_index` is the
+// positional index into scope.resolved and `repo` is the ledger identity
+// label for that root; the SCRIPT supplies both in each lane prompt and
+// matches the result by them, so a result is never trusted for which repo it
+// claims to describe. The top level is an object because structured output
+// needs an object root.
+const GIT_LANE_ENTRY_SCHEMA = {
   type: 'object',
-  required: ['count', 'n_commits_examined', 'method', 'window_note', 'scoped_count', 'scoped_excluded_count', 'scoped_unavailable_count', 'scoped_config_source', 'scoped_exclude_globs', 'scoped_method'],
+  required: ['root_index', 'repo', 'count', 'n_commits_examined', 'method', 'window_note', 'scoped_count', 'scoped_excluded_count', 'scoped_unavailable_count', 'scoped_config_source', 'scoped_exclude_globs', 'scoped_method'],
   properties: {
-    count: { type: 'integer' },
-    n_commits_examined: { type: 'integer' },
+    root_index: { type: 'integer' },
+    repo: { type: 'string' },
+    // Round 2 F3 (AC-QA-19): a reader rejection (toplevel missing or not the
+    // root) carries null figures, `rejected: true` and a bounded reason; the
+    // schema could not represent it before, so a lane had to invent figures.
+    count: { type: ['integer', 'null'] },
+    n_commits_examined: { type: ['integer', 'null'] },
+    // Optional: a lane that relays a reader-side rejection sets these; an
+    // ordinary entry omits them (never undefined-valued, which is not JSON).
+    rejected: { type: ['boolean', 'null'] },
+    reason: { type: ['string', 'null'], maxLength: 300 },
     method: { type: 'string' },
     window_note: { type: 'string' },
     scoped_count: { type: ['integer', 'null'] },
@@ -338,6 +356,36 @@ const GIT_LANE_SCHEMA = {
     scoped_config_source: { type: 'string', enum: ['default', 'repo-override'] },
     scoped_exclude_globs: { type: 'array', items: { type: 'string' } },
     scoped_method: { type: 'string' },
+  },
+}
+const GIT_LANE_SCHEMA = {
+  type: 'object',
+  required: ['repos'],
+  properties: { repos: { type: 'array', items: GIT_LANE_ENTRY_SCHEMA } },
+}
+
+// HARN-OPT-4 T6 (AC-QA-20, AC-PROD-8, AC-DATA-15): the proposal target is a
+// FIXED key set, not a free object, so the stable id and the removal gates
+// read the same keys every time. The six string fields may be empty or null
+// where not applicable; the two booleans are required and are gate inputs.
+// Mirrors PROPOSAL_IDENTITY_KEYS in workflows/lib/optimise-read.mjs
+// (workflow scripts cannot import it, so the list is duplicated and the T6
+// test pins both).
+const PROPOSAL_TARGET_STRING_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+const PROPOSAL_TARGET_KEYS = [...PROPOSAL_TARGET_STRING_KEYS, 'touches_always_on_lens', 'security_purposed']
+const PROPOSAL_TARGET_SCHEMA = {
+  type: 'object',
+  required: PROPOSAL_TARGET_KEYS,
+  additionalProperties: false,
+  properties: {
+    kind: { type: ['string', 'null'] },
+    component: { type: ['string', 'null'] },
+    concern: { type: ['string', 'null'] },
+    lens: { type: ['string', 'null'] },
+    workflow: { type: ['string', 'null'] },
+    job: { type: ['string', 'null'] },
+    touches_always_on_lens: { type: 'boolean' },
+    security_purposed: { type: 'boolean' },
   },
 }
 
@@ -386,22 +434,99 @@ const ciLanePrompt =
   `script computed.`
 const ciLane = () => agent(ciLanePrompt, { label: 'lane:ci', phase: 'Lanes', schema: CI_LANE_SCHEMA })
 
-const gitLanePrompt =
-  `In the CURRENT repo, run exactly \`git log --max-count=500 --name-only --pretty=format:'%x1e%P%x1f%s'\` and ` +
-  `capture its ENTIRE stdout verbatim, unmodified, character-for-character (never the diff, never file contents ` +
+// HARN-OPT-4 T6 (AC-DATA-12, AC-SEC-10, AC-OPS-13): one lane call per roster
+// entry, each naming exactly that entry's root as a double-quoted `git -C`
+// target (the roots have already passed SHELL_METACHAR_RE above, which is
+// what makes the double quotes safe), never "the CURRENT repo", which
+// reported the invoking repo's figure for every roster repo.
+// Round 1 F5 (AC-SEC-10 integrity): ONE command, not a cd step whose failure
+// a later step would silently run past in the wrong directory; the lane also
+// reports the repo toplevel so the script can reject a root that is only a
+// subdirectory of, or a different repo from, what git actually read.
+const gitLanePrompt = (root, rootIndex) =>
+  `Run these two commands, each exactly as written: \`git -C "${root}" log --max-count=500 --name-only --pretty=format:'%x1e%P%x1f%s'\`, and ` +
+  `\`git -C "${root}" rev-parse --show-toplevel\` (capture its stdout as the toplevel). Capture the log's ENTIRE stdout verbatim, unmodified, character-for-character (never the diff, never file contents ` +
   `-- this is metadata only: parent hashes, subject lines, and the paths of files each commit changed; this lane ` +
-  `never reads or reports another repo's history). Also run \`git rev-parse --show-toplevel\` to get this repo's ` +
-  `root path. Find optimise-read.mjs the same way the other lanes do. Pipe exactly ` +
-  `\`{"git_log_raw": "<the entire git log output above, verbatim>", "root": "<the repo root above>"}\` as JSON ` +
+  `reads only this one repo's history and never another's). Find optimise-read.mjs the same way the other lanes do. Pipe exactly ` +
+  `\`{"git_log_raw": "<the entire git log output above, verbatim>", "root": "${root}", "toplevel": "<the rev-parse output, verbatim>"}\` as JSON ` +
   `into \`node <path> escaped-defects\` -- do not parse, reformat, or summarise the git log output yourself; the ` +
-  `script does all parsing and scoring, deterministically, from the raw text you pass it. Return exactly what it ` +
-  `printed, plus a window_note stating how many commits back this covers (e.g. "most recent 500 commits") -- ` +
+  `script does all parsing and scoring, deterministically, from the raw text you pass it. Return a single-element ` +
+  `\`repos\` array whose entry is exactly what it printed (including its \`repo\` field), plus root_index ${rootIndex} ` +
+  `and a window_note stating how many commits back this covers (e.g. "most recent 500 commits") -- ` +
   `this is a heuristic proxy for escaped defects (AC-PROD-7), not a verified per-PR causal count, and the script ` +
   `reports BOTH a raw figure (every "fix:"-typed commit) and a scoped figure (narrowed to commits that touch ` +
-  `product source, excluding configured pipeline/tooling paths); state both plainly, do not overclaim either.`
-const gitLane = () => agent(gitLanePrompt, { label: 'lane:git', phase: 'Lanes', schema: GIT_LANE_SCHEMA })
+  `product source, excluding configured pipeline/tooling paths); state both plainly, do not overclaim either. If the script ` +
+  `printed \`rejected: true\`, relay its rejected and reason fields unchanged with every figure field null (scoped_config_source ` +
+  `\"default\", scoped_exclude_globs [], method and scoped_method set to the reason): never invent figures.`
+const gitLaneFor = (r, i) => () => agent(gitLanePrompt(r.root, i), { label: 'lane:git', phase: 'Lanes', schema: GIT_LANE_SCHEMA })
 
-const [ledgerAgg, ciAgg, gitAgg] = await parallel([ledgerLane, ciLane, gitLane])
+const [ledgerAgg, ciAgg, ...gitResults] = await parallel([ledgerLane, ciLane, ...scope.resolved.map(gitLaneFor)])
+
+// Match each git result to its roster entry by the index the SCRIPT attached
+// (never a path the agent supplies) AND by the ledger identity label the
+// ledger lane derived for that root. Anything else is reported as unmatched
+// with the reason, never merged into another repo's figure (AC-DATA-11).
+// Round 1 F4 (AC-SEC-10): every agent-supplied string is redacted BEFORE it is
+// flattened, bounded, or echoed: any substring equal to a roster root, and any
+// absolute path, becomes the same marker the reader uses for an unidentified
+// repo. ABSOLUTE_PATH_RE mirrors the one in workflows/lib/ledger-append.mjs
+// (a workflow script cannot import it). Redacting before the 120-char slice
+// stops a truncation leaving a root half-visible.
+const REDACTED_PATH_MARKER = '<redacted-path>'
+const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+const rootsLongestFirst = [...roots].sort((a, b) => b.length - a.length)
+const redact = (v) => {
+  let t = String(v)
+  for (const r of rootsLongestFirst) if (r) t = t.split(r).join(REDACTED_PATH_MARKER)
+  return t.replace(ABSOLUTE_PATH_RE, (whole, prefix) => `${prefix}${REDACTED_PATH_MARKER}`)
+}
+const redactDeep = (v) => (typeof v === 'string' ? redact(v) : Array.isArray(v) ? v.map(redactDeep) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactDeep(x)])) : v)
+const flat = (v) => redact(v).replace(/\s+/g, ' ').slice(0, 120)
+const gitPerRepo = scope.resolved.map(() => ({ status: 'failed', reason: 'git lane returned no result', figures: null }))
+const gitUnmatched = []
+const ledgerRepoLabel = (i) => (ledgerAgg && ledgerAgg.perRepo && ledgerAgg.perRepo[i] && typeof ledgerAgg.perRepo[i].root === 'string' ? ledgerAgg.perRepo[i].root : null)
+gitResults.forEach((res, k) => {
+  if (!res || !Array.isArray(res.repos)) return
+  const claims = []
+  for (const e of res.repos) {
+    if (!e || !Number.isInteger(e.root_index) || e.root_index < 0 || e.root_index >= scope.resolved.length) {
+      gitUnmatched.push(`result with root_index ${flat(e && e.root_index)} (repo ${flat(e && e.repo)}): out of range for ${scope.resolved.length} roster repo(s); not used`)
+    } else if (e.root_index !== k) {
+      // The script asked lane k about roster repo k only; an answer about
+      // another index is a swap or a forgery, never a figure for either.
+      gitUnmatched.push(`roster repo ${k + 1}: result claimed root_index ${e.root_index} (repo ${flat(e.repo)}); not used`)
+    } else {
+      claims.push(e)
+    }
+  }
+  if (claims.length > 1) {
+    gitUnmatched.push(`roster repo ${k + 1}: ${claims.length} results claimed root_index ${k}; none used`)
+    gitPerRepo[k] = { status: 'unmatched', reason: 'duplicate results for this roster repo', figures: null }
+  } else if (claims.length === 1) {
+    const e = claims[0]
+    const ledgerRepo = ledgerRepoLabel(k)
+    if (ledgerRepo === null) {
+      // Round 3 L2 (AC-QA-19): with no ledger identity to confirm against,
+      // the figure is unconfirmed, not mismatched. Still not used (AC-SEC-10
+      // matches by identity, never by position alone), but the reason says
+      // what actually happened.
+      const why = ledgerAgg ? 'the ledger lane has no entry for this root' : 'the ledger lane failed'
+      gitUnmatched.push(`roster repo ${k + 1}: ledger identity unavailable (${why}); result repo ${flat(e.repo)} could not be confirmed and was not used`)
+      gitPerRepo[k] = { status: 'unmatched', reason: `ledger identity unavailable (${why}); the figure could not be confirmed as this repo's`, figures: null }
+    } else if (e.repo !== ledgerRepo) {
+      gitUnmatched.push(`roster repo ${k + 1}: result repo ${flat(e.repo)} does not match ledger repo ${flat(ledgerRepo)}; not used`)
+      gitPerRepo[k] = { status: 'unmatched', reason: `repo mismatch (result ${flat(e.repo)}, ledger ${flat(ledgerRepo)})`, figures: null }
+    } else if (e.rejected === true || !Number.isInteger(e.count)) {
+      // Round 2 F3 (AC-QA-19, AC-SEC-10): a rejection the reader made (or any
+      // entry without an integer count) is a failed measurement, never zero.
+      // `rejected` wins over a stale count; the reason is redacted, flattened
+      // and bounded by flat() before it is echoed.
+      gitPerRepo[k] = { status: 'failed', reason: flat(typeof e.reason === 'string' && e.reason ? e.reason : 'git lane returned no integer count'), figures: null }
+    } else {
+      gitPerRepo[k] = { status: 'ok', reason: null, figures: redactDeep(e) }
+    }
+  }
+})
 
 // ---- Phase 3: synthesis ----
 phase('Synthesis')
@@ -411,6 +536,32 @@ const ledgerSufficient = ledgerN >= MIN_RECORDS_FOR_PROPOSALS
 const ledgerCitations = new Set((ledgerAgg && ledgerAgg.citationPool) || [])
 const ciCitations = new Set((ciAgg && ciAgg.citationPool) || [])
 const allCitations = new Set([...ledgerCitations, ...ciCitations])
+
+// Round 1 F3 (AC-PROD-8 clause 2): the id is stable only for identical target
+// words, so a drafter that has never seen an adopted or rejected target will
+// reword it and mint a new id. It is shown the fixed-key target of every
+// proposal with any outcome event, in its own nonce-wrapped data block, and
+// told to reuse one exactly. The ledger carries no target field, so the reader
+// supplies one from the optimiser's own per-run sidecar (round 2 F2); a target
+// it could not supply is carried as its id with the reader's reason, never
+// invented.
+const priorTargetEntries = Object.entries((ledgerAgg && ledgerAgg.proposalOutcomes) || {}).slice(0, 50).map(([id, o]) => (
+  o && o.target && typeof o.target === 'object'
+    // Round 3 M1 (AC-SEC-9): only the six identity fields are offered for
+    // reuse. The two gate booleans describe what THIS proposal does to a
+    // security check; copying a prior target's `security_purposed: false`
+    // onto a new removal would walk it past the gate.
+    ? { proposal_id: redact(id), target: redactDeep(Object.fromEntries(PROPOSAL_TARGET_STRING_KEYS.map((k) => [k, o.target[k]]))) }
+    : { proposal_id: redact(id), target: null, note: `target not known; only the id is known${o && typeof o.targetUnavailableReason === 'string' ? ` (${flat(o.targetUnavailableReason)})` : ''}` }
+))
+const priorTargetsSection = priorTargetEntries.length
+  ? wrapAsData(dataNonce, 'prior-proposal-targets', priorTargetEntries) +
+    `\nThe prior-proposal-targets block above lists proposals that already have a recorded outcome (adopted, rejected or ` +
+    `reverted). If one of your proposals is about the same target as one listed there, you must reuse that target's ` +
+    `six identity fields (kind, component, concern, lens, workflow, job) exactly as listed, so the stable id matches and the ` +
+    `report can annotate it instead of ranking it as new. Set touches_always_on_lens and security_purposed from what YOUR ` +
+    `proposal does to a security check: they are gate inputs, not identity, and are never copied from a prior target.\n\n`
+  : ''
 
 const synthesisPrompt =
   `You are drafting proposals for the harness delivery optimiser. Every proposal you draft is a HYPOTHESIS the ` +
@@ -425,24 +576,26 @@ const synthesisPrompt =
   `\n\n` +
   wrapAsData(dataNonce, 'ci-aggregate', { byJob: ciAgg ? ciAgg.byJob : {}, citationPool: ciAgg ? ciAgg.citationPool : [], failures: ciAgg ? ciAgg.failures : [] }) +
   `\n\n` +
-  wrapAsData(dataNonce, 'escaped-defect-heuristic', gitAgg || { count: null, method: 'unavailable' }) +
+  wrapAsData(dataNonce, 'escaped-defect-heuristic', gitPerRepo.map((g, i) => (g.figures ? { ...g.figures, repo: flat(g.figures.repo), root_index: undefined } : { repo: flat(ledgerRepoLabel(i) || scope.resolved[i].label), count: null, method: 'unavailable' }))) +
   `\n\n` +
   wrapAsData(dataNonce, 'plan-labels', scope.plan_labels) +
   `\n\n` +
+  priorTargetsSection +
   `Draft a ranked list of proposed changes to the harness, the pipelines, or the process (never apply anything -- ` +
-  `you only propose). For EACH proposal, return: target (an object identifying WHAT it is about, used to derive a ` +
-  `stable id, never wording -- and mechanically checked by the orchestrator, so set these fields precisely: ` +
-  `target.lens exactly matching a lens name if the proposal is about a lens; target.workflow and target.job ` +
-  `exactly matching the CI-aggregate's own "workflow"/"job" fields if the proposal is about a specific CI job; ` +
-  `target.segment set to exactly "ci_wait", "human_wait" or "agent_compute" if the proposal is MOTIVATED BY that ` +
-  `wall-clock segment -- the orchestrator will drop such a proposal if that segment has any unmeasured runs in ` +
-  `the window, so only set it when the segment genuinely motivates the proposal; target.touches_always_on_lens ` +
+  `you only propose). For EACH proposal, return: target (an object with EXACTLY these eight keys and no others, ` +
+  `used to derive a stable id, never wording -- and mechanically checked by the orchestrator, so set them ` +
+  `precisely: kind, component and concern name WHAT the proposal is about in a few lowercase words (the same ` +
+  `target must get the same words every cycle); lens exactly matching a lens name if the proposal is about a ` +
+  `lens; workflow and job exactly matching the CI-aggregate's own "workflow"/"job" fields if the proposal is ` +
+  `about a specific CI job; each of those six may be an empty string where not applicable; touches_always_on_lens ` +
   `set to true if the proposal in any way changes whether, when, or how often lens-security or lens-qa runs -- ` +
   `even if it does not name them by their literal id (e.g. "run the security lens only sometimes"), even if it ` +
-  `uses no word like "remove"; target.security_purposed set to true if the proposal deletes, demotes, skips, or ` +
+  `uses no word like "remove"; security_purposed set to true if the proposal deletes, demotes, skips, or ` +
   `otherwise reduces a check whose PURPOSE is security (SAST, secret scanning, dependency/vulnerability auditing, ` +
-  `a security lens trigger) -- these two fields are mechanically checked by the orchestrator regardless of your ` +
-  `wording, so set them honestly rather than omitting them to phrase around the gate), statement (the proposal ` +
+  `a security lens trigger) -- these two booleans are required and mechanically checked by the orchestrator ` +
+  `regardless of your wording, so set them honestly rather than omitting them to phrase around the gate; a ` +
+  `target with a missing or extra key is rejected; a proposal motivated by a wall-clock segment must say so by ` +
+  `name (ci_wait, human_wait or agent_compute) in its statement or motivating_measurement), statement (the proposal ` +
   `itself), motivating_measurement (cite the specific numbers above that motivate it), confirming_measurement ` +
   `(what would confirm or refute it after adoption), n (the sample size backing it -- the record/run count from ` +
   `the aggregate above, never invented), citations (array of real ids copied VERBATIM from a citationPool above ` +
@@ -462,7 +615,7 @@ const synthesis = await agent(synthesisPrompt, {
           type: 'object',
           required: ['target', 'statement', 'motivating_measurement', 'confirming_measurement', 'n', 'citations', 'reinstatement_evidence'],
           properties: {
-            target: { type: 'object' },
+            target: PROPOSAL_TARGET_SCHEMA,
             statement: { type: 'string' },
             motivating_measurement: { type: 'string' },
             confirming_measurement: { type: 'string' },
@@ -478,6 +631,23 @@ const synthesis = await agent(synthesisPrompt, {
 
 let proposals = (synthesis && Array.isArray(synthesis.proposals)) ? synthesis.proposals : []
 const draftedCount = proposals.length
+
+// HARN-OPT-4 T6 (AC-QA-20, AC-DATA-15): a target that is not exactly the
+// fixed key set is rejected here, before any gate reads it and before an id
+// is minted, so an extra key cannot carry a signal the gates never look at.
+// The reason names the keys only (flattened and bounded), never their values.
+const targetKeyOneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 60)
+function malformedTargetReason(p) {
+  const t = p && p.target
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return 'target is not an object'
+  const keys = Object.keys(t)
+  const missing = PROPOSAL_TARGET_KEYS.filter((k) => !keys.includes(k))
+  const extra = keys.filter((k) => !PROPOSAL_TARGET_KEYS.includes(k))
+  if (!missing.length && !extra.length) return null
+  return [missing.length ? `missing ${missing.join(', ')}` : '', extra.length ? `extra ${extra.map(targetKeyOneLine).join(', ')}` : ''].filter(Boolean).join('; ')
+}
+const malformedTargetReasons = proposals.map(malformedTargetReason).filter((r) => r !== null)
+proposals = proposals.filter((p) => malformedTargetReason(p) === null)
 
 // AC-QA-17 mechanical backstop: if the ledger is insufficient, drop any
 // proposal whose ONLY valid citations are ledger ids (no gh citation) --
@@ -590,10 +760,12 @@ function isSegmentSuppressed(segment) {
 // text is now also checked against that segment's unmeasured-run count --
 // mechanical, not reliant on the agent having tagged itself correctly.
 function motivatingSegments(p) {
-  const tagged = p && p.target && WALL_CLOCK_SEGMENTS.includes(p.target.segment) ? [p.target.segment] : []
   const text = `${(p && p.statement) || ''} ${(p && p.motivating_measurement) || ''}`
-  const mentioned = WALL_CLOCK_SEGMENTS.filter((seg) => text.includes(seg))
-  return [...new Set([...tagged, ...mentioned])]
+  // Round 2 F4 (AC-OPS-3, spec bug): the literal token alone let plain words
+  // ("Agent compute is a small share") walk past the brake. Match the name
+  // case- and separator-insensitively: agent_compute, agent-compute, Agent compute.
+  const mentioned = WALL_CLOCK_SEGMENTS.filter((seg) => new RegExp(`\\b${seg.replace('_', '[ _-]?')}\\b`, 'i').test(text))
+  return mentioned
 }
 function isUnmeasuredSegmentMotivated(p) {
   return motivatingSegments(p).some(isSegmentSuppressed)
@@ -608,15 +780,28 @@ proposals = proposals.filter((p) => !isUnmeasuredSegmentMotivated(p))
 // removal case built on a window that could not have seen a failure, or a
 // job that may be a renamed continuation of one with its own unexamined
 // history, is exactly the unbraked-removal risk AC-DATA-8 exists to catch.
+// Round 1 F2 (AC-QA-21, spec bug): the lookup was an exact-key match, so a
+// case or spacing difference between the drafted workflow/job and the
+// aggregate's returned a null entry and waved a weakly evidenced removal
+// through. Both sides are folded with the same trim-plus-case-fold the
+// reader's identityValue uses (the entry's own workflow/job fields, not its
+// key), and a removal that names a job with NO entry fails closed below.
+const foldCiName = (v) => String(v == null ? '' : v).trim().toLowerCase()
 function ciJobEntryFor(target) {
   if (!target || !target.workflow || !target.job) return null
-  const key = `${target.workflow}::${target.job}`
-  return (ciAgg && ciAgg.byJob && ciAgg.byJob[key]) || null
+  const wf = foldCiName(target.workflow)
+  const job = foldCiName(target.job)
+  const entries = Object.values((ciAgg && ciAgg.byJob) || {})
+  return entries.find((e) => e && foldCiName(e.workflow) === wf && foldCiName(e.job) === job) || null
 }
 function isWeakCiEvidenceRemoval(p) {
   if (!isRemovalShaped(p)) return false
+  if (!p.target || !p.target.workflow || !p.target.job) return false
   const entry = ciJobEntryFor(p.target)
-  return !!(entry && (entry.insufficientData || entry.truncated || entry.renameSuspect))
+  // No evidence is weak evidence: a removal citing a job the aggregate does
+  // not know cannot claim "never failed".
+  if (!entry) return true
+  return !!(entry.insufficientData || entry.truncated || entry.renameSuspect)
 }
 const droppedWeakCiEvidence = proposals.filter(isWeakCiEvidenceRemoval)
 proposals = proposals.filter((p) => !isWeakCiEvidenceRemoval(p))
@@ -675,11 +860,37 @@ function annotateProposalOutcome(p) {
   const outcome = p.proposal_id && ledgerAgg && ledgerAgg.proposalOutcomes ? ledgerAgg.proposalOutcomes[p.proposal_id] : null
   if (!outcome) return p
   if (outcome.rejectedCount > 0) p.prior_rejection_ts = outcome.lastRejectionTs
+  // Round 1 F1 (AC-PROD-8, AC-DATA-14): adoption was recorded but never read.
+  if (outcome.adoptedCount > 0 && outcome.lastAdoptionTs) p.prior_adoption_ts = outcome.lastAdoptionTs
   if (outcome.revertedTwiceOrMore) p.reverted_twice = true
   return p
 }
 ranked.forEach(annotateProposalOutcome)
 insufficientDataProposals.forEach(annotateProposalOutcome)
+// An already-adopted target is reported under its own heading, not ranked as new.
+// Round 2 F1 (AC-SEC-15, section 12): a security-purposed removal and a
+// twice-reverted proposal are never moved out of the ranked list, where the
+// reader looks for them; they are annotated there instead.
+const isAdoptedElsewhere = (p) => p.prior_adoption_ts && p.category !== 'security_removal_flagged' && !p.reverted_twice
+const rankedNew = ranked.filter((p) => !isAdoptedElsewhere(p))
+const previouslyAdopted = ranked.filter(isAdoptedElsewhere)
+
+// Round 2 F2 (AC-PROD-8): the ledger holds only ids, so the target a later run
+// shows the drafter comes from this per-run sidecar, written beside the report
+// under the same ensure-ignored check and read by optimise-read.mjs's ledger
+// command. A per-run output like the report (overwritten each run), not a cache
+// of gh or ledger reads. Redacted like everything else this step writes.
+// Round 3 M2 (AC-PROD-8, AC-QA-20): seeded with every prior outcome target the
+// reader supplied this run, then overlaid with this run's proposals, so a
+// decided target survives cycles in which the drafter does not re-raise it.
+// Bounded: an outcome without a target is skipped, and at most
+// SIDECAR_CARRY_MAX prior entries are carried.
+const SIDECAR_CARRY_MAX = 500
+const proposalTargetsSidecar = {}
+for (const [id, o] of Object.entries((ledgerAgg && ledgerAgg.proposalOutcomes) || {}).slice(0, SIDECAR_CARRY_MAX)) {
+  if (o && o.target && typeof o.target === 'object' && /^[0-9a-f]{16}$/.test(id)) proposalTargetsSidecar[id] = redactDeep(o.target)
+}
+for (const p of [...ranked, ...insufficientDataProposals]) if (p.proposal_id) proposalTargetsSidecar[p.proposal_id] = redactDeep(p.target)
 
 // Review round-1 M5: keyed by POSITION (matching `roots`, and therefore
 // `ledgerAgg.perRepo[].rootIndex`), not by the raw absolute root path --
@@ -703,7 +914,8 @@ const reportMarkdown = buildReport({
   triggerAccuracy: ledgerAgg ? ledgerAgg.triggerAccuracy : null,
   ciByJob: ciAgg ? ciAgg.byJob : {},
   ciFailures: ciAgg ? ciAgg.failures : [],
-  escapedDefects: gitAgg,
+  escapedDefects: gitPerRepo.map((g, i) => ({ ...g, label: ledgerRepoLabel(i) || scope.resolved[i].label })),
+  escapedDefectsUnmatched: gitUnmatched,
   draftedCount,
   droppedAlwaysOnSecurityCount: droppedAlwaysOnSecurity.length,
   droppedNoReinstatementCount: droppedNoReinstatement.length,
@@ -748,8 +960,11 @@ const reportMarkdown = buildReport({
     suppressed: isSegmentSuppressed(seg),
   })),
   droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
-  ranked,
+  malformedTargetReasons,
+  ranked: rankedNew,
+  previouslyAdopted,
   insufficientDataProposals,
+  flatten: flat,
 })
 
 const reportWrite = await agent(
@@ -762,12 +977,18 @@ const reportWrite = await agent(
   `.git/info/exclude if not already present, then verifies with \`git check-ignore -q\`, printing {ignored, error}.\n` +
   `If ignored is NOT true: do NOT write the report at all -- return written:false and error naming this reason ` +
   `(e.g. "the report path is not gitignored: <the script's own error>"), and stop here.\n` +
+  `Then run the same script once more for the sidecar path, under the roster's FIRST repo root (round 3 M2: the reader ` +
+  `looks there first; the invoking repo need not be on the roster at all), exactly: \`node <path-to-optimise-report-ignore.mjs> ` +
+  `"${roots[0]}" "${PROPOSAL_TARGETS_RELATIVE_PATH}"\`. If ITS ignored is not true, do NOT write the ` +
+  `sidecar (still write the report) and say so in error.\n` +
   `Only once ignored is true, write EXACTLY the content below, verbatim, to the file "${REPORT_RELATIVE_PATH}" at ` +
   `the CURRENT repo's root (create the .claude/ directory first if it does not exist; overwrite the file if it ` +
-  `already exists). This is the ONLY file you may create or modify in this step. Do NOT run \`git add\`, ` +
+  `already exists). Once the sidecar path is ignored, also write EXACTLY the second data block below, verbatim, to ` +
+  `"${roots[0]}/${PROPOSAL_TARGETS_RELATIVE_PATH}" (create its .claude/ directory first if needed; overwrite it if it exists). Apart from that sidecar, the report is the only file you may create or modify in this step. Do NOT run \`git add\`, ` +
   `\`git commit\`, \`git push\`, any \`gh\` command with \`-X POST/PATCH/PUT/DELETE\`, or any other command that ` +
   `changes repo or remote state.\n\n` +
   wrapAsData(dataNonce, 'report-content-to-write-verbatim', reportMarkdown) +
+  `\n\n` + wrapAsData(dataNonce, 'proposal-targets-sidecar-to-write-verbatim', JSON.stringify(proposalTargetsSidecar)) +
   `\n\nReturn written (boolean), path, and error (null on success).`,
   {
     label: 'report:write',
@@ -785,6 +1006,7 @@ let reportWriteError = null
 if (!reportWrite) reportWriteError = 'report:write agent failed or returned no result'
 else if (!reportWrite.written) reportWriteError = reportWrite.error || 'report:write reported written:false with no reason given'
 if (reportWriteError) log(`Report write failed: ${reportWriteError}`)
+else if (reportWrite.error) log(`Report written; sidecar note: ${reportWrite.error}`)
 
 return {
   resolved: scope.resolved,
@@ -800,7 +1022,8 @@ return {
   report_written: !!(reportWrite && reportWrite.written),
   report_write_error: reportWriteError,
   proposal_ids_computed: proposalIdsComputed,
-  proposals_ranked: ranked,
+  proposals_ranked: rankedNew,
+  proposals_previously_adopted: previouslyAdopted,
   proposals_insufficient_data: insufficientDataProposals,
   report: reportMarkdown,
   __outcome: 'done',
@@ -1181,34 +1404,73 @@ function buildReport(d) {
   for (const f of d.ciFailures || []) lines.push(`- gh unavailable for ${f.repo}: ${f.mode} (${f.command}): ${f.error || 'n/a'}`)
   lines.push('')
   lines.push('## Escaped-defect counter-metric')
-  if (d.escapedDefects && typeof d.escapedDefects.count === 'number') {
-    lines.push(`Raw (unscoped): ${d.escapedDefects.count} of ${d.escapedDefects.n_commits_examined} examined commits matched the heuristic. ${d.escapedDefects.method}`)
+  // HARN-OPT-4 T6 (AC-DATA-11, AC-PROD-7, AC-SEC-10): one block per roster
+  // repo, labelled by the ledger label and numbered by roster position (two
+  // uninstrumented repos share the redaction marker as a label), never the
+  // root path. Every echoed value is flattened and bounded.
+  const oneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)
+  // Round 3 L1 (AC-SEC-10): the label is ledger-supplied text; oneLine flattens
+  // but does not redact, and the run's flattener does both.
+  const flattenLabel = d.flatten || oneLine
+  const gitRepos = Array.isArray(d.escapedDefects) ? d.escapedDefects : []
+  if (!gitRepos.length) lines.push('Escaped defects are not currently captured (git-lane unavailable).')
+  gitRepos.forEach((g, i) => {
+    lines.push(`Repo ${i + 1} (${flattenLabel(g.label)}):`)
+    const f = g.figures
+    if (g.status !== 'ok' || !f || typeof f.count !== 'number') {
+      lines.push(`Not measured: ${oneLine(g.reason || 'git lane unavailable')}`)
+      return
+    }
+    lines.push(`Raw (unscoped): ${f.count} of ${f.n_commits_examined} examined commits matched the heuristic. ${oneLine(f.method)}`)
     // AC-2/AC-4: the scoped figure is reported alongside the raw one, never
     // in place of it, and is stated as unavailable rather than guessed at
     // when the config could not be resolved (scoped_count null).
-    if (typeof d.escapedDefects.scoped_count === 'number') {
-      lines.push(`Scoped to product source (config: ${d.escapedDefects.scoped_config_source}): ${d.escapedDefects.scoped_count} counted, ${d.escapedDefects.scoped_excluded_count} excluded as pipeline/tooling-only, ${d.escapedDefects.scoped_unavailable_count} unavailable (changed paths could not be determined). ${d.escapedDefects.scoped_method}`)
+    if (typeof f.scoped_count === 'number') {
+      lines.push(`Scoped to product source (config: ${f.scoped_config_source}): ${f.scoped_count} counted, ${f.scoped_excluded_count} excluded as pipeline/tooling-only, ${f.scoped_unavailable_count} unavailable (changed paths could not be determined). ${oneLine(f.scoped_method)}`)
     } else {
-      lines.push(`Scoped figure unavailable: ${d.escapedDefects.scoped_method || 'no reason given by the git lane'}`)
+      lines.push(`Scoped figure unavailable: ${oneLine(f.scoped_method || 'no reason given by the git lane')}`)
     }
-  } else {
-    lines.push('Escaped defects are not currently captured (git-lane unavailable).')
-  }
+  })
+  for (const u of d.escapedDefectsUnmatched || []) lines.push(`- Unmatched git result: ${u}`)
   lines.push('')
+  // Round 2 F1/F7 (AC-SEC-15, AC-PROD-8): ONE annotation renderer for all three
+  // proposal sections, so a flag or an outcome shown in one cannot be dropped in
+  // another (the adopted and insufficient-data sections used to omit the
+  // security flag, reinstatement evidence and prior rejection). It also prints
+  // the proposal's target on one flattened, redacted line, the six identity
+  // fields the id derives from.
+  const flatten = d.flatten || oneLine
+  const TARGET_FIELDS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+  const annotationLines = (p) => {
+    const out = [`Target: ${TARGET_FIELDS.map((k) => `${k}=${flatten(p.target && p.target[k] != null ? p.target[k] : '')}`).join(' ')}`]
+    if (p.reinstatement_evidence) out.push(`Reinstatement evidence: ${p.reinstatement_evidence}`)
+    if (p.category === 'security_removal_flagged') out.push('**Flagged: security-purposed check removal/demotion.**')
+    if (p.prior_adoption_ts) out.push(`Already adopted on ${p.prior_adoption_ts}.`)
+    if (p.prior_rejection_ts) out.push(`**Previously rejected on ${p.prior_rejection_ts}.**`)
+    if (p.reverted_twice) out.push('**Flagged: adopted and reverted at least twice previously (§12: keep the original).**')
+    return out
+  }
   lines.push('## Proposals (ranked)')
   if (!d.ranked.length) lines.push('None.')
   for (const p of d.ranked) {
     lines.push(`### ${p.proposal_id || '(no id)'}: ${p.statement}`)
     lines.push(`n=${p.n}. Motivating: ${p.motivating_measurement}. Confirming: ${p.confirming_measurement}. Citations: ${(p.citations || []).join(', ')}.`)
-    if (p.reinstatement_evidence) lines.push(`Reinstatement evidence: ${p.reinstatement_evidence}`)
-    if (p.category === 'security_removal_flagged') lines.push('**Flagged: security-purposed check removal/demotion.**')
-    if (p.prior_rejection_ts) lines.push(`**Previously rejected on ${p.prior_rejection_ts}.**`)
-    if (p.reverted_twice) lines.push('**Flagged: adopted and reverted at least twice previously (§12: keep the original).**')
+    lines.push(...annotationLines(p))
+  }
+  lines.push('')
+  lines.push('## Proposals previously adopted (not ranked as new)')
+  if (!(d.previouslyAdopted || []).length) lines.push('None.')
+  for (const p of d.previouslyAdopted || []) {
+    lines.push(`### ${p.proposal_id || '(no id)'}: ${p.statement}`)
+    lines.push(...annotationLines(p))
   }
   lines.push('')
   lines.push('## Proposals (insufficient data, excluded from ranking)')
   if (!d.insufficientDataProposals.length) lines.push('None.')
-  for (const p of d.insufficientDataProposals) lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
+  for (const p of d.insufficientDataProposals) {
+    lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
+    lines.push(...annotationLines(p))
+  }
   lines.push('')
   lines.push('## Filtering')
   // Owner decision, round-3 coordinator triage: the suppression gate now
@@ -1257,6 +1519,9 @@ function buildReport(d) {
     `Dropped (motivating wall-clock segment has unmeasured runs${unmeasuredSegmentDetail ? ` -- ${unmeasuredSegmentDetail}` : ''}): ${d.droppedUnmeasuredSegmentCount || 0}. ` +
     `Dropped (cited CI job is insufficient-data/truncated/rename-suspect): ${d.droppedWeakCiEvidenceCount || 0}.`
   )
+  // HARN-OPT-4 T6 (AC-QA-20): named, not merely counted. Round 1 F6: this used
+  // a dead /\\s+/g (a literal backslash-s), so multi-line reasons passed through.
+  lines.push(`Proposals rejected: malformed target: ${(d.malformedTargetReasons || []).length}${(d.malformedTargetReasons || []).length ? ` (${d.malformedTargetReasons.map((r) => oneLine(r)).join(' | ')})` : ''}`)
   return lines.join('\n')
 }
 
