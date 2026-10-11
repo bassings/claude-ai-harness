@@ -230,6 +230,43 @@ for (const { name, key, args } of RETRY_CASES) {
   })
 }
 
+// ---- Round 1 L1 (spec bug): the three safety conditions on the generic retry ----
+// The retry above is guarded by a protected-key list, an own-property check and
+// an anchored regex. Before this round nothing failed when any of the three was
+// removed. Each case below is the one input that only that condition stops, and
+// is proven by mutation (see the T8 fix round 1 report).
+const SAFETY_CASES = [
+  // `entryKey` is a key the terminal entry really carries, so only the regex
+  // anchor (not the hasOwn check) stands between the nested path and a retry.
+  { name: 'review-cycle', args: { round: 2 }, nested: 'ac_verdicts[0].round', entryKey: 'round' },
+  { name: 'plan-cycle', args: {}, nested: 'verdicts[0].lenses_run', entryKey: 'lenses_run' },
+]
+for (const { name, args, nested, entryKey } of SAFETY_CASES) {
+  const terminalsOf = (writes) => writes.filter((w) => w.outcome !== 'started')
+
+  test(`T8 ${name} (round 1 L1): a refusal naming run_id is never retried without it; exactly one terminal write, and it keeps run_id`, async () => {
+    const accepted = []
+    const { writes } = await drive(name, { args, ledger: staleWriter('run_id', accepted, { alwaysRefuseTerminal: true, error: 'record rejected: run_id: not an allowed property' }) })
+    const terminals = terminalsOf(writes)
+    assert.equal(terminals.length, 1, 'dropping run_id would orphan the terminal row from its started row')
+    assert.ok(typeof terminals[0].run_id === 'string' && terminals[0].run_id.length > 0, `terminal: ${JSON.stringify(terminals[0])}`)
+  })
+
+  test(`T8 ${name} (round 1 L1): a refusal naming a key the entry does not carry does not retry`, async () => {
+    const accepted = []
+    const { writes } = await drive(name, { args, ledger: staleWriter('nonexistent_key', accepted, { alwaysRefuseTerminal: true, error: 'record rejected: nonexistent_key: not an allowed property' }) })
+    assert.equal(terminalsOf(writes).length, 1, 'a key the entry never had cannot be what the writer refused')
+  })
+
+  test(`T8 ${name} (round 1 L1): a nested refusal "${nested}: not an allowed property" does not retry, and the top-level "${entryKey}" is kept`, async () => {
+    const accepted = []
+    const { writes } = await drive(name, { args, ledger: staleWriter('unused', accepted, { alwaysRefuseTerminal: true, error: `record rejected: ${nested}: not an allowed property` }) })
+    const terminals = terminalsOf(writes)
+    assert.equal(terminals.length, 1, 'a refused nested property is not the top-level key of the same name')
+    assert.ok(entryKey in terminals[0], `the top-level ${entryKey} must survive`)
+  })
+}
+
 // ---- (2) SCHEMA_VERSION 5 and the readers (AC-OPS-3, AC-DATA-17) ----
 
 test('T8 AC-OPS-3: SCHEMA_VERSION is 5, and ledger-append.mjs says why (budget_spent is now a per-run delta)', async () => {
