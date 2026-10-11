@@ -244,13 +244,18 @@ const SAFETY_CASES = [
 for (const { name, args, nested, entryKey } of SAFETY_CASES) {
   const terminalsOf = (writes) => writes.filter((w) => w.outcome !== 'started')
 
-  test(`T8 ${name} (round 1 L1): a refusal naming run_id is never retried without it; exactly one terminal write, and it keeps run_id`, async () => {
-    const accepted = []
-    const { writes } = await drive(name, { args, ledger: staleWriter('run_id', accepted, { alwaysRefuseTerminal: true, error: 'record rejected: run_id: not an allowed property' }) })
-    const terminals = terminalsOf(writes)
-    assert.equal(terminals.length, 1, 'dropping run_id would orphan the terminal row from its started row')
-    assert.ok(typeof terminals[0].run_id === 'string' && terminals[0].run_id.length > 0, `terminal: ${JSON.stringify(terminals[0])}`)
-  })
+  // Round 2 Low: the protected list has three entries and only run_id had a
+  // case, so trimming kind or outcome from the list left every test green.
+  // One case per protected key, so each entry is load-bearing on its own.
+  for (const protectedKey of ['kind', 'outcome', 'run_id']) {
+    test(`T8 ${name} (round 1 L1, round 2 Low): a refusal naming ${protectedKey} is never retried without it; exactly one terminal write, and it keeps ${protectedKey}`, async () => {
+      const accepted = []
+      const { writes } = await drive(name, { args, ledger: staleWriter(protectedKey, accepted, { alwaysRefuseTerminal: true, error: `record rejected: ${protectedKey}: not an allowed property` }) })
+      const terminals = terminalsOf(writes)
+      assert.equal(terminals.length, 1, `dropping ${protectedKey} would land a row the writer must refuse, or orphan it from its started row`)
+      assert.ok(typeof terminals[0][protectedKey] === 'string' && terminals[0][protectedKey].length > 0, `terminal: ${JSON.stringify(terminals[0])}`)
+    })
+  }
 
   test(`T8 ${name} (round 1 L1): a refusal naming a key the entry does not carry does not retry`, async () => {
     const accepted = []
