@@ -60,7 +60,7 @@ test('T1: hostile labels degrade only the lens field, never the record (AC-QA-2)
   assert.equal(out.write_ok, true, out.write_error)
   assert.equal(entry.findings[0].lens, 'lens-qa')
 
-  for (const label of ['lens-security\n+ lens-qa', 'lens-qa + `lens-security`', 'lens-qa | lens-security', '', '+']) {
+  for (const label of ['lens-security\n+ lens-qa', 'lens-qa + `lens-security`', 'lens-security + a|b', '', '+']) {
     const r = writeOpen([label])
     const tag = JSON.stringify(label)
     assert.equal(r.out.write_ok, true, `${tag}: ${r.out.write_error}`)
@@ -89,10 +89,12 @@ test('T1: a 100,000-character label of repeated separators is bounded before any
   const parsed = parseCompoundLensLabel(label)
   const ms = Number(process.hrtime.bigint() - t0) / 1e6
   assert.equal(parsed, 'lens-security')
-  assert.ok(ms < 50, `parser took ${ms} ms`)
+  // Review round 1, L1: 50 ms flaked-in-waiting on a loaded CI box; 500 ms is a
+  // sanity bound. The work bound itself is pinned by the L1 test below.
+  assert.ok(ms < 500, `parser took ${ms} ms`)
   const t1 = process.hrtime.bigint()
   parseCompoundLensLabel(' + '.repeat(33000) + ', '.repeat(33000))
-  assert.ok(Number(process.hrtime.bigint() - t1) / 1e6 < 50, 'separator-only input must also be fast')
+  assert.ok(Number(process.hrtime.bigint() - t1) / 1e6 < 500, 'separator-only input must also be fast')
 })
 
 test('T1: an injected middle segment reaches no field other than the bounded lens_raw (AC-SEC-1)', () => {
@@ -136,6 +138,14 @@ test('T2: 50 findings at the measured maximum size plus 96 ac_verdicts write fin
   assert.equal(entry.ac_verdicts.length, 96)
   assert.ok(Buffer.byteLength(raw) <= MAX_LINE_BYTES, `line was ${Buffer.byteLength(raw)} bytes`)
   assert.ok(entry.findings.every((f) => Buffer.byteLength(JSON.stringify(f)) <= 150), 'fixture findings sit at the measured maximum (about 144 bytes)')
+  // Review round 1, L4 (AC-PROD-1): every one of these 50 labels is a two-lens
+  // compound, so the reader must account for all 50 under a roster lens and
+  // leave none unattributed.
+  const mod = await import(READ_MODULE_URL)
+  const rework = mod.aggregateRework([{ ...entry, repo: 'demo' }])
+  const perLens = Object.values(rework.lensDispositionCounts).reduce((n, c) => n + c.fixed + c.rejected + c.spec_bug + c.open, 0)
+  assert.equal(rework.unattributedFindings, 0, 'no compound-label finding may be unattributed')
+  assert.equal(perLens + rework.unattributedFindings, 50, 'per-lens totals plus unattributed account for all 50 findings')
 })
 
 test('T2: 400 findings with 400 distinct hostile lens strings still write a full envelope inside MAX_LINE_BYTES (AC-SEC-3)', async () => {
@@ -171,4 +181,64 @@ test('T1 reader: a compound-label finding written by the new writer counts once 
   assert.equal(rework.unattributedFindings, 1, 'only the label naming no roster lens is unattributed')
   const total = Object.values(counts).reduce((s, c) => s + c.fixed + c.rejected + c.spec_bug + c.open, 0)
   assert.equal(total + rework.unattributedFindings, labels.length)
+})
+
+// Review round 1, M1 (AC-QA-1): a compound-label finding written open in
+// round 1 and confirmed fixed in round 2 must keep its attribution. The fixed
+// row used to copy prior.lens raw, which degradeEntry then nulled.
+test('M1: a compound-label finding confirmed fixed in round 2 is written fixed under its primary lens with the same id (AC-QA-1)', async () => {
+  const { AC_ID_RAW_MAX_BYTES } = await import(APPEND_MODULE_URL)
+  const mod = await import(READ_MODULE_URL)
+  const label = 'lens-security + lens-architecture'
+  const repo = makeTempRepo()
+  runAppend(repo, { ...envelope(), open_findings: [{ lens: label, location: 'a.js:1', claim: 'c' }] })
+  const finding = { lens: label, location: 'a.js:1', claim: 'c' }
+  const res = runAppend(repo, { ...envelope(), prior_findings: [{ id: '7c35753185a55bf1', ...finding }], fixed_findings: [finding] })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const lines = readLedgerLines(repo)
+  assert.equal(lines.length, 2)
+  const entry = JSON.parse(lines[1])
+  const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
+  assert.equal(fixed.length, 1)
+  assert.equal(fixed[0].lens, 'lens-security')
+  assert.equal(fixed[0].id, '7c35753185a55bf1')
+  assert.equal(fixed[0].lens_raw, Buffer.from(label).subarray(0, AC_ID_RAW_MAX_BYTES).toString('utf8'))
+  assert.equal(entry.invalid_prior_ids_dropped, 0)
+  assert.equal(entry.invalid_fixed_ids_dropped, 0)
+  const rework = mod.aggregateRework([{ ...entry, repo: 'demo' }])
+  assert.equal(rework.lensDispositionCounts['lens-security']?.fixed, 1)
+  assert.equal(rework.unattributedFindings, 0)
+})
+
+// Review round 1, M2 (spec bug): the redaction of lens_raw in main()'s loop
+// was unpinned; deleting it left every test green.
+test('M2: a path-shaped segment in a compound lens label is redacted from lens_raw and never reaches the written line', () => {
+  const { out, raw, entry } = writeOpen(['lens-security + /Users/someone/private'])
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(entry.findings[0].lens, 'lens-security')
+  assert.equal(raw.includes('/Users/'), false, 'the path must be redacted from the raw line')
+})
+
+// Review round 1, L3 (spec bug): '+' with no space before the path slipped
+// past ABSOLUTE_PATH_RE's prefix class. Every *_raw field fed by redactPaths
+// shares that gap, so ac_id_raw is pinned too.
+test('L3: a path directly after "+" is redacted in lens_raw and in ac_id_raw', () => {
+  const a = writeOpen(['lens-qa+/Users/x'])
+  assert.equal(a.out.write_ok, true, a.out.write_error)
+  assert.equal(a.raw.includes('/Users/'), false, 'lens_raw must redact a path glued to "+"')
+
+  const repo = makeTempRepo()
+  const res = runAppend(repo, { ...envelope(), open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'c', ac_id: 'AC-QA-1+/Users/x' }] })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const raw = readLedgerLines(repo)[0]
+  assert.equal(raw.includes('/Users/'), false, 'ac_id_raw must redact a path glued to "+"')
+})
+
+// Review round 1, L1 (spec bug): the 256-character bound itself was unpinned.
+test('L1: the compound parser reads only the first LENS_LABEL_PARSE_MAX_CHARS characters', async () => {
+  const { parseCompoundLensLabel, LENS_LABEL_PARSE_MAX_CHARS } = await import(APPEND_MODULE_URL)
+  assert.equal(parseCompoundLensLabel('x'.repeat(LENS_LABEL_PARSE_MAX_CHARS) + ' + lens-qa'), null, 'a roster name past the bound is never read')
+  assert.equal(parseCompoundLensLabel('lens-qa + ' + 'x'.repeat(LENS_LABEL_PARSE_MAX_CHARS)), 'lens-qa', 'a roster name inside the bound resolves')
 })

@@ -1067,24 +1067,27 @@ export function degradeEntry(entry, redactRawField = (v) => v) {
 // own comment, further down this file). Applied once, here, so all three
 // callers (spec_bugs, rejected_findings, open_findings) get it
 // consistently rather than three separate special cases.
+// HARN-OPT-4 T1 + review round 1 M1: a label that is not itself a valid lens
+// name but names a roster lens in a compound is attributed to the first one.
+// ONE helper serves computeFindings (open, rejected, spec_bug) and
+// computeFixedFindings, because the fixed path copied prior.lens raw and
+// degradeEntry then nulled it, so a compound finding written open could never
+// close under its lens. The id is always hashed from the ORIGINAL label by
+// the caller (AC-QA-3); the original label rides in lens_raw, which main()
+// redacts and bounds for every row, fixed rows included (M2).
+function resolveLensLabel(label) {
+  if (typeof label === 'string' && !new RegExp(LENS_PATTERN_STR).test(label)) {
+    const primary = parseCompoundLensLabel(label)
+    if (primary !== null) return { lens: primary, lensRaw: label.slice(0, LENS_LABEL_PARSE_MAX_CHARS) }
+  }
+  return { lens: label, lensRaw: undefined }
+}
+
 function computeFindings(descriptors, disposition) {
   if (!Array.isArray(descriptors)) return { entries: [], count: null }
   const entries = descriptors.map((f) => {
     if (!f || typeof f !== 'object') return null
-    // HARN-OPT-4 T1: a label that is not itself a valid lens name but names
-    // a roster lens in a compound is attributed to the first one. The id is
-    // still hashed from the ORIGINAL label (AC-QA-3), so a pre-T1 id keeps
-    // matching; the original label rides in lens_raw, which main() redacts
-    // and bounds exactly as degradeEntry does for any other nulled lens.
-    let lens = f.lens
-    let lensRaw
-    if (typeof lens === 'string' && !new RegExp(LENS_PATTERN_STR).test(lens)) {
-      const primary = parseCompoundLensLabel(lens)
-      if (primary !== null) {
-        lensRaw = lens.slice(0, LENS_LABEL_PARSE_MAX_CHARS)
-        lens = primary
-      }
-    }
+    const { lens, lensRaw } = resolveLensLabel(f.lens)
     return {
       id: findingId(f.lens, f.location, f.claim),
       lens,
@@ -1217,9 +1220,11 @@ function computeFixedFindings(priorFindings, fixedFindingDescriptors, sameRoundO
       continue
     }
     seenIds.add(candidate.id)
+    const { lens, lensRaw } = resolveLensLabel(prior.lens)
     entries.push({
       id: candidate.id,
-      lens: prior.lens,
+      lens,
+      ...(lensRaw === undefined ? {} : { lens_raw: lensRaw }),
       severity: prior.severity || 'Low',
       ac_id: prior.ac_id || null,
       disposition: 'fixed',
@@ -1295,7 +1300,9 @@ const TRUNCATABLE_FIELDS = ['task', 'spec', 'spec_raw', 'round_key', 'event', 'e
 // regression class the comment above already names twice. Proven both
 // ways in test/ledger-append.test.js: a colon-prefixed path redacts, a
 // GitHub-style https URL survives untouched.
-const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+// Review round 1 L3: '+' is a prefix too, so 'lens-qa+<path>' (a compound
+// label with no space) and 'AC-QA-1+<path>' redact like any other boundary.
+const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
 
 // The fixed marker for a path that cannot be safely recorded: an absolute
 // path outside the repo root, or (HARN-OPT-2 PR1, AC-SEC-1 case d) a
