@@ -1854,6 +1854,34 @@ test('optimise-cycle (HARN-OPT-4 T5, AC-QA-18): a measured zero prints ": 0" wit
   assert.ok(lines[0].endsWith(`${BLOCKED_LABEL}: 0`), `got: ${lines[0]}`)
 })
 
+test('optimise-cycle (HARN-OPT-4 T5, round 3 F1): the recorded/not-recorded split is rendered on its own line, so legacy rows cannot freeze the headline', async () => {
+  const bu = { count: 7, unresolved: [], byReason: { test_attempt_cap: 1, implement_attempt_cap: 2, tests_modified: 0 }, reasonNotRecorded: 4 }
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ blockedUnresolved: bu }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const lines = result.report.split('\n')
+  const split = lines.filter((l) => l.startsWith('Blocked TDD runs unresolved, reason recorded'))
+  assert.equal(split.length, 1, `report was:\n${result.report}`)
+  assert.ok(split[0].includes('reason recorded (post-T5): 3'), `got: ${split[0]}`)
+  assert.ok(split[0].includes('not recorded (pre-T5): 4'), `got: ${split[0]}`)
+  const head = lines.filter((l) => l.includes(BLOCKED_LABEL))
+  assert.equal(head.length, 1)
+  assert.ok(head[0].endsWith(`${BLOCKED_LABEL}: 7`), `got: ${head[0]}`)
+})
+
+test('optimise-cycle (HARN-OPT-4 T5, round 3 F4): the caveat line names the 500-byte false-clear direction', async () => {
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ blockedUnresolved: blockedFixture() }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const caveat = result.report.split('\n').filter((l) => /re-briefed/.test(l))
+  assert.equal(caveat.length, 1, `report was:\n${result.report}`)
+  assert.ok(/first 500 bytes/.test(caveat[0]), `got: ${caveat[0]}`)
+})
+
+test('optimise-cycle (HARN-OPT-4 T5, round 3 F1): SKILL.md points the week-on-week sentence at the recorded-reason figure', () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
+  // The sentence wraps in the markdown source, so only a full stop ends it.
+  assert.ok(/recorded[^.]*week on week|week on week[^.]*recorded/i.test(skill), 'the week-on-week sentence must name the recorded-reason figure')
+})
+
 test('optimise-cycle (HARN-OPT-4 T5): the ledger lane output schema declares blockedUnresolved', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8')
   const start = src.indexOf('const LEDGER_LANE_SCHEMA')

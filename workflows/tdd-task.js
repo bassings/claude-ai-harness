@@ -431,7 +431,8 @@ const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
 // Round 2 L4 (AC-DATA-2 as amended): a new field is sent only when supplied.
 // blocked_reason rides the terminal row only for a blocked outcome, so done
 // and aborted rows never depend on the retry below against a stale writer
-// (the writer records an absent key as null). Only the enum code goes on the
+// (the writer normalises the absent key to null on tdd_task rows, round 3 F2,
+// so the written line always carries it). Only the enum code goes on the
 // line: never verifier evidence or test output (AC-SEC-8).
 if (OUTCOME_BY_VERDICT[result.verdict] === 'blocked') terminalEntry.blocked_reason = blockedReason
 if (startRunId) terminalEntry.run_id = startRunId

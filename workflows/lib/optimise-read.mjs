@@ -329,7 +329,11 @@ export function aggregateBlockedUnresolved(records, { root = '' } = {}) {
     open.set(key, { repo: r.repo, spec: planKeyForRecord(r, root), task: r.task, reason: recorded ? r.blocked_reason : 'not recorded', seq })
   }
   const unresolved = [...open.values()].map(({ seq: blockedSeq, ...u }) => {
-    const later = doneRows.find((d) => d.seq > blockedSeq && d.repo === u.repo && d.spec === u.spec && d.task !== u.task)
+    // Round 3 F3: every spec-null run canonicalises to the one no-spec bucket,
+    // where a later done run says nothing about this task, so the hint is
+    // never offered there.
+    const noSpecKey = planKeyForRecord({ spec: null }, root)
+    const later = u.spec === noSpecKey ? undefined : doneRows.find((d) => d.seq > blockedSeq && d.repo === u.repo && d.spec === u.spec && d.task !== u.task)
     // One shape, always: the hint fields are present on every entry, false
     // and null when no later done row for the spec exists, so a consumer
     // never has to test for the key (conductor edit after fix round 1).

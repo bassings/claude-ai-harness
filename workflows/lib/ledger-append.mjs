@@ -2178,6 +2178,11 @@ export function main() {
   // dropped or never-supplied round would read as "key absent". Normalise to
   // an explicit null on review_cycle rows so the reader sees one shape.
   if (entry.kind === 'review_cycle' && entry.round === undefined) entry.round = null
+  // HARN-OPT-4 T5 round 3 F2 (AC-OPS-5, AC-QA-17): same rule for blocked_reason
+  // on tdd_task rows. The workflow sends it only when the run blocked
+  // (AC-DATA-2 as amended), and the line still reads null on a done or
+  // aborted row, so key presence tells a post-T5 row from a pre-T5 one.
+  if (entry.kind === 'tdd_task' && entry.blocked_reason === undefined) entry.blocked_reason = null
   if (strayBlockedReason > 0) {
     entry.invalid_record_values_dropped = (entry.invalid_record_values_dropped || 0) + strayBlockedReason
   }

@@ -1081,8 +1081,17 @@ function buildReport(d) {
     // Round 1 M1: the caveat also names re-briefed retries. The count line
     // must stay the exact pinned `label: n` string, so the extra caveat is its
     // own line ahead of it, and only when there is something listed.
-    if (bu.count > 0) lines.push('Blocked TDD runs unresolved in window may include a task re-briefed after a block and then finished (see the hint on each line).')
+    if (bu.count > 0) lines.push('Blocked TDD runs unresolved in window may include a task re-briefed after a block and then finished (see the hint on each line); two briefs identical in their first 500 bytes can falsely clear each other (round 3 F4).')
     lines.push(`${BLOCKED_LABEL}: ${bu.count}`)
+    // Round 3 F1 (AC-PROD-6): legacy rows (no blocked_reason key) can never
+    // resolve retroactively, so the headline alone reads as a trend that is
+    // stuck. The reader already splits recorded from not-recorded; render it
+    // on its own line so the pinned `label: n` line stays exact.
+    const recorded = bu.byReason && typeof bu.byReason === 'object'
+      ? Object.values(bu.byReason).reduce((acc, v) => acc + (typeof v === 'number' ? v : 0), 0)
+      : null
+    const notRecorded = typeof bu.reasonNotRecorded === 'number' ? bu.reasonNotRecorded : null
+    lines.push(`Blocked TDD runs unresolved, reason recorded (post-T5): ${recorded === null ? 'not recorded' : recorded}; not recorded (pre-T5): ${notRecorded === null ? 'not recorded' : notRecorded}.`)
     // Task text is ledger free text: collapse whitespace and bound it so a
     // hostile task string cannot add lines or bulk to the report.
     const oneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)

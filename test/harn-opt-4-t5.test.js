@@ -130,7 +130,11 @@ function writtenBlockedReason(payload) {
   const [raw] = readLedgerLines(repo)
   const entry = JSON.parse(raw)
   assert.equal(entry.write_ok, true, raw)
-  return entry.blocked_reason ?? null
+  // Round 3 F2: the key must be PRESENT and null on the written line (the
+  // writer normalises an absent blocked_reason to null on tdd_task rows, as it
+  // does round on review_cycle rows), so absent and null are told apart here.
+  assert.ok('blocked_reason' in entry, `blocked_reason key absent on the written line: ${raw}`)
+  return entry.blocked_reason
 }
 
 test('T5 tdd-task: a done row and an aborted row carry the key, with the value null (not omitted, not a string)', async () => {
@@ -359,6 +363,16 @@ test('T5 AC-DATA-19: a blocked payload and a hostile blocked_reason each leave t
 let seq = 0
 const tdd = (outcome, task, ts, extra = {}) => ({ schema_version: 4, run_id: `run${++seq}`, ts, repo: 'demo', kind: 'tdd_task', outcome, task, spec: 'specs/a.md', ...extra })
 const T = (n) => `2026-10-11T0${n}:00:00.000Z`
+
+test('T5 reader (round 3 F3): the later-done hint never fires across the no-spec bucket, where unrelated runs share one key', () => {
+  const r = reader.aggregateBlockedUnresolved([
+    tdd('blocked', 'task T, no spec', T(1), { spec: null, blocked_reason: 'implement_attempt_cap' }),
+    tdd('done', 'task U, no spec', T(2), { spec: null }),
+  ])
+  assert.strictEqual(r.count, 1)
+  assert.strictEqual(r.unresolved[0].laterDoneSameSpec, false)
+  assert.strictEqual(r.unresolved[0].laterDoneSameSpecTs, null)
+})
 
 test('T5 reader: a blocked row alone is unresolved (1) and the list names its spec, task and reason (AC-QA-18, shaped like a blocked task finished by hand)', () => {
   const r = reader.aggregateBlockedUnresolved([tdd('blocked', 'A11Y-002 contrast tokens', T(1), { blocked_reason: 'implement_attempt_cap' })])
