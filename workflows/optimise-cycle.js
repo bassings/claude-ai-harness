@@ -324,10 +324,18 @@ const CI_LANE_SCHEMA = {
 // are nullable (AC-4): null means the scoped figure is unavailable (a
 // broken or invalid .claude/harness-triggers.json override), reported via
 // scoped_method rather than guessed at.
-const GIT_LANE_SCHEMA = {
+// HARN-OPT-4 T6 (AC-DATA-11): one entry per roster repo. `root_index` is the
+// positional index into scope.resolved and `repo` is the ledger identity
+// label for that root; the SCRIPT supplies both in each lane prompt and
+// matches the result by them, so a result is never trusted for which repo it
+// claims to describe. The top level is an object because structured output
+// needs an object root.
+const GIT_LANE_ENTRY_SCHEMA = {
   type: 'object',
-  required: ['count', 'n_commits_examined', 'method', 'window_note', 'scoped_count', 'scoped_excluded_count', 'scoped_unavailable_count', 'scoped_config_source', 'scoped_exclude_globs', 'scoped_method'],
+  required: ['root_index', 'repo', 'count', 'n_commits_examined', 'method', 'window_note', 'scoped_count', 'scoped_excluded_count', 'scoped_unavailable_count', 'scoped_config_source', 'scoped_exclude_globs', 'scoped_method'],
   properties: {
+    root_index: { type: 'integer' },
+    repo: { type: 'string' },
     count: { type: 'integer' },
     n_commits_examined: { type: 'integer' },
     method: { type: 'string' },
@@ -338,6 +346,36 @@ const GIT_LANE_SCHEMA = {
     scoped_config_source: { type: 'string', enum: ['default', 'repo-override'] },
     scoped_exclude_globs: { type: 'array', items: { type: 'string' } },
     scoped_method: { type: 'string' },
+  },
+}
+const GIT_LANE_SCHEMA = {
+  type: 'object',
+  required: ['repos'],
+  properties: { repos: { type: 'array', items: GIT_LANE_ENTRY_SCHEMA } },
+}
+
+// HARN-OPT-4 T6 (AC-QA-20, AC-PROD-8, AC-DATA-15): the proposal target is a
+// FIXED key set, not a free object, so the stable id and the removal gates
+// read the same keys every time. The six string fields may be empty or null
+// where not applicable; the two booleans are required and are gate inputs.
+// Mirrors PROPOSAL_IDENTITY_KEYS in workflows/lib/optimise-read.mjs
+// (workflow scripts cannot import it, so the list is duplicated and the T6
+// test pins both).
+const PROPOSAL_TARGET_STRING_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+const PROPOSAL_TARGET_KEYS = [...PROPOSAL_TARGET_STRING_KEYS, 'touches_always_on_lens', 'security_purposed']
+const PROPOSAL_TARGET_SCHEMA = {
+  type: 'object',
+  required: PROPOSAL_TARGET_KEYS,
+  additionalProperties: false,
+  properties: {
+    kind: { type: ['string', 'null'] },
+    component: { type: ['string', 'null'] },
+    concern: { type: ['string', 'null'] },
+    lens: { type: ['string', 'null'] },
+    workflow: { type: ['string', 'null'] },
+    job: { type: ['string', 'null'] },
+    touches_always_on_lens: { type: 'boolean' },
+    security_purposed: { type: 'boolean' },
   },
 }
 
@@ -386,22 +424,63 @@ const ciLanePrompt =
   `script computed.`
 const ciLane = () => agent(ciLanePrompt, { label: 'lane:ci', phase: 'Lanes', schema: CI_LANE_SCHEMA })
 
-const gitLanePrompt =
-  `In the CURRENT repo, run exactly \`git log --max-count=500 --name-only --pretty=format:'%x1e%P%x1f%s'\` and ` +
+// HARN-OPT-4 T6 (AC-DATA-12, AC-SEC-10, AC-OPS-13): one lane call per roster
+// entry, each naming exactly that entry's root as a literal `cd` target (the
+// roots have already passed SHELL_METACHAR_RE above), never "the CURRENT
+// repo", which reported the invoking repo's figure for every roster repo.
+const gitLanePrompt = (root, rootIndex) =>
+  `Run these in order: \`cd ${root}\`, then \`git log --max-count=500 --name-only --pretty=format:'%x1e%P%x1f%s'\`, and ` +
   `capture its ENTIRE stdout verbatim, unmodified, character-for-character (never the diff, never file contents ` +
   `-- this is metadata only: parent hashes, subject lines, and the paths of files each commit changed; this lane ` +
-  `never reads or reports another repo's history). Also run \`git rev-parse --show-toplevel\` to get this repo's ` +
-  `root path. Find optimise-read.mjs the same way the other lanes do. Pipe exactly ` +
-  `\`{"git_log_raw": "<the entire git log output above, verbatim>", "root": "<the repo root above>"}\` as JSON ` +
+  `reads only this one repo's history and never another's). Find optimise-read.mjs the same way the other lanes do. Pipe exactly ` +
+  `\`{"git_log_raw": "<the entire git log output above, verbatim>", "root": "${root}"}\` as JSON ` +
   `into \`node <path> escaped-defects\` -- do not parse, reformat, or summarise the git log output yourself; the ` +
-  `script does all parsing and scoring, deterministically, from the raw text you pass it. Return exactly what it ` +
-  `printed, plus a window_note stating how many commits back this covers (e.g. "most recent 500 commits") -- ` +
+  `script does all parsing and scoring, deterministically, from the raw text you pass it. Return a single-element ` +
+  `\`repos\` array whose entry is exactly what it printed (including its \`repo\` field), plus root_index ${rootIndex} ` +
+  `and a window_note stating how many commits back this covers (e.g. "most recent 500 commits") -- ` +
   `this is a heuristic proxy for escaped defects (AC-PROD-7), not a verified per-PR causal count, and the script ` +
   `reports BOTH a raw figure (every "fix:"-typed commit) and a scoped figure (narrowed to commits that touch ` +
   `product source, excluding configured pipeline/tooling paths); state both plainly, do not overclaim either.`
-const gitLane = () => agent(gitLanePrompt, { label: 'lane:git', phase: 'Lanes', schema: GIT_LANE_SCHEMA })
+const gitLaneFor = (r, i) => () => agent(gitLanePrompt(r.root, i), { label: 'lane:git', phase: 'Lanes', schema: GIT_LANE_SCHEMA })
 
-const [ledgerAgg, ciAgg, gitAgg] = await parallel([ledgerLane, ciLane, gitLane])
+const [ledgerAgg, ciAgg, ...gitResults] = await parallel([ledgerLane, ciLane, ...scope.resolved.map(gitLaneFor)])
+
+// Match each git result to its roster entry by the index the SCRIPT attached
+// (never a path the agent supplies) AND by the ledger identity label the
+// ledger lane derived for that root. Anything else is reported as unmatched
+// with the reason, never merged into another repo's figure (AC-DATA-11).
+const flat = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)
+const gitPerRepo = scope.resolved.map(() => ({ status: 'failed', reason: 'git lane returned no result', figures: null }))
+const gitUnmatched = []
+const ledgerRepoLabel = (i) => (ledgerAgg && ledgerAgg.perRepo && ledgerAgg.perRepo[i] && typeof ledgerAgg.perRepo[i].root === 'string' ? ledgerAgg.perRepo[i].root : null)
+gitResults.forEach((res, k) => {
+  if (!res || !Array.isArray(res.repos)) return
+  const claims = []
+  for (const e of res.repos) {
+    if (!e || !Number.isInteger(e.root_index) || e.root_index < 0 || e.root_index >= scope.resolved.length) {
+      gitUnmatched.push(`result with root_index ${flat(e && e.root_index)} (repo ${flat(e && e.repo)}): out of range for ${scope.resolved.length} roster repo(s); not used`)
+    } else if (e.root_index !== k) {
+      // The script asked lane k about roster repo k only; an answer about
+      // another index is a swap or a forgery, never a figure for either.
+      gitUnmatched.push(`roster repo ${k + 1}: result claimed root_index ${e.root_index} (repo ${flat(e.repo)}); not used`)
+    } else {
+      claims.push(e)
+    }
+  }
+  if (claims.length > 1) {
+    gitUnmatched.push(`roster repo ${k + 1}: ${claims.length} results claimed root_index ${k}; none used`)
+    gitPerRepo[k] = { status: 'unmatched', reason: 'duplicate results for this roster repo', figures: null }
+  } else if (claims.length === 1) {
+    const e = claims[0]
+    const ledgerRepo = ledgerRepoLabel(k)
+    if (ledgerRepo === null || e.repo !== ledgerRepo) {
+      gitUnmatched.push(`roster repo ${k + 1}: result repo ${flat(e.repo)} does not match ledger repo ${flat(ledgerRepo)}; not used`)
+      gitPerRepo[k] = { status: 'unmatched', reason: `repo mismatch (result ${flat(e.repo)}, ledger ${flat(ledgerRepo)})`, figures: null }
+    } else {
+      gitPerRepo[k] = { status: 'ok', reason: null, figures: e }
+    }
+  }
+})
 
 // ---- Phase 3: synthesis ----
 phase('Synthesis')
@@ -425,24 +504,25 @@ const synthesisPrompt =
   `\n\n` +
   wrapAsData(dataNonce, 'ci-aggregate', { byJob: ciAgg ? ciAgg.byJob : {}, citationPool: ciAgg ? ciAgg.citationPool : [], failures: ciAgg ? ciAgg.failures : [] }) +
   `\n\n` +
-  wrapAsData(dataNonce, 'escaped-defect-heuristic', gitAgg || { count: null, method: 'unavailable' }) +
+  wrapAsData(dataNonce, 'escaped-defect-heuristic', gitPerRepo.map((g, i) => (g.figures ? { repo: flat(g.figures.repo), ...g.figures, root_index: undefined } : { repo: flat(ledgerRepoLabel(i) || scope.resolved[i].label), count: null, method: 'unavailable' }))) +
   `\n\n` +
   wrapAsData(dataNonce, 'plan-labels', scope.plan_labels) +
   `\n\n` +
   `Draft a ranked list of proposed changes to the harness, the pipelines, or the process (never apply anything -- ` +
-  `you only propose). For EACH proposal, return: target (an object identifying WHAT it is about, used to derive a ` +
-  `stable id, never wording -- and mechanically checked by the orchestrator, so set these fields precisely: ` +
-  `target.lens exactly matching a lens name if the proposal is about a lens; target.workflow and target.job ` +
-  `exactly matching the CI-aggregate's own "workflow"/"job" fields if the proposal is about a specific CI job; ` +
-  `target.segment set to exactly "ci_wait", "human_wait" or "agent_compute" if the proposal is MOTIVATED BY that ` +
-  `wall-clock segment -- the orchestrator will drop such a proposal if that segment has any unmeasured runs in ` +
-  `the window, so only set it when the segment genuinely motivates the proposal; target.touches_always_on_lens ` +
+  `you only propose). For EACH proposal, return: target (an object with EXACTLY these eight keys and no others, ` +
+  `used to derive a stable id, never wording -- and mechanically checked by the orchestrator, so set them ` +
+  `precisely: kind, component and concern name WHAT the proposal is about in a few lowercase words (the same ` +
+  `target must get the same words every cycle); lens exactly matching a lens name if the proposal is about a ` +
+  `lens; workflow and job exactly matching the CI-aggregate's own "workflow"/"job" fields if the proposal is ` +
+  `about a specific CI job; each of those six may be an empty string where not applicable; touches_always_on_lens ` +
   `set to true if the proposal in any way changes whether, when, or how often lens-security or lens-qa runs -- ` +
   `even if it does not name them by their literal id (e.g. "run the security lens only sometimes"), even if it ` +
-  `uses no word like "remove"; target.security_purposed set to true if the proposal deletes, demotes, skips, or ` +
+  `uses no word like "remove"; security_purposed set to true if the proposal deletes, demotes, skips, or ` +
   `otherwise reduces a check whose PURPOSE is security (SAST, secret scanning, dependency/vulnerability auditing, ` +
-  `a security lens trigger) -- these two fields are mechanically checked by the orchestrator regardless of your ` +
-  `wording, so set them honestly rather than omitting them to phrase around the gate), statement (the proposal ` +
+  `a security lens trigger) -- these two booleans are required and mechanically checked by the orchestrator ` +
+  `regardless of your wording, so set them honestly rather than omitting them to phrase around the gate; a ` +
+  `target with a missing or extra key is rejected; a proposal motivated by a wall-clock segment must say so by ` +
+  `name (ci_wait, human_wait or agent_compute) in its statement or motivating_measurement), statement (the proposal ` +
   `itself), motivating_measurement (cite the specific numbers above that motivate it), confirming_measurement ` +
   `(what would confirm or refute it after adoption), n (the sample size backing it -- the record/run count from ` +
   `the aggregate above, never invented), citations (array of real ids copied VERBATIM from a citationPool above ` +
@@ -462,7 +542,7 @@ const synthesis = await agent(synthesisPrompt, {
           type: 'object',
           required: ['target', 'statement', 'motivating_measurement', 'confirming_measurement', 'n', 'citations', 'reinstatement_evidence'],
           properties: {
-            target: { type: 'object' },
+            target: PROPOSAL_TARGET_SCHEMA,
             statement: { type: 'string' },
             motivating_measurement: { type: 'string' },
             confirming_measurement: { type: 'string' },
@@ -478,6 +558,23 @@ const synthesis = await agent(synthesisPrompt, {
 
 let proposals = (synthesis && Array.isArray(synthesis.proposals)) ? synthesis.proposals : []
 const draftedCount = proposals.length
+
+// HARN-OPT-4 T6 (AC-QA-20, AC-DATA-15): a target that is not exactly the
+// fixed key set is rejected here, before any gate reads it and before an id
+// is minted, so an extra key cannot carry a signal the gates never look at.
+// The reason names the keys only (flattened and bounded), never their values.
+const targetKeyOneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 60)
+function malformedTargetReason(p) {
+  const t = p && p.target
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return 'target is not an object'
+  const keys = Object.keys(t)
+  const missing = PROPOSAL_TARGET_KEYS.filter((k) => !keys.includes(k))
+  const extra = keys.filter((k) => !PROPOSAL_TARGET_KEYS.includes(k))
+  if (!missing.length && !extra.length) return null
+  return [missing.length ? `missing ${missing.join(', ')}` : '', extra.length ? `extra ${extra.map(targetKeyOneLine).join(', ')}` : ''].filter(Boolean).join('; ')
+}
+const malformedTargetReasons = proposals.map(malformedTargetReason).filter((r) => r !== null)
+proposals = proposals.filter((p) => malformedTargetReason(p) === null)
 
 // AC-QA-17 mechanical backstop: if the ledger is insufficient, drop any
 // proposal whose ONLY valid citations are ledger ids (no gh citation) --
@@ -590,10 +687,9 @@ function isSegmentSuppressed(segment) {
 // text is now also checked against that segment's unmeasured-run count --
 // mechanical, not reliant on the agent having tagged itself correctly.
 function motivatingSegments(p) {
-  const tagged = p && p.target && WALL_CLOCK_SEGMENTS.includes(p.target.segment) ? [p.target.segment] : []
   const text = `${(p && p.statement) || ''} ${(p && p.motivating_measurement) || ''}`
   const mentioned = WALL_CLOCK_SEGMENTS.filter((seg) => text.includes(seg))
-  return [...new Set([...tagged, ...mentioned])]
+  return mentioned
 }
 function isUnmeasuredSegmentMotivated(p) {
   return motivatingSegments(p).some(isSegmentSuppressed)
@@ -703,7 +799,8 @@ const reportMarkdown = buildReport({
   triggerAccuracy: ledgerAgg ? ledgerAgg.triggerAccuracy : null,
   ciByJob: ciAgg ? ciAgg.byJob : {},
   ciFailures: ciAgg ? ciAgg.failures : [],
-  escapedDefects: gitAgg,
+  escapedDefects: gitPerRepo.map((g, i) => ({ ...g, label: ledgerRepoLabel(i) || scope.resolved[i].label })),
+  escapedDefectsUnmatched: gitUnmatched,
   draftedCount,
   droppedAlwaysOnSecurityCount: droppedAlwaysOnSecurity.length,
   droppedNoReinstatementCount: droppedNoReinstatement.length,
@@ -748,6 +845,7 @@ const reportMarkdown = buildReport({
     suppressed: isSegmentSuppressed(seg),
   })),
   droppedWeakCiEvidenceCount: droppedWeakCiEvidence.length,
+  malformedTargetReasons,
   ranked,
   insufficientDataProposals,
 })
@@ -1181,19 +1279,31 @@ function buildReport(d) {
   for (const f of d.ciFailures || []) lines.push(`- gh unavailable for ${f.repo}: ${f.mode} (${f.command}): ${f.error || 'n/a'}`)
   lines.push('')
   lines.push('## Escaped-defect counter-metric')
-  if (d.escapedDefects && typeof d.escapedDefects.count === 'number') {
-    lines.push(`Raw (unscoped): ${d.escapedDefects.count} of ${d.escapedDefects.n_commits_examined} examined commits matched the heuristic. ${d.escapedDefects.method}`)
+  // HARN-OPT-4 T6 (AC-DATA-11, AC-PROD-7, AC-SEC-10): one block per roster
+  // repo, labelled by the ledger label and numbered by roster position (two
+  // uninstrumented repos share the redaction marker as a label), never the
+  // root path. Every echoed value is flattened and bounded.
+  const oneLine = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120)
+  const gitRepos = Array.isArray(d.escapedDefects) ? d.escapedDefects : []
+  if (!gitRepos.length) lines.push('Escaped defects are not currently captured (git-lane unavailable).')
+  gitRepos.forEach((g, i) => {
+    lines.push(`Repo ${i + 1} (${oneLine(g.label)}):`)
+    const f = g.figures
+    if (g.status !== 'ok' || !f || typeof f.count !== 'number') {
+      lines.push(`Not measured: ${oneLine(g.reason || 'git lane unavailable')}`)
+      return
+    }
+    lines.push(`Raw (unscoped): ${f.count} of ${f.n_commits_examined} examined commits matched the heuristic. ${oneLine(f.method)}`)
     // AC-2/AC-4: the scoped figure is reported alongside the raw one, never
     // in place of it, and is stated as unavailable rather than guessed at
     // when the config could not be resolved (scoped_count null).
-    if (typeof d.escapedDefects.scoped_count === 'number') {
-      lines.push(`Scoped to product source (config: ${d.escapedDefects.scoped_config_source}): ${d.escapedDefects.scoped_count} counted, ${d.escapedDefects.scoped_excluded_count} excluded as pipeline/tooling-only, ${d.escapedDefects.scoped_unavailable_count} unavailable (changed paths could not be determined). ${d.escapedDefects.scoped_method}`)
+    if (typeof f.scoped_count === 'number') {
+      lines.push(`Scoped to product source (config: ${f.scoped_config_source}): ${f.scoped_count} counted, ${f.scoped_excluded_count} excluded as pipeline/tooling-only, ${f.scoped_unavailable_count} unavailable (changed paths could not be determined). ${oneLine(f.scoped_method)}`)
     } else {
-      lines.push(`Scoped figure unavailable: ${d.escapedDefects.scoped_method || 'no reason given by the git lane'}`)
+      lines.push(`Scoped figure unavailable: ${oneLine(f.scoped_method || 'no reason given by the git lane')}`)
     }
-  } else {
-    lines.push('Escaped defects are not currently captured (git-lane unavailable).')
-  }
+  })
+  for (const u of d.escapedDefectsUnmatched || []) lines.push(`- Unmatched git result: ${u}`)
   lines.push('')
   lines.push('## Proposals (ranked)')
   if (!d.ranked.length) lines.push('None.')
@@ -1257,6 +1367,8 @@ function buildReport(d) {
     `Dropped (motivating wall-clock segment has unmeasured runs${unmeasuredSegmentDetail ? ` -- ${unmeasuredSegmentDetail}` : ''}): ${d.droppedUnmeasuredSegmentCount || 0}. ` +
     `Dropped (cited CI job is insufficient-data/truncated/rename-suspect): ${d.droppedWeakCiEvidenceCount || 0}.`
   )
+  // HARN-OPT-4 T6 (AC-QA-20): named, not merely counted.
+  lines.push(`Proposals rejected: malformed target: ${(d.malformedTargetReasons || []).length}${(d.malformedTargetReasons || []).length ? ` (${d.malformedTargetReasons.map((r) => r.replace(/\\s+/g, ' ').slice(0, 160)).join(' | ')})` : ''}`)
   return lines.join('\n')
 }
 

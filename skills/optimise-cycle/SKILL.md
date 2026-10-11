@@ -102,8 +102,8 @@ wrote:
    stated minimum `n` is excluded from the ranked list and reported
    separately as insufficient data, never hidden.
 5. **Unmeasured wall-clock segment (AC-OPS-3)**: a proposal motivated by a
-   wall-clock segment (`target.segment`) that has at least one unmeasured
-   run in the window is dropped -- a small-looking total can be small
+   wall-clock segment (named in its statement or motivating measurement)
+   that has at least one unmeasured run in the window is dropped -- a small-looking total can be small
    because it genuinely was, or because most of it could not be measured;
    the gate does not let the latter pass as evidence.
 6. **Weak CI evidence (AC-DATA-8)**: a removal-shaped proposal citing a
@@ -116,6 +116,22 @@ wrote:
    rejection's date rather than re-raised silently; one matching two or
    more `proposal_reverted` events is flagged (§12: a change reverted
    twice for being worse keeps the original).
+
+**The proposal target is a fixed key set.** Every drafted `target` carries
+exactly `kind`, `component`, `concern`, `lens`, `workflow`, `job`,
+`touches_always_on_lens` and `security_purposed`, and no other key. A
+target with a key missing or an extra key is rejected before any gate reads
+it or any id is minted, and the report names the keys under "Proposals
+rejected: malformed target". The `proposal_id` is derived from the six
+string fields only, each case-folded and trimmed, in that fixed order, so
+key order, letter case and stray spacing cannot mint a second id for one
+target. The two booleans are inputs to the security gates, not part of
+identity, and neither is the repo: a rejection recorded in one roster repo
+is found for the same target proposed in another. To map an older
+free-shape target onto the new id (the conductor does this once, when it
+re-records outcome events), pipe `{"legacy_targets": [...]}` into
+`optimise-read.mjs ids`: each comes back with its new id, or null and the
+fields the fixed set cannot hold.
 
 ## The escaped-defect counter-metric
 
@@ -266,7 +282,13 @@ It states, every run, in this order:
 5. **CI section** (source: `gh`), with any `gh` failure named distinctly
    and non-fatally (never silently dropped), and a job named
    insufficient-data/truncated/rename-suspect where applicable.
-6. **Escaped-defect counter-metric** and its heuristic caveat.
+6. **Escaped-defect counter-metric** and its heuristic caveat, one block
+   per roster repo (labelled by its ledger label and numbered by roster
+   position, never its path). The git lane runs once per repo, and the script
+   accepts a result only if its roster index and its ledger repo identity both
+   match; any other result is listed as unmatched with the reason, and a repo
+   whose lane failed says "Not measured" rather than borrowing another
+   repo's figure.
 7. **Ranked proposals**, each with citations, confirming measurement, any
    security-removal flag, and any prior-rejection or reverted-twice
    annotation (AC-DATA-10).

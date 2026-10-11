@@ -1685,13 +1685,54 @@ function canonicalJson(value) {
   return JSON.stringify(value)
 }
 
+// HARN-OPT-4 T6 (AC-QA-20, AC-DATA-15): a proposal target is a FIXED key set
+// (kind, component, concern, lens, workflow, job, plus the two gate booleans
+// touches_always_on_lens and security_purposed). Identity is the six string
+// fields only, in this fixed order; the booleans are gate inputs, and `repo`
+// is deliberately not identity, so a rejection recorded in one roster repo is
+// found for the same target proposed in another (the skill documents this).
+export const PROPOSAL_IDENTITY_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+const identityValue = (v) => (typeof v === 'string' ? v : v === null || v === undefined ? '' : String(v)).trim().toLowerCase()
+
 // A stable proposal id derived from the TARGET a proposal is about (never
 // its prose wording), so the same target re-proposed across cycles is
 // recognisable as the same proposal (AC-DATA-10). Real-Node sha256, same
-// pattern as ledger-append.mjs's findingId.
+// pattern as ledger-append.mjs's findingId. Case-folding, trimming and the
+// fixed key order mean key order, letter case and stray whitespace in the
+// drafted target cannot mint a second id for one target (AC-QA-20).
 export function stableProposalId(target) {
-  const canonical = canonicalJson(target)
+  const t = target && typeof target === 'object' ? target : {}
+  // A target carrying none of the six identity keys is a pre-T6 free shape
+  // (the pre-T6 id tests still exercise it); the script rejects those before
+  // the id step, so this branch is reachable only by direct callers.
+  if (!PROPOSAL_IDENTITY_KEYS.some((k) => k in t)) return createHash('sha256').update(canonicalJson(target)).digest('hex').slice(0, 16)
+  const canonical = canonicalJson(PROPOSAL_IDENTITY_KEYS.map((k) => identityValue(t[k])))
   return createHash('sha256').update(canonical).digest('hex').slice(0, 16)
+}
+
+// AC-DATA-14: the conductor re-records outcome events under the new ids, and
+// computes the mapping from this code rather than by hand. Old free shapes
+// map onto the fixed set where they can: workflow_component -> component,
+// feature -> concern; kind, component, concern, lens, workflow and job as
+// given; missing strings empty. Any other key (e.g. the 5 Oct {cycle, change})
+// holds information the fixed set cannot carry, so the answer is null with the
+// key names rather than a lossy id. The two gate booleans and `repo` are not
+// identity and are ignored here.
+const LEGACY_RENAMES = { workflow_component: 'component', feature: 'concern' }
+const LEGACY_IGNORED = ['touches_always_on_lens', 'security_purposed', 'repo']
+export function mapLegacyTarget(target) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return { proposal_id: null, reason: 'target is not an object' }
+  const mapped = {}
+  const unmappable = []
+  for (const [k, v] of Object.entries(target)) {
+    const to = LEGACY_RENAMES[k] || k
+    if (LEGACY_IGNORED.includes(k)) continue
+    if (!PROPOSAL_IDENTITY_KEYS.includes(to)) { unmappable.push(k); continue }
+    if (to in mapped && identityValue(mapped[to]) !== identityValue(v)) { unmappable.push(`${k} (conflicts with ${to})`); continue }
+    mapped[to] = v
+  }
+  if (unmappable.length) return { proposal_id: null, reason: `fields the fixed key set cannot hold: ${unmappable.join(', ')}` }
+  return { proposal_id: stableProposalId(mapped), reason: null }
 }
 
 // ---- CLI ----
@@ -1746,6 +1787,12 @@ function derivePerRepoLabel(records, root) {
   // real identity from), so it must never fall back to any part of the raw
   // path -- a fixed, non-identifying constant instead.
   return REDACTED_PATH_MARKER
+}
+
+function ledgerIdentityForRoot(root) {
+  const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
+  const raw = fs.existsSync(ledgerPath) ? fs.readFileSync(ledgerPath, 'utf8') : ''
+  return derivePerRepoLabel(parseLedgerContent(raw).records, root)
 }
 
 function runLedgerCommand(roots, window) {
@@ -1869,7 +1916,11 @@ export function main() {
     const commits = parseGitLogRaw(typeof payload.git_log_raw === 'string' ? payload.git_log_raw : '')
     const root = typeof payload.root === 'string' && payload.root ? payload.root : process.cwd()
     const config = resolveProductSourceExcludeGlobs(root)
-    return countEscapedDefectCandidates(commits, config)
+    // HARN-OPT-4 T6 (AC-DATA-11, AC-SEC-10): attach the ledger repo identity
+    // for this root, derived exactly as the ledger command derives perRepo[].root,
+    // so the script can match this figure to its roster entry. The root path
+    // itself is never echoed.
+    return { ...countEscapedDefectCandidates(commits, config), repo: ledgerIdentityForRoot(root) }
   }
   if (command === 'ids') {
     const raw = readStdin()
@@ -1881,6 +1932,9 @@ export function main() {
       return { error: 'stdin was not valid JSON (invalid JSON syntax)', ids: [] }
     }
     const targets = Array.isArray(payload && payload.targets) ? payload.targets : []
+    if (Array.isArray(payload && payload.legacy_targets)) {
+      return { legacy_ids: payload.legacy_targets.map((target) => ({ target, ...mapLegacyTarget(target) })) }
+    }
     return { ids: targets.map((target) => ({ target, proposal_id: stableProposalId(target) })) }
   }
   return { error: `unknown command "${command}"; expected "ledger", "ci", "escaped-defects" or "ids"` }
