@@ -1486,7 +1486,7 @@ return {
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
   // HARN-OPT-4 T4 (AC-QA-12, AC-OPS-4): appended in code so the guarantee does
   // not rest on synthesis obeying its prompt. Only when the run produced a report.
-  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay ? `\n\n${NO_SPEC_SENTENCE}` : '')) : '',
+  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '')) : '',
   __outcome: outcome,
 }
 

@@ -129,7 +129,10 @@ test('T4 schema: "2; rm -rf", -1, 1.5, "2" and 0 each write null and are counted
 
 test('T4 schema: an absent round is null on the line and is not counted as dropped', () => {
   const { entry } = writeRow({})
-  assert.ok(entry.round === null || !('round' in entry))
+  // Round 1 L1 (AC-QA-13): the old "null or absent" form passed with the writer's
+  // normalisation deleted. Require the key present and null.
+  assert.ok('round' in entry, 'the round key must be present on the line')
+  assert.strictEqual(entry.round, null)
   assert.ok(!entry.invalid_record_values_dropped)
 })
 
@@ -156,6 +159,11 @@ test('T4 no-spec: the sentence is appended in script code, so it appears even wh
   const { result } = await review({}, { synthesis: { report: 'Findings: none.', spec_bugs: [], rejected_findings: [] } })
   assert.ok(result.report.startsWith('Findings: none.'), 'the synthesised report must be preserved, not replaced')
   assert.ok(result.report.includes(SENTENCE))
+})
+
+test('T4 no-spec: when synthesis already wrote the sentence, the code does not append it again: exactly one occurrence (round 1 L2, AC-QA-12)', async () => {
+  const { result } = await review({}, { synthesis: { report: `Findings: none.\n\n${SENTENCE}`, spec_bugs: [], rejected_findings: [] } })
+  assert.equal(result.report.split(SENTENCE).length - 1, 1, `report was: ${result.report}`)
 })
 
 test('T4 no-spec: the synthesis prompt for a no-spec run carries the sentence too', async () => {
@@ -223,24 +231,51 @@ function mixedRows() {
   ]
 }
 
-test('T4 reader: window-wide conducted=3, direct=4; rows with no round key at all count as direct; started rows and spec-bearing rows count as neither', () => {
+test('T4 reader: window-wide conducted=3, direct=1, round-not-recorded=3; rows with no round key at all are neither conducted nor direct (round 1 M1); started rows and spec-bearing rows count as none', () => {
   const rework = reader.aggregateRework(mixedRows())
   assert.strictEqual(rework.noSpecReviewRunsConducted, 3)
-  assert.strictEqual(rework.noSpecReviewRunsDirect, 4)
+  assert.strictEqual(rework.noSpecReviewRunsDirect, 1)
+  assert.strictEqual(rework.noSpecReviewRunsRoundNotRecorded, 3)
 })
 
 test('T4 reader: the schemaV4 block counts only v4 rows (conducted=3, direct=1)', () => {
   const v4 = reader.aggregateRework(mixedRows()).schemaV4
   assert.strictEqual(v4.noSpecReviewRunsConducted, 3)
   assert.strictEqual(v4.noSpecReviewRunsDirect, 1)
+  assert.strictEqual(v4.noSpecReviewRunsRoundNotRecorded, 0)
+})
+
+test('T4 reader: schema_version 4 no-spec rows WITHOUT a round key count as round-not-recorded, never direct (round 1 M1, AC-QA-30)', () => {
+  const rows = [row('n1'), row('n2'), row('n3'), row('d1', { round: null }), row('c1', { round: 2 })]
+  for (const r of rows.slice(0, 3)) assert.ok(!('round' in r), 'fixture must lack the key')
+  const rework = reader.aggregateRework(rows)
+  assert.strictEqual(rework.noSpecReviewRunsRoundNotRecorded, 3)
+  assert.strictEqual(rework.noSpecReviewRunsDirect, 1)
+  assert.strictEqual(rework.noSpecReviewRunsConducted, 1)
+  assert.strictEqual(rework.schemaV4.noSpecReviewRunsRoundNotRecorded, 3)
+  assert.strictEqual(rework.schemaV4.noSpecReviewRunsDirect, 1)
+  assert.strictEqual(rework.schemaV4.noSpecReviewRunsConducted, 1)
+})
+
+test('T4 reader: when every no-spec terminal row lacks the round key, conducted and direct are null, not a measured 0, in both blocks (round 1 M1, AC-QA-30)', () => {
+  const rework = reader.aggregateRework([row('n1'), row('n2')])
+  assert.strictEqual(rework.noSpecReviewRunsConducted, null)
+  assert.strictEqual(rework.noSpecReviewRunsDirect, null)
+  assert.strictEqual(rework.noSpecReviewRunsRoundNotRecorded, 2)
+  assert.strictEqual(rework.schemaV4.noSpecReviewRunsConducted, null)
+  assert.strictEqual(rework.schemaV4.noSpecReviewRunsDirect, null)
+  assert.strictEqual(rework.schemaV4.noSpecReviewRunsRoundNotRecorded, 2)
 })
 
 test('T4 reader: with no v4 row the schemaV4 figures are null, never a measured 0, while the window-wide direct count still includes the old rows', () => {
   const rework = reader.aggregateRework([row('o1', { schema_version: 3 }), row('o2', { schema_version: 3 })])
   assert.strictEqual(rework.schemaV4.noSpecReviewRunsConducted, null)
   assert.strictEqual(rework.schemaV4.noSpecReviewRunsDirect, null)
-  assert.strictEqual(rework.noSpecReviewRunsConducted, 0)
-  assert.strictEqual(rework.noSpecReviewRunsDirect, 2)
+  // Round 1 M1: old rows carry no round key, so nothing was measured; null,
+  // not 0, and the rows are counted in the third bucket.
+  assert.strictEqual(rework.noSpecReviewRunsConducted, null)
+  assert.strictEqual(rework.noSpecReviewRunsDirect, null)
+  assert.strictEqual(rework.noSpecReviewRunsRoundNotRecorded, 2)
 })
 
 test('T4 reader: both figures survive the CLI output whitelist', () => {
@@ -251,7 +286,9 @@ test('T4 reader: both figures survive the CLI output whitelist', () => {
   assert.equal(res.status, 0, res.stderr)
   const out = JSON.parse(res.stdout.trim())
   assert.strictEqual(out.rework.noSpecReviewRunsConducted, 3)
-  assert.strictEqual(out.rework.noSpecReviewRunsDirect, 4)
+  assert.strictEqual(out.rework.noSpecReviewRunsDirect, 1)
+  assert.strictEqual(out.rework.noSpecReviewRunsRoundNotRecorded, 3)
+  assert.strictEqual(out.rework.schemaV4.noSpecReviewRunsRoundNotRecorded, 0)
   assert.strictEqual(out.rework.schemaV4.noSpecReviewRunsConducted, 3)
   assert.strictEqual(out.rework.schemaV4.noSpecReviewRunsDirect, 1)
 })
