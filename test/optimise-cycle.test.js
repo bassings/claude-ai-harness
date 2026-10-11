@@ -1674,13 +1674,16 @@ test('optimise-cycle: the never-failing AC section renders verdict_disagreements
 })
 
 test('optimise-cycle: Sample completeness renders one line of schema_version >= 4 figures with real numbers and the excluded older-row count (HARN-OPT-4 T3, AC-PROD-10)', async () => {
-  const schemaV4 = { rows: 2, excludedRows: 3, findingsTruncated: 4, unattributedFindings: 5, duplicateVerdictPairs: 6, noSpecReviewRuns: 7 }
+  // Round 1 M1: values chosen so none can collide with digits in label text
+  // ('schema_version >= 4'), and each asserted as an exact label=value pair.
+  const schemaV4 = { rows: 2, excludedRows: 3, findingsTruncated: 41, unattributedFindings: 52, duplicateVerdictPairs: 63, noSpecReviewRuns: 74 }
   const responses = baseResponses({ 'lane:ledger': ledgerFixture({ rework: { ...ledgerFixture().rework, schemaV4 } }) })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   const lines = result.report.split('\n').filter((l) => l.includes('schema_version >= 4'))
   assert.equal(lines.length, 1, `expected exactly one labelled line, report was: ${result.report}`)
-  for (const n of ['4', '5', '6', '7']) assert.ok(new RegExp(`\\b${n}\\b`).test(lines[0]), `missing ${n} in: ${lines[0]}`)
-  assert.ok(/\b3\b/.test(lines[0]), `excluded older-row count missing in: ${lines[0]}`)
+  for (const part of ['findings_truncated=41', 'unattributed findings=52', 'duplicate verdict groups collapsed=63', 'no-spec review runs=74', '3 older rows excluded']) {
+    assert.ok(lines[0].includes(part), `missing "${part}" in: ${lines[0]}`)
+  }
 })
 
 test('optimise-cycle: with no schema_version >= 4 rows the line says "not recorded" and never a measured 0 (HARN-OPT-4 T3, AC-QA-30)', async () => {
@@ -1691,4 +1694,14 @@ test('optimise-cycle: with no schema_version >= 4 rows the line says "not record
   assert.ok(line, `expected the line, report was: ${result.report}`)
   assert.ok(line.includes('not recorded'), `got: ${line}`)
   assert.ok(!/=\s*0\b/.test(line), `must not render a measured zero: ${line}`)
+})
+
+test('optimise-cycle: a never-failing AC whose verdict array was truncated renders verdict_disagreements as "not measured", never a measured 0 (HARN-OPT-4 T3, AC-DATA-8, round 1 L1)', async () => {
+  const row = { key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, truncated_in_window: true, never_failed: null, verdict_disagreements: null }
+  const responses = baseResponses({ 'lane:ledger': ledgerFixture({ neverFailingAcs: [row] }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('specs/a.md AC-QA-1'))
+  assert.ok(line, `expected the AC line, report was: ${result.report}`)
+  assert.ok(line.includes('verdict_disagreements=not measured'), `got: ${line}`)
+  assert.ok(!/verdict_disagreements=(0|null)\b/.test(line), `got: ${line}`)
 })

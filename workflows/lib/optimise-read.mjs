@@ -408,8 +408,15 @@ export function aggregateRework(records, { root = '' } = {}) {
   let v4UnattributedFindings = 0
   let v4DuplicateVerdictPairs = 0
   let v4NoSpecReviewRuns = 0
+  let terminalRows = 0
   for (const r of reviewRecords) {
-    const isV4 = typeof r.schema_version === 'number' && r.schema_version >= 4
+    // Round 1 M2: a run is written as a 'started' row and then a terminal
+    // row, so counting both double-counted rows and no-spec runs (27 against
+    // 17 done rows on the real ledger). Only terminal rows count toward the
+    // v4 split and the no-spec run figures.
+    const isTerminal = r.outcome !== 'started'
+    if (isTerminal) terminalRows += 1
+    const isV4 = isTerminal && typeof r.schema_version === 'number' && r.schema_version >= 4
     if (isV4) {
       v4Rows += 1
       if (typeof r.findings_truncated === 'number') v4FindingsTruncated += r.findings_truncated
@@ -454,7 +461,7 @@ export function aggregateRework(records, { root = '' } = {}) {
       acVerdictsTruncated: r.ac_verdicts_truncated,
       degraded: r.degraded,
     })
-    if (noSpecWasInPlay) noSpecReviewRuns += 1
+    if (isTerminal && noSpecWasInPlay) noSpecReviewRuns += 1
     if (isV4 && noSpecWasInPlay) v4NoSpecReviewRuns += 1
     const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
 
@@ -641,7 +648,7 @@ export function aggregateRework(records, { root = '' } = {}) {
     // AC-QA-30: null, never 0, when no row could have recorded the figure.
     schemaV4: {
       rows: v4Rows,
-      excludedRows: reviewRecords.length - v4Rows,
+      excludedRows: terminalRows - v4Rows,
       findingsTruncated: v4Rows ? v4FindingsTruncated : null,
       unattributedFindings: v4Rows ? v4UnattributedFindings : null,
       duplicateVerdictPairs: v4Rows ? v4DuplicateVerdictPairs : null,
@@ -691,7 +698,9 @@ export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILE
       unattributed_fail_in_window,
       unattributed_verdict_in_entry,
       truncated_in_window,
-      verdict_disagreements: verdictDisagreements.get(key) || 0,
+      // Round 1 L1 (AC-DATA-8): a truncated verdict array may have dropped
+      // the disagreeing verdict, so a measured 0 would be a false claim.
+      verdict_disagreements: truncated_in_window ? null : (verdictDisagreements.get(key) || 0),
       never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry || truncated_in_window ? null : entry.fail === 0,
     })
   }

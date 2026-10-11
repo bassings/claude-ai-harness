@@ -1049,7 +1049,7 @@ function buildReport(d) {
         v4.rows
           ? `Completeness, schema_version >= 4 rows only (${v4.rows} rows; ${v4.excludedRows} older rows excluded): ` +
             `findings_truncated=${fmtV4(v4.findingsTruncated)}, unattributed findings=${fmtV4(v4.unattributedFindings)}, ` +
-            `duplicate verdict pairs collapsed=${fmtV4(v4.duplicateVerdictPairs)}, no-spec review runs=${fmtV4(v4.noSpecReviewRuns)}.`
+            `duplicate verdict groups collapsed=${fmtV4(v4.duplicateVerdictPairs)}, no-spec review runs=${fmtV4(v4.noSpecReviewRuns)}.`
           : `Completeness, schema_version >= 4 rows only: not recorded (no such rows; ${v4.excludedRows} older rows excluded).`
       )
     }
@@ -1087,7 +1087,7 @@ function buildReport(d) {
               : `, never_failed=${a.never_failed}`
       // AC-PROD-3: runs where this criterion's own verdicts disagreed, a
       // figure of its own beside the never-failed claim.
-      const disagreements = a.verdict_disagreements === undefined ? '' : `, verdict_disagreements=${a.verdict_disagreements}`
+      const disagreements = a.verdict_disagreements === undefined ? '' : `, verdict_disagreements=${a.verdict_disagreements === null ? 'not measured' : a.verdict_disagreements}`
       lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}${disagreements}`)
     }
   } else {

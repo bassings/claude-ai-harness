@@ -195,3 +195,48 @@ test('T3 CLI: the ledger command carries the v4 split and per-AC verdict_disagre
   assert.equal(ac.n, 2)
   assert.equal(ac.verdict_disagreements, 1)
 })
+
+// ---- round 1 fix: terminal rows only, truncation, group wording ----
+
+test('T3 round 1 M2: a started row plus its done row for one run_id counts once in every v4 figure and in the window-wide no-spec count (AC-QA-30, AC-PROD-10)', () => {
+  const started = review('run-1', [], { spec: null, outcome: 'started', findings_truncated: 9 })
+  const done = review('run-1', [], { spec: null, findings_truncated: 2 })
+  const olderDone = review('old', [V('AC-QA-1', 'PASS')], { schema_version: 3 })
+  const rework = mod.aggregateRework([started, done, olderDone])
+  assert.equal(rework.schemaV4.rows, 1)
+  assert.equal(rework.schemaV4.noSpecReviewRuns, 1)
+  assert.equal(rework.schemaV4.findingsTruncated, 2)
+  assert.equal(rework.schemaV4.excludedRows, 1)
+  // Before the fix this was 2: the started row was counted as a no-spec run.
+  assert.equal(rework.noSpecReviewRuns, 1)
+})
+
+test('T3 round 1 M2: window-wide noSpecReviewRuns, before and after: three done rows plus their three started rows is 3, not 6', () => {
+  const rows = []
+  for (const id of ['a', 'b', 'c']) {
+    rows.push(review(id, [], { spec: null, schema_version: 3, outcome: 'started' }))
+    rows.push(review(id, [], { spec: null, schema_version: 3 }))
+  }
+  assert.equal(mod.aggregateRework(rows).noSpecReviewRuns, 3)
+})
+
+test('T3 round 1 L1: verdict_disagreements is null, not 0, for a criterion in a bucket whose verdict array was truncated (AC-DATA-8)', () => {
+  const rework = mod.aggregateRework([
+    review('r1', [V('AC-QA-15', 'PASS')], { ac_verdicts_truncated: 40 }),
+    review('r2', [V('AC-QA-15', 'PASS')]),
+  ])
+  const [row] = mod.neverFailingAcs(rework.acVerdicts, { minRuns: 1, truncatedBuckets: rework.truncatedBuckets, verdictDisagreements: rework.verdictDisagreements })
+  assert.equal(row.truncated_in_window, true)
+  assert.equal(row.verdict_disagreements, null)
+  const clean = mod.aggregateRework([review('r3', [V('AC-QA-15', 'PASS')])])
+  const [cleanRow] = mod.neverFailingAcs(clean.acVerdicts, { minRuns: 1, truncatedBuckets: clean.truncatedBuckets, verdictDisagreements: clean.verdictDisagreements })
+  assert.equal(cleanRow.verdict_disagreements, 0)
+})
+
+test('T3 round 1 L2: three identical verdicts for one (run, ac_id) are one duplicate group, and the report label says groups', () => {
+  const rework = mod.aggregateRework([review('r1', [V('AC-QA-15', 'PASS'), V('AC-QA-15', 'PASS'), V('AC-QA-15', 'PASS')])])
+  assert.equal(rework.schemaV4.duplicateVerdictPairs, 1)
+  const src = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8')
+  assert.ok(src.includes('duplicate verdict groups collapsed='))
+  assert.ok(!src.includes('duplicate verdict pairs collapsed'))
+})
