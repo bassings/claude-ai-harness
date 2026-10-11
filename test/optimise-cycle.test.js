@@ -1594,6 +1594,30 @@ test('optimise-cycle: a removal-shaped proposal citing a CI job with a solid (no
   assert.equal(result.proposals_ranked.length, 1)
 })
 
+// ---- HARN-OPT-4 T7 (AC-SEC-13): per-job rows make the scheduled gitleaks job visible with its own failures; the security-removal gate must not depend on the weak-CI flags ----
+
+const t7GitleaksRow = (o = {}) => ({ repo: 'demo', workflow: 'Security', job: 'gitleaks', n: 20, failureCount: 1, failedRunIds: ['309'], meanDurationS: 7, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: false, reRun: false, partialFetch: false, ...o })
+const t7CiWith = (row) => ciFixture({ byJob: { [`demo::${row.workflow}::${row.job}`]: row } })
+
+test('optimise-cycle: a gitleaks removal whose aggregate is neither insufficientData, truncated nor renameSuspect is still flagged security_removal_flagged (AC-SEC-13)', async () => {
+  const responses = baseResponses({
+    'lane:ci': t7CiWith(t7GitleaksRow()),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'Security', job: 'gitleaks' }, statement: 'Remove the scheduled gitleaks job', citations: ['1001'], reinstatement_evidence: 'reinstate if any secret ever leaks', n: 20 })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 1)
+  assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
+})
+
+test('optimise-cycle: the same gitleaks removal with no reinstatement_evidence is dropped even with a clean aggregate (AC-SEC-13)', async () => {
+  const responses = baseResponses({
+    'lane:ci': t7CiWith(t7GitleaksRow()),
+    'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'Security', job: 'gitleaks' }, statement: 'Remove the scheduled gitleaks job', citations: ['1001'], reinstatement_evidence: null, n: 20 })] },
+  })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  assert.equal(result.proposals_ranked.length, 0)
+})
+
 // ---- Review round-1 M7 (AC-DATA-10): a prior rejection is annotated (not silently re-raised); reverted-twice is flagged ----
 
 test('optimise-cycle: a proposal whose target matches a prior proposal_rejected event is annotated with the rejection date, not silently re-raised (M7)', async () => {
