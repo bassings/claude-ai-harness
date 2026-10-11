@@ -193,9 +193,13 @@ either one for a precise, causally attributed count.
 
 ## Recording a proposal's outcome (AC-DATA-10)
 
-A proposal carries a stable `proposal_id`, derived from its **target**
-(workflow file, job name, lens, trigger glob), never its wording, so the
-same target re-proposed across cycles is recognisable as the same proposal.
+A proposal carries a stable `proposal_id`, derived from its **target**, never
+its wording, so the same target re-proposed across cycles is recognisable as
+the same proposal. The target is a fixed key set: `kind`, `component`,
+`concern`, `lens`, `workflow` and `job` (the six fields the id is derived
+from), plus the two gate flags `touches_always_on_lens` and
+`security_purposed`. A drafted target with a key missing or an extra key is
+rejected and listed in the report, never given an id.
 
 **The optimiser itself never writes this.** When a human (or the conductor,
 merging a change that adopts, rejects, or reverts a proposal) makes that
@@ -226,7 +230,11 @@ that rejection's date in the report rather than re-raised silently, and
 one with two or more `proposal_reverted` events is flagged (§12: a change
 reverted twice for being worse keeps the original). This needs no new
 ledger kind or schema change -- it reads exactly the `conduct_plan_event`
-shape documented above.
+shape documented above. A proposal whose id has a recorded `proposal_adopted`
+is annotated "Already adopted on <date>" and listed under its own heading
+rather than ranked as new, with one exception: a security-purposed removal,
+or a proposal reverted at least twice, stays in the ranked list with the
+adoption annotated, so its flag is never moved out of sight.
 
 ## Install verification (both paths work)
 
@@ -289,9 +297,12 @@ It states, every run, in this order:
    match; any other result is listed as unmatched with the reason, and a repo
    whose lane failed says "Not measured" rather than borrowing another
    repo's figure.
-7. **Ranked proposals**, each with citations, confirming measurement, any
-   security-removal flag, and any prior-rejection or reverted-twice
-   annotation (AC-DATA-10).
+7. **Ranked proposals**, each with citations, confirming measurement, a
+   one-line `Target:` showing its six identity fields, any security-removal
+   flag, and any prior-adoption, prior-rejection or reverted-twice
+   annotation (AC-DATA-10). **Proposals previously adopted** are listed in
+   their own section, and the insufficient-data section below, with the same
+   annotations.
 8. **Proposals excluded for insufficient data**, and a **filtering
    summary** naming how many were dropped and why (uncited, always-on
    security removal, missing reinstatement evidence, unmeasured wall-clock
@@ -299,3 +310,13 @@ It states, every run, in this order:
 
 It is the durable artefact (AC-PROD-5): read it after the run, do not
 rely on the conversation transcript.
+
+Beside the report the run writes `.claude/optimise-proposal-targets.json`, a
+map from every proposal id it computed to that proposal's target. The ledger
+holds only ids, so a later run reads this file (through the `ledger` command
+of `optimise-read.mjs`) to show the drafter the target behind an id that has an
+outcome, and to reuse it exactly. It is a per-run output like the report, not
+a cache: it is gitignored by the same check, refused if that check fails,
+overwritten on every cycle run, otherwise kept indefinitely, and deleted with
+`rm .claude/optimise-proposal-targets.json`. When it is missing or malformed
+the drafter gets the bare id and the reason instead.

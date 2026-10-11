@@ -51,6 +51,9 @@ const UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD = 0.2
 // configurable (AC-SIMP-2): a single hard-coded path, same discipline as
 // LEDGER_RELATIVE_PATH in workflows/lib/ledger-append.mjs.
 const REPORT_RELATIVE_PATH = '.claude/optimise-cycle-report.md'
+// Round 2 F2: the per-run sidecar beside the report (proposal id -> fixed-key
+// target); read back by optimise-read.mjs's ledger command. Same one-path discipline.
+const PROPOSAL_TARGETS_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
 
 // AC-SEC-8: every place untrusted text (a ledger free-text field, a gh
 // workflow/job name, a commit subject, a repo root path or display label)
@@ -336,8 +339,16 @@ const GIT_LANE_ENTRY_SCHEMA = {
   properties: {
     root_index: { type: 'integer' },
     repo: { type: 'string' },
-    count: { type: 'integer' },
-    n_commits_examined: { type: 'integer' },
+    // Round 2 F3 (AC-QA-19): a reader rejection (toplevel missing or not the
+    // root) carries null figures, `rejected: true` and a bounded reason; the
+    // schema could not represent it before, so a lane had to invent figures.
+    count: { type: ['integer', 'null'] },
+    n_commits_examined: { type: ['integer', 'null'] },
+    // 'undefined' in the unions below is the in-repo validator's name for an
+    // omitted-but-present key (the T6 fixtures build entries that way); it keeps
+    // `rejected`/`reason` optional while a non-boolean or non-string still fails.
+    rejected: { type: ['boolean', 'null', 'undefined'] },
+    reason: { type: ['string', 'null', 'undefined'], maxLength: 300 },
     method: { type: 'string' },
     window_note: { type: 'string' },
     scoped_count: { type: ['integer', 'null'] },
@@ -445,7 +456,9 @@ const gitLanePrompt = (root, rootIndex) =>
   `and a window_note stating how many commits back this covers (e.g. "most recent 500 commits") -- ` +
   `this is a heuristic proxy for escaped defects (AC-PROD-7), not a verified per-PR causal count, and the script ` +
   `reports BOTH a raw figure (every "fix:"-typed commit) and a scoped figure (narrowed to commits that touch ` +
-  `product source, excluding configured pipeline/tooling paths); state both plainly, do not overclaim either.`
+  `product source, excluding configured pipeline/tooling paths); state both plainly, do not overclaim either. If the script ` +
+  `printed \`rejected: true\`, relay its rejected and reason fields unchanged with every figure field null (scoped_config_source ` +
+  `\"default\", scoped_exclude_globs [], method and scoped_method set to the reason): never invent figures.`
 const gitLaneFor = (r, i) => () => agent(gitLanePrompt(r.root, i), { label: 'lane:git', phase: 'Lanes', schema: GIT_LANE_SCHEMA })
 
 const [ledgerAgg, ciAgg, ...gitResults] = await parallel([ledgerLane, ciLane, ...scope.resolved.map(gitLaneFor)])
@@ -496,6 +509,12 @@ gitResults.forEach((res, k) => {
     if (ledgerRepo === null || e.repo !== ledgerRepo) {
       gitUnmatched.push(`roster repo ${k + 1}: result repo ${flat(e.repo)} does not match ledger repo ${flat(ledgerRepo)}; not used`)
       gitPerRepo[k] = { status: 'unmatched', reason: `repo mismatch (result ${flat(e.repo)}, ledger ${flat(ledgerRepo)})`, figures: null }
+    } else if (e.rejected === true || !Number.isInteger(e.count)) {
+      // Round 2 F3 (AC-QA-19, AC-SEC-10): a rejection the reader made (or any
+      // entry without an integer count) is a failed measurement, never zero.
+      // `rejected` wins over a stale count; the reason is redacted, flattened
+      // and bounded by flat() before it is echoed.
+      gitPerRepo[k] = { status: 'failed', reason: flat(typeof e.reason === 'string' && e.reason ? e.reason : 'git lane returned no integer count'), figures: null }
     } else {
       gitPerRepo[k] = { status: 'ok', reason: null, figures: redactDeep(e) }
     }
@@ -515,13 +534,14 @@ const allCitations = new Set([...ledgerCitations, ...ciCitations])
 // words, so a drafter that has never seen an adopted or rejected target will
 // reword it and mint a new id. It is shown the fixed-key target of every
 // proposal with any outcome event, in its own nonce-wrapped data block, and
-// told to reuse one exactly. The ledger carries no target field (no schema
-// change this round), so a target the reader could not supply is carried as
-// its id with the fact stated, never invented.
+// told to reuse one exactly. The ledger carries no target field, so the reader
+// supplies one from the optimiser's own per-run sidecar (round 2 F2); a target
+// it could not supply is carried as its id with the reader's reason, never
+// invented.
 const priorTargetEntries = Object.entries((ledgerAgg && ledgerAgg.proposalOutcomes) || {}).slice(0, 50).map(([id, o]) => (
   o && o.target && typeof o.target === 'object'
     ? { proposal_id: redact(id), target: redactDeep(o.target) }
-    : { proposal_id: redact(id), target: null, note: 'target not recorded in the ledger; only the id is known' }
+    : { proposal_id: redact(id), target: null, note: `target not known; only the id is known${o && typeof o.targetUnavailableReason === 'string' ? ` (${flat(o.targetUnavailableReason)})` : ''}` }
 ))
 const priorTargetsSection = priorTargetEntries.length
   ? wrapAsData(dataNonce, 'prior-proposal-targets', priorTargetEntries) +
@@ -728,7 +748,10 @@ function isSegmentSuppressed(segment) {
 // mechanical, not reliant on the agent having tagged itself correctly.
 function motivatingSegments(p) {
   const text = `${(p && p.statement) || ''} ${(p && p.motivating_measurement) || ''}`
-  const mentioned = WALL_CLOCK_SEGMENTS.filter((seg) => text.includes(seg))
+  // Round 2 F4 (AC-OPS-3, spec bug): the literal token alone let plain words
+  // ("Agent compute is a small share") walk past the brake. Match the name
+  // case- and separator-insensitively: agent_compute, agent-compute, Agent compute.
+  const mentioned = WALL_CLOCK_SEGMENTS.filter((seg) => new RegExp(`\\b${seg.replace('_', '[ _-]?')}\\b`, 'i').test(text))
   return mentioned
 }
 function isUnmeasuredSegmentMotivated(p) {
@@ -832,8 +855,20 @@ function annotateProposalOutcome(p) {
 ranked.forEach(annotateProposalOutcome)
 insufficientDataProposals.forEach(annotateProposalOutcome)
 // An already-adopted target is reported under its own heading, not ranked as new.
-const rankedNew = ranked.filter((p) => !p.prior_adoption_ts)
-const previouslyAdopted = ranked.filter((p) => p.prior_adoption_ts)
+// Round 2 F1 (AC-SEC-15, section 12): a security-purposed removal and a
+// twice-reverted proposal are never moved out of the ranked list, where the
+// reader looks for them; they are annotated there instead.
+const isAdoptedElsewhere = (p) => p.prior_adoption_ts && p.category !== 'security_removal_flagged' && !p.reverted_twice
+const rankedNew = ranked.filter((p) => !isAdoptedElsewhere(p))
+const previouslyAdopted = ranked.filter(isAdoptedElsewhere)
+
+// Round 2 F2 (AC-PROD-8): the ledger holds only ids, so the target a later run
+// shows the drafter comes from this per-run sidecar, written beside the report
+// under the same ensure-ignored check and read by optimise-read.mjs's ledger
+// command. A per-run output like the report (overwritten each run), not a cache
+// of gh or ledger reads. Redacted like everything else this step writes.
+const proposalTargetsSidecar = {}
+for (const p of [...ranked, ...insufficientDataProposals]) if (p.proposal_id) proposalTargetsSidecar[p.proposal_id] = redactDeep(p.target)
 
 // Review round-1 M5: keyed by POSITION (matching `roots`, and therefore
 // `ledgerAgg.perRepo[].rootIndex`), not by the raw absolute root path --
@@ -907,6 +942,7 @@ const reportMarkdown = buildReport({
   ranked: rankedNew,
   previouslyAdopted,
   insufficientDataProposals,
+  flatten: flat,
 })
 
 const reportWrite = await agent(
@@ -919,12 +955,17 @@ const reportWrite = await agent(
   `.git/info/exclude if not already present, then verifies with \`git check-ignore -q\`, printing {ignored, error}.\n` +
   `If ignored is NOT true: do NOT write the report at all -- return written:false and error naming this reason ` +
   `(e.g. "the report path is not gitignored: <the script's own error>"), and stop here.\n` +
+  `Then run the same script once more for the sidecar path, exactly: \`node <path-to-optimise-report-ignore.mjs> ` +
+  `"$(git rev-parse --show-toplevel)" "${PROPOSAL_TARGETS_RELATIVE_PATH}"\`. If ITS ignored is not true, do NOT write the ` +
+  `sidecar (still write the report) and say so in error.\n` +
   `Only once ignored is true, write EXACTLY the content below, verbatim, to the file "${REPORT_RELATIVE_PATH}" at ` +
   `the CURRENT repo's root (create the .claude/ directory first if it does not exist; overwrite the file if it ` +
-  `already exists). This is the ONLY file you may create or modify in this step. Do NOT run \`git add\`, ` +
+  `already exists). Once the sidecar path is ignored, also write EXACTLY the second data block below, verbatim, to ` +
+  `"${PROPOSAL_TARGETS_RELATIVE_PATH}" at the same root (overwrite it if it exists). Apart from that sidecar, the report is the only file you may create or modify in this step. Do NOT run \`git add\`, ` +
   `\`git commit\`, \`git push\`, any \`gh\` command with \`-X POST/PATCH/PUT/DELETE\`, or any other command that ` +
   `changes repo or remote state.\n\n` +
   wrapAsData(dataNonce, 'report-content-to-write-verbatim', reportMarkdown) +
+  `\n\n` + wrapAsData(dataNonce, 'proposal-targets-sidecar-to-write-verbatim', JSON.stringify(proposalTargetsSidecar)) +
   `\n\nReturn written (boolean), path, and error (null on success).`,
   {
     label: 'report:write',
@@ -942,6 +983,7 @@ let reportWriteError = null
 if (!reportWrite) reportWriteError = 'report:write agent failed or returned no result'
 else if (!reportWrite.written) reportWriteError = reportWrite.error || 'report:write reported written:false with no reason given'
 if (reportWriteError) log(`Report write failed: ${reportWriteError}`)
+else if (reportWrite.error) log(`Report written; sidecar note: ${reportWrite.error}`)
 
 return {
   resolved: scope.resolved,
@@ -1365,27 +1407,44 @@ function buildReport(d) {
   })
   for (const u of d.escapedDefectsUnmatched || []) lines.push(`- Unmatched git result: ${u}`)
   lines.push('')
+  // Round 2 F1/F7 (AC-SEC-15, AC-PROD-8): ONE annotation renderer for all three
+  // proposal sections, so a flag or an outcome shown in one cannot be dropped in
+  // another (the adopted and insufficient-data sections used to omit the
+  // security flag, reinstatement evidence and prior rejection). It also prints
+  // the proposal's target on one flattened, redacted line, the six identity
+  // fields the id derives from.
+  const flatten = d.flatten || oneLine
+  const TARGET_FIELDS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+  const annotationLines = (p) => {
+    const out = [`Target: ${TARGET_FIELDS.map((k) => `${k}=${flatten(p.target && p.target[k] != null ? p.target[k] : '')}`).join(' ')}`]
+    if (p.reinstatement_evidence) out.push(`Reinstatement evidence: ${p.reinstatement_evidence}`)
+    if (p.category === 'security_removal_flagged') out.push('**Flagged: security-purposed check removal/demotion.**')
+    if (p.prior_adoption_ts) out.push(`Already adopted on ${p.prior_adoption_ts}.`)
+    if (p.prior_rejection_ts) out.push(`**Previously rejected on ${p.prior_rejection_ts}.**`)
+    if (p.reverted_twice) out.push('**Flagged: adopted and reverted at least twice previously (§12: keep the original).**')
+    return out
+  }
   lines.push('## Proposals (ranked)')
   if (!d.ranked.length) lines.push('None.')
   for (const p of d.ranked) {
     lines.push(`### ${p.proposal_id || '(no id)'}: ${p.statement}`)
     lines.push(`n=${p.n}. Motivating: ${p.motivating_measurement}. Confirming: ${p.confirming_measurement}. Citations: ${(p.citations || []).join(', ')}.`)
-    if (p.reinstatement_evidence) lines.push(`Reinstatement evidence: ${p.reinstatement_evidence}`)
-    if (p.category === 'security_removal_flagged') lines.push('**Flagged: security-purposed check removal/demotion.**')
-    if (p.prior_rejection_ts) lines.push(`**Previously rejected on ${p.prior_rejection_ts}.**`)
-    if (p.reverted_twice) lines.push('**Flagged: adopted and reverted at least twice previously (§12: keep the original).**')
+    lines.push(...annotationLines(p))
   }
   lines.push('')
   lines.push('## Proposals previously adopted (not ranked as new)')
   if (!(d.previouslyAdopted || []).length) lines.push('None.')
   for (const p of d.previouslyAdopted || []) {
     lines.push(`### ${p.proposal_id || '(no id)'}: ${p.statement}`)
-    lines.push(`Already adopted on ${p.prior_adoption_ts}.`)
+    lines.push(...annotationLines(p))
   }
   lines.push('')
   lines.push('## Proposals (insufficient data, excluded from ranking)')
   if (!d.insufficientDataProposals.length) lines.push('None.')
-  for (const p of d.insufficientDataProposals) lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
+  for (const p of d.insufficientDataProposals) {
+    lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
+    lines.push(...annotationLines(p))
+  }
   lines.push('')
   lines.push('## Filtering')
   // Owner decision, round-3 coordinator triage: the suppression gate now

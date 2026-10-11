@@ -299,8 +299,8 @@ test('T6 escaped-defects CLI: two temp repos with different fix: counts give dif
   assert.equal(runAppend(a, { schema_version: 1, kind: 'tdd_task', outcome: 'done' }).status, 0)
   assert.equal(runAppend(b, { schema_version: 1, kind: 'tdd_task', outcome: 'done' }).status, 0)
   const own = (d) => Number(sh("git log --format=%s | grep -c '^fix:' || true", d).trim())
-  const ra = runCli('escaped-defects', { git_log_raw: gitLogRaw(a), root: a })
-  const rb = runCli('escaped-defects', { git_log_raw: gitLogRaw(b), root: b })
+  const ra = runCli('escaped-defects', { git_log_raw: gitLogRaw(a), root: a, toplevel: a })
+  const rb = runCli('escaped-defects', { git_log_raw: gitLogRaw(b), root: b, toplevel: b })
   assert.equal(ra.out.count, own(a)); assert.equal(rb.out.count, own(b))
   assert.notEqual(ra.out.count, rb.out.count)
   const ledgerLabel = (d) => runCli('ledger', {}, [d]).out.perRepo[0].root
@@ -312,7 +312,7 @@ test('T6 escaped-defects CLI: two temp repos with different fix: counts give dif
 test('T6 escaped-defects CLI: an uninstrumented root carries the redaction marker as its identity (AC-DATA-11)', () => {
   const a = makeTempRepo()
   commitFixes(a, 2)
-  const { out } = runCli('escaped-defects', { git_log_raw: gitLogRaw(a), root: a })
+  const { out } = runCli('escaped-defects', { git_log_raw: gitLogRaw(a), root: a, toplevel: a })
   assert.equal(out.repo, REDACTED)
 })
 
@@ -361,6 +361,12 @@ test('T6 target: a drafted target missing a key, or carrying an extra key, is re
   assert.deepEqual(extractTargets(idCall.prompt).map((t) => t.component), ['good-one'], 'only the well-formed target reaches the id step')
   const at = result.report.indexOf('Proposals rejected: malformed target')
   assert.ok(at >= 0, `report lists the rejection:\n${result.report}`)
+  // Round 2 F6 (AC-QA-20): `at` is the index of the very string searched for, so
+  // the slice always starts with it and the old precondition could not fail.
+  // The real one: the LINE starts with the count of the two malformed targets
+  // drafted here (one missing a key, one carrying an extra), and the good one
+  // is not counted.
+  assert.ok(result.report.split('\n').some((l) => l.startsWith('Proposals rejected: malformed target: 2 (')), 'the rejection line starts with the count of two')
   const tail = result.report.slice(at, at + 800)
   assert.match(tail, /security_purposed/, 'names the missing key')
   assert.match(tail, /segment/, 'names the extra key')
@@ -635,15 +641,30 @@ test('T6 round 1 F1: a re-proposed target whose id already has a proposal_adopte
 
 // ---- F3 (AC-PROD-8 clause 2): the drafter is shown prior targets so it can reuse one exactly ----
 
-test('T6 round 1 F3: the synthesis prompt carries the fixed-key target of every proposal with an outcome event inside its own nonce-wrapped prior-proposal-targets block, with the reuse-exactly instruction (AC-PROD-8)', async () => {
+// Round 2 F2 (AC-PROD-8): the ledger holds only ids, so a target the drafter is
+// to reuse has to come from the optimiser's own per-run sidecar. This test
+// replaces one that injected `target` straight into the outcome fixture, which
+// proved the prompt renders a target but never that the real reader can supply
+// one. Here a real sidecar and a real ledger event go through the real reader.
+const SIDECAR_REL = '.claude/optimise-proposal-targets.json'
+function repoWithOutcomes(events, sidecar) {
+  const repo = makeTempRepo()
+  for (const [id, event] of events) assert.equal(runAppend(repo, { schema_version: 1, kind: 'conduct_plan_event', event, event_scope: `${id}:${event}` }).status, 0)
+  if (sidecar !== undefined) {
+    fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+    fs.writeFileSync(path.join(repo, SIDECAR_REL), typeof sidecar === 'string' ? sidecar : JSON.stringify(sidecar))
+  }
+  return repo
+}
+
+test('T6 round 1 F3 / round 2 F2: a real sidecar plus a real ledger event, read by the real reader, put the fixed-key target of every proposal with an outcome event inside the nonce-wrapped prior-proposal-targets block, with the reuse-exactly instruction (AC-PROD-8)', async () => {
   const adopted = fixedTarget({ kind: 'trigger_tune', component: 'zeta-prior', concern: 'glob', lens: 'lens-operability' })
   const rejected = fixedTarget({ kind: 'ci_note', component: 'eta-prior', concern: 'noise' })
-  const { calls } = await run({
-    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: {
-      [reader.stableProposalId(adopted)]: outcome({ adoptedCount: 1, lastAdoptionTs: '2026-09-01T00:00:00.000Z', target: adopted }),
-      [reader.stableProposalId(rejected)]: outcome({ rejectedCount: 1, lastRejectionTs: '2026-09-02T00:00:00.000Z', target: rejected }),
-    } },
-  })
+  const unrelated = fixedTarget({ kind: 'ci_note', component: 'theta-never-decided', concern: 'noise' })
+  const idA = reader.stableProposalId(adopted); const idR = reader.stableProposalId(rejected)
+  const repo = repoWithOutcomes([[idA, 'proposal_adopted'], [idR, 'proposal_rejected']], { [idA]: adopted, [idR]: rejected, [reader.stableProposalId(unrelated)]: unrelated })
+  const real = runCli('ledger', {}, [repo]).out
+  const { calls } = await run({ 'lane:ledger': { ...ledgerFixture(), proposalOutcomes: real.proposalOutcomes } })
   const prompt = calls.find((c) => c.opts.label === 'synthesis:proposals').prompt
   const block = extractBlock(prompt, 'prior-proposal-targets')
   assert.ok(block, 'the prompt has a nonce-wrapped prior-proposal-targets block')
@@ -651,8 +672,23 @@ test('T6 round 1 F3: the synthesis prompt carries the fixed-key target of every 
     assert.ok(block.includes(`"component":"${t.component}"`), `the block carries ${t.component}'s fixed-key target`)
     assert.ok(block.includes(`"concern":"${t.concern}"`))
   }
+  assert.ok(!block.includes('theta-never-decided'), 'a sidecar entry with no outcome event is not offered as a prior target')
   assert.ok(!prompt.replace(block, '').includes('zeta-prior'), 'the prior target appears only inside the data block, never as bare instruction text')
   assert.match(prompt, /prior-proposal-targets[\s\S]*reuse[\s\S]*exactly|reuse[\s\S]*exactly[\s\S]*prior-proposal-targets/i, 'the prompt tells the drafter to reuse a prior target exactly so the id matches')
+})
+
+test('T6 round 2 F2: with the sidecar absent the same real ledger yields the id-only form in the prompt block, carrying the reader\'s reason, never a throw (AC-PROD-8)', async () => {
+  const target = fixedTarget({ kind: 'trigger_tune', component: 'iota-prior', concern: 'glob' })
+  const id = reader.stableProposalId(target)
+  const repo = repoWithOutcomes([[id, 'proposal_adopted']]) // no sidecar written
+  const real = runCli('ledger', {}, [repo]).out
+  const reason = real.proposalOutcomes[id].targetUnavailableReason
+  assert.equal(typeof reason, 'string'); assert.ok(reason.length > 0, 'the reader says why there is no target')
+  const { calls } = await run({ 'lane:ledger': { ...ledgerFixture(), proposalOutcomes: real.proposalOutcomes } })
+  const block = extractBlock(calls.find((c) => c.opts.label === 'synthesis:proposals').prompt, 'prior-proposal-targets')
+  assert.ok(block && block.includes(id), 'the id is carried')
+  assert.ok(!block.includes('iota-prior'))
+  assert.ok(block.includes(reason), `the reader's reason reaches the drafter: ${block}`)
 })
 
 test('T6 round 1 F3: an outcome whose target is not known carries the id and says so, and no outcomes means no empty-claim block content (AC-PROD-8)', async () => {
@@ -736,4 +772,239 @@ test('T6 round 1 F6: the malformed-target report line flattens through oneLine: 
   assert.ok(line, 'precondition: the malformed-target line rendered')
   assert.ok(!lines.some((l) => l.startsWith('## Injected')), 'agent text must not open a heading')
   assert.ok(line.includes(slashKey), `a literal backslash-s is not whitespace and must survive: ${line}`)
+})
+
+// ==== review round 2 fixes (PR #9): F1 to F8 ====
+
+function sectionOf(report, heading) {
+  const start = report.indexOf(heading)
+  assert.ok(start >= 0, `report has "${heading}":\n${report}`)
+  const rest = report.slice(start)
+  const end = rest.indexOf('\n## ', 5)
+  return end < 0 ? rest : rest.slice(0, end)
+}
+const ADOPTED_HEADING = '## Proposals previously adopted (not ranked as new)'
+const INSUFFICIENT_HEADING = '## Proposals (insufficient data, excluded from ranking)'
+const ADOPTED_TS = '2026-09-01T00:00:00.000Z'
+const REJECTED_TS = '2026-09-02T00:00:00.000Z'
+
+// ---- F1 (AC-SEC-15, AC-PROD-8): one annotation renderer, and a flagged proposal is never moved ----
+
+test('T6 round 2 F1: an adopted security-purposed removal stays in the ranked list, still carrying its security flag and reinstatement evidence, annotated as already adopted (AC-SEC-15)', async () => {
+  const target = fixedTarget({ kind: 'ci_note', component: 'vuln-scan', concern: 'noise', job: 'our-custom-vuln-scanner', security_purposed: true })
+  const id = reader.stableProposalId(target)
+  const { result } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS }) } },
+    'synthesis:proposals': { proposals: [proposal({ target, statement: 'our-custom-vuln-scanner is noisy lately', reinstatement_evidence: 'reinstate on any new CVE class' })] },
+    'synthesis:ids': realIdsResponder,
+  })
+  assert.equal(result.proposals_ranked.length, 1, 'a security-flagged proposal is never moved out of the ranked list')
+  assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
+  assert.equal(result.proposals_previously_adopted.length, 0)
+  const ranked = rankedSection(result.report)
+  assert.ok(ranked.includes(id))
+  assert.ok(ranked.includes('**Flagged: security-purposed check removal/demotion.**'), 'the security flag survives')
+  assert.ok(ranked.includes('Reinstatement evidence: reinstate on any new CVE class'), 'the reinstatement evidence survives')
+  assert.ok(ranked.includes(`Already adopted on ${ADOPTED_TS}`), 'the adoption is annotated where the proposal stays')
+  assert.match(sectionOf(result.report, ADOPTED_HEADING), /None\./)
+})
+
+test('T6 round 2 F1: a proposal adopted and reverted twice stays in the ranked list with both annotations (AC-SEC-15, section 12)', async () => {
+  const target = fixedTarget({ kind: 'trigger_tune', component: 'twice-reverted', concern: 'glob', lens: 'lens-operability' })
+  const id = reader.stableProposalId(target)
+  const { result } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 2, lastAdoptionTs: ADOPTED_TS, revertedCount: 2, revertedTwiceOrMore: true }) } },
+    'synthesis:proposals': { proposals: [proposal({ target, statement: 'Narrow the lens-operability trigger glob' })] },
+    'synthesis:ids': realIdsResponder,
+  })
+  assert.equal(result.proposals_ranked.length, 1, 'reverted twice is never moved out of the ranked list')
+  assert.equal(result.proposals_previously_adopted.length, 0)
+  const ranked = rankedSection(result.report)
+  assert.match(ranked, /adopted and reverted at least twice/)
+  assert.ok(ranked.includes(`Already adopted on ${ADOPTED_TS}`))
+})
+
+test('T6 round 2 F1: the previously-adopted section carries the same annotations as the ranked list: prior rejection and reinstatement evidence, not only the adoption date (AC-PROD-8)', async () => {
+  const target = fixedTarget({ kind: 'trigger_tune', component: 'adopted-and-rejected', concern: 'glob', lens: 'lens-operability' })
+  const id = reader.stableProposalId(target)
+  const { result } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS, rejectedCount: 1, lastRejectionTs: REJECTED_TS }) } },
+    'synthesis:proposals': { proposals: [proposal({ target, statement: 'Narrow the lens-operability trigger glob', reinstatement_evidence: 'keep the glob broad on revert' })] },
+    'synthesis:ids': realIdsResponder,
+  })
+  assert.equal(result.proposals_previously_adopted.length, 1, 'precondition: an ordinary adopted proposal does move')
+  const sec = sectionOf(result.report, ADOPTED_HEADING)
+  assert.ok(sec.includes(`Already adopted on ${ADOPTED_TS}`))
+  assert.ok(sec.includes(`Previously rejected on ${REJECTED_TS}`), `prior rejection dropped from the adopted section:\n${sec}`)
+  assert.ok(sec.includes('Reinstatement evidence: keep the glob broad on revert'), `reinstatement evidence dropped from the adopted section:\n${sec}`)
+})
+
+test('T6 round 2 F1: an insufficient-data proposal with a prior adoption and a prior rejection shows both in its section (AC-PROD-8)', async () => {
+  const target = fixedTarget({ kind: 'ci_note', component: 'thin-evidence', concern: 'noise' })
+  const id = reader.stableProposalId(target)
+  const { result } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS, rejectedCount: 1, lastRejectionTs: REJECTED_TS }) } },
+    'synthesis:proposals': { proposals: [proposal({ target, statement: 'Silence the thin-evidence note', n: 2 })] },
+    'synthesis:ids': realIdsResponder,
+  })
+  assert.equal(result.proposals_insufficient_data.length, 1, 'precondition: the proposal is in the insufficient-data list')
+  const sec = sectionOf(result.report, INSUFFICIENT_HEADING)
+  assert.ok(sec.includes(id) && sec.includes('Silence the thin-evidence note'), 'precondition: the proposal is listed')
+  assert.ok(sec.includes(`Already adopted on ${ADOPTED_TS}`), `adoption dropped from the insufficient-data list:\n${sec}`)
+  assert.ok(sec.includes(`Previously rejected on ${REJECTED_TS}`), `rejection dropped from the insufficient-data list:\n${sec}`)
+})
+
+// ---- F7 (AC-PROD-8): the target is shown, one flattened redacted line, in all three sections ----
+
+test('T6 round 2 F7: every proposal shows its six identity fields on one exact "Target:" line, in the ranked, previously-adopted and insufficient-data sections (AC-PROD-8)', async () => {
+  const fresh = fixedTarget({ kind: 'ci_note', component: 'fresh-thing', concern: 'noise' })
+  const adopted = fixedTarget({ kind: 'trigger_tune', component: 'lens-operability', concern: 'trigger glob', lens: 'lens-operability' })
+  const thin = fixedTarget({ kind: 'ci_demote', component: 'ci', concern: 'duration', workflow: 'ci.yml', job: 'test' })
+  const { result } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [reader.stableProposalId(adopted)]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS }) } },
+    'synthesis:proposals': { proposals: [
+      proposal({ target: fresh, statement: 'Silence the noisy note' }),
+      proposal({ target: adopted, statement: 'Narrow the lens-operability trigger glob' }),
+      proposal({ target: thin, statement: 'Look at the test job duration', n: 2 }),
+    ] },
+    'synthesis:ids': realIdsResponder,
+  })
+  assert.ok(rankedSection(result.report).split('\n').includes('Target: kind=ci_note component=fresh-thing concern=noise lens= workflow= job='), `ranked:\n${rankedSection(result.report)}`)
+  assert.ok(sectionOf(result.report, ADOPTED_HEADING).split('\n').includes('Target: kind=trigger_tune component=lens-operability concern=trigger glob lens=lens-operability workflow= job='))
+  assert.ok(sectionOf(result.report, INSUFFICIENT_HEADING).split('\n').includes('Target: kind=ci_demote component=ci concern=duration lens= workflow=ci.yml job=test'))
+})
+
+test('T6 round 2 F7: the target line is flattened, bounded and redacted: a newline, a heading, a root path and a long value cannot escape it (AC-SEC-10)', async () => {
+  const target = fixedTarget({ kind: 'ci_note', component: `a\n## Injected target heading\n${ALPHA}/sub ${'Z'.repeat(400)}`, concern: 'noise' })
+  const { result } = await run({ 'synthesis:proposals': { proposals: [proposal({ target })] } })
+  const lines = result.report.split('\n')
+  assert.ok(lines.some((l) => l.startsWith('Target: kind=ci_note component=a ## Injected target heading ' + REDACTED)), `the target line is one flattened, redacted line:\n${rankedSection(result.report)}`)
+  assert.ok(!lines.some((l) => l.startsWith('## Injected')))
+  assert.ok(!result.report.includes(ALPHA))
+  assert.ok(!/Z{200}/.test(result.report))
+})
+
+// ---- F2 (AC-PROD-8): the sidecar the optimiser writes beside its report ----
+
+test('T6 round 2 F2: the report:write step is handed a sidecar mapping every proposal id computed this run (ranked, previously adopted, insufficient-data) to its fixed-key target, under the same ensure-ignored step (AC-PROD-8)', async () => {
+  const fresh = fixedTarget({ kind: 'ci_note', component: 'fresh-thing', concern: 'noise' })
+  const adopted = fixedTarget({ kind: 'trigger_tune', component: 'lens-operability', concern: 'trigger glob', lens: 'lens-operability' })
+  const thin = fixedTarget({ kind: 'ci_note', component: 'thin-thing', concern: 'noise' })
+  const { calls } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [reader.stableProposalId(adopted)]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS }) } },
+    'synthesis:proposals': { proposals: [proposal({ target: fresh }), proposal({ target: adopted }), proposal({ target: thin, n: 2 })] },
+    'synthesis:ids': realIdsResponder,
+  })
+  const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
+  assert.ok(prompt.includes('.claude/optimise-proposal-targets.json'), 'the step is told the sidecar path')
+  assert.ok(prompt.includes('optimise-report-ignore.mjs'), 'the existing ensure-ignored script is the guard')
+  const block = extractBlock(prompt, 'proposal-targets-sidecar-to-write-verbatim')
+  assert.ok(block, 'the sidecar content is its own nonce-wrapped data block')
+  assert.deepEqual(JSON.parse(block), {
+    [reader.stableProposalId(fresh)]: fresh,
+    [reader.stableProposalId(adopted)]: adopted,
+    [reader.stableProposalId(thin)]: thin,
+  })
+})
+
+test('T6 round 2 F2: the sidecar is redacted like everything else the optimiser writes: a roster root in a target value never reaches it (AC-SEC-10)', async () => {
+  const target = fixedTarget({ kind: 'ci_note', component: `uses ${ALPHA}/sub`, concern: 'noise' })
+  const { calls } = await run({ 'synthesis:proposals': { proposals: [proposal({ target })] }, 'synthesis:ids': realIdsResponder })
+  const block = extractBlock(calls.find((c) => c.opts.label === 'report:write').prompt, 'proposal-targets-sidecar-to-write-verbatim')
+  assert.ok(block, 'precondition: the sidecar block exists')
+  assert.ok(!block.includes(ALPHA))
+})
+
+// ---- F3 (AC-QA-19, AC-SEC-10): the toplevel check fails closed, and a rejection is representable ----
+
+test('T6 round 2 F3: escaped-defects rejects when toplevel is missing or empty, the same no-figures shape as a mismatch (AC-SEC-10)', () => {
+  const a = makeTempRepo()
+  commitFixes(a, 2)
+  const raw = gitLogRaw(a)
+  for (const payload of [{ git_log_raw: raw, root: a }, { git_log_raw: raw, root: a, toplevel: '' }]) {
+    const { out, raw: text } = runCli('escaped-defects', payload)
+    assert.equal(out.rejected, true, `fails open without a toplevel: ${text}`)
+    assert.equal(typeof out.reason, 'string'); assert.ok(out.reason.length > 0)
+    assert.ok(out.count == null && out.scoped_count == null, `no figures on a rejection: ${text}`)
+    assert.ok(!text.includes(a), 'the reason echoes no path')
+  }
+})
+
+const rejectedEntry = (rootIndex, repo, reason, overrides = {}) => ({
+  ...entry(rootIndex, repo),
+  count: null, n_commits_examined: null, scoped_count: null, scoped_excluded_count: null, scoped_unavailable_count: null,
+  rejected: true, reason, ...overrides,
+})
+
+test('T6 round 2 F3: GIT_LANE_ENTRY_SCHEMA can represent a reader rejection (null figures, optional rejected boolean and reason) and still rejects a non-boolean rejected or a string count (AC-QA-19)', async () => {
+  const { calls } = await run()
+  const schema = calls.find((c) => c.opts.label === 'lane:git').opts.schema
+  assert.deepEqual(validateEntry({ repos: [rejectedEntry(0, 'alpha-repo', 'git toplevel does not match the roster root')] }, schema), [])
+  assert.ok(validateEntry({ repos: [rejectedEntry(0, 'alpha-repo', 'r', { rejected: 'yes' })] }, schema).length > 0, 'rejected is a boolean')
+  assert.ok(validateEntry({ repos: [rejectedEntry(0, 'alpha-repo', 'r', { reason: 5 })] }, schema).length > 0, 'reason is a string')
+  assert.ok(validateEntry({ repos: [rejectedEntry(0, 'alpha-repo', 'r', { count: 'many' })] }, schema).length > 0, 'count is an integer or null, nothing else')
+  assert.deepEqual(validateEntry({ repos: [entry(0, 'alpha-repo')] }, schema), [], 'an ordinary entry without the new fields still validates')
+})
+
+test('T6 round 2 F3: a relayed rejected entry is rendered as "Not measured: <reason>", never as figures and never as "0 of 0" (AC-QA-19)', async () => {
+  const perRoot = goodPair()
+  perRoot[BETA] = { repos: [rejectedEntry(1, 'beta-repo', 'git toplevel does not match the roster root; the git log was not read from that repo')] }
+  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
+  const section = escapedSection(result.report)
+  const b = blockFor(section, ['alpha-repo', 'beta-repo'], 1)
+  assert.match(b, /Not measured: git toplevel does not match the roster root/, `the reason is shown:\n${b}`)
+  assert.doesNotMatch(b, /\bof 0\b|\b0 of\b|examined commits/, 'no figures line')
+  assert.match(blockFor(section, ['alpha-repo', 'beta-repo'], 0), /\b3 of 480\b/, 'the other repo is unaffected')
+})
+
+test('T6 round 2 F3: rejected true wins over a stale integer count, and a null count without the flag is also "Not measured" (AC-QA-19)', async () => {
+  const forged = goodPair()
+  forged[BETA] = { repos: [rejectedEntry(1, 'beta-repo', 'rejected upstream', { count: 7, n_commits_examined: 350 })] }
+  const r1 = await run({ 'lane:git': gitResponder(forged) })
+  const b1 = blockFor(escapedSection(r1.result.report), ['alpha-repo', 'beta-repo'], 1)
+  assert.match(b1, /Not measured: rejected upstream/)
+  assert.doesNotMatch(b1, /\b7 of 350\b/)
+  const nulled = goodPair()
+  nulled[BETA] = { repos: [rejectedEntry(1, 'beta-repo', 'unused', { rejected: undefined, reason: undefined })] }
+  const r2 = await run({ 'lane:git': gitResponder(nulled) })
+  const b2 = blockFor(escapedSection(r2.result.report), ['alpha-repo', 'beta-repo'], 1)
+  assert.match(b2, /Not measured: .+/, `a non-integer count is a failed lane, not zero:\n${b2}`)
+  assert.doesNotMatch(b2, /\bof 0\b|\b0 of\b/)
+})
+
+test('T6 round 2 F3: a rejection reason is flattened, bounded and redacted before it is echoed (AC-SEC-10)', async () => {
+  const perRoot = goodPair()
+  perRoot[BETA] = { repos: [rejectedEntry(1, 'beta-repo', `bad ${BETA}/x\n## Injected reason heading\n${'R'.repeat(400)}`)] }
+  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
+  const b = blockFor(escapedSection(result.report), ['alpha-repo', 'beta-repo'], 1)
+  assert.match(b, /Not measured: bad /, 'precondition: the reason rendered')
+  assert.ok(!result.report.split('\n').some((l) => l.startsWith('## Injected')))
+  assert.ok(!result.report.includes(BETA))
+  assert.ok(!/R{200}/.test(result.report))
+})
+
+// ---- F5 (AC-QA-21): each brake test needs a control proving the entry is otherwise found ----
+
+for (const flag of ['truncated', 'insufficientData', 'renameSuspect']) {
+  test(`T6 brake control: the same ${flag} CI entry with the flag false lets the removal through, so the drop above is for the flag and not for an unknown job (AC-QA-21, round 2 F5)`, async () => {
+    const entryFor = { workflow: 'ci.yml', job: 'lint', n: 100, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: null, meanDurationS: 1, [flag]: false }
+    const { result } = await run({
+      'lane:ci': ciFixture({ 'ci.yml::lint': entryFor }),
+      'synthesis:proposals': { proposals: [proposal({ target: fixedTarget({ kind: 'ci_remove', workflow: 'ci.yml', job: 'lint' }), statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 100 })] },
+    })
+    assert.equal(result.proposals_ranked.length, 1, `the control must survive:\n${result.report}`)
+  })
+}
+
+// ---- F8: SKILL.md describes the shipped shape ----
+
+test('T6 round 2 F8: SKILL.md no longer describes the old target shape, and documents the fixed key set, the adoption annotation, the new section and the sidecar', () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
+  assert.ok(!skill.includes('(workflow file, job name, lens, trigger glob)'), 'the old target description is gone')
+  for (const key of ['kind', 'component', 'concern', 'lens', 'workflow', 'job', 'touches_always_on_lens', 'security_purposed']) assert.ok(skill.includes('`' + key + '`'), `the fixed key ${key} is named`)
+  assert.ok(skill.includes('Already adopted'), 'the adoption annotation is documented')
+  assert.ok(skill.includes('Proposals previously adopted'), 'the new report section is documented')
+  const reading = skill.slice(skill.indexOf('## Reading the report'))
+  assert.ok(reading.includes('.claude/optimise-proposal-targets.json'), 'the sidecar is documented under Reading the report')
+  assert.ok(reading.includes('rm .claude/optimise-proposal-targets.json'), 'its retention and removal are stated')
 })

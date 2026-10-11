@@ -1204,7 +1204,7 @@ test('optimise-cycle: a proposal with n below the minimum is excluded from the r
 
 // ---- Review round-1 M4 (AC-OPS-3): a proposal motivated by an unmeasured wall-clock segment is dropped ----
 
-test('optimise-cycle: a proposal whose target.segment is agent_compute is dropped when that segment has >=1 unmeasured run in the window, naming the field and count in the report (M4)', async () => {
+test('optimise-cycle: a proposal whose statement names the literal token agent_compute (the legacy target.segment tag is appended to the statement by the fixture, so this proves the text path, not a typed tag) is dropped when that segment has >=1 unmeasured run in the window, naming the field and count in the report (M4)', async () => {
   const responses = baseResponses({
     'lane:ledger': ledgerFixture({
       wallClock: {
@@ -1230,6 +1230,36 @@ test('optimise-cycle: a proposal whose target.segment is agent_compute is droppe
   // the Filtering line.
   assert.match(result.report, /agent_compute \(4 unmeasured runs\)/, 'the Filtering line must name the segment AND its exact unmeasured-run count in its own distinct phrasing')
 })
+
+// Round 2 F4 (AC-OPS-3, spec bug): the text path matched only the literal
+// token, so a statement written in plain words ("Agent compute is a small share
+// of wall-clock") walked straight past the unmeasured-segment brake. Each
+// spelling below must be gated, and each has a control (the same words with
+// the segment fully measured) so a drop is for the measurement, not the words.
+function wallClockWith(segment, measured, unmeasured) {
+  const totals = { ciWaitSeconds: 0, ciWaitMeasuredRuns: 3, ciWaitUnmeasuredRuns: 0, humanWaitSeconds: 0, humanWaitMeasuredRuns: 3, humanWaitUnmeasuredRuns: 0, agentComputeSeconds: 0, agentComputeMeasuredRuns: 3, agentComputeUnmeasuredRuns: 0, unterminatedWaits: 0 }
+  const camel = { ci_wait: 'ciWait', human_wait: 'humanWait', agent_compute: 'agentCompute' }[segment]
+  totals[`${camel}MeasuredRuns`] = measured
+  totals[`${camel}UnmeasuredRuns`] = unmeasured
+  return { byPlan: {}, totals, source: { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' } }
+}
+for (const [segment, statement] of [
+  ['agent_compute', 'Agent compute is a small share of wall-clock; add concurrency'],
+  ['agent_compute', 'agent-compute dominates; add a lane'],
+  ['ci_wait', 'CI wait dominates the cycle; shard the suite'],
+  ['ci_wait', 'ci-wait is the long pole'],
+  ['human_wait', 'Human wait is the bottleneck; batch the reviews'],
+  ['human_wait', 'Pre-approve plans to shorten human-wait'],
+]) {
+  test(`optimise-cycle: a plain-words statement "${statement}" is gated on ${segment} having unmeasured runs, and is kept when that segment is fully measured (AC-OPS-3, round 2 F4)`, async () => {
+    const drafted = { 'synthesis:proposals': { proposals: [proposal({ statement, citations: ['run-1'] })] } }
+    const gated = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses({ ...drafted, 'lane:ledger': ledgerFixture({ wallClock: wallClockWith(segment, 0, 4) }) }) })
+    assert.equal(gated.result.proposals_ranked.length, 0, 'plain words must not walk past the brake')
+    assert.match(gated.result.report, new RegExp(`${segment} \\(4 unmeasured runs\\)`), 'the Filtering line names the canonical segment and its count')
+    const control = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses({ ...drafted, 'lane:ledger': ledgerFixture({ wallClock: wallClockWith(segment, 4, 0) }) }) })
+    assert.equal(control.result.proposals_ranked.length, 1, 'the same words survive when the segment is measured')
+  })
+}
 
 // Round-2 L2, self-caught vacuous-mutant fix: the assertion above can pass
 // purely from the FILTERING line's drop-reason detail even if the wall-

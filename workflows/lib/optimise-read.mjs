@@ -1799,6 +1799,81 @@ function ledgerIdentityForRoot(root) {
   return derivePerRepoLabel(parseLedgerContent(raw).records, root)
 }
 
+// Round 2 F2 (AC-PROD-8, AC-SEC-10): the ledger holds only proposal ids, so the
+// optimiser writes a per-run sidecar of id -> fixed-key target beside its
+// report. This is a per-run OUTPUT like the report, overwritten each run, not a
+// cache of ledger or gh reads. The reader treats it as hostile data: it never
+// throws, spawns nothing, refuses anything that is not a plain bounded file,
+// accepts an entry only if it is exactly the fixed key set, and flattens and
+// bounds every string it hands on. Mirrors PROPOSAL_TARGET_KEYS in
+// workflows/optimise-cycle.js (a workflow script cannot import this file).
+export const PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
+const SIDECAR_MAX_BYTES = 1024 * 1024
+const SIDECAR_STRING_MAX = 200
+const SIDECAR_BOOLEAN_KEYS = ['touches_always_on_lens', 'security_purposed']
+function sidecarTargetOrReason(t) {
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return { reason: 'sidecar entry is not an object' }
+  const keys = Object.keys(t)
+  const fixed = [...PROPOSAL_IDENTITY_KEYS, ...SIDECAR_BOOLEAN_KEYS]
+  if (keys.length !== fixed.length || !fixed.every((k) => keys.includes(k))) return { reason: 'sidecar entry is not the fixed key set' }
+  const out = {}
+  for (const k of PROPOSAL_IDENTITY_KEYS) {
+    const v = t[k]
+    if (v !== null && typeof v !== 'string') return { reason: 'sidecar entry has a non-string identity field' }
+    if (typeof v === 'string' && v.length > SIDECAR_STRING_MAX) return { reason: 'sidecar entry has an over-long identity field' }
+    out[k] = typeof v === 'string' ? v.replace(/\s+/g, ' ') : v
+  }
+  for (const k of SIDECAR_BOOLEAN_KEYS) {
+    if (typeof t[k] !== 'boolean') return { reason: 'sidecar entry has a non-boolean gate field' }
+    out[k] = t[k]
+  }
+  return { target: out }
+}
+function readProposalTargetsSidecar(roots) {
+  let firstFailure = 'proposal-target sidecar not found'
+  const merged = {}
+  let anyRead = false
+  roots.forEach((root, i) => {
+    const file = path.join(root, PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH)
+    let parsed
+    try {
+      const st = fs.lstatSync(file)
+      if (!st.isFile() || st.size > SIDECAR_MAX_BYTES) throw new Error('not a plain bounded file')
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch (e) {
+      // ENOENT is the ordinary "not written yet"; anything else is unreadable
+      // or malformed. The message is never echoed (it can carry the path).
+      if (i === 0) firstFailure = e && e.code === 'ENOENT' ? 'proposal-target sidecar not found' : 'proposal-target sidecar unreadable or not valid JSON'
+      return
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (i === 0) firstFailure = 'proposal-target sidecar is not a JSON object'
+      return
+    }
+    anyRead = true
+    for (const [id, t] of Object.entries(parsed)) if (!(id in merged)) merged[id] = t
+  })
+  return anyRead ? { entries: merged } : { reason: firstFailure }
+}
+// Attach `target` (or `targetUnavailableReason`) to each outcome, and only to
+// ids that already have an outcome event: the sidecar never creates one.
+function attachSidecarTargets(outcomes, roots) {
+  const sidecar = readProposalTargetsSidecar(roots)
+  for (const [id, o] of Object.entries(outcomes)) {
+    let reason = sidecar.reason
+    if (sidecar.entries) {
+      if (!Object.prototype.hasOwnProperty.call(sidecar.entries, id)) reason = 'proposal-target sidecar has no entry for this proposal'
+      else {
+        const r = sidecarTargetOrReason(sidecar.entries[id])
+        if (r.target) { o.target = r.target; continue }
+        reason = r.reason
+      }
+    }
+    o.targetUnavailableReason = reason
+  }
+  return outcomes
+}
+
 function runLedgerCommand(roots, window) {
   const perRepo = []
   let combinedRecords = []
@@ -1855,7 +1930,7 @@ function runLedgerCommand(roots, window) {
     rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecReviewRunsConducted: rework.noSpecReviewRunsConducted, noSpecReviewRunsDirect: rework.noSpecReviewRunsDirect, noSpecReviewRunsRoundNotRecorded: rework.noSpecReviewRunsRoundNotRecorded, reviewRunsWithRound: rework.reviewRunsWithRound, noSpecFindingsReclassified: rework.noSpecFindingsReclassified, schemaV4: rework.schemaV4 },
     blockedUnresolved,
     neverFailingAcs: neverFailing,
-    proposalOutcomes: mapToObject(proposalOutcomes),
+    proposalOutcomes: attachSidecarTargets(mapToObject(proposalOutcomes), roots),
     wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
     triggerAccuracy: trigger,
     citationPool: citationPool(windowed),
@@ -1924,11 +1999,15 @@ export function main() {
     // both, fs only), git read an enclosing or different repo, so the figures
     // are about the wrong history. Rejected with a reason, never figures, and
     // the reason echoes no path.
+    // Round 2 F3 (AC-QA-19, AC-SEC-10): this check used to be skipped when
+    // `toplevel` was missing or empty, so a lane that omitted it (or a failed
+    // rev-parse) got figures with no integrity check at all. It now fails
+    // closed: no toplevel is the same no-figures rejection as a mismatch.
+    let same = false
     if (typeof payload.toplevel === 'string' && payload.toplevel) {
-      let same = false
       try { same = fs.realpathSync(payload.toplevel) === fs.realpathSync(root) } catch (e) { same = false }
-      if (!same) return { rejected: true, reason: 'git toplevel does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null }
     }
+    if (!same) return { rejected: true, reason: 'git toplevel is missing or does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null, repo: ledgerIdentityForRoot(root) }
     const config = resolveProductSourceExcludeGlobs(root)
     // HARN-OPT-4 T6 (AC-DATA-11, AC-SEC-10): attach the ledger repo identity
     // for this root, derived exactly as the ledger command derives perRepo[].root,
