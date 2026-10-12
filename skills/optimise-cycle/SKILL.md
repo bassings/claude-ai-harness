@@ -275,7 +275,7 @@ It states, every run, in this order:
    (source: ledger). The rework section ends with **blocked unresolved**:
    TDD runs that ended blocked and have no later done run for the same
    repo, spec and task, one line each with the reason code (`test_attempt_cap`,
-   `implement_attempt_cap` or `tests_modified`), or "not recorded" for a run
+   `implement_attempt_cap`, `tests_modified` or `test_defect`), or "not recorded" for a run
    from before the code existed. It is an **upper bound**: a task finished
    by hand, or re-briefed with different wording and then finished by the
    harness, leaves no resolution row under its original text, so a listed
@@ -288,6 +288,11 @@ It states, every run, in this order:
    resolve retroactively) with real post-change blocks, so read the
    "reason recorded" figure on the line beneath it: that figure staying high
    week on week is the signal, not a single line and not the headline.
+   The same aggregate carries `byModel`: terminal TDD runs counted by the
+   model they requested (null when none was given) against outcome and
+   reason, which is how a run re-dispatched on a stronger model, and how
+   many of those ended done, shows up. The model is what was asked for, not
+   confirmed by the runtime.
 4. **Trigger accuracy** (source: ledger), with an unmeasured `trigger_count`
    bucketed separately from both "nothing in scope" and "examined and
    found nothing".

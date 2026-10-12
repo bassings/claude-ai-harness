@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, wasNoSpecInPlay } from './ledger-append.mjs'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, wasNoSpecInPlay, BLOCKED_REASONS, MODEL_PATTERN_STR } from './ledger-append.mjs'
 
 // Round-7 review F1 (§12 reframe, corrected a second time): round-6's
 // isNeutralised(obj, field) asked a SHAPE question -- "is this value null
@@ -309,7 +309,7 @@ function planKeyForRecord(record, root = '') {
 // joins by outcome, and its reason is 'not recorded', never a value; a
 // non-enum value (hand-edited ledger) is likewise never echoed. byReason counts
 // the unresolved rows that carry a recorded enum reason.
-const BLOCKED_REASONS = ['test_attempt_cap', 'implement_attempt_cap', 'tests_modified']
+// HARN-OPT-5 T1 (AC-ARCH-5): BLOCKED_REASONS is imported from ledger-append.mjs, the one definition site.
 export function aggregateBlockedUnresolved(records, { root = '' } = {}) {
   const open = new Map()
   // Round 1 M1 (AC-PROD-6, AC-DATA-9): every done row in time order, so an
@@ -345,7 +345,26 @@ export function aggregateBlockedUnresolved(records, { root = '' } = {}) {
     if (u.reason === 'not recorded') reasonNotRecorded += 1
     else byReason[u.reason] += 1
   }
-  return { count: unresolved.length, unresolved, byReason, reasonNotRecorded }
+  // HARN-OPT-5 T1 (AC-PROD-8): terminal tdd_task rows counted by requested
+  // model crossed with outcome and blocked_reason, so the weekly report shows
+  // how many runs asked for a non-default model and how they ended. Folded in
+  // here rather than a new section. A row with no model key (pre-v6) or a
+  // value outside the token pattern reads as null and is never echoed; the same
+  // holds for a reason outside the enum.
+  const modelRe = new RegExp(MODEL_PATTERN_STR)
+  const byModelCounts = new Map()
+  for (const r of records) {
+    if (!r || r.kind !== 'tdd_task' || !['done', 'blocked', 'aborted'].includes(r.outcome)) continue
+    const model = typeof r.model === 'string' && modelRe.test(r.model) ? r.model : null
+    const blocked_reason = BLOCKED_REASONS.includes(r.blocked_reason) ? r.blocked_reason : null
+    const key = JSON.stringify([model, r.outcome, blocked_reason])
+    byModelCounts.set(key, (byModelCounts.get(key) || 0) + 1)
+  }
+  const byModel = [...byModelCounts].map(([k, count]) => {
+    const [model, outcome, blocked_reason] = JSON.parse(k)
+    return { model, outcome, blocked_reason, count }
+  })
+  return { count: unresolved.length, unresolved, byReason, reasonNotRecorded, byModel }
 }
 
 // Rework attribution (spec item 1) + AC-verdict aggregation keyed by

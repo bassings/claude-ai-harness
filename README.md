@@ -793,6 +793,14 @@ runtime statically rejects any `import` before execution, so the schema,
 validation and the write itself live in this one real-Node script instead,
 invoked via Bash from each workflow's final step).
 
+A `tdd_task` line also carries `model`: the implementer model the run asked for
+through `tdd-task`'s optional `model` argument, or null when none was given. It
+is **requested, not confirmed**: the line records the token that was passed to
+the implementer dispatches, not a report from the runtime of which model
+actually ran. `blocked_reason` on that line is one of `test_attempt_cap`,
+`implement_attempt_cap`, `tests_modified` or `test_defect` (the implementer
+reported that the frozen test itself is wrong).
+
 **The `schema_version` 3 boundary, and reading a window that spans it.**
 `SCHEMA_VERSION` is 3 from the validator change onward. What changed at that
 boundary, field by field:

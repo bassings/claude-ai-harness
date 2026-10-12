@@ -274,9 +274,9 @@ for (const { name, args, nested, entryKey } of SAFETY_CASES) {
 
 // ---- (2) SCHEMA_VERSION 5 and the readers (AC-OPS-3, AC-DATA-17) ----
 
-test('T8 AC-OPS-3: SCHEMA_VERSION is 5, and ledger-append.mjs says why (budget_spent is now a per-run delta)', async () => {
+test('T8 AC-OPS-3: SCHEMA_VERSION is 6 (T8 took it to 5; HARN-OPT-5 T1 to 6), and ledger-append.mjs says why (budget_spent is now a per-run delta)', async () => {
   const { SCHEMA_VERSION } = await import(APPEND_URL)
-  assert.equal(SCHEMA_VERSION, 5)
+  assert.equal(SCHEMA_VERSION, 6)
   const src = fs.readFileSync(path.join(WF_DIR, 'lib', 'ledger-append.mjs'), 'utf8')
   const at = src.indexOf('export const SCHEMA_VERSION')
   const preceding = src.slice(Math.max(0, at - 1500), at)
@@ -312,11 +312,11 @@ test('T8 AC-DATA-17: no reader in workflows/lib aggregates budget_spent', () => 
 
 // ---- (5) AC-DATA-19: a v5 terminal payload through the real writer appends one line ----
 
-test('T8 AC-DATA-19: a v5 terminal payload carrying a delta leaves the seeded bytes as a prefix and adds exactly one line, stamped 5', () => {
+test('T8 AC-DATA-19: a terminal payload carrying a delta leaves the seeded bytes as a prefix and adds exactly one line, stamped with the current version (6)', () => {
   const repo = makeTempRepo()
   const { added } = assertAppendPreservesPrefix(repo, { kind: 'tdd_task', task: 'T', outcome: 'done', spec: null, budget_spent: 250, rounds: { test_attempts: 1, implement_attempts: 1 }, blocked_reason: null })
   const entry = JSON.parse(added)
-  assert.strictEqual(entry.schema_version, 5)
+  assert.strictEqual(entry.schema_version, 6)
   assert.strictEqual(entry.budget_spent, 250)
 })
 
