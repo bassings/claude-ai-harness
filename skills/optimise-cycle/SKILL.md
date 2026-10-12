@@ -289,7 +289,7 @@ It states, every run, in this order:
    "reason recorded" figure on the line beneath it: that figure staying high
    week on week is the signal, not a single line and not the headline.
    The same aggregate carries `byModel`: terminal TDD runs counted by the
-   model they requested (null when none was given) against outcome and
+   model they requested (null when no model was recorded: none was given, or the key was stripped for a stale writer, or the row is degraded) against outcome and
    reason, which is how a run re-dispatched on a stronger model, and how
    many of those ended done, shows up. The model is what was asked for, not
    confirmed by the runtime.

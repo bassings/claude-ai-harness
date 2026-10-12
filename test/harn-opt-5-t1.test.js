@@ -544,3 +544,80 @@ test('T1 AC-SIMP-1: no dependency is added (no package manifest or lockfile is t
   assert.equal(tracked.status, 0, tracked.stderr)
   assert.equal(tracked.stdout.trim(), '', `a manifest or lockfile is tracked: ${tracked.stdout}`)
 })
+
+// ---- review round 1 fixes (F1 to F5), written RED first ----
+
+test('T1 round 1 F1 (AC-QA-8): the verifier\'s GREEN evidence survives a malformed implement response, so the next implementer still sees it', async () => {
+  const EVIDENCE = 'SENTINEL_GREEN_EVIDENCE_5E2B expected 3 got 2'
+  const map = {
+    'write-test#1': WRITE_TEST, 'verify-red#1': RED_OK,
+    'implement#1': IMPL, 'verify-green#1': { ...GREEN_RED, evidence: EVIDENCE },
+    'implement#2': {}, // malformed: neither shape
+    'implement#3': TD, // ends the run once its prompt has been captured
+  }
+  const { calls } = await runTdd(map)
+  const third = calls.find((c) => c.opts.label === 'implement#3')
+  assert.ok(third, 'implement#3 must be dispatched')
+  assert.ok(third.prompt.includes(EVIDENCE), 'the GREEN evidence must reach implement#3 even though attempt 2 was malformed')
+  assert.ok(/malformed/.test(third.prompt), 'and the malformed-response note is sent too, both when both apply')
+})
+
+test('T1 round 1 F2 (AC-DATA-13): the test_defect and malformed-at-cap BLOCKED results return the RED-time test_hashes so the human can verify the tests are untouched', async () => {
+  const defect = await runTdd({ ...DONE, 'implement#1': TD })
+  assert.equal(defect.result.verdict, 'BLOCKED')
+  assert.deepEqual(defect.result.test_hashes, RED_OK.test_hashes, 'test_defect result must carry the RED verifier\'s hashes')
+  const capped = await runTdd({ ...DONE, 'implement#1': {}, 'implement#2': {}, 'implement#3': {} })
+  assert.equal(capped.result.verdict, 'BLOCKED')
+  assert.strictEqual(capped.terminal.blocked_reason, 'implement_attempt_cap')
+  assert.deepEqual(capped.result.test_hashes, RED_OK.test_hashes, 'malformed-at-cap result must carry the same hashes')
+})
+
+test('T1 round 1 F3 (AC-QA-5): each stripped key is named by its OWN retry log line, in the workflow\'s wording, not by the incidental model line or the writer\'s error text', async () => {
+  const implCap = {
+    'write-test#1': WRITE_TEST, 'verify-red#1': RED_OK,
+    'implement#1': IMPL, 'implement#2': IMPL, 'implement#3': IMPL,
+    'verify-green#1': GREEN_RED, 'verify-green#2': GREEN_RED, 'verify-green#3': GREEN_RED,
+  }
+  const accepted = []; const seen = []
+  const { logs } = await runTdd(implCap, { args: { model: 'opus' }, ledger: staleWriter({ refuse: ['model', 'blocked_reason'], allAtOnce: true, accepted, seen }) })
+  assert.equal(logs.filter((l) => /^Terminal ledger write refused model \(installed writer predates it\); retrying once without it/.test(l)).length, 1, `logs: ${JSON.stringify(logs)}`)
+  assert.equal(logs.filter((l) => /^Terminal ledger write refused blocked_reason as well \(installed writer predates it\); retrying without model, blocked_reason:/.test(l)).length, 1, `logs: ${JSON.stringify(logs)}`)
+})
+
+test('T1 round 1 F4 (AC-QA-1): review-cycle and plan-cycle write no `model` key on any ledger payload', async () => {
+  const consistency = { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null }
+  const tip = { head_sha: 'abcdef1234567890', head_tree: '1111111111111111111111111111111111111111' }
+  const cov = { examined: 'x', verified_by: 'y', could_not_check: 'z' }
+  const revLens = { verdict: 'CLEAN', coverage: cov, findings: [], head_sha_measured: tip.head_sha, head_tree_measured: tip.head_tree }
+  const review = await runWorkflow(path.join(WF_DIR, 'review-cycle.js'), {
+    args: {},
+    agent: {
+      'scope:diff': { base: 'main', ...tip, files: [{ path: 'src/foo.js', status: 'M' }], new_dependency_entries: false, new_modules: false, custom_rules: null, harness_triggers_file_exists: false, consistency },
+      'lens-security': revLens, 'lens-qa': revLens,
+      synthesis: { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [] },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  const planLens = { verdict: 'CLEAN', coverage: cov, acceptance_criteria: [{ id: 'AC-SEC-1', statement: 'x' }] }
+  const plan = await runWorkflow(path.join(WF_DIR, 'plan-cycle.js'), {
+    args: { spec: 'specs/foo.md' },
+    agent: {
+      'scope:spec': { head_sha: 'abc1234567890def', summary: 's', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'], consistency },
+      'lens-security': planLens, 'lens-qa': planLens, 'lens-simplicity': { ...planLens, acceptance_criteria: [] }, 'lens-product': planLens,
+      'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def' },
+      'ledger:write': LEDGER_OK,
+    },
+  })
+  for (const [name, run] of [['review-cycle', review], ['plan-cycle', plan]]) {
+    assert.equal(run.result.telemetry.outcome, 'done', `${name} must reach its DONE fixture`)
+    const payloads = run.calls.filter((c) => c.opts.label === 'ledger:write').map((c) => extractLedgerPayload(c.prompt))
+    assert.ok(payloads.length >= 2, `${name}: started and terminal writes expected`)
+    for (const p of payloads) assert.ok(!('model' in p), `${name}: a payload carries model: ${JSON.stringify(p)}`)
+  }
+})
+
+test('T1 round 1 F5 (AC-PROD-8): SKILL.md says the byModel null bucket means no model was recorded, listing all three causes, not "none was given"', () => {
+  const skill = fs.readFileSync(path.join(ROOT, 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8').replace(/\s+/g, ' ')
+  assert.ok(skill.includes('null when no model was recorded: none was given, or the key was stripped for a stale writer, or the row is degraded'), 'the null bucket wording must name all three causes')
+  assert.ok(!skill.includes('(null when none was given)'), 'the old, narrower wording is gone')
+})

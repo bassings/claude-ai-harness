@@ -348,9 +348,11 @@ export function aggregateBlockedUnresolved(records, { root = '' } = {}) {
   // HARN-OPT-5 T1 (AC-PROD-8): terminal tdd_task rows counted by requested
   // model crossed with outcome and blocked_reason, so the weekly report shows
   // how many runs asked for a non-default model and how they ended. Folded in
-  // here rather than a new section. A row with no model key (pre-v6) or a
-  // value outside the token pattern reads as null and is never echoed; the same
-  // holds for a reason outside the enum.
+  // here rather than a new section. A row with no model key (pre-v6, none given,
+  // or stripped for a stale writer) or a value outside the token pattern (a
+  // degraded row) reads as null and is never echoed; the same holds for a
+  // reason outside the enum. Null therefore means no model was recorded
+  // (round 1 F5, AC-PROD-8).
   const modelRe = new RegExp(MODEL_PATTERN_STR)
   const byModelCounts = new Map()
   for (const r of records) {

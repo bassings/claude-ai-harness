@@ -319,7 +319,13 @@ log(`RED confirmed: ${test.test_files.join(', ')} fail for the right reason.`)
 // ---- Phase 3 + 4: implement, verify GREEN against frozen tests; loop on failure ----
 let impl = null
 let green = null
-let retryNote = ''
+// Two notes, not one (round 1 F1, AC-QA-8): a malformed implement response
+// used to overwrite the verifier's GREEN evidence in a single variable, so the
+// next implementer never saw why the last well-formed attempt failed. The GREEN
+// evidence is kept until the next verifier run replaces it; the malformed note
+// is cleared once a well-formed response arrives. Both are sent when both apply.
+let greenNote = ''
+let malformedNote = ''
 // HARN-OPT-5 T1: every BLOCKED exit of the Implement loop (test_defect, a
 // malformed response at the cap, the GREEN attempt cap) sets this and breaks;
 // the one return after the loop sends it. The AC-QA-9 static pin fixes run()
@@ -336,7 +342,7 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     `production code and return test_defect: {file, reason} (the test file and why it is wrong) instead of summary ` +
     `and files_changed; otherwise return summary and files_changed, never both. ` +
     `Do not commit yet.` +
-    retryNote,
+    greenNote + malformedNote,
     {
       agentType: 'implementer',
       ...modelOpt,
@@ -367,25 +373,29 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (wellFormedTestDefect) {
       // HARN-OPT-5 T1 (AC-SEC-8, AC-ARCH-7, AC-DATA-13): the implementer says
       // the frozen test is wrong. End here: nothing is committed, no git
-      // command runs, the tests keep their RED-time bytes. Returns from inside
+      // command runs, and this workflow does not modify the tests. Returns from inside
       // run() so the single terminal write below records it; only the enum
       // code reaches the ledger, while the returned result names file and
       // reason for the human who has to fix the test.
       blockedReason = 'test_defect'
-      implBlocked = { verdict: 'BLOCKED', reason: 'The implementer reported that the test itself is defective. Nothing is committed; fix the test and re-brief.', test_defect: impl.test_defect }
+      // test_hashes (round 1 F2, AC-DATA-13): no GREEN verifier runs on this
+      // exit, so the RED-time hashes are returned for the human to compare
+      // against the files without a new dispatch.
+      implBlocked = { verdict: 'BLOCKED', reason: 'The implementer reported that the test itself is defective. Nothing is committed; fix the test and re-brief.', test_defect: impl.test_defect, test_hashes: red.test_hashes }
       break
     }
   } else {
     log(`Implement attempt ${attempt} returned a malformed response (neither or both of summary/files_changed and test_defect, or a wrong type)`)
     if (attempt === MAX_ATTEMPTS) {
       blockedReason = 'implement_attempt_cap'
-      implBlocked = { verdict: 'BLOCKED', reason: MAX_ATTEMPTS + ' implementation attempts did not produce a well-formed response. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.' }
+      implBlocked = { verdict: 'BLOCKED', reason: MAX_ATTEMPTS + ' implementation attempts did not produce a well-formed response. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.', test_hashes: red.test_hashes }
       break
     }
-    retryNote = `\nYour previous response was malformed: return either summary and files_changed, or test_defect {file, reason}, never both and never neither.`
+    malformedNote = `\nYour previous response was malformed: return either summary and files_changed, or test_defect {file, reason}, never both and never neither.`
     continue
   }
 
+  malformedNote = ''
   phase('GREEN')
   const hashList = red.test_hashes.map(h => `${h.file}: ${h.sha256}`).join('\n')
   green = await agent(
@@ -420,7 +430,7 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   }
   if (green.green && green.suite_green) break
   log(`GREEN gate rejected attempt ${attempt}: ${green.evidence.slice(0, 200)}`)
-  retryNote = `\nYour previous attempt did not go green. Verifier evidence: ${green.evidence}`
+  greenNote = `\nYour previous attempt did not go green. Verifier evidence: ${green.evidence}`
   if (attempt === MAX_ATTEMPTS) {
     blockedReason = 'implement_attempt_cap'
     implBlocked = { verdict: 'BLOCKED', reason: MAX_ATTEMPTS + ' implementation attempts did not go green. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.', last_evidence: green.evidence }
