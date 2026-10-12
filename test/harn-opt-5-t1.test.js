@@ -426,6 +426,11 @@ test('T1 test_defect (AC-QA-8): a response with neither shape, both shapes, a te
     byp({ test_defect: { reason: 'r' } }),
     byp({ test_defect: { file: 'b.test.js', reason: 7 } }),
     byp({}),
+    // Round 3 F1 (spec bug against AC-QA-8): the either-or moved out of the
+    // JSON schema into code, so the `summary` string check and the
+    // files_changed string-items check are the only guard; pin both halves.
+    byp({ files_changed: ['a.js'] }),
+    byp({ summary: 'x', files_changed: [7] }),
   ]
   for (let i = 0; i + 3 <= malformed.length; i++) {
     const trio = malformed.slice(i, i + 3)
