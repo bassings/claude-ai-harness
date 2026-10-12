@@ -306,10 +306,18 @@ test('T6 M1 AC-SEC-1: a corrupt .git/index (check-ignore exits non-1) fails clos
   fs.writeFileSync(path.join(repo, '.git', 'index'), 'NOT-AN-INDEX-garbage-garbage-garbage')
   const probe = spawnSync('git', ['check-ignore', '-q', LEDGER_REL], { cwd: repo })
   assert.ok(probe.status !== 0 && probe.status !== 1, `fixture must force a non-1 exit, got ${probe.status}`)
+  // Conductor, after fix round 1: the status check (only exit 1 means
+  // unmatched) was the one mutant that survived, because the post-write check
+  // also fails closed; its own effect is that the writer never touches the
+  // exclude file on a non-1 exit, so pin that too.
+  const excludePath = path.join(repo, '.git', 'info', 'exclude')
+  fs.mkdirSync(path.dirname(excludePath), { recursive: true })
+  fs.writeFileSync(excludePath, '# untouched\n')
   const { out } = runOne(repo)
   assert.equal(out.write_ok, false)
   assert.match(out.write_error, /not actually gitignored/)
   assert.equal(readLedgerLines(repo).length, 0)
+  assert.equal(fs.readFileSync(excludePath, 'utf8'), '# untouched\n', 'a non-1 check-ignore exit must not write the exclude file')
 })
 
 test('T6 M1 AC-SEC-1: a symlinked .claude directory (check-ignore exits 128, beyond a symbolic link) fails closed', () => {

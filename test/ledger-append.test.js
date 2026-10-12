@@ -3875,7 +3875,7 @@ function countGitInvocations(repo, payload) {
   return { out, calls }
 }
 
-test('ledger-append: an ordinary write with an origin remote configured invokes git exactly 4 times (show-superproject-working-tree, git-common-dir, remote get-url origin, check-ignore) -- resolving the current working tree\'s own root for AC-ARCH-3 adds an fs stat walk, never a 5th git subprocess (AC-QA-20)', () => {
+test('ledger-append: an ordinary FIRST write with an origin remote configured invokes git exactly 5 times (show-superproject-working-tree, git-common-dir, remote get-url origin, the classifying check-ignore -v, and the fail-closed post-write check-ignore -q; HARN-OPT-5 T6 round 1 M1) -- resolving the current working tree\'s own root for AC-ARCH-3 adds an fs stat walk, never a 5th git subprocess (AC-QA-20)', () => {
   const repo = makeTempRepo()
   sh('git remote add origin git@github.com:example/example.git', repo)
   const { out, calls } = countGitInvocations(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
