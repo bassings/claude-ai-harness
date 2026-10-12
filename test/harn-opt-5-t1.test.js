@@ -534,8 +534,13 @@ test('T1 docs: optimise-cycle SKILL.md names test_defect where it lists the othe
   assert.match(ledger, /claude-opus-5-5[\s\S]{0,200}claude-sonnet-5-5/, 'the probe measurement is stated, not just the claim')
 })
 
-test('T1 AC-SIMP-1: no dependency is added (package.json and lockfiles are unchanged from main)', () => {
-  const diff = spawnSync('git', ['diff', '--name-only', 'main', '--', 'package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'], { cwd: ROOT, encoding: 'utf8' })
-  assert.equal(diff.status, 0, diff.stderr)
-  assert.equal(diff.stdout.trim(), '')
+// Conductor fix after CI round 1: the first form diffed against the revision
+// `main`, which exists locally but not in a CI checkout (only origin/main does),
+// so the test failed on both CI jobs with "bad revision 'main'". The invariant
+// AC-SIMP-1 wants is simpler and environment-free: this repo tracks no package
+// manifest or lockfile at all, so "no new dependency" means none appears.
+test('T1 AC-SIMP-1: no dependency is added (no package manifest or lockfile is tracked, so none can have changed)', () => {
+  const tracked = spawnSync('git', ['ls-files', '--', 'package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb'], { cwd: ROOT, encoding: 'utf8' })
+  assert.equal(tracked.status, 0, tracked.stderr)
+  assert.equal(tracked.stdout.trim(), '', `a manifest or lockfile is tracked: ${tracked.stdout}`)
 })
