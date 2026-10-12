@@ -29,7 +29,7 @@ const { makeTempRepo, runAppend, readLedgerLines, cleanupTempRepos, APPEND_SCRIP
 
 const WF = path.join(__dirname, '..', 'workflows', 'tdd-task.js')
 const MODULE_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
-const REASONS = ['test_attempt_cap', 'implement_attempt_cap', 'tests_modified']
+const REASONS = ['test_attempt_cap', 'implement_attempt_cap', 'tests_modified', 'test_defect'] // test_defect added by HARN-OPT-5 T1
 
 test.after(cleanupTempRepos)
 
@@ -433,7 +433,7 @@ test('T5 reader: pre-T5 blocked rows (no blocked_reason key) join the unresolved
   const r = reader.aggregateBlockedUnresolved(rows)
   assert.strictEqual(r.count, 10)
   assert.strictEqual(r.reasonNotRecorded, 4)
-  assert.deepEqual(r.byReason, { test_attempt_cap: 1, implement_attempt_cap: 3, tests_modified: 2 })
+  assert.deepEqual(r.byReason, { test_attempt_cap: 1, implement_attempt_cap: 3, tests_modified: 2, test_defect: 0 })
   for (const u of r.unresolved.filter((x) => x.task.startsWith('old'))) assert.strictEqual(u.reason, 'not recorded')
   for (const u of r.unresolved.filter((x) => !x.task.startsWith('old'))) assert.ok(REASONS.includes(u.reason))
 })
@@ -542,7 +542,7 @@ test('T5 reader (round 1 M1): the hint is non-clearing -- count and byReason are
     tdd('done', 'A reworded', T(2)),
   ])
   assert.strictEqual(r.count, 1)
-  assert.deepEqual(r.byReason, { test_attempt_cap: 0, implement_attempt_cap: 0, tests_modified: 1 })
+  assert.deepEqual(r.byReason, { test_attempt_cap: 0, implement_attempt_cap: 0, tests_modified: 1, test_defect: 0 })
 })
 
 test('T5 SKILL.md (round 1 M1): the blocked unresolved item names re-briefed retries alongside hand-finished tasks', () => {

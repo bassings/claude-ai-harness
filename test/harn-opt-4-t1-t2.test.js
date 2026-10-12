@@ -41,9 +41,9 @@ function writeOpen(lensLabels, extra = {}) {
 
 // Moved from 4 to 5 by HARN-OPT-4 T8: budget_spent changed meaning from a
 // session running total to a per-run delta, which is a second bump (AC-OPS-3).
-test('T1: SCHEMA_VERSION is 5 (T1 bumped to 4, T8 to 5) so post-change rows are separable from legacy rows (AC-OPS-3)', async () => {
+test('T1: SCHEMA_VERSION is 6 (T1 bumped to 4, T8 to 5, HARN-OPT-5 T1 to 6) so post-change rows are separable from legacy rows (AC-OPS-3)', async () => {
   const { SCHEMA_VERSION } = await import(APPEND_MODULE_URL)
-  assert.equal(SCHEMA_VERSION, 5)
+  assert.equal(SCHEMA_VERSION, 6)
 })
 
 for (const label of ['lens-security + lens-architecture', 'lens-security, lens-architecture', 'lens-security and lens-architecture']) {

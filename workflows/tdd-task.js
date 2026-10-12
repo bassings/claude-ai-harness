@@ -1,7 +1,7 @@
 export const meta = {
   name: 'tdd-task',
   description: 'Script-enforced TDD for one scoped change: implementation is unreachable until the failing test is verified RED for the right reason, and GREEN is proven against unmodified tests',
-  whenToUse: 'For one PR-sized behaviour change. Args: {task: string (required), spec?: string, suite_command?: string (broader gate to run at GREEN), test_hint?: string (where tests live / how to run them)}',
+  whenToUse: 'For one PR-sized behaviour change. Args: {task: string (required), spec?: string, suite_command?: string (broader gate to run at GREEN), test_hint?: string (where tests live / how to run them), model?: string (lowercase token, e.g. opus; requested for both implementer dispatches)}',
   phases: [
     { title: 'Test', detail: 'write the minimal failing test, nothing else' },
     { title: 'RED', detail: 'independent verifier runs it: must fail, for the right reason' },
@@ -15,6 +15,19 @@ let opts = args
 if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts = null } }
 opts = opts || {}
 if (!opts.task) throw new Error('tdd-task requires args.task: the behaviour to implement')
+
+// HARN-OPT-5 T1 (AC-QA-3, AC-SEC-7): the optional implementer model. Validated
+// here, before the started ledger write and before any dispatch, against the
+// same token rule the ledger writer enforces, so a bad value fails loudly
+// rather than being neutralised to null after the fact. Only absence
+// (undefined) skips the check: an empty string, null or a non-string throws.
+const MODEL_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/
+if (opts.model !== undefined && !(typeof opts.model === 'string' && MODEL_RE.test(opts.model))) {
+  throw new Error('tdd-task args.model must be a lowercase token matching ^[a-z0-9][a-z0-9.-]{0,63}$ (a-z, 0-9, dot and hyphen; 1 to 64 characters; no leading dot or hyphen)')
+}
+// Spread into BOTH implementer dispatches and nowhere else (AC-QA-1); empty
+// when no model was supplied, so no agent() call carries a model key (AC-QA-2).
+const modelOpt = opts.model !== undefined ? { model: opts.model } : {}
 
 const specNote = opts.spec ? `The governing spec is ${opts.spec}; the task should satisfy its acceptance criteria.` : ''
 const hintNote = opts.test_hint ? `Test location/runner hint: ${opts.test_hint}.` : ''
@@ -234,6 +247,9 @@ function redactLogText(text) {
 // ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
 async function run() {
 
+// HARN-OPT-5 T1 (AC-OPS-4): name the requested model once, before the first Test dispatch.
+log(`Implementer model: ${opts.model !== undefined ? opts.model : 'default'}`)
+
 // ---- Phase 1 + 2: write the test, verify RED; loop until genuinely red ----
 let test = null
 let red = null
@@ -249,6 +265,7 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     `what the failure output must say for it to be failing for the RIGHT reason (the missing behaviour, not a typo or import error).`,
     {
       agentType: 'implementer',
+      ...modelOpt,
       label: `write-test#${attempt}`,
       phase: 'Test',
       schema: {
@@ -302,6 +319,22 @@ log(`RED confirmed: ${test.test_files.join(', ')} fail for the right reason.`)
 // ---- Phase 3 + 4: implement, verify GREEN against frozen tests; loop on failure ----
 let impl = null
 let green = null
+// Two notes, not one (round 1 F1, AC-QA-8): a malformed implement response
+// used to overwrite the verifier's GREEN evidence in a single variable, so the
+// next implementer never saw why the last well-formed attempt failed. The GREEN
+// evidence is kept until the next verifier run replaces it; the malformed note
+// is cleared once a well-formed response arrives. Both are sent when both apply.
+let greenNote = ''
+let malformedNote = ''
+// HARN-OPT-5 T1 (round 2 F1, AC-QA-8): every BLOCKED exit of the Implement
+// loop (test_defect, a malformed response at the cap, the GREEN attempt cap)
+// records which one it was in `implExit` and breaks; the ONE result is
+// assembled after the loop from the loop's state, so the three exits cannot
+// disagree about which fields they carry. The AC-QA-9 static pin fixes run()
+// at 8 terminating returns, and one assembled return keeps it there.
+let implExit = null
+let wellFormedNotGreen = 0
+let malformedAttempts = 0
 for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   rounds.implement_attempts = attempt
   phase('Implement')
@@ -309,22 +342,65 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     `TDD, step two. Task: ${opts.task}\n${specNote}\n` +
     `A failing test now pins this behaviour: ${test.test_files.join(', ')} (run via: ${test.test_command}).\n` +
     `Write the MINIMUM production code to make it pass, matching the surrounding code's style. ` +
-    `The test files above are FROZEN: do not edit them for any reason; if the test is wrong, stop and say so. ` +
+    `The test files above are FROZEN: do not edit them for any reason. If the test itself is wrong, write no ` +
+    `production code and return test_defect: {file, reason} (the test file and why it is wrong) instead of summary ` +
+    `and files_changed; otherwise return summary and files_changed, never both. ` +
     `Do not commit yet.` +
-    (green ? `\nYour previous attempt did not go green. Verifier evidence: ${green.evidence}` : ''),
+    greenNote + malformedNote,
     {
       agentType: 'implementer',
+      ...modelOpt,
       label: `implement#${attempt}`,
       phase: 'Implement',
+      // The either-or (summary + files_changed, or test_defect) is enforced
+      // below rather than in the schema: validateEntry, the structural
+      // validator the test double shares, has no anyOf, so one object with
+      // every field optional is the shape that can be declared (AC-QA-6, AC-QA-8).
       schema: {
         type: 'object',
-        required: ['summary', 'files_changed'],
-        properties: { summary: { type: 'string' }, files_changed: { type: 'array', items: { type: 'string' } } },
+        properties: {
+          summary: { type: 'string' },
+          files_changed: { type: 'array', items: { type: 'string' } },
+          test_defect: { type: 'object', required: ['file', 'reason'], properties: { file: { type: 'string' }, reason: { type: 'string' } } },
+        },
       },
     }
   )
   if (!impl) return { verdict: 'ABORTED', reason: agentDispatchFailedReason('Implement') }
+  // Exactly one shape counts (AC-QA-8): a test_defect alone, or summary plus
+  // files_changed alone. Anything else is a failed attempt, never a verifier run.
+  const hasTestDefect = impl.test_defect !== undefined
+  const hasImpl = impl.summary !== undefined || impl.files_changed !== undefined
+  const wellFormedTestDefect = hasTestDefect && !!impl.test_defect && typeof impl.test_defect.file === 'string' && typeof impl.test_defect.reason === 'string'
+  const wellFormedImpl = typeof impl.summary === 'string' && Array.isArray(impl.files_changed) && impl.files_changed.every(f => typeof f === 'string')
+  if (hasTestDefect !== hasImpl && (hasTestDefect ? wellFormedTestDefect : wellFormedImpl)) {
+    if (wellFormedTestDefect) {
+      // HARN-OPT-5 T1 (AC-SEC-8, AC-ARCH-7, AC-DATA-13): the implementer says
+      // the frozen test is wrong. End here: nothing is committed, no git
+      // command runs, and this workflow does not modify the tests. Returns from inside
+      // run() so the single terminal write below records it; only the enum
+      // code reaches the ledger, while the returned result names file and
+      // reason for the human who has to fix the test.
+      blockedReason = 'test_defect'
+      // test_hashes (round 1 F2, AC-DATA-13): no GREEN verifier runs on this
+      // exit, so the RED-time hashes are returned for the human to compare
+      // against the files without a new dispatch.
+      implExit = 'test_defect'
+      break
+    }
+  } else {
+    malformedAttempts++
+    log(`Implement attempt ${attempt} returned a malformed response (neither or both of summary/files_changed and test_defect, or a wrong type)`)
+    if (attempt === MAX_ATTEMPTS) {
+      blockedReason = 'implement_attempt_cap'
+      implExit = 'malformed_cap'
+      break
+    }
+    malformedNote = `\nYour previous response was malformed: return either summary and files_changed, or test_defect {file, reason}, never both and never neither.`
+    continue
+  }
 
+  malformedNote = ''
   phase('GREEN')
   const hashList = red.test_hashes.map(h => `${h.file}: ${h.sha256}`).join('\n')
   green = await agent(
@@ -359,9 +435,32 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   }
   if (green.green && green.suite_green) break
   log(`GREEN gate rejected attempt ${attempt}: ${green.evidence.slice(0, 200)}`)
+  wellFormedNotGreen++
+  greenNote = `\nYour previous attempt did not go green. Verifier evidence: ${green.evidence}`
   if (attempt === MAX_ATTEMPTS) {
     blockedReason = 'implement_attempt_cap'
-    return { verdict: 'BLOCKED', reason: MAX_ATTEMPTS + ' implementation attempts did not go green. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.', last_evidence: green.evidence }
+    implExit = 'green_cap'
+    break
+  }
+}
+if (implExit) {
+  // Round 2 F1 (AC-QA-8): always verdict, reason and test_hashes; last_evidence
+  // whenever a GREEN verifier ran (it holds the latest verdict, also across a
+  // later malformed response); the reason counts what happened, well-formed
+  // not-green and malformed attempts separately. Round 2 F2 (AC-DATA-13): the
+  // test_defect and malformed-at-cap exits run no GREEN verifier, so skip every
+  // frozen-test integrity check; the reason instructs the comparison, and no
+  // agent dispatch is added.
+  const compare = ' To check the frozen tests: compare the sha256 of each test file with test_hashes before editing; a mismatch means the implementer modified the frozen test.'
+  const isDefect = implExit === 'test_defect'
+  const unverified = isDefect || implExit === 'malformed_cap'
+  const counts = MAX_ATTEMPTS + ' implementation attempts: ' + wellFormedNotGreen + ' well-formed but not green, ' + malformedAttempts + ' malformed. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.'
+  return {
+    verdict: 'BLOCKED',
+    reason: isDefect ? 'The implementer reported that the test itself is defective. Nothing is committed; fix the test and re-brief.' + compare : (unverified ? counts + compare : counts),
+    test_hashes: red.test_hashes,
+    last_evidence: green ? green.evidence : undefined,
+    ...(isDefect ? { test_defect: impl.test_defect } : {}),
   }
 }
 
@@ -446,18 +545,42 @@ const terminalEntry = { kind: 'tdd_task', task: opts.task, ...telemetry }
 // so the written line always carries it). Only the enum code goes on the
 // line: never verifier evidence or test output (AC-SEC-8).
 if (OUTCOME_BY_VERDICT[result.verdict] === 'blocked') terminalEntry.blocked_reason = blockedReason
+// HARN-OPT-5 T1 (AC-QA-2, AC-OPS-4): the requested model rides the terminal row
+// only when supplied, like blocked_reason, so a stale writer costs one retry
+// below and an absent model never appears in the payload (the writer reads null).
+if (opts.model !== undefined) terminalEntry.model = opts.model
 if (startRunId) terminalEntry.run_id = startRunId
 let terminalWrite = await writeLedger(terminalEntry)
-// HARN-OPT-4 T5 (AC-DATA-2, as amended): an installed writer older than this
-// file refuses blocked_reason as "not an allowed property", which would cost
-// the whole terminal row. Retry ONCE without the new key so the blocked or done
-// row still lands; any other refusal, and a refusal of the retry, is final and
-// reported through the write_ok:false consumer below. Placed after the
-// byte-identical exception guard, not inside it. T8 copies this shape.
-if (!terminalWrite.write_ok && /blocked_reason/.test(String(terminalWrite.write_error)) && /not an allowed property/.test(String(terminalWrite.write_error))) {
-  log(`Terminal ledger write refused blocked_reason (installed writer predates it); retrying once without it: ${redactLogText(String(terminalWrite.write_error))}`)
-  const { blocked_reason, ...retryEntry } = terminalEntry
+// HARN-OPT-4 T8 (T4 round 3 L1, AC-DATA-2): an installed writer older than this
+// file refuses a key it does not know as "not an allowed property", which would
+// cost the whole terminal row. Retry ONCE without that key (never kind, outcome
+// or run_id) so the row still lands; any other refusal, and a refusal of the
+// retry, is final and reported by the write_ok:false consumer below.
+// HARN-OPT-5 T1 (AC-ARCH-4): this generic block replaces the key-specific
+// blocked_reason retry and is byte-identical across all three workflows.
+const firstTerminalWrite = terminalWrite
+const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.\[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
+if (refusedKey && !['kind', 'outcome', 'run_id'].includes(refusedKey) && Object.hasOwn(terminalEntry, refusedKey)) {
+  log(`Terminal ledger write refused ${refusedKey} (installed writer predates it); retrying once without it: ${redactLogText(String(terminalWrite.write_error))}`)
+  const { [refusedKey]: _refused, ...retryEntry } = terminalEntry
   terminalWrite = await writeLedger(retryEntry)
+}
+// HARN-OPT-5 T1 (AC-QA-5, AC-ARCH-4): this workflow can send TWO optional keys
+// (model, blocked_reason), and the block above strips only the first one a
+// writer names, so a writer two versions old refuses the second on the retry.
+// Continue stripping, bounded by the optional keys sent minus the one already
+// stripped, so the terminal row still lands, keeps its run_id, and every key
+// stripped is named in the log. Nothing here runs unless the block above
+// retried, and only a key this payload carries is ever removed.
+const optionalKeysSent = ['model', 'blocked_reason'].filter(k => Object.hasOwn(terminalEntry, k))
+const strippedKeys = terminalWrite !== firstTerminalWrite && refusedKey ? [refusedKey] : []
+for (let extra = 1; strippedKeys.length > 0 && extra < optionalKeysSent.length; extra++) {
+  const nextKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.\[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
+  if (!nextKey || !optionalKeysSent.includes(nextKey) || strippedKeys.includes(nextKey)) break
+  strippedKeys.push(nextKey)
+  log(`Terminal ledger write refused ${nextKey} as well (installed writer predates it); retrying without ${strippedKeys.join(', ')}: ${redactLogText(String(terminalWrite.write_error))}`)
+  const furtherEntry = Object.fromEntries(Object.entries(terminalEntry).filter(([k]) => !strippedKeys.includes(k)))
+  terminalWrite = await writeLedger(furtherEntry)
 }
 // 2026-08-18: give write_ok:false a CONSUMER -- see plan-cycle.js for the
 // full rationale. It was computed, logged and returned to nobody, so the
