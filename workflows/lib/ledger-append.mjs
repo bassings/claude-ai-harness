@@ -1694,11 +1694,17 @@ function ensureGitignored(root) {
   // exclude line could lose to, so no second check-ignore is needed.
   let verdict = 'none'
   try {
-    const hit = execFileSync('git', ['check-ignore', '-v', LEDGER_RELATIVE_PATH], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
-    const pattern = hit.split('\t')[0].split(':').slice(2).join(':')
+    // L1 (AC-SEC-13): -z (which git only allows with --stdin) gives NUL-separated fields (source, line, pattern,
+    // path), so a ':' inside the excludes file's own path cannot shift the
+    // pattern field the way splitting the plain `-v` line on ':' did.
+    const hit = execFileSync('git', ['check-ignore', '-v', '-z', '--stdin'], { cwd: root, encoding: 'utf8', input: LEDGER_RELATIVE_PATH + '\0', stdio: ['pipe', 'pipe', 'ignore'] })
+    const pattern = hit.split('\0')[2] || ''
     verdict = pattern.startsWith('!') ? 'negated' : 'ignored'
   } catch (e) {
-    // exit 1: no pattern matches the path
+    // M1 (AC-SEC-1): only exit 1 means "no pattern matches". Any other status
+    // (128 for a corrupt index or a path beyond a symlink) is an error, and
+    // treating it as unmatched failed open.
+    if (e.status !== 1) return false
   }
   if (verdict === 'ignored') return true
   if (verdict === 'negated') return false
@@ -1753,6 +1759,15 @@ function ensureGitignored(root) {
       fs.rmSync(tmp, { force: true })
       throw e
     }
+  }
+  // M1 (AC-SEC-1): `git check-ignore` never reports a TRACKED path, so a
+  // force-added ledger is still "unmatched" after the line is written. Prove
+  // the path is now ignored (exit 0) or refuse; security outranks the extra
+  // subprocess (AC-QA-20). Runs whether or not this writer changed the file.
+  try {
+    execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root, stdio: 'ignore' })
+  } catch (e) {
+    return false
   }
   return true
 }

@@ -3880,7 +3880,20 @@ test('ledger-append: an ordinary write with an origin remote configured invokes 
   sh('git remote add origin git@github.com:example/example.git', repo)
   const { out, calls } = countGitInvocations(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
   assert.equal(out.write_ok, true, out.write_error)
-  assert.equal(calls.length, 4, `expected exactly 4 git invocations, got ${calls.length}: ${JSON.stringify(calls)}`)
+  // Round 1 M1 (security over the subprocess budget, per the spec's precedence
+  // decision): a FIRST write now makes five git calls (the three above, the
+  // classifying check-ignore -v, and a post-write check-ignore -q that keeps the
+  // fail-closed refusal for tracked ledgers).
+  assert.equal(calls.length, 5, `expected exactly 5 git invocations on a first write, got ${calls.length}: ${JSON.stringify(calls)}`)
+})
+
+test('ledger-append: a write to an already-ignored ledger invokes git exactly 4 times -- the single classifying check-ignore, nothing after it (AC-QA-18, AC-QA-20, round 1 M1)', () => {
+  const repo = makeTempRepo()
+  sh('git remote add origin git@github.com:example/example.git', repo)
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
+  const { out, calls } = countGitInvocations(repo, { schema_version: 1, kind: 'tdd_task', outcome: 'done' })
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(calls.length, 4, `expected exactly 4 git invocations on an already-ignored write, got ${calls.length}: ${JSON.stringify(calls)}`)
 })
 
 test('ledger-append: a worktree-authored write (which needs BOTH the main-checkout root and the worktree\'s own root) still invokes git no more than the main-checkout case -- resolving the worktree\'s own root costs zero additional git subprocesses (AC-QA-20, the actual worktree code path)', () => {
@@ -3891,7 +3904,8 @@ test('ledger-append: a worktree-authored write (which needs BOTH the main-checko
   try {
     const { out, calls } = countGitInvocations(worktreeDir, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: path.join(worktreeDir, 'specs', 'a.md') })
     assert.equal(out.write_ok, true, out.write_error)
-    assert.ok(calls.length <= 4, `expected no more than 4 git invocations from a worktree write, got ${calls.length}: ${JSON.stringify(calls)}`)
+    // Round 1 M1: first write is five calls (see above), so the ceiling is 5.
+    assert.ok(calls.length <= 5, `expected no more than 5 git invocations from a worktree write, got ${calls.length}: ${JSON.stringify(calls)}`)
   } finally {
     sh(`git worktree remove --force "${worktreeDir}"`, repo)
   }

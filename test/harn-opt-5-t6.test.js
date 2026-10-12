@@ -85,12 +85,15 @@ test('T6 AC-DATA-1: 50 concurrent writers into an exclude holding two operator l
     const exclude = fs.readFileSync(excludePathOf(repo), 'utf8')
     assert.ok(exclude.startsWith(OPERATOR_LINES), `round ${round}: operator lines intact and in order`)
     assert.equal(exclude.split('\n').filter((l) => l.trim() === LEDGER_REL).length, 1, `round ${round}: ledger line exactly once`)
+    // Round 1 L2 (AC-DATA-1): losing writers must remove their own temp file.
+    assert.deepEqual(strayFiles(path.dirname(excludePathOf(repo))), [], `round ${round}: no stray temp files in .git/info`)
   }
 })
 
 test('T6 AC-DATA-2: the hook exists, and while writers sit inside the exclude replacement window the exclude never loses its operator lines and every writer succeeds', async () => {
   const src = fs.readFileSync(APPEND_SCRIPT, 'utf8')
-  assert.ok(src.includes(WINDOW), `ledger-append.mjs must define the test-only hook ${WINDOW}`)
+  // Round 1 L3 (AC-DATA-6): the hook must be READ from process.env in code, not merely named in a comment.
+  assert.ok(new RegExp(`process\\.env(\\.${WINDOW}\\b|\\[\\s*['"]${WINDOW}['"]\\s*\\])`).test(src), `ledger-append.mjs must read ${WINDOW} from process.env`)
 
   const repo = makeTempRepo()
   fs.writeFileSync(excludePathOf(repo), OPERATOR_LINES)
@@ -115,6 +118,8 @@ test('T6 AC-DATA-2: the hook exists, and while writers sit inside the exclude re
   assert.equal(sawBad, null)
   assertAllWriteOk(results)
   assert.equal(readLedgerLines(repo).length, 6)
+  // Round 1 L2 (AC-DATA-2): six writers raced; the five that lost must have cleaned up.
+  assert.deepEqual(strayFiles(path.dirname(excludePathOf(repo))), [], 'no stray temp files in .git/info after the race')
 })
 
 test('T6 AC-QA-18: when the ledger is already ignored, no write touches the exclude (inode, mtime, bytes), even read-only', async (t) => {
@@ -182,7 +187,7 @@ test('T6 AC-DATA-4: replacement is a rename from a uniquely named temp file besi
 
 test('T6 AC-DATA-4: an error thrown before the rename removes the writer\'s own temp file and leaves the target alone', async () => {
   const src = fs.readFileSync(APPEND_SCRIPT, 'utf8')
-  assert.ok(src.includes(THROW), `ledger-append.mjs must define the test-only hook ${THROW}`)
+  assert.ok(new RegExp(`process\\.env(\\.${THROW}\\b|\\[\\s*['"]${THROW}['"]\\s*\\])`).test(src), `ledger-append.mjs must read ${THROW} from process.env`)
   const repo = makeTempRepo()
   const exclude = excludePathOf(repo)
   fs.writeFileSync(exclude, OPERATOR_LINES)
@@ -240,6 +245,10 @@ test('T6 AC-DATA-6: ensureGitignored has no truncating open of the exclude targe
   assert.ok(!/writeFileSync/.test(body), 'no fs.writeFileSync in ensureGitignored')
   assert.ok(!/openSync\([^)]*['"]w\+?['"]/.test(body) && !/flag:\s*['"]w/.test(body), "no open with the 'w' flag")
   assert.ok(!/truncate/i.test(body), 'no truncate')
+  // Round 1 L3 (AC-DATA-6): other in-place or copy-over writers of the exclude target.
+  assert.ok(!/copyFile(Sync)?\b/.test(body), 'no copyFile onto the exclude target')
+  assert.ok(!/promises\s*\.\s*writeFile|\bwriteFile\s*\(/.test(body), 'no fs.promises.writeFile or writeFile')
+  assert.ok(!/openSync\([^)]*['"]r\+['"]/.test(body) && !/ftruncate/i.test(body), "no 'r+' open or ftruncate")
   assert.ok(/renameSync/.test(body), 'replacement is by rename')
   assert.ok(/realpathSync/.test(body), 'the target is resolved with realpath')
   assert.ok(/check-ignore/.test(body), 'ignore status is checked first, inside ensureGitignored')
@@ -257,4 +266,95 @@ test('T6 AC-SEC-13: with a tracked negation re-including the ledger, every concu
     assert.match(r.out.write_error, /not actually gitignored/)
   })
   assert.equal(readLedgerLines(repo).length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Fix round 1 (PR #13 review round 1).
+
+function runOne(repo, extraEnv) {
+  const res = spawnSync('node', [APPEND_SCRIPT], {
+    cwd: repo,
+    input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done' }),
+    encoding: 'utf8',
+    env: { ...sanitizedGitEnv(), ...(extraEnv || {}) },
+  })
+  return { ...res, out: JSON.parse(res.stdout.trim().split('\n').pop()) }
+}
+
+// Round 1 M1 (AC-SEC-13 intent, AC-SEC-1): `git check-ignore` never reports a
+// TRACKED path, so a force-added ledger exits 1 before and after the exclude
+// line is written. The writer must refuse rather than append to a file git tracks.
+test('T6 M1 AC-SEC-1: a force-added, committed ledger makes every concurrent writer refuse and leaves the ledger bytes unchanged', async () => {
+  const repo = makeTempRepo()
+  const ledger = path.join(repo, LEDGER_REL)
+  fs.mkdirSync(path.dirname(ledger), { recursive: true })
+  fs.writeFileSync(ledger, '{"tracked":"seed"}\n')
+  sh(`git add -f ${LEDGER_REL} && git commit -q -m track-ledger`, repo)
+  const before = fs.readFileSync(ledger)
+  const results = await Promise.all(Array.from({ length: 8 }, (_, i) => spawnWriter(repo, i).done))
+  results.forEach((r, i) => {
+    assert.ok(r.out, `writer ${i} printed no result: ${r.stdout} ${r.stderr}`)
+    assert.equal(r.out.write_ok, false, `writer ${i} must refuse a tracked ledger`)
+    assert.match(r.out.write_error, /not actually gitignored/)
+  })
+  assert.ok(fs.readFileSync(ledger).equals(before), 'tracked ledger bytes unchanged')
+})
+
+// Round 1 M1: any check-ignore exit other than 1 (here 128) is an error, not "unmatched".
+test('T6 M1 AC-SEC-1: a corrupt .git/index (check-ignore exits non-1) fails closed with write_ok false and no ledger line', () => {
+  const repo = makeTempRepo()
+  fs.writeFileSync(path.join(repo, '.git', 'index'), 'NOT-AN-INDEX-garbage-garbage-garbage')
+  const probe = spawnSync('git', ['check-ignore', '-q', LEDGER_REL], { cwd: repo })
+  assert.ok(probe.status !== 0 && probe.status !== 1, `fixture must force a non-1 exit, got ${probe.status}`)
+  const { out } = runOne(repo)
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /not actually gitignored/)
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
+test('T6 M1 AC-SEC-1: a symlinked .claude directory (check-ignore exits 128, beyond a symbolic link) fails closed', () => {
+  const repo = makeTempRepo()
+  const elsewhere = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'claude-elsewhere-'))
+  fs.rmSync(path.join(repo, '.claude'), { recursive: true, force: true })
+  fs.symlinkSync(elsewhere, path.join(repo, '.claude'))
+  const probe = spawnSync('git', ['check-ignore', '-q', LEDGER_REL], { cwd: repo })
+  assert.ok(probe.status !== 0 && probe.status !== 1, `fixture must force a non-1 exit, got ${probe.status}`)
+  const { out } = runOne(repo)
+  assert.equal(out.write_ok, false)
+  assert.equal(fs.existsSync(path.join(elsewhere, 'harness-ledger.jsonl')), false, 'nothing written through the symlink')
+})
+
+// Round 1 L1 (AC-SEC-13): `-v` output splits on ':' so a colon in the excludes
+// path misreads a negation as ignored. The parser must use -z fields.
+test('T6 L1 AC-SEC-13: a global excludes file whose path contains a colon and which negates the ledger makes the writer refuse', () => {
+  const repo = makeTempRepo()
+  const dir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'colon-'))
+  const excl = path.join(dir, 'a:b')
+  fs.writeFileSync(excl, '!' + LEDGER_REL + '\n')
+  sh(`git config core.excludesFile ${JSON.stringify(excl)}`, repo)
+  const probe = spawnSync('git', ['check-ignore', '-v', LEDGER_REL], { cwd: repo, encoding: 'utf8' })
+  assert.equal(probe.status, 0, 'fixture: git must report the negation')
+  const { out } = runOne(repo)
+  assert.equal(out.write_ok, false, 'negation via a colon path must be refused')
+  assert.match(out.write_error, /not actually gitignored/)
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
+// Round 1 L2 (AC-QA-19): CRLF, a trailing line with no newline, and a missing .git/info.
+test('T6 L2 AC-QA-19: existing exclude bytes (CRLF, last line unterminated) are preserved exactly and the ledger line appended after one newline', () => {
+  const repo = makeTempRepo()
+  const original = '# c\r\nfoo\r\nlast-no-newline'
+  fs.writeFileSync(excludePathOf(repo), original)
+  const { out } = runOne(repo)
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(fs.readFileSync(excludePathOf(repo), 'utf8'), original + '\n' + LEDGER_REL + '\n')
+  assert.deepEqual(strayFiles(path.dirname(excludePathOf(repo))), [])
+})
+
+test('T6 L2 AC-QA-19: a missing .git/info directory is created and the write succeeds', () => {
+  const repo = makeTempRepo()
+  fs.rmSync(path.join(repo, '.git', 'info'), { recursive: true, force: true })
+  const { out } = runOne(repo)
+  assert.equal(out.write_ok, true, out.write_error)
+  assert.equal(fs.readFileSync(excludePathOf(repo), 'utf8'), LEDGER_REL + '\n')
 })
