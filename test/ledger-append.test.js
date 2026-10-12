@@ -206,12 +206,20 @@ test('ledger-append: 50 concurrent writers all land, each parses as JSON, each r
       const child = spawn('node', [APPEND_SCRIPT], { cwd: repo })
       child.stdin.end(JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: `writer-${i}` }))
       let stderr = ''
+      let stdout = ''
       child.stderr.on('data', (d) => (stderr += d))
-      child.on('close', (code) => (code === 0 ? resolve() : reject(new Error('exit ' + code + ': ' + stderr))))
+      child.stdout.on('data', (d) => (stdout += d))
+      child.on('close', (code) => (code === 0 ? resolve(stdout) : reject(new Error('exit ' + code + ': ' + stderr))))
       child.on('error', reject)
     })
   )
-  await Promise.all(runs)
+  const outputs = await Promise.all(runs)
+  // HARN-OPT-5 T6 (AC-DATA-3/AC-QA-18): exit 0 is not success, the writer
+  // reports a refusal as write_ok:false with exit 0, so assert it per writer.
+  outputs.forEach((stdout, i) => {
+    const out = JSON.parse(stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, true, `writer ${i} write_ok false: ${out.write_error}`)
+  })
   const lines = readLedgerLines(repo)
   assert.equal(lines.length, N, 'every writer must have appended exactly one line')
   const parsed = lines.map((l) => JSON.parse(l))

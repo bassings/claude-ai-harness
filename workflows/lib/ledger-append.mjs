@@ -35,7 +35,7 @@
 // invocation does (guarded below).
 
 import { execFileSync } from 'node:child_process'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1678,17 +1678,83 @@ function resolveWorkingTreeRoot(cwd) {
 // diff on a tracked file, never needs staging, and never gets swept into
 // an unrelated `git add -A`.
 function ensureGitignored(root) {
+  // AC-DATA-1/AC-QA-18: ask git first and touch nothing when the ledger is
+  // already ignored (by this file or a tracked .gitignore). The old
+  // read-modify-write truncated the exclude file in place, so a concurrent
+  // writer's `git check-ignore` could observe it empty and refuse (CI's
+  // hostile-git step landed 43 of 50 writers). Now only a writer that finds
+  // the path unmatched ever writes, and never in place.
+  //
+  // One subprocess classifies the path (AC-QA-20 counts them): `-v` also
+  // reports a winning NEGATION pattern (`!path`, exit 0), which `-q` would
+  // call ignored. Returns true when the ledger is, or after this call will
+  // be, ignored; false (fail closed, AC-SEC-13) when a negation re-includes
+  // it, in which case nothing is written because adding an exclude line
+  // cannot beat a later negation. An unmatched path has no pattern a new
+  // exclude line could lose to, so no second check-ignore is needed.
+  let verdict = 'none'
+  try {
+    const hit = execFileSync('git', ['check-ignore', '-v', LEDGER_RELATIVE_PATH], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    const pattern = hit.split('\t')[0].split(':').slice(2).join(':')
+    verdict = pattern.startsWith('!') ? 'negated' : 'ignored'
+  } catch (e) {
+    // exit 1: no pattern matches the path
+  }
+  if (verdict === 'ignored') return true
+  if (verdict === 'negated') return false
   const gitDir = path.join(root, '.git')
   const infoDir = path.join(gitDir, 'info')
   const excludePath = path.join(infoDir, 'exclude')
   fs.mkdirSync(infoDir, { recursive: true })
-  let contents = ''
-  if (fs.existsSync(excludePath)) contents = fs.readFileSync(excludePath, 'utf8')
-  const lines = contents.split('\n')
-  if (!lines.some((l) => l.trim() === LEDGER_RELATIVE_PATH)) {
-    const sep = contents.length && !contents.endsWith('\n') ? '\n' : ''
-    fs.writeFileSync(excludePath, contents + sep + LEDGER_RELATIVE_PATH + '\n')
+  // AC-DATA-5: resolve a symlinked exclude and replace the file it points at,
+  // beside it, so the link itself is never swapped for a regular file.
+  let target = excludePath
+  try {
+    target = fs.realpathSync(excludePath)
+  } catch (e) {
+    // absent (or dangling): create at the conventional path
   }
+  const readTarget = () => (fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '')
+  const hasLine = (c) => c.split('\n').some((l) => l.trim() === LEDGER_RELATIVE_PATH)
+  const contents = readTarget()
+  if (!hasLine(contents)) {
+    const sep = contents.length && !contents.endsWith('\n') ? '\n' : ''
+    // AC-DATA-4: a uniquely named temp file in the TARGET's directory (a
+    // rename is only atomic within one filesystem), created exclusively.
+    const tmp = path.join(path.dirname(target), `.exclude.${process.pid}.${randomBytes(8).toString('hex')}.tmp`)
+    let mode = 0o644
+    try {
+      mode = fs.statSync(target).mode & 0o777
+    } catch (e) {
+      // no existing target: default mode
+    }
+    try {
+      const fd = fs.openSync(tmp, 'wx', mode)
+      try {
+        fs.writeSync(fd, contents + sep + LEDGER_RELATIVE_PATH + '\n')
+        fs.fchmodSync(fd, mode)
+      } finally {
+        fs.closeSync(fd)
+      }
+      // TEST-ONLY, no-ops unless a test sets these exact env vars (AC-DATA-2):
+      // hold the writer between creating the temp file and the rename, or
+      // fail there, so a test can prove the target is untouched meanwhile.
+      const testWindowMs = Number(process.env.LEDGER_APPEND_TEST_EXCLUDE_WINDOW_MS || 0)
+      if (testWindowMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, testWindowMs)
+      if (process.env.LEDGER_APPEND_TEST_EXCLUDE_THROW) throw new Error('injected failure before exclude rename')
+      // A concurrent writer may have won while this one was building; its
+      // result already satisfies us, so do not replace it a second time.
+      if (hasLine(readTarget())) {
+        fs.rmSync(tmp, { force: true })
+      } else {
+        fs.renameSync(tmp, target)
+      }
+    } catch (e) {
+      fs.rmSync(tmp, { force: true })
+      throw e
+    }
+  }
+  return true
 }
 
 function result(run_id, ts, write_ok, write_error) {
@@ -2350,20 +2416,14 @@ export function main() {
   }
 
   try {
-    ensureGitignored(root)
-    // L1: ensureGitignored only ASSERTS the ledger is ignored (writes
-    // .git/info/exclude); it never VERIFIES the assertion took effect. A
-    // tracked .gitignore carrying a later negation pattern
-    // (`!.claude/harness-ledger.jsonl`) re-includes the path -- git
-    // resolves ignore precedence by file, last match wins, and
-    // .git/info/exclude has no special priority over a tracked .gitignore.
-    // Writing and reporting success in that state risks the ledger
-    // actually being committed, the exact outcome AC-SEC-1 forbids.
-    try {
-      execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root })
-    } catch (e) {
+    if (!ensureGitignored(root)) {
       return result(run_id, ts, false, 'the ledger path is not actually gitignored (a tracked .gitignore may re-include it with a negation pattern) -- refusing to write rather than risk it being committed')
     }
+    // L1 (AC-SEC-13): a tracked .gitignore carrying a later negation
+    // (`!.claude/harness-ledger.jsonl`) re-includes the path, and
+    // .git/info/exclude has no priority over it. ensureGitignored reports
+    // that as false above, so we refuse rather than risk the ledger being
+    // committed (AC-SEC-1).
     fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
 
     // M3: a conduct_plan_event replay (the conducting agent re-ticking and
