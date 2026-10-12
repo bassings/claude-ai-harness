@@ -795,9 +795,13 @@ invoked via Bash from each workflow's final step).
 
 A `tdd_task` line also carries `model`: the implementer model the run asked for
 through `tdd-task`'s optional `model` argument, or null when none was given. It
-is **requested, not confirmed**: the line records the token that was passed to
-the implementer dispatches, not a report from the runtime of which model
-actually ran. `blocked_reason` on that line is one of `test_attempt_cap`,
+is **requested, and confirmed by transcript**: the line records the token that
+was passed to the implementer dispatches; which model actually ran is recorded
+by the runtime in each subagent's transcript, not in the ledger. Measured on
+2026-10-13 (HARN-OPT-5 AC-PROD-5): a probe run with `model: opus` ran both
+implementer dispatches on claude-opus-5-5, where the same workflow with no
+`model` ran them on claude-sonnet-5-5, the installed agent's pin.
+`blocked_reason` on that line is one of `test_attempt_cap`,
 `implement_attempt_cap`, `tests_modified` or `test_defect` (the implementer
 reported that the frozen test itself is wrong).
 

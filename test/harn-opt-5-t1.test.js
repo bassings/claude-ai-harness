@@ -523,14 +523,15 @@ test('T1 reader: byModel rides the CLI output inside the existing blockedUnresol
   assert.strictEqual(out.blockedUnresolved.byReason.test_defect, 1)
 })
 
-test('T1 docs: optimise-cycle SKILL.md names test_defect where it lists the other reasons, and README describes model as "requested, not confirmed" (AC-ARCH-5, AC-PROD-5)', () => {
+test('T1 docs: optimise-cycle SKILL.md names test_defect where it lists the other reasons, and README describes model as "requested, and confirmed by transcript", the wording the AC-PROD-5 probe settled (AC-ARCH-5, AC-PROD-5)', () => {
   const skill = fs.readFileSync(path.join(ROOT, 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
   const at = skill.indexOf('`tests_modified`')
   assert.ok(at >= 0)
   assert.ok(/test_defect/.test(skill.slice(Math.max(0, at - 400), at + 400)), 'test_defect must sit beside the other three reasons')
   const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')
   const ledger = readme.slice(readme.indexOf('## Run ledger'))
-  assert.match(ledger, /`model`[^\n]*(\n[^\n]*)?requested, not confirmed|requested, not confirmed[^\n]*(\n[^\n]*)?`model`/)
+  assert.match(ledger, /`model`[^\n]*(\n[^\n]*)?requested, and confirmed by transcript|requested, and confirmed by transcript[^\n]*(\n[^\n]*)?`model`/)
+  assert.match(ledger, /claude-opus-5-5[\s\S]{0,200}claude-sonnet-5-5/, 'the probe measurement is stated, not just the claim')
 })
 
 test('T1 AC-SIMP-1: no dependency is added (package.json and lockfiles are unchanged from main)', () => {
