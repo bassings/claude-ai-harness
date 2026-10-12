@@ -668,11 +668,11 @@ test('static: T8 round 1 M1 -- the budget start-read and budgetSpentDelta block 
   assert.equal(plan, tdd, 'plan-cycle.js\'s T8 budget block has drifted from tdd-task.js\'s')
 })
 
-// The generic terminal-write retry is duplicated in plan-cycle.js and
-// review-cycle.js. tdd-task.js is deliberately EXCLUDED: its T5 retry is
-// specific to one key (task_id handling), so it differs on purpose and must not
-// be forced into this pin.
-test('static: T8 round 1 M1 -- the generic terminal-write retry block (refusedKey .. end of its if-block) is byte-identical between plan-cycle.js and review-cycle.js (tdd-task.js excluded: its T5 retry is key-specific)', () => {
+// The generic terminal-write retry is duplicated in all three workflows.
+// HARN-OPT-5 T1 (AC-ARCH-4): tdd-task.js's key-specific blocked_reason retry was
+// replaced by this block, so the pin now covers all three files and the
+// exclusion that used to stand here is gone.
+test('static: T8 round 1 M1 / HARN-OPT-5 T1 -- the generic terminal-write retry block (refusedKey .. end of its if-block) is byte-identical across tdd-task.js, plan-cycle.js and review-cycle.js', () => {
   function extractRetry(fileName) {
     const lines = readAll('workflows', fileName).split('\n')
     const start = lines.findIndex((l) => l.includes('const refusedKey ='))
@@ -682,8 +682,10 @@ test('static: T8 round 1 M1 -- the generic terminal-write retry block (refusedKe
   }
   const review = extractRetry('review-cycle.js')
   const plan = extractRetry('plan-cycle.js')
+  const tdd = extractRetry('tdd-task.js')
   assert.ok(review.includes('Object.hasOwn') && review.length > 300, 'sanity: the extract must be the whole retry block')
   assert.equal(plan, review, 'plan-cycle.js\'s generic retry block has drifted from review-cycle.js\'s')
+  assert.equal(tdd, review, 'tdd-task.js\'s generic retry block has drifted from review-cycle.js\'s')
 })
 
 // specs/harn-fix-3.md AC-QA-1..4: the install-consistency preflight block

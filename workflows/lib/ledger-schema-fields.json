@@ -65,6 +65,10 @@
   ],
   "lenses_run": "array",
   "lenses_skipped": "array",
+  "model": [
+    "string",
+    "null"
+  ],
   "outcome": "string",
   "plan_key": [
     "string",

@@ -57,7 +57,14 @@ import { fileURLToPath } from 'node:url'
 // unchanged, but a window spanning this change would otherwise mix the two
 // populations under one name. No reader may add or average budget_spent across
 // rows of different schema versions.
-export const SCHEMA_VERSION = 5
+// HARN-OPT-5 T1 (AC-SIMP-2, AC-DATA-15): bumped from 5, once, for two additive
+// changes that ship together. `model` (the implementer model a tdd-task run
+// requested, a bounded lowercase token) is a new tdd_task field, and
+// blocked_reason gains `test_defect` (the implementer reporting that the
+// frozen test itself is wrong). Neither rewrites an earlier line: v5 rows read
+// as model null and keep their reasons, so a window spanning this change shows
+// both versions in schemaVersionsSeen rather than mixing them silently.
+export const SCHEMA_VERSION = 6
 
 // Hard-coded and not configurable (AC-SIMP-2): resolved against the MAIN
 // checkout root (never a worktree's own .claude/) via `git rev-parse
@@ -237,6 +244,23 @@ const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // a new disposition would have had to be added correctly in all of them or
 // fail silently in whichever one was missed.
 export const DISPOSITIONS = ['open', 'rejected', 'spec_bug', 'fixed']
+
+// HARN-OPT-5 T1 (AC-ARCH-5): the closed set of reasons a tdd_task run ends
+// BLOCKED, defined once here. The schema's enum is built from it and
+// optimise-read.mjs imports it, so a reason added here cannot be missed by the
+// reader (the old local copy there was how test_defect would have been counted
+// as 'not recorded').
+export const BLOCKED_REASONS = ['test_attempt_cap', 'implement_attempt_cap', 'tests_modified', 'test_defect']
+
+// HARN-OPT-5 T1 (AC-SEC-7): the one definition of a conforming `model` token,
+// shared by the schema and the reader so neither can accept what the other
+// rejects.
+export const MODEL_PATTERN_STR = '^[a-z0-9][a-z0-9.-]{0,63}$'
+
+// HARN-OPT-5 T1 (AC-ARCH-3): keys that mean something only on a tdd_task row.
+// On any other kind the writer strips and counts them; on a tdd_task row an
+// absent one is normalised to an explicit null. One list, one code path.
+const TDD_ONLY_KEYS = ['blocked_reason', 'model']
 
 // The envelope + payload schema for one ledger line. additionalProperties is
 // false at every object level (AC-SEC-2): a field that is not declared here
@@ -533,7 +557,14 @@ export const LEDGER_ENTRY_SCHEMA = {
     // neutralised to null and counted in invalid_record_values_dropped, and the
     // line still writes. The schema is global, so the writer (not this
     // declaration) refuses the field on any kind but tdd_task (T4 round 3 L6).
-    blocked_reason: { type: ['string', 'null'], enum: ['test_attempt_cap', 'implement_attempt_cap', 'tests_modified', null] },
+    blocked_reason: { type: ['string', 'null'], enum: [...BLOCKED_REASONS, null] },
+    // HARN-OPT-5 T1 (AC-SEC-7, AC-QA-4): the implementer model a tdd-task run
+    // REQUESTED (not confirmed by the runtime), a bounded lowercase token so
+    // caller text can never reach the durable line. A non-conforming value is
+    // neutralised to null and counted in invalid_record_values_dropped by the
+    // same degrade path as blocked_reason; the line still writes. Meaningful on
+    // tdd_task rows only (TDD_ONLY_KEYS below).
+    model: { type: ['string', 'null'], pattern: MODEL_PATTERN_STR },
     // conduct_plan_event only: which state transition this line records, and
     // an idempotency key (run_id + event) so a re-tick that replays an
     // already-recorded event does not double-count it (AC-QA-9).
@@ -1022,9 +1053,10 @@ export function degradeEntry(entry, redactRawField = (v) => v) {
         container[last] = null
         const bucket = last === 'ac_id' ? 'ac_id' : err.pathParts[0] === 'findings' && (last === 'lens' || last === 'severity') ? 'finding_field' : 'general'
         neutralisations.push({ pathParts: err.pathParts, bucket, kind: 'siblingField' })
-      } else if (err.pathParts.length === 1 && last === 'blocked_reason') {
+      } else if (err.pathParts.length === 1 && (last === 'blocked_reason' || last === 'model')) {
         // HARN-OPT-4 T5 (AC-OPS-5): same treatment as round, below. A rejected
         // reason is caller text; none of it is retained, only counted.
+        // HARN-OPT-5 T1 (AC-SEC-7): model rides the same branch, for the same reason.
         container[last] = null
         neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'siblingField' })
       } else if (err.pathParts.length === 1 && last === 'round') {
@@ -2171,10 +2203,16 @@ export function main() {
   // tdd_task row. The schema is global, so on any other kind it is removed here
   // and counted below (degradeEntry overwrites the counter, so the add happens
   // after it), rather than written as a reason that row cannot have.
-  let strayBlockedReason = 0
-  if (entry.kind !== 'tdd_task' && 'blocked_reason' in entry) {
-    delete entry.blocked_reason
-    strayBlockedReason = 1
+  // HARN-OPT-5 T1 (AC-ARCH-3): `model` is the second such key, so both go
+  // through this one list rather than a third strip-and-count block.
+  let strayTddOnlyKeys = 0
+  if (entry.kind !== 'tdd_task') {
+    for (const key of TDD_ONLY_KEYS) {
+      if (key in entry) {
+        delete entry[key]
+        strayTddOnlyKeys += 1
+      }
+    }
   }
   const degraded = degradeEntry(entry, redactRawField)
   if (!degraded.ok) {
@@ -2188,9 +2226,13 @@ export function main() {
   // on tdd_task rows. The workflow sends it only when the run blocked
   // (AC-DATA-2 as amended), and the line still reads null on a done or
   // aborted row, so key presence tells a post-T5 row from a pre-T5 one.
-  if (entry.kind === 'tdd_task' && entry.blocked_reason === undefined) entry.blocked_reason = null
-  if (strayBlockedReason > 0) {
-    entry.invalid_record_values_dropped = (entry.invalid_record_values_dropped || 0) + strayBlockedReason
+  // HARN-OPT-5 T1 (AC-QA-2, AC-ARCH-3): the same normalisation for every
+  // tdd_task-only key, so an absent model reads as an explicit null.
+  if (entry.kind === 'tdd_task') {
+    for (const key of TDD_ONLY_KEYS) if (entry[key] === undefined) entry[key] = null
+  }
+  if (strayTddOnlyKeys > 0) {
+    entry.invalid_record_values_dropped = (entry.invalid_record_values_dropped || 0) + strayTddOnlyKeys
   }
   if (explicitNullAcVerdictAcId > 0) {
     entry.invalid_ac_ids_dropped = (entry.invalid_ac_ids_dropped || 0) + explicitNullAcVerdictAcId

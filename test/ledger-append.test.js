@@ -4565,7 +4565,7 @@ test('ledger-append module (M1): wasNoSpecInPlay treats an EMPTIED ac_verdicts a
   assert.equal(wasNoSpecInPlay(null, [], { acVerdictsTruncated: -1 }), true, 'nor a negative one')
 })
 
-test('ledger-append (M7): SCHEMA_VERSION is 5 (HARN-OPT-4 T1 took it to 4; T8 to 5 because budget_spent became a per-run delta, not a running total), so a window spanning this change can tell the two populations apart', async () => {
+test('ledger-append (M7): SCHEMA_VERSION is 6 (HARN-OPT-5 T1 took it to 6; HARN-OPT-4 T1 took it to 4; T8 to 5 because budget_spent became a per-run delta, not a running total), so a window spanning this change can tell the two populations apart', async () => {
   // Planning decision 5, and it was not built in the first pass. Without it a
   // 90-day window mixes lines written before and after four validator changes
   // with nothing to separate them: an ac_id that is null could be a real
@@ -4574,7 +4574,7 @@ test('ledger-append (M7): SCHEMA_VERSION is 5 (HARN-OPT-4 T1 took it to 4; T8 to
   // already tallies schema_version without rejecting any, so the bump costs
   // nothing and makes the two readable apart.
   const { SCHEMA_VERSION } = await import(APPEND_MODULE_URL)
-  assert.equal(SCHEMA_VERSION, 5)
+  assert.equal(SCHEMA_VERSION, 6)
 })
 
 test('ledger-append (M7): the written line carries the new version, not the caller-supplied one', () => {
@@ -4582,6 +4582,6 @@ test('ledger-append (M7): the written line carries the new version, not the call
   const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done' })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
-  assert.equal(JSON.parse(readLedgerLines(repo)[0]).schema_version, 5,
+  assert.equal(JSON.parse(readLedgerLines(repo)[0]).schema_version, 6,
     'the writer stamps its own version; a caller cannot claim to be a different one')
 })
