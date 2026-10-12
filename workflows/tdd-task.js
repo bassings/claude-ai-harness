@@ -326,11 +326,15 @@ let green = null
 // is cleared once a well-formed response arrives. Both are sent when both apply.
 let greenNote = ''
 let malformedNote = ''
-// HARN-OPT-5 T1: every BLOCKED exit of the Implement loop (test_defect, a
-// malformed response at the cap, the GREEN attempt cap) sets this and breaks;
-// the one return after the loop sends it. The AC-QA-9 static pin fixes run()
-// at 8 terminating returns, and routing three exits through one keeps it there.
-let implBlocked = null
+// HARN-OPT-5 T1 (round 2 F1, AC-QA-8): every BLOCKED exit of the Implement
+// loop (test_defect, a malformed response at the cap, the GREEN attempt cap)
+// records which one it was in `implExit` and breaks; the ONE result is
+// assembled after the loop from the loop's state, so the three exits cannot
+// disagree about which fields they carry. The AC-QA-9 static pin fixes run()
+// at 8 terminating returns, and one assembled return keeps it there.
+let implExit = null
+let wellFormedNotGreen = 0
+let malformedAttempts = 0
 for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   rounds.implement_attempts = attempt
   phase('Implement')
@@ -381,14 +385,15 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       // test_hashes (round 1 F2, AC-DATA-13): no GREEN verifier runs on this
       // exit, so the RED-time hashes are returned for the human to compare
       // against the files without a new dispatch.
-      implBlocked = { verdict: 'BLOCKED', reason: 'The implementer reported that the test itself is defective. Nothing is committed; fix the test and re-brief.', test_defect: impl.test_defect, test_hashes: red.test_hashes }
+      implExit = 'test_defect'
       break
     }
   } else {
+    malformedAttempts++
     log(`Implement attempt ${attempt} returned a malformed response (neither or both of summary/files_changed and test_defect, or a wrong type)`)
     if (attempt === MAX_ATTEMPTS) {
       blockedReason = 'implement_attempt_cap'
-      implBlocked = { verdict: 'BLOCKED', reason: MAX_ATTEMPTS + ' implementation attempts did not produce a well-formed response. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.', test_hashes: red.test_hashes }
+      implExit = 'malformed_cap'
       break
     }
     malformedNote = `\nYour previous response was malformed: return either summary and files_changed, or test_defect {file, reason}, never both and never neither.`
@@ -430,14 +435,34 @@ for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
   }
   if (green.green && green.suite_green) break
   log(`GREEN gate rejected attempt ${attempt}: ${green.evidence.slice(0, 200)}`)
+  wellFormedNotGreen++
   greenNote = `\nYour previous attempt did not go green. Verifier evidence: ${green.evidence}`
   if (attempt === MAX_ATTEMPTS) {
     blockedReason = 'implement_attempt_cap'
-    implBlocked = { verdict: 'BLOCKED', reason: MAX_ATTEMPTS + ' implementation attempts did not go green. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.', last_evidence: green.evidence }
+    implExit = 'green_cap'
     break
   }
 }
-if (implBlocked) return { ...implBlocked }
+if (implExit) {
+  // Round 2 F1 (AC-QA-8): always verdict, reason and test_hashes; last_evidence
+  // whenever a GREEN verifier ran (it holds the latest verdict, also across a
+  // later malformed response); the reason counts what happened, well-formed
+  // not-green and malformed attempts separately. Round 2 F2 (AC-DATA-13): the
+  // test_defect and malformed-at-cap exits run no GREEN verifier, so skip every
+  // frozen-test integrity check; the reason instructs the comparison, and no
+  // agent dispatch is added.
+  const compare = ' To check the frozen tests: compare the sha256 of each test file with test_hashes before editing; a mismatch means the implementer modified the frozen test.'
+  const isDefect = implExit === 'test_defect'
+  const unverified = isDefect || implExit === 'malformed_cap'
+  const counts = MAX_ATTEMPTS + ' implementation attempts: ' + wellFormedNotGreen + ' well-formed but not green, ' + malformedAttempts + ' malformed. Per the three-failures rule, the frame is suspect: re-open the approach rather than retrying.'
+  return {
+    verdict: 'BLOCKED',
+    reason: isDefect ? 'The implementer reported that the test itself is defective. Nothing is committed; fix the test and re-brief.' + compare : (unverified ? counts + compare : counts),
+    test_hashes: red.test_hashes,
+    last_evidence: green ? green.evidence : undefined,
+    ...(isDefect ? { test_defect: impl.test_defect } : {}),
+  }
+}
 
 // ---- Commit: only reachable with RED proven, GREEN proven, tests untouched ----
 const commit = await agent(

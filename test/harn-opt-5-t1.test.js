@@ -72,7 +72,8 @@ const IMPLEMENTER_LABEL = /^(write-test|implement)#\d+$/
 // ---- (1) the `model` argument (AC-QA-1, AC-QA-2, AC-QA-3, AC-OPS-4, AC-SIMP-3) ----
 
 test('T1 model: an invalid value throws before the started write and before any agent dispatch, naming `model` and the rule (AC-QA-3)', async () => {
-  const bad = ['', 'Opus', '.opus', '-opus', 'a'.repeat(65), 'op us', ' opus', 'opus\n', '../opus', 'a/b', 7, true, {}, ['opus']]
+  const bad = ['', 'Opus', '.opus', '-opus', 'a'.repeat(65), 'op us', ' opus', 'opus\n', '../opus', 'a/b', 7, true, {}, ['opus'], null]
+  // null (round 2 F4, AC-QA-3): throws by design, only undefined means absent.
   for (const model of bad) {
     const label = JSON.stringify(model)
     let thrown
@@ -620,4 +621,62 @@ test('T1 round 1 F5 (AC-PROD-8): SKILL.md says the byModel null bucket means no 
   const skill = fs.readFileSync(path.join(ROOT, 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8').replace(/\s+/g, ' ')
   assert.ok(skill.includes('null when no model was recorded: none was given, or the key was stripped for a stale writer, or the row is degraded'), 'the null bucket wording must name all three causes')
   assert.ok(!skill.includes('(null when none was given)'), 'the old, narrower wording is gone')
+})
+
+// ---- review round 2 fixes (F1 to F4), written RED first ----
+
+const COMPARE_RE = /compare the sha256 of each test file with test_hashes before editing; a mismatch means the implementer modified the frozen test/
+
+test('T1 round 2 F1 (AC-QA-8): a malformed response at the cap after two well-formed red attempts returns the second verifier\'s evidence and a reason counting both kinds of attempt', async () => {
+  const E1 = 'FIRST_GREEN_EVIDENCE_A1'; const E2 = 'SECOND_GREEN_EVIDENCE_B2'
+  const { result, terminal } = await runTdd({
+    'write-test#1': WRITE_TEST, 'verify-red#1': RED_OK,
+    'implement#1': IMPL, 'verify-green#1': { ...GREEN_RED, evidence: E1 },
+    'implement#2': IMPL, 'verify-green#2': { ...GREEN_RED, evidence: E2 },
+    'implement#3': {},
+  })
+  assert.equal(result.verdict, 'BLOCKED')
+  assert.strictEqual(terminal.blocked_reason, 'implement_attempt_cap')
+  assert.strictEqual(result.last_evidence, E2, 'the latest GREEN verifier evidence must ride the malformed-at-cap exit')
+  assert.match(result.reason, /2 well-formed/, `reason must count well-formed attempts: ${result.reason}`)
+  assert.match(result.reason, /1 malformed/, `reason must count malformed attempts: ${result.reason}`)
+  assert.ok(!/did not produce a well-formed response/.test(result.reason), 'the false "every attempt was malformed" wording is gone')
+  assert.deepEqual(result.test_hashes, RED_OK.test_hashes)
+})
+
+test('T1 round 2 F1 (AC-QA-8): three malformed attempts report 3 malformed, no last_evidence; a test_defect after a rejected GREEN carries that evidence and test_hashes', async () => {
+  const allBad = await runTdd({ ...DONE, 'implement#1': {}, 'implement#2': {}, 'implement#3': {} })
+  assert.match(allBad.result.reason, /3 malformed/, allBad.result.reason)
+  assert.match(allBad.result.reason, /0 well-formed/, allBad.result.reason)
+  assert.ok(allBad.result.last_evidence === undefined, 'no GREEN verifier ran, so no last_evidence')
+  const EV = 'GREEN_BEFORE_DEFECT_EVIDENCE'
+  const defect = await runTdd({
+    ...DONE, 'implement#1': IMPL, 'verify-green#1': { ...GREEN_RED, evidence: EV }, 'implement#2': TD,
+  })
+  assert.equal(defect.result.verdict, 'BLOCKED')
+  assert.strictEqual(defect.terminal.blocked_reason, 'test_defect')
+  assert.strictEqual(defect.result.last_evidence, EV)
+  assert.deepEqual(defect.result.test_hashes, RED_OK.test_hashes)
+  assert.deepEqual(defect.result.test_defect, TD.test_defect)
+})
+
+test('T1 round 2 F2 (AC-DATA-13): the test_defect and malformed-at-cap reasons instruct comparing the sha256 of each test file with test_hashes, and test_hashes is present', async () => {
+  const defect = await runTdd({ ...DONE, 'implement#1': TD })
+  const capped = await runTdd({ ...DONE, 'implement#1': {}, 'implement#2': {}, 'implement#3': {} })
+  for (const [name, r] of [['test_defect', defect.result], ['malformed-at-cap', capped.result]]) {
+    assert.match(r.reason, COMPARE_RE, `${name}: ${r.reason}`)
+    assert.deepEqual(r.test_hashes, RED_OK.test_hashes, `${name}: test_hashes present`)
+  }
+})
+
+test('T1 round 2 F3 (spec bug): README documents the stale-writer test_defect neutralisation and the byModel null bucket carries the same three causes as SKILL.md', () => {
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8').slice(fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8').indexOf('## Run ledger')).replace(/\s+/g, ' ')
+  assert.ok(readme.includes('a `test_defect` blocked_reason is neutralised to null by `degradeEntry`'), 'README must say degradeEntry neutralises test_defect')
+  assert.ok(/not an allowed property/.test(readme) && /enum mismatch/.test(readme), 'and name why the stale-writer retry does not handle it (enum mismatch, not "not an allowed property")')
+  assert.ok(/stamped 5/.test(readme) && readme.includes('invalid_record_values_dropped'), 'and the stamp 5 and the counter')
+  assert.ok(/not recorded/.test(readme) && /reinstall/.test(readme), 'and that such runs read as not recorded until the writer is reinstalled')
+  const phrase = 'null when no model was recorded: none was given, or the key was stripped for a stale writer, or the row is degraded'
+  assert.ok(readme.includes(phrase), 'README byModel null bucket wording')
+  const skill = fs.readFileSync(path.join(ROOT, 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8').replace(/\s+/g, ' ')
+  assert.ok(skill.includes(phrase), 'SKILL.md byModel null bucket wording is identical')
 })

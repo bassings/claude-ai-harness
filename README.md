@@ -804,6 +804,17 @@ implementer dispatches on claude-opus-5-5, where the same workflow with no
 `blocked_reason` on that line is one of `test_attempt_cap`,
 `implement_attempt_cap`, `tests_modified` or `test_defect` (the implementer
 reported that the frozen test itself is wrong).
+The `model` value is null when no model was recorded: none was given, or the
+key was stripped for a stale writer, or the row is degraded. The optimiser's
+`byModel` null bucket carries the same three causes (HARN-OPT-5 T1 round 2 F3).
+
+**Reading `test_defect` rows while the installed writer predates schema 6.**
+While the installed `ledger-append.mjs` is older than schema 6, a `test_defect`
+blocked_reason is neutralised to null by `degradeEntry`: the old enum does not
+list it, and that is an enum mismatch, which the stale-writer retry does not
+handle because it only retries on "not an allowed property". The row is stamped
+5, with `invalid_record_values_dropped` incremented, so such runs read as "not
+recorded" until the writer is reinstalled.
 
 **The `schema_version` 3 boundary, and reading a window that spans it.**
 `SCHEMA_VERSION` is 3 from the validator change onward. What changed at that
