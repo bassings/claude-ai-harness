@@ -119,7 +119,7 @@ file on disk. Measured in this repo on 2026-08-18, with zero agents spawned:
   marker.
 
 **`workflows/lib/*.mjs`** -- `ledger-append.mjs`, `optimise-read.mjs`,
-`redact-transcript.mjs`, `install-consistency.mjs` -- are not part of that capture. A workflow script has
+`redact-transcript.mjs`, `install-consistency.mjs`, `stray-snapshot.mjs` -- are not part of that capture. A workflow script has
 no filesystem access, so it instructs an agent to shell out to
 `node ~/.claude/workflows/lib/<file>.mjs` (see the resolution order in
 `plan-cycle.js:100-106`, global mirror first). `node` reads the file when the
