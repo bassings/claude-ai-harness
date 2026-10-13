@@ -63,9 +63,26 @@ function actAsCompliantAgent(prompt, { cwd, scratchDir, writerEnvPrefix = '' }) 
   if (/<[^>]*>/.test(writerCommand)) throw new Error('unsubstituted placeholder in the instructed writer command: ' + writerCommand)
   const wrote = runSh(writerEnvPrefix + writerCommand, { cwd, env })
   const result = JSON.parse(wrote.stdout.trim().split('\n').pop())
+  // Review round 2 F2 (AC-SEC-4): the deletion decision comes from the prompt, as a real agent's would, so a step 5
+  // weakened to keep the file on a failure path leaves the file behind here too and the end-to-end test goes RED.
   const rmCommand = cmds.rm[0].replace('<the file>', file)
-  runSh(rmCommand, { cwd, env })
+  if (deletesOnOutcome(prompt, result)) runSh(rmCommand, { cwd, env })
   return { file, writerCommand: writerEnvPrefix + writerCommand, result, commands: cmds }
 }
 
-module.exports = { backtickSpans, instructedCommands, runSh, actAsCompliantAgent }
+// Reads step 5 of the prompt the way a compliant agent would: delete on this outcome only if the step says the delete
+// applies on every exit path, or names this outcome without carving it out.
+function deletesOnOutcome(prompt, result) {
+  const text = String(prompt)
+  const start = text.indexOf('\n5. ')
+  if (start < 0) return false
+  const rest = text.slice(start + 1)
+  const next = rest.search(/\n(\d\. |If the script)/)
+  const step5 = next >= 0 ? rest.slice(0, next) : rest
+  if (/on every exit path/i.test(step5) && !/only after|keep (it|the file)|do not delete|leave (it|the file)|except/i.test(step5)) return true
+  const ok = result && result.write_ok === true
+  if (ok) return /successful write|write_ok:?\s*true|success/i.test(step5)
+  return /write_ok:?\s*false/i.test(step5) && !/keep (it|the file)[^.]*write_ok:?\s*false|only after a successful/i.test(step5)
+}
+
+module.exports = { backtickSpans, instructedCommands, runSh, actAsCompliantAgent, deletesOnOutcome }

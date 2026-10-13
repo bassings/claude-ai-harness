@@ -17,7 +17,8 @@ const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload, extractEncodedPayload } = require('./helpers/extract-ledger-payload.js')
-const { instructedCommands, runSh, actAsCompliantAgent } = require('./helpers/ledger-agent.js')
+const { instructedCommands, runSh, actAsCompliantAgent, backtickSpans } = require('./helpers/ledger-agent.js')
+const { START_DELIMITER, END_DELIMITER } = require('./helpers/extract-ledger-payload.js')
 const { makeTempRepo, cleanupTempRepos, readLedgerLines, APPEND_SCRIPT, SUITE_TMPDIR, sanitizedGitEnv } = require('./helpers/temp-repo.js')
 
 test.after(cleanupTempRepos)
@@ -79,9 +80,20 @@ for (const [name, drive] of Object.entries(DRIVERS)) {
     assert.ok(JSON.stringify(extractLedgerPayload(prompt)).includes(JSON.stringify(text).slice(1, -1)), 'hostile text must be in the payload')
     const cmds = instructedCommands(prompt)
     assert.equal(cmds.node.length, 1, 'exactly one Bash command runs the writer')
-    for (const command of [...cmds.mktemp, ...cmds.node, ...cmds.rm]) {
-      assert.equal(commandCarriesPayload(command, encoded, ["';touch", '$(touch', '`touch', marker, 'touch']), false, `command carries payload text: ${command}`)
+    // Review round 2 F1 (AC-SEC-1, AC-QA-14): EVERY backtick span is scanned, not only the mktemp, node and rm ones, so
+    // an echo, printf, tee or heredoc fallback that carries the payload is caught; the encoded payload appears exactly
+    // once in the prompt, on the line between the delimiters; and only one span anywhere names the writer or the file
+    // on the writer's side (the rm and mktemp spans are the other two allowed to name the file).
+    const spans = backtickSpans(prompt)
+    for (const command of spans) {
+      assert.equal(commandCarriesPayload(command, encoded, ["';touch", '$(touch', '`touch', marker, 'touch']), false, `a backtick span carries payload text: ${command}`)
     }
+    assert.equal(prompt.split(encoded).length - 1, 1, 'the encoded payload occurs exactly once in the prompt')
+    const lines = prompt.split('\n')
+    assert.equal(lines[lines.indexOf(START_DELIMITER) + 1], encoded, 'the one occurrence is the line after the start delimiter')
+    assert.equal(lines[lines.indexOf(START_DELIMITER) + 2], END_DELIMITER, 'followed by the end delimiter')
+    assert.deepEqual(spans.filter((s) => /ledger-append|<the file>/.test(s)), [cmds.node[0], cmds.rm[0]], 'only the writer command and rm name the writer or the file (mktemp names its template)')
+    assert.deepEqual(spans.filter((s) => /\bnode\b/.test(s)), [cmds.node[0]], 'no other span runs node')
     assert.equal(prompt.includes(marker), false, 'the marker path (hostile text) must not appear anywhere in the prompt')
   })
 
