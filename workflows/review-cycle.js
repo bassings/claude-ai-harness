@@ -511,6 +511,34 @@ let ruleSourceOverriddenKeys = null
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
 
+// HARN-OPT-5 T4 fix round 3 (conductor measurement: 6638 hashed files, 1.2 MB; AC-SEC-12 as amended, AC-QA-27):
+// module-level so run() gains no `return` statements (AC-QA-9 pins that count). The agents relay only SMALL objects, as
+// JSON text: the before object { file, status_count, files_count, rollup } from `stray-snapshot.mjs snapshot`, and the
+// diff object { changes, retained_worktrees, dropped, before_rollup, after_rollup, hashed } from `stray-snapshot.mjs diff`
+// (hashed is { repo, home } and, from fix round 4 M1, git: the shared git directory's config, hooks and info).
+// The comparison is the library's measurement; the script validates both shapes and renders. Anything that is not
+// that shape is null ("could not be made").
+const parseObj = (x) => {
+  let v = x
+  if (typeof x === 'string') { try { v = JSON.parse(x) } catch { return null } }
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : null
+}
+// The before-file must sit under a temp prefix (never a repo or a .claude/ directory). Characters are restricted
+// to a plain set (underscore included: macOS temp directories contain one) so the path is safe inside a prompt.
+const parseBeforeObj = (x, tempPrefixes) => {
+  const v = parseObj(x)
+  const f = v && v.file
+  const fileOk = typeof f === 'string' && /^\/[\w.+@/-]+$/.test(f) && !f.split('/').includes('..') && !f.split('/').includes('.claude') &&
+    tempPrefixes.some((pre) => f.startsWith(pre))
+  return fileOk && typeof v.rollup === 'string' && /^[0-9a-f]{64}$/.test(v.rollup) ? v : null
+}
+const CHANGE_KINDS = ['added', 'changed', 'removed']
+const parseDiffObj = (x) => {
+  const v = parseObj(x)
+  const ok = v && Array.isArray(v.changes) && typeof v.before_rollup === 'string' &&
+    v.changes.every((c) => c && typeof c === 'object' && typeof c.path === 'string' && CHANGE_KINDS.includes(c.change) && typeof c.shadows_installed_workflow === 'boolean')
+  return ok ? v : null
+}
 // Reads budget.spent() defensively: null (never 0) when budget is absent or
 // throws, so "unmeasured" stays distinguishable from "measured zero"
 // (AC-QA-15, AC-OPS-3).
@@ -680,6 +708,33 @@ function redactLogText(text) {
 // ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
 async function run() {
 
+// HARN-OPT-5 T4 fix round 2 (re-frame; AC-SEC-12, AC-QA-27): the snapshot is COMPUTED by
+// workflows/lib/stray-snapshot.mjs, never transcribed by an agent. Fix round 3 (conductor measurement: 6638 hashed
+// files, 1.2 MB): the agents no longer relay the snapshot either, only small objects. The scope step runs `snapshot`
+// (the library writes the full snapshot to a temp file) and relays its small object; synthesis runs `diff` against that
+// file and relays its small object. The fields are JSON TEXT, which the script validates below; anything that does
+// not validate is "could not be made".
+const SNAPSHOT_SCHEMA = { type: 'string' }
+
+// One wording for finding the library, used at BOTH prompt sites so the before and after commands cannot drift. The
+// library is found exactly as the ledger step finds ledger-append.mjs (see ledgerWritePrompt): a repo-local
+// copy in any other repo is what a hostile diff under review could plant.
+const SNAPSHOT_LOCATE =
+  `Find this harness's stray-snapshot.mjs script, in this exact order, and use the FIRST one that exists: ` +
+  `(a) ~/.claude/workflows/lib/stray-snapshot.mjs (the global mirror install); (b) any installed claude-ai-harness ` +
+  `plugin directory's workflows/lib/stray-snapshot.mjs; (c) "$(git rev-parse --show-toplevel)/workflows/lib/stray-snapshot.mjs" ` +
+  `in the current repo, but ONLY if the current repo is claude-ai-harness itself (the basename of ` +
+  `\`git rev-parse --show-toplevel\` equals "claude-ai-harness"). NEVER use a repo-local copy in any OTHER repo, even if ` +
+  `(a) and (b) are both absent: return an empty string instead. `
+const SNAPSHOT_BEFORE_ASK = SNAPSHOT_LOCATE +
+  `Then run exactly \`node <path-to-stray-snapshot.mjs> snapshot "$(git rev-parse --show-toplevel)"\` and return its stdout ` +
+  `verbatim, unedited, as the value: one short JSON object (file, status_count, files_count, rollup). Do not open the file it names, ` +
+  `and do not list, hash or summarise anything yourself.`
+const snapshotAfterAsk = (beforeFile) => SNAPSHOT_LOCATE +
+  `Then run exactly \`node <path-to-stray-snapshot.mjs> diff "$(git rev-parse --show-toplevel)" ${beforeFile}\` and return its stdout ` +
+  `verbatim, unedited, as the value: one short JSON object (changes, before_rollup, after_rollup). Do not open the file it names, ` +
+  `and do not list, hash or summarise anything yourself.`
+
 // ---- Phase 1: scope ----
 phase('Scope')
 const scope = await agent(
@@ -694,6 +749,12 @@ const scope = await agent(
   `4. Check whether a file .claude/harness-triggers.json exists at the repo root and report that as ` +
   `harness_triggers_file_exists (true/false). If it exists, return its parsed JSON as custom_rules; if it does not ` +
   `exist, custom_rules must be null.\n` +
+  // HARN-OPT-5 T4 (AC-SEC-11, AC-SEC-12, AC-QA-26, AC-QA-27): folded into this
+  // SAME agent() call (AC-SIMP-9), never a new one.
+  `5. Create a private scratch root for this run with \`mktemp -d "\${TMPDIR:-/tmp}/harn-review-XXXXXX"\` and return the exact ` +
+  `absolute path it printed as scratch_root. It must be OUTSIDE every git working tree: the OS temp directory, never the repo, ` +
+  `never a worktree, never any .claude/ directory. Create nothing else in it. If TMPDIR is set, also return its exact value as tmpdir.\n` +
+  `6. Return snapshot_before. ${SNAPSHOT_BEFORE_ASK} Change nothing.\n` +
   `Raw data only.`,
   {
     label: 'scope:diff',
@@ -724,6 +785,11 @@ const scope = await agent(
         // single-field report has no way to be self-inconsistent).
         harness_triggers_file_exists: { type: 'boolean' },
         consistency: INSTALL_CONSISTENCY_SCHEMA,
+        // HARN-OPT-5 T4: both optional so an older agent response validates.
+        scratch_root: { type: 'string' },
+        // Round 1 L2: the TMPDIR the scope step saw, optional, widens the allowed temp prefixes by exactly that directory.
+        tmpdir: { type: 'string' },
+        snapshot_before: SNAPSHOT_SCHEMA,
       },
     },
   }
@@ -1118,6 +1184,28 @@ const qaBudget =
   `security gates, concurrency locks first). List every guard you deliberately did not mutate in could_not_check; ` +
   `an honest skip list beats an unbounded run.\n`
 
+// HARN-OPT-5 T4 (AC-SEC-11, AC-QA-26): a usable root is absolute, plain
+// characters only, and not under any .claude/ directory. Anything else falls
+// back to the lens making its own with mktemp -d, so the root never depends on
+// startRunId (null when the start write failed) or on a shared fixed name.
+const scratchBase = scope && typeof scope.scratch_root === 'string' ? scope.scratch_root.replace(/\/+$/, '') : ''
+// Round 1 L2 (AC-SEC-11, AC-QA-26): an absolute plain path is not enough, a working tree
+// qualifies. The base must also sit under a known temp prefix, or under the TMPDIR the
+// scope step passed through (a bare "/" or a relative value never widens the list).
+const plainAbsolute = (x) => /^\/[A-Za-z0-9._+@\/-]+$/.test(x) && !x.split('/').includes('..') && !x.split('/').includes('.claude')
+const scopeTmpdir = scope && typeof scope.tmpdir === 'string' ? scope.tmpdir.replace(/\/+$/, '') : ''
+const tempPrefixes = ['/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/'].concat(scopeTmpdir && plainAbsolute(scopeTmpdir) ? [`${scopeTmpdir}/`] : [])
+const scratchUsable = plainAbsolute(scratchBase) && tempPrefixes.some((pre) => scratchBase.startsWith(pre))
+// Fix round 3 (AC-SEC-12): the before object is validated here, before the synthesis prompt needs its file path.
+const snapBefore = parseBeforeObj(scope && scope.snapshot_before, tempPrefixes)
+const scratchClause = (lens) =>
+  (scratchUsable
+    ? `Your private scratch root is ${scratchBase}/${lens} (create it with mkdir -p). `
+    : `Create your private scratch root first with \`mktemp -d "\${TMPDIR:-/tmp}/harn-${lens}-XXXXXX"\` and use only the path it prints. `) +
+    `Put every extraction, copy and scratch file for this review inside that root and nowhere else; no other lens or run shares it. ` +
+    `You must not write to the main checkout, to any worktree other than your own, to any .claude/ directory inside a repo, or to ~/.claude/. ` +
+    `When you finish you may delete only your own root, with: ${scratchUsable ? `rm -rf ${scratchBase}/${lens}` : 'rm -rf on the exact path mktemp printed'} (nothing else).\n\n`
+
 const lensPrompt = (lens) =>
   `REVIEW mode. The reviewed tip is commit ${scopeSha}. FIRST, before anything else, run \`git rev-parse HEAD\` ` +
   `in your worktree. If it differs, your checkout has drifted from the reviewed tip (a parallel session may have ` +
@@ -1135,6 +1223,7 @@ const lensPrompt = (lens) =>
   `Changed files (${paths.length} total):\n${fileList}\n\n` +
   `${specClause}\n\n` +
   (lens === 'lens-qa' ? qaBudget : '') +
+  scratchClause(lens) +
   `You are in an isolated git worktree: mutation experiments (break the guard, watch the test fail, restore) are safe here. ` +
   `The worktree will not contain uncommitted tooling from the main checkout (virtualenvs, node_modules); if you need the ` +
   `project's interpreter or test runner, invoke the main checkout's copy by absolute path (locate the main checkout ` +
@@ -1378,6 +1467,7 @@ const synthesis = await agent(
       `built change, not proof of repair -- when in doubt, leave it out of fixed_findings; a finding that stays open is ` +
       `the safe direction, a false confirmation is not. `
     : '') +
+  (snapBefore ? `Also return snapshot_after. ${snapshotAfterAsk(snapBefore.file)} Read-only: change nothing. ` : '') +
   `Also run \`git rev-parse HEAD\` in the repo NOW, at synthesis time, and return its exact output as ` +
   `head_sha_at_synthesis. This is not the sha you were told about: several agent sessions share these checkouts, and if ` +
   `another one switches branches mid-run the review would silently be about a different tree than it reports on. Report ` +
@@ -1406,10 +1496,56 @@ const synthesis = await agent(
         // never as "confirmed nothing" (which would be indistinguishable
         // from a genuine empty confirmation).
         fixed_findings: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
+        // HARN-OPT-5 T4 (AC-SEC-12): optional, so an older response validates.
+        snapshot_after: SNAPSHOT_SCHEMA,
       },
     },
   }
 )
+
+// HARN-OPT-5 T4 (AC-SEC-12, AC-QA-27): never by lens self-report. Reports only; nothing is deleted, moved or overwritten.
+// Fix round 3 (conductor measurement: 6638 files, 1.2 MB): the comparison is now the LIBRARY's measurement
+// (`stray-snapshot.mjs diff`, with the bidirectional, hash-aware and XY-decided rules of rounds 1 and 2), and this
+// script's role is validation and rendering. It checks both shapes and that the diff was made against the before
+// file it asked about (the rollups agree); a mismatch is could-not-be-made, never a rendered comparison.
+// 'unchecked' (null) stays distinct from 'checked clean' ([]).
+const strayWrites = []
+let retainedWorktrees = []
+let hashedCounts = null
+let strayNote = null
+let strayChecked = false
+const snapDiff = parseDiffObj(synthesis && synthesis.snapshot_after)
+// 'a snapshot was missing' is the round 1 wording, kept verbatim because an existing test pins it exactly.
+const couldNot = (why) => `The before/after comparison of the main checkout and ~/.claude/workflows/ could not be made (${why}), so stray writes by lenses are unchecked.`
+if (!snapBefore) {
+  strayNote = couldNot('a snapshot was missing')
+} else if (!snapDiff) {
+  strayNote = couldNot('a snapshot was missing')
+} else if (snapDiff.before_rollup !== snapBefore.rollup) {
+  strayNote = couldNot('its before_rollup did not match the rollup of the before-snapshot, so it was made against a different file')
+} else {
+  strayChecked = true
+  for (const c of snapDiff.changes) strayWrites.push({ path: c.path, change: c.change, shadows_installed_workflow: c.shadows_installed_workflow })
+  if (Array.isArray(snapDiff.retained_worktrees)) retainedWorktrees = snapDiff.retained_worktrees.filter(p => typeof p === 'string')
+  const h = snapDiff.hashed
+  if (h && Number.isInteger(h.repo) && Number.isInteger(h.home)) hashedCounts = h
+}
+// The header says what was compared and by whom, that the review itself removed or restored nothing, and how
+// many files were hashed. A change inside a file that git already lists as dirty, outside the hashed set, shows only
+// if its XY code moves.
+// Fix round 4 (review round 3 L2): a path is whatever a lens planted, and the renderer is the one place it reaches
+// markdown. Control characters (a newline would start a new report line, a heading, a verdict) are rendered as their
+// \uXXXX escape; the structured stray_writes field carries the path verbatim.
+const showPath = (p) => p.replace(/[\u0000-\u001f\u007f]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
+const strayReport = (strayNote
+  ? `\n\n### STRAY WRITES\n${strayNote}`
+  : strayWrites.length
+    ? `\n\n### STRAY WRITES\nMeasured by the stray-snapshot library, not by an agent: these paths differ between the start and the end of the lens phase, by every git status entry of the main checkout and by the hash (sha256) of the files in the harness-loaded locations (the repo .claude/ settings, hooks, agents, skills, workflows and commands, .githooks/, bin/, .github/workflows/, the shared .git/ config, hooks and info, and ~/.claude/ settings, CLAUDE.md, agents, skills, hooks, workflows, commands, bin and plugins)` +
+      (hashedCounts ? `; ${hashedCounts.repo} repo files${Number.isInteger(hashedCounts.git) ? `, ${hashedCounts.git} git-directory files` : ''} and ${hashedCounts.home} home files were hashed` : '') +
+      `. The review itself removed or restored nothing; review each by hand.\n` +
+      strayWrites.map(w => `- ${showPath(w.path)} (${w.change})${w.shadows_installed_workflow ? ' (a repo-local workflow copy: it will shadow the installed workflow of the same name)' : ''}`).join('\n')
+    : '') +
+  (retainedWorktrees.length ? `\n\nLens worktree retained: ${retainedWorktrees.map(showPath).join(', ')} (harness-owned, not a stray write).` : '')
 
 // A synthesis response missing the required structured fields (e.g. an
 // older or misbehaving agent that only returned prose) must not silently
@@ -1490,7 +1626,8 @@ return {
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
   // HARN-OPT-4 T4 (AC-QA-12, AC-OPS-4): appended in code so the guarantee does
   // not rest on synthesis obeying its prompt. Only when the run produced a report.
-  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '')) : '',
+  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '') + strayReport) : (snapBefore && (strayNote || strayWrites.length) ? strayReport.trim() : ''),  // fix round 4 (L1): a measured stray survives an aborted run
+  stray_writes: strayChecked ? strayWrites : null,
   __outcome: outcome,
 }
 

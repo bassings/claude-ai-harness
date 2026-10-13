@@ -127,7 +127,7 @@ test('review-cycle.js: normal completion preserves the existing return shape and
 // `result.open_findings = ...` assignment for the ordering).
 test('review-cycle.js: the result carries EXACTLY its documented keys plus telemetry -- the internal __outcome sentinel does not leak through (L5, AC-ARCH-10; widened fix round 2 for open_findings, justified above)', async () => {
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
-  assert.deepEqual(Object.keys(result).sort(), ['base', 'head', 'lenses', 'open_findings', 'report', 'skipped', 'telemetry', 'verdicts'])
+  assert.deepEqual(Object.keys(result).sort(), ['base', 'head', 'lenses', 'open_findings', 'report', 'skipped', 'stray_writes', 'telemetry', 'verdicts'])
 })
 
 // M1: a run whose synthesis agent fails (undefined response) or returns a
@@ -1643,7 +1643,11 @@ test('review-cycle.js: AC-QA-1 -- the scope:diff prompt instructs locating insta
   assert.match(scopeCall.prompt, /~\/\.claude\/workflows\/lib\/install-consistency\.mjs/, 'must name the global mirror install location, same convention as the ledger writer')
   assert.match(scopeCall.prompt, /CLAUDE_HOME/, 'must name CLAUDE_HOME as an override (M11)')
   assert.match(scopeCall.prompt, /takes priority and skips the search/, 'must state CLAUDE_HOME is checked FIRST, ahead of the (a)/(b) search')
-  assert.doesNotMatch(scopeCall.prompt, /git rev-parse --show-toplevel/, 'M2: the repo-local resolution branch (c) must be removed entirely, not merely prohibited in prose')
+  // HARN-OPT-5 T4 round 2: the prompt now also tells the agent to run stray-snapshot.mjs against "$(git rev-parse --show-toplevel)",
+  // so the M2 check is scoped to the install-consistency instruction (everything before the repo steps), which is what it guards.
+  const installInstruction = scopeCall.prompt.slice(0, scopeCall.prompt.indexOf('In the repo at the current working directory'))
+  assert.ok(installInstruction.length > 0 && installInstruction.includes('install-consistency.mjs'), 'precondition: the install-consistency instruction was isolated')
+  assert.doesNotMatch(installInstruction, /git rev-parse --show-toplevel/, 'M2: the repo-local resolution branch (c) must be removed entirely, not merely prohibited in prose')
   assert.match(scopeCall.prompt, /deliberately no repo-local fallback option at all/, 'must state plainly that no repo-local fallback exists at all (M2)')
   assert.match(scopeCall.prompt, /NEVER a path inside the repository currently being planned or reviewed/, 'must forbid branch (b) resolving to anything inside the reviewed checkout (M2)')
   assert.match(scopeCall.prompt, /as its ONE argument/, 'must instruct passing the resolved install root explicitly, not relying on the script\'s own ~/.claude default')
@@ -1857,8 +1861,9 @@ test('review-cycle.js: round three -- the override is named in the RETURNED REPO
 test('review-cycle.js: round three -- a report that is NOT overridden leaves the returned report untouched (the banner must not appear on every run)', async () => {
   const { result } = await runWorkflow(WF, { args: { allow_inconsistent_install: true }, agent: baseAgent() })
   // HARN-OPT-4 T4 (AC-QA-12): this run has no spec, so the script appends the
-  // no-spec consequence sentence. Still exact equality: nothing else, and no banner.
-  assert.equal(result.report, '### VERDICT\nCLEAN\n\nNo spec was supplied, so findings are not anchored to any acceptance criterion.', 'a consistent install must produce the synthesis report with only the no-spec sentence appended, and no override banner')
+  // no-spec consequence sentence. HARN-OPT-5 T4 (AC-QA-27): this fixture carries
+  // no snapshots, so the could-not-compare line follows. Still exact equality: nothing else, and no banner.
+  assert.equal(result.report, '### VERDICT\nCLEAN\n\nNo spec was supplied, so findings are not anchored to any acceptance criterion.\n\n### STRAY WRITES\nThe before/after comparison of the main checkout and ~/.claude/workflows/ could not be made (a snapshot was missing), so stray writes by lenses are unchecked.', 'a consistent install must produce the synthesis report with only the no-spec sentence appended, and no override banner')
 })
 
 test('review-cycle.js: round three -- a PROVEN mismatch with NO flag on args still refuses (the override must not be active by default)', async () => {
