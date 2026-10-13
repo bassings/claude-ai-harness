@@ -514,7 +514,8 @@ let ruleSourceOverriddenKeys = null
 // HARN-OPT-5 T4 fix round 3 (conductor measurement: 6638 hashed files, 1.2 MB; AC-SEC-12 as amended, AC-QA-27):
 // module-level so run() gains no `return` statements (AC-QA-9 pins that count). The agents relay only SMALL objects, as
 // JSON text: the before object { file, status_count, files_count, rollup } from `stray-snapshot.mjs snapshot`, and the
-// diff object { changes, retained_worktrees, dropped, before_rollup, after_rollup, hashed } from `stray-snapshot.mjs diff`.
+// diff object { changes, retained_worktrees, dropped, before_rollup, after_rollup, hashed } from `stray-snapshot.mjs diff`
+// (hashed is { repo, home } and, from fix round 4 M1, git: the shared git directory's config, hooks and info).
 // The comparison is the library's measurement; the script validates both shapes and renders. Anything that is not
 // that shape is null ("could not be made").
 const parseObj = (x) => {
@@ -1532,15 +1533,19 @@ if (!snapBefore) {
 // The header says what was compared and by whom, that the review itself removed or restored nothing, and how
 // many files were hashed. A change inside a file that git already lists as dirty, outside the hashed set, shows only
 // if its XY code moves.
+// Fix round 4 (review round 3 L2): a path is whatever a lens planted, and the renderer is the one place it reaches
+// markdown. Control characters (a newline would start a new report line, a heading, a verdict) are rendered as their
+// \uXXXX escape; the structured stray_writes field carries the path verbatim.
+const showPath = (p) => p.replace(/[\u0000-\u001f\u007f]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
 const strayReport = (strayNote
   ? `\n\n### STRAY WRITES\n${strayNote}`
   : strayWrites.length
-    ? `\n\n### STRAY WRITES\nMeasured by the stray-snapshot library, not by an agent: these paths differ between the start and the end of the lens phase, by every git status entry of the main checkout and by the hash (sha256) of the files in the harness-loaded locations (the repo .claude/ settings, hooks, agents, skills, workflows and commands, .githooks/, bin/, .github/workflows/, and ~/.claude/ settings, CLAUDE.md, agents, skills, hooks, workflows, commands, bin and plugins)` +
-      (hashedCounts ? `; ${hashedCounts.repo} repo files and ${hashedCounts.home} home files were hashed` : '') +
+    ? `\n\n### STRAY WRITES\nMeasured by the stray-snapshot library, not by an agent: these paths differ between the start and the end of the lens phase, by every git status entry of the main checkout and by the hash (sha256) of the files in the harness-loaded locations (the repo .claude/ settings, hooks, agents, skills, workflows and commands, .githooks/, bin/, .github/workflows/, the shared .git/ config, hooks and info, and ~/.claude/ settings, CLAUDE.md, agents, skills, hooks, workflows, commands, bin and plugins)` +
+      (hashedCounts ? `; ${hashedCounts.repo} repo files${Number.isInteger(hashedCounts.git) ? `, ${hashedCounts.git} git-directory files` : ''} and ${hashedCounts.home} home files were hashed` : '') +
       `. The review itself removed or restored nothing; review each by hand.\n` +
-      strayWrites.map(w => `- ${w.path} (${w.change})${w.shadows_installed_workflow ? ' (a repo-local workflow copy: it will shadow the installed workflow of the same name)' : ''}`).join('\n')
+      strayWrites.map(w => `- ${showPath(w.path)} (${w.change})${w.shadows_installed_workflow ? ' (a repo-local workflow copy: it will shadow the installed workflow of the same name)' : ''}`).join('\n')
     : '') +
-  (retainedWorktrees.length ? `\n\nLens worktree retained: ${retainedWorktrees.join(', ')} (harness-owned, not a stray write).` : '')
+  (retainedWorktrees.length ? `\n\nLens worktree retained: ${retainedWorktrees.map(showPath).join(', ')} (harness-owned, not a stray write).` : '')
 
 // A synthesis response missing the required structured fields (e.g. an
 // older or misbehaving agent that only returned prose) must not silently
@@ -1621,7 +1626,7 @@ return {
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
   // HARN-OPT-4 T4 (AC-QA-12, AC-OPS-4): appended in code so the guarantee does
   // not rest on synthesis obeying its prompt. Only when the run produced a report.
-  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '') + strayReport) : (strayNote && snapBefore ? strayReport.trim() : ''),
+  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '') + strayReport) : (snapBefore && (strayNote || strayWrites.length) ? strayReport.trim() : ''),  // fix round 4 (L1): a measured stray survives an aborted run
   stray_writes: strayChecked ? strayWrites : null,
   __outcome: outcome,
 }

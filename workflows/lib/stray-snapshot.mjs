@@ -21,9 +21,17 @@
 //   node stray-snapshot.mjs diff <repo-root> <before-file>
 //     takes a fresh snapshot, compares it with the before-file, and prints ONE compact object
 //     { changes: [{path, change, shadows_installed_workflow}], retained_worktrees, dropped,
-//       before_rollup, after_rollup, hashed: { repo, home } }. An unreadable or malformed before-file exits
+//       before_rollup, after_rollup, hashed: { repo, home, git } }. An unreadable or malformed before-file exits
 //     non-zero with a one-line reason on stderr and nothing on stdout.
-// The library never deletes, moves or appends: its only write is the one new file snapshot mode creates.
+// The library never writes into a repo or a home directory. Its only write is the file snapshot mode creates, and its
+// only removal is that same file (and its harn-snap-* parent) once a successful diff has read it (fix round 4, L3).
+//
+// Fix round 4 (conductor fix pass after review round 3; AC-SEC-12 as amended). M1: the SHARED git directory was not
+// watched, and it is the cheapest persistence route open to a prompt-injected lens: `git config core.hooksPath` or
+// `core.fsmonitor` run inside a lens worktree writes the common .git/config, which decides whether the hashed
+// .githooks/ files run at all. The common git dir's config, hooks/ and info/ (resolved with
+// `git rev-parse --git-common-dir`, never a caller-supplied path) are hashed under the label '.git/...'. Never the
+// index, objects, refs or logs: `git status` itself refreshes the index, so hashing it would report the library's own run.
 //
 // status  every entry of `git status --porcelain=v1 -z --untracked-files=all --ignored` (-z means no
 //         C-quoting; a rename is one entry at its target path), minus bulk ignored directories, chosen
@@ -57,6 +65,15 @@ const changeOfXy = (xy) => (/D/.test(xy) ? 'removed' : /[MT]/.test(xy) ? 'change
 
 const byPath = (a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
 const plainSort = (xs) => [...xs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+
+// The common git directory (shared by every worktree of the checkout), absolute. Null when the root is not a checkout.
+function gitCommonDir(root) {
+  const res = spawnSync('git', ['-C', root, 'rev-parse', '--git-common-dir'], { encoding: 'utf8' })
+  if (res.error || res.status !== 0) return null
+  const d = res.stdout.trim()
+  return d ? path.resolve(root, d) : null
+}
+const GIT_DIR_LOCATIONS = ['config', 'hooks', 'info']
 
 function gitStatus(root) {
   const res = spawnSync('git', ['-C', root, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored'],
@@ -119,9 +136,12 @@ function walk(abs, label, skipDirs, out, seen) {
   }
 }
 
-function hashFiles(root, home) {
+function hashFiles(root, home, gitDir) {
   const out = []
   for (const loc of REPO_LOCATIONS) walk(path.join(root, loc), loc, new Set(['node_modules']), out, new Set())
+  // Fix round 4 M1: the common git dir, labelled '.git/...' whatever its real location (a worktree's common dir is the
+  // main checkout's), so the label never carries an absolute path.
+  if (gitDir) for (const loc of GIT_DIR_LOCATIONS) walk(path.join(gitDir, loc), `.git/${loc}`, new Set(), out, new Set())
   for (const loc of HOME_LOCATIONS) {
     const skip = new Set(loc === 'plugins' ? ['node_modules', 'cache'] : ['node_modules'])
     walk(path.join(home, '.claude', loc), `~/.claude/${loc}`, skip, out, new Set())
@@ -136,7 +156,7 @@ function takeSnapshot(rootDir) {
   const raw = gitStatus(rootDir)
   if (raw === null) return null
   const { status, retained, dropped } = classify(parseStatus(raw))
-  return { status, files: hashFiles(rootDir, os.homedir()), retained_worktrees: retained, dropped }
+  return { status, files: hashFiles(rootDir, os.homedir(), gitCommonDir(rootDir)), retained_worktrees: retained, dropped }
 }
 
 const fail = (msg, code = 1) => {
@@ -153,6 +173,15 @@ function readBefore(file) {
   const ok = body && typeof body === 'object' && !Array.isArray(body) && Array.isArray(body.status) && Array.isArray(body.files)
   if (!ok) return fail(`before-file ${file} is not a snapshot (status and files arrays required)`)
   return { body, rollup: sha256Of(bytes) }
+}
+
+// Fix round 4 (L3): a successful diff reaps the before-file it read, but ONLY a file snapshot mode made: named
+// before.json inside a harn-snap-* directory. The directory goes with it when empty. Anything else is left alone, and
+// a refused before-file is left for forensics. Failure to remove is not an error: the diff on stdout is the result.
+function reapBefore(file) {
+  const dir = path.dirname(path.resolve(file))
+  if (path.basename(file) !== 'before.json' || !path.basename(dir).startsWith('harn-snap-')) return
+  try { fs.unlinkSync(file); fs.rmdirSync(dir) } catch { /* left in place; stdout already carries the result */ }
 }
 
 // Deterministic comparison (moved here from review-cycle.js in fix round 3). Status entries by path, the XY code
@@ -199,14 +228,16 @@ if (mode === 'snapshot') {
   process.stdout.write(JSON.stringify({ file, status_count: snap.status.length, files_count: snap.files.length, rollup: sha256Of(bytes) }) + '\n')
 } else if (mode === 'diff') {
   const home = snap.files.filter((f) => f.path.startsWith('~/.claude/')).length
+  const git = snap.files.filter((f) => f.path.startsWith('.git/')).length  // round 4 M1: counted on its own
   process.stdout.write(JSON.stringify({
     changes: compare(before.body, snap),
     retained_worktrees: snap.retained_worktrees,
     dropped: snap.dropped,
     before_rollup: before.rollup,
     after_rollup: sha256Of(JSON.stringify(snap) + '\n'),
-    hashed: { repo: snap.files.length - home, home },
+    hashed: { repo: snap.files.length - home - git, home, git },
   }) + '\n')
+  reapBefore(args[2])
 } else {
   process.stdout.write(JSON.stringify(snap) + '\n')
 }

