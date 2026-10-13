@@ -1870,7 +1870,16 @@ export function main() {
   let payload
   try {
     const raw = readStdin()
-    payload = raw.trim() ? JSON.parse(raw) : {}
+    // HARN-OPT-5 T5 (AC-SEC-1): the ledger:write step feeds this script a
+    // file holding the BASE64 of the payload JSON. Trimmed stdin made only
+    // of base64-alphabet characters (and padding) is decoded as UTF-8
+    // first; raw JSON (the conductor's conduct_plan_event lines) starts
+    // with a brace, which is outside that alphabet, so it is unaffected.
+    // Anything that decodes to non-JSON falls to the malformed-input path.
+    const text = raw.trim()
+    const stripped = text.replace(/\s+/g, '')
+    const decoded = stripped && /^[A-Za-z0-9+/]+={0,2}$/.test(stripped) ? Buffer.from(stripped, 'base64').toString('utf8') : raw
+    payload = text ? JSON.parse(decoded) : {}
   } catch (e) {
     return result(randomUUID(), ts, false, 'payload was not valid JSON: ' + e.message)
   }
