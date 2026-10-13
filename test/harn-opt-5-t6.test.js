@@ -536,3 +536,20 @@ test('T6 round 2 F5 AC-DATA-4: an operator line appended while the writer sits i
   assert.equal(readLedgerLines(repo).length, 1)
   assert.deepEqual(strayFiles(path.dirname(exclude)), [])
 })
+
+// Conductor, after the T6 round-3 push: the pre-push gate hung for 54 minutes
+// inside `git check-ignore -v -z --stdin` (git waiting on stdin) and did not
+// reproduce in five capped runs. Pinned statically: every git call the
+// function makes carries a timeout, so a recurrence fails closed instead of
+// freezing the gate. The behavioural proof (a git that never exits) is not
+// executed here, stated plainly.
+test('T6 conductor: every git subprocess in ensureGitignored carries a timeout, so a hung git fails closed rather than freezing the writer', () => {
+  const src = fs.readFileSync(APPEND_SCRIPT, 'utf8')
+  const start = src.indexOf('function ensureGitignored(')
+  const end = src.indexOf('\n}\n', start)
+  const body = src.slice(start, end)
+  const calls = body.match(/execFileSync\('git'[^\n]*/g) || []
+  assert.ok(calls.length >= 2, `expected the classifying and post-write git calls, found ${calls.length}`)
+  for (const c of calls) assert.match(c, /timeout: GIT_CALL_TIMEOUT_MS/, `git call without a timeout: ${c}`)
+  assert.match(src, /const GIT_CALL_TIMEOUT_MS = \d+/)
+})

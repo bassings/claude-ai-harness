@@ -1677,6 +1677,10 @@ function resolveWorkingTreeRoot(cwd) {
 // operator's file to begin with, so writing to it can never turn up as a
 // diff on a tracked file, never needs staging, and never gets swept into
 // an unrelated `git add -A`.
+// Upper bound on any git subprocess ensureGitignored runs; a hang becomes a
+// fail-closed refusal rather than a frozen writer (see the note at the call).
+const GIT_CALL_TIMEOUT_MS = 10_000
+
 function ensureGitignored(root) {
   // AC-DATA-1/AC-QA-18: ask git first and touch nothing when the ledger is
   // already ignored (by this file or a tracked .gitignore). The old
@@ -1697,7 +1701,12 @@ function ensureGitignored(root) {
     // L1 (AC-SEC-13): -z (which git only allows with --stdin) gives NUL-separated fields (source, line, pattern,
     // path), so a ':' inside the excludes file's own path cannot shift the
     // pattern field the way splitting the plain `-v` line on ':' did.
-    const hit = execFileSync('git', ['check-ignore', '-v', '-z', '--stdin'], { cwd: root, encoding: 'utf8', input: LEDGER_RELATIVE_PATH + '\0', stdio: ['pipe', 'pipe', 'ignore'] })
+    // Conductor, after the T6 round-3 push: the pre-push gate once sat for 54
+    // minutes inside this call, git waiting on stdin, not reproduced in five
+    // capped runs since. Every git call here carries a timeout so a recurrence
+    // fails closed (a thrown, non-1 status below) instead of freezing the
+    // caller.
+    const hit = execFileSync('git', ['check-ignore', '-v', '-z', '--stdin'], { cwd: root, encoding: 'utf8', input: LEDGER_RELATIVE_PATH + '\0', stdio: ['pipe', 'pipe', 'ignore'], timeout: GIT_CALL_TIMEOUT_MS })
     const pattern = hit.split('\0')[2] || ''
     verdict = pattern.startsWith('!') ? 'negated' : 'ignored'
   } catch (e) {
@@ -1818,7 +1827,7 @@ function ensureGitignored(root) {
   // the path is now ignored (exit 0) or refuse; security outranks the extra
   // subprocess (AC-QA-20). Runs whether or not this writer changed the file.
   try {
-    execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root, stdio: 'ignore' })
+    execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root, stdio: 'ignore', timeout: GIT_CALL_TIMEOUT_MS })
   } catch (e) {
     return false
   }
