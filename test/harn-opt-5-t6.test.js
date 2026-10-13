@@ -281,10 +281,10 @@ function runOne(repo, extraEnv) {
   return { ...res, out: JSON.parse(res.stdout.trim().split('\n').pop()) }
 }
 
-// Round 1 M1 (AC-SEC-13 intent, AC-SEC-1): `git check-ignore` never reports a
+// Round 1 M1 (AC-SEC-13 intent): `git check-ignore` never reports a
 // TRACKED path, so a force-added ledger exits 1 before and after the exclude
 // line is written. The writer must refuse rather than append to a file git tracks.
-test('T6 M1 AC-SEC-1: a force-added, committed ledger makes every concurrent writer refuse and leaves the ledger bytes unchanged', async () => {
+test('T6 M1 AC-SEC-13: a force-added, committed ledger makes every concurrent writer refuse and leaves the ledger bytes unchanged', async () => {
   const repo = makeTempRepo()
   const ledger = path.join(repo, LEDGER_REL)
   fs.mkdirSync(path.dirname(ledger), { recursive: true })
@@ -301,7 +301,7 @@ test('T6 M1 AC-SEC-1: a force-added, committed ledger makes every concurrent wri
 })
 
 // Round 1 M1: any check-ignore exit other than 1 (here 128) is an error, not "unmatched".
-test('T6 M1 AC-SEC-1: a corrupt .git/index (check-ignore exits non-1) fails closed with write_ok false and no ledger line', () => {
+test('T6 M1 AC-SEC-13: a corrupt .git/index (check-ignore exits non-1) fails closed with write_ok false and no ledger line', () => {
   const repo = makeTempRepo()
   fs.writeFileSync(path.join(repo, '.git', 'index'), 'NOT-AN-INDEX-garbage-garbage-garbage')
   const probe = spawnSync('git', ['check-ignore', '-q', LEDGER_REL], { cwd: repo })
@@ -320,7 +320,7 @@ test('T6 M1 AC-SEC-1: a corrupt .git/index (check-ignore exits non-1) fails clos
   assert.equal(fs.readFileSync(excludePath, 'utf8'), '# untouched\n', 'a non-1 check-ignore exit must not write the exclude file')
 })
 
-test('T6 M1 AC-SEC-1: a symlinked .claude directory (check-ignore exits 128, beyond a symbolic link) fails closed', () => {
+test('T6 M1 AC-SEC-13: a symlinked .claude directory (check-ignore exits 128, beyond a symbolic link) fails closed', () => {
   const repo = makeTempRepo()
   const elsewhere = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'claude-elsewhere-'))
   fs.rmSync(path.join(repo, '.claude'), { recursive: true, force: true })
@@ -365,4 +365,113 @@ test('T6 L2 AC-QA-19: a missing .git/info directory is created and the write suc
   const { out } = runOne(repo)
   assert.equal(out.write_ok, true, out.write_error)
   assert.equal(fs.readFileSync(excludePathOf(repo), 'utf8'), LEDGER_REL + '\n')
+})
+
+
+// ---------------------------------------------------------------------------
+// Fix round 2 (PR #13 review round 2, F1 to F5).
+
+function writeOnce(repo, extraEnv) {
+  return runOne(repo, extraEnv)
+}
+
+// Round 2 F1 (AC-DATA-5, AC-SEC-13): a DANGLING symlinked exclude was treated
+// as absent and the rename landed over the link. Fail closed instead.
+test('T6 round 2 F1 AC-DATA-5: a dangling symlinked exclude stays a symlink with the same link string; write_ok false, the condition named, the resolved path never leaked, no ledger line', () => {
+  const repo = makeTempRepo()
+  const exclude = excludePathOf(repo)
+  const gone = path.join(SUITE_TMPDIR, 'dangling-target-dir-f1', 'does-not-exist')
+  fs.rmSync(exclude, { force: true })
+  fs.symlinkSync(gone, exclude)
+  const { out } = writeOnce(repo)
+  assert.ok(fs.lstatSync(exclude).isSymbolicLink(), 'exclude must still be a symlink, not a regular file')
+  assert.equal(fs.readlinkSync(exclude), gone, 'link string unchanged')
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /exclude path is a dangling symlink/)
+  assert.ok(!out.write_error.includes(gone), 'the resolved path must not appear in write_error')
+  assert.equal(readLedgerLines(repo).length, 0)
+  assert.deepEqual(strayFiles(path.dirname(exclude)), [], 'no stray temp file')
+})
+
+// Round 2 F2 (AC-QA-18): hermetic against the operator's global git ignore.
+test('T6 round 2 F2 AC-QA-18: makeTempRepo is hermetic against a global excludes file (core.excludesFile is /dev/null)', () => {
+  const repo = makeTempRepo()
+  assert.equal(sh('git config --local --get core.excludesFile', repo).trim(), '/dev/null')
+})
+
+test('T6 round 2 F2 AC-QA-18: a repo-local core.excludesFile already ignoring .claude/ means write_ok true with the exclude untouched (inode, mtime, bytes)', () => {
+  const repo = makeTempRepo()
+  const dir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'local-excl-'))
+  const excl = path.join(dir, 'ignore')
+  fs.writeFileSync(excl, '.claude/\n')
+  sh(`git config core.excludesFile ${JSON.stringify(excl)}`, repo)
+  const exclude = excludePathOf(repo)
+  fs.mkdirSync(path.dirname(exclude), { recursive: true })
+  fs.writeFileSync(exclude, OPERATOR_LINES)
+  const before = fs.statSync(exclude)
+  const beforeBytes = fs.readFileSync(exclude)
+  const { out } = writeOnce(repo)
+  assert.equal(out.write_ok, true, out.write_error)
+  const after = fs.statSync(exclude)
+  assert.equal(after.ino, before.ino, 'inode unchanged')
+  assert.equal(after.mtimeMs, before.mtimeMs, 'mtime unchanged')
+  assert.ok(fs.readFileSync(exclude).equals(beforeBytes), 'bytes unchanged')
+  assert.equal(readLedgerLines(repo).length, 1)
+})
+
+// Round 2 F3 (AC-DATA-5, spec bug, refuse rather than bypass): a rename forks a hard-linked exclude.
+test('T6 round 2 F3 AC-DATA-5: a hard-linked exclude is refused, the inode is still shared, the bytes are unchanged, the condition is named and no ledger line is written', () => {
+  const repo = makeTempRepo()
+  const exclude = excludePathOf(repo)
+  const other = path.join(fs.mkdtempSync(path.join(SUITE_TMPDIR, 'hardlink-')), 'other-name')
+  fs.writeFileSync(exclude, OPERATOR_LINES)
+  fs.linkSync(exclude, other)
+  const { out } = writeOnce(repo)
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /hard link/i)
+  assert.equal(fs.statSync(exclude).ino, fs.statSync(other).ino, 'still one shared inode')
+  assert.equal(fs.statSync(exclude).nlink, 2)
+  assert.equal(fs.readFileSync(exclude, 'utf8'), OPERATOR_LINES)
+  assert.equal(fs.readFileSync(other, 'utf8'), OPERATOR_LINES)
+  assert.equal(readLedgerLines(repo).length, 0)
+  assert.deepEqual(strayFiles(path.dirname(exclude)), [], 'no stray temp file')
+})
+
+// Round 2 F4 (AC-DATA-5, spec bug): a read-only exclude in a writable .git/info
+// was silently replaced where the old in-place write failed with EACCES.
+test('T6 round 2 F4 AC-DATA-5: a read-only (0444) exclude is refused with the condition named, bytes and mode unchanged, no ledger line', () => {
+  const repo = makeTempRepo()
+  const exclude = excludePathOf(repo)
+  fs.writeFileSync(exclude, OPERATOR_LINES)
+  try {
+    fs.chmodSync(exclude, 0o444)
+    const { out } = writeOnce(repo)
+    assert.equal(out.write_ok, false)
+    assert.match(out.write_error, /not writable|read-only/i)
+    assert.equal(fs.readFileSync(exclude, 'utf8'), OPERATOR_LINES)
+    assert.equal(fs.statSync(exclude).mode & 0o777, 0o444, 'mode unchanged')
+    assert.equal(readLedgerLines(repo).length, 0)
+    assert.deepEqual(strayFiles(path.dirname(exclude)), [], 'no stray temp file')
+  } finally {
+    fs.chmodSync(exclude, 0o644)
+  }
+})
+
+// Round 2 F5 (AC-DATA-4): an operator edit between the writer's read and its rename was lost.
+test('T6 round 2 F5 AC-DATA-4: an operator line appended while the writer sits in the replacement window survives alongside the ledger line', async () => {
+  const repo = makeTempRepo()
+  const exclude = excludePathOf(repo)
+  fs.writeFileSync(exclude, OPERATOR_LINES)
+  const w = spawnWriter(repo, 1, { [WINDOW]: '1500' })
+  await waitFor(() => strayFiles(path.dirname(exclude))[0], 15000, 'temp file in .git/info')
+  fs.appendFileSync(exclude, '*.added-during-window\n')
+  const r = await w.done
+  assert.ok(r.out, `no result: ${r.stdout} ${r.stderr}`)
+  assert.equal(r.out.write_ok, true, r.out.write_error)
+  const lines = fs.readFileSync(exclude, 'utf8').split('\n')
+  assert.ok(lines.includes('*.added-during-window'), 'the operator edit made during the window must survive')
+  assert.ok(lines.includes('*.secret-scratch'), 'original operator lines survive')
+  assert.ok(lines.includes(LEDGER_REL), 'ledger line present')
+  assert.equal(readLedgerLines(repo).length, 1)
+  assert.deepEqual(strayFiles(path.dirname(exclude)), [])
 })
