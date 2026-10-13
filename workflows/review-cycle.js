@@ -511,34 +511,13 @@ let ruleSourceOverriddenKeys = null
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
 
-// HARN-OPT-5 T4 round 1 (L4, AC-QA-27): module-level so run() gains no `return` statements (AC-QA-9 pins that count).
-// git quotes unusual paths in C style when -z is not honoured; undo it (octal bytes, \", \\, \n, \t) via percent-decoding.
-function unquoteC(q) {
-  if (q.length < 2 || q[0] !== '"' || q[q.length - 1] !== '"') return q
-  const esc = { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', f: '\f', v: '\v' }
-  const body = q.slice(1, -1)
-  let enc = ''
-  try {
-    for (let i = 0; i < body.length; i++) {
-      const c = body[i]
-      if (c !== '\\') { enc += encodeURIComponent(c); continue }
-      const oct = /^[0-7]{3}/.exec(body.slice(i + 1))
-      if (oct) { enc += '%' + parseInt(oct[0], 8).toString(16).padStart(2, '0'); i += 3; continue }
-      i++
-      enc += encodeURIComponent(esc[body[i]] !== undefined ? esc[body[i]] : body[i])
-    }
-    return decodeURIComponent(enc)
-  } catch (e) { return body }
-}
-// A status entry is "XY path". A rename or copy is "R  target\0origin" under -z (target first) or "R  origin -> target" without it; the target is the path reported.
-function statusPath(entry) {
-  const parts = entry.split('\0')
-  let p = parts[0].slice(3)
-  if (/[RC]/.test(parts[0].slice(0, 2)) && parts.length < 2) {
-    const i = p.lastIndexOf(' -> ')
-    if (i >= 0) p = p.slice(i + 4)
-  }
-  return unquoteC(p)
+// HARN-OPT-5 T4 round 2 (AC-SEC-12): module-level so run() gains no `return` statements (AC-QA-9 pins that count).
+// The snapshot arrives as the JSON text of stray-snapshot.mjs; anything that is not that shape is null ("could not be made").
+const parseSnap = (x) => {
+  let v = x
+  if (typeof x === 'string') { try { v = JSON.parse(x) } catch { return null } }
+  const ok = v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.status) && Array.isArray(v.files)
+  return ok ? v : null
 }
 // Reads budget.spent() defensively: null (never 0) when budget is absent or
 // throws, so "unmeasured" stays distinguishable from "measured zero"
@@ -709,28 +688,23 @@ function redactLogText(text) {
 // ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
 async function run() {
 
-// HARN-OPT-5 T4 (AC-SEC-12): the shape shared by snapshot_before and snapshot_after.
-const SNAPSHOT_SCHEMA = {
-  type: 'object',
-  properties: {
-    status: { type: 'array', items: { type: 'string' } },
-    workflow_files: { type: 'array', items: { type: 'object', required: ['path', 'sha256'], properties: { path: { type: 'string' }, sha256: { type: 'string' } } } },
-  },
-}
+// HARN-OPT-5 T4 fix round 2 (re-frame; AC-SEC-12, AC-QA-27): the snapshot is COMPUTED by
+// workflows/lib/stray-snapshot.mjs and the agent only relays its stdout, so completeness no
+// longer competes with transcription volume (round 2 M1, M2, M4). The field is JSON TEXT, which
+// the script parses below; anything that does not parse to the library's shape is "could not be made".
+const SNAPSHOT_SCHEMA = { type: 'string' }
 
-// HARN-OPT-5 T4 fix round 1 (M1, M2, L3; AC-SEC-12, AC-QA-27): the one wording of the
-// snapshot ask, used at BOTH prompt sites so the before and after commands cannot drift.
-// The status command is narrowed (M2) so the agent transcribes tens of lines, not
-// hundreds: -z for unambiguous renames, a pathspec of the source and config types plus
-// .claude, and explicit exclusion of bulk ignored directories. The hashed set (M1, L3)
-// covers the repo's own .claude/workflows/ and the code-bearing parts of ~/.claude/,
-// never projects/ or todos/ (runtime churn).
-const SNAPSHOT_STATUS_CMD = "`git status --porcelain --untracked-files=all --ignored=matching -z -- .claude '*.js' '*.mjs' '*.py' '*.json' '*.md' ':(exclude,glob)**/node_modules/**' ':(exclude,glob)**/coverage/**' ':(exclude,glob)**/__pycache__/**' ':(exclude,glob)**/.venv/**' ':(exclude,glob)**/venv/**'`"
+// One wording, used at BOTH prompt sites so the before and after commands cannot drift. The library
+// is found exactly as the ledger step finds ledger-append.mjs (see ledgerWritePrompt): a repo-local
+// copy in any other repo is what a hostile diff under review could plant.
 const SNAPSHOT_ASK =
-  `status = the exact entries of ${SNAPSHOT_STATUS_CMD} run at the repo root (one array element per NUL-separated entry; ` +
-  `a rename is one element with its two paths), and workflow_files = {path, sha256} (sha256 of the contents) for every file in ` +
-  `the repo's own .claude/workflows/ (tracked, untracked or ignored; repo-relative path) and, under ~/.claude/, settings.json, ` +
-  `AGENT-HARNESS.md and every file under agents/, skills/, hooks/ and workflows/ (absolute path). Never hash projects/ or todos/ (runtime churn).`
+  `Find this harness's stray-snapshot.mjs script, in this exact order, and use the FIRST one that exists: ` +
+  `(a) ~/.claude/workflows/lib/stray-snapshot.mjs (the global mirror install); (b) any installed claude-ai-harness ` +
+  `plugin directory's workflows/lib/stray-snapshot.mjs; (c) "$(git rev-parse --show-toplevel)/workflows/lib/stray-snapshot.mjs" ` +
+  `in the current repo, but ONLY if the current repo is claude-ai-harness itself (the basename of ` +
+  `\`git rev-parse --show-toplevel\` equals "claude-ai-harness"). NEVER use a repo-local copy in any OTHER repo, even if ` +
+  `(a) and (b) are both absent: return an empty string instead. Then run exactly \`node <path-to-stray-snapshot.mjs> ` +
+  `"$(git rev-parse --show-toplevel)"\` and return its stdout JSON verbatim, unedited, as the value. Do not list, hash or summarise anything yourself.`
 
 // ---- Phase 1: scope ----
 phase('Scope')
@@ -751,7 +725,7 @@ const scope = await agent(
   `5. Create a private scratch root for this run with \`mktemp -d "\${TMPDIR:-/tmp}/harn-review-XXXXXX"\` and return the exact ` +
   `absolute path it printed as scratch_root. It must be OUTSIDE every git working tree: the OS temp directory, never the repo, ` +
   `never a worktree, never any .claude/ directory. Create nothing else in it. If TMPDIR is set, also return its exact value as tmpdir.\n` +
-  `6. Return snapshot_before: ${SNAPSHOT_ASK} Change nothing.\n` +
+  `6. Return snapshot_before. ${SNAPSHOT_ASK} Change nothing.\n` +
   `Raw data only.`,
   {
     label: 'scope:diff',
@@ -1462,7 +1436,7 @@ const synthesis = await agent(
       `built change, not proof of repair -- when in doubt, leave it out of fixed_findings; a finding that stays open is ` +
       `the safe direction, a false confirmation is not. `
     : '') +
-  `Also return snapshot_after, taken NOW with the same commands as the before-snapshot: ${SNAPSHOT_ASK} Read-only: change nothing. ` +
+  `Also return snapshot_after, taken NOW the same way as the before-snapshot. ${SNAPSHOT_ASK} Read-only: change nothing. ` +
   `Also run \`git rev-parse HEAD\` in the repo NOW, at synthesis time, and return its exact output as ` +
   `head_sha_at_synthesis. This is not the sha you were told about: several agent sessions share these checkouts, and if ` +
   `another one switches branches mid-run the review would silently be about a different tree than it reports on. Report ` +
@@ -1500,43 +1474,39 @@ const synthesis = await agent(
 
 // HARN-OPT-5 T4 (AC-SEC-12, AC-QA-27): compared HERE, deterministically, never
 // by lens self-report. Reports only; nothing is deleted, moved or overwritten.
-// Round 1 (M1, M2, L1, L4): the comparison is bidirectional (a before-only entry is
-// 'removed'), hashed files compare by hash (an overwrite is 'changed'), harness-owned
-// and transient paths are filtered in code, renames and C-quoted paths are parsed, and
-// 'unchecked' (null) is distinct from 'checked clean' ([]).
-const snapOk = (x) => x && Array.isArray(x.status) && Array.isArray(x.workflow_files)
+// Round 1 (M1, M2, L1): bidirectional (a before-only entry is 'removed'), hashed files compare
+// by hash (an overwrite is 'changed'), 'unchecked' (null) is distinct from 'checked clean' ([]).
+// Round 2 (M1 to M4, L2): the snapshot is the JSON stdout of stray-snapshot.mjs, so the paths
+// arrive resolved and the harness-owned worktrees and transient files arrive pre-separated
+// (retained_worktrees, dropped); the filters that lived here moved into the library, where
+// they are anchored. The change of a newly appearing status entry comes from its XY code, so
+// a tracked file a lens deleted or edited is never labelled 'added' (M3).
 const strayWrites = []
-const retainedWorktrees = []
+let retainedWorktrees = []
 let strayNote = null
 let strayChecked = false
-const snapBefore = scope.snapshot_before
-const snapAfter = synthesis && synthesis.snapshot_after
-const isRepoWorkflow = (p) => !p.startsWith('/') && /(^|\/)\.claude\/workflows\/[^/]+$/.test(p)
-const isTransientPath = (p) => /^\.claude\/scheduled_tasks\.(lock|json)$/.test(p)
-const isLensWorktree = (p) => /^\.claude\/worktrees\//.test(p)
-if (!snapOk(snapBefore) || !snapOk(snapAfter)) {
+const snapBefore = parseSnap(scope.snapshot_before)
+const snapAfter = parseSnap(synthesis && synthesis.snapshot_after)
+// Anchored at the repo root (round 2 L2): '~/.claude/workflows/x.js' is the installed copy, not a shadow of it.
+const isRepoWorkflow = (p) => /^\.claude\/workflows\/[^/]+$/.test(p)
+const changeOfXy = (xy) => (/D/.test(xy) ? 'removed' : /[MT]/.test(xy) ? 'changed' : 'added')
+if (!snapBefore || !snapAfter) {
   strayNote = 'The before/after comparison of the main checkout and ~/.claude/workflows/ could not be made (a snapshot was missing), so stray writes by lenses are unchecked.'
 } else {
   strayChecked = true
-  const entries = (list) => list.filter(l => typeof l === 'string').map(line => ({ line, path: statusPath(line) }))
-  const bStatus = entries(snapBefore.status)
-  const aStatus = entries(snapAfter.status)
-  const bLines = new Set(bStatus.map(e => e.line))
-  const aLines = new Set(aStatus.map(e => e.line))
-  const bPaths = new Set(bStatus.map(e => e.path))
-  const aPaths = new Set(aStatus.map(e => e.path))
+  const wellFormed = (l, k) => l.filter(e => e && typeof e === 'object' && typeof e.path === 'string' && typeof e[k] === 'string')
+  const bStatus = new Map(wellFormed(snapBefore.status, 'xy').map(e => [e.path, e.xy]))
+  const aStatus = new Map(wellFormed(snapAfter.status, 'xy').map(e => [e.path, e.xy]))
   const add = (path, change) => strayWrites.push({ path, change, shadows_installed_workflow: change !== 'removed' && isRepoWorkflow(path) })
-  for (const e of aStatus) {
-    if (bLines.has(e.line) || isTransientPath(e.path)) continue
-    if (isLensWorktree(e.path)) { retainedWorktrees.push(e.path); continue }
-    add(e.path, bPaths.has(e.path) ? 'changed' : 'added')
+  for (const [p, xy] of aStatus) {
+    if (!bStatus.has(p)) add(p, changeOfXy(xy))
+    else if (bStatus.get(p) !== xy) add(p, 'changed')
   }
-  for (const e of bStatus) {
-    if (aLines.has(e.line) || aPaths.has(e.path) || isTransientPath(e.path) || isLensWorktree(e.path)) continue
-    add(e.path, 'removed')
+  for (const p of bStatus.keys()) {
+    if (!aStatus.has(p)) add(p, 'removed')
   }
-  const bFiles = new Map(snapBefore.workflow_files.map(f => [f.path, f.sha256]))
-  const aFiles = new Map(snapAfter.workflow_files.map(f => [f.path, f.sha256]))
+  const bFiles = new Map(wellFormed(snapBefore.files, 'sha256').map(f => [f.path, f.sha256]))
+  const aFiles = new Map(wellFormed(snapAfter.files, 'sha256').map(f => [f.path, f.sha256]))
   const seen = (p) => strayWrites.some(w => w.path === p)
   for (const [p, h] of aFiles) {
     if (seen(p)) continue
@@ -1546,11 +1516,15 @@ if (!snapOk(snapBefore) || !snapOk(snapAfter)) {
   for (const p of bFiles.keys()) {
     if (!aFiles.has(p) && !seen(p)) add(p, 'removed')
   }
+  if (Array.isArray(snapAfter.retained_worktrees)) retainedWorktrees = snapAfter.retained_worktrees.filter(p => typeof p === 'string')
 }
+// Round 2 M3: the header says what was actually hashed and that the review itself removed or restored
+// nothing (the old "Nothing was removed" sentence sat over entries a lens had deleted). A change
+// inside a file that git already lists as dirty, outside the hashed set, shows only if its XY code moves.
 const strayReport = (strayNote
   ? `\n\n### STRAY WRITES\n${strayNote}`
   : strayWrites.length
-    ? `\n\n### STRAY WRITES\nThese paths changed in the main checkout or the harness files (the repo .claude/workflows/, ~/.claude/) during the lens phase. Nothing was removed; review each by hand.\n` +
+    ? `\n\n### STRAY WRITES\nThese paths differ between the start and the end of the lens phase: every git status entry of the main checkout, and the hash (sha256) of the files in the harness-loaded locations (the repo .claude/ settings, hooks, agents, skills, workflows and commands, .githooks/, bin/, .github/workflows/, and ~/.claude/ settings, CLAUDE.md, agents, skills, hooks, workflows, commands, bin and plugins). The review itself removed or restored nothing; review each by hand.\n` +
       strayWrites.map(w => `- ${w.path} (${w.change})${w.shadows_installed_workflow ? ' (a repo-local workflow copy: it will shadow the installed workflow of the same name)' : ''}`).join('\n')
     : '') +
   (retainedWorktrees.length ? `\n\nLens worktree retained: ${retainedWorktrees.join(', ')} (harness-owned, not a stray write).` : '')
@@ -1634,7 +1608,7 @@ return {
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
   // HARN-OPT-4 T4 (AC-QA-12, AC-OPS-4): appended in code so the guarantee does
   // not rest on synthesis obeying its prompt. Only when the run produced a report.
-  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '') + strayReport) : (strayNote && snapOk(snapBefore) ? strayReport.trim() : ''),
+  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '') + strayReport) : (strayNote && snapBefore ? strayReport.trim() : ''),
   stray_writes: strayChecked ? strayWrites : null,
   __outcome: outcome,
 }

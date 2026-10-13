@@ -3,13 +3,20 @@
 // Written RED first. Pins AC-SEC-11, AC-SEC-12, AC-QA-26, AC-QA-27, AC-SIMP-9,
 // AC-SIMP-3, AC-SIMP-1, AC-OPS-17.
 //
+// Fix round 2 (re-frame, owner decision after the circuit-breaker): the snapshot is COMPUTED
+// by workflows/lib/stray-snapshot.mjs (tested in test/stray-snapshot.test.js) and the agents
+// only relay its stdout, so snapshot_before / snapshot_after are now JSON TEXT (type string)
+// that the script parses. Round 1 tests that pinned the old agent-transcribed contract
+// (a git status command with a pathspec, string status lines, a hashed-set wording in the
+// prompt) are updated to that contract below, each saying why; none is deleted.
+//
 // Names this file fixes (the spec fixes behaviour, not field names):
 //   scope:diff response   .scratch_root      absolute string from `mktemp -d`
-//                         .snapshot_before   { status: string[], workflow_files: [{path, sha256}] }
-//                         (status = lines of `git status --porcelain --untracked-files=all --ignored`;
-//                          workflow_files = files under ~/.claude/workflows/ with sha256)
-//   synthesis response    .snapshot_after    same shape as snapshot_before
-//   workflow result       .stray_writes      array of { path, shadows_installed_workflow: boolean }
+//                         .snapshot_before   string: the library's stdout JSON,
+//                           { status: [{path, xy}], files: [{path, sha256}], retained_worktrees: [path], dropped: [path] }
+//                           (files under ~/.claude/ are written '~/.claude/...', repo files repo-relative)
+//   synthesis response    .snapshot_after    same
+//   workflow result       .stray_writes      array of { path, change, shadows_installed_workflow: boolean }, or null
 // All three response fields are optional so an older agent response validates.
 // Never touches the real ledger: the fake runtime stubs every agent().
 require('./helpers/git-env.js').scrubGitEnv()
@@ -63,10 +70,15 @@ const promptOf = (calls, label) => {
 
 const SCRATCH = '/var/folders/zz/harn-run-Xk39aB'
 const WFPATH = '.claude/workflows/optimise-cycle.js'
-const BEFORE = {
-  status: ['?? notes/preexisting.txt', ' M README.md'],
-  workflow_files: [{ path: '/home/u/.claude/workflows/review-cycle.js', sha256: 'aa'.repeat(32) }],
-}
+// mk: the library's stdout as the agent relays it (a JSON string). Status entries are written
+// 'XY path' here for readability and become {path, xy}, exactly what the library computes.
+const mk = (status = [], files = [], extra = {}) => JSON.stringify({
+  status: status.map((e) => (typeof e === 'string' ? { xy: e.slice(0, 2), path: e.slice(3) } : e)),
+  files, retained_worktrees: [], dropped: [], ...extra,
+})
+const BEFORE_STATUS = ['?? notes/preexisting.txt', ' M README.md']
+const BEFORE_FILES = [{ path: '~/.claude/workflows/review-cycle.js', sha256: 'aa'.repeat(32) }]
+const BEFORE = mk(BEFORE_STATUS, BEFORE_FILES)
 const withScratch = (extra = {}) => ({ 'scope:diff': { ...SCOPE_OK, scratch_root: SCRATCH, snapshot_before: BEFORE, ...extra } })
 
 // ---- (1) AC-SEC-11, AC-QA-26: per-lens scratch root in the lens prompt ----
@@ -90,9 +102,10 @@ test('T4 scratch: the scope:diff prompt asks for a mktemp -d root outside every 
   assert.match(p, /mktemp -d/)
   assert.match(p, /scratch_root/)
   assert.match(p, /snapshot_before/)
-  assert.match(p, /git status --porcelain --untracked-files=all --ignored/)
-  assert.match(p, /sha256/)
-  assert.match(p, /~\/\.claude\/workflows/)
+  // Round 2 re-frame: the agent no longer transcribes a git status listing or hashes; it runs the library.
+  assert.match(p, /stray-snapshot\.mjs/)
+  // Round 2 L1/L2 (AC-SEC-11): the primary root's template carries its random suffix, pinned whole.
+  assert.ok(p.includes('mktemp -d "${TMPDIR:-/tmp}/harn-review-XXXXXX"'), 'primary mktemp template must be exactly harn-review-XXXXXX')
 })
 
 test('T4 scratch: the lens prompt forbids writes to all four named locations', async () => {
@@ -160,8 +173,8 @@ const strays = (r) => {
   assert.ok(Array.isArray(r.result.stray_writes), 'result.stray_writes must be an array')
   return r.result.stray_writes
 }
-const afterWith = (extraStatus, extraFiles = []) => ({
-  synthesis: { ...SYNTH, snapshot_after: { status: [...BEFORE.status, ...extraStatus], workflow_files: [...BEFORE.workflow_files, ...extraFiles] } },
+const afterWith = (extraStatus, extraFiles = [], extra = {}) => ({
+  synthesis: { ...SYNTH, snapshot_after: mk([...BEFORE_STATUS, ...extraStatus], [...BEFORE_FILES, ...extraFiles], extra) },
 })
 
 test('T4 stray: an after-snapshot that gains ?? .claude/workflows/optimise-cycle.js names the path with the shadow warning', async () => {
@@ -184,9 +197,9 @@ test('T4 stray: an ordinary new path is reported without the shadow warning', as
 })
 
 test('T4 stray: a changed file under ~/.claude/workflows/ is reported by path', async () => {
-  const changed = [{ path: '/home/u/.claude/workflows/planted.js', sha256: 'bb'.repeat(32) }]
+  const changed = [{ path: '~/.claude/workflows/planted.js', sha256: 'bb'.repeat(32) }]
   const r = await review({}, { ...withScratch(), ...afterWith([], changed) })
-  assert.deepEqual(strays(r).map((s) => s.path), ['/home/u/.claude/workflows/planted.js'])
+  assert.deepEqual(strays(r).map((s) => s.path), ['~/.claude/workflows/planted.js'])
 })
 
 test('T4 stray: identical snapshots produce no stray_writes and no stray-write report line', async () => {
@@ -216,7 +229,7 @@ test('T4 stray: nothing is deleted, moved or overwritten (no new agent call, no 
   const { calls } = await review({}, { ...withScratch(), ...afterWith([`?? ${WFPATH}`]) })
   const p = promptOf(calls, 'synthesis')
   assert.match(p, /snapshot_after/)
-  assert.match(p, /git status --porcelain --untracked-files=all --ignored/)
+  assert.match(p, /stray-snapshot\.mjs/)  // round 2: the library, not a transcribed git status
   assert.doesNotMatch(p, /\b(rm|mv)\s+[^\n]*\.claude\/workflows/)
 })
 
@@ -250,6 +263,9 @@ test('T4 schema: scratch_root, snapshot_before and snapshot_after are declared a
   assert.ok(scope.properties.scratch_root, 'scope schema must declare scratch_root')
   assert.ok(scope.properties.snapshot_before, 'scope schema must declare snapshot_before')
   assert.ok(syn.properties.snapshot_after, 'synthesis schema must declare snapshot_after')
+  // Round 2: the snapshot is the library's stdout relayed verbatim, so it is JSON TEXT the script parses.
+  assert.equal(scope.properties.snapshot_before.type, 'string')
+  assert.equal(syn.properties.snapshot_after.type, 'string')
   for (const k of ['scratch_root', 'snapshot_before']) assert.ok(!scope.required.includes(k), `${k} must be optional`)
   assert.ok(!syn.required.includes('snapshot_after'), 'snapshot_after must be optional')
 })
@@ -268,12 +284,12 @@ test('T4 spec: the "What this replaces" tip/ row says the name existed nowhere i
 //   stray_writes entries gain  change: 'added' | 'removed' | 'changed'
 //   stray_writes            null when either snapshot is missing (unchecked), [] when checked clean
 //   scope:diff response     .tmpdir  optional string, the TMPDIR the scope step saw (L2)
-//   repo-local workflow files ride in workflow_files with repo-relative paths (.claude/workflows/x.js)
+//   repo-local workflow files ride in files[] with repo-relative paths (.claude/workflows/x.js)
 // ======================================================================
-const HOME = '/home/u/.claude'
+const HOME = '~/.claude'
 const LOCAL_WF = '.claude/workflows/review-cycle.js'
-const afterOf = (status, files) => ({ synthesis: { ...SYNTH, snapshot_after: { status, workflow_files: files } } })
-const beforeOf = (status, files) => withScratch({ snapshot_before: { status, workflow_files: files } })
+const afterOf = (status, files, extra) => ({ synthesis: { ...SYNTH, snapshot_after: mk(status, files, extra) } })
+const beforeOf = (status, files, extra) => withScratch({ snapshot_before: mk(status, files, extra) })
 const H = (c) => c.repeat(64)
 
 // ---- M1 (AC-SEC-12, AC-QA-27): removals and content changes are visible ----
@@ -315,27 +331,13 @@ test('T4 r1 M1: an unchanged repo-local workflow hash is not reported', async ()
   assert.deepEqual(strays(r), [])
 })
 
-test('T4 r1 M1: both prompts ask for hashes of the repo own .claude/workflows/ (tracked, untracked or ignored)', async () => {
-  const { calls } = await review({}, withScratch())
-  for (const l of ['scope:diff', 'synthesis']) {
-    const p = promptOf(calls, l)
-    assert.match(p, /(repo-local|repo's own|repo own|repository's own)[^\n]{0,60}(?<!~\/)\.claude\/workflows\//i, `${l}: repo-local .claude/workflows/ not hashed`)
-    assert.match(p, /ignored/i)
-  }
-})
+// Round 2 re-frame: the hashed set is computed by the library (test/stray-snapshot.test.js), so the
+// round 1 test that pinned the prompt wording of the repo .claude/workflows/ hash ask is replaced by
+// the library-command contract in the round 2 block at the end of this file.
 
 // ---- L3 (folded into M1): the hashed set under ~/.claude/ ----
 
-test('T4 r1 L3: both prompts name the widened ~/.claude/ set and exclude projects/ and todos/', async () => {
-  const { calls } = await review({}, withScratch())
-  for (const l of ['scope:diff', 'synthesis']) {
-    const p = promptOf(calls, l)
-    for (const n of ['settings.json', 'agents/', 'skills/', 'hooks/', 'workflows/', 'AGENT-HARNESS.md']) {
-      assert.ok(p.includes(n), `${l}: ${n} missing from the hashed set`)
-    }
-    assert.match(p, /(never|not|exclude)[^.\n]{0,80}projects\/[^.\n]{0,40}todos\/|(never|not|exclude)[^.\n]{0,80}todos\/[^.\n]{0,40}projects\//i, `${l}: projects/ and todos/ must be excluded`)
-  }
-})
+// (round 2: the prompt-wording test for the widened ~/.claude/ set moved to the library tests; see above.)
 
 test('T4 r1 L3: a changed ~/.claude/settings.json and a new ~/.claude/agents file are reported by path', async () => {
   const s0 = { path: `${HOME}/settings.json`, sha256: H('a') }
@@ -348,39 +350,35 @@ test('T4 r1 L3: a changed ~/.claude/settings.json and a new ~/.claude/agents fil
 
 // ---- M2 (AC-QA-27): harness-owned and transient paths are not stray writes ----
 
-test('T4 r1 M2: a retained lens worktree is listed on its own line, never as a stray write', async () => {
-  const r = await review({}, { ...beforeOf([], []), ...afterOf(['!! .claude/worktrees/wf_x/'], []) })
+test('T4 r1 M2 (round 2: library fields): a retained lens worktree is listed on its own line, never as a stray write', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([], [], { retained_worktrees: ['.claude/worktrees/wf_x'] }) })
   assert.deepEqual(strays(r), [])
   const line = r.result.report.split('\n').find((l) => /lens worktree retained/i.test(l))
   assert.ok(line, 'report must carry a "lens worktree retained" line')
   assert.ok(line.includes('.claude/worktrees/wf_x'))
 })
 
-test('T4 r1 M2: scheduled_tasks.lock and scheduled_tasks.json appearing are not stray writes', async () => {
-  const r = await review({}, { ...beforeOf([], []), ...afterOf(['?? .claude/scheduled_tasks.lock', '!! .claude/scheduled_tasks.json'], []) })
+test('T4 r1 M2 (round 2: library fields): dropped paths (scheduled_tasks) are not stray writes and are not mentioned', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([], [], { dropped: ['.claude/scheduled_tasks.lock', '.claude/scheduled_tasks.json'] }) })
   assert.deepEqual(strays(r), [])
   assert.doesNotMatch(r.result.report, /scheduled_tasks/)
 })
 
-test('T4 r1 M2: a real stray alongside the filtered paths is still reported', async () => {
-  const r = await review({}, { ...beforeOf([], []), ...afterOf(['!! .claude/worktrees/wf_x/', '?? .claude/scheduled_tasks.lock', `?? ${WFPATH}`], []) })
+test('T4 r1 M2: a real stray alongside retained and dropped paths is still reported', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([`?? ${WFPATH}`], [], { retained_worktrees: ['.claude/worktrees/wf_x'], dropped: ['.claude/scheduled_tasks.lock'] }) })
   assert.deepEqual(strays(r).map((s) => s.path), [WFPATH])
 })
 
-test('T4 r1 M2: the status command is narrowed (-z, a pathspec) and not a bare --ignored over the whole tree', async () => {
-  const { calls } = await review({}, withScratch())
-  for (const l of ['scope:diff', 'synthesis']) {
-    const p = promptOf(calls, l)
-    const cmd = /git status --porcelain[^`\n]*`/.exec(p)
-    assert.ok(cmd, `${l}: no git status command`)
-    assert.match(cmd[0], /--untracked-files=all/)
-    assert.match(cmd[0], /\s-z\b/, `${l}: -z not requested`)
-    assert.match(cmd[0], /--ignored(=matching)?\s/, `${l}: --ignored missing`)
-    assert.match(cmd[0], /\s--\s+\S/, `${l}: no pathspec after --`)
-    assert.match(cmd[0], /\.claude/, `${l}: pathspec must cover .claude`)
-    assert.match(cmd[0], /\*\.js|:\(exclude\)|:!/, `${l}: pathspec must restrict or exclude bulk directories`)
-  }
+// Round 2 L2 (AC-QA-27): the lens-worktree filter moved into the library and is anchored there; the script
+// itself must not swallow a look-alike. src/worktrees/planted.js is a stray, not a retained worktree.
+test('T4 r2 L2: ?? src/worktrees/planted.js stays a stray (the worktree filter is anchored)', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf(['?? src/worktrees/planted.js'], []) })
+  assert.deepEqual(strays(r).map((s) => [s.path, s.change]), [['src/worktrees/planted.js', 'added']])
+  assert.doesNotMatch(r.result.report, /lens worktree retained/i)
 })
+
+// (round 2: the round 1 test that pinned the narrowed git status pathspec in the prompt is replaced by the
+// library-command contract in the round 2 block, because the narrowing is what blinded the snapshot, M1.)
 
 // ---- L1 (AC-SEC-12): unchecked is distinguishable from checked-clean ----
 
@@ -437,20 +435,132 @@ test('T4 r1 L2: a tmpdir of / or a relative path does not widen the allowed pref
   }
 })
 
-// ---- L4 (AC-QA-27): renames and C-quoted paths still trigger the shadow warning ----
+// ---- L4 (AC-QA-27), round 2: renames and quoting are resolved by the library (-z, target path), so the
+// script receives plain paths. The shadow test must still fire on them. ----
 
-test('T4 r1 L4: a -z rename (target first) into .claude/workflows/ is reported at the target with the shadow warning', async () => {
-  const r = await review({}, { ...beforeOf([], []), ...afterOf([`R  ${WFPATH}\0notes/old.js`], []) })
+test('T4 r1 L4 (round 2): a renamed-in entry (xy R ) at .claude/workflows/ is reported at the target with the shadow warning', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([{ path: WFPATH, xy: 'R ' }], []) })
   const s = strays(r)
   assert.equal(s.length, 1)
   assert.equal(s[0].path, WFPATH)
+  assert.equal(s[0].change, 'added')
   assert.equal(s[0].shadows_installed_workflow, true)
 })
-test('T4 r1 L4: an arrow-form rename into .claude/workflows/ is reported at the target with the shadow warning', async () => {
-  const r = await review({}, { ...beforeOf([], []), ...afterOf([`R  notes/old.js -> ${WFPATH}`], []) })
-  assert.deepEqual(strays(r).map((s) => [s.path, s.shadows_installed_workflow]), [[WFPATH, true]])
+test('T4 r1 L4 (round 2): a path with a quote and a space is carried verbatim and still shadows', async () => {
+  const p = '.claude/workflows/a"b c.js'
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([{ path: p, xy: '??' }], []) })
+  assert.deepEqual(strays(r).map((s) => [s.path, s.shadows_installed_workflow]), [[p, true]])
 })
-test('T4 r1 L4: a C-quoted path is unquoted before the shadow test', async () => {
-  const r = await review({}, { ...beforeOf([], []), ...afterOf(['?? ".claude/workflows/a\\"b c.js"'], []) })
-  assert.deepEqual(strays(r).map((s) => [s.path, s.shadows_installed_workflow]), [['.claude/workflows/a"b c.js', true]])
+
+// ======================================================================
+// Fix round 2 (PR #14 review round 2: M1 to M4, L1 to L3). Re-frame: stray-snapshot.mjs computes, agents relay.
+// ======================================================================
+
+const has = (r, path_) => strays(r).find((s) => s.path === path_)
+const lineOf = (r, needle) => r.result.report.split('\n').find((l) => l.includes(needle))
+
+// ---- M1/M3: change is derived from the XY code of a newly appearing entry ----
+for (const [xy, want] of [[' D', 'removed'], ['D ', 'removed'], ['MD', 'removed'], [' M', 'changed'], ['M ', 'changed'], ['??', 'added'], ['!!', 'added'], ['A ', 'added'], ['R ', 'added']]) {
+  test(`T4 r2 M3: a newly appearing entry with xy '${xy}' is '${want}'`, async () => {
+    const r = await review({}, { ...beforeOf([], []), ...afterOf([{ path: 'src/x.js', xy }], []) })
+    assert.deepEqual(strays(r).map((s) => [s.path, s.change]), [['src/x.js', want]])
+    assert.match(lineOf(r, 'src/x.js'), new RegExp(`\\(${want}\\)`))
+  })
+}
+
+test('T4 r2 M1: a tracked .githooks/pre-push modified by a lens (xy " M") is reported changed', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([' M .githooks/pre-push'], []) })
+  assert.deepEqual(strays(r).map((s) => [s.path, s.change]), [['.githooks/pre-push', 'changed']])
+})
+
+test('T4 r2 M3: a tracked file deleted by a lens reads removed, never added', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([' D README.md'], []) })
+  const line = lineOf(r, 'README.md')
+  assert.match(line, /removed/)
+  assert.doesNotMatch(line, /added/)
+})
+
+test('T4 r2 M3: the report header says what was hashed and that the review itself removed or restored nothing, and never claims "Nothing was removed"', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([' D README.md'], []) })
+  const rep = r.result.report
+  assert.match(rep, /removed or restored nothing/i)
+  assert.doesNotMatch(rep, /Nothing was removed/)
+  assert.match(rep, /hash/i)
+  assert.match(rep, /~\/\.claude\//)
+  assert.match(rep, /\.githooks\//)
+})
+
+test('T4 r2 M1: a changed ~/.claude/CLAUDE.md and an added bin/ file and an added .claude/hooks/ file are reported from the hashed set', async () => {
+  const r = await review({}, {
+    ...beforeOf([], [{ path: '~/.claude/CLAUDE.md', sha256: H('a') }]),
+    ...afterOf([], [{ path: '~/.claude/CLAUDE.md', sha256: H('b') }, { path: 'bin/tool', sha256: H('c') }, { path: '.claude/hooks/guard.sh', sha256: H('d') }]),
+  })
+  assert.deepEqual(strays(r).map((x) => [x.path, x.change]).sort(), [['.claude/hooks/guard.sh', 'added'], ['bin/tool', 'added'], ['~/.claude/CLAUDE.md', 'changed']])
+})
+
+test('T4 r2: only the repo .claude/workflows/ carries the shadow warning, not ~/.claude/workflows/ and not .claude/hooks/', async () => {
+  const r = await review({}, {
+    ...beforeOf([], []),
+    ...afterOf([], [{ path: '~/.claude/workflows/x.js', sha256: H('a') }, { path: '.claude/hooks/y.sh', sha256: H('b') }, { path: WFPATH, sha256: H('c') }]),
+  })
+  assert.deepEqual(strays(r).map((x) => [x.path, x.shadows_installed_workflow]).sort(), [[WFPATH, true], ['.claude/hooks/y.sh', false], ['~/.claude/workflows/x.js', false]].sort())
+})
+
+test('T4 r2: a pre-existing entry present in both snapshots is not reported, and a before-only entry is removed', async () => {
+  const r = await review({}, { ...beforeOf(['?? a.txt', ' M b.txt'], []), ...afterOf(['?? a.txt'], []) })
+  assert.deepEqual(strays(r).map((s) => [s.path, s.change]), [['b.txt', 'removed']])
+})
+
+// ---- could-not-be-made: missing, non-JSON, wrong shape ----
+for (const [name, bad] of [
+  ['not JSON', 'git: not a repository'],
+  ['JSON but not a snapshot', '[1,2]'],
+  ['JSON object without status or files', '{"ok":true}'],
+]) {
+  for (const side of ['before', 'after']) {
+    test(`T4 r2: a ${side} snapshot that is ${name} reads 'could not be made' and stray_writes null`, async () => {
+      const o = side === 'before'
+        ? { ...withScratch({ snapshot_before: bad }), ...afterWith([]) }
+        : { ...withScratch(), synthesis: { ...SYNTH, snapshot_after: bad } }
+      const r = await review({}, o)
+      assert.equal(r.result.stray_writes, null)
+      assert.match(r.result.report, /could not be made/i)
+    })
+  }
+}
+
+// ---- static: both prompts run the library and never ask the agent to list files itself ----
+test('T4 r2 static: scope:diff and synthesis run stray-snapshot.mjs exactly, found the way the ledger step finds ledger-append.mjs, and relay stdout verbatim', async () => {
+  const { calls } = await review({}, withScratch())
+  for (const l of ['scope:diff', 'synthesis']) {
+    const p = promptOf(calls, l)
+    assert.match(p, /node <path[^>\n]*>\s+"\$\(git rev-parse --show-toplevel\)"/, `${l}: must tell the agent to run node <path> "$(git rev-parse --show-toplevel)"`)
+    assert.match(p, /verbatim/i, `${l}: stdout must be relayed verbatim`)
+    const a = p.indexOf('~/.claude/workflows/lib/stray-snapshot.mjs')
+    assert.ok(a >= 0, `${l}: installed mirror path missing`)
+    const b = p.indexOf('plugin', a)
+    assert.ok(b > a, `${l}: installed plugin must come after the mirror`)
+    assert.ok(p.indexOf('claude-ai-harness', b) > b, `${l}: repo copy only for claude-ai-harness itself, after the plugin`)
+    assert.match(p, /NEVER use a repo-local copy in any OTHER repo/, `${l}: repo-local copies in other repos must be forbidden`)
+    // the agent must not list or hash anything itself
+    assert.doesNotMatch(p, /git status/, `${l}: must not ask the agent to run git status`)
+    assert.doesNotMatch(p, /NUL-separated|every file|sha256 of the contents/i, `${l}: must not ask the agent to transcribe a listing`)
+  }
+})
+
+// ---- AC-SEC-11, AC-QA-26 round 2 L1: the .claude path-component guard must be load-bearing ----
+// Each of these passes every other check (known temp prefix, plain characters, no ..), so only the
+// .claude segment guard can reject it.
+test('T4 r2 L1: /tmp/repo/.claude/scratch is rejected (only the .claude guard can)', async () => {
+  const { calls } = await review({}, { 'scope:diff': { ...SCOPE_OK, snapshot_before: BEFORE, scratch_root: '/tmp/repo/.claude/scratch' } })
+  const p = promptOf(calls, 'lens-qa')
+  assert.match(p, /mktemp -d[^\n]*lens-qa[^\n]*XXXXXX/)
+  assert.ok(!p.includes('/tmp/repo/.claude/scratch/lens-qa'))
+})
+test('T4 r2 L1: a tmpdir of /Users/x/repo/.claude/tmp does not widen the prefixes (only the .claude guard can reject it)', async () => {
+  const root = '/Users/x/repo/.claude/tmp/harn-review-aB3'
+  const { calls } = await review({}, withScratch({ scratch_root: root, tmpdir: '/Users/x/repo/.claude/tmp' }))
+  const p = promptOf(calls, 'lens-qa')
+  assert.match(p, /mktemp -d[^\n]*lens-qa[^\n]*XXXXXX/)
+  assert.ok(!p.includes(`${root}/lens-qa`))
 })

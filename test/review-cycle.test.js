@@ -1643,7 +1643,11 @@ test('review-cycle.js: AC-QA-1 -- the scope:diff prompt instructs locating insta
   assert.match(scopeCall.prompt, /~\/\.claude\/workflows\/lib\/install-consistency\.mjs/, 'must name the global mirror install location, same convention as the ledger writer')
   assert.match(scopeCall.prompt, /CLAUDE_HOME/, 'must name CLAUDE_HOME as an override (M11)')
   assert.match(scopeCall.prompt, /takes priority and skips the search/, 'must state CLAUDE_HOME is checked FIRST, ahead of the (a)/(b) search')
-  assert.doesNotMatch(scopeCall.prompt, /git rev-parse --show-toplevel/, 'M2: the repo-local resolution branch (c) must be removed entirely, not merely prohibited in prose')
+  // HARN-OPT-5 T4 round 2: the prompt now also tells the agent to run stray-snapshot.mjs against "$(git rev-parse --show-toplevel)",
+  // so the M2 check is scoped to the install-consistency instruction (everything before the repo steps), which is what it guards.
+  const installInstruction = scopeCall.prompt.slice(0, scopeCall.prompt.indexOf('In the repo at the current working directory'))
+  assert.ok(installInstruction.length > 0 && installInstruction.includes('install-consistency.mjs'), 'precondition: the install-consistency instruction was isolated')
+  assert.doesNotMatch(installInstruction, /git rev-parse --show-toplevel/, 'M2: the repo-local resolution branch (c) must be removed entirely, not merely prohibited in prose')
   assert.match(scopeCall.prompt, /deliberately no repo-local fallback option at all/, 'must state plainly that no repo-local fallback exists at all (M2)')
   assert.match(scopeCall.prompt, /NEVER a path inside the repository currently being planned or reviewed/, 'must forbid branch (b) resolving to anything inside the reviewed checkout (M2)')
   assert.match(scopeCall.prompt, /as its ONE argument/, 'must instruct passing the resolved install root explicitly, not relying on the script\'s own ~/.claude default')
