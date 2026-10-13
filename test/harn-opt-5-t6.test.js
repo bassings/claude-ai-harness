@@ -120,6 +120,67 @@ test('T6 AC-DATA-2: the hook exists, and while writers sit inside the exclude re
   assert.equal(readLedgerLines(repo).length, 6)
   // Round 1 L2 (AC-DATA-2): six writers raced; the five that lost must have cleaned up.
   assert.deepEqual(strayFiles(path.dirname(excludePathOf(repo))), [], 'no stray temp files in .git/info after the race')
+  // Round 3 F1 (AC-DATA-2, AC-QA-19): the exactly-once guard (hasLine on the
+  // fresh re-read) had never been seen to fail; count the line, do not just
+  // check a prefix.
+  assert.equal(fs.readFileSync(excludePathOf(repo), 'utf8').split('\n').filter((l) => l.trim() === LEDGER_REL).length, 1, 'the ledger line appears exactly once after the race')
+})
+
+// Round 3 F2 (AC-DATA-6): only the static scan could see an in-place truncating
+// write; a rename produces a NEW inode, an in-place write keeps the old one.
+// This is the deliberate inverse of the AC-QA-18 same-inode check.
+test('T6 round 3 F2 AC-DATA-6: a needed exclude write replaces the file (new inode), never writes it in place (same inode)', () => {
+  const repo = makeTempRepo()
+  const exclude = excludePathOf(repo)
+  fs.writeFileSync(exclude, OPERATOR_LINES)
+  const before = fs.statSync(exclude)
+  const { out } = writeOnce(repo)
+  assert.equal(out.write_ok, true, out.write_error)
+  const after = fs.statSync(exclude)
+  assert.notEqual(after.ino, before.ino, 'a rename-based replacement yields a new inode; an in-place write would keep the old one')
+  assert.ok(fs.readFileSync(exclude, 'utf8').startsWith(OPERATOR_LINES))
+})
+
+// Round 3 F3 (spec bug, conductor decision: refuse rather than regress silently):
+// a non-writable target directory is refused up front with a path-free message.
+test('T6 round 3 F3: a read-only .git/info with a writable exclude is refused with the condition named and no path in write_error, no ledger line', () => {
+  const repo = makeTempRepo()
+  const exclude = excludePathOf(repo)
+  fs.writeFileSync(exclude, OPERATOR_LINES)
+  const info = path.dirname(exclude)
+  try {
+    fs.chmodSync(info, 0o555)
+    const { out } = writeOnce(repo)
+    assert.equal(out.write_ok, false)
+    assert.match(out.write_error, /directory is not writable/)
+    assert.ok(!out.write_error.includes(info) && !out.write_error.includes('.tmp'), `no path in write_error: ${out.write_error}`)
+    assert.equal(fs.readFileSync(exclude, 'utf8'), OPERATOR_LINES)
+    assert.equal(readLedgerLines(repo).length, 0)
+  } finally {
+    fs.chmodSync(info, 0o755)
+  }
+})
+
+test('T6 round 3 F3: an exclude symlinked into a read-only directory outside the repo is refused and the resolved directory never appears in write_error', () => {
+  const repo = makeTempRepo()
+  const exclude = excludePathOf(repo)
+  const outside = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'ro-outside-'))
+  const target = path.join(outside, 'exclude')
+  fs.writeFileSync(target, OPERATOR_LINES)
+  fs.rmSync(exclude, { force: true })
+  fs.symlinkSync(target, exclude)
+  try {
+    fs.chmodSync(outside, 0o555)
+    const { out } = writeOnce(repo)
+    assert.equal(out.write_ok, false)
+    assert.match(out.write_error, /directory is not writable/)
+    assert.ok(!out.write_error.includes(outside), `the resolved directory must not appear in write_error: ${out.write_error}`)
+    assert.ok(fs.lstatSync(exclude).isSymbolicLink(), 'still a symlink')
+    assert.equal(fs.readFileSync(target, 'utf8'), OPERATOR_LINES)
+    assert.equal(readLedgerLines(repo).length, 0)
+  } finally {
+    fs.chmodSync(outside, 0o755)
+  }
 })
 
 test('T6 AC-QA-18: when the ledger is already ignored, no write touches the exclude (inode, mtime, bytes), even read-only', async (t) => {

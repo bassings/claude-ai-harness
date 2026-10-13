@@ -1756,6 +1756,16 @@ function ensureGitignored(root) {
         return 'the git exclude file is not writable (read-only) -- refusing to replace it'
       }
     }
+    // Round 3 F3 (conductor decision, same family as F3/F4 above): a target
+    // directory that is not writable cannot take the temp file or the rename,
+    // and the old in-place write would have succeeded there. Refuse up front
+    // with a named, path-free message rather than let EACCES surface with the
+    // resolved directory (possibly outside the repo, via a symlink) inside it.
+    try {
+      fs.accessSync(path.dirname(target), fs.constants.W_OK)
+    } catch (e) {
+      return 'the git exclude file\'s directory is not writable -- refusing to replace the file (a rename needs a writable directory)'
+    }
     const mode = existing ? existing.mode & 0o777 : 0o644
     // AC-DATA-4: a uniquely named temp file in the TARGET's directory (a
     // rename is only atomic within one filesystem), created exclusively.
