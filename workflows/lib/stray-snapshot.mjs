@@ -11,7 +11,19 @@
 // Usage: node stray-snapshot.mjs <repo-root>
 // Prints ONE compact JSON object:
 //   { status: [{path, xy}], files: [{path, sha256}], retained_worktrees: [path], dropped: [path] }
-// Exits non-zero only when the root is not a git checkout. Read-only: it never writes to disk.
+// Exits non-zero only when the root is not a git checkout.
+//
+// Fix round 3 (conductor measurement at verification: 6638 hashed files, 1.2 MB of JSON; AC-SEC-12 as amended,
+// AC-QA-27): an agent cannot relay 1.2 MB faithfully, so the bulk moves off the agent into two modes.
+//   node stray-snapshot.mjs snapshot <repo-root>
+//     computes the same snapshot, WRITES it (0600) to a file made with mkdtemp under os.tmpdir(), and prints ONE
+//     small object { file, status_count, files_count, rollup }; rollup is the sha256 of the file's bytes.
+//   node stray-snapshot.mjs diff <repo-root> <before-file>
+//     takes a fresh snapshot, compares it with the before-file, and prints ONE compact object
+//     { changes: [{path, change, shadows_installed_workflow}], retained_worktrees, dropped,
+//       before_rollup, after_rollup, hashed: { repo, home } }. An unreadable or malformed before-file exits
+//     non-zero with a one-line reason on stderr and nothing on stdout.
+// The library never deletes, moves or appends: its only write is the one new file snapshot mode creates.
 //
 // status  every entry of `git status --porcelain=v1 -z --untracked-files=all --ignored` (-z means no
 //         C-quoting; a rename is one entry at its target path), minus bulk ignored directories, chosen
@@ -36,6 +48,12 @@ const HOME_LOCATIONS = [
   'CLAUDE.md', 'settings.json', 'settings.local.json', 'AGENT-HARNESS.md', 'agents', 'skills', 'hooks',
   'workflows', 'commands', 'bin', 'plugins',
 ]
+
+// The repo-local workflow directory (anchored, direct children only): a copy there shadows the installed workflow.
+const isRepoWorkflow = (p) => /^\.claude\/workflows\/[^/]+$/.test(p)
+// A newly appearing status entry's change comes from its XY code, so a tracked file a lens deleted or edited is
+// never labelled 'added' (round 2 M3).
+const changeOfXy = (xy) => (/D/.test(xy) ? 'removed' : /[MT]/.test(xy) ? 'changed' : 'added')
 
 const byPath = (a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
 const plainSort = (xs) => [...xs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
@@ -111,15 +129,84 @@ function hashFiles(root, home) {
   return out.sort(byPath)
 }
 
-const root = process.argv[2]
-if (!root) {
-  process.stderr.write('usage: node stray-snapshot.mjs <repo-root>\n')
+const sha256Of = (x) => createHash('sha256').update(x).digest('hex')
+
+// The snapshot of a checkout, or null when it is not one.
+function takeSnapshot(rootDir) {
+  const raw = gitStatus(rootDir)
+  if (raw === null) return null
+  const { status, retained, dropped } = classify(parseStatus(raw))
+  return { status, files: hashFiles(rootDir, os.homedir()), retained_worktrees: retained, dropped }
+}
+
+const fail = (msg, code = 1) => {
+  process.stderr.write(`stray-snapshot: ${msg}\n`)
+  process.exit(code)
+}
+
+// Fix round 3: a before-file is validated before anything is compared. One line on stderr, nothing on stdout.
+function readBefore(file) {
+  let bytes
+  try { bytes = fs.readFileSync(file) } catch { return fail(`cannot read before-file ${file}`) }
+  let body
+  try { body = JSON.parse(bytes.toString('utf8')) } catch { return fail(`before-file ${file} is not JSON`) }
+  const ok = body && typeof body === 'object' && !Array.isArray(body) && Array.isArray(body.status) && Array.isArray(body.files)
+  if (!ok) return fail(`before-file ${file} is not a snapshot (status and files arrays required)`)
+  return { body, rollup: sha256Of(bytes) }
+}
+
+// Deterministic comparison (moved here from review-cycle.js in fix round 3). Status entries by path, the XY code
+// deciding a newly appearing entry's change; hashed files by sha256; a hashed file already reported via status is not repeated.
+function compare(before, after) {
+  const changes = []
+  const add = (p, change) => changes.push({ path: p, change, shadows_installed_workflow: change !== 'removed' && isRepoWorkflow(p) })
+  const bStatus = new Map(before.status.map((e) => [e.path, e.xy]))
+  const aStatus = new Map(after.status.map((e) => [e.path, e.xy]))
+  for (const [p, xy] of aStatus) {
+    if (!bStatus.has(p)) add(p, changeOfXy(xy))
+    else if (bStatus.get(p) !== xy) add(p, 'changed')
+  }
+  for (const p of bStatus.keys()) if (!aStatus.has(p)) add(p, 'removed')
+  const bFiles = new Map(before.files.map((f) => [f.path, f.sha256]))
+  const aFiles = new Map(after.files.map((f) => [f.path, f.sha256]))
+  const seen = (p) => changes.some((c) => c.path === p)
+  for (const [p, h] of aFiles) {
+    if (seen(p)) continue
+    if (!bFiles.has(p)) add(p, 'added')
+    else if (bFiles.get(p) !== h) add(p, 'changed')
+  }
+  for (const p of bFiles.keys()) if (!aFiles.has(p) && !seen(p)) add(p, 'removed')
+  return changes.sort(byPath)
+}
+
+const args = process.argv.slice(2)
+const mode = args[0] === 'snapshot' || args[0] === 'diff' ? args[0] : null
+const root = mode ? args[1] : args[0]
+if (!root || (mode === 'diff' && !args[2])) {
+  process.stderr.write('usage: node stray-snapshot.mjs [snapshot] <repo-root> | diff <repo-root> <before-file>\n')
   process.exit(2)
 }
-const raw = gitStatus(root)
-if (raw === null) {
-  process.stderr.write(`stray-snapshot: ${root} is not a git checkout\n`)
-  process.exit(1)
+const before = mode === 'diff' ? readBefore(args[2]) : null
+const snap = takeSnapshot(root)
+if (snap === null) fail(`${root} is not a git checkout`)
+
+if (mode === 'snapshot') {
+  const bytes = JSON.stringify(snap) + '\n'
+  // mkdtemp makes a fresh 0700 directory; 'wx' with mode 0600 means the file is new and private.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harn-snap-'))
+  const file = path.join(dir, 'before.json')
+  fs.writeFileSync(file, bytes, { flag: 'wx', mode: 0o600 })
+  process.stdout.write(JSON.stringify({ file, status_count: snap.status.length, files_count: snap.files.length, rollup: sha256Of(bytes) }) + '\n')
+} else if (mode === 'diff') {
+  const home = snap.files.filter((f) => f.path.startsWith('~/.claude/')).length
+  process.stdout.write(JSON.stringify({
+    changes: compare(before.body, snap),
+    retained_worktrees: snap.retained_worktrees,
+    dropped: snap.dropped,
+    before_rollup: before.rollup,
+    after_rollup: sha256Of(JSON.stringify(snap) + '\n'),
+    hashed: { repo: snap.files.length - home, home },
+  }) + '\n')
+} else {
+  process.stdout.write(JSON.stringify(snap) + '\n')
 }
-const { status, retained, dropped } = classify(parseStatus(raw))
-process.stdout.write(JSON.stringify({ status, files: hashFiles(root, os.homedir()), retained_worktrees: retained, dropped }) + '\n')

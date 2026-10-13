@@ -10,6 +10,19 @@
 // (a git status command with a pathspec, string status lines, a hashed-set wording in the
 // prompt) are updated to that contract below, each saying why; none is deleted.
 //
+// Fix round 3 (conductor finding at verification; AC-SEC-12 as amended, AC-QA-27): the real snapshot is 6638 hashed
+// files and 1.2 MB, which an agent cannot relay faithfully. The agents now relay only SMALL objects:
+//   scope:diff   .snapshot_before  string: stdout of `stray-snapshot.mjs snapshot <root>`,
+//                                  { file, status_count, files_count, rollup }  (file under a temp prefix, rollup 64-hex)
+//   synthesis    .snapshot_after   string: stdout of `stray-snapshot.mjs diff <root> <before file>`,
+//                                  { changes: [{path, change, shadows_installed_workflow}], retained_worktrees, dropped,
+//                                    before_rollup, after_rollup, hashed: { repo, home } }
+// The comparison is the library's measurement (test/stray-snapshot.test.js); the script validates and renders.
+// The round 2 relay tests below were rewritten to that contract, each keeping its scenario: the scenarios still
+// build full snapshots with mk(), and the fake `synthesis` agent plays the library by computing the diff object
+// from the before snapshot it registered (found through the before-file path in the prompt it was given).
+// None is deleted. The round 3 block at the end adds the new contract's own tests.
+//
 // Names this file fixes (the spec fixes behaviour, not field names):
 //   scope:diff response   .scratch_root      absolute string from `mktemp -d`
 //                         .snapshot_before   string: the library's stdout JSON,
@@ -78,7 +91,42 @@ const mk = (status = [], files = [], extra = {}) => JSON.stringify({
 })
 const BEFORE_STATUS = ['?? notes/preexisting.txt', ' M README.md']
 const BEFORE_FILES = [{ path: '~/.claude/workflows/review-cycle.js', sha256: 'aa'.repeat(32) }]
-const BEFORE = mk(BEFORE_STATUS, BEFORE_FILES)
+// Fix round 3: scripted stand-in for the library. registerBefore() plays `snapshot` (returns the SMALL object the
+// agent relays, remembering the full snapshot under its before-file path); oracleDiff() plays `diff`.
+const sha256 = (x) => crypto.createHash('sha256').update(x).digest('hex')
+const REGISTRY = new Map()
+function registerBefore(snapJson) {
+  const snap = JSON.parse(snapJson)
+  const rollup = sha256(JSON.stringify(snap))
+  const file = `/var/folders/zz/T/harn-snap-${rollup.slice(0, 8)}/before.json`
+  REGISTRY.set(file, { snap, rollup })
+  return JSON.stringify({ file, status_count: snap.status.length, files_count: snap.files.length, rollup })
+}
+const isRepoWf = (p) => /^\.claude\/workflows\/[^/]+$/.test(p)
+function oracleDiff(b, a, beforeRollup) {
+  const changes = []
+  const add = (p, change) => changes.push({ path: p, change, shadows_installed_workflow: change !== 'removed' && isRepoWf(p) })
+  const bs = new Map(b.status.map((e) => [e.path, e.xy])); const as = new Map(a.status.map((e) => [e.path, e.xy]))
+  for (const [p, xy] of as) { if (!bs.has(p)) add(p, /D/.test(xy) ? 'removed' : /[MT]/.test(xy) ? 'changed' : 'added'); else if (bs.get(p) !== xy) add(p, 'changed') }
+  for (const p of bs.keys()) if (!as.has(p)) add(p, 'removed')
+  const bf = new Map(b.files.map((f) => [f.path, f.sha256])); const af = new Map(a.files.map((f) => [f.path, f.sha256]))
+  const seen = (p) => changes.some((c) => c.path === p)
+  for (const [p, h] of af) { if (seen(p)) continue; if (!bf.has(p)) add(p, 'added'); else if (bf.get(p) !== h) add(p, 'changed') }
+  for (const p of bf.keys()) if (!af.has(p) && !seen(p)) add(p, 'removed')
+  const home = a.files.filter((f) => f.path.startsWith('~/.claude/')).length
+  return {
+    changes: changes.sort((x, y) => (x.path < y.path ? -1 : 1)), retained_worktrees: a.retained_worktrees, dropped: a.dropped,
+    before_rollup: beforeRollup, after_rollup: sha256(JSON.stringify(a)), hashed: { repo: a.files.length - home, home },
+  }
+}
+// The fake synthesis agent: finds the before-file path in the prompt it was given, as the real agent would.
+const diffAgent = (mutate = (d) => d) => (afterSnapJson) => (prompt) => {
+  const file = [...REGISTRY.keys()].find((k) => prompt.includes(k))
+  if (!file) return SYNTH
+  const { snap, rollup } = REGISTRY.get(file)
+  return { ...SYNTH, snapshot_after: JSON.stringify(mutate(oracleDiff(snap, JSON.parse(afterSnapJson), rollup))) }
+}
+const BEFORE = registerBefore(mk(BEFORE_STATUS, BEFORE_FILES))
 const withScratch = (extra = {}) => ({ 'scope:diff': { ...SCOPE_OK, scratch_root: SCRATCH, snapshot_before: BEFORE, ...extra } })
 
 // ---- (1) AC-SEC-11, AC-QA-26: per-lens scratch root in the lens prompt ----
@@ -174,7 +222,7 @@ const strays = (r) => {
   return r.result.stray_writes
 }
 const afterWith = (extraStatus, extraFiles = [], extra = {}) => ({
-  synthesis: { ...SYNTH, snapshot_after: mk([...BEFORE_STATUS, ...extraStatus], [...BEFORE_FILES, ...extraFiles], extra) },
+  synthesis: diffAgent()(mk([...BEFORE_STATUS, ...extraStatus], [...BEFORE_FILES, ...extraFiles], extra)),
 })
 
 test('T4 stray: an after-snapshot that gains ?? .claude/workflows/optimise-cycle.js names the path with the shadow warning', async () => {
@@ -288,8 +336,8 @@ test('T4 spec: the "What this replaces" tip/ row says the name existed nowhere i
 // ======================================================================
 const HOME = '~/.claude'
 const LOCAL_WF = '.claude/workflows/review-cycle.js'
-const afterOf = (status, files, extra) => ({ synthesis: { ...SYNTH, snapshot_after: mk(status, files, extra) } })
-const beforeOf = (status, files, extra) => withScratch({ snapshot_before: mk(status, files, extra) })
+const afterOf = (status, files, extra) => ({ synthesis: diffAgent()(mk(status, files, extra)) })
+const beforeOf = (status, files, extra) => withScratch({ snapshot_before: registerBefore(mk(status, files, extra)) })
 const H = (c) => c.repeat(64)
 
 // ---- M1 (AC-SEC-12, AC-QA-27): removals and content changes are visible ----
@@ -530,22 +578,28 @@ for (const [name, bad] of [
 }
 
 // ---- static: both prompts run the library and never ask the agent to list files itself ----
-test('T4 r2 static: scope:diff and synthesis run stray-snapshot.mjs exactly, found the way the ledger step finds ledger-append.mjs, and relay stdout verbatim', async () => {
+// Fix round 3 rewrote this round 2 test (which pinned `node <path> "$(git rev-parse --show-toplevel)"` and a verbatim
+// relay of the full snapshot): the agents now run a MODE and relay a small object. The location rules, the
+// repo-local-copy rule and the no-listing rules are kept as they were.
+test('T4 r2 static (round 3 form): scope:diff runs `snapshot`, synthesis runs `diff` with the before-file, library found the way the ledger step finds ledger-append.mjs', async () => {
   const { calls } = await review({}, withScratch())
+  const beforeFile = JSON.parse(BEFORE).file
   for (const l of ['scope:diff', 'synthesis']) {
     const p = promptOf(calls, l)
-    assert.match(p, /node <path[^>\n]*>\s+"\$\(git rev-parse --show-toplevel\)"/, `${l}: must tell the agent to run node <path> "$(git rev-parse --show-toplevel)"`)
-    assert.match(p, /verbatim/i, `${l}: stdout must be relayed verbatim`)
     const a = p.indexOf('~/.claude/workflows/lib/stray-snapshot.mjs')
     assert.ok(a >= 0, `${l}: installed mirror path missing`)
     const b = p.indexOf('plugin', a)
     assert.ok(b > a, `${l}: installed plugin must come after the mirror`)
     assert.ok(p.indexOf('claude-ai-harness', b) > b, `${l}: repo copy only for claude-ai-harness itself, after the plugin`)
     assert.match(p, /NEVER use a repo-local copy in any OTHER repo/, `${l}: repo-local copies in other repos must be forbidden`)
-    // the agent must not list or hash anything itself
     assert.doesNotMatch(p, /git status/, `${l}: must not ask the agent to run git status`)
     assert.doesNotMatch(p, /NUL-separated|every file|sha256 of the contents/i, `${l}: must not ask the agent to transcribe a listing`)
   }
+  assert.match(promptOf(calls, 'scope:diff'), /node <path[^>\n]*>\s+snapshot\s+"\$\(git rev-parse --show-toplevel\)"/, 'scope:diff must run the snapshot mode on the toplevel')
+  const after = promptOf(calls, 'synthesis')
+  assert.match(after, /node <path[^>\n]*>\s+diff\s+"\$\(git rev-parse --show-toplevel\)"\s+\S*/, 'synthesis must run the diff mode on the toplevel')
+  assert.ok(after.includes(beforeFile), 'the synthesis prompt must carry the before-file path taken from the before object')
+  assert.doesNotMatch(after, /node <path[^>\n]*>\s+snapshot\b/, 'synthesis must not take a second snapshot of its own')
 })
 
 // ---- AC-SEC-11, AC-QA-26 round 2 L1: the .claude path-component guard must be load-bearing ----
@@ -563,4 +617,145 @@ test('T4 r2 L1: a tmpdir of /Users/x/repo/.claude/tmp does not widen the prefixe
   const p = promptOf(calls, 'lens-qa')
   assert.match(p, /mktemp -d[^\n]*lens-qa[^\n]*XXXXXX/)
   assert.ok(!p.includes(`${root}/lens-qa`))
+})
+
+// ======================================================================
+// Fix round 3 (conductor measurement: 6638 hashed files, 1.2 MB; AC-SEC-12 as amended, AC-QA-27, AC-SIMP-9).
+// The agents relay only small objects; the script validates both shapes and renders the library's changes.
+// ======================================================================
+const BEFORE_FILE = JSON.parse(BEFORE).file
+const BEFORE_ROLLUP = JSON.parse(BEFORE).rollup
+const smallBefore = (o = {}) => JSON.stringify({ file: BEFORE_FILE, status_count: 2, files_count: 1, rollup: BEFORE_ROLLUP, ...o })
+const smallAfter = (o = {}) => JSON.stringify({
+  changes: [], retained_worktrees: [], dropped: [], before_rollup: BEFORE_ROLLUP, after_rollup: 'cd'.repeat(32), hashed: { repo: 3, home: 2 }, ...o,
+})
+const scripted = (before, after) => ({ ...withScratch({ snapshot_before: before }), synthesis: { ...SYNTH, snapshot_after: after } })
+
+test('T4 r3: a clean scripted pair (equal rollups, no changes) gives stray_writes [] and no stray line in the report', async () => {
+  const r = await review({}, scripted(smallBefore(), smallAfter({ after_rollup: BEFORE_ROLLUP })))
+  assert.deepEqual(r.result.stray_writes, [])
+  assert.doesNotMatch(r.result.report, /stray|could not be made/i)
+})
+
+test('T4 r3: one added repo-local workflow renders with the shadow warning, the hashed counts, the nothing-removed header and the library as the measurer', async () => {
+  const r = await review({}, scripted(smallBefore(), smallAfter({
+    changes: [{ path: WFPATH, change: 'added', shadows_installed_workflow: true }], hashed: { repo: 37, home: 4211 },
+  })))
+  assert.deepEqual(r.result.stray_writes, [{ path: WFPATH, change: 'added', shadows_installed_workflow: true }])
+  const line = r.result.report.split('\n').find((l) => l.includes(WFPATH))
+  assert.ok(line && /\(added\)/.test(line) && /shadow/i.test(line), `line: ${line}`)
+  assert.match(r.result.report, /removed or restored nothing/i)
+  assert.doesNotMatch(r.result.report, /Nothing was removed/)
+  assert.ok(r.result.report.includes('37') && r.result.report.includes('4211'), 'the hashed counts (repo 37, home 4211) must be rendered')
+  assert.match(r.result.report, /stray-snapshot/i, 'the header must say the comparison is the library\'s measurement')
+})
+
+test('T4 r3: the script renders the library\'s shadow flag as given and does not recompute it', async () => {
+  const r = await review({}, scripted(smallBefore(), smallAfter({
+    changes: [{ path: 'src/odd.js', change: 'added', shadows_installed_workflow: true }, { path: WFPATH, change: 'changed', shadows_installed_workflow: false }],
+  })))
+  assert.deepEqual(r.result.stray_writes.map((s) => [s.path, s.shadows_installed_workflow]), [['src/odd.js', true], [WFPATH, false]])
+  assert.match(r.result.report.split('\n').find((l) => l.includes('src/odd.js')), /shadow/i)
+  assert.doesNotMatch(r.result.report.split('\n').find((l) => l.includes(WFPATH)), /shadow/i)
+})
+
+test('T4 r3: a removed tracked file is rendered as removed', async () => {
+  const r = await review({}, scripted(smallBefore(), smallAfter({ changes: [{ path: 'README.md', change: 'removed', shadows_installed_workflow: false }] })))
+  assert.deepEqual(r.result.stray_writes.map((s) => [s.path, s.change]), [['README.md', 'removed']])
+  assert.match(r.result.report.split('\n').find((l) => l.includes('README.md')), /\(removed\)/)
+})
+
+test('T4 r3: retained worktrees come from the diff object and render on their own line, never as strays', async () => {
+  const r = await review({}, scripted(smallBefore(), smallAfter({ retained_worktrees: ['.claude/worktrees/wf_x'], dropped: ['.claude/scheduled_tasks.lock'] })))
+  assert.deepEqual(r.result.stray_writes, [])
+  assert.ok(r.result.report.split('\n').find((l) => /lens worktree retained/i.test(l))?.includes('.claude/worktrees/wf_x'))
+  assert.doesNotMatch(r.result.report, /scheduled_tasks/)
+})
+
+test('T4 r3: a before_rollup that differs from the before object\'s rollup is could-not-be-made with the rollup as the reason, stray_writes null, and the changes are not rendered', async () => {
+  const r = await review({}, scripted(smallBefore(), smallAfter({
+    before_rollup: 'ee'.repeat(32), changes: [{ path: WFPATH, change: 'added', shadows_installed_workflow: true }],
+  })))
+  assert.equal(r.result.stray_writes, null)
+  assert.match(r.result.report, /could not be made/i)
+  assert.match(r.result.report, /rollup/i)
+  assert.ok(!r.result.report.includes(WFPATH), 'a comparison made against a different before-file must not be rendered')
+})
+
+test('T4 r3: a missing before object gives null and could-not-be-made even when the after object is well formed', async () => {
+  const r = await review({}, { 'scope:diff': { ...SCOPE_OK, scratch_root: SCRATCH }, synthesis: { ...SYNTH, snapshot_after: smallAfter() } })
+  assert.equal(r.result.stray_writes, null)
+  assert.match(r.result.report, /could not be made/i)
+})
+
+for (const [name, file] of [
+  ['under a repo root', '/Users/x/repos/proj/snap/before.json'],
+  ['under a repo .claude/ directory', '/Users/x/repos/proj/.claude/snap/before.json'],
+  ['relative', 'snap/before.json'],
+  ['a temp-looking prefix with a traversal out of it', '/tmp/../Users/x/repos/proj/before.json'],
+  ['a look-alike of a temp prefix', '/tmpfoo/snap/before.json'],
+  ['empty', ''],
+]) {
+  test(`T4 r3: a before object whose file path is ${name} is rejected (null, could not be made)`, async () => {
+    const r = await review({}, scripted(smallBefore({ file }), smallAfter()))
+    assert.equal(r.result.stray_writes, null)
+    assert.match(r.result.report, /could not be made/i)
+  })
+}
+
+for (const ok of ['/tmp/harn-snap-aB3/before.json', '/private/var/folders/zz/T/harn-snap-aB3/before.json']) {
+  test(`T4 r3: a before file under a temp prefix (${ok}) is accepted and its path reaches the synthesis prompt`, async () => {
+    const before = smallBefore({ file: ok })
+    const { result, calls } = await review({}, scripted(before, smallAfter()))
+    assert.deepEqual(result.stray_writes, [])
+    assert.ok(promptOf(calls, 'synthesis').includes(ok))
+  })
+}
+
+for (const [name, patch] of [
+  ['a rollup that is not 64 hex characters', { rollup: 'abc123' }],
+  ['an upper-case rollup', { rollup: BEFORE_ROLLUP.toUpperCase() }],
+  ['a missing rollup', { rollup: undefined }],
+  ['a missing file', { file: undefined }],
+]) {
+  test(`T4 r3: a before object with ${name} is could-not-be-made`, async () => {
+    const r = await review({}, scripted(smallBefore(patch), smallAfter()))
+    assert.equal(r.result.stray_writes, null)
+    assert.match(r.result.report, /could not be made/i)
+  })
+}
+
+for (const [name, patch] of [
+  ['changes that is not an array', { changes: 'none' }],
+  ['a change entry with an unknown change kind', { changes: [{ path: 'a', change: 'vanished', shadows_installed_workflow: false }] }],
+  ['a change entry with no path', { changes: [{ change: 'added', shadows_installed_workflow: false }] }],
+  ['a change entry whose shadow flag is not a boolean', { changes: [{ path: 'a', change: 'added', shadows_installed_workflow: 'yes' }] }],
+  ['a missing before_rollup', { before_rollup: undefined }],
+]) {
+  test(`T4 r3: a diff object with ${name} is could-not-be-made`, async () => {
+    const r = await review({}, scripted(smallBefore(), smallAfter(patch)))
+    assert.equal(r.result.stray_writes, null)
+    assert.match(r.result.report, /could not be made/i)
+  })
+}
+
+test('T4 r3: the old full-snapshot shape in either field is no longer a valid comparison (the script no longer diffs snapshots itself)', async () => {
+  const full = mk(['?? a.txt'], [])
+  let r = await review({}, scripted(full, smallAfter()))
+  assert.equal(r.result.stray_writes, null)
+  r = await review({}, scripted(smallBefore(), full))
+  assert.equal(r.result.stray_writes, null)
+})
+
+test('T4 r3 static: neither prompt asks the agent to relay a snapshot body, only the small objects, and the script no longer compares snapshots', async () => {
+  const { calls } = await review({}, withScratch())
+  for (const l of ['scope:diff', 'synthesis']) {
+    const p = promptOf(calls, l)
+    assert.match(p, /rollup/, `${l}: the prompt must name the small object's rollup`)
+    assert.doesNotMatch(p, /\bstatus\b[^\n]{0,40}\bfiles\b|retained_worktrees: \[|\{ ?status:/i, `${l}: must not describe a snapshot body to relay`)
+    assert.doesNotMatch(p, /return (the )?(full )?snapshot (body|json)|entire snapshot/i, `${l}: must not ask for the body`)
+  }
+  assert.match(promptOf(calls, 'scope:diff'), /file/, 'the before prompt must name the file key of the small object')
+  assert.match(promptOf(calls, 'synthesis'), /changes/, 'the diff prompt must name the changes key of the small object')
+  assert.doesNotMatch(SRC, /snapBefore\.status|snapAfter\.status|snapAfter\.files/, 'the script must not diff status or files itself')
 })

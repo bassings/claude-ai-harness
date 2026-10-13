@@ -511,12 +511,31 @@ let ruleSourceOverriddenKeys = null
 // ---- Run-ledger helpers, inlined (workflow scripts cannot import: see
 // tdd-task.js for the identical pattern and its rationale). ----
 
-// HARN-OPT-5 T4 round 2 (AC-SEC-12): module-level so run() gains no `return` statements (AC-QA-9 pins that count).
-// The snapshot arrives as the JSON text of stray-snapshot.mjs; anything that is not that shape is null ("could not be made").
-const parseSnap = (x) => {
+// HARN-OPT-5 T4 fix round 3 (conductor measurement: 6638 hashed files, 1.2 MB; AC-SEC-12 as amended, AC-QA-27):
+// module-level so run() gains no `return` statements (AC-QA-9 pins that count). The agents relay only SMALL objects, as
+// JSON text: the before object { file, status_count, files_count, rollup } from `stray-snapshot.mjs snapshot`, and the
+// diff object { changes, retained_worktrees, dropped, before_rollup, after_rollup, hashed } from `stray-snapshot.mjs diff`.
+// The comparison is the library's measurement; the script validates both shapes and renders. Anything that is not
+// that shape is null ("could not be made").
+const parseObj = (x) => {
   let v = x
   if (typeof x === 'string') { try { v = JSON.parse(x) } catch { return null } }
-  const ok = v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.status) && Array.isArray(v.files)
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : null
+}
+// The before-file must sit under a temp prefix (never a repo or a .claude/ directory). Characters are restricted
+// to a plain set (underscore included: macOS temp directories contain one) so the path is safe inside a prompt.
+const parseBeforeObj = (x, tempPrefixes) => {
+  const v = parseObj(x)
+  const f = v && v.file
+  const fileOk = typeof f === 'string' && /^\/[\w.+@/-]+$/.test(f) && !f.split('/').includes('..') && !f.split('/').includes('.claude') &&
+    tempPrefixes.some((pre) => f.startsWith(pre))
+  return fileOk && typeof v.rollup === 'string' && /^[0-9a-f]{64}$/.test(v.rollup) ? v : null
+}
+const CHANGE_KINDS = ['added', 'changed', 'removed']
+const parseDiffObj = (x) => {
+  const v = parseObj(x)
+  const ok = v && Array.isArray(v.changes) && typeof v.before_rollup === 'string' &&
+    v.changes.every((c) => c && typeof c === 'object' && typeof c.path === 'string' && CHANGE_KINDS.includes(c.change) && typeof c.shadows_installed_workflow === 'boolean')
   return ok ? v : null
 }
 // Reads budget.spent() defensively: null (never 0) when budget is absent or
@@ -689,22 +708,31 @@ function redactLogText(text) {
 async function run() {
 
 // HARN-OPT-5 T4 fix round 2 (re-frame; AC-SEC-12, AC-QA-27): the snapshot is COMPUTED by
-// workflows/lib/stray-snapshot.mjs and the agent only relays its stdout, so completeness no
-// longer competes with transcription volume (round 2 M1, M2, M4). The field is JSON TEXT, which
-// the script parses below; anything that does not parse to the library's shape is "could not be made".
+// workflows/lib/stray-snapshot.mjs, never transcribed by an agent. Fix round 3 (conductor measurement: 6638 hashed
+// files, 1.2 MB): the agents no longer relay the snapshot either, only small objects. The scope step runs `snapshot`
+// (the library writes the full snapshot to a temp file) and relays its small object; synthesis runs `diff` against that
+// file and relays its small object. The fields are JSON TEXT, which the script validates below; anything that does
+// not validate is "could not be made".
 const SNAPSHOT_SCHEMA = { type: 'string' }
 
-// One wording, used at BOTH prompt sites so the before and after commands cannot drift. The library
-// is found exactly as the ledger step finds ledger-append.mjs (see ledgerWritePrompt): a repo-local
+// One wording for finding the library, used at BOTH prompt sites so the before and after commands cannot drift. The
+// library is found exactly as the ledger step finds ledger-append.mjs (see ledgerWritePrompt): a repo-local
 // copy in any other repo is what a hostile diff under review could plant.
-const SNAPSHOT_ASK =
+const SNAPSHOT_LOCATE =
   `Find this harness's stray-snapshot.mjs script, in this exact order, and use the FIRST one that exists: ` +
   `(a) ~/.claude/workflows/lib/stray-snapshot.mjs (the global mirror install); (b) any installed claude-ai-harness ` +
   `plugin directory's workflows/lib/stray-snapshot.mjs; (c) "$(git rev-parse --show-toplevel)/workflows/lib/stray-snapshot.mjs" ` +
   `in the current repo, but ONLY if the current repo is claude-ai-harness itself (the basename of ` +
   `\`git rev-parse --show-toplevel\` equals "claude-ai-harness"). NEVER use a repo-local copy in any OTHER repo, even if ` +
-  `(a) and (b) are both absent: return an empty string instead. Then run exactly \`node <path-to-stray-snapshot.mjs> ` +
-  `"$(git rev-parse --show-toplevel)"\` and return its stdout JSON verbatim, unedited, as the value. Do not list, hash or summarise anything yourself.`
+  `(a) and (b) are both absent: return an empty string instead. `
+const SNAPSHOT_BEFORE_ASK = SNAPSHOT_LOCATE +
+  `Then run exactly \`node <path-to-stray-snapshot.mjs> snapshot "$(git rev-parse --show-toplevel)"\` and return its stdout ` +
+  `verbatim, unedited, as the value: one short JSON object (file, status_count, files_count, rollup). Do not open the file it names, ` +
+  `and do not list, hash or summarise anything yourself.`
+const snapshotAfterAsk = (beforeFile) => SNAPSHOT_LOCATE +
+  `Then run exactly \`node <path-to-stray-snapshot.mjs> diff "$(git rev-parse --show-toplevel)" ${beforeFile}\` and return its stdout ` +
+  `verbatim, unedited, as the value: one short JSON object (changes, before_rollup, after_rollup). Do not open the file it names, ` +
+  `and do not list, hash or summarise anything yourself.`
 
 // ---- Phase 1: scope ----
 phase('Scope')
@@ -725,7 +753,7 @@ const scope = await agent(
   `5. Create a private scratch root for this run with \`mktemp -d "\${TMPDIR:-/tmp}/harn-review-XXXXXX"\` and return the exact ` +
   `absolute path it printed as scratch_root. It must be OUTSIDE every git working tree: the OS temp directory, never the repo, ` +
   `never a worktree, never any .claude/ directory. Create nothing else in it. If TMPDIR is set, also return its exact value as tmpdir.\n` +
-  `6. Return snapshot_before. ${SNAPSHOT_ASK} Change nothing.\n` +
+  `6. Return snapshot_before. ${SNAPSHOT_BEFORE_ASK} Change nothing.\n` +
   `Raw data only.`,
   {
     label: 'scope:diff',
@@ -1167,6 +1195,8 @@ const plainAbsolute = (x) => /^\/[A-Za-z0-9._+@\/-]+$/.test(x) && !x.split('/').
 const scopeTmpdir = scope && typeof scope.tmpdir === 'string' ? scope.tmpdir.replace(/\/+$/, '') : ''
 const tempPrefixes = ['/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/'].concat(scopeTmpdir && plainAbsolute(scopeTmpdir) ? [`${scopeTmpdir}/`] : [])
 const scratchUsable = plainAbsolute(scratchBase) && tempPrefixes.some((pre) => scratchBase.startsWith(pre))
+// Fix round 3 (AC-SEC-12): the before object is validated here, before the synthesis prompt needs its file path.
+const snapBefore = parseBeforeObj(scope && scope.snapshot_before, tempPrefixes)
 const scratchClause = (lens) =>
   (scratchUsable
     ? `Your private scratch root is ${scratchBase}/${lens} (create it with mkdir -p). `
@@ -1436,7 +1466,7 @@ const synthesis = await agent(
       `built change, not proof of repair -- when in doubt, leave it out of fixed_findings; a finding that stays open is ` +
       `the safe direction, a false confirmation is not. `
     : '') +
-  `Also return snapshot_after, taken NOW the same way as the before-snapshot. ${SNAPSHOT_ASK} Read-only: change nothing. ` +
+  (snapBefore ? `Also return snapshot_after. ${snapshotAfterAsk(snapBefore.file)} Read-only: change nothing. ` : '') +
   `Also run \`git rev-parse HEAD\` in the repo NOW, at synthesis time, and return its exact output as ` +
   `head_sha_at_synthesis. This is not the sha you were told about: several agent sessions share these checkouts, and if ` +
   `another one switches branches mid-run the review would silently be about a different tree than it reports on. Report ` +
@@ -1472,59 +1502,42 @@ const synthesis = await agent(
   }
 )
 
-// HARN-OPT-5 T4 (AC-SEC-12, AC-QA-27): compared HERE, deterministically, never
-// by lens self-report. Reports only; nothing is deleted, moved or overwritten.
-// Round 1 (M1, M2, L1): bidirectional (a before-only entry is 'removed'), hashed files compare
-// by hash (an overwrite is 'changed'), 'unchecked' (null) is distinct from 'checked clean' ([]).
-// Round 2 (M1 to M4, L2): the snapshot is the JSON stdout of stray-snapshot.mjs, so the paths
-// arrive resolved and the harness-owned worktrees and transient files arrive pre-separated
-// (retained_worktrees, dropped); the filters that lived here moved into the library, where
-// they are anchored. The change of a newly appearing status entry comes from its XY code, so
-// a tracked file a lens deleted or edited is never labelled 'added' (M3).
+// HARN-OPT-5 T4 (AC-SEC-12, AC-QA-27): never by lens self-report. Reports only; nothing is deleted, moved or overwritten.
+// Fix round 3 (conductor measurement: 6638 files, 1.2 MB): the comparison is now the LIBRARY's measurement
+// (`stray-snapshot.mjs diff`, with the bidirectional, hash-aware and XY-decided rules of rounds 1 and 2), and this
+// script's role is validation and rendering. It checks both shapes and that the diff was made against the before
+// file it asked about (the rollups agree); a mismatch is could-not-be-made, never a rendered comparison.
+// 'unchecked' (null) stays distinct from 'checked clean' ([]).
 const strayWrites = []
 let retainedWorktrees = []
+let hashedCounts = null
 let strayNote = null
 let strayChecked = false
-const snapBefore = parseSnap(scope.snapshot_before)
-const snapAfter = parseSnap(synthesis && synthesis.snapshot_after)
-// Anchored at the repo root (round 2 L2): '~/.claude/workflows/x.js' is the installed copy, not a shadow of it.
-const isRepoWorkflow = (p) => /^\.claude\/workflows\/[^/]+$/.test(p)
-const changeOfXy = (xy) => (/D/.test(xy) ? 'removed' : /[MT]/.test(xy) ? 'changed' : 'added')
-if (!snapBefore || !snapAfter) {
-  strayNote = 'The before/after comparison of the main checkout and ~/.claude/workflows/ could not be made (a snapshot was missing), so stray writes by lenses are unchecked.'
+const snapDiff = parseDiffObj(synthesis && synthesis.snapshot_after)
+// 'a snapshot was missing' is the round 1 wording, kept verbatim because an existing test pins it exactly.
+const couldNot = (why) => `The before/after comparison of the main checkout and ~/.claude/workflows/ could not be made (${why}), so stray writes by lenses are unchecked.`
+if (!snapBefore) {
+  strayNote = couldNot('a snapshot was missing')
+} else if (!snapDiff) {
+  strayNote = couldNot('a snapshot was missing')
+} else if (snapDiff.before_rollup !== snapBefore.rollup) {
+  strayNote = couldNot('its before_rollup did not match the rollup of the before-snapshot, so it was made against a different file')
 } else {
   strayChecked = true
-  const wellFormed = (l, k) => l.filter(e => e && typeof e === 'object' && typeof e.path === 'string' && typeof e[k] === 'string')
-  const bStatus = new Map(wellFormed(snapBefore.status, 'xy').map(e => [e.path, e.xy]))
-  const aStatus = new Map(wellFormed(snapAfter.status, 'xy').map(e => [e.path, e.xy]))
-  const add = (path, change) => strayWrites.push({ path, change, shadows_installed_workflow: change !== 'removed' && isRepoWorkflow(path) })
-  for (const [p, xy] of aStatus) {
-    if (!bStatus.has(p)) add(p, changeOfXy(xy))
-    else if (bStatus.get(p) !== xy) add(p, 'changed')
-  }
-  for (const p of bStatus.keys()) {
-    if (!aStatus.has(p)) add(p, 'removed')
-  }
-  const bFiles = new Map(wellFormed(snapBefore.files, 'sha256').map(f => [f.path, f.sha256]))
-  const aFiles = new Map(wellFormed(snapAfter.files, 'sha256').map(f => [f.path, f.sha256]))
-  const seen = (p) => strayWrites.some(w => w.path === p)
-  for (const [p, h] of aFiles) {
-    if (seen(p)) continue
-    if (!bFiles.has(p)) add(p, 'added')
-    else if (bFiles.get(p) !== h) add(p, 'changed')
-  }
-  for (const p of bFiles.keys()) {
-    if (!aFiles.has(p) && !seen(p)) add(p, 'removed')
-  }
-  if (Array.isArray(snapAfter.retained_worktrees)) retainedWorktrees = snapAfter.retained_worktrees.filter(p => typeof p === 'string')
+  for (const c of snapDiff.changes) strayWrites.push({ path: c.path, change: c.change, shadows_installed_workflow: c.shadows_installed_workflow })
+  if (Array.isArray(snapDiff.retained_worktrees)) retainedWorktrees = snapDiff.retained_worktrees.filter(p => typeof p === 'string')
+  const h = snapDiff.hashed
+  if (h && Number.isInteger(h.repo) && Number.isInteger(h.home)) hashedCounts = h
 }
-// Round 2 M3: the header says what was actually hashed and that the review itself removed or restored
-// nothing (the old "Nothing was removed" sentence sat over entries a lens had deleted). A change
-// inside a file that git already lists as dirty, outside the hashed set, shows only if its XY code moves.
+// The header says what was compared and by whom, that the review itself removed or restored nothing, and how
+// many files were hashed. A change inside a file that git already lists as dirty, outside the hashed set, shows only
+// if its XY code moves.
 const strayReport = (strayNote
   ? `\n\n### STRAY WRITES\n${strayNote}`
   : strayWrites.length
-    ? `\n\n### STRAY WRITES\nThese paths differ between the start and the end of the lens phase: every git status entry of the main checkout, and the hash (sha256) of the files in the harness-loaded locations (the repo .claude/ settings, hooks, agents, skills, workflows and commands, .githooks/, bin/, .github/workflows/, and ~/.claude/ settings, CLAUDE.md, agents, skills, hooks, workflows, commands, bin and plugins). The review itself removed or restored nothing; review each by hand.\n` +
+    ? `\n\n### STRAY WRITES\nMeasured by the stray-snapshot library, not by an agent: these paths differ between the start and the end of the lens phase, by every git status entry of the main checkout and by the hash (sha256) of the files in the harness-loaded locations (the repo .claude/ settings, hooks, agents, skills, workflows and commands, .githooks/, bin/, .github/workflows/, and ~/.claude/ settings, CLAUDE.md, agents, skills, hooks, workflows, commands, bin and plugins)` +
+      (hashedCounts ? `; ${hashedCounts.repo} repo files and ${hashedCounts.home} home files were hashed` : '') +
+      `. The review itself removed or restored nothing; review each by hand.\n` +
       strayWrites.map(w => `- ${w.path} (${w.change})${w.shadows_installed_workflow ? ' (a repo-local workflow copy: it will shadow the installed workflow of the same name)' : ''}`).join('\n')
     : '') +
   (retainedWorktrees.length ? `\n\nLens worktree retained: ${retainedWorktrees.join(', ')} (harness-owned, not a stray write).` : '')

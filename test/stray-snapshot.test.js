@@ -197,11 +197,286 @@ test('stray-snapshot: read-only -- git status is identical before and after a ru
   assert.equal(sh('git status --porcelain=v1 -z --untracked-files=all --ignored', repo), before)
 })
 
-test('stray-snapshot: static -- no dependency, no filesystem write call', () => {
+test('stray-snapshot: static -- no dependency, and the library never deletes, moves or appends (fix round 3: snapshot mode may create its own temp file)', () => {
+  // Fix round 3 (conductor measurement: 6638 files, 1.2 MB) rewrote the round 2 form of this test, which banned
+  // writeFileSync and mkdirSync outright. Snapshot mode now writes ONE file made with mkdtemp; what stays banned is
+  // every call that could destroy or alter something that already exists (AC-SEC-12 as amended).
   const src = fs.readFileSync(LIB, 'utf8')
   assert.doesNotMatch(src, /\brequire\(['"][^.n]/)
   assert.doesNotMatch(src, /from ['"](?!node:|\.)/)
-  for (const call of ['writeFileSync', 'appendFileSync', 'rmSync', 'unlinkSync', 'mkdirSync', 'renameSync', 'copyFileSync']) {
-    assert.ok(!src.includes(call), `${call} must not appear: the library is read-only`)
+  for (const call of ['appendFileSync', 'rmSync', 'rmdirSync', 'unlinkSync', 'renameSync', 'copyFileSync', 'truncateSync', 'symlinkSync', 'linkSync']) {
+    assert.ok(!src.includes(call), `${call} must not appear: the library never deletes or alters anything that exists`)
   }
+})
+
+// ======================================================================
+// Fix round 3 (conductor finding at verification; AC-SEC-12 as amended, AC-QA-27). Measured on the real
+// checkout: the one-argument form returns 6638 hashed files and 1.2 MB of JSON, which an agent cannot relay
+// faithfully. The bulk moves off the agent:
+//   node stray-snapshot.mjs snapshot <root>
+//     computes the full snapshot (identical to the one-argument form) and writes it to a 0600 file made with
+//     mkdtemp under the OS temp directory (os.tmpdir(), so TMPDIR), never under a repo or .claude/. Prints ONE
+//     small JSON object { file, status_count, files_count, rollup }; rollup is the sha256 of the file's bytes.
+//   node stray-snapshot.mjs diff <root> <before-file>
+//     takes a fresh snapshot, compares it with the before-file deterministically, prints ONE compact object
+//     { changes: [{path, change, shadows_installed_workflow}], retained_worktrees, dropped,
+//       before_rollup, after_rollup, hashed: { repo, home } }
+//     before_rollup is the sha256 of the before-file's bytes as read now; after_rollup that of the fresh snapshot.
+//     An unreadable or malformed before-file: non-zero exit, a one-line reason on stderr, NOTHING on stdout.
+// The one-argument form keeps working (every test above uses it).
+// ======================================================================
+const tmpBase = () => fs.mkdtempSync(path.join(SUITE_TMPDIR, 'snaptmp-'))
+function lib(args, home = emptyHome(), tmp = tmpBase()) {
+  const res = spawnSync('node', [LIB, ...args], { encoding: 'utf8', env: { ...process.env, HOME: home, TMPDIR: tmp } })
+  let out = null
+  if (res.status === 0) { try { out = JSON.parse(res.stdout) } catch { out = null } }
+  return { res, out, home, tmp }
+}
+function take(repo, home, tmp) {
+  const r = lib(['snapshot', repo], home, tmp)
+  assert.equal(r.res.status, 0, `snapshot mode must succeed; stderr: ${r.res.stderr}`)
+  assert.ok(r.out, `snapshot mode must print one JSON object; stdout: ${r.res.stdout}`)
+  return r
+}
+const diffOf = (repo, beforeFile, home, tmp) => lib(['diff', repo, beforeFile], home, tmp)
+function diffAfter(repo, home, tmp, mutate) {
+  const b = take(repo, home, tmp)
+  mutate()
+  const d = diffOf(repo, b.out.file, home, tmp)
+  assert.equal(d.res.status, 0, `diff mode must succeed; stderr: ${d.res.stderr}`)
+  assert.ok(d.out, `diff mode must print one JSON object; stdout: ${d.res.stdout}`)
+  return { b, d, out: d.out }
+}
+const changeOf = (out, p) => out.changes.find((c) => c.path === p)
+const fileSha = (f) => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex')
+
+test('stray-snapshot r3 snapshot: prints one small object with exactly file, status_count, files_count, rollup', () => {
+  const repo = makeTempRepo(); const home = emptyHome()
+  put(repo, '.githooks/pre-push'); put(repo, 'u.txt'); put(home, '.claude/CLAUDE.md')
+  const { res, out } = take(repo, home)
+  assert.equal(res.stdout.trim().split('\n').length, 1)
+  assert.deepEqual(Object.keys(out).sort(), ['file', 'files_count', 'rollup', 'status_count'])
+  assert.match(out.rollup, /^[0-9a-f]{64}$/)
+  assert.equal(typeof out.file, 'string')
+})
+
+test('stray-snapshot r3 snapshot: the file holds the full snapshot (same as the one-argument form), counts match, rollup is the sha256 of its bytes', () => {
+  const repo = makeTempRepo(); const home = emptyHome()
+  put(repo, '.githooks/pre-push'); put(repo, 'u.txt'); put(home, '.claude/CLAUDE.md'); put(home, '.claude/agents/a.md')
+  const { out } = take(repo, home)
+  const body = JSON.parse(fs.readFileSync(out.file, 'utf8'))
+  assert.deepEqual(body, snap(repo, home).out, 'the written snapshot must equal the one-argument form on the same tree')
+  assert.equal(out.status_count, body.status.length)
+  assert.equal(out.files_count, body.files.length)
+  assert.ok(body.files.length >= 3 && body.status.length >= 2, 'fixture precondition')
+  assert.equal(out.rollup, fileSha(out.file))
+})
+
+test('stray-snapshot r3 snapshot: the file is created under the OS temp directory, outside the repo and any .claude/, mode 0600', () => {
+  const repo = makeTempRepo(); const tmp = tmpBase()
+  const { out } = take(repo, undefined, tmp)
+  const real = fs.realpathSync(out.file)
+  assert.ok(real.startsWith(fs.realpathSync(tmp) + path.sep), `${real} must be under TMPDIR ${tmp}`)
+  assert.ok(path.relative(fs.realpathSync(repo), real).startsWith('..'), 'must not be inside the repo')
+  assert.ok(!real.split(path.sep).includes('.claude'), 'must not be under any .claude/')
+  assert.equal(fs.statSync(real).mode & 0o777, 0o600)
+  assert.notEqual(path.dirname(real), fs.realpathSync(tmp), 'made with mkdtemp: its own fresh directory, not a fixed name in the temp root')
+})
+
+test('stray-snapshot r3 snapshot: stdout stays small however many files are hashed (300 hashed files)', () => {
+  const repo = makeTempRepo()
+  for (let i = 0; i < 300; i++) put(repo, `bin/tool-${i}.sh`, `#${i}\n`)
+  const { res, out } = take(repo)
+  assert.equal(out.files_count, 300)
+  assert.ok(res.stdout.length < 1024, `stdout was ${res.stdout.length} bytes`)
+})
+
+test('stray-snapshot r3 snapshot: rollup is stable across two runs on an unchanged tree, and each run writes its own file', () => {
+  const repo = makeTempRepo(); const home = emptyHome(); const tmp = tmpBase()
+  put(repo, 'bin/b'); put(repo, 'u.txt'); put(home, '.claude/settings.json')
+  const a = take(repo, home, tmp).out
+  const b = take(repo, home, tmp).out
+  assert.equal(a.rollup, b.rollup)
+  assert.notEqual(a.file, b.file)
+})
+
+test('stray-snapshot r3 snapshot: rollup changes when one hashed file changes, and when a status entry appears', () => {
+  const repo = makeTempRepo(); const home = emptyHome(); const tmp = tmpBase()
+  put(repo, '.githooks/pre-push', 'one\n')
+  const a = take(repo, home, tmp).out.rollup
+  put(repo, '.githooks/pre-push', 'two\n')
+  const b = take(repo, home, tmp).out.rollup
+  assert.notEqual(a, b)
+  put(repo, 'new-untracked.txt')
+  assert.notEqual(take(repo, home, tmp).out.rollup, b)
+})
+
+test('stray-snapshot r3 snapshot: leaves the repo untouched (git status identical) and exits non-zero with nothing on stdout when the root is not a checkout', () => {
+  const repo = makeTempRepo()
+  put(repo, 'u.txt')
+  const before = sh('git status --porcelain=v1 -z --untracked-files=all --ignored', repo)
+  take(repo)
+  assert.equal(sh('git status --porcelain=v1 -z --untracked-files=all --ignored', repo), before)
+  const dir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'notgit-'))
+  const r = lib(['snapshot', dir])
+  assert.notEqual(r.res.status, 0)
+  assert.equal(r.res.stdout, '')
+  assert.doesNotMatch(r.res.stderr, /Cannot find module/)
+})
+
+test('stray-snapshot r3 diff: an unchanged tree gives no changes, equal rollups, and exactly the documented keys', () => {
+  const repo = makeTempRepo(); const home = emptyHome()
+  put(repo, 'bin/b'); put(repo, 'u.txt')
+  const { b, d, out } = diffAfter(repo, home, undefined, () => {})
+  assert.equal(d.res.stdout.trim().split('\n').length, 1)
+  assert.deepEqual(Object.keys(out).sort(), ['after_rollup', 'before_rollup', 'changes', 'dropped', 'hashed', 'retained_worktrees'])
+  assert.deepEqual(out.changes, [])
+  assert.equal(out.before_rollup, b.out.rollup)
+  assert.equal(out.after_rollup, b.out.rollup)
+})
+
+test('stray-snapshot r3 diff: an added repo-local workflow is one entry, added, with shadows_installed_workflow true', () => {
+  const repo = makeTempRepo()
+  const { out } = diffAfter(repo, undefined, undefined, () => put(repo, '.claude/workflows/optimise-cycle.js'))
+  assert.deepEqual(out.changes, [{ path: '.claude/workflows/optimise-cycle.js', change: 'added', shadows_installed_workflow: true }])
+})
+
+test('stray-snapshot r3 diff: an ordinary added file is added without the shadow flag', () => {
+  const repo = makeTempRepo()
+  const { out } = diffAfter(repo, undefined, undefined, () => put(repo, 'scratch/leftover.txt'))
+  assert.deepEqual(out.changes, [{ path: 'scratch/leftover.txt', change: 'added', shadows_installed_workflow: false }])
+})
+
+for (const [name, mutate, xyPath, want] of [
+  ['a newly appearing tracked deletion (" D")', (repo) => fs.rmSync(path.join(repo, 'a.txt')), 'a.txt', 'removed'],
+  ['a newly appearing tracked edit (" M")', (repo) => put(repo, 'a.txt', 'edited\n'), 'a.txt', 'changed'],
+  ['a newly appearing untracked file ("??")', (repo) => put(repo, 'fresh.txt'), 'fresh.txt', 'added'],
+  ['a newly appearing ignored file ("!!")', (repo) => put(repo, 'ignored.out'), 'ignored.out', 'added'],
+]) {
+  test(`stray-snapshot r3 diff: ${name} is '${want}' (the XY code decides), never shadowing`, () => {
+    const repo = makeTempRepo()
+    put(repo, 'a.txt', '1\n'); put(repo, '.gitignore', 'ignored.out\n'); sh('git add a.txt .gitignore && git commit -q -m a', repo)
+    const { out } = diffAfter(repo, undefined, undefined, () => mutate(repo))
+    assert.deepEqual(out.changes, [{ path: xyPath, change: want, shadows_installed_workflow: false }])
+  })
+}
+
+test('stray-snapshot r3 diff: a before-only status entry (an untracked file a lens removed) is removed, without the shadow flag', () => {
+  const repo = makeTempRepo()
+  put(repo, '.claude/workflows/gone.js'); put(repo, 'u.txt')
+  const { out } = diffAfter(repo, undefined, undefined, () => { fs.rmSync(path.join(repo, 'u.txt')); fs.rmSync(path.join(repo, '.claude/workflows/gone.js')) })
+  assert.deepEqual(out.changes.map((c) => [c.path, c.change, c.shadows_installed_workflow]).sort(),
+    [['.claude/workflows/gone.js', 'removed', false], ['u.txt', 'removed', false]])
+})
+
+test('stray-snapshot r3 diff: an entry present in both whose XY changed (" M" to "M " after git add) is changed', () => {
+  const repo = makeTempRepo()
+  put(repo, 'a.txt', '1\n'); sh('git add a.txt && git commit -q -m a', repo)
+  put(repo, 'a.txt', '2\n')
+  const { out } = diffAfter(repo, undefined, undefined, () => sh('git add a.txt', repo))
+  assert.deepEqual(out.changes, [{ path: 'a.txt', change: 'changed', shadows_installed_workflow: false }])
+})
+
+test('stray-snapshot r3 diff: a hashed file whose content changed while its status stayed "??" is changed, with the shadow flag under .claude/workflows/', () => {
+  const repo = makeTempRepo()
+  put(repo, '.claude/workflows/x.js', 'one\n')
+  const { out } = diffAfter(repo, undefined, undefined, () => put(repo, '.claude/workflows/x.js', 'two\n'))
+  assert.deepEqual(out.changes, [{ path: '.claude/workflows/x.js', change: 'changed', shadows_installed_workflow: true }])
+})
+
+test('stray-snapshot r3 diff: home files are reported with ~/.claude paths; removed and ~/.claude/workflows/ never carry the shadow flag; only the anchored repo .claude/workflows/ does', () => {
+  const repo = makeTempRepo(); const home = emptyHome()
+  put(home, '.claude/CLAUDE.md', 'one\n'); put(home, '.claude/bin/gone', 'x\n'); put(repo, '.claude/hooks/old.sh')
+  const { out } = diffAfter(repo, home, undefined, () => {
+    put(home, '.claude/CLAUDE.md', 'two\n'); fs.rmSync(path.join(home, '.claude/bin/gone'))
+    put(home, '.claude/workflows/x.js'); put(repo, '.claude/hooks/y.sh'); put(repo, '.claude/workflows/w.js'); put(repo, '.claude/workflows/sub/deep.js')
+  })
+  const got = out.changes.map((c) => [c.path, c.change, c.shadows_installed_workflow]).sort()
+  assert.deepEqual(got, [
+    ['.claude/hooks/y.sh', 'added', false],
+    ['.claude/workflows/sub/deep.js', 'added', false],
+    ['.claude/workflows/w.js', 'added', true],
+    ['~/.claude/CLAUDE.md', 'changed', false],
+    ['~/.claude/bin/gone', 'removed', false],
+    ['~/.claude/workflows/x.js', 'added', false],
+  ].sort())
+  assert.ok(!JSON.stringify(out).includes(home), 'the absolute home path must never reach stdout')
+})
+
+test('stray-snapshot r3 diff: a retained lens worktree and the dropped lock file are listed on their own fields, never as changes', () => {
+  const repo = makeTempRepo()
+  const { out } = diffAfter(repo, undefined, undefined, () => { put(repo, '.claude/worktrees/wf_x/file.txt'); put(repo, '.claude/scheduled_tasks.lock') })
+  assert.deepEqual(out.changes, [])
+  assert.ok(out.retained_worktrees.some((p) => p === '.claude/worktrees/wf_x' || p.startsWith('.claude/worktrees/wf_x/')), JSON.stringify(out.retained_worktrees))
+  assert.deepEqual(out.dropped, ['.claude/scheduled_tasks.lock'])
+})
+
+test('stray-snapshot r3 diff: hashed counts are the AFTER snapshot files split into repo and home', () => {
+  const repo = makeTempRepo(); const home = emptyHome()
+  put(repo, 'bin/a'); put(home, '.claude/CLAUDE.md')
+  const { out } = diffAfter(repo, home, undefined, () => { put(repo, 'bin/b'); put(repo, '.githooks/h'); put(home, '.claude/agents/a.md') })
+  assert.deepEqual(out.hashed, { repo: 3, home: 2 })
+})
+
+test('stray-snapshot r3 diff: stdout is one small object however big the snapshot is (300 hashed files, one change)', () => {
+  const repo = makeTempRepo()
+  for (let i = 0; i < 300; i++) put(repo, `bin/tool-${i}.sh`, `#${i}\n`)
+  const { d, out } = diffAfter(repo, undefined, undefined, () => put(repo, 'bin/tool-7.sh', 'changed\n'))
+  assert.deepEqual(out.changes.map((c) => [c.path, c.change]), [['bin/tool-7.sh', 'changed']])
+  assert.equal(out.hashed.repo, 300)
+  assert.ok(d.res.stdout.length < 1024, `stdout was ${d.res.stdout.length} bytes`)
+})
+
+test('stray-snapshot r3 diff: before_rollup is the sha256 of the before-file as read now (a tampered file surfaces), after_rollup moves when the tree does', () => {
+  const repo = makeTempRepo(); const home = emptyHome(); const tmp = tmpBase()
+  put(repo, 'bin/b', 'one\n')
+  const b = take(repo, home, tmp)
+  const body = JSON.parse(fs.readFileSync(b.out.file, 'utf8'))
+  body.files[0].sha256 = 'f'.repeat(64)
+  fs.writeFileSync(b.out.file, JSON.stringify(body))
+  const tampered = diffOf(repo, b.out.file, home, tmp)
+  assert.equal(tampered.res.status, 0, tampered.res.stderr)
+  assert.notEqual(tampered.out.before_rollup, b.out.rollup, 'a rollup mismatch must be surfaced, not hidden')
+  assert.equal(tampered.out.before_rollup, fileSha(b.out.file))
+  const b2 = take(repo, home, tmp)
+  put(repo, 'bin/b', 'two\n')
+  const moved = diffOf(repo, b2.out.file, home, tmp)
+  assert.notEqual(moved.out.after_rollup, moved.out.before_rollup)
+})
+
+test('stray-snapshot r3 diff: it deletes nothing (the before-file survives) and writes nothing into the repo', () => {
+  const repo = makeTempRepo(); const tmp = tmpBase()
+  put(repo, 'u.txt')
+  const b = take(repo, undefined, tmp)
+  const before = sh('git status --porcelain=v1 -z --untracked-files=all --ignored', repo)
+  const d = diffOf(repo, b.out.file, undefined, tmp)
+  assert.equal(d.res.status, 0, d.res.stderr)
+  assert.ok(fs.existsSync(b.out.file), 'the before-file must still exist')
+  assert.equal(sh('git status --porcelain=v1 -z --untracked-files=all --ignored', repo), before)
+})
+
+for (const [name, make] of [
+  ['a missing file', (dir) => path.join(dir, 'nope.json')],
+  ['a file that is not JSON', (dir) => { const f = path.join(dir, 'b.json'); fs.writeFileSync(f, 'not json at all'); return f }],
+  ['JSON that is not a snapshot (an array)', (dir) => { const f = path.join(dir, 'b.json'); fs.writeFileSync(f, '[1,2]'); return f }],
+  ['an object without status or files', (dir) => { const f = path.join(dir, 'b.json'); fs.writeFileSync(f, '{"ok":true}'); return f }],
+  ['an empty file', (dir) => { const f = path.join(dir, 'b.json'); fs.writeFileSync(f, ''); return f }],
+]) {
+  test(`stray-snapshot r3 diff: ${name} as the before-file exits non-zero with one reason line on stderr and nothing on stdout`, () => {
+    const repo = makeTempRepo(); const tmp = tmpBase()
+    // Precondition: the same invocation shape works with a good before-file, so a failure below is about the before-file.
+    const good = take(repo, undefined, tmp)
+    assert.equal(diffOf(repo, good.out.file, undefined, tmp).res.status, 0)
+    const r = diffOf(repo, make(tmp), undefined, tmp)
+    assert.notEqual(r.res.status, 0)
+    assert.equal(r.res.stdout, '')
+    assert.equal(r.res.stderr.trim().split('\n').length, 1, `one-line reason expected; got: ${r.res.stderr}`)
+    assert.doesNotMatch(r.res.stderr, /not a git checkout|Cannot find module/, 'must fail because of the before-file')
+  })
+}
+
+test('stray-snapshot r3: the one-argument form still prints the full snapshot object (kept working)', () => {
+  const { res, out } = snap(makeTempRepo())
+  assert.equal(res.status, 0, res.stderr)
+  assert.deepEqual(Object.keys(out).sort(), ['dropped', 'files', 'retained_worktrees', 'status'])
 })
