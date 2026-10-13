@@ -680,6 +680,15 @@ function redactLogText(text) {
 // ONE ledger write below (AC-ARCH-3), instead of each return needing its own.
 async function run() {
 
+// HARN-OPT-5 T4 (AC-SEC-12): the shape shared by snapshot_before and snapshot_after.
+const SNAPSHOT_SCHEMA = {
+  type: 'object',
+  properties: {
+    status: { type: 'array', items: { type: 'string' } },
+    workflow_files: { type: 'array', items: { type: 'object', required: ['path', 'sha256'], properties: { path: { type: 'string' }, sha256: { type: 'string' } } } },
+  },
+}
+
 // ---- Phase 1: scope ----
 phase('Scope')
 const scope = await agent(
@@ -694,6 +703,13 @@ const scope = await agent(
   `4. Check whether a file .claude/harness-triggers.json exists at the repo root and report that as ` +
   `harness_triggers_file_exists (true/false). If it exists, return its parsed JSON as custom_rules; if it does not ` +
   `exist, custom_rules must be null.\n` +
+  // HARN-OPT-5 T4 (AC-SEC-11, AC-SEC-12, AC-QA-26, AC-QA-27): folded into this
+  // SAME agent() call (AC-SIMP-9), never a new one.
+  `5. Create a private scratch root for this run with \`mktemp -d "\${TMPDIR:-/tmp}/harn-review-XXXXXX"\` and return the exact ` +
+  `absolute path it printed as scratch_root. It must be OUTSIDE every git working tree: the OS temp directory, never the repo, ` +
+  `never a worktree, never any .claude/ directory. Create nothing else in it.\n` +
+  `6. Return snapshot_before: status = the exact lines of \`git status --porcelain --untracked-files=all --ignored\` run at the ` +
+  `repo root, and workflow_files = every file under ~/.claude/workflows/ as {path, sha256} (sha256 of its contents). Change nothing.\n` +
   `Raw data only.`,
   {
     label: 'scope:diff',
@@ -724,6 +740,9 @@ const scope = await agent(
         // single-field report has no way to be self-inconsistent).
         harness_triggers_file_exists: { type: 'boolean' },
         consistency: INSTALL_CONSISTENCY_SCHEMA,
+        // HARN-OPT-5 T4: both optional so an older agent response validates.
+        scratch_root: { type: 'string' },
+        snapshot_before: SNAPSHOT_SCHEMA,
       },
     },
   }
@@ -1118,6 +1137,20 @@ const qaBudget =
   `security gates, concurrency locks first). List every guard you deliberately did not mutate in could_not_check; ` +
   `an honest skip list beats an unbounded run.\n`
 
+// HARN-OPT-5 T4 (AC-SEC-11, AC-QA-26): a usable root is absolute, plain
+// characters only, and not under any .claude/ directory. Anything else falls
+// back to the lens making its own with mktemp -d, so the root never depends on
+// startRunId (null when the start write failed) or on a shared fixed name.
+const scratchBase = scope && typeof scope.scratch_root === 'string' ? scope.scratch_root.replace(/\/+$/, '') : ''
+const scratchUsable = /^\/[A-Za-z0-9._+@\/-]+$/.test(scratchBase) && !scratchBase.split('/').includes('..') && !scratchBase.split('/').includes('.claude')
+const scratchClause = (lens) =>
+  (scratchUsable
+    ? `Your private scratch root is ${scratchBase}/${lens} (create it with mkdir -p). `
+    : `Create your private scratch root first with \`mktemp -d "\${TMPDIR:-/tmp}/harn-${lens}-XXXXXX"\` and use only the path it prints. `) +
+    `Put every extraction, copy and scratch file for this review inside that root and nowhere else; no other lens or run shares it. ` +
+    `You must not write to the main checkout, to any worktree other than your own, to any .claude/ directory inside a repo, or to ~/.claude/. ` +
+    `When you finish you may delete only your own root, with: ${scratchUsable ? `rm -rf ${scratchBase}/${lens}` : 'rm -rf on the exact path mktemp printed'} (nothing else).\n\n`
+
 const lensPrompt = (lens) =>
   `REVIEW mode. The reviewed tip is commit ${scopeSha}. FIRST, before anything else, run \`git rev-parse HEAD\` ` +
   `in your worktree. If it differs, your checkout has drifted from the reviewed tip (a parallel session may have ` +
@@ -1135,6 +1168,7 @@ const lensPrompt = (lens) =>
   `Changed files (${paths.length} total):\n${fileList}\n\n` +
   `${specClause}\n\n` +
   (lens === 'lens-qa' ? qaBudget : '') +
+  scratchClause(lens) +
   `You are in an isolated git worktree: mutation experiments (break the guard, watch the test fail, restore) are safe here. ` +
   `The worktree will not contain uncommitted tooling from the main checkout (virtualenvs, node_modules); if you need the ` +
   `project's interpreter or test runner, invoke the main checkout's copy by absolute path (locate the main checkout ` +
@@ -1378,6 +1412,9 @@ const synthesis = await agent(
       `built change, not proof of repair -- when in doubt, leave it out of fixed_findings; a finding that stays open is ` +
       `the safe direction, a false confirmation is not. `
     : '') +
+  `Also return snapshot_after, taken NOW with the same commands as the before-snapshot: status = the exact lines of ` +
+  `\`git status --porcelain --untracked-files=all --ignored\` at the repo root, and workflow_files = every file under ` +
+  `~/.claude/workflows/ as {path, sha256}. Read-only: change nothing. ` +
   `Also run \`git rev-parse HEAD\` in the repo NOW, at synthesis time, and return its exact output as ` +
   `head_sha_at_synthesis. This is not the sha you were told about: several agent sessions share these checkouts, and if ` +
   `another one switches branches mid-run the review would silently be about a different tree than it reports on. Report ` +
@@ -1406,10 +1443,40 @@ const synthesis = await agent(
         // never as "confirmed nothing" (which would be indistinguishable
         // from a genuine empty confirmation).
         fixed_findings: { type: 'array', items: { type: 'object', required: ['lens', 'location', 'claim'], properties: { lens: { type: 'string' }, location: { type: 'string' }, claim: { type: 'string' }, ac_id: { type: ['string', 'null'] } } } },
+        // HARN-OPT-5 T4 (AC-SEC-12): optional, so an older response validates.
+        snapshot_after: SNAPSHOT_SCHEMA,
       },
     },
   }
 )
+
+// HARN-OPT-5 T4 (AC-SEC-12, AC-QA-27): compared HERE, deterministically, never
+// by lens self-report. Reports only; nothing is deleted, moved or overwritten.
+const snapOk = (x) => x && Array.isArray(x.status) && Array.isArray(x.workflow_files)
+const strayWrites = []
+let strayNote = null
+const snapBefore = scope.snapshot_before
+const snapAfter = synthesis && synthesis.snapshot_after
+if (!snapOk(snapBefore) || !snapOk(snapAfter)) {
+  strayNote = 'The before/after comparison of the main checkout and ~/.claude/workflows/ could not be made (a snapshot was missing), so stray writes by lenses are unchecked.'
+} else {
+  const seenStatus = new Set(snapBefore.status)
+  for (const line of snapAfter.status) {
+    if (typeof line !== 'string' || seenStatus.has(line)) continue
+    const p = line.slice(3)
+    strayWrites.push({ path: p, shadows_installed_workflow: /(^|\/)\.claude\/workflows\/[^/]+$/.test(p) })
+  }
+  const seenFiles = new Set(snapBefore.workflow_files.map(f => `${f.path}\0${f.sha256}`))
+  for (const f of snapAfter.workflow_files) {
+    if (!seenFiles.has(`${f.path}\0${f.sha256}`) && !strayWrites.some(w => w.path === f.path)) strayWrites.push({ path: f.path, shadows_installed_workflow: false })
+  }
+}
+const strayReport = strayNote
+  ? `\n\n### STRAY WRITES\n${strayNote}`
+  : strayWrites.length
+    ? `\n\n### STRAY WRITES\nThese paths changed in the main checkout or ~/.claude/workflows/ during the lens phase. Nothing was removed; review each by hand.\n` +
+      strayWrites.map(w => `- ${w.path}${w.shadows_installed_workflow ? ' (a repo-local workflow copy: it will shadow the installed workflow of the same name)' : ''}`).join('\n')
+    : ''
 
 // A synthesis response missing the required structured fields (e.g. an
 // older or misbehaving agent that only returned prose) must not silently
@@ -1490,7 +1557,8 @@ return {
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
   // HARN-OPT-4 T4 (AC-QA-12, AC-OPS-4): appended in code so the guarantee does
   // not rest on synthesis obeying its prompt. Only when the run produced a report.
-  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '')) : '',
+  report: reportOk ? ((installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.report}` : synthesis.report) + (noSpecWasInPlay && !String(synthesis.report).includes(NO_SPEC_SENTENCE) ? `\n\n${NO_SPEC_SENTENCE}` : '') + strayReport) : '',
+  stray_writes: strayWrites,
   __outcome: outcome,
 }
 

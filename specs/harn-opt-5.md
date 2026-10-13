@@ -41,7 +41,7 @@ Also recorded during the plan: the T6 human wait has an end event but no start e
 | The base64-in-shell ledger write in all three workflows (replaced by a payload file) | security | AC-SEC-n |
 | The read-modify-write of `.git/info/exclude` in `ensureGitignored` | data | AC-DATA-n |
 | The five-flag OR in `isWeakCiEvidenceRemoval` (replaced by the never-failed verdict) | qa | AC-QA-n |
-| The shared `tip/` extraction name in the lens prompt | operability | AC-OPS-n |
+| The shared `tip/` extraction name in the lens prompt: it existed nowhere in source (lenses improvised it), so there is nothing to delete; removal is satisfied by the per-lens root being present in the prompt | operability | AC-OPS-17 |
 
 ## Decisions taken up front
 
