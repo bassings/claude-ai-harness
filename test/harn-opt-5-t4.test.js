@@ -75,8 +75,11 @@ test('T4 scratch: each lens prompt names <scratch_root>/<lens>, and two lenses n
   const { calls } = await review({}, withScratch())
   const sec = promptOf(calls, 'lens-security')
   const qa = promptOf(calls, 'lens-qa')
-  assert.ok(sec.includes(`${SCRATCH}/lens-security`), 'lens-security prompt must name its own root')
-  assert.ok(qa.includes(`${SCRATCH}/lens-qa`), 'lens-qa prompt must name its own root')
+  // Conductor, after the build: the delete instruction also carries the path,
+  // so a bare includes() passed with the lens segment dropped from the root
+  // statement. Pin the statement itself.
+  assert.ok(sec.includes(`Your private scratch root is ${SCRATCH}/lens-security`), 'lens-security prompt must state its own root')
+  assert.ok(qa.includes(`Your private scratch root is ${SCRATCH}/lens-qa`), 'lens-qa prompt must state its own root')
   assert.ok(!sec.includes(`${SCRATCH}/lens-qa`), "lens-security must not be told lens-qa's root")
   assert.ok(!qa.includes(`${SCRATCH}/lens-security`), "lens-qa must not be told lens-security's root")
 })
