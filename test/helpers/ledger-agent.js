@@ -66,23 +66,32 @@ function actAsCompliantAgent(prompt, { cwd, scratchDir, writerEnvPrefix = '' }) 
   // Review round 2 F2 (AC-SEC-4): the deletion decision comes from the prompt, as a real agent's would, so a step 5
   // weakened to keep the file on a failure path leaves the file behind here too and the end-to-end test goes RED.
   const rmCommand = cmds.rm[0].replace('<the file>', file)
-  if (deletesOnOutcome(prompt, result)) runSh(rmCommand, { cwd, env })
+  if (deletesOnOutcome(prompt)) runSh(rmCommand, { cwd, env })
   return { file, writerCommand: writerEnvPrefix + writerCommand, result, commands: cmds }
 }
 
-// Reads step 5 of the prompt the way a compliant agent would: delete on this outcome only if the step says the delete
-// applies on every exit path, or names this outcome without carving it out.
-function deletesOnOutcome(prompt, result) {
+// Review round 3 F1 (AC-SEC-4): the agreed step texts, pinned VERBATIM. Round 2 read step 5 through a denylist of
+// carve-out phrasings and round 3 showed a rephrased carve-out ("skip this delete and keep the payload") sailing past
+// it. Enumerating wordings never closes; an exact pin does, and the L5 block is byte-identical across the three
+// workflows so one string covers all of them. Any change to a step must change the pin here on purpose.
+const EXPECTED_STEP_2 = "2. Create the payload file by exclusive create, with exactly this command and nothing else: `mktemp \"${TMPDIR:-/tmp}/harn-ledger-XXXXXX\"`. It prints the path of a new, empty file in a directory outside every git working tree; call that path \"the file\". Never put the file inside the checkout (never under `git rev-parse --show-toplevel`, never in a worktree), never use a fixed name or path, and never derive a name from the run_id. If mktemp fails or prints nothing, or the path somehow already holds content (a collision: read it and check it is empty), report write_ok false with write_error naming that, do not run the writer at all and do not pipe anything to it, and go straight to step 5."
+const EXPECTED_STEP_3 = "3. The payload below is base64-encoded SPECIFICALLY so its raw text (which may contain quotes or other shell metacharacters authored by a reviewed diff, a lens finding, or task text) never reaches a shell command. Do not decode it, inspect it, or reconstruct the JSON by hand. Put exactly the text between the two delimiter lines (the delimiter lines themselves excluded, nothing added) into the file with your file-writing tool (the Write tool), reading the empty file first if the tool requires that. Never write it via a shell command, and never put any of it in a Bash command."
+const EXPECTED_STEP_5 = "5. Delete exactly that one file with `rm \"<the file>\"`, on every exit path: after a successful write, after write_ok false, when the writer was not found or could not be found, when node fails to start, and after a collision. Delete only that one file: no glob, no flags, no directory."
+
+// One numbered step of the prompt: from "\nN. " to the next numbered step or the closing paragraph.
+function stepOf(prompt, n) {
   const text = String(prompt)
-  const start = text.indexOf('\n5. ')
-  if (start < 0) return false
+  const start = text.indexOf(`\n${n}. `)
+  if (start < 0) return null
   const rest = text.slice(start + 1)
   const next = rest.search(/\n(\d\. |If the script)/)
-  const step5 = next >= 0 ? rest.slice(0, next) : rest
-  if (/on every exit path/i.test(step5) && !/only after|keep (it|the file)|do not delete|leave (it|the file)|except/i.test(step5)) return true
-  const ok = result && result.write_ok === true
-  if (ok) return /successful write|write_ok:?\s*true|success/i.test(step5)
-  return /write_ok:?\s*false/i.test(step5) && !/keep (it|the file)[^.]*write_ok:?\s*false|only after a successful/i.test(step5)
+  return next >= 0 ? rest.slice(0, next) : rest
 }
 
-module.exports = { backtickSpans, instructedCommands, runSh, actAsCompliantAgent, deletesOnOutcome }
+// The stand-in agent deletes on every outcome ONLY when step 5 is exactly the agreed text; any other wording fails
+// closed (the file is kept), so a weakened or rephrased step 5 leaves the file behind in the end-to-end test.
+function deletesOnOutcome(prompt) {
+  return stepOf(prompt, 5) === EXPECTED_STEP_5
+}
+
+module.exports = { backtickSpans, instructedCommands, runSh, actAsCompliantAgent, deletesOnOutcome, stepOf, EXPECTED_STEP_2, EXPECTED_STEP_3, EXPECTED_STEP_5 }

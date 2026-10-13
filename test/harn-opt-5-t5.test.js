@@ -10,7 +10,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload, START_DELIMITER, END_DELIMITER } = require('./helpers/extract-ledger-payload.js')
-const { instructedCommands, actAsCompliantAgent } = require('./helpers/ledger-agent.js')
+const { instructedCommands, actAsCompliantAgent, EXPECTED_STEP_2, EXPECTED_STEP_3, EXPECTED_STEP_5 } = require('./helpers/ledger-agent.js')
 const { makeTempRepo, sh, cleanupTempRepos, readLedgerLines, SUITE_TMPDIR } = require('./helpers/temp-repo.js')
 const { extractEncodedPayload } = require('./helpers/extract-ledger-payload.js')
 
@@ -68,9 +68,12 @@ for (const file of Object.keys(FILES)) {
     const lines = prompt.split('\n')
     assert.equal(lines.filter((l) => l === START_DELIMITER).length, 1)
     assert.equal(lines.filter((l) => l === END_DELIMITER).length, 1)
-    assert.match(prompt, /\bWrite\b[^.]*tool|file-writing tool/i, 'tells the agent to use its file-writing tool (Write)')
-    assert.match(prompt, /never[^.]*(shell|Bash)/i, 'forbids writing the payload via a shell command')
-    assert.match(prompt, /read(ing)? the empty file first/i, 'covers the tool that needs a read before write')
+    // Review round 3 F1 (recurrence): the prose of step 3 (everything before the delimiter) pinned verbatim.
+    const step3 = step(prompt, 3)
+    assert.equal(step3.slice(0, step3.indexOf(START_DELIMITER)).replace(/\n$/, ''), EXPECTED_STEP_3, 'step 3 prose is exactly the agreed text')
+    for (const clause of ['file-writing tool (the Write tool)', 'Never write it via a shell command', 'reading the empty file first']) {
+      assert.ok(EXPECTED_STEP_3.includes(clause), `the agreed step 3 says: ${clause}`)
+    }
     const cmds = instructedCommands(prompt)
     assert.deepEqual(cmds.node, ['node <path-to-ledger-append.mjs> < "<the file>"'])
     const at = (s) => prompt.indexOf(s)
@@ -83,22 +86,21 @@ for (const file of Object.keys(FILES)) {
     assert.deepEqual(cmds.rm, ['rm "<the file>"'])
     assert.equal(/\brm\s+-/.test(prompt), false, 'no rm flags anywhere in the prompt')
     assert.equal(/[*?]/.test(cmds.rm[0]), false, 'no glob in the delete command')
-    const step5 = step(prompt, 5)
-    assert.ok(step5.includes('rm "<the file>"'), 'the delete command is in step 5')
-    for (const exitPath of [/successful write/i, /write_ok:?\s*false/i, /(not found|cannot be found|could not be found)/i, /(fail(s|ed)? to start|node (itself )?(fail|could not start))/i, /collision/i]) {
-      assert.match(step5, exitPath, `step 5 must name exit path ${exitPath}`)
+    // Review round 3 F1: pinned verbatim (a denylist of carve-out phrasings can always be rephrased around).
+    assert.equal(step(prompt, 5), EXPECTED_STEP_5, 'step 5 is exactly the agreed text')
+    for (const exitPath of ['successful write', 'write_ok false', 'not found', 'fails to start', 'collision']) {
+      assert.ok(EXPECTED_STEP_5.includes(exitPath), `the agreed step 5 names exit path ${exitPath}`)
     }
-    assert.match(step5, /on every exit path/i, 'the delete is stated as unconditional, in step 5 itself')
-    assert.doesNotMatch(step5, /only after|keep (it|the file)|do not delete|leave (it|the file)|except/i, 'step 5 must not carve out any path on which the file is kept')
+    assert.ok(EXPECTED_STEP_5.includes('on every exit path'), 'the agreed step 5 is unconditional')
   })
 
   test(`${file}: a failed or empty mktemp, or a path that already holds content, reports write_ok false naming that and pipes nothing (AC-SEC-3, AC-DATA-7)`, async () => {
     const prompt = await firstPrompt(file)
-    const step2 = step(prompt, 2)
-    assert.match(step2, /mktemp fails|if mktemp (fails|prints nothing)/i)
-    assert.match(step2, /already (exists|held|holds|has) content/i, 'step 2 itself names the non-empty-file collision')
-    assert.match(step2, /(do not|never|not) (run|pipe|feed)[^.]*(writer|ledger-append)|(writer|ledger-append)[^.]*(is )?not run/i, 'step 2 itself says nothing is piped to the writer on a collision')
-    assert.match(step2, /(do not|never|not) (pipe|feed)/i, 'and that nothing is piped')
+    // Review round 3 F1 (recurrence): pinned verbatim, like step 5.
+    assert.equal(step(prompt, 2), EXPECTED_STEP_2, 'step 2 is exactly the agreed text')
+    for (const clause of ['If mktemp fails or prints nothing', 'already holds content', 'do not run the writer at all', 'do not pipe anything to it']) {
+      assert.ok(EXPECTED_STEP_2.includes(clause), `the agreed step 2 says: ${clause}`)
+    }
   })
 
   test(`${file}: step 1 keeps the H1 writer search order and its repo-local gate (AC-SEC-5)`, async () => {

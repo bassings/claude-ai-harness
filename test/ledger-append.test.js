@@ -4643,6 +4643,27 @@ test('ledger-append: base64 that decodes to non-JSON is the malformed-input path
   assert.deepEqual(readLedgerLines(repo), [])
 })
 
+// Review round 3 F2: an agent or its file tool may wrap a long base64 line; internal whitespace (LF or CRLF, at 76
+// columns) is stripped before the alphabet gate, and the row is identical to the one from unwrapped input.
+test('ledger-append: base64 stdin wrapped at 76 columns (LF, and CRLF) decodes to the same row as the unwrapped line (HARN-OPT-5 T5)', () => {
+  const payload = { kind: 'tdd_task', outcome: 'started', run_id: 'wrap-id', task: 'a task long enough to wrap: ' + 'x'.repeat(200), spec: null }
+  const std = b64(payload)
+  assert.ok(std.length > 76, 'fixture precondition: the encoding spans several 76-column lines')
+  const rows = []
+  for (const nl of ['\n', '\r\n']) {
+    const wrapped = std.match(/.{1,76}/g).join(nl) + nl
+    const repo = makeTempRepo()
+    const out = JSON.parse(runAppendStdin(repo, wrapped).stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, true, JSON.stringify(out))
+    rows.push(stripVolatile(readLedgerLines(repo)[0]))
+  }
+  const plain = makeTempRepo()
+  assert.equal(JSON.parse(runAppendStdin(plain, std + '\n').stdout.trim().split('\n').pop()).write_ok, true)
+  const reference = stripVolatile(readLedgerLines(plain)[0])
+  assert.deepEqual(rows[0], reference, 'LF-wrapped input lands the same row')
+  assert.deepEqual(rows[1], reference, 'CRLF-wrapped input lands the same row')
+})
+
 // Review round 1 F6: the base64-alphabet gate must be exact. Node's Buffer.from(x, 'base64') is lenient (it accepts
 // base64url and skips characters outside the alphabet), so a looser gate would partly decode a corrupted or
 // url-encoded payload file instead of refusing it. Each fixture decodes to VALID JSON under the lenient decoder, so a
@@ -4654,7 +4675,7 @@ test('ledger-append: near-base64 stdin (base64url, a stray quote or angle bracke
   assert.ok(std.includes('+') && std.includes('/'), 'fixture precondition: the standard encoding uses + and /')
   const url = std.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
   assert.equal(JSON.parse(Buffer.from(url, 'base64').toString('utf8')).task, payload.task, 'fixture precondition: the lenient decoder accepts base64url')
-  for (const [name, input] of [['base64url', url], ['a quoted base64 string (valid JSON, not an object)', `"${std}"`], ['a stray angle bracket', `${std}>`], ['over-padding', std.replace(/=*$/, '===')], ['a JSON array', '[1,2]'], ['a JSON number', '42']]) {
+  for (const [name, input] of [['base64url', url], ['a quoted base64 string (valid JSON, not an object)', `"${std}"`], ['a stray angle bracket', `${std}>`], ['over-padding', std.replace(/=*$/, '===')], ['a JSON array', '[1,2]'], ['base64 of a JSON number (reaches the object guard through the decode path)', b64(42)], ['base64 of JSON null', b64(null)]]) {
     const repo = makeTempRepo()
     const res = runAppendStdin(repo, input + '\n')
     assert.equal(res.status, 0, `${name}: the writer always exits 0; stderr: ${res.stderr}`)
