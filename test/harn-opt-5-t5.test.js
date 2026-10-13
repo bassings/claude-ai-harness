@@ -12,6 +12,18 @@ const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload, START_DELIMITER, END_DELIMITER } = require('./helpers/extract-ledger-payload.js')
 const { instructedCommands, actAsCompliantAgent } = require('./helpers/ledger-agent.js')
 const { makeTempRepo, sh, cleanupTempRepos, readLedgerLines, SUITE_TMPDIR } = require('./helpers/temp-repo.js')
+const { extractEncodedPayload } = require('./helpers/extract-ledger-payload.js')
+
+// Review round 1 F1 and F4 (AC-SEC-4, AC-DATA-7): the exit-path and collision checks used to run over the WHOLE prompt,
+// where step 1 and the closing paragraph also say "write_ok false" and step 5 says "after a collision", so reversing
+// step 5 or deleting step 2's collision clause stayed green. Each check now reads its own numbered step only.
+function step(prompt, n) {
+  const start = prompt.indexOf(`\n${n}. `)
+  assert.ok(start >= 0, `step ${n} not found`)
+  const rest = prompt.slice(start + 1)
+  const next = rest.search(/\n(\d\. |If the script)/)
+  return next >= 0 ? rest.slice(0, next) : rest
+}
 
 test.after(cleanupTempRepos)
 
@@ -71,18 +83,22 @@ for (const file of Object.keys(FILES)) {
     assert.deepEqual(cmds.rm, ['rm "<the file>"'])
     assert.equal(/\brm\s+-/.test(prompt), false, 'no rm flags anywhere in the prompt')
     assert.equal(/[*?]/.test(cmds.rm[0]), false, 'no glob in the delete command')
-    const afterRm = prompt.slice(prompt.indexOf('rm "<the file>"') - 600)
-    for (const exitPath of [/write_ok:?\s*false/i, /(not found|cannot be found|could not be found)/i, /(fail(s|ed)? to start|node (itself )?(fail|could not start))/i]) {
-      assert.match(prompt, exitPath, `delete step must cover exit path ${exitPath}`)
+    const step5 = step(prompt, 5)
+    assert.ok(step5.includes('rm "<the file>"'), 'the delete command is in step 5')
+    for (const exitPath of [/successful write/i, /write_ok:?\s*false/i, /(not found|cannot be found|could not be found)/i, /(fail(s|ed)? to start|node (itself )?(fail|could not start))/i, /collision/i]) {
+      assert.match(step5, exitPath, `step 5 must name exit path ${exitPath}`)
     }
-    assert.match(afterRm, /every (exit )?path|regardless|in every case|always/i, 'the delete is stated as unconditional')
+    assert.match(step5, /on every exit path/i, 'the delete is stated as unconditional, in step 5 itself')
+    assert.doesNotMatch(step5, /only after|keep (it|the file)|do not delete|leave (it|the file)|except/i, 'step 5 must not carve out any path on which the file is kept')
   })
 
   test(`${file}: a failed or empty mktemp, or a path that already holds content, reports write_ok false naming that and pipes nothing (AC-SEC-3, AC-DATA-7)`, async () => {
     const prompt = await firstPrompt(file)
-    assert.match(prompt, /mktemp fails|if mktemp (fails|prints nothing)/i)
-    assert.match(prompt, /already (exists|held|holds|has) content|collision/i)
-    assert.match(prompt, /(do not|never|not) (run|pipe|feed)[^.]*(writer|ledger-append)|(writer|ledger-append)[^.]*(is )?not run/i, 'says nothing is piped to the writer on a collision')
+    const step2 = step(prompt, 2)
+    assert.match(step2, /mktemp fails|if mktemp (fails|prints nothing)/i)
+    assert.match(step2, /already (exists|held|holds|has) content/i, 'step 2 itself names the non-empty-file collision')
+    assert.match(step2, /(do not|never|not) (run|pipe|feed)[^.]*(writer|ledger-append)|(writer|ledger-append)[^.]*(is )?not run/i, 'step 2 itself says nothing is piped to the writer on a collision')
+    assert.match(step2, /(do not|never|not) (pipe|feed)/i, 'and that nothing is piped')
   })
 
   test(`${file}: step 1 keeps the H1 writer search order and its repo-local gate (AC-SEC-5)`, async () => {
@@ -149,20 +165,64 @@ for (const file of Object.keys(FILES)) {
 // AC-QA-15: a payload full of the characters the old "first {" heuristic
 // tripped on round-trips exactly, for every ledger:write call a run makes.
 const BRACEY = 'a } b { c \\"d\\" "e" {run_id, ts, write_ok, write_error} {"x":"}"}'
-for (const [file, key] of [['tdd-task.js', 'task'], ['plan-cycle.js', 'spec']]) {
-  test(`${file}: every ledger:write payload round-trips deepEqual with braces, escaped quotes and the return-contract text in a field (AC-QA-15)`, async () => {
+// Review round 1 F5 (AC-QA-15): review-cycle.js is driven too (BRACEY as a finding claim and a spec-bug claim), and the
+// old self-comparison (a parsed value always equals its own JSON round-trip) is replaced by a check that the text
+// between the delimiters is the canonical base64 of the decoded payload, so the workflow's own encoder, the delimiter
+// extraction and the decode agree byte for byte.
+const SCOPE = {
+  base: 'main', head_sha: 'abcdef1234567890', head_tree: '1111111111111111111111111111111111111111',
+  files: [{ path: 'src/foo.js', status: 'M' }], new_dependency_entries: false, new_modules: false, custom_rules: null,
+  harness_triggers_file_exists: false,
+  consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null, escape_hatch_active: false },
+}
+const cleanLens = () => ({ verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, findings: [], head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' })
+const reviewAgents = (claim) => ({
+  'scope:diff': SCOPE,
+  'lens-security': cleanLens(), 'lens-qa': cleanLens(),
+  synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim }], rejected_findings: [] },
+  'ledger:write': { run_id: 'r1', ts: 'x', write_ok: true, write_error: null },
+})
+const RUNS = [
+  ['tdd-task.js', { args: { task: BRACEY }, agent: {} }, (p) => p.task],
+  ['plan-cycle.js', { args: { spec: BRACEY }, agent: {} }, (p) => p.spec],
+  // With no spec in play, review-cycle reclassifies the synthesis's spec bugs as ordinary open findings (D4).
+  ['review-cycle.js', { args: {}, agent: reviewAgents(BRACEY) }, (p) => [...(p.spec_bugs || []), ...(p.open_findings || [])].map((f) => f.claim).find((c) => c === BRACEY) || null],
+]
+for (const [file, opts, carried] of RUNS) {
+  test(`${file}: every ledger:write payload round-trips with braces, escaped quotes and the return-contract text in a field, and the delimited text is its canonical base64 (AC-QA-15)`, async () => {
     let calls
     try {
-      ;({ calls } = await runWorkflow(path.join(WF_DIR, file), { args: { [key]: BRACEY }, agent: {} }))
+      ;({ calls } = await runWorkflow(path.join(WF_DIR, file), opts))
     } catch (e) {
       calls = e.calls
     }
     const writes = calls.filter((c) => c.opts.label === 'ledger:write')
-    assert.ok(writes.length >= 1)
+    assert.ok(writes.length >= 2, 'a started and a terminal write')
+    let seen = 0
     for (const w of writes) {
       const payload = extractLedgerPayload(w.prompt)
-      if (payload.outcome === 'started') assert.equal(payload[key], BRACEY)
-      assert.deepEqual(payload, JSON.parse(JSON.stringify(payload)))
+      if (carried(payload) === BRACEY) seen++
+      assert.equal(extractEncodedPayload(w.prompt), Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'), 'the delimited text is exactly the canonical base64 of the payload')
+      assert.ok(!w.prompt.includes(BRACEY), 'the raw text never appears in the prompt')
     }
+    assert.ok(seen >= 1, `BRACEY must reach at least one payload of ${file}`)
   })
 }
+
+// Review round 1 F5 (AC-QA-15): the extractor is strict by contract, and prose that looks like a payload is ignored.
+const b64 = (o) => Buffer.from(JSON.stringify(o), 'utf8').toString('base64')
+const wrap = (encoded, before = '', after = '') => `${before}\n${START_DELIMITER}\n${encoded}\n${END_DELIMITER}\n${after}`
+test('extractEncodedPayload: exactly one start and one end delimiter, in order, or it throws (AC-QA-15)', () => {
+  const enc = b64({ kind: 'tdd_task', outcome: 'started' })
+  assert.throws(() => extractEncodedPayload(`no delimiters here ${enc}`), /expected exactly one/)
+  assert.throws(() => extractEncodedPayload(`${START_DELIMITER}\n${START_DELIMITER}\n${enc}\n${END_DELIMITER}`), /found 2 start/)
+  assert.throws(() => extractEncodedPayload(`${END_DELIMITER}\n${enc}\n${START_DELIMITER}`), /expected exactly one/)
+  assert.throws(() => extractEncodedPayload(wrap(enc) + `\n${END_DELIMITER}`), /found 1 start, 2 end/)
+})
+test('extractEncodedPayload: a long base64-looking run and braces in the surrounding prose are never mistaken for the payload (AC-QA-15)', () => {
+  const real = { kind: 'tdd_task', outcome: 'started', task: 'the real one' }
+  const decoy = b64({ kind: 'tdd_task', outcome: 'started', task: 'DECOY' })
+  const prose = `Return {run_id, ts, write_ok, write_error}. Example: ${decoy} and {"x":"}"} ` + 'A'.repeat(80)
+  assert.equal(extractEncodedPayload(wrap(b64(real), prose, prose)), b64(real))
+  assert.deepEqual(extractLedgerPayload(wrap(b64(real), prose, prose)), real)
+})

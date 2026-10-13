@@ -13,9 +13,28 @@ function backtickSpans(prompt) {
   return [...String(prompt).matchAll(/`([^`\n]+)`/g)].map((m) => m[1])
 }
 
+// Review round 1 F2 (AC-QA-14): a backtick inside interpolated payload text would close a command span early and hide
+// the rest of the line from the stand-in agent, while a real agent substitutes the whole instruction. A command span
+// is only accepted when the character after its closing backtick is one that can follow a command in prose
+// (whitespace, punctuation or the end of the text); anything else means the span was cut mid-payload.
+function commandSpans(prompt) {
+  const text = String(prompt)
+  const out = []
+  for (const m of text.matchAll(/`([^`\n]+)`/g)) {
+    const span = m[1]
+    if (!/^(mktemp|node|rm) /.test(span)) continue
+    const after = text.charAt(m.index + m[0].length)
+    if (after !== '' && !/[\s.,;:)\]]/.test(after)) {
+      throw new Error(`instructed command span ends mid-text (payload interpolated into a command?): \`${span}\` followed by ${JSON.stringify(after)}`)
+    }
+    out.push(span)
+  }
+  return out
+}
+
 // The three shell commands the prompt instructs, by leading word.
 function instructedCommands(prompt) {
-  const spans = backtickSpans(prompt)
+  const spans = commandSpans(prompt)
   return {
     mktemp: spans.filter((s) => s.startsWith('mktemp ')),
     node: spans.filter((s) => s.startsWith('node ')),

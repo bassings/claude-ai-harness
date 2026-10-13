@@ -100,14 +100,57 @@ for (const [name, drive] of Object.entries(DRIVERS)) {
     const entry = JSON.parse(lines[0])
     assert.equal(entry.kind, payload.kind)
     assert.equal(entry.outcome, payload.outcome)
-    if (name === 'tdd-task.js') {
-      // Conductor fix (T5 test defect 3): the marker is an absolute path outside the repo, and the writer has always
-      // redacted those in free-text fields (REDACTED_PATH_MARKER); the task lands byte-for-byte modulo that redaction.
-      const { redactPaths } = await import(pathToFileURL(APPEND_SCRIPT).href)
-      assert.equal(entry.task, redactPaths(payload.task, fs.realpathSync(repo)), 'the nasty task string must land byte-for-byte, modulo the existing path redaction')
-      assert.ok(entry.task.includes('it\'s "q" `b` $(touch ') && entry.task.includes('\nEOF\nline3 \u{1F600}'), 'the quotes, backtick, substitution, newline, EOF line and astral character survive')
+    // Conductor fix (T5 test defect 3) and review round 1 F3 (AC-QA-14): every key the payload carries is compared
+    // with the appended row, for all three workflows. The writer fills in ts, repo and run_id and has always redacted
+    // absolute paths outside the repo in free text (REDACTED_PATH_MARKER), so strings are compared after that
+    // redaction; nested values (a finding list the writer decorates with ids) are compared leaf by leaf.
+    const { redactPaths } = await import(pathToFileURL(APPEND_SCRIPT).href)
+    const root = fs.realpathSync(repo)
+    const leaves = (v) => (typeof v === 'string' ? [v] : Array.isArray(v) ? v.flatMap(leaves) : v && typeof v === 'object' ? Object.values(v).flatMap(leaves) : [v])
+    // The writer folds spec_bugs, rejected_findings, fixed_findings, open_findings and prior_findings into one
+    // `findings` array that carries ids, never the claim or location (no free text in the ledger, AC-SEC-2), so each
+    // descriptor is checked by the id the writer computes from its lens, location and claim. spec and spec_raw are
+    // kept as sent (their canonicalisation lands in plan_key), so those are compared without redaction.
+    const FOLDED = ['spec_bugs', 'rejected_findings', 'fixed_findings', 'open_findings', 'prior_findings']
+    const AS_SENT = ['spec', 'spec_raw']
+    const { findingId } = await import(pathToFileURL(APPEND_SCRIPT).href)
+    let compared = 0
+    for (const [key, value] of Object.entries(payload)) {
+      if (['ts', 'repo', 'run_id'].includes(key) || value === null || value === undefined) continue
+      if (FOLDED.includes(key)) {
+        for (const f of value) assert.ok((entry.findings || []).some((g) => g.id === findingId(f.lens, f.location, f.claim)), `finding ${JSON.stringify(f)} of ${key} must land by id`)
+        compared++
+        continue
+      }
+      assert.ok(key in entry, `row must carry payload key ${key}`)
+      const expect = (v) => (typeof v === 'string' && !AS_SENT.includes(key) ? redactPaths(v, root) : v)
+      if (typeof value !== 'object') {
+        assert.equal(entry[key], expect(value), `field ${key} must land as sent`)
+      } else {
+        const got = leaves(entry[key])
+        for (const leaf of leaves(value)) assert.ok(got.includes(expect(leaf)), `leaf ${JSON.stringify(leaf)} of ${key} must land as sent`)
+      }
+      compared++
     }
+    assert.ok(compared >= 2, 'at least kind and outcome were compared')
+    if (name === 'tdd-task.js') assert.ok(entry.task.includes('it\'s "q" `b` $(touch ') && entry.task.includes('\nEOF\nline3 \u{1F600}'), 'the quotes, backtick, substitution, newline, EOF line and astral character survive')
     assert.equal(fs.existsSync(run.file), false, 'the payload file is deleted afterwards')
+  })
+}
+
+// Review round 1 F2 (AC-QA-14): an EXECUTED fixture whose breakout precedes any backtick. With the payload interpolated
+// inline after the writer command, the single-quote breakout and the command substitution run before any backtick can
+// close the span, so the marker appears and this test goes RED where the NASTY fixture's own backtick hid it.
+for (const [name, drive] of Object.entries(DRIVERS)) {
+  test(`${name}: executing the prompt's steps with the breakout-first HOSTILE claim creates no marker and still lands the row (AC-SEC-1, AC-QA-14)`, async () => {
+    const marker = path.join(SUITE_TMPDIR, `PWNED_${name}_${process.pid}_c`)
+    fs.rmSync(marker, { force: true })
+    const { prompt } = await drive(HOSTILE.replaceAll('$MARKER', marker))
+    const repo = makeTempRepo()
+    const run = actAsCompliantAgent(prompt, { cwd: repo, scratchDir: fs.mkdtempSync(path.join(SUITE_TMPDIR, 'scratch-')) })
+    assert.equal(fs.existsSync(marker), false, `the instructed steps executed the payload and created ${marker}`)
+    assert.equal(run.result.write_ok, true, JSON.stringify(run.result))
+    assert.equal(readLedgerLines(repo).length, 1)
   })
 }
 

@@ -4643,6 +4643,29 @@ test('ledger-append: base64 that decodes to non-JSON is the malformed-input path
   assert.deepEqual(readLedgerLines(repo), [])
 })
 
+// Review round 1 F6: the base64-alphabet gate must be exact. Node's Buffer.from(x, 'base64') is lenient (it accepts
+// base64url and skips characters outside the alphabet), so a looser gate would partly decode a corrupted or
+// url-encoded payload file instead of refusing it. Each fixture decodes to VALID JSON under the lenient decoder, so a
+// loosened gate writes a row and this test goes RED.
+test('ledger-append: near-base64 stdin (base64url, a stray quote or angle bracket, over-padding) is refused with no row (HARN-OPT-5 T5)', () => {
+  let payload = { kind: 'tdd_task', outcome: 'done', task: 'pad' }
+  let std = b64(payload)
+  for (let i = 0; !(std.includes('+') && std.includes('/')) && i < 2000; i++) { payload = { ...payload, task: `pad${i}~>?${'?'.repeat(i % 7)}` }; std = b64(payload) }
+  assert.ok(std.includes('+') && std.includes('/'), 'fixture precondition: the standard encoding uses + and /')
+  const url = std.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  assert.equal(JSON.parse(Buffer.from(url, 'base64').toString('utf8')).task, payload.task, 'fixture precondition: the lenient decoder accepts base64url')
+  for (const [name, input] of [['base64url', url], ['a quoted base64 string (valid JSON, not an object)', `"${std}"`], ['a stray angle bracket', `${std}>`], ['over-padding', std.replace(/=*$/, '===')], ['a JSON array', '[1,2]'], ['a JSON number', '42']]) {
+    const repo = makeTempRepo()
+    const res = runAppendStdin(repo, input + '\n')
+    assert.equal(res.status, 0, `${name}: the writer always exits 0; stderr: ${res.stderr}`)
+    assert.equal(res.stdout.trim().split('\n').length, 1, `${name}: exactly one line on stdout`)
+    const out = JSON.parse(res.stdout.trim())
+    assert.equal(out.write_ok, false, `${name} must be refused: ${JSON.stringify(out)}`)
+    assert.match(out.write_error, /not valid JSON/i)
+    assert.deepEqual(readLedgerLines(repo), [], `${name}: no row`)
+  }
+})
+
 test('ledger-append: raw JSON on stdin is unchanged, and so is non-base64 garbage (HARN-OPT-5 T5)', () => {
   const repo = makeTempRepo()
   assert.equal(JSON.parse(runAppendStdin(repo, JSON.stringify({ kind: 'tdd_task', outcome: 'done' })).stdout.trim().split('\n').pop()).write_ok, true)

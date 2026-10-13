@@ -1880,6 +1880,11 @@ export function main() {
     const stripped = text.replace(/\s+/g, '')
     const decoded = stripped && /^[A-Za-z0-9+/]+={0,2}$/.test(stripped) ? Buffer.from(stripped, 'base64').toString('utf8') : raw
     payload = text ? JSON.parse(decoded) : {}
+    // HARN-OPT-5 T5 review round 1 (F6): a quoted base64 string, a number or an
+    // array is valid JSON but not a payload; before this check the writer threw
+    // on `'task' in payload` and exited 1 with nothing on stdout, breaking the
+    // always-exits-0-and-prints-one-line contract the prompt relies on.
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('payload is not a JSON object')
   } catch (e) {
     return result(randomUUID(), ts, false, 'payload was not valid JSON: ' + e.message)
   }
