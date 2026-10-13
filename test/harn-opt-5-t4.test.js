@@ -262,3 +262,195 @@ test('T4 spec: the "What this replaces" tip/ row says the name existed nowhere i
   assert.match(row, /nowhere in (the )?source/i)
   assert.match(row, /per-lens (scratch )?root/i)
 })
+
+// ======================================================================
+// Fix round 1 (PR #14 review: security and qa). Names fixed here:
+//   stray_writes entries gain  change: 'added' | 'removed' | 'changed'
+//   stray_writes            null when either snapshot is missing (unchecked), [] when checked clean
+//   scope:diff response     .tmpdir  optional string, the TMPDIR the scope step saw (L2)
+//   repo-local workflow files ride in workflow_files with repo-relative paths (.claude/workflows/x.js)
+// ======================================================================
+const HOME = '/home/u/.claude'
+const LOCAL_WF = '.claude/workflows/review-cycle.js'
+const afterOf = (status, files) => ({ synthesis: { ...SYNTH, snapshot_after: { status, workflow_files: files } } })
+const beforeOf = (status, files) => withScratch({ snapshot_before: { status, workflow_files: files } })
+const H = (c) => c.repeat(64)
+
+// ---- M1 (AC-SEC-12, AC-QA-27): removals and content changes are visible ----
+
+test('T4 r1 M1: a before-only status line is reported as removed', async () => {
+  const r = await review({}, { ...beforeOf(['?? .claude/hooks/guard.sh', ' M README.md'], []), ...afterOf([' M README.md'], []) })
+  const s = strays(r)
+  assert.equal(s.length, 1)
+  assert.equal(s[0].path, '.claude/hooks/guard.sh')
+  assert.equal(s[0].change, 'removed')
+  assert.match(r.result.report.split('\n').find((l) => l.includes('guard.sh')), /removed/i)
+})
+
+test('T4 r1 M1: a before-only hashed file is reported as removed', async () => {
+  const f = { path: `${HOME}/workflows/review-cycle.js`, sha256: H('a') }
+  const r = await review({}, { ...beforeOf([], [f]), ...afterOf([], []) })
+  const s = strays(r)
+  assert.deepEqual(s.map((x) => [x.path, x.change]), [[f.path, 'removed']])
+})
+
+test('T4 r1 M1: a repo-local workflow whose hash changed (pre-existing, same status line) is reported changed with the shadow warning', async () => {
+  const st = [`?? ${LOCAL_WF}`]
+  const r = await review({}, {
+    ...beforeOf(st, [{ path: LOCAL_WF, sha256: H('a') }]),
+    ...afterOf(st, [{ path: LOCAL_WF, sha256: H('b') }]),
+  })
+  const s = strays(r)
+  assert.equal(s.length, 1)
+  assert.equal(s[0].path, LOCAL_WF)
+  assert.equal(s[0].change, 'changed')
+  assert.equal(s[0].shadows_installed_workflow, true)
+  assert.match(r.result.report.split('\n').find((l) => l.includes(LOCAL_WF)), /shadow/i)
+})
+
+test('T4 r1 M1: an unchanged repo-local workflow hash is not reported', async () => {
+  const st = [`?? ${LOCAL_WF}`]
+  const f = [{ path: LOCAL_WF, sha256: H('a') }]
+  const r = await review({}, { ...beforeOf(st, f), ...afterOf(st, f) })
+  assert.deepEqual(strays(r), [])
+})
+
+test('T4 r1 M1: both prompts ask for hashes of the repo own .claude/workflows/ (tracked, untracked or ignored)', async () => {
+  const { calls } = await review({}, withScratch())
+  for (const l of ['scope:diff', 'synthesis']) {
+    const p = promptOf(calls, l)
+    assert.match(p, /(repo-local|repo's own|repo own|repository's own)[^\n]{0,60}(?<!~\/)\.claude\/workflows\//i, `${l}: repo-local .claude/workflows/ not hashed`)
+    assert.match(p, /ignored/i)
+  }
+})
+
+// ---- L3 (folded into M1): the hashed set under ~/.claude/ ----
+
+test('T4 r1 L3: both prompts name the widened ~/.claude/ set and exclude projects/ and todos/', async () => {
+  const { calls } = await review({}, withScratch())
+  for (const l of ['scope:diff', 'synthesis']) {
+    const p = promptOf(calls, l)
+    for (const n of ['settings.json', 'agents/', 'skills/', 'hooks/', 'workflows/', 'AGENT-HARNESS.md']) {
+      assert.ok(p.includes(n), `${l}: ${n} missing from the hashed set`)
+    }
+    assert.match(p, /(never|not|exclude)[^.\n]{0,80}projects\/[^.\n]{0,40}todos\/|(never|not|exclude)[^.\n]{0,80}todos\/[^.\n]{0,40}projects\//i, `${l}: projects/ and todos/ must be excluded`)
+  }
+})
+
+test('T4 r1 L3: a changed ~/.claude/settings.json and a new ~/.claude/agents file are reported by path', async () => {
+  const s0 = { path: `${HOME}/settings.json`, sha256: H('a') }
+  const r = await review({}, {
+    ...beforeOf([], [s0]),
+    ...afterOf([], [{ ...s0, sha256: H('b') }, { path: `${HOME}/agents/x.md`, sha256: H('c') }]),
+  })
+  assert.deepEqual(strays(r).map((x) => [x.path, x.change]).sort(), [[`${HOME}/agents/x.md`, 'added'], [s0.path, 'changed']].sort())
+})
+
+// ---- M2 (AC-QA-27): harness-owned and transient paths are not stray writes ----
+
+test('T4 r1 M2: a retained lens worktree is listed on its own line, never as a stray write', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf(['!! .claude/worktrees/wf_x/'], []) })
+  assert.deepEqual(strays(r), [])
+  const line = r.result.report.split('\n').find((l) => /lens worktree retained/i.test(l))
+  assert.ok(line, 'report must carry a "lens worktree retained" line')
+  assert.ok(line.includes('.claude/worktrees/wf_x'))
+})
+
+test('T4 r1 M2: scheduled_tasks.lock and scheduled_tasks.json appearing are not stray writes', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf(['?? .claude/scheduled_tasks.lock', '!! .claude/scheduled_tasks.json'], []) })
+  assert.deepEqual(strays(r), [])
+  assert.doesNotMatch(r.result.report, /scheduled_tasks/)
+})
+
+test('T4 r1 M2: a real stray alongside the filtered paths is still reported', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf(['!! .claude/worktrees/wf_x/', '?? .claude/scheduled_tasks.lock', `?? ${WFPATH}`], []) })
+  assert.deepEqual(strays(r).map((s) => s.path), [WFPATH])
+})
+
+test('T4 r1 M2: the status command is narrowed (-z, a pathspec) and not a bare --ignored over the whole tree', async () => {
+  const { calls } = await review({}, withScratch())
+  for (const l of ['scope:diff', 'synthesis']) {
+    const p = promptOf(calls, l)
+    const cmd = /git status --porcelain[^`\n]*`/.exec(p)
+    assert.ok(cmd, `${l}: no git status command`)
+    assert.match(cmd[0], /--untracked-files=all/)
+    assert.match(cmd[0], /\s-z\b/, `${l}: -z not requested`)
+    assert.match(cmd[0], /--ignored(=matching)?\s/, `${l}: --ignored missing`)
+    assert.match(cmd[0], /\s--\s+\S/, `${l}: no pathspec after --`)
+    assert.match(cmd[0], /\.claude/, `${l}: pathspec must cover .claude`)
+    assert.match(cmd[0], /\*\.js|:\(exclude\)|:!/, `${l}: pathspec must restrict or exclude bulk directories`)
+  }
+})
+
+// ---- L1 (AC-SEC-12): unchecked is distinguishable from checked-clean ----
+
+test('T4 r1 L1: stray_writes is null when the before snapshot is missing', async () => {
+  const r = await review({}, { 'scope:diff': { ...SCOPE_OK, scratch_root: SCRATCH }, ...afterWith([]) })
+  assert.equal(r.result.stray_writes, null)
+  assert.match(r.result.report, /could not be made/i)
+})
+test('T4 r1 L1: stray_writes is null when the after snapshot is missing', async () => {
+  const r = await review({}, withScratch())
+  assert.equal(r.result.stray_writes, null)
+})
+test('T4 r1 L1: stray_writes is null when neither snapshot exists', async () => {
+  const r = await review({}, {})
+  assert.equal(r.result.stray_writes, null)
+})
+test('T4 r1 L1: checked-clean is still an empty array, not null', async () => {
+  const r = await review({}, { ...withScratch(), ...afterWith([]) })
+  assert.deepEqual(r.result.stray_writes, [])
+})
+test('T4 r1 L1: the could-not-be-made sentence survives a failed synthesis (reportOk false)', async () => {
+  const r = await review({}, { ...withScratch(), synthesis: { ...SYNTH, report: '' } })
+  assert.equal(r.result.stray_writes, null)
+  assert.match(r.result.report, /could not be made/i)
+})
+
+// ---- L2 (AC-SEC-11, AC-QA-26): the scratch base must be under a temp prefix ----
+
+for (const bad of ['/tmp/a/../repo/x', '/Users/x/repos/proj/scratch', '/home/u/work/tree', '/tmpfoo/x', '/private/tmpx/y']) {
+  test(`T4 r1 L2: scratch_root ${bad} falls back to the per-lens mktemp clause`, async () => {
+    const { calls } = await review({}, { 'scope:diff': { ...SCOPE_OK, snapshot_before: BEFORE, scratch_root: bad } })
+    const p = promptOf(calls, 'lens-qa')
+    assert.match(p, /mktemp -d[^\n]*lens-qa[^\n]*XXXXXX/)
+    assert.ok(!p.includes(`${bad}/lens-qa`), 'rejected base must not be used as a root')
+  })
+}
+for (const ok of ['/tmp/harn-review-aB3', '/private/tmp/harn-review-aB3', '/var/folders/zz/T/harn-review-aB3', '/private/var/folders/zz/T/harn-review-aB3']) {
+  test(`T4 r1 L2: scratch_root ${ok} under a known temp prefix is used`, async () => {
+    const { calls } = await review({}, withScratch({ scratch_root: ok }))
+    assert.ok(promptOf(calls, 'lens-qa').includes(`Your private scratch root is ${ok}/lens-qa`))
+  })
+}
+test('T4 r1 L2: a scratch_root under the TMPDIR the scope step passed through is used; the same path without tmpdir is not', async () => {
+  const root = '/data/scratchvol/harn-review-aB3'
+  let r = await review({}, withScratch({ scratch_root: root, tmpdir: '/data/scratchvol' }))
+  assert.ok(promptOf(r.calls, 'lens-qa').includes(`Your private scratch root is ${root}/lens-qa`))
+  r = await review({}, withScratch({ scratch_root: root }))
+  assert.match(promptOf(r.calls, 'lens-qa'), /mktemp -d[^\n]*lens-qa[^\n]*XXXXXX/)
+})
+test('T4 r1 L2: a tmpdir of / or a relative path does not widen the allowed prefixes', async () => {
+  for (const tmpdir of ['/', 'relative/tmp']) {
+    const { calls } = await review({}, withScratch({ scratch_root: '/Users/x/repos/proj/scratch', tmpdir }))
+    assert.match(promptOf(calls, 'lens-qa'), /mktemp -d[^\n]*lens-qa[^\n]*XXXXXX/, `tmpdir ${tmpdir}`)
+  }
+})
+
+// ---- L4 (AC-QA-27): renames and C-quoted paths still trigger the shadow warning ----
+
+test('T4 r1 L4: a -z rename (target first) into .claude/workflows/ is reported at the target with the shadow warning', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([`R  ${WFPATH}\0notes/old.js`], []) })
+  const s = strays(r)
+  assert.equal(s.length, 1)
+  assert.equal(s[0].path, WFPATH)
+  assert.equal(s[0].shadows_installed_workflow, true)
+})
+test('T4 r1 L4: an arrow-form rename into .claude/workflows/ is reported at the target with the shadow warning', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf([`R  notes/old.js -> ${WFPATH}`], []) })
+  assert.deepEqual(strays(r).map((s) => [s.path, s.shadows_installed_workflow]), [[WFPATH, true]])
+})
+test('T4 r1 L4: a C-quoted path is unquoted before the shadow test', async () => {
+  const r = await review({}, { ...beforeOf([], []), ...afterOf(['?? ".claude/workflows/a\\"b c.js"'], []) })
+  assert.deepEqual(strays(r).map((s) => [s.path, s.shadows_installed_workflow]), [['.claude/workflows/a"b c.js', true]])
+})
