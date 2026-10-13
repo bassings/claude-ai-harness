@@ -35,7 +35,7 @@
 // invocation does (guarded below).
 
 import { execFileSync } from 'node:child_process'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -1677,18 +1677,161 @@ function resolveWorkingTreeRoot(cwd) {
 // operator's file to begin with, so writing to it can never turn up as a
 // diff on a tracked file, never needs staging, and never gets swept into
 // an unrelated `git add -A`.
+// Upper bound on any git subprocess ensureGitignored runs; a hang becomes a
+// fail-closed refusal rather than a frozen writer (see the note at the call).
+const GIT_CALL_TIMEOUT_MS = 10_000
+
 function ensureGitignored(root) {
+  // AC-DATA-1/AC-QA-18: ask git first and touch nothing when the ledger is
+  // already ignored (by this file or a tracked .gitignore). The old
+  // read-modify-write truncated the exclude file in place, so a concurrent
+  // writer's `git check-ignore` could observe it empty and refuse (CI's
+  // hostile-git step landed 43 of 50 writers). Now only a writer that finds
+  // the path unmatched ever writes, and never in place.
+  //
+  // One subprocess classifies the path (AC-QA-20 counts them): `-v` also
+  // reports a winning NEGATION pattern (`!path`, exit 0), which `-q` would
+  // call ignored. Returns true when the ledger is, or after this call will
+  // be, ignored; false, or a string naming the refusal (fail closed, AC-SEC-13), when a negation re-includes
+  // it, in which case nothing is written because adding an exclude line
+  // cannot beat a later negation. An unmatched path has no pattern a new
+  // exclude line could lose to, so no second check-ignore is needed.
+  let verdict = 'none'
+  try {
+    // L1 (AC-SEC-13): -z (which git only allows with --stdin) gives NUL-separated fields (source, line, pattern,
+    // path), so a ':' inside the excludes file's own path cannot shift the
+    // pattern field the way splitting the plain `-v` line on ':' did.
+    // Conductor, after the T6 round-3 push: the pre-push gate once sat for 54
+    // minutes inside this call, git waiting on stdin, not reproduced in five
+    // capped runs since. Every git call here carries a timeout so a recurrence
+    // fails closed (a thrown, non-1 status below) instead of freezing the
+    // caller.
+    const hit = execFileSync('git', ['check-ignore', '-v', '-z', '--stdin'], { cwd: root, encoding: 'utf8', input: LEDGER_RELATIVE_PATH + '\0', stdio: ['pipe', 'pipe', 'ignore'], timeout: GIT_CALL_TIMEOUT_MS })
+    const pattern = hit.split('\0')[2] || ''
+    verdict = pattern.startsWith('!') ? 'negated' : 'ignored'
+  } catch (e) {
+    // M1 (AC-SEC-13): only exit 1 means "no pattern matches". Any other status
+    // (128 for a corrupt index or a path beyond a symlink) is an error, and
+    // treating it as unmatched failed open.
+    if (e.status !== 1) return false
+  }
+  if (verdict === 'ignored') return true
+  if (verdict === 'negated') return false
   const gitDir = path.join(root, '.git')
   const infoDir = path.join(gitDir, 'info')
   const excludePath = path.join(infoDir, 'exclude')
   fs.mkdirSync(infoDir, { recursive: true })
-  let contents = ''
-  if (fs.existsSync(excludePath)) contents = fs.readFileSync(excludePath, 'utf8')
-  const lines = contents.split('\n')
-  if (!lines.some((l) => l.trim() === LEDGER_RELATIVE_PATH)) {
-    const sep = contents.length && !contents.endsWith('\n') ? '\n' : ''
-    fs.writeFileSync(excludePath, contents + sep + LEDGER_RELATIVE_PATH + '\n')
+  // AC-DATA-5: resolve a symlinked exclude and replace the file it points at,
+  // beside it, so the link itself is never swapped for a regular file.
+  // Round 2 F1 (AC-DATA-5, AC-SEC-13): a DANGLING link has nothing to resolve
+  // to; falling back to the link path let the rename land over the link and
+  // silently replace it with a regular file. lstat first and fail closed,
+  // naming the condition and never the resolved path.
+  let target = excludePath
+  let isLink = false
+  try {
+    isLink = fs.lstatSync(excludePath).isSymbolicLink()
+  } catch (e) {
+    // absent: create at the conventional path
   }
+  if (isLink) {
+    try {
+      target = fs.realpathSync(excludePath)
+    } catch (e) {
+      return 'the git exclude path is a dangling symlink -- refusing to replace it with a regular file'
+    }
+  }
+  const readTarget = () => (fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '')
+  const hasLine = (c) => c.split('\n').some((l) => l.trim() === LEDGER_RELATIVE_PATH)
+  const contents = readTarget()
+  if (!hasLine(contents)) {
+    // Round 2 F3/F4 (AC-DATA-5, conductor decision: refuse rather than
+    // bypass): a rename forks a hard-linked file away from its other names
+    // and silently replaces a read-only one, where the old in-place write
+    // failed with EACCES. Refuse both before any temp file exists.
+    let existing = null
+    try {
+      existing = fs.statSync(target)
+    } catch (e) {
+      // no existing target: nothing to fork or protect
+    }
+    if (existing && existing.nlink > 1) {
+      return 'the git exclude file is a hard link (more than one name) -- refusing to replace it, which would fork the link'
+    }
+    if (existing) {
+      try {
+        fs.accessSync(target, fs.constants.W_OK)
+      } catch (e) {
+        return 'the git exclude file is not writable (read-only) -- refusing to replace it'
+      }
+    }
+    // Round 3 F3 (conductor decision, same family as F3/F4 above): a target
+    // directory that is not writable cannot take the temp file or the rename,
+    // and the old in-place write would have succeeded there. Refuse up front
+    // with a named, path-free message rather than let EACCES surface with the
+    // resolved directory (possibly outside the repo, via a symlink) inside it.
+    try {
+      fs.accessSync(path.dirname(target), fs.constants.W_OK)
+    } catch (e) {
+      return 'the git exclude file\'s directory is not writable -- refusing to replace the file (a rename needs a writable directory)'
+    }
+    const mode = existing ? existing.mode & 0o777 : 0o644
+    // AC-DATA-4: a uniquely named temp file in the TARGET's directory (a
+    // rename is only atomic within one filesystem), created exclusively.
+    const writeTemp = (base) => {
+      const tmp = path.join(path.dirname(target), `.exclude.${process.pid}.${randomBytes(8).toString('hex')}.tmp`)
+      try {
+        const fd = fs.openSync(tmp, 'wx', mode)
+        try {
+          fs.writeSync(fd, base + (base.length && !base.endsWith('\n') ? '\n' : '') + LEDGER_RELATIVE_PATH + '\n')
+          fs.fchmodSync(fd, mode)
+        } finally {
+          fs.closeSync(fd)
+        }
+      } catch (e) {
+        fs.rmSync(tmp, { force: true })
+        throw e
+      }
+      return tmp
+    }
+    let tmp = writeTemp(contents)
+    try {
+      // TEST-ONLY, no-ops unless a test sets these exact env vars (AC-DATA-2):
+      // hold the writer between creating the temp file and the rename, or
+      // fail there, so a test can prove the target is untouched meanwhile.
+      const testWindowMs = Number(process.env.LEDGER_APPEND_TEST_EXCLUDE_WINDOW_MS || 0)
+      if (testWindowMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, testWindowMs)
+      if (process.env.LEDGER_APPEND_TEST_EXCLUDE_THROW) throw new Error('injected failure before exclude rename')
+      // A concurrent writer may have won while this one was building; its
+      // result already satisfies us, so do not replace it a second time.
+      // Round 2 F5 (AC-DATA-4): if the bytes changed (an operator edit) since
+      // they were read, the temp file is stale and renaming it would lose that
+      // edit: discard it and rebuild once from the fresh bytes.
+      const fresh = readTarget()
+      if (hasLine(fresh)) {
+        fs.rmSync(tmp, { force: true })
+      } else if (fresh === contents) {
+        fs.renameSync(tmp, target)
+      } else {
+        fs.rmSync(tmp, { force: true })
+        tmp = writeTemp(fresh)
+        fs.renameSync(tmp, target)
+      }
+    } catch (e) {
+      fs.rmSync(tmp, { force: true })
+      throw e
+    }
+  }
+  // M1 (AC-SEC-13): `git check-ignore` never reports a TRACKED path, so a
+  // force-added ledger is still "unmatched" after the line is written. Prove
+  // the path is now ignored (exit 0) or refuse; security outranks the extra
+  // subprocess (AC-QA-20). Runs whether or not this writer changed the file.
+  try {
+    execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root, stdio: 'ignore', timeout: GIT_CALL_TIMEOUT_MS })
+  } catch (e) {
+    return false
+  }
+  return true
 }
 
 function result(run_id, ts, write_ok, write_error) {
@@ -2350,20 +2493,16 @@ export function main() {
   }
 
   try {
-    ensureGitignored(root)
-    // L1: ensureGitignored only ASSERTS the ledger is ignored (writes
-    // .git/info/exclude); it never VERIFIES the assertion took effect. A
-    // tracked .gitignore carrying a later negation pattern
-    // (`!.claude/harness-ledger.jsonl`) re-includes the path -- git
-    // resolves ignore precedence by file, last match wins, and
-    // .git/info/exclude has no special priority over a tracked .gitignore.
-    // Writing and reporting success in that state risks the ledger
-    // actually being committed, the exact outcome AC-SEC-1 forbids.
-    try {
-      execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root })
-    } catch (e) {
-      return result(run_id, ts, false, 'the ledger path is not actually gitignored (a tracked .gitignore may re-include it with a negation pattern) -- refusing to write rather than risk it being committed')
+    const ignored = ensureGitignored(root)
+    if (ignored !== true) {
+      // A string is a named refusal from ensureGitignored (round 2 F1, F3, F4).
+      return result(run_id, ts, false, typeof ignored === 'string' ? ignored : 'the ledger path is not actually gitignored (a tracked .gitignore may re-include it with a negation pattern) -- refusing to write rather than risk it being committed')
     }
+    // L1 (AC-SEC-13): a tracked .gitignore carrying a later negation
+    // (`!.claude/harness-ledger.jsonl`) re-includes the path, and
+    // .git/info/exclude has no priority over it. ensureGitignored reports
+    // that as false above, so we refuse rather than risk the ledger being
+    // committed (AC-SEC-13).
     fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
 
     // M3: a conduct_plan_event replay (the conducting agent re-ticking and

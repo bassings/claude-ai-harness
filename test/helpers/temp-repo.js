@@ -129,6 +129,8 @@ function makeTempRepo() {
   assertGitContextWithin(dir, sh('git rev-parse --absolute-git-dir', dir).trim())
   sh('git config user.email test@example.com', dir)
   sh('git config user.name Test', dir)
+  // Round 2 F2 (AC-QA-18): hermetic against the operator's global git ignore.
+  sh('git config core.excludesFile /dev/null', dir)
   fs.writeFileSync(path.join(dir, 'README.md'), 'seed\n')
   sh('git add README.md && git commit -q -m seed', dir)
   return dir
