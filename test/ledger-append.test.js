@@ -4607,3 +4607,91 @@ test('ledger-append (M7): the written line carries the new version, not the call
   assert.equal(JSON.parse(readLedgerLines(repo)[0]).schema_version, 6,
     'the writer stamps its own version; a caller cannot claim to be a different one')
 })
+
+// HARN-OPT-5 T5 (AC-SEC-1, AC-SEC-2): the ledger:write step now feeds the
+// writer a file holding the BASE64 of the payload JSON. The writer decodes
+// it itself, so the payload stays opaque in the prompt. Raw JSON on stdin
+// must keep working (the conductor pipes conduct_plan_event lines that way).
+function runAppendStdin(cwd, stdinText, env = {}) {
+  const { sanitizedGitEnv } = require('./helpers/temp-repo.js')
+  return spawnSync('node', [APPEND_SCRIPT], { cwd, input: stdinText, encoding: 'utf8', env: sanitizedGitEnv(env) })
+}
+const b64 = (obj) => Buffer.from(typeof obj === 'string' ? obj : JSON.stringify(obj), 'utf8').toString('base64')
+// Conductor fix (T5 test defect 1): the two rows are written into two temp repos, and the writer stamps each row's
+// `repo` identity from the checkout basename when there is no remote, so that field differs by construction; it is
+// dropped along with ts. Everything else, including the hostile task string, must be identical.
+const stripVolatile = (line) => { const e = JSON.parse(line); delete e.ts; delete e.repo; return e }
+
+test('ledger-append: base64 stdin decodes to the same row as raw JSON stdin, including quotes, a newline and an astral character (HARN-OPT-5 T5)', () => {
+  const payload = { kind: 'tdd_task', outcome: 'started', run_id: 'same-id', task: 'it\'s "q" `b` $(touch X)\nEOF\n\u{1F600}', spec: null }
+  const rawRepo = makeTempRepo()
+  const b64Repo = makeTempRepo()
+  assert.equal(JSON.parse(runAppendStdin(rawRepo, JSON.stringify(payload)).stdout.trim()).write_ok, true)
+  const res = runAppendStdin(b64Repo, b64(payload) + '\n')
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, JSON.stringify(out))
+  assert.equal(out.run_id, 'same-id')
+  assert.deepEqual(stripVolatile(readLedgerLines(b64Repo)[0]), stripVolatile(readLedgerLines(rawRepo)[0]))
+  assert.equal(JSON.parse(readLedgerLines(b64Repo)[0]).task, payload.task)
+})
+
+test('ledger-append: base64 that decodes to non-JSON is the malformed-input path -- write_ok false, no row (HARN-OPT-5 T5)', () => {
+  const repo = makeTempRepo()
+  const out = JSON.parse(runAppendStdin(repo, b64('this is not json')).stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /not valid JSON/i)
+  assert.deepEqual(readLedgerLines(repo), [])
+})
+
+// Review round 3 F2: an agent or its file tool may wrap a long base64 line; internal whitespace (LF or CRLF, at 76
+// columns) is stripped before the alphabet gate, and the row is identical to the one from unwrapped input.
+test('ledger-append: base64 stdin wrapped at 76 columns (LF, and CRLF) decodes to the same row as the unwrapped line (HARN-OPT-5 T5)', () => {
+  const payload = { kind: 'tdd_task', outcome: 'started', run_id: 'wrap-id', task: 'a task long enough to wrap: ' + 'x'.repeat(200), spec: null }
+  const std = b64(payload)
+  assert.ok(std.length > 76, 'fixture precondition: the encoding spans several 76-column lines')
+  const rows = []
+  for (const nl of ['\n', '\r\n']) {
+    const wrapped = std.match(/.{1,76}/g).join(nl) + nl
+    const repo = makeTempRepo()
+    const out = JSON.parse(runAppendStdin(repo, wrapped).stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, true, JSON.stringify(out))
+    rows.push(stripVolatile(readLedgerLines(repo)[0]))
+  }
+  const plain = makeTempRepo()
+  assert.equal(JSON.parse(runAppendStdin(plain, std + '\n').stdout.trim().split('\n').pop()).write_ok, true)
+  const reference = stripVolatile(readLedgerLines(plain)[0])
+  assert.deepEqual(rows[0], reference, 'LF-wrapped input lands the same row')
+  assert.deepEqual(rows[1], reference, 'CRLF-wrapped input lands the same row')
+})
+
+// Review round 1 F6: the base64-alphabet gate must be exact. Node's Buffer.from(x, 'base64') is lenient (it accepts
+// base64url and skips characters outside the alphabet), so a looser gate would partly decode a corrupted or
+// url-encoded payload file instead of refusing it. Each fixture decodes to VALID JSON under the lenient decoder, so a
+// loosened gate writes a row and this test goes RED.
+test('ledger-append: near-base64 stdin (base64url, a stray quote or angle bracket, over-padding) is refused with no row (HARN-OPT-5 T5)', () => {
+  let payload = { kind: 'tdd_task', outcome: 'done', task: 'pad' }
+  let std = b64(payload)
+  for (let i = 0; !(std.includes('+') && std.includes('/')) && i < 2000; i++) { payload = { ...payload, task: `pad${i}~>?${'?'.repeat(i % 7)}` }; std = b64(payload) }
+  assert.ok(std.includes('+') && std.includes('/'), 'fixture precondition: the standard encoding uses + and /')
+  const url = std.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  assert.equal(JSON.parse(Buffer.from(url, 'base64').toString('utf8')).task, payload.task, 'fixture precondition: the lenient decoder accepts base64url')
+  for (const [name, input] of [['base64url', url], ['a quoted base64 string (valid JSON, not an object)', `"${std}"`], ['a stray angle bracket', `${std}>`], ['over-padding', std.replace(/=*$/, '===')], ['a JSON array', '[1,2]'], ['base64 of a JSON number (reaches the object guard through the decode path)', b64(42)], ['base64 of JSON null', b64(null)]]) {
+    const repo = makeTempRepo()
+    const res = runAppendStdin(repo, input + '\n')
+    assert.equal(res.status, 0, `${name}: the writer always exits 0; stderr: ${res.stderr}`)
+    assert.equal(res.stdout.trim().split('\n').length, 1, `${name}: exactly one line on stdout`)
+    const out = JSON.parse(res.stdout.trim())
+    assert.equal(out.write_ok, false, `${name} must be refused: ${JSON.stringify(out)}`)
+    assert.match(out.write_error, /not valid JSON/i)
+    assert.deepEqual(readLedgerLines(repo), [], `${name}: no row`)
+  }
+})
+
+test('ledger-append: raw JSON on stdin is unchanged, and so is non-base64 garbage (HARN-OPT-5 T5)', () => {
+  const repo = makeTempRepo()
+  assert.equal(JSON.parse(runAppendStdin(repo, JSON.stringify({ kind: 'tdd_task', outcome: 'done' })).stdout.trim().split('\n').pop()).write_ok, true)
+  assert.equal(readLedgerLines(repo).length, 1)
+  const bad = JSON.parse(runAppendStdin(repo, '{not json!').stdout.trim().split('\n').pop())
+  assert.equal(bad.write_ok, false)
+  assert.equal(readLedgerLines(repo).length, 1, 'no second row')
+})

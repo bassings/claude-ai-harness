@@ -4,56 +4,33 @@
 // run, rather than a hand-written stand-in that only proves the two sides
 // agree by coincidence (this is the gap H3 exists to close).
 //
-// Two embedding shapes are supported so this helper keeps working across
-// the H1 fix (raw JSON in the prompt -> base64 in the prompt): a raw `{...}`
-// JSON object found by brace-matching (tolerant of nested braces/strings),
-// or, if none parses, the first long base64-alphabet run, decoded then
-// parsed. Whichever the current prompt text actually uses is picked up
-// automatically; nothing here should need to change again when the prompt
-// wording changes, only if the embedding mechanism itself changes again.
+// HARN-OPT-5 T5 (AC-QA-15): the payload now sits in the prompt between a
+// pair of fixed delimiter lines, base64-encoded, and is fed to the writer
+// from a private file rather than a shell string. This helper reads ONLY
+// what is between those lines. The earlier "first { in the prompt" and
+// "first long base64 run" heuristics are gone on purpose: a payload (or the
+// prompt's own prose, e.g. the literal {run_id, ts, write_ok, write_error})
+// can contain braces, and a heuristic that guesses the boundary round-trips
+// by coincidence rather than by contract.
+const START_DELIMITER = '<<<HARNESS-LEDGER-PAYLOAD>>>'
+const END_DELIMITER = '<<<END-HARNESS-LEDGER-PAYLOAD>>>'
 
-function findJsonObject(text) {
-  const start = text.indexOf('{')
-  if (start === -1) return null
-  let depth = 0
-  let inString = false
-  let escape = false
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i]
-    if (inString) {
-      if (escape) escape = false
-      else if (ch === '\\') escape = true
-      else if (ch === '"') inString = false
-      continue
-    }
-    if (ch === '"') { inString = true; continue }
-    if (ch === '{') depth++
-    else if (ch === '}') {
-      depth--
-      if (depth === 0) return text.slice(start, i + 1)
-    }
+function extractEncodedPayload(promptText) {
+  const lines = String(promptText).split('\n')
+  const starts = lines.flatMap((l, i) => (l === START_DELIMITER ? [i] : []))
+  const ends = lines.flatMap((l, i) => (l === END_DELIMITER ? [i] : []))
+  if (starts.length !== 1 || ends.length !== 1 || ends[0] <= starts[0]) {
+    throw new Error(
+      `extractEncodedPayload: expected exactly one ${START_DELIMITER} line followed by exactly one ${END_DELIMITER} line ` +
+        `in the prompt text (found ${starts.length} start, ${ends.length} end)`
+    )
   }
-  return null
+  return lines.slice(starts[0] + 1, ends[0]).join('\n').trim()
 }
 
 function extractLedgerPayload(promptText) {
-  const jsonBlob = findJsonObject(promptText)
-  if (jsonBlob) {
-    try {
-      return JSON.parse(jsonBlob)
-    } catch (e) {
-      // fall through to the base64 route
-    }
-  }
-  const b64Match = promptText.match(/[A-Za-z0-9+/]{40,}={0,2}/)
-  if (b64Match) {
-    try {
-      return JSON.parse(Buffer.from(b64Match[0], 'base64').toString('utf8'))
-    } catch (e) {
-      // fall through to the error below
-    }
-  }
-  throw new Error('extractLedgerPayload: could not find a JSON payload (raw or base64) in the prompt text')
+  const encoded = extractEncodedPayload(promptText)
+  return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'))
 }
 
-module.exports = { extractLedgerPayload }
+module.exports = { extractLedgerPayload, extractEncodedPayload, START_DELIMITER, END_DELIMITER }
