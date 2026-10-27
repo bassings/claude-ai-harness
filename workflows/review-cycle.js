@@ -1981,7 +1981,7 @@ const payloadAcVerdictList = payloadAcVerdicts(acVerdicts)
     [priorVerified ? priorVerified.invalid : 0, 'invalid_prior_ids_dropped', 'a prior_findings entry whose id did not match the id recomputed from its own lens, location and claim'],
     [payloadDrops.ac_ids, 'invalid_ac_ids_dropped', 'a non-conforming ac_id was nulled'],
     [payloadDrops.finding_fields, 'invalid_finding_fields_dropped', 'a non-conforming lens or severity was nulled'],
-    [payloadDrops.record_values, 'invalid_record_values_dropped', 'a malformed descriptor was dropped or a non-conforming verdict was nulled'],
+    [payloadDrops.record_values, 'invalid_record_values_dropped', 'a malformed descriptor or synthesis list was dropped, a non-conforming verdict was nulled, or a malformed round, round_key, checkout-drift value or start run_id was dropped'],
   ].filter(([n]) => n > 0)
   const sent = fixedPairs.length
   const parts = [
@@ -2070,7 +2070,9 @@ if (ledgerFailed) {
   result.ledger_write_failed = true
   result.ledger_write_error = startWrite.write_error || terminalWrite.write_error || 'unknown'
   const why = startWrite.write_error || terminalWrite.write_error || 'unknown'
-  log(`TELEMETRY NOT RECORDED for this run: ${redactLogText(String(why))}. The run itself is unaffected, but this run leaves no telemetry.`)
+  // A writer that refuses finding_entries predates HARN-OPT-6; the retry deliberately never strips that key, so name the remedy here.
+  const staleWriter = /finding_entries: not an allowed property/.test(String(why)) ? ' The installed ledger-append.mjs predates HARN-OPT-6: run bin/install.sh and bin/install.sh --check, then restart the session (named workflows are cached per session).' : ''
+  log(`TELEMETRY NOT RECORDED for this run: ${redactLogText(String(why))}. The run itself is unaffected, but this run leaves no telemetry.${staleWriter}`)
 }
 if (threw) throw runError
 return { ...result, telemetry }

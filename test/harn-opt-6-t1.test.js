@@ -96,6 +96,8 @@ test('AC-OPS-4: a writer refusing the findings key ends write_ok false and never
   assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'the refused-key retry must not run for the findings key')
   assert.equal(result.ledger_write_failed, true)
   assert.ok(logs.some((l) => l.includes('TELEMETRY NOT RECORDED')))
+  // Round 5 L5: the line names the stale writer and the remedy, since the retry never strips this key.
+  assert.ok(logs.some((l) => l.includes('TELEMETRY NOT RECORDED') && /predates HARN-OPT-6/.test(l) && /bin\/install\.sh/.test(l) && /restart the session/.test(l)), `no remedy on the failure line: ${JSON.stringify(logs)}`)
 })
 
 test('AC-DATA-9: ledger-append.mjs no longer defines findingId or imports createHash', () => {

@@ -119,6 +119,34 @@ test('1: the writer adds a prior\'s field_drops and ac_id_drops once per prior i
   for (const f of withCounts.findings) assert.ok(!('field_drops' in f) && !('ac_id_drops' in f), 'the integers never reach the row')
 })
 
+// Round 5 L2: the writer measures findings_truncated itself; a caller-supplied value is ignored.
+test('the writer ignores a payload-supplied findings_truncated and records only its own measurement', async () => {
+  const { terminal } = await review({})
+  const repo = makeTempRepo()
+  const out = lastJson(runAppend(repo, { ...terminal, findings_truncated: 7 }).stdout)
+  assert.equal(out.write_ok, true, out.write_error)
+  const row = terminalRows(repo).pop()
+  assert.equal(row.findings_truncated, 0, 'a round under MAX_FINDINGS has nothing truncated, whatever the payload claims')
+})
+
+// Round 5 L1: the writer's guard on the per-prior integers is load-bearing. A hostile value adds nothing and the row lands.
+test('1: a prior whose field_drops or ac_id_drops is negative, a string, a fraction, null or beyond the safe-integer range adds nothing', async () => {
+  const { terminal } = await review({})
+  const id = (tag) => oracleId('lens-security', `h${tag}.js:1`, `hostile ${tag}`)
+  const bad = [-3, '2', 1.5, null, 2 ** 60]
+  const entries = bad.flatMap((v, i) => [
+    { id: id(i), lens: 'lens-security', severity: null, ac_id: null, disposition: 'prior', field_drops: v, ac_id_drops: v },
+    { id: id(i), lens: 'lens-security', severity: null, ac_id: null, disposition: 'fixed' },
+  ])
+  const repo = makeTempRepo()
+  const out = lastJson(runAppend(repo, { ...terminal, finding_entries: entries, fixed_findings_supplied: true, invalid_finding_fields_dropped: 4, invalid_ac_ids_dropped: 6 }).stdout)
+  assert.equal(out.write_ok, true, out.write_error)
+  const row = terminalRows(repo).pop()
+  assert.equal(row.findings.filter((f) => f.disposition === 'fixed').length, bad.length, 'reference: every hostile prior is still recorded fixed')
+  assert.equal(row.invalid_finding_fields_dropped, 4, 'no hostile field_drops value changed the count')
+  assert.equal(row.invalid_ac_ids_dropped, 6, 'no hostile ac_id_drops value changed the count')
+})
+
 test('1: the AC-OPS-6 line says how many fixed confirmations were sent and points at the row for the writer\'s reconciliation counts', async () => {
   const keep = withId({ lens: 'lens-qa', location: 'k.js:1', claim: 'confirmed once and repeated' })
   const stillOpen = withId({ lens: 'lens-security', location: 'o.js:2', claim: 'confirmed but open again' })

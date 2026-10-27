@@ -638,6 +638,8 @@ test('J (round 3): a start run_id that is not UUID-shaped is counted once under 
     assert.equal(dropLines.length, 1, `exactly one drop line expected, got ${JSON.stringify(dropLines)}`)
     assert.match(dropLines[0], /invalid_record_values_dropped=1/)
     assert.ok(logs.some((l) => /run_id/.test(l) && /will not pair/i.test(l)), `no log says the terminal row will not pair with its start row for ${odd}: ${JSON.stringify(logs)}`)
+    // Round 5 L6: the drop line's stated reason covers this source, not only descriptors and verdicts.
+    assert.ok(logs.some((l) => /invalid_record_values_dropped=1/.test(l) && /start run_id/.test(l)), `the drop line does not name a start run_id as a possible reason: ${JSON.stringify(logs)}`)
   }
   const good = await review({}, { 'ledger:write': [{ ...LEDGER_OK, run_id: START_UUID }, LEDGER_OK] })
   assert.equal(good.terminal.run_id, START_UUID)
