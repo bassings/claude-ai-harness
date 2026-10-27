@@ -89,7 +89,7 @@ test('AC-OPS-11: README Run ledger failure-signal table pins each exact string a
 })
 
 test('M1: a done review with null open_findings means a stale installed review-cycle.js, with the remedy', () => {
-  assert.ok(openFindingsStep().includes("If the review's outcome was done and open_findings is still null, the installed review-cycle.js predates HARN-OPT-6 (its ledger row carries legacy_payload: true); run bin/install.sh and bin/install.sh --check, then restart the session or dispatch by scriptPath, and record that in the tick log."))
+  assert.ok(openFindingsStep().includes("If the review's `result.telemetry.outcome` is `\"done\"` and open_findings is still null, the installed review-cycle.js predates HARN-OPT-6 (its ledger row carries legacy_payload: true); run bin/install.sh and bin/install.sh --check, then restart the session or dispatch by scriptPath, and record that in the tick log."))
 })
 
 test('L1: both relay instructions tell the conductor to replace home-directory paths with ~', () => {
@@ -100,7 +100,9 @@ test('L1: both relay instructions tell the conductor to replace home-directory p
 })
 
 test('L1: review-cycle returns ledger_write_error redacted, as its log line already does', async () => {
+  // Round 2 L4: a macOS home path and a /home path (this operator's home sits under one) must both be redacted.
   const CANARY = '/Users/canary-user/secret/ledger.jsonl'
+  const CANARY_HOME = '/Volumes/Storage/home/canary-user/secret/ledger.jsonl'
   const COVERAGE = { examined: 'x', verified_by: 'y', could_not_check: 'z' }
   const TIP = { head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' }
   const CLEAN = { verdict: 'CLEAN', coverage: COVERAGE, findings: [], ...TIP }
@@ -116,12 +118,13 @@ test('L1: review-cycle returns ledger_write_error redacted, as its log line alre
     'scope:diff': SCOPE, 'lens-security': CLEAN, 'lens-qa': CLEAN,
     ...Object.fromEntries(lenses.map((l) => [l, CLEAN])),
     synthesis: { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [] },
-    'ledger:write': [OK, { run_id: 'r', ts: 't', write_ok: false, write_error: `cannot write ${CANARY}` }],
+    'ledger:write': [OK, { run_id: 'r', ts: 't', write_ok: false, write_error: `cannot write ${CANARY} or ${CANARY_HOME}` }],
   }
   const { result } = await runWorkflow(path.join(ROOT, 'workflows', 'review-cycle.js'), { args: {}, agent })
   assert.equal(result.ledger_write_failed, true)
   assert.ok(typeof result.ledger_write_error === 'string' && result.ledger_write_error.includes('cannot write'), 'error text still returned')
   assert.ok(!result.ledger_write_error.includes('/Users/canary-user'), `home path leaked: ${result.ledger_write_error}`)
+  assert.ok(!result.ledger_write_error.includes('home/canary-user'), `a /home path leaked: ${result.ledger_write_error}`)
   assert.ok(result.ledger_write_error.includes('<redacted-path>'))
 })
 
@@ -163,3 +166,14 @@ test('L4/L5: README row (c) names every way past the ceiling and a standing reme
   assert.match(c, /\(the AC-QA-13 tally[^)]*acceptance window[^)]*\)/)
   assert.doesNotMatch(c, /which only a round with more than 60 findings in one disposition can reach/)
 })
+
+// Round 2 L5 and L6: row (c) states the ceiling and row (b) says how to detect a stale workflow.
+test('L5/L6: README row (c) names the ceiling and row (b) names the run-time symptom and the on-disk check', () => {
+  const rows = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8').split('\n')
+  const rowB = rows.find((l) => l.startsWith('| (b) Stale workflow'))
+  const rowC = rows.find((l) => l.startsWith('| (c) Terminal write payload'))
+  assert.ok(rowC && rowC.includes('120,000-byte base64 ceiling'), 'row (c) must state the ceiling')
+  assert.ok(rowB && rowB.includes('`result.telemetry.outcome` is `"done"` but whose open_findings is null'), 'row (b) must name the run-time symptom')
+  assert.ok(rowB.includes(`grep '"legacy_payload":true' .claude/harness-ledger.jsonl`), 'row (b) must name the on-disk check')
+})
+

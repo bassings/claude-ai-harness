@@ -180,8 +180,8 @@ rather than narrating a condition that does not apply here.
         `open_findings` is `null`: do NOT touch the stored entry for this
         task -- leave whatever the previous round left there, and note the
         anomaly (`open_findings was null for <task id>`) in this tick's
-        log entry, step 3 below. If the review's outcome was done and
-        open_findings is still null, the installed review-cycle.js predates
+        log entry, step 3 below. If the review's `result.telemetry.outcome`
+        is `"done"` and open_findings is still null, the installed review-cycle.js predates
         HARN-OPT-6 (its ledger row carries legacy_payload: true); run
         bin/install.sh and bin/install.sh --check, then restart the session
         or dispatch by scriptPath, and record that in the tick log.
