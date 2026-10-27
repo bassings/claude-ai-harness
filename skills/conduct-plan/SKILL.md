@@ -211,7 +211,8 @@ rather than narrating a condition that does not apply here.
    Also log task-level state transitions to the run ledger, so wall-clock can
    later be decomposed into agent compute vs CI wait vs human wait: at each
    `pr-open`→`awaiting-ci` transition and its resolution, and at each
-   `blocked-on-human` entry/exit, PR raised and PR merged, run
+   block entry and exit (step 5 e and f, and step 6 for a leftover note),
+   PR raised and PR merged, run
    `workflows/lib/ledger-append.mjs` (found the same way as any harness file:
    this repo, `~/.claude/workflows/lib/`, or an installed plugin; pipe the
    payload's JSON to its stdin) with a payload of `{kind:
@@ -229,6 +230,11 @@ rather than narrating a condition that does not apply here.
    symlinked ancestor, or from outside the repo, canonicalises to a fixed
    out-of-repo marker, and two different plans can collapse onto that one key.
    A repo-relative path never reaches the marker.
+   Check the writer's response every time: on `write_ok: false`, or a call
+   that was stopped before it ran, record `<event> not written:
+   <write_error>` in the tick's log entry, as step 5 b does for its own
+   anomaly, so a missing wait is visible in the log and not only as an
+   absence in the ledger at the next weekly read-out.
    `event_scope` (never a pre-built `event_key`) is required for this kind:
    the script refuses a conduct_plan_event line without one. The script
    itself computes the occurrence number and mints `event_key` as
@@ -310,12 +316,49 @@ rather than narrating a condition that does not apply here.
       forgotten note parks every later plan in the repo indefinitely, with an
       allow message no one can tell apart from a real block.
 
+   d. When the block follows an escalation round, the question line names the
+      model token the escalation used and the default it escalated from, the
+      tdd-task verdict and blocked_reason, the review verdict with finding
+      counts by severity, the pre-escalation PR tip SHA (the tip the PR still
+      sits at), the escalation branch name (or the worktree path relative to
+      the repo root, never an absolute path), and the frame
+      question. A note written when the
+      escalation itself failed to dispatch or ABORTED says so in those words,
+      never as a plain three-round block. The note and the log entry carry
+      outcome codes, round counts and blocked_reason only, never verbatim
+      verifier evidence or a test_defect reason: the plan file and the note
+      can reach a public repository, and that evidence routinely holds
+      absolute paths under the operator's home directory.
+   e. Once the block is recorded, whether the note was written (c) or the
+      write was refused (b) and the question asked in the reply only, append
+      `human_wait_started` through `ledger-append.mjs` as step 3 specifies,
+      exactly once per block, so the human-wait decomposition does not
+      depend on memory. Append it after the note, never before it.
+   f. The moment the answer arrives, delete `.claude/blocked-on-human` if it
+      exists and append `human_wait_ended` the same way, exactly once per
+      block, so every start has its end. Step 6 does the same for a leftover
+      note it deletes at Done, using the task id of the log entry that
+      recorded that block's `human_wait_started` (the note line carries no
+      task id), and only when no end has been written for that block. If
+      the answer abandons an escalation round, dispose of its branch and
+      worktree in the same tick (remove the worktree, delete the branch
+      locally and on the remote); until then they are the only copy of that
+      work and stay untouched.
+
    The hook also refuses a symlink at that path, ignores an empty or
    whitespace-only file, reads at most 4096 bytes, and strips control
    characters before quoting the note back.
 
 6. **Done?** All boxes ticked: delete `<repo>/.claude/active-plan`, and
-   delete `<repo>/.claude/blocked-on-human` if it exists. That second
+   list every escalation branch or worktree the Conductor log names for
+   this plan and dispose of each one that is merged or abandoned (remove
+   the worktree, delete the branch locally and on the remote), leaving only
+   one an open block still depends on;
+   delete `<repo>/.claude/blocked-on-human` if it exists, appending
+   `human_wait_ended` when you do, under the task id of the log entry that
+   recorded that block's `human_wait_started` and only if no end was written
+   for it, so that the block's start is not left unpaired (AC-OPS-9). That
+   second
    delete is not housekeeping: the note is not scoped to a session and
    outlives the plan, so a leftover one parks the NEXT plan conducted in
    this repo, silently. Same diagnosis as the prune below, same file, and
@@ -344,13 +387,61 @@ rather than narrating a condition that does not apply here.
   before advancing the task's state.
 - Never mark `merged` from memory; only from `gh pr view <n>`.
 - **Rework circuit-breaker. Count rounds in the conductor log and obey the
-  count.** Stop and record the block (step 5) with the frame question,
-  rather than iterating, at whichever of these comes first:
-  - **three fix rounds on one task** (the original rule), or
+  count.** There are two triggers, and they do not behave alike:
+  - **three fix rounds on one task** (the original rule). At three fix rounds
+    the conductor dispatches exactly one escalation round: `/tdd-task` with
+    `model` set to the token stated below, in a fresh implementer,
+    never a direct implementer dispatch. The escalation build is dispatched
+    only after the previous implementer's process has exited, and it commits
+    on its own branch or worktree: the PR branch tip is not moved, and is
+    never force-pushed, until the escalation round's review is clean, so a
+    block leaves the PR tip at the pre-escalation SHA (AC-DATA-20). That
+    round is followed by one full review-cycle round, lens-security included
+    as on any review, and only then a block note or a merge: a clean build
+    and a clean review merge as usual, anything else goes to the block note
+    (step 5). An escalation round whose own build or review is not clean goes
+    straight to the block note. A task whose escalation round has already run
+    goes straight to the block note at its next breaker, never a second
+    escalation. The clean path is explicit, not "merge as usual" by itself:
+    fast-forward the PR branch to the escalation tip (a plain push, never a
+    force-push), return the task to `awaiting-ci`, and merge only on green
+    CI, as for any other push. Once that merge has landed and the content is
+    confirmed on main, dispose of the escalation branch and worktree in the
+    same tick (the §8 worktree rule): remove the worktree and delete the
+    branch locally and on the remote. The tick's Conductor log line for the
+    escalation round records (AC-OPS-1): that it was dispatched, the exact
+    `model` token passed to /tdd-task, the model the runtime reported for
+    the escalation implementer (from its transcript, as AC-PROD-5 reads it,
+    or "not reported"), the escalation branch name (or the worktree path
+    relative to the repo root, never an absolute path, since the log is a
+    tracked file) and the tdd-task run id, the tdd-task verdict, and the
+    review verdict and round (or that no review ran). That line is the durable state a later
+    wake reconciles from: a session that restarts mid-escalation finds the
+    branch and the run id there, never in memory.
   - **the first time a review round finds a defect that the previous
     round's fix introduced.** One self-inflicted regression is the signal
-    the frame is wrong; do not wait for three. Say plainly whose
-    instruction caused it, including when it was yours.
+    the frame is wrong; do not wait for three. On the first self-inflicted
+    regression the conductor goes straight to the block note with the frame
+    question (record the block, step 5), with no escalation round, because
+    that trigger exists for a value call the owner must make. Say plainly
+    whose instruction caused it, including when it was yours.
+
+  The escalation model token: the default `sonnet` escalates to `opus` (the
+  installed mirror's pin), and the default `opus` escalates to `fable` (the
+  repo implementer's pin, at agents/implementer.md:4). "The default" is the
+  model the previous round's implementer transcript reports it ran on (the
+  AC-PROD-5 mechanism), never a pin read off a file, because the two installs
+  differ. If the default is already the strongest tier, the round is skipped
+  and the log and the block note say "escalation skipped: no stronger tier".
+  If the runtime refuses the token, that is a failed dispatch, not a missing
+  tier: the log and the block note say "escalation failed to dispatch:
+  runtime refused model `<token>`" with the error code only, and step 5 d's
+  failed-to-dispatch rule applies. If the previous round's transcript reports
+  no model, or a model not in this table, do not escalate: the log and the
+  block note say "escalation failed to dispatch: default model unknown
+  (<the reported value, or not reported>)" and the same rule applies, so the
+  owner is never told the strongest tool was tried when it was not.
+
   Escalate with the cost so far (review rounds, tokens, wall-clock) and what
   the change is protecting, so the human can make a value call rather than a
   correctness one. "The next fix is small" is not a reason to continue: it
