@@ -59,14 +59,18 @@ function actAsCompliantAgent(prompt, { cwd, scratchDir, writerEnvPrefix = '' }) 
   const file = made.stdout.trim()
   if (made.status !== 0 || !file) throw new Error(`mktemp failed: ${made.stderr}`)
   fs.writeFileSync(file, extractEncodedPayload(prompt))
-  const writerCommand = cmds.node[0].replace('<path-to-ledger-append.mjs>', APPEND_SCRIPT).replace('<the file>', file)
+  // The real paths reach the shell as environment variables, never spliced into the command text (CodeQL
+  // js/shell-command-injection-from-environment): the command string stays exactly the prompt's own text with each
+  // placeholder swapped for a variable reference, so a path holding a quote or a space cannot change what runs.
+  const runEnv = { ...env, HARN_APPEND_SCRIPT: APPEND_SCRIPT, HARN_PAYLOAD_FILE: file }
+  const writerCommand = cmds.node[0].replace('<path-to-ledger-append.mjs>', '"$HARN_APPEND_SCRIPT"').replace('<the file>', '$HARN_PAYLOAD_FILE')
   if (/<[^>]*>/.test(writerCommand)) throw new Error('unsubstituted placeholder in the instructed writer command: ' + writerCommand)
-  const wrote = runSh(writerEnvPrefix + writerCommand, { cwd, env })
+  const wrote = runSh(writerEnvPrefix + writerCommand, { cwd, env: runEnv })
   const result = JSON.parse(wrote.stdout.trim().split('\n').pop())
   // Review round 2 F2 (AC-SEC-4): the deletion decision comes from the prompt, as a real agent's would, so a step 5
   // weakened to keep the file on a failure path leaves the file behind here too and the end-to-end test goes RED.
-  const rmCommand = cmds.rm[0].replace('<the file>', file)
-  if (deletesOnOutcome(prompt)) runSh(rmCommand, { cwd, env })
+  const rmCommand = cmds.rm[0].replace('<the file>', '$HARN_PAYLOAD_FILE')
+  if (deletesOnOutcome(prompt)) runSh(rmCommand, { cwd, env: runEnv })
   return { file, writerCommand: writerEnvPrefix + writerCommand, result, commands: cmds }
 }
 

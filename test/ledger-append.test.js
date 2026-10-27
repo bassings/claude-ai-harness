@@ -297,8 +297,9 @@ test('ledger-append: a properly newline-terminated ledger is NOT healed (no spur
 // conversion is platform-dependent.
 function runAppendWithFsizeLimit(cwd, payload, blocks) {
   const { spawnSync } = require('node:child_process')
-  const script = `ulimit -f ${blocks}; exec node ${JSON.stringify(APPEND_SCRIPT)}`
-  return spawnSync('/bin/sh', ['-c', script], { cwd, input: JSON.stringify(payload), encoding: 'utf8' })
+  // Values reach the shell as positional arguments, never spliced into the script text (CodeQL
+  // js/shell-command-injection-from-environment).
+  return spawnSync('/bin/sh', ['-c', 'ulimit -f "$1"; exec node "$2"', 'sh', String(blocks), APPEND_SCRIPT], { cwd, input: JSON.stringify(payload), encoding: 'utf8' })
 }
 
 test('ledger-append: a SHORT write (fs.writeSync returns fewer bytes than requested, e.g. an ENOSPC-style near-full volume) is reported as write_ok:false, never silently as success (HIGH round 3, contributing cause)', () => {
@@ -369,7 +370,7 @@ function spawnAppendAsync(cwd, payload, { blocks, env } = {}) {
   return new Promise((resolve, reject) => {
     const spawnEnv = { ...process.env, ...(env || {}) }
     const child = blocks
-      ? spawn('/bin/sh', ['-c', `ulimit -f ${blocks}; exec node ${JSON.stringify(APPEND_SCRIPT)}`], { cwd, env: spawnEnv })
+      ? spawn('/bin/sh', ['-c', 'ulimit -f "$1"; exec node "$2"', 'sh', String(blocks), APPEND_SCRIPT], { cwd, env: spawnEnv })
       : spawn('node', [APPEND_SCRIPT], { cwd, env: spawnEnv })
     let stdout = ''
     let stderr = ''
