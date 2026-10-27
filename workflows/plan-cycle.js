@@ -305,6 +305,12 @@ let opts = args
 if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts = null } }
 opts = opts || {}
 if (typeof opts !== 'object' || !opts.spec) throw new Error('plan-cycle requires args.spec: the path to the spec file to plan against')
+// HARN-OPT-5 T8 review round 1 F4: the spec path is interpolated into two "run exactly" shell commands (the
+// snapshot and the verify), so it is restricted to a plain path with no `..` segment before anything runs; the same
+// shape parseSpecSnapshot applies to the snapshot file. A path with a space, a quote or a substitution is refused.
+if (typeof opts.spec !== 'string' || !/^[\w.+@/-]+$/.test(opts.spec) || opts.spec.split('/').includes('..')) {
+  throw new Error('plan-cycle refuses args.spec: the spec path must be a plain path (letters, digits, . + @ / - _) with no .. segment, because it is passed to a shell command verbatim')
+}
 const specPath = opts.spec
 
 // Review round-2 L-1: `lenses` (the triggered roster) is local to run(), so
@@ -527,7 +533,12 @@ const scope = await agent(
   `- operability: does it change production behaviour, logging, containers, CI or operational scripts?\n` +
   `- user_facing: will a user see or feel this change?\n` +
   `Also return a two-sentence summary of what the spec asks for, and the list of repo paths it will most likely touch.\n` +
-  `Finally, run \`git rev-parse HEAD\` and return its exact output as head_sha.`,
+  `Run \`git rev-parse HEAD\` and return its exact output as head_sha.\n` +
+  // HARN-OPT-5 T8: the pre-write-back snapshot, taken here so no new agent() call is needed.
+  `Finally, snapshot the spec for the write-back check (HARN-OPT-5 T8). ` + SPEC_WB_LOCATE +
+  `Then run exactly \`node <path-to-spec-writeback.mjs> snapshot ${specPath}\` and return its stdout verbatim, unedited, as ` +
+  `spec_snapshot: one short JSON object (file, sha256, headings, ac_ids). Do not open the file it names, and do not ` +
+  `edit the spec.`,
   {
     label: 'scope:spec',
     phase: 'Scope',
@@ -537,6 +548,7 @@ const scope = await agent(
       required: ['summary', 'ui', 'data', 'architecture', 'operability', 'user_facing', 'likely_paths', 'head_sha', 'consistency'],
       properties: {
         head_sha: { type: 'string' },
+        spec_snapshot: { type: 'string' },
         summary: { type: 'string' },
         ui: { type: 'boolean' },
         data: { type: 'boolean' },
@@ -631,6 +643,7 @@ lensesRunRaw = lensReports.map(r => r.lens)
 
 // ---- Phase 3: synthesis, simplicity veto, write-back ----
 phase('Synthesis')
+const specBefore = parseSpecSnapshot(scope.spec_snapshot)
 const synthesis = await agent(
   `You are the orchestrator of the multi-lens planning harness defined in AGENT-HARNESS.md (find and read it: check ` +
   `~/.claude/AGENT-HARNESS.md, the repo root, and any installed claude-ai-harness plugin directory). ` +
@@ -641,13 +654,24 @@ const synthesis = await agent(
   `stated goal. A vetoed criterion is DROPPED and recorded, unless it belongs to security, data-loss or the accessibility ` +
   `floor, which simplicity cannot override. Record every veto with its reason.\n` +
   `2. Merge the surviving criteria, deduplicating overlaps (keep the more testable wording; keep both IDs in a note).\n` +
+  (specBefore ? '' : `NO RESTORABLE SNAPSHOT of the spec exists (HARN-OPT-5 T8), so do NOT edit the spec file in step 3: skip the edit, ` +
+    `return surviving_ids as the ids you would have kept, and say in the summary that nothing was written.\n`) +
   `3. Edit the spec file at ${specPath}: add or replace a section titled "## Acceptance criteria" containing the surviving ` +
-  `AC-<LENS>-<n> lines grouped by lens, each on one line, exactly as the review cycle will verify them. Preserve the rest ` +
+  `AC-<LENS>-<n> lines grouped by lens, each on one line and ending in a full stop (a trailing note in parentheses or ` +
+  `brackets may follow it), exactly as the review cycle will verify them. Preserve the rest ` +
   `of the file byte-for-byte. Also add a "### Vetoed at planning" subsection listing the drops and reasons, if any.\n` +
   `FORMAT, NOT A SUGGESTION: write each criterion as \`- **AC-<LENS>-<n>:** <criterion>\` -- list marker, bolded id, ` +
   `COLON INSIDE the bold, one space, then the text. test/static-checks.test.js scans specs for exactly this shape (and ` +
   `two older spellings) to enforce id uniqueness, and a spec written in a fourth spelling fails the pre-push gate as ` +
   `unreadable rather than passing silently. Do not invent a variant such as \`**AC-X-1** -- text\`.\n` +
+  (specBefore ? `After the edit, verify it by script (HARN-OPT-5 T8; the 2026-10-13 write-back pasted the preamble into the criteria and ` +
+    `cut lines mid-sentence). ` + SPEC_WB_LOCATE +
+    `First write the AC ids you kept, as a JSON array of strings (the same ids you return as surviving_ids; each matches ` +
+    `^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$), into the file ${survivingIdsFile(specBefore)} with your file-writing tool (the Write tool), ` +
+    `never via a shell command; then run exactly ` +
+    `\`node <path-to-spec-writeback.mjs> verify ${specPath} ${specBefore.file} ${survivingIdsFile(specBefore)}\` and return its stdout ` +
+    `verbatim, unedited, as writeback_check. That command restores the spec itself if the write-back is bad: change nothing else, ` +
+    `do not retry the edit, and do not repair the spec by hand.\n` : '') +
   `4. Return a markdown summary: a per-lens table (verdict, criteria count, could_not_check), the veto list, any lens ` +
   `findings about the spec itself (BLOCKED lenses prominently), and the final AC count.\n` +
   `Return only the markdown summary as "summary".\n` +
@@ -659,6 +683,8 @@ const synthesis = await agent(
     schema: { type: 'object', required: ['summary'], properties: {
       summary: { type: 'string' },
       head_sha_at_synthesis: { type: ['string', 'null'] },
+      surviving_ids: { type: 'array', items: { type: 'string' } },
+      writeback_check: { type: 'string' },
     } } }
 )
 
@@ -673,18 +699,77 @@ const synthesis = await agent(
 // missing with nothing failing.
 synthesisHeadSha = synthesis && typeof synthesis.head_sha_at_synthesis === 'string' ? synthesis.head_sha_at_synthesis : null
 const reportOk = synthesis && typeof synthesis.summary === 'string' && synthesis.summary.length > 0
-const outcome = !reportOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
+// HARN-OPT-5 T8: a write-back that could not be checked, or failed its check, is aborted -- never blocked, never done.
+// T8 review round 1 F4: an id outside the AC pattern would have reached the verify command's shell argument; the run
+// is aborted (the check is treated as malformed) rather than trusting what the agent typed.
+const survivingIdsOk = synthesis && Array.isArray(synthesis.surviving_ids) && synthesis.surviving_ids.every((id) => typeof id === 'string' && /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/.test(id))
+const writeback = survivingIdsOk ? parseWritebackCheck(synthesis && synthesis.writeback_check, specBefore, synthesis.surviving_ids) : null
+const writebackOk = Boolean(writeback && writeback.ok)
+const outcome = !reportOk || !writebackOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
+// T8 review round 3 F6: a run with no restorable snapshot (missing, malformed, or a path outside the temp allowlist)
+// never edited the spec, which is a different situation from a check that came back malformed; each gets its own notice.
+const writebackNotice = writebackOk ? null : writeback
+  ? `> WRITE-BACK REJECTED (HARN-OPT-5 T8): the spec edit failed its script check and ${writeback.restored ? 'was restored to its pre-write-back bytes' : 'was NOT confirmed restored; check the spec'}. Problems:\n` +
+    writeback.problems.map(p => `> - ${p}`).join('\n')
+  : !specBefore
+    ? `> WRITE-BACK SKIPPED (HARN-OPT-5 T8): no restorable snapshot of the spec was taken (the snapshot object was missing, malformed, or named a path outside the temp allowlist: /tmp, /private/tmp, /var/folders, /private/var/folders), so the synthesis was told not to edit the spec and no criteria were written. Check TMPDIR on this machine.`
+    : `> WRITE-BACK UNCHECKED (HARN-OPT-5 T8): the script check of the spec edit is missing or malformed, so the write-back is not recorded as done. Check the spec by hand.`
+const reportBody = reportOk ? (installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.summary}` : synthesis.summary) : ''
 
 return {
   spec: specPath,
   lenses,
   skipped,
   verdicts: Object.fromEntries(lensReports.map(r => [r.lens, r.verdict])),
-  report: reportOk ? (installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.summary}` : synthesis.summary) : '',
+  // The write-back notice decorates a real summary; a run with no summary at all keeps the empty report an aborted run
+  // has always carried (test/plan-cycle.test.js M1), and the outcome and `writeback` field say what happened.
+  report: reportOk && writebackNotice ? `${writebackNotice}\n\n${reportBody}` : reportBody,
+  writeback,
   __outcome: outcome,
 }
 
 } // end run()
+
+// HARN-OPT-5 T8 (the 2026-10-13 incident: the synthesis write-back pasted the whole preamble into the criteria at three
+// points and cut three criterion lines at a regex end anchor followed by a backtick, and only the pre-push duplicate-
+// criterion scan caught it). The write-back is now verified by SCRIPT: the scope step snapshots the spec through
+// workflows/lib/spec-writeback.mjs, and the synthesis step runs that library's `verify`, which restores the snapshot's
+// bytes itself on any failure. Workflow scripts have no filesystem access, so the agents only relay the library's small
+// stdout objects and this script validates them; a missing or malformed object is never read as success.
+const SPEC_WB_LOCATE =
+  `Find this harness's spec-writeback.mjs script, in this exact order, and use the FIRST one that exists: ` +
+  `(a) ~/.claude/workflows/lib/spec-writeback.mjs (the global mirror install); (b) any installed claude-ai-harness ` +
+  `plugin directory's workflows/lib/spec-writeback.mjs; (c) "$(git rev-parse --show-toplevel)/workflows/lib/spec-writeback.mjs" ` +
+  `in the current repo, but ONLY if the current repo is claude-ai-harness itself (the basename of ` +
+  `\`git rev-parse --show-toplevel\` equals "claude-ai-harness"). NEVER use a repo-local copy in any OTHER repo, even if ` +
+  `(a) and (b) are both absent: return an empty string instead. `
+const SPEC_WB_TEMP_PREFIXES = ['/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/']
+const parseJsonObj = (x) => {
+  let v = x
+  if (typeof x === 'string') { try { v = JSON.parse(x) } catch { return null } }
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : null
+}
+// The snapshot file must be the library's own harn-specwb-* directory under a temp prefix (never a repo or .claude/).
+const parseSpecSnapshot = (x) => {
+  const v = parseJsonObj(x)
+  const f = v && v.file
+  const fileOk = typeof f === 'string' && /^\/[\w.+@/-]+$/.test(f) && !f.split('/').includes('..') && !f.split('/').includes('.claude') &&
+    SPEC_WB_TEMP_PREFIXES.some((pre) => f.startsWith(pre)) && /\/harn-specwb-[\w-]+\/[\w.-]+$/.test(f)
+  return fileOk && typeof v.sha256 === 'string' && /^[0-9a-f]{64}$/.test(v.sha256) ? v : null
+}
+// T8 review round 2 M1: the surviving ids travel in a file beside the snapshot, at a path this script composes from the
+// validated snapshot path (no agent-typed text reaches the verify command), and verify echoes the ids it checked.
+const survivingIdsFile = (before) => `${before.file.slice(0, before.file.lastIndexOf('/'))}/surviving.json`
+const sameIdSet = (a, b) => Array.isArray(a) && Array.isArray(b) && JSON.stringify([...new Set(a)].sort()) === JSON.stringify([...new Set(b)].sort())
+// The check must be about THIS snapshot (sha256 tie), carry a boolean ok and an array of problems, and have checked
+// exactly the ids the agent returned as surviving_ids (round 2 M1: otherwise a dropped criterion could pass if the
+// agent handed verify the ids it actually wrote rather than the ids it was given).
+const parseWritebackCheck = (x, before, survivingIds) => {
+  const v = parseJsonObj(x)
+  const ok = v && before && typeof v.ok === 'boolean' && Array.isArray(v.problems) && v.problems.every((p) => typeof p === 'string') &&
+    v.snapshot_sha256 === before.sha256 && (v.ok ? v.problems.length === 0 : true) && sameIdSet(v.surviving_ids_checked, survivingIds)
+  return ok ? { ok: v.ok, problems: v.problems, restored: v.restored === true } : null
+}
 
 // Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
 // pattern and its rationale.

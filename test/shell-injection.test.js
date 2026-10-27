@@ -63,7 +63,14 @@ const DRIVERS = {
     const prompts = calls.filter((c) => c.opts.label === 'ledger:write').map((c) => c.prompt)
     return { prompt: prompts[0], prompts, text }
   },
+  // HARN-OPT-5 T8 (F4): plan-cycle refuses a spec path that is not a plain path before any agent runs, so hostile
+  // text can no longer enter its payload at all; the driver proves the refusal, then runs with a plain path (the only
+  // free-text field plan-cycle's payload has is `spec`, so `text` is that plain path for the fixture guard).
   'plan-cycle.js': async (text) => {
+    if (!/^[\w.+@/-]+$/.test(text) || text.split('/').includes('..')) {
+      await assert.rejects(runWorkflow(WF('plan-cycle.js'), { args: { spec: text }, agent: {} }), /refuses args\.spec/, 'hostile spec text is refused at the door')
+      text = 'specs/plain.md'
+    }
     const { calls } = await runWorkflow(WF('plan-cycle.js'), { args: { spec: text }, agent: {} })
     const prompts = calls.filter((c) => c.opts.label === 'ledger:write').map((c) => c.prompt)
     return { prompt: prompts[0], prompts, text }
