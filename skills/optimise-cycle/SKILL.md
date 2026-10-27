@@ -107,10 +107,18 @@ wrote:
    because it genuinely was, or because most of it could not be measured;
    the gate does not let the latter pass as evidence.
 6. **Weak CI evidence (AC-DATA-8)**: a removal-shaped proposal citing a
-   specific CI job (`target.workflow` + `target.job`) whose aggregate is
-   insufficient-data, window-truncated, or a suspected rename is dropped --
-   a "never failed" claim resting on incomplete history must not motivate
-   a removal.
+   specific CI job (`target.workflow` + `target.job`) is dropped unless every
+   matching aggregate row has `neverFailed` exactly `true` (AC-SIMP-5). The
+   reader nulls that verdict for insufficient data, a truncated window, a
+   suspected rename, a re-run or a partial fetch, so the brake reads the
+   verdict and names none of them. A job counts as a re-run per job, not per
+   run (AC-DATA-16): for a run at attempt 2 the lane fetches
+   `gh run view <id> --attempt 1 --json jobs`, and a job is cleared only when
+   its raw name appears once in both attempts and its attempt-1 conclusion was
+   `success`. A fetch failure, a malformed or empty payload, or a run at
+   attempt 3 or more leaves every job a re-run (AC-DATA-17), and the count of
+   runs whose attempt-1 jobs could not be fetched prints in the per-repo CI
+   stats line (AC-OPS-14).
 7. **Proposal-outcome lookup (AC-DATA-10)**: a proposal whose stable id
    matches a prior `proposal_rejected` event is annotated with that
    rejection's date rather than re-raised silently; one matching two or
@@ -297,8 +305,10 @@ It states, every run, in this order:
    bucketed separately from both "nothing in scope" and "examined and
    found nothing".
 5. **CI section** (source: `gh`), with any `gh` failure named distinctly
-   and non-fatally (never silently dropped), and a job named
-   insufficient-data/truncated/rename-suspect where applicable.
+   and non-fatally (never silently dropped), each job carrying its
+   qualifiers (insufficient data, truncated window, rename suspect, re-run,
+   partial fetch) where applicable, and a removal proposal whose cited job
+   has no settled never-failed verdict reported as dropped for that reason.
 6. **Escaped-defect counter-metric** and its heuristic caveat, one block
    per roster repo (labelled by its ledger label and numbered by roster
    position, never its path). The git lane runs once per repo, and the script

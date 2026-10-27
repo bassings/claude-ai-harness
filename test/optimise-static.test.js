@@ -194,3 +194,52 @@ test('static: optimise-read.mjs\'s per-record loops (parseLedgerContent, aggrega
     assert.ok(!/\bfs\./.test(body), `${signature} must contain no fs.* call -- got a match in:\n${body}`)
   }
 })
+
+// ---- HARN-OPT-5 T7 (AC-SIMP-5, AC-QA-22, AC-SIMP-11): the brake reads the verdict; the lane gains one gh call ----
+
+test('static: isWeakCiEvidenceRemoval keys on neverFailed !== true, names none of the five flags, and the comment explaining why it did not is gone (AC-SIMP-5, AC-QA-22)', () => {
+  const src = readAll('workflows', 'optimise-cycle.js')
+  const start = src.indexOf('function isWeakCiEvidenceRemoval(')
+  const end = src.indexOf('const droppedWeakCiEvidence', start)
+  assert.ok(start >= 0 && end > start, 'sanity: the function body was located')
+  const body = src.slice(start, end)
+  assert.match(body, /neverFailed\s*!==\s*true/)
+  for (const flag of ['insufficientData', 'truncated', 'renameSuspect', 'reRun', 'partialFetch']) assert.ok(!body.includes(flag), `the brake body must not name ${flag}`)
+  assert.ok(!/pin the opposite|T6 brake controls|Keying on `neverFailed/.test(src), 'the comment explaining why the code did not key on neverFailed is gone')
+})
+
+test('static: the CI lane prompt gains exactly one further gh invocation, the attempt-1 jobs fetch, for runs with attempt > 1, and still caches nothing (AC-SIMP-11, AC-DATA-17)', () => {
+  const src = readAll('workflows', 'optimise-cycle.js')
+  const start = src.indexOf('const ciLanePrompt')
+  const end = src.indexOf('const ciLane = ', start)
+  assert.ok(start >= 0 && end > start, 'sanity: the lane prompt was located')
+  const prompt = src.slice(start, end)
+  assert.equal((prompt.match(/gh run view <id> --attempt 1 --json jobs/g) || []).length, 1, 'the attempt-1 fetch is named once, verbatim')
+  assert.equal((prompt.match(/gh run view <id>/g) || []).length, 2, 'two gh run view invocations in total: latest jobs and attempt-1 jobs')
+  assert.equal((prompt.match(/gh run list/g) || []).length >= 1, true)
+  assert.ok(!/gh (?!run (?:list|view))\w+/.test(prompt.replace(/`gh` /g, '')), 'no other gh subcommand is introduced')
+  const at = prompt.indexOf('--attempt 1')
+  const near = prompt.slice(Math.max(0, at - 300), at + 300)
+  assert.match(near, /attempt[^.]{0,40}(?:> ?1|greater than 1|more than 1|above 1)/i, 'issued only for runs with attempt > 1')
+  // T7 round 2 L1 (AC-SEC-14): the id restriction is stated inline on the attempt-1 command, not by reference.
+  assert.match(near, /<id> MUST be an all-digit databaseId taken from that repo's own list/, 'the all-digits, own-list id rule is restated on the attempt-1 command')
+  assert.ok(prompt.includes('attempt1_jobs') && prompt.includes('attempt1_fetch_error'), 'each such run carries its attempt-1 jobs or a fetch-failed marker')
+})
+
+test('static: SKILL.md describes the attempt-1 re-run qualification (AC-SIMP-5, AC-DATA-16)', () => {
+  assert.ok(readAll('skills', 'optimise-cycle', 'SKILL.md').includes('--attempt 1'))
+})
+
+// T7 round 2 L5: the skill's description of the brake is the operator's statement of what the optimiser drops, and it
+// drifted from the code once (round 1 F1); item 6 is pinned to the verdict the brake reads.
+test('static: SKILL.md item 6 says the brake reads neverFailed exactly true and does not restate the old three-flag criterion (AC-SIMP-5)', () => {
+  const skill = readAll('skills', 'optimise-cycle', 'SKILL.md')
+  const start = skill.indexOf('**Weak CI evidence')
+  const end = skill.indexOf('\n7. ', start)
+  assert.ok(start > 0 && end > start, 'sanity: item 6 located')
+  const item6 = skill.slice(start, end)
+  assert.ok(item6.includes('`neverFailed` exactly `true`'), 'names the verdict the brake reads')
+  assert.ok(item6.includes('--attempt 1'), 'names the attempt-1 fetch')
+  assert.doesNotMatch(item6, /insufficient-data, window-truncated, or a suspected rename/, 'the old three-flag criterion is gone')
+  assert.doesNotMatch(item6, /is dropped if[^.]*(insufficientData|truncated|renameSuspect)/, 'no flag is named as the criterion')
+})

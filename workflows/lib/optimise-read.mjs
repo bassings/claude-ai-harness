@@ -2032,7 +2032,7 @@ function runCiCommand(payload) {
   for (const run of runs) {
     if (!run || typeof run.repo !== 'string' || typeof run.workflow !== 'string' || !run.repo || !run.workflow) continue
     if (!validRunId(run.id)) continue
-    const stats = repoStats[run.repo] || (repoStats[run.repo] = { notCompleted: 0, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } })
+    const stats = repoStats[run.repo] || (repoStats[run.repo] = { notCompleted: 0, attempt1Unfetched: 0, pastAttempt2: 0, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } })
     const id = String(run.id)
     // Round 3 L1 (AC-QA-23): a run the lane emits twice (a retry after a rate
     // limit, overlapping pages, a re-listing) counts once everywhere, not only
@@ -2056,9 +2056,33 @@ function runCiCommand(payload) {
     // validRunId reads ids, and any other present-but-unreadable attempt
     // fails closed as a re-run. Only an absent attempt, or a first one, is not.
     const attemptN = typeof run.attempt === 'number' ? run.attempt : typeof run.attempt === 'string' && /^[0-9]+$/.test(run.attempt) ? Number(run.attempt) : null
-    const rerun = run.attempt === undefined ? false : attemptN === null ? true : attemptN > 1
-    for (const job of Array.isArray(run.jobs) ? run.jobs : []) {
-      if (!job || typeof job.name !== 'string' || !job.name) continue
+    // HARN-OPT-5 T7 (AC-DATA-16, AC-DATA-17, AC-SIMP-11): the re-run flag is
+    // per job, joined to the run's attempt-1 jobs by run id plus RAW job name
+    // (the run is one id; normalising first would let two distinct jobs share
+    // a key). A job is NOT a re-run only when the run is at attempt exactly 2,
+    // its raw name appears exactly once in both attempts, the attempt-1 payload
+    // is well formed, and its attempt-1 conclusion is success. Everything else
+    // fails closed: a fetch failure, an empty or malformed payload, a missing
+    // or duplicated name, a non-success attempt 1, or attempt > 2 (an
+    // intermediate failure cannot be seen) all leave the job a re-run.
+    const latestJobs = (Array.isArray(run.jobs) ? run.jobs : []).filter((job) => job && typeof job.name === 'string' && job.name)
+    const rawCounts = (jobs) => jobs.reduce((m, j) => m.set(j.name, (m.get(j.name) || 0) + 1), new Map())
+    const a1 = run.attempt1_jobs
+    const a1WellFormed = !run.attempt1_fetch_error && Array.isArray(a1) && a1.length > 0 && a1.every((j) => j && typeof j.name === 'string' && j.name)
+    // T7 round 2 L2: a run past attempt 2, or one whose attempt is present but unreadable, fails closed for every job
+    // (AC-DATA-17) and is COUNTED, so the report can say why a job has no settled verdict.
+    if (run.attempt !== undefined && (attemptN === null || attemptN > 2)) stats.pastAttempt2 += 1
+    if (attemptN !== null && attemptN > 1 && !a1WellFormed) {
+      stats.attempt1Unfetched += 1
+      // T7 review round 1 F2 (AC-QA-24): a failed attempt-1 fetch is also counted by mode beside the per-run fetch
+      // failures, so a token problem and a quota problem stay distinguishable on the stats line.
+      if (run.attempt1_fetch_error) stats.fetchFailures[FETCH_MODES.includes(run.attempt1_fetch_error) ? run.attempt1_fetch_error : 'other'] += 1
+    }
+    const latestCounts = rawCounts(latestJobs)
+    const a1Counts = a1WellFormed ? rawCounts(a1) : new Map()
+    const a1Success = a1WellFormed ? new Map(a1.map((j) => [j.name, j.conclusion === 'success'])) : new Map()
+    for (const job of latestJobs) {
+      const rerun = run.attempt === undefined || attemptN === 1 ? false : attemptN !== 2 ? true : !(a1WellFormed && latestCounts.get(job.name) === 1 && a1Counts.get(job.name) === 1 && a1Success.get(job.name) === true)
       flat.push({ repo: run.repo, workflow: run.workflow, job: normaliseJobName(job.name), run_id: id, rerun, conclusion: job.conclusion, started_at: run.started_at, duration_s: job.duration_s })
     }
   }
