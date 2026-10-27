@@ -1,7 +1,7 @@
 export const meta = {
   name: 'review-cycle',
   description: 'Multi-lens review of the branch diff per AGENT-HARNESS.md: single-focus lenses in parallel, one synthesised report',
-  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one), round?: integer (the review round for this task as counted by the conductor, 1 for the first; recorded on the ledger rows; absent for a direct review), prior_findings?: array (round two onward: findings reported open going into this round, as {id, lens, location, claim, severity?, ac_id?} -- id is REQUIRED and must be the exact value THIS workflow returned as open_findings[].id in an earlier round (verified by recomputing the hash from lens/location/claim; a mismatched or missing id is dropped, counted, and produces no fixed entry) -- a synthesis confirmation matching one gets recorded disposition "fixed" in the ledger, guarded so an unmatched claim is dropped, never recorded; absent, behaviour is unchanged)}',
+  whenToUse: 'Before raising a PR, or as the local review gate on a branch. Args: {base?: string (default: the default branch), spec?: string, lenses?: string[] (override triggering), adversarial?: boolean (adds reviewer-verification), allow_inconsistent_install?: boolean (one-run override of a PROVEN install-consistency refusal; named in the log and the report whenever it suppresses one), round?: integer (the review round for this task as counted by the conductor, 1 for the first; recorded on the ledger rows; absent for a direct review), prior_findings?: array (round two onward: findings reported open going into this round, as {id, lens, location, claim, severity?, ac_id?} -- id is REQUIRED and must be the exact value THIS workflow computed and returned as open_findings[].id (computed by this workflow, not by the ledger writer) in an earlier round (verified by recomputing the hash from lens/location/claim; a mismatched or missing id is dropped, counted, and produces no fixed entry) -- a synthesis confirmation matching one gets recorded disposition "fixed" in the ledger, guarded so an unmatched claim is dropped, never recorded; absent, behaviour is unchanged)}',
   phases: [
     { title: 'Scope', detail: 'diff the branch, classify the change surface' },
     { title: 'Lenses', detail: 'triggered lenses review in parallel, isolated worktrees' },
@@ -2068,7 +2068,7 @@ if (ledgerFailed) {
   // `if (threw) throw runError` / `return { ...result, telemetry }` pair stays
   // byte-identical across all three workflows (AC-ARCH-9).
   result.ledger_write_failed = true
-  result.ledger_write_error = startWrite.write_error || terminalWrite.write_error || 'unknown'
+  result.ledger_write_error = redactLogText(String(startWrite.write_error || terminalWrite.write_error || 'unknown'))
   const why = startWrite.write_error || terminalWrite.write_error || 'unknown'
   // A writer that refuses finding_entries predates HARN-OPT-6; the retry deliberately never strips that key, so name the remedy here.
   const staleWriter = /finding_entries: not an allowed property/.test(String(why)) ? ' The installed ledger-append.mjs predates HARN-OPT-6: run bin/install.sh and bin/install.sh --check, then restart the session (named workflows are cached per session).' : ''

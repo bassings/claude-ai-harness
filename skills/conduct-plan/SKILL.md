@@ -164,9 +164,11 @@ rather than narrating a condition that does not apply here.
      3. After `/review-cycle` returns, inspect its `open_findings` field
         (an array of `{id, lens, location, claim, severity, ac_id,
         recurrence}` -- this is the STRUCTURED return value, never the
-        markdown `report` string, and it is `null`, not `[]`, when the
-        ledger write itself failed or an older `ledger-append.mjs` did not
-        return ids). If it is an array (including empty -- `[]` is real
+        markdown `report` string, and it is `null`, not `[]`, only for a run
+        whose outcome is not done (aborted, blocked, or no lens report
+        collected) or for an older installed `review-cycle.js` that
+        returns none; a thrown review surfaces as an error and leaves the
+        stored entry untouched). If it is an array (including empty -- `[]` is real
         data, nothing is open, not the same as "unmeasured"): run the
         lettered ensure-ignored check (a-c) above FIRST. If it does not
         report `ignored: true`, stop here per step c's fail-closed
@@ -178,7 +180,11 @@ rather than narrating a condition that does not apply here.
         `open_findings` is `null`: do NOT touch the stored entry for this
         task -- leave whatever the previous round left there, and note the
         anomaly (`open_findings was null for <task id>`) in this tick's
-        log entry, step 3 below.
+        log entry, step 3 below. If the review's `result.telemetry.outcome`
+        is `"done"` and open_findings is still null, the installed review-cycle.js predates
+        HARN-OPT-6 (its ledger row carries legacy_payload: true); run
+        bin/install.sh and bin/install.sh --check, then restart the session
+        or dispatch by scriptPath, and record that in the tick log.
      4. Do NOT accumulate: step 3's write REPLACES the stored value for
         this task, it does not merge with an earlier one. A finding already
         confirmed fixed drops out of `open_findings` on its own (the lens
@@ -232,9 +238,14 @@ rather than narrating a condition that does not apply here.
    A repo-relative path never reaches the marker.
    Check the writer's response every time: on `write_ok: false`, or a call
    that was stopped before it ran, record `<event> not written:
-   <write_error>` in the tick's log entry, as step 5 b does for its own
+   <write_error>` in the tick's log entry (replace any absolute path under
+   the home directory with ~ before writing it to the tracked plan log), as step 5 b does for its own
    anomaly, so a missing wait is visible in the log and not only as an
-   absence in the ledger at the next weekly read-out.
+   absence in the ledger at the next weekly read-out. The same applies to
+   `/review-cycle`: when it returns `ledger_write_failed` true, record
+   `review ledger not written: <ledger_write_error>` in the tick's log
+   entry (replace any absolute path under the home directory with ~ before
+   writing it to the tracked plan log), and never write a replacement `review_cycle` row by hand.
    `event_scope` (never a pre-built `event_key`) is required for this kind:
    the script refuses a conduct_plan_event line without one. The script
    itself computes the occurrence number and mints `event_key` as
