@@ -305,8 +305,10 @@ It states, every run, in this order:
    bucketed separately from both "nothing in scope" and "examined and
    found nothing".
 5. **CI section** (source: `gh`), with any `gh` failure named distinctly
-   and non-fatally (never silently dropped), and a job named
-   insufficient-data/truncated/rename-suspect where applicable.
+   and non-fatally (never silently dropped), each job carrying its
+   qualifiers (insufficient data, truncated window, rename suspect, re-run,
+   partial fetch) where applicable, and a removal proposal whose cited job
+   has no settled never-failed verdict reported as dropped for that reason.
 6. **Escaped-defect counter-metric** and its heuristic caveat, one block
    per roster repo (labelled by its ledger label and numbered by roster
    position, never its path). The git lane runs once per repo, and the script

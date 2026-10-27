@@ -818,9 +818,10 @@ proposals = proposals.filter((p) => !isUnmeasuredSegmentMotivated(p))
 
 // Review round-1 M6 (AC-DATA-8): a removal-shaped proposal whose target
 // names a specific CI job (workflow + job, matched against every row's own
-// workflow and job fields; T7 rows are per repo, so there can be several) is dropped if that job's aggregate is
-// insufficientData, truncated, or renameSuspect -- a "never failed"
-// removal case built on a window that could not have seen a failure, or a
+// workflow and job fields; T7 rows are per repo, so there can be several) is dropped unless that job's aggregate has
+// a settled neverFailed of true (HARN-OPT-5 T7, AC-SIMP-5): the reader nulls the verdict for every weakening
+// condition (too few runs, a truncated window, a suspected rename, a re-run, a partial fetch), so anything but true
+// is a "never failed" removal case built on evidence that could not have seen a failure, or a
 // job that may be a renamed continuation of one with its own unexamined
 // history, is exactly the unbraked-removal risk AC-DATA-8 exists to catch.
 // Round 1 F2 (AC-QA-21, spec bug): the lookup was an exact-key match, so a
@@ -1463,7 +1464,7 @@ function buildReport(d) {
   // AC-OPS-10, AC-OPS-11: per repo, runs left out as not completed and failed per-run fetches by mode.
   for (const [repo, st] of Object.entries(d.ciRepoStats || {})) {
     const ff = (st && st.fetchFailures) || {}
-    lines.push(`- ${ciFlat(repo)}: ${ciNum((st && st.notCompleted) || 0)} runs not completed (left out); per-run fetch failures: rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}; attempt-1 jobs not fetched: ${ciNum((st && st.attempt1Unfetched) || 0)}`)
+    lines.push(`- ${ciFlat(repo)}: ${ciNum((st && st.notCompleted) || 0)} runs not completed (left out); per-run fetch failures: rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}; attempt-1 jobs not fetched: ${st && typeof st.attempt1Unfetched === 'number' ? ciNum(st.attempt1Unfetched) : 'n/a'}`)  // T7 review F5: a reader that never reported the field prints n/a, never 0
   }
   // AC-QA-32: the lane's own cost, so the first run after shipping records the baseline.
   for (const g of d.ciGhStats || []) lines.push(`- ${ciFlat(g.repo)}: wall-clock ${g.wall_clock_s == null ? 'n/a' : ciNum(g.wall_clock_s)}s, ${g.gh_calls == null ? 'n/a' : ciNum(g.gh_calls)} gh calls`)
@@ -1583,7 +1584,8 @@ function buildReport(d) {
     `Dropped (always-on security lens removal, never permitted): ${d.droppedAlwaysOnSecurityCount}. ` +
     `Dropped (removal without reinstatement evidence): ${d.droppedNoReinstatementCount}. ` +
     `Dropped (motivating wall-clock segment has unmeasured runs${unmeasuredSegmentDetail ? ` -- ${unmeasuredSegmentDetail}` : ''}): ${d.droppedUnmeasuredSegmentCount || 0}. ` +
-    `Dropped (cited CI job is insufficient-data/truncated/rename-suspect): ${d.droppedWeakCiEvidenceCount || 0}.`
+    // T7 review round 1 F1: the label names the verdict the brake reads, not the three flags it stopped enumerating.
+    `Dropped (cited CI job has no settled never-failed verdict; see the CI section qualifiers): ${d.droppedWeakCiEvidenceCount || 0}.`
   )
   // HARN-OPT-4 T6 (AC-QA-20): named, not merely counted. Round 1 F6: this used
   // a dead /\\s+/g (a literal backslash-s), so multi-line reasons passed through.

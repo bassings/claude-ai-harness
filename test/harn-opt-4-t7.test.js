@@ -338,12 +338,24 @@ test('T7 in-flight: a run whose status is not completed is left out of the aggre
   assert.equal(out.repoStats.b.notCompleted, 1)
 })
 
-test('T7 re-runs: a digit-string attempt "2" is a re-run, and a present but non-numeric attempt fails closed as a re-run (AC-OPS-10, round 1 L4)', () => {
-  for (const attempt of ['2', 'x', '', '1.5', {}, null]) {
+test('T7 re-runs: a digit-string attempt "2" is read as attempt 2, and a present but non-numeric attempt fails closed as a re-run even with a clean attempt-1 payload (AC-OPS-10, round 1 L4; HARN-OPT-5 T7 F3)', () => {
+  // T7 review round 1 F3 (AC-SEC-14): every run carries a clean attempt-1 payload, so only the attempt clause can make
+  // it a re-run; before this the missing payload forced the verdict and the clause was never exercised. With that
+  // payload, the digit-string "2" is read as attempt 2 and the job is NOT a re-run (HARN-OPT-5 T7, AC-DATA-16),
+  // which proves the digit-string is parsed as a number; the non-numeric forms still fail closed.
+  const clean = { attempt1_jobs: [{ name: 'test', conclusion: 'success' }] }
+  {
     const runs = []
-    for (let i = 1; i <= 6; i++) runs.push(mkRun('a', 'CI', 2000 + i, i, [['test']], i === 4 ? { attempt } : {}))
+    for (let i = 1; i <= 6; i++) runs.push(mkRun('a', 'CI', 2000 + i, i, [['test']], i === 4 ? { attempt: '2', ...clean } : {}))
     const row = rowFor(ci(runs), 'a', 'CI', 'test')
-    assert.equal(row.reRun, true, `attempt ${JSON.stringify(attempt)} must read as a re-run`)
+    assert.equal(row.reRun, false, 'a digit-string "2" with a clean attempt-1 success is attempt 2, not a re-run')
+    assert.equal(row.neverFailed, true)
+  }
+  for (const attempt of ['x', '', '1.5', {}, null]) {
+    const runs = []
+    for (let i = 1; i <= 6; i++) runs.push(mkRun('a', 'CI', 2000 + i, i, [['test']], i === 4 ? { attempt, ...clean } : {}))
+    const row = rowFor(ci(runs), 'a', 'CI', 'test')
+    assert.equal(row.reRun, true, `attempt ${JSON.stringify(attempt)} must read as a re-run even with a clean attempt-1 payload`)
     assert.equal(row.neverFailed, null, `attempt ${JSON.stringify(attempt)}`)
   }
   for (const attempt of [1, '1', undefined]) {

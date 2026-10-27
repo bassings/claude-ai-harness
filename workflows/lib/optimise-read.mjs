@@ -2069,7 +2069,12 @@ function runCiCommand(payload) {
     const rawCounts = (jobs) => jobs.reduce((m, j) => m.set(j.name, (m.get(j.name) || 0) + 1), new Map())
     const a1 = run.attempt1_jobs
     const a1WellFormed = !run.attempt1_fetch_error && Array.isArray(a1) && a1.length > 0 && a1.every((j) => j && typeof j.name === 'string' && j.name)
-    if (attemptN !== null && attemptN > 1 && !a1WellFormed) stats.attempt1Unfetched += 1
+    if (attemptN !== null && attemptN > 1 && !a1WellFormed) {
+      stats.attempt1Unfetched += 1
+      // T7 review round 1 F2 (AC-QA-24): a failed attempt-1 fetch is also counted by mode beside the per-run fetch
+      // failures, so a token problem and a quota problem stay distinguishable on the stats line.
+      if (run.attempt1_fetch_error) stats.fetchFailures[FETCH_MODES.includes(run.attempt1_fetch_error) ? run.attempt1_fetch_error : 'other'] += 1
+    }
     const latestCounts = rawCounts(latestJobs)
     const a1Counts = a1WellFormed ? rawCounts(a1) : new Map()
     const a1Success = a1WellFormed ? new Map(a1.map((j) => [j.name, j.conclusion === 'success'])) : new Map()

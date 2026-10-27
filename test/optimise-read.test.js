@@ -3243,4 +3243,14 @@ test('optimise-read T7 (AC-OPS-14): the count of attempt>1 runs whose attempt-1 
     t7Run(4, 1, ['test']),
   ])
   assert.equal(out.repoStats.a.attempt1Unfetched, 2)
+  // T7 review round 1 F2 (AC-QA-24): the rate-limited attempt-1 fetch is also counted by mode.
+  assert.equal(out.repoStats.a.fetchFailures.rate_limited, 1)
+  assert.equal(out.repoStats.a.fetchFailures.other, 0, 'an empty attempt-1 payload is unfetched, not a fetch failure by mode')
+})
+
+test('optimise-read T7 (AC-QA-24): an attempt-1 fetch error of an unknown mode is counted under other, and every such job stays a re-run', () => {
+  const out = t7Ci([t7Run(1, 2, ['test'], { attempt1_fetch_error: 'weird' })])
+  assert.equal(out.repoStats.a.fetchFailures.other, 1)
+  assert.equal(out.repoStats.a.attempt1Unfetched, 1)
+  assert.equal(t7Row(out, 'test').reRun, true)
 })

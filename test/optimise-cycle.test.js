@@ -1580,7 +1580,7 @@ test('optimise-cycle: a removal-shaped proposal whose target names a CI job that
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 0)
-  assert.match(result.report, /insufficient-data\/truncated\/rename-suspect/i)
+  assert.match(result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/)  // T7 review F1/F4: label and count pinned
 })
 
 test('optimise-cycle: a removal-shaped proposal citing a CI job with a solid (not truncated/insufficient/rename-suspect) never-failed claim survives (M6 does not over-block)', async () => {
@@ -1612,7 +1612,7 @@ for (const flag of ['reRun', 'partialFetch']) {
     const responses = baseResponses({ 'lane:ci': t7Rows(t7LintRow(T7_WEAK[flag])), 'synthesis:proposals': t7LintRemoval() })
     const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
     assert.equal(result.proposals_ranked.length, 0, `${flag} must brake the removal`)
-    assert.match(result.report, /insufficient-data\/truncated\/rename-suspect/i)
+    assert.match(result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/)  // T7 review F1/F4
   })
 }
 
@@ -1659,7 +1659,15 @@ test('optimise-cycle: the brake table (AC-QA-21): only neverFailed true survives
 test('optimise-cycle: a neverFailed-null entry with every legacy flag false drops the removal into the weak-evidence count (AC-QA-22, restates the T6 and AC-SEC-13 survival controls)', async () => {
   const result = await t5Verdict(t7LintRow({ neverFailed: null }))
   assert.equal(result.proposals_ranked.length, 0)
-  assert.match(result.report, /insufficient-data\/truncated\/rename-suspect/i)
+  assert.match(result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/, 'T7 review F4: the drop lands in the weak-evidence bucket, count pinned')
+})
+
+// T7 review round 1 F5 (AC-OPS-14): a reader that predates T7 reports no attempt1Unfetched at all; the line must say n/a, never 0.
+test('optimise-cycle: a repoStats entry without attempt1Unfetched (an older reader) prints n/a for the attempt-1 count, never 0', async () => {
+  const responses = baseResponses({ 'lane:ci': ciFixture({ repoStats: { demo: { notCompleted: 1, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } } } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('runs not completed'))
+  assert.match(line, /attempt-1 jobs not fetched: n\/a/)
 })
 
 test('optimise-cycle: the attempt-1 unfetched count prints in the existing per-repo CI stats line, not a new section (AC-OPS-14, AC-SIMP-11)', async () => {

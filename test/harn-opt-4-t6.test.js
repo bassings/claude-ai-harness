@@ -451,7 +451,7 @@ for (const flag of ['truncated', 'insufficientData', 'renameSuspect']) {
       'synthesis:proposals': { proposals: [proposal({ target: fixedTarget({ kind: 'ci_remove', workflow: 'ci.yml', job: 'lint' }), statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 100 })] },
     })
     assert.equal(result.proposals_ranked.length, 0)
-    assert.match(result.report, /insufficient-data\/truncated\/rename-suspect/i)
+    assert.match(result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/)  // T7 review F1/F4
   })
 }
 
@@ -467,7 +467,7 @@ test('T6 brake: the CI lookup folds case and surrounding whitespace on the propo
     'synthesis:proposals': { proposals: [removal(' LINT ')] },
   })
   assert.equal(weak.result.proposals_ranked.length, 0, 'the fold must find the weak entry; an exact-key lookup waves the removal through')
-  assert.match(weak.result.report, /Dropped \(cited CI job is insufficient-data\/truncated\/rename-suspect\): 1\b/)
+  assert.match(weak.result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/)
   const workflowCase = await run({
     'lane:ci': ciFixture({ 'CI.yml::Lint': ciEntry('Lint', { workflow: 'CI.yml', truncated: true, neverFailed: null }) }),
     'synthesis:proposals': { proposals: [removal(' lint\t')] },
@@ -486,7 +486,7 @@ test('T6 brake: a removal-shaped proposal whose workflow/job names no CI aggrega
     'synthesis:proposals': { proposals: [removal('no-such-job')] },
   })
   assert.equal(result.proposals_ranked.length, 0, 'no evidence is weak evidence for a removal')
-  assert.match(result.report, /Dropped \(cited CI job is insufficient-data\/truncated\/rename-suspect\): 1\b/)
+  assert.match(result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/)
 })
 
 // ==== stableProposalId over the fixed key set ====
