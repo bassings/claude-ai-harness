@@ -158,9 +158,9 @@ test('AC-OPS-6: every non-zero drop count is named with its reason on one line, 
   for (const name of ['invalid_prior_ids_dropped', 'invalid_ac_ids_dropped', 'invalid_finding_fields_dropped', 'invalid_record_values_dropped']) assert.match(lines[0], new RegExp(`${name}=[1-9]`))
 })
 
-// Fix round 3, item B: the script computes the writer's two fixed-reconciliation counts itself, with the same rule as the
-// writer's computeFixedFindings, and names them on the one drop line. They are not payload fields (the writer owns the row).
-test('AC-OPS-6: the drop line names invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped, with the values the real writer records on the row', async () => {
+// HARN-OPT-6 simplify-and-finish pass (owner decision 2026-10-28, M2): the writer is the single owner of the fixed-claim rule,
+// so the run-time line says how many fixed confirmations were sent and points at the row for the writer's two counts.
+test('AC-OPS-6: the drop line says how many fixed confirmations were sent, and the row (not the script) carries invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped', async () => {
   const keep = withId({ lens: 'lens-qa', location: 'k.js:1', claim: 'confirmed once and repeated' })
   const stillOpen = withId({ lens: 'lens-security', location: 'o.js:2', claim: 'confirmed but open again' })
   const repo = makeTempRepo()
@@ -170,27 +170,29 @@ test('AC-OPS-6: the drop line names invalid_fixed_ids_dropped and duplicate_fixe
     'ledger:write': newWriter(repo),
   })
   const row = readLedgerLines(repo).map((l) => JSON.parse(l)).filter((r) => r.outcome !== 'started').pop()
-  assert.equal(row.invalid_fixed_ids_dropped, 2, 'reference: the unmatched claim and the claim that is also open')
-  assert.equal(row.duplicate_fixed_ids_dropped, 1, 'reference: the repeated confirmation')
-  const lines = logs.filter((l) => /_dropped=/.test(l))
-  assert.equal(lines.length, 1, `expected exactly one drop line, got ${JSON.stringify(lines)}`)
-  assert.match(lines[0], /\binvalid_fixed_ids_dropped=2\b/)
-  assert.match(lines[0], /\bduplicate_fixed_ids_dropped=1\b/)
-  assert.ok(!('invalid_fixed_ids_dropped' in terminal) && !('duplicate_fixed_ids_dropped' in terminal), 'the counts name the log line only; the writer owns them on the row')
+  assert.equal(row.invalid_fixed_ids_dropped, 2, 'the unmatched claim and the claim that is also open')
+  assert.equal(row.duplicate_fixed_ids_dropped, 1, 'the repeated confirmation')
+  const lines = logs.filter((l) => /fixed_confirmations_sent=/.test(l))
+  assert.equal(lines.length, 1, `expected exactly one fixed_confirmations_sent line, got ${JSON.stringify(logs)}`)
+  assert.match(lines[0], /\bfixed_confirmations_sent=4\b/)
+  assert.match(lines[0], /see invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped on the row/)
+  assert.ok(!logs.some((l) => /\b(invalid|duplicate)_fixed_ids_dropped=\d/.test(l)), 'the script no longer logs a count it does not own')
+  assert.ok(!('invalid_fixed_ids_dropped' in terminal) && !('duplicate_fixed_ids_dropped' in terminal), 'the counts are the writer\'s alone')
 })
 
-test('AC-OPS-6: the fixed counts are applied the writer\'s way: a same-round open claim past the 60th is invalid, and nothing is named when fixed_findings was not supplied or every claim is valid', async () => {
+test('AC-OPS-6: fixed_confirmations_sent counts what was sent whatever the writer later decides (a same-round open claim past the 60th included), and is absent when fixed_findings was not supplied or was empty', async () => {
   const many = Array.from({ length: 65 }, (_, i) => lensFinding(`claim ${i}`, `f${i}.js:${i + 1}`))
   const last = withId({ lens: 'lens-security', location: many[64].location, claim: many[64].claim })
   const over = await review({ spec: 'specs/example.md', round: 2, prior_findings: [last] }, {
     ...withFindings(many),
     synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(last)] },
   })
-  assert.match(over.logs.filter((l) => /_dropped=/.test(l)).join('\n'), /\binvalid_fixed_ids_dropped=1\b/, 'the 65th open finding is still open this round, so its confirmation is invalid')
+  assert.match(over.logs.join('\n'), /\bfixed_confirmations_sent=1\b/)
+  assert.ok(!over.logs.some((l) => /\b(invalid|duplicate)_fixed_ids_dropped=\d/.test(l)))
   const clean = await review({ spec: 'specs/example.md', round: 2, prior_findings: [last] }, { synthesis: { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(last)] } })
-  assert.ok(!clean.logs.some((l) => /fixed_ids_dropped/.test(l)), `a valid confirmation names no count: ${JSON.stringify(clean.logs)}`)
+  assert.match(clean.logs.join('\n'), /\bfixed_confirmations_sent=1\b/, 'a valid confirmation is still a confirmation sent')
   const none = await review({ spec: 'specs/example.md', round: 2, prior_findings: [last] }, {})
-  assert.ok(!none.logs.some((l) => /fixed_ids_dropped/.test(l)), 'fixed_findings was not supplied, so no fixed count exists to name')
+  assert.ok(!none.logs.some((l) => /fixed_confirmations_sent/.test(l)), 'fixed_findings was not supplied, so nothing was sent')
 })
 
 // Fix round 3, item C: the live ledger resolves the way the writer resolves it, from a linked worktree too.

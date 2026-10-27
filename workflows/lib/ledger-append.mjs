@@ -1112,13 +1112,20 @@ function readFindingEntries(entries) {
       dropped += 1
       continue
     }
-    byDisposition[e.disposition].push({
+    const read = {
       id: e.id,
       lens: e.lens === undefined ? null : e.lens,
       severity: e.severity === undefined ? null : e.severity,
       ac_id: e.ac_id || null,
       disposition: e.disposition,
-    })
+    }
+    // A prior carries how many of its labels review-cycle.js neutralised (see
+    // computeFixedFindings); only a non-negative safe integer counts.
+    if (e.disposition === PAYLOAD_PRIOR_DISPOSITION) {
+      read.fieldDrops = Number.isSafeInteger(e.field_drops) && e.field_drops > 0 ? e.field_drops : 0
+      read.acIdDrops = Number.isSafeInteger(e.ac_id_drops) && e.ac_id_drops > 0 ? e.ac_id_drops : 0
+    }
+    byDisposition[e.disposition].push(read)
   }
   return { byDisposition, dropped }
 }
@@ -1147,11 +1154,16 @@ function readFindingEntries(entries) {
 // of a correctly matched id is counted separately under duplicateDropped: the
 // synthesis repeated a real confirmation rather than fabricating one.
 //
+// Each recorded fixed entry also adds its prior's fieldDrops and acIdDrops (the
+// labels review-cycle.js neutralised on that prior), once per prior, so the row
+// counts them as the 06049e4 writer did. An unconfirmed, duplicated, unmatched
+// or still-open prior adds nothing.
+//
 // null invalidDropped/duplicateDropped (never a bare 0) when no fixed
 // confirmations were supplied at all, matching findings_truncated's
 // null-vs-zero convention.
 function computeFixedFindings(priorEntries, fixedClaims, fixedSupplied, sameRoundOtherDispositionIds) {
-  if (!fixedSupplied) return { entries: [], invalidDropped: null, duplicateDropped: null }
+  if (!fixedSupplied) return { entries: [], invalidDropped: null, duplicateDropped: null, fieldDrops: 0, acIdDrops: 0 }
   const priorById = new Map()
   for (const prior of priorEntries) {
     if (!priorById.has(prior.id)) priorById.set(prior.id, prior)
@@ -1160,6 +1172,8 @@ function computeFixedFindings(priorEntries, fixedClaims, fixedSupplied, sameRoun
   const seenIds = new Set()
   let invalidDropped = 0
   let duplicateDropped = 0
+  let fieldDrops = 0
+  let acIdDrops = 0
   for (const claim of fixedClaims) {
     const prior = priorById.get(claim.id)
     if (!prior || sameRoundOtherDispositionIds.has(claim.id)) {
@@ -1172,8 +1186,10 @@ function computeFixedFindings(priorEntries, fixedClaims, fixedSupplied, sameRoun
     }
     seenIds.add(claim.id)
     entries.push({ id: claim.id, lens: prior.lens, severity: prior.severity, ac_id: prior.ac_id, disposition: 'fixed' })
+    fieldDrops += prior.fieldDrops || 0
+    acIdDrops += prior.acIdDrops || 0
   }
-  return { entries, invalidDropped, duplicateDropped }
+  return { entries, invalidDropped, duplicateDropped, fieldDrops, acIdDrops }
 }
 
 // Fix round 1, finding 4: a flat concatenate-then-slice truncation let
@@ -2074,6 +2090,8 @@ export function main() {
     scriptDrops[k] = Number.isInteger(payload[k]) && payload[k] > 0 ? payload[k] : 0
   }
   scriptDrops.invalid_record_values_dropped += read.dropped + legacyKeysPresent.length
+  scriptDrops.invalid_finding_fields_dropped += fixed.fieldDrops
+  scriptDrops.invalid_ac_ids_dropped += fixed.acIdDrops
   // finding_entries and the legacy keys never reach the schema-validated entry
   // (additionalProperties:false would refuse the whole line), nor does event_scope.
   const { finding_entries, event_scope, fixed_findings_supplied, ...restPayloadWithLegacy } = payload
@@ -2460,9 +2478,10 @@ export function main() {
   if (typeof entry.invalid_prior_ids_dropped === 'number') extra.invalid_prior_ids_dropped = entry.invalid_prior_ids_dropped
   // HARN-OPT-6 (AC-DATA-6b): a payload carrying the legacy descriptor keys came
   // from a review-cycle.js that predates this writer. It landed without
-  // findings; say so in the result, where the operator and the ledger:write
-  // agent's report can see it, rather than letting a findings-free row read as
-  // a clean review.
+  // findings; say so in the result. A workflow script that predates this change
+  // drops this note, because its pinned writeLedger response schema does not
+  // carry it, so the operator does not see it from such a run; a reader finds
+  // legacy_payload on the row instead.
   if (legacyKeysPresent.length) {
     extra.legacy_descriptor_keys_dropped = legacyKeysPresent.length
     extra.legacy_descriptor_note = `the payload carried raw finding descriptors (${legacyKeysPresent.join(', ')}), which this writer no longer hashes; the workflow script predates HARN-OPT-6, so this row has no findings. Run bin/install.sh and restart the session.`

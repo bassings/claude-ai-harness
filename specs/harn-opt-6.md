@@ -53,7 +53,7 @@ findings, ASCII text) is 1,408 bytes, and the largest payload of conforming
 values (every roster lens, the longest lens name, AC id and verdict map the
 allowlists accept, 60 entries in each of open, rejected, spec_bug and fixed
 confirmations, 60 verified prior ids, 96 ac_verdicts, a 40-character round key
-and drift values) is 97,064 bytes. The ceiling is 120,000 bytes, about a
+and drift values) is 99,624 bytes. The ceiling is 120,000 bytes, about a
 quarter above the largest measured payload; the test in
 test/harn-opt-6-r2.test.js fails if a payload built to those limits reaches it.
 The ceiling holds for a round with at most MAX_FINDINGS entries in each of

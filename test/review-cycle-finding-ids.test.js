@@ -524,7 +524,12 @@ test('AC-SEC-1/2/4: hostile prior_findings and their fixed_findings echo reach n
     const entries = run.terminal.finding_entries
     assert.equal(entries.filter((e) => e.disposition === 'prior').length, 3, 'all three priors verify against their correct ids')
     assert.equal(entries.filter((e) => e.disposition === 'fixed').length, 3)
-    for (const e of entries) assert.deepEqual(Object.keys(e).sort(), ['ac_id', 'disposition', 'id', 'lens', 'severity'], 'an entry carries ids and closed-set labels only')
+    // A verified prior also carries two integer label-drop counts the writer adds once per recorded fix (finishing pass, item 1).
+    for (const e of entries) {
+      const keys = e.disposition === 'prior' ? ['ac_id', 'ac_id_drops', 'disposition', 'field_drops', 'id', 'lens', 'severity'] : ['ac_id', 'disposition', 'id', 'lens', 'severity']
+      assert.deepEqual(Object.keys(e).sort(), keys, 'an entry carries ids, closed-set labels and (on a prior) integer counts only')
+      if (e.disposition === 'prior') for (const k of ['ac_id_drops', 'field_drops']) assert.ok(Number.isInteger(e[k]) && e[k] >= 0, `${k} is a non-negative integer`)
+    }
     assert.deepEqual(entries.filter((e) => e.disposition === 'prior').map((e) => [e.lens, e.severity, e.ac_id]), [['lens-security', 'High', 'AC-SEC-1'], ['lens-security', null, null], ['lens-security', 'High', 'AC-SEC-1']])
     for (const s of allStrings({ ...run.terminal, spec: undefined, run_id: undefined })) assert.ok(/^[0-9a-f]{16}$|^(lens|reviewer)-[a-z]+$|^(Critical|High|Medium|Low)$|^(open|rejected|spec_bug|fixed|prior)$|^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$|^(CLEAN|FINDINGS|BLOCKED|PASS|FAIL|UNVERIFIABLE)$|^[0-9a-f]{7,64}$|^(review_cycle|done|started|blocked|aborted|repo-tuned|harness defaults|path|config|default)$/.test(s), `payload string outside the closed sets: ${JSON.stringify(s).slice(0, 80)}`)
   }

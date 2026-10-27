@@ -1800,8 +1800,8 @@ function findingEntry(descriptor, disposition, count = true, countFields = count
 // {descriptor, entry} pairs for the descriptors that survive findingEntry.
 // countFields false is for the fixed confirmations: the writer takes a fixed row's
 // lens, severity and ac_id from the PRIOR finding the claim matches, never from
-// the claim, so a claim's own labels are not counted (reconcileFixed counts the
-// matched prior's instead, the way the 06049e4 writer's row did).
+// the claim, so a claim's own labels are not counted (the matched prior's are,
+// through field_drops and ac_id_drops on its entry, which the writer adds).
 function findingPairs(descriptors, disposition, countFields = true) {
   if (!Array.isArray(descriptors)) return []
   return descriptors.map(descriptor => ({ descriptor, entry: findingEntry(descriptor, disposition, true, countFields) })).filter(pair => pair.entry)
@@ -1812,44 +1812,23 @@ function findingPairs(descriptors, disposition, countFields = true) {
 // rest is the one place invalid_prior_ids_dropped is computed.
 function verifiedPriorEntries(prior) {
   const entries = []
-  const labelDrops = new Map()
   let invalid = 0
   for (const p of prior) {
     const safe = p && typeof p === 'object' ? p : {}
     if (typeof safe.id === 'string' && safe.id === findingId(safe.lens, safe.location, safe.claim)) {
       const entry = { id: safe.id, lens: payloadLens(safe.lens, false), severity: payloadSeverity(safe.severity, false), ac_id: payloadAcId(safe.ac_id, false), disposition: 'prior' }
-      // What the writer's fixed row would have counted if this prior is confirmed:
-      // a lens or severity that did not conform, and an ac_id that was supplied
-      // but did not conform (an absent one is not a drop).
+      // What the writer's fixed row counts if it records this prior fixed: a lens
+      // or severity that did not conform, and an ac_id that was supplied but did
+      // not conform (an absent one is not a drop). The writer adds these once.
       const absentAcId = safe.ac_id === null || safe.ac_id === undefined || safe.ac_id === ''
+      entry.field_drops = (entry.lens === null ? 1 : 0) + (entry.severity === null ? 1 : 0)
+      entry.ac_id_drops = entry.ac_id === null && !absentAcId ? 1 : 0
       entries.push(entry)
-      if (!labelDrops.has(entry.id)) labelDrops.set(entry.id, { fieldDrops: (entry.lens === null ? 1 : 0) + (entry.severity === null ? 1 : 0), acIdDrops: entry.ac_id === null && !absentAcId ? 1 : 0 })
     } else {
       invalid += 1
     }
   }
-  return { entries, invalid, labelDrops }
-}
-// The writer's computeFixedFindings, on ids alone, so the two counts it records on
-// the row can be named on the AC-OPS-6 line and the confirmed priors' labels
-// counted as the 06049e4 writer counted them. Same rule: a claim is invalid when
-// its id is not a verified prior id or the same round gives that id another
-// disposition; a repeat of a valid one is a duplicate. Null counts when
-// fixed_findings was not supplied. The writer remains the only place a row is
-// reconciled; these numbers are for the log and the label counters.
-function reconcileFixed(labelDrops, fixedEntries, supplied, otherDispositionIds) {
-  if (!supplied) return { invalid: null, duplicate: null, fieldDrops: 0, acIdDrops: 0 }
-  const seen = new Set()
-  const out = { invalid: 0, duplicate: 0, fieldDrops: 0, acIdDrops: 0 }
-  for (const claim of fixedEntries) {
-    const prior = labelDrops.get(claim.id)
-    if (!prior || otherDispositionIds.has(claim.id)) { out.invalid += 1; continue }
-    if (seen.has(claim.id)) { out.duplicate += 1; continue }
-    seen.add(claim.id)
-    out.fieldDrops += prior.fieldDrops
-    out.acIdDrops += prior.acIdDrops
-  }
-  return out
+  return { entries, invalid }
 }
 // A lens name in lenses_run, lenses_skipped or a verdicts key passes the same
 // closed-set check as a finding's lens (payloadLens): a non-member is dropped and
@@ -1987,36 +1966,30 @@ const rejectedPairs = findingPairs(rejectedFindingsRaw, 'rejected')
 const openPairs = findingPairs(openFindingsRaw, 'open')
 const fixedPairs = findingPairs(fixedFindingsRaw, 'fixed', false)
 const priorVerified = priorFindings ? verifiedPriorEntries(priorFindings) : null
-const fixedReconciled = reconcileFixed(
-  priorVerified ? priorVerified.labelDrops : new Map(),
-  fixedPairs.map(pair => pair.entry),
-  fixedPairs.length > 0 || Boolean(fixedFindingsRaw),
-  new Set([...specBugPairs, ...rejectedPairs, ...openPairs].map(pair => pair.entry.id)),
-)
-payloadDrops.finding_fields += fixedReconciled.fieldDrops
-payloadDrops.ac_ids += fixedReconciled.acIdDrops
 const payloadAcVerdictList = payloadAcVerdicts(acVerdicts)
 {
   // AC-OPS-6: one line naming each non-zero count and its reason, only when
   // something was dropped, the way invalid_ac_ids_dropped is logged.
-  // invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped are computed here
-  // with the writer's rule (reconcileFixed) because the pinned writeLedger
-  // response carries only run_id, ts, write_ok, write_error and
-  // invalid_ac_ids_dropped, so the writer's own values never come back. They are
-  // named on this line only; the row's values are the writer's.
+  // The writer alone decides which fixed confirmations match a verified prior,
+  // and the pinned writeLedger response does not carry its two counts back, so
+  // this line says only how many were sent and where the row holds the rest.
   // The writer's legacy_payload marker (a payload from a workflow that predates
   // HARN-OPT-6) cannot be logged here either: the pinned writeLedger response
   // schema is byte-identical across the three workflow files and cannot carry
   // legacy_payload, so a reader finds it on the row.
   const drops = [
     [priorVerified ? priorVerified.invalid : 0, 'invalid_prior_ids_dropped', 'a prior_findings entry whose id did not match the id recomputed from its own lens, location and claim'],
-    [fixedReconciled.invalid, 'invalid_fixed_ids_dropped', 'a fixed confirmation matched no verified prior id, or its finding is still open, rejected or a spec bug this round'],
-    [fixedReconciled.duplicate, 'duplicate_fixed_ids_dropped', 'a valid fixed confirmation was repeated'],
     [payloadDrops.ac_ids, 'invalid_ac_ids_dropped', 'a non-conforming ac_id was nulled'],
     [payloadDrops.finding_fields, 'invalid_finding_fields_dropped', 'a non-conforming lens or severity was nulled'],
     [payloadDrops.record_values, 'invalid_record_values_dropped', 'a malformed descriptor was dropped or a non-conforming verdict was nulled'],
   ].filter(([n]) => n > 0)
-  if (drops.length) log(`Run ${startRunId || 'unknown'}: ${drops.map(([n, name, why]) => `${name}=${n} (${why})`).join('; ')}`)
+  const sent = fixedPairs.length
+  const parts = [
+    ...drops.map(([n, name, why]) => `${name}=${n} (${why})`),
+    ...(sent > 0 ? [`fixed_confirmations_sent=${sent} (the writer records which match a verified prior; ` +
+      'see invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped on the row)'] : []),
+  ]
+  if (parts.length) log(`Run ${startRunId || 'unknown'}: ${parts.join('; ')}`)
 }
 const terminalEntry = {
   kind: 'review_cycle',
@@ -2051,13 +2024,18 @@ if (refusedKey && !['kind', 'outcome', 'run_id', 'finding_entries'].includes(ref
   const { [refusedKey]: _refused, ...retryEntry } = terminalEntry
   terminalWrite = await writeLedger(retryEntry)
 }
+// A failed terminal write names the base64 size of the payload first sent, in bytes,
+// for the AC-QA-13 live tally. Outside writeLedger and the pinned retry block above.
+if (!terminalWrite.write_ok) log(`Terminal ledger write payload was ${toBase64(JSON.stringify(terminalEntry)).length} bytes (base64).`)
 // HARN-OPT-6 (AC-PROD-1, AC-ARCH-6): result.open_findings is built from the
 // ids computed in this script, so it is an array whether or not the ledger
 // write landed. Each element is the original descriptor plus its id, in the
 // same order as the 'open' entries on the payload; a caller passes this exact
 // array, untouched, as next round's prior_findings. An empty array means this
-// round produced no open findings.
-result.open_findings = openPairs.map(pair => ({ ...pair.descriptor, id: pair.entry.id }))
+// round produced no open findings. A run whose outcome is not done (aborted,
+// blocked, no review performed) returns null, never [], so a failed round cannot
+// overwrite the caller's stored priors with an empty list.
+result.open_findings = telemetry.outcome === 'done' ? openPairs.map(pair => ({ ...pair.descriptor, id: pair.entry.id })) : null
 // 2026-08-18: give write_ok:false a CONSUMER -- see plan-cycle.js for the
 // full rationale. It was computed, logged and returned to nobody, so the
 // ledger stopped recording on 2026-08-12 and nothing noticed for six days.
