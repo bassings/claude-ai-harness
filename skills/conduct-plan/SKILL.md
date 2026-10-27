@@ -164,9 +164,10 @@ rather than narrating a condition that does not apply here.
      3. After `/review-cycle` returns, inspect its `open_findings` field
         (an array of `{id, lens, location, claim, severity, ac_id,
         recurrence}` -- this is the STRUCTURED return value, never the
-        markdown `report` string, and it is `null`, not `[]`, when the
-        ledger write itself failed or an older `ledger-append.mjs` did not
-        return ids). If it is an array (including empty -- `[]` is real
+        markdown `report` string, and it is `null`, not `[]`, only for a run
+        whose outcome is not done (aborted, blocked, thrown, or no lens
+        report collected) or for an older installed `review-cycle.js` that
+        returns none). If it is an array (including empty -- `[]` is real
         data, nothing is open, not the same as "unmeasured"): run the
         lettered ensure-ignored check (a-c) above FIRST. If it does not
         report `ignored: true`, stop here per step c's fail-closed
@@ -234,7 +235,10 @@ rather than narrating a condition that does not apply here.
    that was stopped before it ran, record `<event> not written:
    <write_error>` in the tick's log entry, as step 5 b does for its own
    anomaly, so a missing wait is visible in the log and not only as an
-   absence in the ledger at the next weekly read-out.
+   absence in the ledger at the next weekly read-out. The same applies to
+   `/review-cycle`: when it returns `ledger_write_failed` true, record
+   `review ledger not written: <ledger_write_error>` in the tick's log
+   entry, and never write a replacement `review_cycle` row by hand.
    `event_scope` (never a pre-built `event_key`) is required for this kind:
    the script refuses a conduct_plan_event line without one. The script
    itself computes the occurrence number and mints `event_key` as

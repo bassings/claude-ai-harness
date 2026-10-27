@@ -793,6 +793,16 @@ runtime statically rejects any `import` before execution, so the schema,
 validation and the write itself live in this one real-Node script instead,
 invoked via Bash from each workflow's final step).
 
+**Ledger failure signals.** Three signals mean a run's telemetry was not
+recorded correctly. The first two come from a harness install that is out of
+step with itself; the third comes from a terminal write that stopped or failed.
+
+| Signal | Exact text | What it means | Remedy |
+|---|---|---|---|
+| (a) Stale writer | the `TELEMETRY NOT RECORDED for this run:` log line, naming `finding_entries: not an allowed property` and `ledger-append.mjs predates HARN-OPT-6` | The installed writer is older than the workflow and refuses the findings key, so the run leaves no telemetry. | Run `bin/install.sh` and `bin/install.sh --check`, then restart the session or dispatch by scriptPath, because named workflows are cached per session. |
+| (b) Stale workflow | a `review_cycle` row carrying `legacy_payload: true` with no findings | The workflow is older than the writer, typically a session started before `bin/install.sh` ran, so it wrote through the new writer in the old shape. | Run `bin/install.sh` and `bin/install.sh --check`, then restart the session or dispatch by scriptPath, because named workflows are cached per session. |
+| (c) Terminal write payload | the log line `Terminal ledger write payload was N bytes (base64)` | The terminal write was stopped or failed. The size tells a size stop from any other: a payload near the ceiling is a size stop, a small one points at another cause. | Read the `write_error` that came with it; a size stop needs the payload reduced, anything else follows its own message. |
+
 A `tdd_task` line also carries `model`: the implementer model the run asked for
 through `tdd-task`'s optional `model` argument, or null when none was given. It
 is **requested, and confirmed by transcript**: the line records the token that
