@@ -451,22 +451,25 @@ for (const flag of ['truncated', 'insufficientData', 'renameSuspect']) {
       'synthesis:proposals': { proposals: [proposal({ target: fixedTarget({ kind: 'ci_remove', workflow: 'ci.yml', job: 'lint' }), statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 100 })] },
     })
     assert.equal(result.proposals_ranked.length, 0)
-    assert.match(result.report, /insufficient-data\/truncated\/rename-suspect/i)
+    assert.match(result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/)  // T7 review F1/F4
   })
 }
 
 const removal = (job, extra = {}) => proposal({ target: fixedTarget({ kind: 'ci_remove', workflow: 'ci.yml', job, ...extra }), statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 20 })
 const ciEntry = (job, overrides = {}) => ({ workflow: 'ci.yml', job, n: 20, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: true, meanDurationS: 1, ...overrides })
 
+// HARN-OPT-5 T7 (AC-QA-22): the weak entries below now carry neverFailed null,
+// as the reader writes them (a weakening flag nulls the verdict); the brake
+// reads the verdict, so a flag beside neverFailed true is no longer the weak shape.
 test('T6 brake: the CI lookup folds case and surrounding whitespace on the proposal side, so a weak entry still drops a removal that spells the job differently, and a solid entry still lets it through (AC-QA-21, round 1 F2)', async () => {
   const weak = await run({
-    'lane:ci': ciFixture({ 'ci.yml::Lint': ciEntry('Lint', { insufficientData: true }) }),
+    'lane:ci': ciFixture({ 'ci.yml::Lint': ciEntry('Lint', { insufficientData: true, neverFailed: null }) }),
     'synthesis:proposals': { proposals: [removal(' LINT ')] },
   })
   assert.equal(weak.result.proposals_ranked.length, 0, 'the fold must find the weak entry; an exact-key lookup waves the removal through')
-  assert.match(weak.result.report, /Dropped \(cited CI job is insufficient-data\/truncated\/rename-suspect\): 1\b/)
+  assert.match(weak.result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/)
   const workflowCase = await run({
-    'lane:ci': ciFixture({ 'CI.yml::Lint': ciEntry('Lint', { workflow: 'CI.yml', truncated: true }) }),
+    'lane:ci': ciFixture({ 'CI.yml::Lint': ciEntry('Lint', { workflow: 'CI.yml', truncated: true, neverFailed: null }) }),
     'synthesis:proposals': { proposals: [removal(' lint\t')] },
   })
   assert.equal(workflowCase.result.proposals_ranked.length, 0, 'the entry side is folded too, workflow included')
@@ -483,7 +486,7 @@ test('T6 brake: a removal-shaped proposal whose workflow/job names no CI aggrega
     'synthesis:proposals': { proposals: [removal('no-such-job')] },
   })
   assert.equal(result.proposals_ranked.length, 0, 'no evidence is weak evidence for a removal')
-  assert.match(result.report, /Dropped \(cited CI job is insufficient-data\/truncated\/rename-suspect\): 1\b/)
+  assert.match(result.report, /Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): 1\b/)
 })
 
 // ==== stableProposalId over the fixed key set ====
@@ -992,7 +995,11 @@ test('T6 round 2 F3: a rejection reason is flattened, bounded and redacted befor
 
 for (const flag of ['truncated', 'insufficientData', 'renameSuspect']) {
   test(`T6 brake control: the same ${flag} CI entry with the flag false lets the removal through, so the drop above is for the flag and not for an unknown job (AC-QA-21, round 2 F5)`, async () => {
-    const entryFor = { workflow: 'ci.yml', job: 'lint', n: 100, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: null, meanDurationS: 1, [flag]: false }
+    // HARN-OPT-5 T7 (AC-QA-22): this control used to feed neverFailed null with
+    // every flag false and require the removal to survive. The brake now reads
+    // the verdict (neverFailed !== true), so a null verdict is weak evidence
+    // whatever the flags say; the control carries neverFailed true instead.
+    const entryFor = { workflow: 'ci.yml', job: 'lint', n: 100, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: true, meanDurationS: 1, [flag]: false }
     const { result } = await run({
       'lane:ci': ciFixture({ 'ci.yml::lint': entryFor }),
       'synthesis:proposals': { proposals: [proposal({ target: fixedTarget({ kind: 'ci_remove', workflow: 'ci.yml', job: 'lint' }), statement: 'Remove the lint job: never failed', citations: ['1001'], reinstatement_evidence: 'evidence', n: 100 })] },
