@@ -80,7 +80,7 @@ const DRIVERS = {
         spec_snapshot: JSON.stringify({ file: '/tmp/harn-specwb-fx/spec.snapshot', sha256: 'a'.repeat(64), headings: ['## Problem'], ac_ids: [] }),
       },
       'lens-security': LENS_CLEAN, 'lens-qa': LENS_CLEAN, 'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] }, 'lens-product': LENS_CLEAN,
-      'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def', surviving_ids: [], writeback_check: JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: 'b'.repeat(64), snapshot_sha256: 'a'.repeat(64) }) },
+      'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def', surviving_ids: [], writeback_check: JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: 'b'.repeat(64), snapshot_sha256: 'a'.repeat(64), surviving_ids_checked: [] }) },
       'ledger:write': ledger,
     }),
   },

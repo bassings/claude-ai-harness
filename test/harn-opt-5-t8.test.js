@@ -18,10 +18,10 @@ const OTHER_SHA = 'b'.repeat(64)
 const SNAP_FILE = '/tmp/harn-specwb-AbC123/spec.snapshot'
 const BEFORE = { file: SNAP_FILE, sha256: SHA, headings: ['## Problem', '## Acceptance criteria'], ac_ids: ['AC-SEC-1'] }
 const IDS = ['AC-SEC-1', 'AC-QA-1']
-const CHECK_OK = { ok: true, problems: [], restored: false, spec_sha256: OTHER_SHA, snapshot_sha256: SHA }
+const CHECK_OK = { ok: true, problems: [], restored: false, spec_sha256: OTHER_SHA, snapshot_sha256: SHA, surviving_ids_checked: IDS }
 const CHECK_BAD = {
   ok: false, problems: ['duplicate heading: ## Problem (2 times)', 'criterion line ends mid-sentence: AC-QA-1'],
-  restored: true, spec_sha256_after_restore: SHA, snapshot_sha256: SHA,
+  restored: true, spec_sha256_after_restore: SHA, snapshot_sha256: SHA, surviving_ids_checked: IDS,
 }
 
 const CONSISTENCY_OK = {
@@ -237,4 +237,27 @@ test('plan-cycle T8 (F5): without a restorable snapshot the synthesis prompt for
   const p = calls.find((c) => c.opts.label === 'synthesis:write-back').prompt
   assert.match(p, /do NOT edit the spec/)
   assert.doesNotMatch(p, /spec-writeback\.mjs> verify/)
+})
+
+// ======================================================================
+// Review round 2 of PR #18 (wf_f89fed92-3b7). M1: the ids travel in a file the script names, and the check is tied
+// to the ids the agent returned.
+// ======================================================================
+test('plan-cycle T8 (M1): the verify command carries no agent-typed ids; the ids file sits beside the snapshot and is written with the file tool', async () => {
+  const { calls } = await go(agents())
+  const p = calls.find((c) => c.opts.label === 'synthesis:write-back').prompt
+  assert.doesNotMatch(p, /<surviving_ids as a JSON array>/)
+  assert.match(p, new RegExp(`verify ${SPEC} ${SNAP_FILE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} /tmp/harn-specwb-AbC123/surviving\.json`))
+  assert.match(p, /write the AC ids you kept[^.]*into the file \/tmp\/harn-specwb-AbC123\/surviving\.json with your file-writing tool/)
+  assert.match(p, /never via a shell command/)
+})
+
+test('plan-cycle T8 (M1): a check whose echoed ids differ from the returned surviving_ids is aborted with writeback null', async () => {
+  for (const checked of [['AC-SEC-1'], ['AC-SEC-1', 'AC-QA-1', 'AC-QA-2'], undefined, 'AC-SEC-1']) {
+    const { result } = await go(agents({ check: json({ ...CHECK_OK, surviving_ids_checked: checked }) }))
+    assert.equal(result.telemetry.outcome, 'aborted', JSON.stringify(checked))
+    assert.equal(result.writeback, null, JSON.stringify(checked))
+  }
+  const same = await go(agents({ check: json({ ...CHECK_OK, surviving_ids_checked: ['AC-QA-1', 'AC-SEC-1', 'AC-SEC-1'] }) }))
+  assert.equal(same.result.telemetry.outcome, 'done', 'order and duplicates do not matter; the set does')
 })

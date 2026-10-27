@@ -12,7 +12,7 @@
 //     copies the spec's bytes to a 0600 file made with mkdtemp under os.tmpdir() (never under a repo or .claude/) and
 //     prints ONE object { file, sha256, headings: [every "## " line, in order], ac_ids: [ids defined by "- **AC-...:**" lines] }.
 //     Exits non-zero only when the spec cannot be read.
-//   node spec-writeback.mjs verify <spec-path> <snapshot-file> <surviving-ids-json>
+//   node spec-writeback.mjs verify <spec-path> <snapshot-file> <surviving-ids-file>
 //     checks the spec as written now against the snapshot:
 //       (a) every top-level heading the snapshot had appears exactly once now, and "## Acceptance criteria" exactly once;
 //       (b) the set of AC ids defined now equals the surviving set given;
@@ -31,7 +31,9 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 
 const SNAP_PREFIX = 'harn-specwb-'
-const AC_LINE = /^- \*\*(AC-[A-Z]+-\d+):\*\*(.*)$/
+// T8 review round 2 H1: a lens prefix may carry a digit (AC-A11Y-<n>), the same blindness static-checks M5 recorded.
+const AC_LINE = /^- \*\*(AC-[A-Z][A-Z0-9]*-\d+):\*\*(.*)$/
+const AC_ID = /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/
 const ACCEPTANCE = '## Acceptance criteria'
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
@@ -115,14 +117,46 @@ function snapshot(specPath) {
   process.stdout.write(JSON.stringify({ file, sha256: sha256(bytes), headings: headingsOf(text), ac_ids: criteriaOf(text).map((c) => c.id) }) + '\n')
 }
 
-function verify(specPath, snapFile, idsJson) {
-  if (!specPath || !snapFile || idsJson === undefined) fail('usage: verify <spec-path> <snapshot-file> <surviving-ids-json>')
+// T8 review round 2 M2: the text outside the acceptance-criteria section (the section runs from its heading to the
+// next top-level heading or the end). A restore only ever rewrites that section's edit; if anything OUTSIDE it differs
+// from the snapshot, someone else (the operator, during a multi-minute run) changed the spec, and overwriting that
+// would be silent data loss, so verify reports and refuses to restore instead.
+// The section ends at the next top-level heading the SNAPSHOT had that has not already appeared earlier in the file:
+// a snapshot heading pasted into the section (the 2026-10-13 shape) has appeared above already, so it stays inside and
+// a restore still happens; a genuinely following heading such as "## Tasks" ends the section as it should.
+function outsideSection(text, snapshotText) {
+  const snapHeadings = new Set(headingsOf(snapshotText))
+  const out = []
+  const seen = new Map()
+  let inside = false
+  for (const l of linesOf(text)) {
+    const t = l.trimEnd()
+    if (t === ACCEPTANCE) { inside = true; seen.set(t, (seen.get(t) || 0) + 1); continue }
+    if (inside && t.startsWith('## ') && snapHeadings.has(t) && !(seen.get(t) > 0)) inside = false
+    if (t.startsWith('## ')) seen.set(t, (seen.get(t) || 0) + 1)
+    if (!inside) out.push(l)
+  }
+  return out.join('\n')
+}
+
+// T8 review round 2 M1: the surviving ids come from a FILE the synthesis agent writes with its file tool, never from a
+// shell argument it types (the shape T5 removed for the ledger payload), and the ids verified are echoed back as
+// surviving_ids_checked so the workflow can tie them to the ids the agent returned.
+function readIds(idsFile) {
+  let raw
+  try { raw = fs.readFileSync(idsFile, 'utf8') } catch (e) { fail(`cannot read the surviving-ids file: ${e.code || e.message}`) }
+  let ids
+  try { ids = JSON.parse(raw) } catch { fail('the surviving-ids file is not JSON') }
+  if (!Array.isArray(ids) || !ids.every((x) => typeof x === 'string' && AC_ID.test(x))) fail('the surviving-ids file must be a JSON array of AC ids')
+  return [...new Set(ids)].sort()
+}
+
+function verify(specPath, snapFile, idsFile) {
+  if (!specPath || !snapFile || !idsFile) fail('usage: verify <spec-path> <snapshot-file> <surviving-ids-file>')
   let snapBytes
   try { snapBytes = fs.readFileSync(snapFile) } catch (e) { fail(`cannot read the snapshot file: ${e.code || e.message}`) }
   if (!snapBytes.length) fail('the snapshot file is empty')
-  let surviving
-  try { surviving = JSON.parse(idsJson) } catch { fail('the surviving ids argument is not JSON') }
-  if (!Array.isArray(surviving) || !surviving.every((x) => typeof x === 'string')) fail('the surviving ids argument must be a JSON array of strings')
+  const surviving = readIds(idsFile)
 
   const problems = []
   let nowBytes = null
@@ -131,18 +165,27 @@ function verify(specPath, snapFile, idsJson) {
 
   const snapshot_sha256 = sha256(snapBytes)
   if (problems.length) {
+    const snapText = snapBytes.toString('utf8')
+    const changedOutside = nowBytes !== null && outsideSection(nowBytes.toString('utf8'), snapText) !== outsideSection(snapText, snapText)
+    if (changedOutside) {
+      problems.push('the spec changed outside the acceptance-criteria section since the snapshot (not restored, so that change is kept; check the spec by hand)')
+      process.stdout.write(JSON.stringify({ ok: false, problems, restored: false, spec_sha256: sha256(nowBytes), snapshot_sha256, surviving_ids_checked: surviving }) + '\n')
+      return
+    }
     restore(specPath, snapBytes)
-    process.stdout.write(JSON.stringify({ ok: false, problems, restored: true, spec_sha256_after_restore: sha256(fs.readFileSync(specPath)), snapshot_sha256 }) + '\n')
+    process.stdout.write(JSON.stringify({ ok: false, problems, restored: true, spec_sha256_after_restore: sha256(fs.readFileSync(specPath)), snapshot_sha256, surviving_ids_checked: surviving }) + '\n')
     return
   }
   const dir = path.dirname(snapFile)
   if (path.basename(dir).startsWith(SNAP_PREFIX)) {
+    // The ids file the agent wrote beside the snapshot (round 2 M1) goes with it.
+    try { if (path.dirname(path.resolve(idsFile)) === path.resolve(dir)) fs.unlinkSync(idsFile) } catch { /* same as below */ }
     try { fs.unlinkSync(snapFile); fs.rmdirSync(dir) } catch { /* left in place; stdout already carries the result */ }
   }
-  process.stdout.write(JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: sha256(nowBytes), snapshot_sha256 }) + '\n')
+  process.stdout.write(JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: sha256(nowBytes), snapshot_sha256, surviving_ids_checked: surviving }) + '\n')
 }
 
 const [mode, ...rest] = process.argv.slice(2)
 if (mode === 'snapshot' && rest[0]) snapshot(rest[0])
 else if (mode === 'verify') verify(...rest)
-else fail('usage: snapshot <spec-path> | verify <spec-path> <snapshot-file> <surviving-ids-json>')
+else fail('usage: snapshot <spec-path> | verify <spec-path> <snapshot-file> <surviving-ids-file>')

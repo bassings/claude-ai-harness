@@ -54,7 +54,14 @@ function fixture(original = spec()) {
   assert.ok(s.out, `snapshot must print one JSON object; stdout: ${s.res.stdout}`)
   return { dir, specPath, tmp, snap: s.out, original }
 }
-const verify = (f, ids = IDS, snapFile = f.snap.file) => run(['verify', f.specPath, snapFile, JSON.stringify(ids)], f.tmp)
+// Round 2 M1: the surviving ids are read from a file beside the snapshot, never from a shell argument.
+function idsFileFor(f, ids, snapFile = f.snap.file) {
+  const p = path.join(path.dirname(snapFile), 'surviving.json')
+  fs.mkdirSync(path.dirname(p), { recursive: true })
+  fs.writeFileSync(p, typeof ids === 'string' ? ids : JSON.stringify(ids))
+  return p
+}
+const verify = (f, ids = IDS, snapFile = f.snap.file) => run(['verify', f.specPath, snapFile, idsFileFor(f, ids, snapFile)], f.tmp)
 function assertRestored(f, v) {
   assert.equal(v.res.status, 0, v.res.stderr)
   assert.equal(v.out.ok, false)
@@ -96,9 +103,9 @@ test('spec-writeback verify: a clean write-back passes, echoes the snapshot sha2
   fs.writeFileSync(f.specPath, written)
   const v = verify(f, [...IDS, 'AC-QA-3'])
   assert.equal(v.res.status, 0, v.res.stderr)
-  assert.deepEqual(v.out, { ok: true, problems: [], restored: false, spec_sha256: sha(written), snapshot_sha256: f.snap.sha256 })
+  assert.deepEqual(v.out, { ok: true, problems: [], restored: false, spec_sha256: sha(written), snapshot_sha256: f.snap.sha256, surviving_ids_checked: [...IDS, 'AC-QA-3'].sort() })
   assert.equal(fs.readFileSync(f.specPath, 'utf8'), written, 'a passing write-back is left alone')
-  assert.ok(!fs.existsSync(f.snap.file) && !fs.existsSync(path.dirname(f.snap.file)))
+  assert.ok(!fs.existsSync(f.snap.file) && !fs.existsSync(path.dirname(f.snap.file)), 'the snapshot, the ids file beside it and their directory are reaped')
 })
 
 test('spec-writeback verify: a dropped criterion fails naming it, and the spec is restored', () => {
@@ -119,23 +126,45 @@ test('spec-writeback verify: a criterion not in the surviving set fails naming i
   assert.ok(v.out.problems.some((p) => /AC-QA-9/.test(p)), JSON.stringify(v.out.problems))
 })
 
-test('spec-writeback verify: a duplicated top-level heading fails naming it, and the spec is restored', () => {
+// Round 2 M2: a heading duplicated OUTSIDE the criteria section is reported but not restored (the library cannot tell
+// an agent's outside edit from an operator's, and clobbering an operator's edit is silent data loss); duplicated
+// inside the section (the 2026-10-13 shape, tested below) it is restored.
+test('spec-writeback verify: a top-level heading duplicated outside the criteria section fails naming it and is left for the operator, not restored', () => {
   const f = fixture()
-  fs.writeFileSync(f.specPath, spec() + '\n## Goals\n\nAgain.\n')
+  const written = spec() + '\n## Goals\n\nAgain.\n'
+  fs.writeFileSync(f.specPath, written)
+  const v = verify(f)
+  assert.equal(v.out.ok, false)
+  assert.equal(v.out.restored, false)
+  assert.ok(v.out.problems.some((p) => /## Goals/.test(p)), JSON.stringify(v.out.problems))
+  assert.ok(v.out.problems.some((p) => /changed outside the acceptance-criteria section/.test(p)), JSON.stringify(v.out.problems))
+  assert.equal(fs.readFileSync(f.specPath, 'utf8'), written)
+})
+
+test('spec-writeback verify: a top-level heading duplicated INSIDE the criteria section fails naming it, and the spec is restored', () => {
+  const f = fixture()
+  fs.writeFileSync(f.specPath, spec([...CRITERIA, '', '## Goals', '', 'Again.']))
   const v = verify(f)
   assertRestored(f, v)
   assert.ok(v.out.problems.some((p) => /## Goals/.test(p)), JSON.stringify(v.out.problems))
 })
 
-test('spec-writeback verify: a dropped top-level heading, and a missing "## Acceptance criteria", fail and restore', () => {
+// Round 2 M2: both of these damage the file OUTSIDE the criteria section, so they are reported and left, not restored.
+test('spec-writeback verify: a dropped top-level heading, and a missing "## Acceptance criteria", fail naming them and are left for the operator', () => {
   const f = fixture()
-  fs.writeFileSync(f.specPath, spec().replace('## Tasks\n', 'Tasks\n'))
-  assertRestored(f, verify(f))
+  const dropped = spec().replace('## Tasks\n', 'Tasks\n')
+  fs.writeFileSync(f.specPath, dropped)
+  const v1 = verify(f)
+  assert.equal(v1.out.ok, false); assert.equal(v1.out.restored, false)
+  assert.ok(v1.out.problems.some((p) => /missing heading: ## Tasks/.test(p)), JSON.stringify(v1.out.problems))
+  assert.equal(fs.readFileSync(f.specPath, 'utf8'), dropped)
   const g = fixture()
-  fs.writeFileSync(g.specPath, spec().replace('## Acceptance criteria', '### Acceptance criteria'))
+  const demoted = spec().replace('## Acceptance criteria', '### Acceptance criteria')
+  fs.writeFileSync(g.specPath, demoted)
   const v = verify(g)
-  assertRestored(g, v)
+  assert.equal(v.out.ok, false); assert.equal(v.out.restored, false)
   assert.ok(v.out.problems.some((p) => /Acceptance criteria/.test(p)), JSON.stringify(v.out.problems))
+  assert.equal(fs.readFileSync(g.specPath, 'utf8'), demoted)
 })
 
 test('spec-writeback verify: the 2026-10-13 pasted-preamble shape fails (duplicate headings and a duplicated criterion line) and restores', () => {
@@ -257,7 +286,7 @@ for (const name of fs.readdirSync(SPECS_DIR).filter((n) => n.endsWith('.md')).so
   test(`spec-writeback verify (F1 regression): the real spec ${name} passes against its own ids, or fails only for a missing criteria section`, () => {
     const original = fs.readFileSync(path.join(SPECS_DIR, name), 'utf8')
     const f = fixture(original)
-    const ids = [...original.matchAll(/^- \*\*(AC-[A-Z]+-\d+):\*\*/gm)].map((m) => m[1])
+    const ids = [...original.matchAll(/^- \*\*(AC-[A-Z][A-Z0-9]*-\d+):\*\*/gm)].map((m) => m[1])  // round 2 H1: digit prefixes too
     const v = verify(f, ids)
     assert.equal(v.res.status, 0, v.res.stderr)
     const hasSection = /^## Acceptance criteria$/m.test(original)
@@ -277,11 +306,14 @@ test('spec-writeback verify (F2): a snapshot with no criteria section passes onc
   const f1 = fixture(noSection); fs.writeFileSync(f1.specPath, added)
   const v1 = verify(f1)
   assert.deepEqual(v1.out.problems, [], JSON.stringify(v1.out))
+  // Round 2 M2: criteria written under a level-3 heading or no heading sit OUTSIDE any criteria section, so the file
+  // is reported and left for the operator, never restored over.
   for (const [label, bad] of [['a level-3 heading', added.replace('## Acceptance criteria', '### Acceptance criteria')], ['no heading', added.replace('## Acceptance criteria\n\n', '')]]) {
     const f = fixture(noSection); fs.writeFileSync(f.specPath, bad)
     const v = verify(f)
     assert.ok(v.out.problems.some((p) => p.includes('"## Acceptance criteria" must appear exactly once, found 0')), `${label}: ${JSON.stringify(v.out.problems)}`)
-    assertRestored(f, v)
+    assert.equal(v.out.ok, false, label); assert.equal(v.out.restored, false, label)
+    assert.equal(fs.readFileSync(f.specPath, 'utf8'), bad, `${label}: left as written`)
   }
 })
 
@@ -305,3 +337,73 @@ test('spec-writeback verify (F1): a hand-written criterion line identical to the
   assert.ok(changed.out.problems.some((p) => p.includes('AC-QA-7') && p.includes('mid-sentence')), JSON.stringify(changed.out.problems))
   assertRestored(f2, changed)
 })
+
+// ======================================================================
+// Review round 2 of PR #18 (wf_f89fed92-3b7).
+// ======================================================================
+test('spec-writeback (H1): a lens prefix with a digit, AC-A11Y-<n>, is read as a criterion id by snapshot and verify (ids written by hand, not derived)', () => {
+  const f = fixture()
+  const written = spec(['- **AC-A11Y-1:** Focus is visible.', '- **AC-SEC-1:** Returns 401.'])
+  fs.writeFileSync(f.specPath, written)
+  const v = verify(f, ['AC-A11Y-1', 'AC-SEC-1'])
+  assert.deepEqual(v.out && v.out.problems, [], JSON.stringify(v.out))
+  assert.equal(v.out.ok, true)
+  assert.deepEqual(v.out.surviving_ids_checked, ['AC-A11Y-1', 'AC-SEC-1'])
+  const s = run(['snapshot', f.specPath], f.tmp)
+  assert.deepEqual(s.out.ac_ids, ['AC-A11Y-1', 'AC-SEC-1'])
+})
+
+test('spec-writeback (M1): verify echoes the ids it checked, sorted and deduplicated, and a malformed ids file exits non-zero with nothing on stdout and no restore', () => {
+  const f = fixture()
+  const v = verify(f, ['AC-QA-2', 'AC-SEC-1', 'AC-QA-1', 'AC-QA-1'])
+  assert.deepEqual(v.out.surviving_ids_checked, ['AC-QA-1', 'AC-QA-2', 'AC-SEC-1'])
+  for (const bad of ['not json', '["AC-SEC-1", 42]', '["AC-SEC-1", "x; touch PWNED"]', '{"ids":[]}']) {
+    const f2 = fixture()
+    fs.writeFileSync(f2.specPath, spec([...CRITERIA, '- **AC-QA-9:** An extra one.']))
+    const r = verify(f2, bad)
+    assert.notEqual(r.res.status, 0, bad)
+    assert.equal(r.res.stdout, '', bad)
+    assert.equal(r.res.stderr.trim().split('\n').length, 1, bad)
+    assert.equal(fs.readFileSync(f2.specPath, 'utf8'), spec([...CRITERIA, '- **AC-QA-9:** An extra one.']), 'a refused ids file restores nothing')
+  }
+})
+
+test('spec-writeback (M2): a bad write-back is NOT restored when the spec changed outside the acceptance-criteria section since the snapshot, and that edit survives', () => {
+  const f = fixture()
+  const operatorEdit = spec([...CRITERIA, '- **AC-QA-9:** An extra one.'], PREAMBLE.replace('Something is wrong.', 'Something is wrong, the operator adds.'))
+  fs.writeFileSync(f.specPath, operatorEdit)
+  const v = verify(f)
+  assert.equal(v.res.status, 0, v.res.stderr)
+  assert.equal(v.out.ok, false)
+  assert.equal(v.out.restored, false)
+  assert.ok(v.out.problems.some((p) => p.includes('unexpected criterion: AC-QA-9')), JSON.stringify(v.out.problems))
+  assert.ok(v.out.problems.some((p) => p.includes('changed outside the acceptance-criteria section')), JSON.stringify(v.out.problems))
+  assert.equal(fs.readFileSync(f.specPath, 'utf8'), operatorEdit, 'the operator\'s edit outside the section is kept')
+  // The same bad write-back with nothing changed outside the section IS restored.
+  const g = fixture()
+  fs.writeFileSync(g.specPath, spec([...CRITERIA, '- **AC-QA-9:** An extra one.']))
+  assertRestored(g, verify(g))
+})
+
+// Round 2 L1: the first real-spec loop grandfathers every unchanged line, so it cannot see a regression in the
+// sentence-shape check. This loop snapshots each real spec with its criterion lines removed, so every criterion line
+// is new to the write-back and judged; hand-written harn-fix-3.md carries multi-line criteria and is the one allowed
+// exception, pinned by name.
+const MULTILINE_LEGACY = new Set(['harn-fix-3.md'])
+for (const name of fs.readdirSync(SPECS_DIR).filter((n) => n.endsWith('.md')).sort()) {
+  test(`spec-writeback verify (L1 regression): every criterion line of the real spec ${name}, judged as newly written, passes the sentence-shape check`, () => {
+    const original = fs.readFileSync(path.join(SPECS_DIR, name), 'utf8')
+    const ids = [...original.matchAll(/^- \*\*(AC-[A-Z][A-Z0-9]*-\d+):\*\*/gm)].map((m) => m[1])
+    if (!ids.length) return
+    const withoutCriteria = original.split('\n').filter((l) => !/^- \*\*AC-[A-Z][A-Z0-9]*-\d+:\*\*/.test(l)).join('\n')
+    const f = fixture(withoutCriteria)
+    fs.writeFileSync(f.specPath, original)
+    const v = verify(f, ids)
+    assert.equal(v.res.status, 0, v.res.stderr)
+    const midSentence = v.out.problems.filter((p) => p.includes('mid-sentence'))
+    const other = v.out.problems.filter((p) => !p.includes('mid-sentence'))
+    assert.deepEqual(other, [], `${name}: ${JSON.stringify(other)}`)
+    if (MULTILINE_LEGACY.has(name)) assert.ok(midSentence.length > 0, `${name} is listed as legacy multi-line but no line was flagged; drop it from the list`)
+    else assert.deepEqual(midSentence, [], `${name}: ${JSON.stringify(midSentence)}`)
+  })
+}

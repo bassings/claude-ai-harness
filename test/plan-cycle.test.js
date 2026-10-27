@@ -51,7 +51,7 @@ const LENS_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: '
 // unhappy paths; here they only keep the pre-T8 expectations (done, blocked, verbatim report) meaningful.
 const T8_SHA = 'a'.repeat(64)
 const T8_SNAPSHOT = JSON.stringify({ file: '/tmp/harn-specwb-base/spec.snapshot', sha256: T8_SHA, headings: ['## Problem'], ac_ids: [] })
-const T8_CHECK_OK = JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: 'b'.repeat(64), snapshot_sha256: T8_SHA })
+const T8_CHECK_OK = JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: 'b'.repeat(64), snapshot_sha256: T8_SHA, surviving_ids_checked: [] })
 function baseAgent(overrides = {}) {
   return {
     'scope:spec': { ...SCOPE_OK, spec_snapshot: T8_SNAPSHOT },

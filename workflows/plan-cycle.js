@@ -665,9 +665,10 @@ const synthesis = await agent(
   `unreadable rather than passing silently. Do not invent a variant such as \`**AC-X-1** -- text\`.\n` +
   (specBefore ? `After the edit, verify it by script (HARN-OPT-5 T8; the 2026-10-13 write-back pasted the preamble into the criteria and ` +
     `cut lines mid-sentence). ` + SPEC_WB_LOCATE + `Then run exactly ` +
-    `\`node <path-to-spec-writeback.mjs> verify ${specPath} ${specBefore.file} '<surviving_ids as a JSON array>'\`, where the last ` +
-    `argument is the AC ids you kept as a JSON array of strings (the same ids you return as surviving_ids; each must match ` +
-    `^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$ and nothing else goes into that argument), and return its stdout ` +
+    `first write the AC ids you kept, as a JSON array of strings (the same ids you return as surviving_ids; each matches ` +
+    `^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$), into the file ${survivingIdsFile(specBefore)} with your file-writing tool (the Write tool), ` +
+    `never via a shell command; then run exactly ` +
+    `\`node <path-to-spec-writeback.mjs> verify ${specPath} ${specBefore.file} ${survivingIdsFile(specBefore)}\` and return its stdout ` +
     `verbatim, unedited, as writeback_check. That command restores the spec itself if the write-back is bad: change nothing else, ` +
     `do not retry the edit, and do not repair the spec by hand.\n` : '') +
   `4. Return a markdown summary: a per-lens table (verdict, criteria count, could_not_check), the veto list, any lens ` +
@@ -701,7 +702,7 @@ const reportOk = synthesis && typeof synthesis.summary === 'string' && synthesis
 // T8 review round 1 F4: an id outside the AC pattern would have reached the verify command's shell argument; the run
 // is aborted (the check is treated as malformed) rather than trusting what the agent typed.
 const survivingIdsOk = synthesis && Array.isArray(synthesis.surviving_ids) && synthesis.surviving_ids.every((id) => typeof id === 'string' && /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/.test(id))
-const writeback = survivingIdsOk ? parseWritebackCheck(synthesis && synthesis.writeback_check, specBefore) : null
+const writeback = survivingIdsOk ? parseWritebackCheck(synthesis && synthesis.writeback_check, specBefore, synthesis.surviving_ids) : null
 const writebackOk = Boolean(writeback && writeback.ok)
 const outcome = !reportOk || !writebackOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
 const writebackNotice = writebackOk ? null : writeback
@@ -751,11 +752,17 @@ const parseSpecSnapshot = (x) => {
     SPEC_WB_TEMP_PREFIXES.some((pre) => f.startsWith(pre)) && /\/harn-specwb-[\w-]+\/[\w.-]+$/.test(f)
   return fileOk && typeof v.sha256 === 'string' && /^[0-9a-f]{64}$/.test(v.sha256) ? v : null
 }
-// The check must be about THIS snapshot (sha256 tie) and carry a boolean ok and an array of problems.
-const parseWritebackCheck = (x, before) => {
+// T8 review round 2 M1: the surviving ids travel in a file beside the snapshot, at a path this script composes from the
+// validated snapshot path (no agent-typed text reaches the verify command), and verify echoes the ids it checked.
+const survivingIdsFile = (before) => `${before.file.slice(0, before.file.lastIndexOf('/'))}/surviving.json`
+const sameIdSet = (a, b) => Array.isArray(a) && Array.isArray(b) && JSON.stringify([...new Set(a)].sort()) === JSON.stringify([...new Set(b)].sort())
+// The check must be about THIS snapshot (sha256 tie), carry a boolean ok and an array of problems, and have checked
+// exactly the ids the agent returned as surviving_ids (round 2 M1: otherwise a dropped criterion could pass if the
+// agent handed verify the ids it actually wrote rather than the ids it was given).
+const parseWritebackCheck = (x, before, survivingIds) => {
   const v = parseJsonObj(x)
   const ok = v && before && typeof v.ok === 'boolean' && Array.isArray(v.problems) && v.problems.every((p) => typeof p === 'string') &&
-    v.snapshot_sha256 === before.sha256 && (v.ok ? v.problems.length === 0 : true)
+    v.snapshot_sha256 === before.sha256 && (v.ok ? v.problems.length === 0 : true) && sameIdSet(v.surviving_ids_checked, survivingIds)
   return ok ? { ok: v.ok, problems: v.problems, restored: v.restored === true } : null
 }
 
