@@ -23,6 +23,7 @@ const { spawnSync } = require('node:child_process')
 // test/helpers/git-env.js's own header for why this is per-file, not
 // suite-wide, and why it must be called (not merely imported) here.
 require('./helpers/git-env.js').scrubGitEnv()
+const { hermeticRepoConfig } = require('./helpers/git-env.js')
 
 const SCRIPT = path.join(__dirname, '..', 'workflows', 'lib', 'install-consistency.mjs')
 const MODULE_URL = pathToFileURL(SCRIPT).href
@@ -608,6 +609,7 @@ function gitInitAndCommit(dir) {
     }
   }
   run(['init', '-q'])
+  hermeticRepoConfig(dir, run)  // no background housekeeping in a fixture (see git-env.js)
   run(['add', '-A'])
   // Throwaway fixture repos only, never the real project history -- the
   // explicit identity and gpgsign=false avoid depending on this machine's
@@ -1229,6 +1231,15 @@ test('install-consistency: CLI --check-staleness reports ok:false (never ok:true
   const out = JSON.parse(res.stdout.trim())
   assert.equal(out.ok, false)
   assert.equal(out.blind, true)
+})
+
+// Review finding 2 (Medium, 2026-10-27): the call site that ends the git 2.55 maintenance-lock flake is the one in
+// gitInitAndCommit, so it is pinned here through writeTree itself, not through a test-supplied runner elsewhere.
+test('install-consistency: every writeTree fixture repo has git background maintenance switched off (gc.auto 0, maintenance.auto false)', () => {
+  const dir = writeTree({ 'README.md': 'x\n' })
+  const get = (key) => spawnSync('git', ['-C', dir, 'config', '--get', key], { encoding: 'utf8' }).stdout.trim()
+  assert.equal(get('gc.auto'), '0')
+  assert.equal(get('maintenance.auto'), 'false')
 })
 
 test('install-consistency: CLI --check-staleness never touches either directory it is given, proven against a real subprocess run (AC-OPS-2)', () => {
