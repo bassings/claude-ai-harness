@@ -287,10 +287,10 @@ test('T4 simp: review-cycle.js keeps exactly four `await agent(` sites (AC-SIMP-
   assert.equal((SRC.match(/await agent\(/g) || []).length, 4)
 })
 
-test('T4 simp: meta.whenToUse is unchanged, so no new workflow argument (AC-SIMP-3)', () => {
+test('T4 simp: meta.whenToUse adds no new workflow argument; hash re-pinned for the HARN-OPT-6 T2 wording that prior ids are computed by this workflow (AC-SIMP-3)', () => {
   const m = /whenToUse:\s*'((?:[^'\\]|\\.)*)'/.exec(SRC)
   assert.ok(m, 'whenToUse literal not found')
-  assert.equal(crypto.createHash('sha256').update(m[1]).digest('hex'), '8dfdf7b4ed2aa9e4412a206f02aff78f244560b953e3d3539a9e9e162a06dfb0')
+  assert.equal(crypto.createHash('sha256').update(m[1]).digest('hex'), 'e159d4533e9019dd6cc6f13518976546d2937690d360085f45771507ea9b16ec')
 })
 
 test('T4 simp: no new import or dependency in review-cycle.js (AC-SIMP-1)', () => {
