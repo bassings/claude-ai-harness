@@ -477,19 +477,20 @@ test('review-cycle.js: a ledger write failure via the agent call itself throwing
 // Review round-2 M-3: see tdd-task.test.js for the identical guard and
 // its rationale -- see the L5 byte-identity guard for why this trio is
 // necessarily triplicated.
+// The run id is UUID-shaped: a start run_id that is not is counted and logged on its own (HARN-OPT-6 fix round 3, item J).
 test('review-cycle.js: when the ledger:write response carries invalid_ac_ids_dropped > 0, writeLedger logs one visible line naming the run and the count (M-3)', async () => {
   const { logs } = await runWorkflow(WF, {
     args: {},
     agent: baseAgent({
       'ledger:write': [
-        { run_id: 'run-with-sanitised-ids', ts: 't1', write_ok: true, write_error: null },
-        { run_id: 'run-with-sanitised-ids', ts: 't2', write_ok: true, write_error: null, invalid_ac_ids_dropped: 2 },
+        { run_id: '5a1e0c2e-5b0e-4f4a-9a52-7d3f2c1b8a90', ts: 't1', write_ok: true, write_error: null },
+        { run_id: '5a1e0c2e-5b0e-4f4a-9a52-7d3f2c1b8a90', ts: 't2', write_ok: true, write_error: null, invalid_ac_ids_dropped: 2 },
       ],
     }),
   })
   const sanitiseLog = logs.find((l) => l.includes('invalid_ac_ids_dropped') || l.toLowerCase().includes('sanitised'))
   assert.ok(sanitiseLog, `expected a log line about the sanitisation, got: ${JSON.stringify(logs)}`)
-  assert.ok(sanitiseLog.includes('run-with-sanitised-ids'), `must name the run, got: ${sanitiseLog}`)
+  assert.ok(sanitiseLog.includes('5a1e0c2e-5b0e-4f4a-9a52-7d3f2c1b8a90'), `must name the run, got: ${sanitiseLog}`)
   assert.ok(sanitiseLog.includes('2'), `must name the count, got: ${sanitiseLog}`)
 })
 

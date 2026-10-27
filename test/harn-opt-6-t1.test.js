@@ -24,7 +24,7 @@ function oracleId(lens, location, claim) {
   return createHash('sha256').update(String(lens || '')).update(' ').update(String(location || '').trim().toLowerCase()).update(' ').update(String(claim || '')).digest('hex').slice(0, 16)
 }
 
-const LEDGER_OK = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
+const LEDGER_OK = { run_id: '3c9d1e62-5a7b-4f08-8e21-9b4d6c0a7f13', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
 const TIP = { head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' }
 const COVERAGE = { examined: 'x', verified_by: 'y', could_not_check: 'z' }
 const CLEAN = { verdict: 'CLEAN', coverage: COVERAGE, findings: [], ...TIP }
@@ -127,18 +127,32 @@ test('AC-DATA-2/AC-DATA-5: the writer lands the script\'s ids verbatim and drops
 })
 
 // Transition-only (AC-QA-14): delete once no installed review-cycle.js predates HARN-OPT-6.
-test('AC-DATA-6b (transition-only): a legacy descriptor payload is never hashed and the writer says the workflow script predates HARN-OPT-6', async () => {
+// This is the ONE test that feeds the new writer raw descriptor keys (what a pre-HARN-OPT-6 review-cycle.js sends). It also
+// holds the legacy_payload marker (fix round 2 item E, merged here in fix round 3 item G), so no other test needs them.
+test('AC-DATA-6b (transition-only): a legacy descriptor payload is never hashed, the writer says the workflow script predates HARN-OPT-6, and the row carries legacy_payload true (findings-free included) where a new-path row never does', async () => {
   const { calls } = await runWorkflow(WF, { args: {}, agent: agentWithTwoFindings() })
-  const { [FINDINGS_KEY]: _ids, ...base } = terminalPayload(calls)
+  const newPath = terminalPayload(calls)
+  const { [FINDINGS_KEY]: _ids, ...base } = newPath
+  const land = (payload) => {
+    const repo = makeTempRepo()
+    const out = JSON.parse(runAppend(repo, payload).stdout.trim().split('\n').pop())
+    const lines = readLedgerLines(repo)
+    assert.equal(lines.length, 1, 'the row must still land')
+    return { out, lines, row: JSON.parse(lines[0]) }
+  }
+
   const legacy = { ...base, open_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: null }] }
-  const repo = makeTempRepo()
-  const res = runAppend(repo, legacy)
-  const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  const lines = readLedgerLines(repo)
-  assert.equal(lines.length, 1, 'the row must still land')
-  const row = JSON.parse(lines[0])
+  const { out, lines, row } = land(legacy)
   assert.equal(row.kind, 'review_cycle')
   assert.equal(row.outcome, 'done')
   assert.ok(!(row.findings || []).some((f) => f.id === oracleId('lens-security', 'foo.js:10', 'missing auth check')), 'a legacy descriptor must not be hashed')
   assert.match(`${out.write_error} ${JSON.stringify(out)} ${lines[0]}`, /predates HARN-OPT-6/)
+  assert.equal(row.legacy_payload, true, 'a legacy payload with a finding must carry the marker')
+
+  const freeOfFindings = land({ ...base, spec_bugs: null, rejected_findings: [], open_findings: [] })
+  assert.equal(freeOfFindings.row.legacy_payload, true, 'a findings-free legacy payload must carry the marker')
+
+  assert.notEqual(land(newPath).row.legacy_payload, true, 'a new-path row must not carry the marker')
+  const clean = await runWorkflow(WF, { args: {}, agent: agentWithTwoFindings({ 'lens-security': CLEAN }) })
+  assert.notEqual(land(terminalPayload(clean.calls)).row.legacy_payload, true, 'a genuinely clean new-path round must not carry the marker')
 })

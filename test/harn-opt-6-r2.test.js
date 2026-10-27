@@ -46,7 +46,7 @@ const newWriter = (repo) => (prompt) => lastJson(runAppend(repo, extractLedgerPa
 const oldWriterAgent = (repo) => (prompt) => runOldWriter(repo, extractLedgerPayload(prompt))
 
 // ---- fixtures (same shapes as test/harn-opt-6-gap.test.js) ----
-const LEDGER_OK = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
+const LEDGER_OK = { run_id: '3c9d1e62-5a7b-4f08-8e21-9b4d6c0a7f13', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
 const TIP = { head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' }
 const COVERAGE = { examined: 'x', verified_by: 'y', could_not_check: 'z' }
 const CLEAN = { verdict: 'CLEAN', coverage: COVERAGE, findings: [], ...TIP }
@@ -163,16 +163,69 @@ const overCap = (() => {
   }
 })()
 
-test('A: with every disposition above MAX_FINDINGS the script caps only open, rejected and spec_bug; priors and valid fixed confirmations are not cut', async () => {
-  const { MAX_FINDINGS } = await import(WRITER_URL)
+// Fix round 3, item A (owner decision 2026-10-28, review round 3 finding 2): the script cuts nothing. Truncation happens
+// only in the writer, after its same-round exclusion, so a still-open finding past the 60th can never be recorded fixed.
+test('A (round 3): with every disposition above MAX_FINDINGS the script cuts none of them and sends no findings_truncated; the writer alone truncates', async () => {
   const { terminal } = await review(overCap.args, overCap.over)
   const by = (d) => terminal.finding_entries.filter((e) => e.disposition === d)
-  for (const d of ['open', 'rejected', 'spec_bug']) assert.equal(by(d).length, MAX_FINDINGS, `${d} must be capped at MAX_FINDINGS in the script`)
+  for (const d of ['open', 'rejected', 'spec_bug']) assert.equal(by(d).length, OVER, `${d}: the script must send all ${OVER}, not a capped count`)
   assert.equal(by('prior').length, OVER, 'verified prior ids must not be capped')
   const priorIds = new Set(by('prior').map((e) => e.id))
   const validFixed = new Set(by('fixed').map((e) => e.id).filter((id) => priorIds.has(id)))
   assert.equal(validFixed.size, OVER, 'every valid confirmation (all 75 distinct prior ids) must reach the writer')
+  assert.ok(!('findings_truncated' in terminal), 'the script must not hand the writer a findings_truncated count: the writer computes it')
 })
+
+test('A (round 3): review-cycle.js holds no script-side per-disposition cap (PAYLOAD_MAX_FINDINGS, cappedFindingCount) and slices no pair list', () => {
+  const src = fs.readFileSync(WF, 'utf8')
+  assert.ok(!/PAYLOAD_MAX_FINDINGS/.test(src), 'PAYLOAD_MAX_FINDINGS is still in review-cycle.js')
+  assert.ok(!/cappedFindingCount/.test(src), 'cappedFindingCount is still in review-cycle.js')
+  assert.ok(!/Pairs\.slice\(|pairs\.slice\(/.test(src), 'a finding pair list is still sliced in review-cycle.js')
+})
+
+// A claim fixed against the 61st finding of a disposition: the writer excludes it (the same round gives that id another
+// disposition) BEFORE it truncates, so no fixed entry, one invalid_fixed_ids_dropped, and the same findings_truncated as
+// the 06049e4 writer records for the same round.
+function overlapCase(disposition) {
+  const n = 61
+  const mk = (tag, i) => ({ lens: 'lens-qa', location: `${tag}${i}.js:${i + 1}`, claim: `${tag} claim ${i}`, severity: 'Medium', ac_id: null })
+  let over = {}
+  let open = []
+  let rejected = []
+  let specBugs = []
+  if (disposition === 'open') {
+    const findings = Array.from({ length: n }, (_, i) => lensFinding(`open claim ${i}`, `o${i}.js:${i + 1}`))
+    open = findings.map((f) => ({ lens: 'lens-security', location: f.location, claim: f.claim, severity: 'High', ac_id: null, recurrence: null }))
+    over = withFindings(findings)
+  } else {
+    const list = Array.from({ length: n }, (_, i) => mk(disposition, i))
+    if (disposition === 'rejected') rejected = list
+    else specBugs = list
+    over = { synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: specBugs, rejected_findings: rejected, fixed_findings: [] } }
+  }
+  const target = { open, rejected, spec_bug: specBugs }[disposition][n - 1]
+  const prior = withId({ lens: target.lens, location: target.location, claim: target.claim, severity: target.severity, ac_id: null })
+  const fixed = [confirm(prior)]
+  const synthesis = { report: '### VERDICT\nFINDINGS', spec_bugs: specBugs, rejected_findings: rejected, fixed_findings: fixed }
+  return {
+    prior,
+    args: { spec: 'specs/example.md', round: 2, prior_findings: [prior] },
+    over: { ...over, synthesis },
+    descriptors: { spec_bugs: specBugs, rejected_findings: rejected, open_findings: open, prior_findings: [prior], fixed_findings: fixed },
+  }
+}
+for (const disposition of ['open', 'rejected', 'spec_bug']) {
+  test(`A (round 3): a fixed claim overlapping the 61st ${disposition} finding records no fixed entry, counts one invalid_fixed_ids_dropped and the same findings_truncated as the 06049e4 writer`, async () => {
+    const c = overlapCase(disposition)
+    const g = await goldenAgainstOld(c)
+    assert.ok(!g.newRow.findings.some((f) => f.disposition === 'fixed'), 'the still-open finding was recorded fixed')
+    assert.equal(g.newRow.invalid_fixed_ids_dropped, 1)
+    assert.equal(g.oldRow.invalid_fixed_ids_dropped, 1, 'reference: the 06049e4 writer drops the claim')
+    assert.ok(g.newRow.findings_truncated > 0, 'a 61-entry disposition must be truncated by the writer')
+    assert.equal(g.newRow.findings_truncated, g.oldRow.findings_truncated)
+    sameRow(g)
+  })
+}
 
 test('A: golden row against the 06049e4 writer with every disposition above MAX_FINDINGS, duplicate and unmatched fixed claims included', async () => {
   const g = await goldenAgainstOld(overCap)
@@ -181,15 +234,18 @@ test('A: golden row against the 06049e4 writer with every disposition above MAX_
   assert.equal(g.newRow.invalid_fixed_ids_dropped, 5)
 })
 
-test('A: the spec\'s Problem-section payload paragraph matches the amended criteria (priors never capped; only the written dispositions are)', () => {
+test('A (round 3): the spec\'s Problem-section payload paragraph scopes the ceiling to rounds with at most MAX_FINDINGS entries per disposition and says larger rounds are unbounded by owner decision', () => {
   const spec = fs.readFileSync(SPEC, 'utf8')
   const start = spec.indexOf('\n## Problem')
   const problem = spec.slice(start, spec.indexOf('\n## ', start + 1))
   const para = /\bPayload size\b[\s\S]*/.exec(problem)
   assert.ok(para, 'no "Payload size" paragraph in Problem')
-  assert.doesNotMatch(para[0], /five dispositions/i, 'the paragraph still describes all five dispositions as capped')
-  assert.match(para[0], /(prior ids?|verified prior)[^.]*\b(never|not)\b[^.]*\bcapped\b|\bnever capped\b[^.]*prior/i, 'the paragraph must say verified prior ids are never capped')
-  assert.match(para[0], /open[^.]*rejected[^.]*spec_bug|written dispositions/i, 'the paragraph must name the capped (written) dispositions')
+  const text = para[0].replace(/\s+/g, ' ')
+  assert.doesNotMatch(text, /five dispositions/i, 'the paragraph still describes all five dispositions as capped')
+  assert.doesNotMatch(text, /script caps/i, 'the paragraph still says the script caps the written dispositions')
+  assert.match(text, /at most MAX_FINDINGS entries (in|per) (each|every)/i, 'the paragraph must scope the ceiling to rounds with at most MAX_FINDINGS entries per disposition')
+  assert.match(text, /unbounded/i, 'the paragraph must say plainly that larger rounds are unbounded')
+  assert.match(text, /owner/i, 'the paragraph must attribute the unbounded case to the owner decision')
 })
 
 // =====================================================================================================================
@@ -262,7 +318,7 @@ test('B: the largest-payload fixture is a payload of conforming values at every 
   assert.match(LONGEST_LENS, new RegExp(LENS_PATTERN_STR))
 })
 
-test('B: the largest conforming payload stays under the ceiling recorded in the spec, the ceiling is derived from it (not more than 30% above), and the paragraph records the measured sizes', async () => {
+test('B: for a round with at most MAX_FINDINGS entries per disposition, the largest conforming payload stays under the ceiling recorded in the spec, the ceiling is derived from it (not more than 30% above), and the paragraph records the measured sizes', async () => {
   const big = await largestPayload()
   const typical = await typicalPayload()
   const para = payloadParagraph()
@@ -376,26 +432,7 @@ test('D: changing the writer\'s patterns or enums alone is caught', async () => 
 // =====================================================================================================================
 // Item E: a legacy descriptor payload leaves a marker on the row.
 // =====================================================================================================================
-test('E: the writer sets legacy_payload true on a row built from a legacy descriptor payload, including a findings-free one, and never on a new-path row', async () => {
-  const { terminal } = await review({}, withFindings([lensFinding('c', 'a.js:1')]))
-  const { finding_entries, ...base } = terminal
-  const freeOfFindings = { ...base, spec_bugs: null, rejected_findings: [], open_findings: [] }
-  const withDescriptors = { ...base, open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'c', severity: 'High', ac_id: null }] }
-  for (const [name, payload] of [['findings-free legacy', freeOfFindings], ['legacy with a finding', withDescriptors]]) {
-    const repo = makeTempRepo()
-    const out = lastJson(runAppend(repo, payload).stdout)
-    assert.equal(out.write_ok, true, out.write_error)
-    assert.equal(terminalRows(repo).pop().legacy_payload, true, `${name}: the row must carry legacy_payload: true`)
-  }
-  const repo = makeTempRepo()
-  assert.equal(lastJson(runAppend(repo, terminal).stdout).write_ok, true)
-  assert.notEqual(terminalRows(repo).pop().legacy_payload, true, 'a new-path row must not carry the marker')
-  const clean = await review({}, {})
-  const cleanRepo = makeTempRepo()
-  assert.equal(lastJson(runAppend(cleanRepo, clean.terminal).stdout).write_ok, true)
-  assert.notEqual(terminalRows(cleanRepo).pop().legacy_payload, true, 'a genuinely clean new-path round must not carry the marker')
-})
-
+// The legacy_payload behaviour test lives in the single transition-only test in test/harn-opt-6-t1.test.js (fix round 3, item G).
 test('E: legacy_payload is an optional boolean in the writer schema', async () => {
   const { LEDGER_ENTRY_SCHEMA } = await import(WRITER_URL)
   const prop = LEDGER_ENTRY_SCHEMA.properties.legacy_payload
@@ -516,4 +553,101 @@ test('K: ledger-append.mjs names no findingId function and its schema comments d
   assert.ok(from > 0 && to > from, 'could not locate LEDGER_ENTRY_SCHEMA')
   const schemaBlock = src.slice(from, to).split('\n').map((line, i) => [i + 1, line]).filter(([, line]) => /\/\//.test(line) && /\bhash|recomput/i.test(line))
   assert.deepEqual(schemaBlock, [], 'a schema comment still describes hashing or recomputation in the writer')
+})
+
+// =====================================================================================================================
+// Fix round 3 (review round 3, wf_a4f9657b-eb9). Items A (above), B (test/harn-opt-6-gap.test.js), C (gap), E
+// (test/review-cycle-finding-ids.test.js), G (test/harn-opt-6-t1.test.js and test/static-checks.test.js) and H
+// (test/harn-opt-6-r2-env.test.js) live elsewhere. As above, no assertion leans on a lens the default scope does not run
+// unless the run passes `lenses` or a spec.
+// =====================================================================================================================
+
+// ---- Item D: lenses_run, lenses_skipped and verdicts keys pass the same closed-set lens check as finding lenses ----
+test('D (round 3): a lens name outside the roster never reaches lenses_run, lenses_skipped or the verdicts keys; it is dropped and counted; roster lenses are kept', async () => {
+  const hostile = '/home/canary-user/secret $(id) `x`'
+  const plainRun = await review({}, {})
+  const { payloads, terminal, logs } = await review({ lenses: [hostile, 'lens-madeup', 'reviewer-verification'] }, { [hostile]: CLEAN, 'lens-madeup': CLEAN })
+  const text = JSON.stringify(payloads)
+  assert.ok(!text.includes('canary-user') && !text.includes('madeup'), 'a non-roster lens name reached a payload')
+  assert.deepEqual(terminal.lenses_run, ['lens-security', 'lens-qa', 'reviewer-verification'], 'roster lenses stay, in order; non-members are dropped')
+  assert.deepEqual(Object.keys(terminal.verdicts), ['lens-security', 'lens-qa', 'reviewer-verification'])
+  assert.ok(terminal.lenses_skipped.every((l) => ALL_LENSES.includes(l)), `lenses_skipped carries a non-roster name: ${JSON.stringify(terminal.lenses_skipped)}`)
+  const dropped = (t) => t.invalid_finding_fields_dropped + t.invalid_record_values_dropped
+  assert.ok(dropped(terminal) - dropped(plainRun.terminal) >= 2, `the two non-members must be counted (counters ${dropped(terminal)} against ${dropped(plainRun.terminal)} for a plain run)`)
+  assert.ok(logs.some((l) => /_dropped=/.test(l)), 'the drop must be named on the AC-OPS-6 line')
+})
+
+test('D (round 3): through the real writer a row built from a run with a non-roster lens carries no trace of it', async () => {
+  const hostile = '/home/canary-user/secret'
+  const repo = makeTempRepo()
+  await review({ lenses: [hostile] }, { [hostile]: CLEAN, 'ledger:write': newWriter(repo) })
+  const row = terminalRows(repo).pop()
+  assert.ok(row, 'the terminal row must land')
+  assert.ok(!JSON.stringify(row).includes('canary-user'))
+  assert.deepEqual(row.lenses_run, ['lens-security', 'lens-qa'])
+})
+
+// ---- Item F: the review-cycle log names a legacy_payload result when the writer reports one; the pinned response schema cannot carry it ----
+test('F (round 3): review-cycle.js records in a code comment that the pinned writeLedger response schema cannot carry legacy_payload, so the script cannot log it', () => {
+  const lines = fs.readFileSync(WF, 'utf8').split('\n')
+  const hits = lines.map((l, i) => [i, l]).filter(([, l]) => /^\s*\/\/.*legacy_payload/.test(l))
+  assert.ok(hits.length > 0, 'no code comment in review-cycle.js names legacy_payload')
+  const blocks = hits.map(([i]) => {
+    let a = i
+    let b = i
+    while (a > 0 && /^\s*\/\//.test(lines[a - 1])) a -= 1
+    while (b < lines.length - 1 && /^\s*\/\//.test(lines[b + 1])) b += 1
+    return lines.slice(a, b + 1).join(' ')
+  })
+  assert.ok(blocks.some((b) => /writeLedger/.test(b) && /pinned|byte-identical/i.test(b) && /cannot|can't|does not carry/i.test(b)), `no comment says the pinned writeLedger response cannot carry it: ${JSON.stringify(blocks)}`)
+})
+
+// ---- Item I: AC-DATA-3's two-round join, two priors one character apart ----
+test('I (round 3): two priors one character apart, only the first confirmed in round two, record exactly the first id fixed, and the reader joins it under one lens', async () => {
+  const repo = makeTempRepo()
+  const claimA = 'unbounded read of the request body A'
+  const claimB = 'unbounded read of the request body B'
+  const r1 = await review({ spec: 'specs/example.md', round: 1 }, { ...withFindings([lensFinding(claimA, 'u.js:1'), lensFinding(claimB, 'u.js:1')]), 'ledger:write': newWriter(repo) })
+  const prior = r1.result.open_findings
+  assert.equal(prior.length, 2)
+  assert.notEqual(prior[0].id, prior[1].id, 'one character apart must give two ids')
+  const firstId = oracleId('lens-security', 'u.js:1', claimA)
+  assert.equal(prior[0].id, firstId)
+  await review({ spec: 'specs/example.md', round: 2, prior_findings: prior }, {
+    ...withFindings([lensFinding(claimB, 'u.js:1')]),
+    synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(prior[0])] },
+    'ledger:write': newWriter(repo),
+  })
+  const rows = terminalRows(repo)
+  assert.equal(rows.length, 2)
+  assert.deepEqual(rows[1].findings.filter((f) => f.disposition === 'fixed').map((f) => f.id), [firstId])
+  assert.equal(rows[1].invalid_fixed_ids_dropped, 0)
+  const mod = await import(pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'optimise-read.mjs')).href)
+  const rework = mod.aggregateRework(rows.map((r) => ({ ...r, repo: 'demo' })))
+  assert.equal(rework.lensDispositionCounts['lens-security']?.fixed, 1, 'exactly one fixed, for the first id only')
+})
+
+// ---- Item J: a start run_id that fails PAYLOAD_RUN_ID_RE is counted and logged ----
+const START_UUID = '0f8fad5b-d9cb-469f-a165-70867728950e'
+test('J (round 3): a start run_id that is not UUID-shaped is counted once under invalid_record_values_dropped and logged as one that will not pair with its start row; a UUID-shaped one is neither', async () => {
+  for (const odd of ['r1', 'not-a-uuid', START_UUID.toUpperCase().slice(0, -1), `${START_UUID}-x`]) {
+    const { terminal, logs } = await review({}, { 'ledger:write': [{ ...LEDGER_OK, run_id: odd }, LEDGER_OK] })
+    assert.ok(!('run_id' in terminal), `${odd} must not be reused`)
+    assert.equal(terminal.invalid_record_values_dropped, 1, `${odd} must be counted once`)
+    const dropLines = logs.filter((l) => /_dropped=/.test(l))
+    assert.equal(dropLines.length, 1, `exactly one drop line expected, got ${JSON.stringify(dropLines)}`)
+    assert.match(dropLines[0], /invalid_record_values_dropped=1/)
+    assert.ok(logs.some((l) => /run_id/.test(l) && /will not pair/i.test(l)), `no log says the terminal row will not pair with its start row for ${odd}: ${JSON.stringify(logs)}`)
+  }
+  const good = await review({}, { 'ledger:write': [{ ...LEDGER_OK, run_id: START_UUID }, LEDGER_OK] })
+  assert.equal(good.terminal.run_id, START_UUID)
+  assert.equal(good.terminal.invalid_record_values_dropped, 0)
+  assert.ok(!good.logs.some((l) => /will not pair/i.test(l)))
+})
+
+test('J (round 3): a failed start write (no run_id at all) is not counted as a malformed one', async () => {
+  const failedStart = { run_id: null, ts: null, write_ok: false, write_error: 'safety classifier stopped the write' }
+  const { terminal, logs } = await review({}, { 'ledger:write': [failedStart, LEDGER_OK] })
+  assert.equal(terminal.invalid_record_values_dropped, 0)
+  assert.ok(!logs.some((l) => /will not pair/i.test(l)))
 })

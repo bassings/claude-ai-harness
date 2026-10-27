@@ -13,6 +13,11 @@ const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
 const { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
+// The writer refuses every write when HARNESS_LEDGER_READONLY is set (as a review lens sets it), and this file spawns the
+// writer with its own copies of process.env. Dropped here so the file passes with the variable exported; the tests of the
+// read-only behaviour itself pass it explicitly in their spawn environment, which this does not touch.
+delete process.env.HARNESS_LEDGER_READONLY
+
 // HARN-OPT-6: the writer takes finding ids, not descriptors, so the tests below
 // send the id-bearing finding_entries shape directly, as literals. The id of an
 // entry is any 16 lowercase hex digits; the writer hashes nothing.

@@ -35,7 +35,7 @@ test.before(async () => {
 
 // ---- fake-runtime fixtures (same shapes as test/review-cycle.test.js) ----
 
-const LEDGER_OK = { run_id: 'r1', ts: '2026-10-11T00:00:00.000Z', write_ok: true, write_error: null }
+const LEDGER_OK = { run_id: '3c9d1e62-5a7b-4f08-8e21-9b4d6c0a7f13', ts: '2026-10-11T00:00:00.000Z', write_ok: true, write_error: null }
 const SHA = 'abcdef1234567890'
 const TREE = '1111111111111111111111111111111111111111'
 const SCOPE_OK = {

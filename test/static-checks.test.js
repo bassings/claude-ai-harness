@@ -2361,7 +2361,9 @@ test('static: conduct-plan/SKILL.md review step shows a literal /review-cycle ca
 // test/helpers/finding-entries.js keeps (AC-QA-2).
 test('no test builds writer payloads through a descriptor converter, and the only test using legacy descriptor keys is the one transition-only test (AC-QA-14)', () => {
   const testDir = path.join(ROOT, 'test')
-  const files = [...fs.readdirSync(testDir).filter((f) => f.endsWith('.js')).map((f) => path.join(testDir, f)), ...fs.readdirSync(path.join(testDir, 'helpers')).filter((f) => f.endsWith('.js')).map((f) => path.join(testDir, 'helpers', f))]
+  // Every .js file under test/, at any depth (fix round 3, item G): the guard used to read the top level and helpers/ only.
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : e.name.endsWith('.js') ? [path.join(dir, e.name)] : []))
+  const files = walk(testDir)
   const self = path.join(testDir, 'static-checks.test.js')
   const converters = files.filter((f) => f !== self && /\btoFindingEntries\b|\bLEGACY_DESCRIPTOR_KEYS\b/.test(fs.readFileSync(f, 'utf8')))
   assert.deepEqual(converters.map((f) => path.relative(ROOT, f)), [], 'these test files still use a descriptor-to-finding_entries converter')
@@ -2379,4 +2381,17 @@ test('no test builds writer payloads through a descriptor converter, and the onl
   assert.deepEqual(offenders, [], 'writer-side tests must send finding_entries, not descriptors')
   const transitional = files.filter((f) => f !== self).flatMap((f) => [...fs.readFileSync(f, 'utf8').matchAll(/^test\((['"`])(?:(?!\1).)*transition-only(?:(?!\1).)*\1/gm)].map(() => path.basename(f)))
   assert.deepEqual(transitional, ['harn-opt-6-t1.test.js'], 'exactly one test names itself transition-only')
+  // Fix round 3, item G: the check above reads three named writer-side files, so a legacy descriptor payload built anywhere
+  // else (HARN-OPT-6 fix round 2 put one in test/harn-opt-6-r2.test.js) went unseen. This reads EVERY test file: a payload
+  // object that spreads a captured payload and adds a legacy descriptor key may appear only in the one transition-only test.
+  // (A synthesis response legitimately names spec_bugs and rejected_findings, so the key alone is not the signal.)
+  const SPREAD_LEGACY = /\.\.\.(?:terminal|base|payload|telemetry|good|newPath|rest)\b[^\n]*\b(?:spec_bugs|rejected_findings|open_findings|prior_findings|fixed_findings)\s*:/
+  const stray = []
+  for (const file of files.filter((f) => f !== self)) {
+    for (const chunk of fs.readFileSync(file, 'utf8').split(/\n(?=test\()/)) {
+      if (/^test\((['"`])(?:(?!\1).)*transition-only/.test(chunk)) continue
+      for (const line of chunk.split('\n')) if (!/^\s*\/\//.test(line) && SPREAD_LEGACY.test(line)) stray.push(`${path.relative(ROOT, file)}: ${line.trim().slice(0, 110)}`)
+    }
+  }
+  assert.deepEqual(stray, [], 'a legacy descriptor payload is built outside the single transition-only test')
 })

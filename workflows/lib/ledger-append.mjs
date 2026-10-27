@@ -2089,8 +2089,9 @@ export function main() {
   const findingsFields = 'finding_entries' in payload
     ? {
         findings: budgetFindings([specBugs, rejected, fixed.entries, open], MAX_FINDINGS),
-        // review-cycle.js caps each disposition before sending, and passes the
-        // number it cut as findings_truncated so the recorded count is unchanged.
+        // review-cycle.js no longer cuts anything before sending (fix round 3), so
+        // allFindings.length alone governs the count; a findings_truncated an older
+        // review-cycle.js sent is still added so its count is not lost.
         findings_truncated: Math.max(0, allFindings.length - MAX_FINDINGS) + (Number.isSafeInteger(payload.findings_truncated) && payload.findings_truncated > 0 ? payload.findings_truncated : 0),
       }
     : {}

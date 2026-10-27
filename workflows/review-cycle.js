@@ -1730,15 +1730,6 @@ const PAYLOAD_SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 const PAYLOAD_VERDICTS = ['PASS', 'FAIL', 'UNVERIFIABLE']
 const PAYLOAD_LENS_VERDICTS = ['CLEAN', 'FINDINGS', 'BLOCKED']
 const PAYLOAD_RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
-// The same bound ledger-append.mjs applies to the findings array (its
-// MAX_FINDINGS); a test pins the two together. Only the written dispositions
-// (open, rejected, spec_bug) are capped here, so the payload size ceiling
-// recorded in specs/harn-opt-6.md is a bound for them rather than a hope, and
-// the written row is unchanged because the writer's own cap is never more
-// generous. Verified prior ids and fixed confirmations are never cut: the
-// writer reconciles them on ids alone, and a cut would drop a valid
-// confirmation (AC-QA-9 and AC-ARCH-9 as amended 2026-10-28).
-const PAYLOAD_MAX_FINDINGS = 60
 const payloadDrops = { ac_ids: 0, finding_fields: 0, record_values: 0 }
 // AC-SEC-2: round_key and lens_checkout_drift values are commit hashes. The
 // drift values come from lens self-reports, so a non-conforming one is dropped
@@ -1793,23 +1784,27 @@ const roundField = opts.round === undefined ? {} : Number.isInteger(opts.round) 
 // One descriptor in, one {id, lens, severity, ac_id, disposition} entry out.
 // A descriptor that is not an object, or lacks a string lens, location or claim,
 // is dropped and counted rather than hashed from empty strings (AC-QA-10).
-function findingEntry(descriptor, disposition, count = true) {
+function findingEntry(descriptor, disposition, count = true, countFields = count) {
   if (!descriptor || typeof descriptor !== 'object' || typeof descriptor.lens !== 'string' || typeof descriptor.location !== 'string' || typeof descriptor.claim !== 'string') {
     if (count) payloadDrops.record_values += 1
     return null
   }
   return {
     id: findingId(descriptor.lens, descriptor.location, descriptor.claim),
-    lens: payloadLens(descriptor.lens, count),
-    severity: payloadSeverity(descriptor.severity, count),
-    ac_id: payloadAcId(descriptor.ac_id, count),
+    lens: payloadLens(descriptor.lens, countFields),
+    severity: payloadSeverity(descriptor.severity, countFields),
+    ac_id: payloadAcId(descriptor.ac_id, countFields),
     disposition,
   }
 }
 // {descriptor, entry} pairs for the descriptors that survive findingEntry.
-function findingPairs(descriptors, disposition) {
+// countFields false is for the fixed confirmations: the writer takes a fixed row's
+// lens, severity and ac_id from the PRIOR finding the claim matches, never from
+// the claim, so a claim's own labels are not counted (reconcileFixed counts the
+// matched prior's instead, the way the 06049e4 writer's row did).
+function findingPairs(descriptors, disposition, countFields = true) {
   if (!Array.isArray(descriptors)) return []
-  return descriptors.map(descriptor => ({ descriptor, entry: findingEntry(descriptor, disposition) })).filter(pair => pair.entry)
+  return descriptors.map(descriptor => ({ descriptor, entry: findingEntry(descriptor, disposition, true, countFields) })).filter(pair => pair.entry)
 }
 // The prior-id guard (AC-ARCH-8): a supplied id must equal the id recomputed
 // from that entry's own lens, location and claim. Only verified ids travel, as
@@ -1817,22 +1812,59 @@ function findingPairs(descriptors, disposition) {
 // rest is the one place invalid_prior_ids_dropped is computed.
 function verifiedPriorEntries(prior) {
   const entries = []
+  const labelDrops = new Map()
   let invalid = 0
   for (const p of prior) {
     const safe = p && typeof p === 'object' ? p : {}
     if (typeof safe.id === 'string' && safe.id === findingId(safe.lens, safe.location, safe.claim)) {
-      entries.push({ id: safe.id, lens: payloadLens(safe.lens, false), severity: payloadSeverity(safe.severity, false), ac_id: payloadAcId(safe.ac_id, false), disposition: 'prior' })
+      const entry = { id: safe.id, lens: payloadLens(safe.lens, false), severity: payloadSeverity(safe.severity, false), ac_id: payloadAcId(safe.ac_id, false), disposition: 'prior' }
+      // What the writer's fixed row would have counted if this prior is confirmed:
+      // a lens or severity that did not conform, and an ac_id that was supplied
+      // but did not conform (an absent one is not a drop).
+      const absentAcId = safe.ac_id === null || safe.ac_id === undefined || safe.ac_id === ''
+      entries.push(entry)
+      if (!labelDrops.has(entry.id)) labelDrops.set(entry.id, { fieldDrops: (entry.lens === null ? 1 : 0) + (entry.severity === null ? 1 : 0), acIdDrops: entry.ac_id === null && !absentAcId ? 1 : 0 })
     } else {
       invalid += 1
     }
   }
-  return { entries, invalid }
+  return { entries, invalid, labelDrops }
+}
+// The writer's computeFixedFindings, on ids alone, so the two counts it records on
+// the row can be named on the AC-OPS-6 line and the confirmed priors' labels
+// counted as the 06049e4 writer counted them. Same rule: a claim is invalid when
+// its id is not a verified prior id or the same round gives that id another
+// disposition; a repeat of a valid one is a duplicate. Null counts when
+// fixed_findings was not supplied. The writer remains the only place a row is
+// reconciled; these numbers are for the log and the label counters.
+function reconcileFixed(labelDrops, fixedEntries, supplied, otherDispositionIds) {
+  if (!supplied) return { invalid: null, duplicate: null, fieldDrops: 0, acIdDrops: 0 }
+  const seen = new Set()
+  const out = { invalid: 0, duplicate: 0, fieldDrops: 0, acIdDrops: 0 }
+  for (const claim of fixedEntries) {
+    const prior = labelDrops.get(claim.id)
+    if (!prior || otherDispositionIds.has(claim.id)) { out.invalid += 1; continue }
+    if (seen.has(claim.id)) { out.duplicate += 1; continue }
+    seen.add(claim.id)
+    out.fieldDrops += prior.fieldDrops
+    out.acIdDrops += prior.acIdDrops
+  }
+  return out
+}
+// A lens name in lenses_run, lenses_skipped or a verdicts key passes the same
+// closed-set check as a finding's lens (payloadLens): a non-member is dropped and
+// counted, never emitted, because the names come from the caller's `lenses`
+// override and the lens reports.
+function payloadLensNames(names) {
+  return (Array.isArray(names) ? names : []).map(name => payloadLens(name)).filter(name => name !== null)
 }
 function payloadLensVerdicts(verdicts) {
-  return Object.fromEntries(Object.entries(verdicts || {}).map(([lens, verdict]) => {
-    if (PAYLOAD_LENS_VERDICTS.includes(verdict)) return [lens, verdict]
+  return Object.fromEntries(Object.entries(verdicts || {}).flatMap(([lens, verdict]) => {
+    const name = payloadLens(lens)
+    if (name === null) return []
+    if (PAYLOAD_LENS_VERDICTS.includes(verdict)) return [[name, verdict]]
     if (verdict !== null && verdict !== undefined) payloadDrops.record_values += 1
-    return [lens, null]
+    return [[name, null]]
   }))
 }
 function payloadAcVerdicts(verdicts) {
@@ -1865,6 +1897,13 @@ function budgetSpentDelta() {
 }
 const startWrite = await writeLedger({ kind: 'review_cycle', outcome: 'started', spec: specPath, ...roundField })
 const startRunId = startWrite.write_ok ? startWrite.run_id : null
+// A start run_id that is not UUID-shaped is never reused on the terminal row (the
+// writer would refuse it), so the two rows cannot pair. Counted once and logged,
+// not silent; a failed start write has no run_id and is not this case.
+if (startRunId !== null && startRunId !== undefined && !PAYLOAD_RUN_ID_RE.test(startRunId)) {
+  payloadDrops.record_values += 1
+  log('The start row run_id is not UUID-shaped, so the terminal row will not pair with its start row (counted in invalid_record_values_dropped).')
+}
 
 // PR 2 (AC-QA-8, AC-ARCH-9): an exception escaping run() must still
 // produce exactly one terminal ledger write, carrying the existing
@@ -1897,8 +1936,8 @@ const telemetry = {
   spec: specPath,
   ...roundField,
   round_key: payloadRoundKeyValue,
-  lenses_run: result.lenses || lensesRunRaw,
-  lenses_skipped: result.skipped || [],
+  lenses_run: payloadLensNames(result.lenses || lensesRunRaw),
+  lenses_skipped: payloadLensNames(result.skipped || []),
   trigger_counts: triggerCounts,
   lens_checkout_drift: payloadDriftValue,
   // Omitted entirely, not written as null, when lens-architecture did not run
@@ -1935,45 +1974,57 @@ const telemetry = {
 // original descriptors; labels are resolved or nulled here, and every
 // neutralisation is counted in the existing counters. ledger-append.mjs
 // reconciles the fixed confirmations against the verified prior ids and
-// truncates the row at MAX_FINDINGS; neither is repeated here. This script caps
-// only the written dispositions (open, rejected, spec_bug) and never cuts
-// verified prior ids or fixed confirmations (AC-ARCH-8, AC-ARCH-9 as amended).
+// truncates the row at MAX_FINDINGS; neither is repeated here. This script cuts
+// nothing: truncation happens only in the writer, after its same-round exclusion,
+// so a still-open finding past the 60th can never be recorded fixed (AC-ARCH-8,
+// AC-ARCH-9, note of 2026-10-28). A round larger than MAX_FINDINGS per
+// disposition is therefore unbounded in payload size, by owner decision.
 // A list the synthesis returned as something other than an array is a counted
 // drop (AC-QA-10); null or absent is not malformed.
 payloadDrops.record_values += malformedListCount
 const specBugPairs = findingPairs(specBugsRaw, 'spec_bug')
 const rejectedPairs = findingPairs(rejectedFindingsRaw, 'rejected')
 const openPairs = findingPairs(openFindingsRaw, 'open')
-const fixedPairs = findingPairs(fixedFindingsRaw, 'fixed')
+const fixedPairs = findingPairs(fixedFindingsRaw, 'fixed', false)
 const priorVerified = priorFindings ? verifiedPriorEntries(priorFindings) : null
+const fixedReconciled = reconcileFixed(
+  priorVerified ? priorVerified.labelDrops : new Map(),
+  fixedPairs.map(pair => pair.entry),
+  fixedPairs.length > 0 || Boolean(fixedFindingsRaw),
+  new Set([...specBugPairs, ...rejectedPairs, ...openPairs].map(pair => pair.entry.id)),
+)
+payloadDrops.finding_fields += fixedReconciled.fieldDrops
+payloadDrops.ac_ids += fixedReconciled.acIdDrops
 const payloadAcVerdictList = payloadAcVerdicts(acVerdicts)
 {
   // AC-OPS-6: one line naming each non-zero count and its reason, only when
   // something was dropped, the way invalid_ac_ids_dropped is logged.
-  // invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped are not in this
-  // line: the writer computes them while reconciling fixed_findings against the
-  // verified prior ids, and the pinned writeLedger response carries only
-  // run_id, ts, write_ok, write_error and invalid_ac_ids_dropped, so this script
-  // never sees them. They are on the ledger row itself.
+  // invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped are computed here
+  // with the writer's rule (reconcileFixed) because the pinned writeLedger
+  // response carries only run_id, ts, write_ok, write_error and
+  // invalid_ac_ids_dropped, so the writer's own values never come back. They are
+  // named on this line only; the row's values are the writer's.
+  // The writer's legacy_payload marker (a payload from a workflow that predates
+  // HARN-OPT-6) cannot be logged here either: the pinned writeLedger response
+  // schema is byte-identical across the three workflow files and cannot carry
+  // legacy_payload, so a reader finds it on the row.
   const drops = [
     [priorVerified ? priorVerified.invalid : 0, 'invalid_prior_ids_dropped', 'a prior_findings entry whose id did not match the id recomputed from its own lens, location and claim'],
+    [fixedReconciled.invalid, 'invalid_fixed_ids_dropped', 'a fixed confirmation matched no verified prior id, or its finding is still open, rejected or a spec bug this round'],
+    [fixedReconciled.duplicate, 'duplicate_fixed_ids_dropped', 'a valid fixed confirmation was repeated'],
     [payloadDrops.ac_ids, 'invalid_ac_ids_dropped', 'a non-conforming ac_id was nulled'],
     [payloadDrops.finding_fields, 'invalid_finding_fields_dropped', 'a non-conforming lens or severity was nulled'],
     [payloadDrops.record_values, 'invalid_record_values_dropped', 'a malformed descriptor was dropped or a non-conforming verdict was nulled'],
   ].filter(([n]) => n > 0)
   if (drops.length) log(`Run ${startRunId || 'unknown'}: ${drops.map(([n, name, why]) => `${name}=${n} (${why})`).join('; ')}`)
 }
-const cappedFindingCount = [specBugPairs, rejectedPairs, openPairs].reduce((n, pairs) => n + Math.max(0, pairs.length - PAYLOAD_MAX_FINDINGS), 0)
 const terminalEntry = {
   kind: 'review_cycle',
   finding_entries: [
-    ...[specBugPairs, rejectedPairs, openPairs].flatMap(pairs => pairs.slice(0, PAYLOAD_MAX_FINDINGS).map(pair => pair.entry)),
+    ...[specBugPairs, rejectedPairs, openPairs].flatMap(pairs => pairs.map(pair => pair.entry)),
     ...fixedPairs.map(pair => pair.entry),
     ...(priorVerified ? priorVerified.entries : []),
   ],
-  // Entries cut by the cap above, handed to the writer so findings_truncated
-  // still counts every finding the run produced, as it did before the cap.
-  ...(cappedFindingCount > 0 ? { findings_truncated: cappedFindingCount } : {}),
   ...telemetry,
   ac_verdicts: payloadAcVerdictList,
   invalid_ac_ids_dropped: payloadDrops.ac_ids,

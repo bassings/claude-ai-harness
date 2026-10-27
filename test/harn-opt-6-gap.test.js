@@ -18,7 +18,13 @@ const { makeTempRepo, runAppend, readLedgerLines, cleanupTempRepos, SUITE_TMPDIR
 const ROOT = path.join(__dirname, '..')
 const WF = path.join(ROOT, 'workflows', 'review-cycle.js')
 const SPEC = path.join(ROOT, 'specs', 'harn-opt-6.md')
-const LIVE_LEDGER = path.join(ROOT, '.claude', 'harness-ledger.jsonl')
+// The live ledger is where the writer puts it: the parent of `git rev-parse --path-format=absolute --git-common-dir`, so a
+// linked worktree resolves to the MAIN checkout's ledger rather than to an .claude/ of its own that never holds one.
+function liveLedgerPath(cwd) {
+  const commonDir = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd, encoding: 'utf8', env: sanitizedGitEnv() }).trim()
+  return path.join(path.dirname(commonDir), '.claude', 'harness-ledger.jsonl')
+}
+const LIVE_LEDGER = liveLedgerPath(ROOT)
 const OLD = '06049e4'
 
 test.after(cleanupTempRepos)
@@ -48,7 +54,7 @@ const newWriter = (repo) => (prompt) => JSON.parse(runAppend(repo, extractLedger
 const oldWriterAgent = (repo) => (prompt) => runOldWriter(repo, extractLedgerPayload(prompt))
 
 // ---- fixtures (same shapes as test/review-cycle-finding-ids.test.js) ----
-const LEDGER_OK = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
+const LEDGER_OK = { run_id: '3c9d1e62-5a7b-4f08-8e21-9b4d6c0a7f13', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
 const TIP = { head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' }
 const COVERAGE = { examined: 'x', verified_by: 'y', could_not_check: 'z' }
 const CLEAN = { verdict: 'CLEAN', coverage: COVERAGE, findings: [], ...TIP }
@@ -152,15 +158,61 @@ test('AC-OPS-6: every non-zero drop count is named with its reason on one line, 
   for (const name of ['invalid_prior_ids_dropped', 'invalid_ac_ids_dropped', 'invalid_finding_fields_dropped', 'invalid_record_values_dropped']) assert.match(lines[0], new RegExp(`${name}=[1-9]`))
 })
 
-test('AC-OPS-6: the script says, beside the drop line, why the writer\'s fixed-reconciliation counts (invalid_fixed_ids_dropped, duplicate_fixed_ids_dropped) are not in it', () => {
-  const src = fs.readFileSync(WF, 'utf8')
-  const start = src.indexOf('AC-OPS-6: one line naming each non-zero count')
-  const end = src.indexOf('const terminalEntry = {')
-  assert.ok(start >= 0 && end > start, 'could not locate the drop-line block')
-  const block = src.slice(start, end)
-  assert.match(block, /invalid_fixed_ids_dropped/, 'the block must name the writer-side fixed counts')
-  assert.match(block, /duplicate_fixed_ids_dropped/)
-  assert.match(block, /writeLedger/, 'the comment must say the pinned writeLedger response cannot carry them')
+// Fix round 3, item B: the script computes the writer's two fixed-reconciliation counts itself, with the same rule as the
+// writer's computeFixedFindings, and names them on the one drop line. They are not payload fields (the writer owns the row).
+test('AC-OPS-6: the drop line names invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped, with the values the real writer records on the row', async () => {
+  const keep = withId({ lens: 'lens-qa', location: 'k.js:1', claim: 'confirmed once and repeated' })
+  const stillOpen = withId({ lens: 'lens-security', location: 'o.js:2', claim: 'confirmed but open again' })
+  const repo = makeTempRepo()
+  const { logs, terminal } = await review({ spec: 'specs/example.md', round: 2, prior_findings: [keep, stillOpen] }, {
+    ...withFindings([lensFinding(stillOpen.claim, stillOpen.location)]),
+    synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(keep), confirm(keep), confirm(stillOpen), { lens: 'lens-qa', location: 'never.js:1', claim: 'never open' }] },
+    'ledger:write': newWriter(repo),
+  })
+  const row = readLedgerLines(repo).map((l) => JSON.parse(l)).filter((r) => r.outcome !== 'started').pop()
+  assert.equal(row.invalid_fixed_ids_dropped, 2, 'reference: the unmatched claim and the claim that is also open')
+  assert.equal(row.duplicate_fixed_ids_dropped, 1, 'reference: the repeated confirmation')
+  const lines = logs.filter((l) => /_dropped=/.test(l))
+  assert.equal(lines.length, 1, `expected exactly one drop line, got ${JSON.stringify(lines)}`)
+  assert.match(lines[0], /\binvalid_fixed_ids_dropped=2\b/)
+  assert.match(lines[0], /\bduplicate_fixed_ids_dropped=1\b/)
+  assert.ok(!('invalid_fixed_ids_dropped' in terminal) && !('duplicate_fixed_ids_dropped' in terminal), 'the counts name the log line only; the writer owns them on the row')
+})
+
+test('AC-OPS-6: the fixed counts are applied the writer\'s way: a same-round open claim past the 60th is invalid, and nothing is named when fixed_findings was not supplied or every claim is valid', async () => {
+  const many = Array.from({ length: 65 }, (_, i) => lensFinding(`claim ${i}`, `f${i}.js:${i + 1}`))
+  const last = withId({ lens: 'lens-security', location: many[64].location, claim: many[64].claim })
+  const over = await review({ spec: 'specs/example.md', round: 2, prior_findings: [last] }, {
+    ...withFindings(many),
+    synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(last)] },
+  })
+  assert.match(over.logs.filter((l) => /_dropped=/.test(l)).join('\n'), /\binvalid_fixed_ids_dropped=1\b/, 'the 65th open finding is still open this round, so its confirmation is invalid')
+  const clean = await review({ spec: 'specs/example.md', round: 2, prior_findings: [last] }, { synthesis: { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(last)] } })
+  assert.ok(!clean.logs.some((l) => /fixed_ids_dropped/.test(l)), `a valid confirmation names no count: ${JSON.stringify(clean.logs)}`)
+  const none = await review({ spec: 'specs/example.md', round: 2, prior_findings: [last] }, {})
+  assert.ok(!none.logs.some((l) => /fixed_ids_dropped/.test(l)), 'fixed_findings was not supplied, so no fixed count exists to name')
+})
+
+// Fix round 3, item C: the live ledger resolves the way the writer resolves it, from a linked worktree too.
+test('C: liveLedgerPath from a linked worktree is the file the writer lands its row in, in the main checkout', () => {
+  const main = makeTempRepo()
+  const wt = path.join(SUITE_TMPDIR, `wt-${path.basename(main)}`)
+  execFileSync('git', ['worktree', 'add', '-q', wt, '-b', 'wt-branch'], { cwd: main, env: sanitizedGitEnv() })
+  const out = JSON.parse(runAppend(wt, { schema_version: 1, kind: 'tdd_task', outcome: 'done' }).stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const resolved = liveLedgerPath(wt)
+  assert.equal(fs.realpathSync(resolved), fs.realpathSync(path.join(main, '.claude', 'harness-ledger.jsonl')))
+  assert.equal(readLedgerLines(main).length, 1, 'the row landed in the main checkout')
+  assert.ok(!fs.existsSync(path.join(wt, '.claude', 'harness-ledger.jsonl')), 'the worktree has no ledger of its own')
+  assert.notEqual(path.join(wt, '.claude', 'harness-ledger.jsonl'), resolved, 'a join on the worktree root is the wrong answer')
+})
+
+test('C: no test file joins the checkout root to .claude/harness-ledger.jsonl directly (it is wrong from a linked worktree)', () => {
+  const testDir = __dirname
+  const files = fs.readdirSync(testDir).filter((f) => f.endsWith('.js')).map((f) => path.join(testDir, f))
+  const direct = new RegExp(['path\\.join\\(\\s*(?:ROOT|REPO_ROOT|__dirname)\\b[^)]*', "['\"]harness-ledger\\.jsonl['\"]"].join(''))
+  const offenders = files.filter((f) => direct.test(fs.readFileSync(f, 'utf8'))).map((f) => path.basename(f))
+  assert.deepEqual(offenders, [], 'resolve the live ledger through git --git-common-dir, as the writer does')
 })
 
 // ---- AC-DATA-8 and AC-OPS-12 need the reader as it stood at 06049e4 ----
@@ -200,7 +252,7 @@ test('AC-DATA-8: an open row from the 06049e4 writer and fixed rows from the new
   assert.match(plain(counts), /"fixed":1|\["fixed",1\]/, `expected exactly one fixed (the repeat is a duplicate): ${plain(counts)}`)
 })
 
-test('AC-DATA-8: optimise-read over a copy of the live ledger gives the same rework aggregates as the 06049e4 reader, and the live ledger is not read-modified', { skip: !LIVE_COPY && 'no live ledger in this checkout (it is untracked)' }, async () => {
+test('AC-DATA-8: optimise-read over a copy of the live ledger gives the same rework aggregates as the 06049e4 reader, and the live ledger is not read-modified', { skip: !LIVE_COPY && `UNVERIFIED: no live ledger at ${LIVE_LEDGER} (it is untracked), so the live-copy comparison against the 06049e4 reader did not run` }, async () => {
   const copyDir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'live-copy-'))
   const copy = path.join(copyDir, 'harness-ledger.jsonl')
   fs.writeFileSync(copy, LIVE_COPY)

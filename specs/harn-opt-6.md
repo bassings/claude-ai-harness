@@ -49,18 +49,19 @@ payloads cannot be recovered: they were stopped before the writer ran and were
 never written anywhere. So
 the limit is measured on the new path instead, from base64 payloads handed to
 the ledger write prompt: a typical review_cycle terminal payload (three
-findings, ASCII text) is 1,344 bytes, and the largest payload of conforming
+findings, ASCII text) is 1,408 bytes, and the largest payload of conforming
 values (every roster lens, the longest lens name, AC id and verdict map the
 allowlists accept, 60 entries in each of open, rejected, spec_bug and fixed
 confirmations, 60 verified prior ids, 96 ac_verdicts, a 40-character round key
-and drift values) is 97,000 bytes. The ceiling is 120,000 bytes, about a
+and drift values) is 97,064 bytes. The ceiling is 120,000 bytes, about a
 quarter above the largest measured payload; the test in
 test/harn-opt-6-r2.test.js fails if a payload built to those limits reaches it.
-The script caps only the written dispositions (open, rejected, spec_bug) at
-MAX_FINDINGS each; verified prior ids are never capped, and fixed confirmations
-are never cut before the writer reconciles them, so a round carrying more than
-MAX_FINDINGS prior ids or confirmations may exceed the ceiling, which the owner
-accepted on 2026-10-28.
+The ceiling holds for a round with at most MAX_FINDINGS entries in each of
+open, rejected and spec_bug. The script cuts nothing: truncation happens only
+in the writer, after its same-round exclusion, so a round with more entries
+than that, or more than MAX_FINDINGS prior ids or confirmations, is unbounded
+in payload size and may exceed the ceiling. The owner decided on 2026-10-28
+to accept that.
 
 ## Not in scope
 

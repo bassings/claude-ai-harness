@@ -126,7 +126,7 @@ for (const [name, code] of [
 }
 
 // ---- fixtures for runs of the whole workflow ----
-const LEDGER_OK = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
+const LEDGER_OK = { run_id: '3c9d1e62-5a7b-4f08-8e21-9b4d6c0a7f13', ts: '2026-08-10T00:00:00.000Z', write_ok: true, write_error: null }
 const TIP = { head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' }
 const COVERAGE = { examined: 'x', verified_by: 'y', could_not_check: 'z' }
 const CLEAN = { verdict: 'CLEAN', coverage: COVERAGE, findings: [], ...TIP }
@@ -404,10 +404,9 @@ test('M1: no other default on a finding entry replaces a real value: a conformin
   assert.deepEqual(row.findings.map((f) => [f.severity, f.ac_id, f.lens]), ['Critical', 'High', 'Medium', 'Low'].map((s, i) => [s, `AC-SEC-${i + 1}`, 'lens-security']))
 })
 
-// The prior finding is confirmed fixed, so its severity decides the fixed row. invalid_finding_fields_dropped is left out of
-// that one comparison: the 06049e4 writer counted a prior's bad severity when the prior became a fixed row, and the script
-// cannot know which priors the writer will confirm (reconciliation stays in the writer, AC-ARCH-9), so that count is a
-// recorded divergence rather than something this fixture can hold equal. The fixed row's severity itself IS compared.
+// The prior finding is confirmed fixed, so its severity decides the fixed row. The 06049e4 writer counted a prior's bad
+// severity, ac_id and lens when the prior became a fixed row, so the script (which sees the same fixed claims and the same
+// verified priors) counts them for the CONFIRMED priors only (fix round 3, item E); nothing is left out of the comparison.
 GOLDEN['non-enum severity on a rejected, an open and a prior finding'] = (() => {
   const priorOdd = { lens: 'lens-qa', location: 'odd.js:9', claim: 'prior with an odd severity', severity: 'Catastrophic', ac_id: null }
   const synthesis = {
@@ -423,7 +422,6 @@ GOLDEN['non-enum severity on a rejected, an open and a prior finding'] = (() => 
       open_findings: [{ lens: 'lens-security', location: 'c.js:3', claim: 'odd open', severity: 'Urgent', ac_id: null, recurrence: null }],
       prior_findings: [withId(priorOdd)], fixed_findings: synthesis.fixed_findings,
     }),
-    ignore: ['invalid_finding_fields_dropped'],
   }
 })()
 GOLDEN['non-enum severity on a rejected and an open finding, nothing ignored'] = (() => {
@@ -445,6 +443,43 @@ GOLDEN['spec bugs, rejected and open findings each above MAX_FINDINGS'] = (() =>
     descriptors: () => ({ spec_bugs: synthesis.spec_bugs, rejected_findings: synthesis.rejected_findings, open_findings: open.map((f) => ({ lens: 'lens-security', location: f.location, claim: f.claim, severity: 'High', ac_id: null, recurrence: null })) }),
   }
 })()
+
+// Fix round 3, item E: a prior with a non-enum severity, a free-text ac_id and an unknown lens. Confirmed fixed, the fixed row
+// takes the prior's (nulled) values and the writer's counters count them; left unconfirmed, the prior is only reconciled
+// against, and the counters match the 06049e4 writer's for that case too. Nothing is ignored in either comparison.
+const priorEverythingOdd = { lens: 'orchestrator', location: 'odd.js:9', claim: 'prior with every closed-set field odd', severity: 'Catastrophic', ac_id: 'free text AC' }
+GOLDEN['confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens'] = (() => {
+  const synthesis = { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(priorEverythingOdd)] }
+  return {
+    args: { spec: 'specs/example.md', prior_findings: [withId(priorEverythingOdd)] },
+    over: { synthesis },
+    descriptors: () => ({ spec_bugs: [], rejected_findings: [], open_findings: [], prior_findings: [withId(priorEverythingOdd)], fixed_findings: synthesis.fixed_findings }),
+  }
+})()
+GOLDEN['unconfirmed prior with a non-enum severity, a free-text ac_id and an unknown lens'] = (() => {
+  const other = { lens: 'lens-qa', location: 'ok.js:1', claim: 'a prior that is confirmed', severity: 'High', ac_id: 'AC-QA-1' }
+  const synthesis = { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(other)] }
+  return {
+    args: { spec: 'specs/example.md', prior_findings: [withId(priorEverythingOdd), withId(other)] },
+    over: { synthesis },
+    descriptors: () => ({ spec_bugs: [], rejected_findings: [], open_findings: [], prior_findings: [withId(priorEverythingOdd), withId(other)], fixed_findings: synthesis.fixed_findings }),
+  }
+})()
+
+test('E (round 3): a confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens records a fixed row with null severity, ac_id and lens, and the same three counters as the 06049e4 writer', { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+  const fixture = GOLDEN['confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens']
+  const { terminal } = await review(fixture.args, fixture.over)
+  const oldRepo = makeTempRepo()
+  const newRepo = makeTempRepo()
+  assert.equal(runOldWriter(oldRepo, legacyPayload(terminal, fixture.descriptors())).write_ok, true)
+  assert.equal(JSON.parse(runAppend(newRepo, terminal).stdout.trim().split('\n').pop()).write_ok, true)
+  const before = normalise(readLedgerLines(oldRepo)[0])
+  const after = normalise(readLedgerLines(newRepo)[0])
+  const fixedRow = (row) => row.findings.filter((f) => f.disposition === 'fixed').map((f) => [f.lens, f.severity, f.ac_id])
+  assert.deepEqual(fixedRow(after), fixedRow(before), 'the fixed row\'s lens, severity and ac_id')
+  for (const k of ['invalid_finding_fields_dropped', 'invalid_ac_ids_dropped', 'invalid_record_values_dropped']) assert.equal(after[k], before[k], `${k} differs from the 06049e4 writer's`)
+  assert.ok(after.invalid_finding_fields_dropped + after.invalid_ac_ids_dropped > 0, 'the fixture must provoke at least one counter, or the comparison is vacuous')
+})
 
 // ---- M2 (AC-SEC-1): prior_findings and the fixed echo carry text too, and none of it may reach the payload ----
 // Every free-text slot of every prior carries a sentinel, the ids are the correct ones for those hostile values, the
