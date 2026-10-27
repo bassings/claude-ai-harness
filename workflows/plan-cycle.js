@@ -657,15 +657,16 @@ const synthesis = await agent(
   (specBefore ? '' : `NO RESTORABLE SNAPSHOT of the spec exists (HARN-OPT-5 T8), so do NOT edit the spec file in step 3: skip the edit, ` +
     `return surviving_ids as the ids you would have kept, and say in the summary that nothing was written.\n`) +
   `3. Edit the spec file at ${specPath}: add or replace a section titled "## Acceptance criteria" containing the surviving ` +
-  `AC-<LENS>-<n> lines grouped by lens, each on one line, exactly as the review cycle will verify them. Preserve the rest ` +
+  `AC-<LENS>-<n> lines grouped by lens, each on one line and ending in a full stop (a trailing note in parentheses or ` +
+  `brackets may follow it), exactly as the review cycle will verify them. Preserve the rest ` +
   `of the file byte-for-byte. Also add a "### Vetoed at planning" subsection listing the drops and reasons, if any.\n` +
   `FORMAT, NOT A SUGGESTION: write each criterion as \`- **AC-<LENS>-<n>:** <criterion>\` -- list marker, bolded id, ` +
   `COLON INSIDE the bold, one space, then the text. test/static-checks.test.js scans specs for exactly this shape (and ` +
   `two older spellings) to enforce id uniqueness, and a spec written in a fourth spelling fails the pre-push gate as ` +
   `unreadable rather than passing silently. Do not invent a variant such as \`**AC-X-1** -- text\`.\n` +
   (specBefore ? `After the edit, verify it by script (HARN-OPT-5 T8; the 2026-10-13 write-back pasted the preamble into the criteria and ` +
-    `cut lines mid-sentence). ` + SPEC_WB_LOCATE + `Then run exactly ` +
-    `first write the AC ids you kept, as a JSON array of strings (the same ids you return as surviving_ids; each matches ` +
+    `cut lines mid-sentence). ` + SPEC_WB_LOCATE +
+    `First write the AC ids you kept, as a JSON array of strings (the same ids you return as surviving_ids; each matches ` +
     `^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$), into the file ${survivingIdsFile(specBefore)} with your file-writing tool (the Write tool), ` +
     `never via a shell command; then run exactly ` +
     `\`node <path-to-spec-writeback.mjs> verify ${specPath} ${specBefore.file} ${survivingIdsFile(specBefore)}\` and return its stdout ` +
@@ -705,10 +706,14 @@ const survivingIdsOk = synthesis && Array.isArray(synthesis.surviving_ids) && sy
 const writeback = survivingIdsOk ? parseWritebackCheck(synthesis && synthesis.writeback_check, specBefore, synthesis.surviving_ids) : null
 const writebackOk = Boolean(writeback && writeback.ok)
 const outcome = !reportOk || !writebackOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
+// T8 review round 3 F6: a run with no restorable snapshot (missing, malformed, or a path outside the temp allowlist)
+// never edited the spec, which is a different situation from a check that came back malformed; each gets its own notice.
 const writebackNotice = writebackOk ? null : writeback
   ? `> WRITE-BACK REJECTED (HARN-OPT-5 T8): the spec edit failed its script check and ${writeback.restored ? 'was restored to its pre-write-back bytes' : 'was NOT confirmed restored; check the spec'}. Problems:\n` +
     writeback.problems.map(p => `> - ${p}`).join('\n')
-  : `> WRITE-BACK UNCHECKED (HARN-OPT-5 T8): the script check of the spec edit is missing or malformed, so the write-back is not recorded as done. Check the spec by hand.`
+  : !specBefore
+    ? `> WRITE-BACK SKIPPED (HARN-OPT-5 T8): no restorable snapshot of the spec was taken (the snapshot object was missing, malformed, or named a path outside the temp allowlist: /tmp, /private/tmp, /var/folders, /private/var/folders), so the synthesis was told not to edit the spec and no criteria were written. Check TMPDIR on this machine.`
+    : `> WRITE-BACK UNCHECKED (HARN-OPT-5 T8): the script check of the spec edit is missing or malformed, so the write-back is not recorded as done. Check the spec by hand.`
 const reportBody = reportOk ? (installOverrideNotice ? `> ${installOverrideNotice}\n\n${synthesis.summary}` : synthesis.summary) : ''
 
 return {

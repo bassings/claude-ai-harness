@@ -52,18 +52,29 @@ const criteriaOf = (text) => linesOf(text).map((l) => AC_LINE.exec(l)).filter(Bo
 // identical to one in the snapshot is the operator's own (hand-written specs carry multi-line criteria), and the
 // write-back is judged on what it wrote. test/spec-writeback.test.js runs verify over every real spec under specs/
 // against its own snapshot and ids, so the structural checks are pinned against real input.
+// T8 review round 3 F2: a demand for terminal punctuation rejected complete criteria ("Returns 401 for a bad token",
+// "The command is `make verify`"), and the writer was never told the rule. The check now looks for TRUNCATION
+// signatures only: an odd number of backticks, unbalanced ( ) or [ ], a closing code span whose content ends in an
+// anchor or opener (the 2026-10-13 cut, "`/^abc$`"), a trailing comma, dash or opener, or a trailing connective word.
+// The synthesis prompt still asks for a full stop, as style; its absence alone is not a defect.
+const CONNECTIVES = new Set(['and', 'or', 'then', 'the', 'a', 'an', 'of', 'to', 'with', 'by', 'for', 'in', 'on', 'at', 'is', 'are', 'that', 'which', 'when', 'where', 'if', 'but', 'as', 'into', 'from', 'than', 'so', 'not', 'be', 'was', 'were', 'has', 'have', 'its', 'their', 'any', 'each', 'every', 'no'])
 function midSentence(text) {
   if ((text.match(/`/g) || []).length % 2 === 1) return 'an odd number of backticks'
   const bare = text.replace(/`[^`]*`/g, '')
   if ((bare.match(/\(/g) || []).length !== (bare.match(/\)/g) || []).length) return 'unbalanced parentheses'
+  if ((bare.match(/\[/g) || []).length !== (bare.match(/\]/g) || []).length) return 'unbalanced brackets'
   let t = text.trimEnd()
   for (;;) {
-    const peeled = t.replace(/[\s*_"'`]+$/, '').replace(/\s*[([][^()[\]]*[)\]]$/, '')
+    const peeled = t.replace(/[\s*_"']+$/, '').replace(/\s*[([][^()[\]]*[)\]]$/, '')
     if (peeled === t) break
     t = peeled
   }
-  const last = t.replace(/[\s*_"'`)\]]+$/, '').slice(-1)
-  if (!last || !'.?!:'.includes(last)) return `the last character is not sentence-terminal (${JSON.stringify(text.slice(-1))})`
+  const span = /`([^`]*)`$/.exec(t)
+  if (span && /[$^/|\\([{]$/.test(span[1])) return 'ends in a code span cut at an anchor or opener'
+  const tail = t.replace(/[\s*_"'`)\]]+$/, '')
+  if (/[,\-([{]$/.test(tail)) return `ends with ${JSON.stringify(tail.slice(-1))}`
+  const lastWord = (/([A-Za-z]+)$/.exec(tail) || [])[1]
+  if (lastWord && CONNECTIVES.has(lastWord.toLowerCase())) return `ends with the connective "${lastWord}"`
   return null
 }
 
@@ -80,6 +91,11 @@ function problemsOf(now, snapshotText, surviving) {
 
   const criteria = criteriaOf(now)
   const defined = new Set(criteria.map((c) => c.id))
+  // T8 review round 3 F1: the same id defined twice with different text is the id-uniqueness class the pre-push
+  // gate caught on 2026-10-13; a set comparison cannot see it, so definitions are counted per id.
+  const perId = new Map()
+  for (const c of criteria) perId.set(c.id, (perId.get(c.id) || 0) + 1)
+  for (const [id, n] of perId) if (n > 1) problems.push(`duplicate criterion id: ${id} (${n} times)`)
   const want = new Set(surviving)
   for (const id of want) if (!defined.has(id)) problems.push(`missing criterion: ${id} is in the surviving set but not defined in the spec`)
   for (const id of defined) if (!want.has(id)) problems.push(`unexpected criterion: ${id} is defined in the spec but not in the surviving set`)

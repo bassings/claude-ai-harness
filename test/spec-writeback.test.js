@@ -196,11 +196,13 @@ test('spec-writeback verify: a line cut right after "$`" fails as mid-sentence a
   assert.ok(v.out.problems.some((p) => /mid-sentence|ends|truncat/i.test(p) && /AC-QA-2/.test(p)), JSON.stringify(v.out.problems))
 })
 
-test('spec-writeback verify: mid-sentence shapes each fail on their own -- odd backticks, unbalanced parentheses, a non-terminal last character', () => {
+test('spec-writeback verify: mid-sentence shapes each fail on their own -- odd backticks, unbalanced parentheses or brackets, a trailing connective, a trailing comma', () => {
   const shapes = [
     '- **AC-QA-2:** The pattern ends with `/^abc$/ and stops.',   // odd backticks, terminal period
     '- **AC-QA-2:** The pattern (see the note and stops.',        // unbalanced parentheses, terminal period
-    '- **AC-QA-2:** The pattern is anchored and then',            // plain truncation
+    '- **AC-QA-2:** The pattern is anchored and then',            // a trailing connective word
+    '- **AC-QA-2:** The pattern is anchored,',                     // a trailing comma
+    '- **AC-QA-2:** See [the note and stops.',                     // unbalanced brackets
   ]
   for (const line of shapes) {
     const f = fixture()
@@ -332,7 +334,7 @@ test('spec-writeback verify (F1): a hand-written criterion line identical to the
   const same = verify(f, [...IDS, 'AC-QA-7'])
   assert.deepEqual(same.out.problems, [], JSON.stringify(same.out))
   const f2 = fixture(spec([...CRITERIA, legacy]))
-  fs.writeFileSync(f2.specPath, spec([...CRITERIA, legacy + ' and now changed']))
+  fs.writeFileSync(f2.specPath, spec([...CRITERIA, legacy + ' and now changed by the']))  // ends with a connective, a truncation signature
   const changed = verify(f2, [...IDS, 'AC-QA-7'])
   assert.ok(changed.out.problems.some((p) => p.includes('AC-QA-7') && p.includes('mid-sentence')), JSON.stringify(changed.out.problems))
   assertRestored(f2, changed)
@@ -407,3 +409,37 @@ for (const name of fs.readdirSync(SPECS_DIR).filter((n) => n.endsWith('.md')).so
     else assert.deepEqual(midSentence, [], `${name}: ${JSON.stringify(midSentence)}`)
   })
 }
+
+// ======================================================================
+// Review round 3 of PR #18 (wf_16cb840d-aa1).
+// ======================================================================
+test('spec-writeback verify (round 3 F1): the same id defined twice with different text fails as a duplicate id and restores', () => {
+  const f = fixture()
+  fs.writeFileSync(f.specPath, spec([CRITERIA[0], '- **AC-QA-1:** One wording.', '- **AC-QA-1:** Another wording.', CRITERIA[2]]))
+  const v = verify(f)
+  assert.ok(v.out.problems.some((p) => p === 'duplicate criterion id: AC-QA-1 (2 times)'), JSON.stringify(v.out.problems))
+  assertRestored(f, v)
+})
+
+test('spec-writeback verify (round 3 F2): complete criteria without terminal punctuation, ending in a code span, a semicolon or a link, are not flagged', () => {
+  const ok = [
+    '- **AC-SEC-1:** Returns 401 for a bad token',
+    '- **AC-QA-1:** The command is `make verify`',
+    '- **AC-QA-2:** Ends with a semicolon;',
+    '- **AC-QA-3:** Ends in a link https://example.com/x',
+  ]
+  const f = fixture()
+  fs.writeFileSync(f.specPath, spec(ok))
+  const v = verify(f, ['AC-SEC-1', 'AC-QA-1', 'AC-QA-2', 'AC-QA-3'])
+  assert.deepEqual(v.out && v.out.problems, [], JSON.stringify(v.out))
+})
+
+test('spec-writeback verify (round 3 F2): a closing code span cut at an anchor or opener is still the 2026-10-13 signature', () => {
+  for (const line of ['- **AC-QA-2:** The pattern ends with `/^abc$`', '- **AC-QA-2:** Matches `foo(`', '- **AC-QA-2:** Uses `^`']) {
+    const f = fixture()
+    fs.writeFileSync(f.specPath, spec([CRITERIA[0], CRITERIA[1], line]))
+    const v = verify(f)
+    assert.ok(v.out.problems.some((p) => /AC-QA-2.*cut at an anchor or opener/.test(p)), `${line} -> ${JSON.stringify(v.out.problems)}`)
+    assertRestored(f, v)
+  }
+})

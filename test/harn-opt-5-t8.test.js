@@ -207,8 +207,9 @@ test('plan-cycle T8 (F4): a spec path with a space, a quote or a command substit
 })
 
 test('plan-cycle T8 (F4): a surviving id outside the AC pattern aborts the run with writeback null, even when the check says ok', async () => {
+  // Round 3 F5: the check echoes the hostile list itself, so only the pattern guard can abort the run.
   for (const surviving of [['AC-SEC-1', "x'; touch PWNED; '"], ['AC-SEC-1', 'AC-sec-1'], ['AC-SEC-1', 'AC-QA-1 && touch PWNED']]) {
-    const { result } = await go(agents({ surviving }))
+    const { result } = await go(agents({ surviving, check: json({ ...CHECK_OK, surviving_ids_checked: surviving }) }))
     assert.equal(result.telemetry.outcome, 'aborted', JSON.stringify(surviving))
     assert.equal(result.writeback, null)
   }
@@ -230,6 +231,27 @@ test('plan-cycle T8 (F5): ok false with restored false says NOT confirmed restor
 test('plan-cycle T8 (F5): a missing writeback_check puts WRITE-BACK UNCHECKED in the report', async () => {
   const { result } = await go(agents({ check: undefined }))
   assert.match(result.report, /WRITE-BACK UNCHECKED/)
+  assert.doesNotMatch(result.report, /WRITE-BACK SKIPPED/)
+})
+
+// Round 3 F6: a run with no restorable snapshot never edited the spec; it says so, distinctly, and names the allowlist.
+test('plan-cycle T8 (round 3 F6): a missing or rejected spec_snapshot puts WRITE-BACK SKIPPED, naming the temp allowlist, never UNCHECKED', async () => {
+  for (const snapshot of [undefined, json({ ...BEFORE, file: '/run/user/1000/harn-specwb-x/spec.snapshot' })]) {
+    const { result } = await go(agents({ snapshot }))
+    assert.equal(result.telemetry.outcome, 'aborted')
+    assert.match(result.report, /WRITE-BACK SKIPPED/)
+    assert.match(result.report, /temp allowlist: \/tmp, \/private\/tmp, \/var\/folders/)
+    assert.doesNotMatch(result.report, /WRITE-BACK UNCHECKED/)
+  }
+})
+
+// Round 3 F4: the verify instruction reads cleanly; the stray "Then run exactly" before "first write" is gone.
+test('plan-cycle T8 (round 3 F4): the synthesis verify instruction is not garbled and asks for a full stop on each criterion', async () => {
+  const { calls } = await go(agents())
+  const p = calls.find((c) => c.opts.label === 'synthesis:write-back').prompt
+  assert.doesNotMatch(p, /run exactly first write/i)
+  assert.match(p, /First write the AC ids you kept/)
+  assert.match(p, /each on one line and ending in a full stop/)
 })
 
 test('plan-cycle T8 (F5): without a restorable snapshot the synthesis prompt forbids the edit and names no verify command', async () => {
