@@ -195,6 +195,7 @@ const cleanLens = () => ({ verdict: 'CLEAN', coverage: { examined: 'x', verified
 const reviewAgents = (claim) => ({
   'scope:diff': SCOPE,
   'lens-security': cleanLens(), 'lens-qa': cleanLens(),
+  'lens-design': cleanLens(), 'lens-accessibility': cleanLens(), 'lens-product': cleanLens(), 'lens-architecture': cleanLens(), 'lens-data': cleanLens(), 'lens-operability': cleanLens(), 'reviewer-verification': cleanLens(),
   synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim }], rejected_findings: [] },
   'ledger:write': { run_id: 'r1', ts: 'x', write_ok: true, write_error: null },
 })
@@ -202,8 +203,9 @@ const RUNS = [
   ['tdd-task.js', { args: { task: BRACEY }, agent: {} }, (p) => p.task],
   // HARN-OPT-5 T8 (F4, round 2 L2): plan-cycle refuses BRACEY as a spec path before any agent runs (asserted in its
   // own test below) and its payload has no other free-text field, so it has no row in this round-trip.
-  // With no spec in play, review-cycle reclassifies the synthesis's spec bugs as ordinary open findings (D4).
-  ['review-cycle.js', { args: {}, agent: reviewAgents(BRACEY) }, (p) => [...(p.spec_bugs || []), ...(p.open_findings || [])].map((f) => f.claim).find((c) => c === BRACEY) || null],
+  // HARN-OPT-6: review-cycle's payload carries finding ids and never finding text, so a finding claim no longer
+  // reaches it. The caller's `spec` argument is the free text that does (AC-SEC-2's one exception).
+  ['review-cycle.js', { args: { spec: BRACEY }, agent: reviewAgents('a benign claim') }, (p) => p.spec],
 ]
 test('plan-cycle.js: BRACEY cannot be its spec path at all (HARN-OPT-5 T8 F4 refuses it before any agent runs), so the round-trip above uses a plain path', async () => {
   await assert.rejects(runWorkflow(path.join(WF_DIR, 'plan-cycle.js'), { args: { spec: BRACEY }, agent: {} }), /refuses args\.spec/)

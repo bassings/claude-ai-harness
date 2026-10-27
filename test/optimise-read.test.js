@@ -15,6 +15,10 @@ const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
 const { makeTempRepo, runAppend, trackTempDir, cleanupTempRepos, SUITE_TMPDIR, sh, LEDGER_REL } = require('./helpers/temp-repo.js')
+
+// HARN-OPT-6: the writer takes finding ids, so these tests send the id-bearing
+// finding_entries shape directly, as literals.
+const ENTRY = (id, disposition, extra = {}) => ({ id, lens: 'lens-security', severity: 'Low', ac_id: null, disposition, ...extra })
 const fs = require('node:fs')
 const os = require('node:os')
 
@@ -701,11 +705,13 @@ test('optimise-read CLI: the ledger command\'s output includes rework.invalidFix
     kind: 'review_cycle',
     outcome: 'done',
     spec: 'specs/a.md',
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [
-      { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
-      { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
-      { lens: 'lens-security', location: 'nowhere.js:1', claim: 'never reported open' },
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [
+      ENTRY('e74fb146b7ddc6cb', 'prior'),
+      ENTRY('e74fb146b7ddc6cb', 'fixed'),
+      ENTRY('e74fb146b7ddc6cb', 'fixed'),
+      ENTRY('00000000000000aa', 'fixed'), // never reported open
     ],
   })
   const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
@@ -722,7 +728,8 @@ test('optimise-read CLI: the ledger command\'s output includes rework.invalidPri
     kind: 'review_cycle',
     outcome: 'done',
     spec: 'specs/a.md',
-    prior_findings: [{ id: 'wrongwrongwrong0', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    invalid_prior_ids_dropped: 1, // counted in review-cycle.js, which recomputes each supplied prior id from its own descriptor
+    finding_entries: [],
   })
   const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
   assert.equal(res.status, 0, res.stderr)
@@ -2400,7 +2407,8 @@ test('optimise-read (M1): end to end -- a line the REAL writer produced carrying
   const res = runAppend(repo, {
     schema_version: 1, kind: 'review_cycle', outcome: 'done', spec: null,
     ac_verdicts_truncated: 7,
-    spec_bugs: Array.from({ length: 3 }, (_, i) => ({ lens: 'lens-qa', location: `s${i}.js:1`, claim: `spec bug ${i}` })),
+    spec_bug_count: 3,
+    finding_entries: Array.from({ length: 3 }, (_, i) => ENTRY(`00000000000000b${i}`, 'spec_bug', { lens: 'lens-qa' })),
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)

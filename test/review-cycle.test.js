@@ -9,7 +9,8 @@ const assert = require('node:assert/strict')
 const path = require('node:path')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
-const { makeTempRepo, runAppend, readLedgerLines, cleanupTempRepos } = require('./helpers/temp-repo.js')
+const { cleanupTempRepos } = require('./helpers/temp-repo.js')
+const { findingId } = require('./helpers/finding-entries.js')
 
 const WF = path.join(__dirname, '..', 'workflows', 'review-cycle.js')
 
@@ -114,17 +115,15 @@ test('review-cycle.js: normal completion preserves the existing return shape and
 //
 // Fix round 2 (specs/record-fixed-findings.md AC-1): this pin is
 // DELIBERATELY widened here, not removed -- `open_findings` is a genuine,
-// reviewed, documented new key (this round's open findings WITH their real
-// ids, so a caller can pass them forward unchanged as next round's
+// reviewed, documented new key (this round's open findings WITH their ids,
+// so a caller can pass them forward unchanged as next round's
 // prior_findings), never an accidental leak. The protection this test
 // exists for -- an UNDOCUMENTED key silently reaching a caller -- is fully
 // intact: the assertion still fails the instant any key other than this
-// named, deliberate set appears. What justified the change: `open_findings`
-// could not be threaded back any other way (workflow scripts have no
-// node:crypto, so the real id only exists after ledger-append.mjs computes
-// it inside the terminal write, which completes before this pinned return
-// statement runs -- see review-cycle.js's own comment at the
-// `result.open_findings = ...` assignment for the ordering).
+// named, deliberate set appears. Since HARN-OPT-6 the ids are computed by
+// review-cycle.js itself, so open_findings is an array whether or not the
+// ledger write landed (see review-cycle.js's comment at the
+// `result.open_findings = ...` assignment).
 test('review-cycle.js: the result carries EXACTLY its documented keys plus telemetry -- the internal __outcome sentinel does not leak through (L5, AC-ARCH-10; widened fix round 2 for open_findings, justified above)', async () => {
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   assert.deepEqual(Object.keys(result).sort(), ['base', 'head', 'lenses', 'open_findings', 'report', 'skipped', 'stray_writes', 'telemetry', 'verdicts'])
@@ -161,8 +160,10 @@ test('review-cycle.js: the start-record ledger write is the very first agent() c
 // AC-QA-9: distinct run_ids per call, and the terminal request checked
 // against the START write's run_id, not just a call count -- see
 // tdd-task.test.js's parametrized version for the identical rationale.
+// The writer mints UUIDs, and the script reuses a start run_id for the terminal row only when it is UUID-shaped (AC-SEC-2).
+const START_RUN_ID = '7b1e4c52-0a3d-4f6e-9c1b-2d8f5e6a7b90'
 const PAIRED_LEDGER = [
-  { run_id: 'return-path-start', ts: 't1', write_ok: true, write_error: null },
+  { run_id: START_RUN_ID, ts: 't1', write_ok: true, write_error: null },
   { run_id: 'return-path-terminal', ts: 't2', write_ok: true, write_error: null },
 ]
 
@@ -191,7 +192,7 @@ test('review-cycle.js: a genuinely empty diff (scope succeeded, zero files) stil
   assert.equal(result.telemetry.outcome, 'no-op')
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
-  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
+  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, START_RUN_ID, 'the terminal write must request reuse of the start run_id')
 })
 
 // AC-1: a scope step that returned NOTHING (the agent failed or was
@@ -246,7 +247,7 @@ test('review-cycle.js: "every lens agent failed" early return (line 149 historic
   assert.equal(result.telemetry.outcome, 'aborted')
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
-  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
+  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, START_RUN_ID, 'the terminal write must request reuse of the start run_id')
 })
 
 test('review-cycle.js: outcome is blocked when any lens returns BLOCKED', async () => {
@@ -456,29 +457,6 @@ test('review-cycle.js: spec bugs and rejected findings from a well-formed synthe
   assert.equal(result.telemetry.rejected_finding_count, 1)
 })
 
-test('review-cycle.js: the raw spec_bugs/rejected_findings descriptors are sent to the ledger-write step as data, since workflow scripts have no node:crypto to compute finding ids themselves (AC-QA-11) -- ledger-append.mjs computes the actual ids (see its own tests)', async () => {
-  // Passes a spec for the same reason as the telemetry-count test above: this
-  // is about descriptors reaching the ledger step, not about the no-spec case,
-  // and with no spec in play a spec_bug is now correctly reclassified (D4).
-  const { calls } = await runWorkflow(WF, {
-    args: { spec: 'specs/example.md' },
-    agent: baseAgent({
-      synthesis: {
-        report: 'x',
-        spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: 'no AC covers this' }],
-        rejected_findings: [],
-      },
-    }),
-  })
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  // The prompt embeds the payload base64-encoded (H1: no shell-injection
-  // surface via raw quotes), so this decodes it rather than string-matching
-  // the prompt text directly.
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.equal(payload.spec_bugs[0].lens, 'lens-qa')
-  assert.equal(payload.spec_bugs[0].claim, 'no AC covers this')
-})
-
 test('review-cycle.js: a ledger write failure never fails the run (AC-QA-7)', async () => {
   const { result, logs } = await runWorkflow(WF, {
     args: {},
@@ -499,19 +477,20 @@ test('review-cycle.js: a ledger write failure via the agent call itself throwing
 // Review round-2 M-3: see tdd-task.test.js for the identical guard and
 // its rationale -- see the L5 byte-identity guard for why this trio is
 // necessarily triplicated.
+// The run id is UUID-shaped: a start run_id that is not is counted and logged on its own (HARN-OPT-6 fix round 3, item J).
 test('review-cycle.js: when the ledger:write response carries invalid_ac_ids_dropped > 0, writeLedger logs one visible line naming the run and the count (M-3)', async () => {
   const { logs } = await runWorkflow(WF, {
     args: {},
     agent: baseAgent({
       'ledger:write': [
-        { run_id: 'run-with-sanitised-ids', ts: 't1', write_ok: true, write_error: null },
-        { run_id: 'run-with-sanitised-ids', ts: 't2', write_ok: true, write_error: null, invalid_ac_ids_dropped: 2 },
+        { run_id: '5a1e0c2e-5b0e-4f4a-9a52-7d3f2c1b8a90', ts: 't1', write_ok: true, write_error: null },
+        { run_id: '5a1e0c2e-5b0e-4f4a-9a52-7d3f2c1b8a90', ts: 't2', write_ok: true, write_error: null, invalid_ac_ids_dropped: 2 },
       ],
     }),
   })
   const sanitiseLog = logs.find((l) => l.includes('invalid_ac_ids_dropped') || l.toLowerCase().includes('sanitised'))
   assert.ok(sanitiseLog, `expected a log line about the sanitisation, got: ${JSON.stringify(logs)}`)
-  assert.ok(sanitiseLog.includes('run-with-sanitised-ids'), `must name the run, got: ${sanitiseLog}`)
+  assert.ok(sanitiseLog.includes('5a1e0c2e-5b0e-4f4a-9a52-7d3f2c1b8a90'), `must name the run, got: ${sanitiseLog}`)
   assert.ok(sanitiseLog.includes('2'), `must name the count, got: ${sanitiseLog}`)
 })
 
@@ -523,35 +502,6 @@ test('review-cycle.js: a ledger:write response with invalid_ac_ids_dropped 0 (or
 test('review-cycle.js: telemetry.budget_spent is null when no budget is supplied (AC-QA-15)', async () => {
   const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
   assert.equal(result.telemetry.budget_spent, null)
-})
-
-test('review-cycle.js: every lens\'s reported findings are sent to the ledger-write step as open_findings (H5: accepted findings were previously never recorded at all, so fix-vs-reject could never be computed)', async () => {
-  const { calls } = await runWorkflow(WF, {
-    args: {},
-    agent: baseAgent({
-      'lens-security': {
-        verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
-        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
-        findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f' }],
-      },
-    }),
-  })
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.ok(Array.isArray(payload.open_findings), 'expected an open_findings array in the terminal payload')
-  assert.equal(payload.open_findings.length, 1)
-  assert.equal(payload.open_findings[0].lens, 'lens-security')
-  assert.equal(payload.open_findings[0].location, 'foo.js:10')
-  assert.equal(payload.open_findings[0].claim, 'missing auth check')
-  assert.equal(payload.open_findings[0].severity, 'High')
-})
-
-test('review-cycle.js: a CLEAN run with no findings from any lens sends an empty open_findings array, not null (a real measured zero)', async () => {
-  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.deepEqual(payload.open_findings, [])
 })
 
 // H4: AC verdicts were collected from every lens (each lens's structured
@@ -607,147 +557,9 @@ test('review-cycle.js: the schema each lens is called with declares ac_id on a f
   assert.ok('ac_id' in findingProps, 'the findings schema each lens is called with must declare ac_id')
 })
 
-test('review-cycle.js: a finding\'s ac_id survives into open_findings when a lens supplies one, instead of always being null (H4)', async () => {
-  const { calls } = await runWorkflow(WF, {
-    args: {},
-    agent: baseAgent({
-      'lens-security': {
-        verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
-        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
-        findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-3' }],
-      },
-    }),
-  })
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.equal(payload.open_findings[0].ac_id, 'AC-SEC-3', 'a lens-supplied ac_id must survive, not be discarded to null')
-})
-
-// specs/record-fixed-findings.md AC-1: absent args.prior_findings, review-cycle.js's
-// behaviour is unchanged -- no prior-findings block in the synthesis prompt,
-// no fixed_findings requested, and the terminal payload's own
-// prior_findings/fixed_findings both stay null.
-test('review-cycle.js: with no prior_findings argument, the synthesis prompt carries no PRIOR-ROUND FINDINGS block and the terminal payload sends prior_findings/fixed_findings as null (AC-1)', async () => {
-  const { calls } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
-  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
-  assert.ok(!synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'), 'no prior-findings block must appear in the synthesis prompt when the argument is absent')
-  assert.ok(!synthesisCall.prompt.includes('fixed_findings'), 'the fixed_findings instruction must not appear either')
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.equal(payload.prior_findings, null)
-  assert.equal(payload.fixed_findings, null)
-})
-
-// AC-1: a non-array prior_findings (a caller mistake, or a stale caller
-// passing something else entirely) must be treated exactly like "absent",
-// never partially trusted.
-test('review-cycle.js: a non-array args.prior_findings is treated as absent, not partially trusted (AC-1)', async () => {
-  const { calls } = await runWorkflow(WF, { args: { prior_findings: 'not-an-array' }, agent: baseAgent() })
-  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
-  assert.ok(!synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'))
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.equal(payload.prior_findings, null)
-})
-
-// AC-2: supplying prior_findings puts the exact array in the synthesis
-// prompt and carries it, plus the synthesis's own fixed_findings response,
-// through unmapped to the terminal ledger payload.
-test('review-cycle.js: with prior_findings supplied, the synthesis prompt carries them verbatim and the terminal payload carries both prior_findings and the synthesis\'s fixed_findings through unmapped (AC-2)', async () => {
-  const PRIOR = [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1' }]
-  const { calls } = await runWorkflow(WF, {
-    args: { prior_findings: PRIOR },
-    agent: baseAgent({
-      synthesis: {
-        report: '### VERDICT\nCLEAN',
-        spec_bugs: [],
-        rejected_findings: [],
-        fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-      },
-    }),
-  })
-  const synthesisCall = calls.find((c) => c.opts.label === 'synthesis')
-  assert.ok(synthesisCall.prompt.includes('PRIOR-ROUND FINDINGS'), 'the prior-findings block must appear when the argument is supplied')
-  assert.ok(synthesisCall.prompt.includes('missing auth check'), 'the prior finding\'s own claim text must reach the prompt')
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.deepEqual(payload.prior_findings, PRIOR)
-  assert.deepEqual(payload.fixed_findings, [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }])
-})
-
-// AC-2: an older or misbehaving synthesis agent that never returns
-// fixed_findings at all (undefined, not an empty array) must read as null,
-// the same unmeasured-vs-zero distinction spec_bugs/rejected_findings
-// already hold to.
-test('review-cycle.js: a synthesis response with prior_findings supplied but no fixed_findings field at all sends fixed_findings as null, not an empty array (AC-2, AC-OPS-3\'s convention)', async () => {
-  const PRIOR = [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }]
-  const { calls } = await runWorkflow(WF, { args: { prior_findings: PRIOR }, agent: baseAgent() })
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.equal(payload.fixed_findings, null)
-})
-
-// ---- Fix round 2 (specs/record-fixed-findings.md AC-1): result.open_findings.
-// Route B: the REAL id only exists after ledger-append.mjs computes it
-// inside the terminal write, so it can only reach review-cycle's OWN
-// return value via writeLedger's response -- proven here at the unit
-// level (a scripted ledger:write response), with the full real-writer
-// round trip proven separately in test/ledger-seam.test.js. ----
-
-test('review-cycle.js: result.open_findings zips this round\'s open finding descriptors with the REAL ids the ledger:write response returned, in order (fix round 2, AC-1)', async () => {
-  const { result } = await runWorkflow(WF, {
-    args: {},
-    agent: baseAgent({
-      'lens-security': {
-        verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
-        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
-        findings: [{ severity: 'High', claim: 'missing auth check', location: 'foo.js:10', evidence: 'e', consequence: 'c', fix: 'f', ac_id: 'AC-SEC-1' }],
-      },
-      'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: ['e74fb146b7ddc6cb'] }],
-    }),
-  })
-  assert.deepEqual(result.open_findings, [
-    { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1', recurrence: null, id: 'e74fb146b7ddc6cb' },
-  ])
-})
-
-test('review-cycle.js: result.open_findings is null when the ledger:write response carries no open_finding_ids at all (an older ledger-append.mjs, or the write failed before computing them) -- never a confident empty array (fix round 2, AC-1)', async () => {
-  const { result } = await runWorkflow(WF, { args: {}, agent: baseAgent() })
-  assert.equal(result.open_findings, null)
-})
-
-test('review-cycle.js: result.open_findings is populated on ROUND ONE too, with no prior_findings argument supplied at all -- this is what a later round needs to join against, so it cannot be gated on prior_findings\' own presence (fix round 2, AC-1/AC-4)', async () => {
-  const { result } = await runWorkflow(WF, {
-    args: {},
-    agent: baseAgent({
-      'lens-qa': {
-        verdict: 'FINDINGS',
-        head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111',
-        coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' },
-        findings: [{ severity: 'Low', claim: 'a style nit', location: 'bar.js:1', evidence: 'e', consequence: 'c', fix: 'f' }],
-      },
-      'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: ['deadbeefdeadbeef'] }],
-    }),
-  })
-  assert.ok(Array.isArray(result.open_findings) && result.open_findings.length === 1, `expected round one to return its own open finding with an id, got: ${JSON.stringify(result.open_findings)}`)
-  assert.equal(result.open_findings[0].id, 'deadbeefdeadbeef')
-})
-
-// AC-4: absent prior_findings/fixed_findings, review-cycle's DECISIONS are
-// unchanged -- the addition of result.open_findings (unconditional, see
-// above) does not alter what gets written or how outcome is decided.
-test('review-cycle.js: AC-4 -- with nothing supplied, the terminal payload\'s prior_findings/fixed_findings stay null exactly as before, regardless of result.open_findings now always being populated', async () => {
-  const { calls } = await runWorkflow(WF, {
-    args: {},
-    agent: baseAgent({ 'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: [] }] }),
-  })
-  const terminalCall = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const payload = extractLedgerPayload(terminalCall.prompt)
-  assert.equal(payload.prior_findings, null)
-  assert.equal(payload.fixed_findings, null)
-})
+// result.open_findings, the finding-id payload and the prior-id guard are
+// covered in test/review-cycle-finding-ids.test.js (HARN-OPT-6); the full
+// real-writer round trip is in test/ledger-seam.test.js.
 
 // Review round-2, new harness-level finding: during review round 2, a lens
 // wrote two TEST-FIXTURE records into the live ledger while probing
@@ -794,7 +606,7 @@ test('review-cycle.js: an exception thrown by an agent() call inside run() still
         agent: baseAgent({
           'scope:diff': () => { throw new Error('agent step crashed mid-run') },
           'ledger:write': [
-            { run_id: 'start-abc', ts: 't1', write_ok: true, write_error: null },
+            { run_id: START_RUN_ID, ts: 't1', write_ok: true, write_error: null },
             { run_id: 'terminal-abc', ts: 't2', write_ok: true, write_error: null },
           ],
         }),
@@ -806,10 +618,10 @@ test('review-cycle.js: an exception thrown by an agent() call inside run() still
       const startPayload = extractLedgerPayload(ledgerCalls[0].prompt)
       const terminalPayload = extractLedgerPayload(ledgerCalls[1].prompt)
       assert.ok(!('run_id' in startPayload), 'the start write does not request an existing run_id')
-      assert.equal(terminalPayload.run_id, 'start-abc', 'the terminal write must reuse the start run_id')
+      assert.equal(terminalPayload.run_id, START_RUN_ID, 'the terminal write must reuse the start run_id')
       assert.equal(terminalPayload.outcome, 'aborted', 'a thrown run() must never be recorded as done or blocked (AC-QA-12)')
       assert.ok(
-        err.logs.some((l) => l.includes('start-abc') && l.includes('agent step crashed mid-run')),
+        err.logs.some((l) => l.includes(START_RUN_ID) && l.includes('agent step crashed mid-run')),
         `expected one log line naming the run_id and the failure, got ${JSON.stringify(err.logs)}`
       )
       return true
@@ -2451,8 +2263,10 @@ test('review-cycle.js: an aborted run still records the findings the other lense
   assert.equal(ledgerCalls.length, 2, 'a start write and a terminal write must both have happened')
   const terminal = extractLedgerPayload(ledgerCalls[1].prompt)
   assert.deepEqual(terminal.lenses_run, ['lens-security', 'lens-qa'], 'both lenses reported, so both must appear')
-  assert.equal(terminal.open_findings.length, 1, 'the Critical finding lens-security DID report must survive the abort, not be destroyed by another lens misreporting its sha')
-  assert.equal(terminal.open_findings[0].severity, 'Critical')
+  const openEntries = terminal.finding_entries.filter((e) => e.disposition === 'open')
+  assert.equal(openEntries.length, 1, 'the Critical finding lens-security DID report must survive the abort, not be destroyed by another lens misreporting its sha')
+  assert.equal(openEntries[0].severity, 'Critical')
+  assert.equal(openEntries[0].id, findingId('lens-security', 'foo.js:10', 'remote code execution'))
 })
 
 
@@ -2666,40 +2480,6 @@ test('review-cycle.js: a genuinely different sha at synthesis DOES still raise t
   })
   assert.equal(result.checkout_moved, true)
   assert.match(result.checkout_moved_detail, /moved mid-review/)
-})
-
-// Round-two review F9: the second half of the review-D validator fix (union
-// types in an ITEMS schema) had no test of its own. Reverting it left
-// ledger-append's own suite fully green; only the full run caught it, through
-// three tests about an unrelated feature that happened to exercise the path.
-// A fix surviving on somebody else's coverage is one refactor from unguarded.
-//
-// It belongs here rather than in ledger-append's suite because the only
-// union-typed items schema in the repo is this workflow's ledger:write response
-// (open_finding_ids: items { type: ['string','null'] }), validated by the fake
-// runtime through the very function under test.
-test('review-cycle.js: an items schema with a UNION type accepts every member of the union (review F9)', async () => {
-  const { result } = await runWorkflow(WF, {
-    args: {},
-    agent: baseAgent({ 'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: ['abcdef0123456789', null] }] }),
-  })
-  assert.equal(result.telemetry.outcome, 'done', 'both members of the union must be accepted by the response validator')
-})
-
-test('review-cycle.js: an items schema with a UNION type still rejects a NON-member, so F9 did not simply switch item checking off', async () => {
-  // The ledger step deliberately swallows its own failures -- telemetry must
-  // never fail the caller's run -- so a rejected response is not observable as
-  // a throw. It is observable as the ids not arriving: a number is refused by
-  // the validator rather than carried through as an id.
-  const { result } = await runWorkflow(WF, {
-    args: {},
-    agent: baseAgent({
-      'scope:diff': { ...SCOPE_OK, files: [{ path: 'src/foo.js', status: 'M' }] },
-      'lens-security': { ...SECURITY_CLEAN, verdict: 'FINDINGS', findings: [{ severity: 'High', claim: 'c', location: 'a.js:1', evidence: 'e', consequence: 'x', fix: 'f' }] },
-      'ledger:write': [LEDGER_OK, { ...LEDGER_OK, open_finding_ids: [42] }],
-    }),
-  })
-  assert.equal(result.open_findings, null, 'a non-member item must not survive validation into a real finding id')
 })
 
 // ---------------------------------------------------------------------------
@@ -3067,10 +2847,10 @@ test('review-cycle.js (D4): the finding itself SURVIVES -- reclassified, never d
   })
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   const payload = extractLedgerPayload(ledgerCalls[ledgerCalls.length - 1].prompt)
-  const open = payload.open_findings || []
-  assert.ok(open.some((f) => f.location === 'synthesis-only.js:9'),
+  const syntheticId = findingId('lens-security', 'synthesis-only.js:9', 'seen only by synthesis')
+  assert.ok(payload.finding_entries.some((e) => e.disposition === 'open' && e.id === syntheticId),
     'the finding is real; only its classification was wrong. Dropping it would be this spec\'s own defect recurring inside its own fix')
-  assert.ok(!(payload.spec_bugs || []).some((f) => f.location === 'synthesis-only.js:9'),
+  assert.ok(!payload.finding_entries.some((e) => e.disposition === 'spec_bug' && e.id === syntheticId),
     'and it must not ALSO remain filed as a spec bug -- reclassified means moved, not copied')
 })
 
@@ -3089,7 +2869,7 @@ test('review-cycle.js (D4): when a spec IS in play, spec_bug classification is u
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   const payload = extractLedgerPayload(ledgerCalls[ledgerCalls.length - 1].prompt)
   assert.equal(payload.spec_bug_count, 1, 'a real spec CAN have a real bug; this must not be blanket-suppressed')
-  assert.equal((payload.spec_bugs || []).length, 1)
+  assert.equal(payload.finding_entries.filter((e) => e.disposition === 'spec_bug').length, 1)
 })
 
 test('review-cycle.js (D4): a run invoked with NO spec argument, where a lens FOUND one, keeps its spec_bug classification', async () => {
@@ -3118,50 +2898,5 @@ test('review-cycle.js (D4): a run invoked with NO spec argument, where a lens FO
   assert.ok(payload.ac_verdicts.length > 0, 'precondition: but a lens located one and verified criteria against it')
   assert.equal(payload.spec_bug_count, 1,
     'a spec WAS in play, so the classification stands; suppressing it here would lose a real quality signal')
-  assert.equal((payload.spec_bugs || []).length, 1)
-})
-
-// Review round 2 L3 (AC-QA-3, integration half): the unit tests pin that the
-// writer attributes a compound label's fixed row to its primary lens, but
-// nothing proved the join through review-cycle.js itself -- a prior_findings
-// entry handed in verbatim, plus a matching fixed_findings confirmation.
-// The ledger:write step is the REAL ledger-append.mjs (same shape as the
-// round trip in test/ledger-seam.test.js).
-//
-// Round one is NOT driven here, deliberately: review-cycle.js stamps every
-// open finding with the workflow's own lens label, last, so a lens report
-// cannot introduce a compound label (see the `{ ...r, lens }` spread, round-two
-// review F1). A round-one run therefore returns the id of the plain
-// 'lens-security' finding, never 7c35753185a55bf1. A compound label can only
-// reach a prior_findings entry from outside the workflow (a hand-built or
-// legacy entry, or a synthesis-sourced one), so that is what this seeds; its
-// id is the one the writer itself recomputes and verifies.
-test('review-cycle.js: a prior_findings entry with a compound lens label, confirmed fixed by synthesis, is written fixed under its primary lens with the same id through the real writer (review round 2 L3, AC-QA-3)', async () => {
-  const repo = makeTempRepo()
-  const label = 'lens-security + lens-architecture'
-  const prior = [{ id: '7c35753185a55bf1', lens: label, location: 'a.js:1', claim: 'c' }]
-  const realWriter = (prompt) => {
-    const res = runAppend(repo, extractLedgerPayload(prompt))
-    assert.equal(res.status, 0, `real ledger-append.mjs exited non-zero: ${res.stderr}`)
-    return JSON.parse(res.stdout.trim().split('\n').pop())
-  }
-  const { calls } = await runWorkflow(WF, {
-    args: { prior_findings: prior },
-    agent: baseAgent({
-      synthesis: { ...SYNTHESIS_OK, fixed_findings: [{ lens: label, location: 'a.js:1', claim: 'c' }] },
-      'ledger:write': realWriter,
-    }),
-  })
-  const terminal = extractLedgerPayload(calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt)
-  assert.deepEqual(terminal.prior_findings, prior, 'sanity: the entry must reach the terminal payload verbatim')
-  assert.deepEqual(terminal.fixed_findings, [{ lens: label, location: 'a.js:1', claim: 'c' }], 'sanity: so must the confirmation')
-
-  const lines = readLedgerLines(repo)
-  const entry = JSON.parse(lines[lines.length - 1])
-  const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
-  assert.equal(fixed.length, 1, `expected exactly one fixed entry, got: ${JSON.stringify(entry.findings)}`)
-  assert.equal(fixed[0].lens, 'lens-security')
-  assert.equal(fixed[0].id, '7c35753185a55bf1')
-  assert.equal(entry.invalid_prior_ids_dropped, 0)
-  assert.equal(entry.invalid_fixed_ids_dropped, 0)
+  assert.equal(payload.finding_entries.filter((e) => e.disposition === 'spec_bug').length, 1)
 })

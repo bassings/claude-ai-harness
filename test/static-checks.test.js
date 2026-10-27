@@ -2290,26 +2290,29 @@ test('static: the AC-definition counter recognises every lens prefix the ledger 
   }
 })
 
-// Review round 2 L2: ROSTER_LENSES in workflows/lib/ledger-append.mjs is a
-// hand-copied list of the agents/ files, and its own comment says a name
-// missing there silently costs attribution (a compound label resolves to
+// Review round 2 L2, moved by HARN-OPT-6: PAYLOAD_ROSTER_LENSES in
+// workflows/review-cycle.js is a hand-copied list of the agents/ files (the
+// compound-label resolution moved out of the writer into that script), and a
+// name missing there silently costs attribution (a compound label resolves to
 // null and the finding reads as unattributed) rather than failing anything.
 // A new lens file added without touching that list would therefore drift
-// unnoticed. Checked in BOTH directions: a lens file the set lacks, and a set
+// unnoticed. Checked in BOTH directions: a lens file the list lacks, and a list
 // entry with no file behind it. implementer.md is the one agents/ file that
 // is not a reviewing lens.
-test('ledger-append.mjs ROSTER_LENSES matches the lens files in agents/ in both directions (review round 2 L2)', async () => {
-  const { pathToFileURL } = require('node:url')
-  const { ROSTER_LENSES } = await import(pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'ledger-append.mjs')).href)
+test('review-cycle.js PAYLOAD_ROSTER_LENSES matches the lens files in agents/ in both directions (review round 2 L2, HARN-OPT-6)', () => {
+  const source = readAll('workflows', 'review-cycle.js')
+  const match = /const PAYLOAD_ROSTER_LENSES = \[([^\]]*)\]/.exec(source)
+  assert.ok(match, 'could not locate PAYLOAD_ROSTER_LENSES in review-cycle.js')
+  const roster = new Set([...match[1].matchAll(/'([^']+)'/g)].map((m) => m[1]))
   const expected = new Set(
     fs.readdirSync(path.join(ROOT, 'agents'))
       .filter((f) => f.endsWith('.md') && f !== 'implementer.md')
       .map((f) => f.slice(0, -'.md'.length)),
   )
-  const missing = [...expected].filter((n) => !ROSTER_LENSES.has(n))
-  const extra = [...ROSTER_LENSES].filter((n) => !expected.has(n))
-  assert.deepEqual(missing, [], `agents/ has lens file(s) missing from ROSTER_LENSES in ledger-append.mjs: ${missing.join(', ')}`)
-  assert.deepEqual(extra, [], `ROSTER_LENSES in ledger-append.mjs names lens(es) with no file in agents/: ${extra.join(', ')}`)
+  const missing = [...expected].filter((n) => !roster.has(n))
+  const extra = [...roster].filter((n) => !expected.has(n))
+  assert.deepEqual(missing, [], `agents/ has lens file(s) missing from PAYLOAD_ROSTER_LENSES in review-cycle.js: ${missing.join(', ')}`)
+  assert.deepEqual(extra, [], `PAYLOAD_ROSTER_LENSES in review-cycle.js names lens(es) with no file in agents/: ${extra.join(', ')}`)
 })
 
 // HARN-OPT-4 T4 (AC-QA-14): the conductor's review-invocation step must name
@@ -2349,4 +2352,46 @@ test('static: conduct-plan/SKILL.md review step shows a literal /review-cycle ca
   assert.match(step, /\/review-cycle \{[^}\n]*"spec": "[^"\n]+"[^}\n]*"round": \d+[^}\n]*\}/, 'expected a literal /review-cycle call with an unquoted numeric round')
   const warn = step.split(/\n\s*\n/).find((p) => /quoted/i.test(p) && /null/i.test(p) && /direct/i.test(p))
   assert.ok(warn, 'expected a sentence saying a quoted number is nulled by the writer and read as a direct review')
+})
+
+// HARN-OPT-6 (AC-QA-14 clause 1): writer-side tests send the id-bearing finding_entries payload directly. A
+// descriptor-to-entries converter in the test tree would be a second copy of review-cycle.js's logic that about a
+// hundred writer tests then pin instead of the writer, so none may exist, and a legacy descriptor key may appear in a
+// test only inside the single test that names itself transition-only. The node:crypto id oracle is the one export
+// test/helpers/finding-entries.js keeps (AC-QA-2).
+test('no test builds writer payloads through a descriptor converter, and the only test using legacy descriptor keys is the one transition-only test (AC-QA-14)', () => {
+  const testDir = path.join(ROOT, 'test')
+  // Every .js file under test/, at any depth (fix round 3, item G): the guard used to read the top level and helpers/ only.
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : e.name.endsWith('.js') ? [path.join(dir, e.name)] : []))
+  const files = walk(testDir)
+  const self = path.join(testDir, 'static-checks.test.js')
+  const converters = files.filter((f) => f !== self && /\btoFindingEntries\b|\bLEGACY_DESCRIPTOR_KEYS\b/.test(fs.readFileSync(f, 'utf8')))
+  assert.deepEqual(converters.map((f) => path.relative(ROOT, f)), [], 'these test files still use a descriptor-to-finding_entries converter')
+  const helper = require(path.join(testDir, 'helpers', 'finding-entries.js'))
+  assert.deepEqual(Object.keys(helper).sort(), ['findingId'], 'test/helpers/finding-entries.js must export only the node:crypto id oracle')
+
+  const LEGACY_KEY = /^\s*(?:spec_bugs|rejected_findings|open_findings|prior_findings|fixed_findings)\s*:|[{,]\s*(?:spec_bugs|rejected_findings|open_findings|prior_findings|fixed_findings)\s*:/m
+  const writerSide = ['ledger-append.test.js', 'optimise-read.test.js', 'harn-opt-4-t1-t2.test.js'].map((f) => path.join(testDir, f))
+  const offenders = []
+  for (const file of writerSide) {
+    for (const chunk of fs.readFileSync(file, 'utf8').split(/\n(?=test\()/)) {
+      if (LEGACY_KEY.test(chunk)) offenders.push(`${path.basename(file)}: ${chunk.slice(0, 110).replace(/\s+/g, ' ')}`)
+    }
+  }
+  assert.deepEqual(offenders, [], 'writer-side tests must send finding_entries, not descriptors')
+  const transitional = files.filter((f) => f !== self).flatMap((f) => [...fs.readFileSync(f, 'utf8').matchAll(/^test\((['"`])(?:(?!\1).)*transition-only(?:(?!\1).)*\1/gm)].map(() => path.basename(f)))
+  assert.deepEqual(transitional, ['harn-opt-6-t1.test.js'], 'exactly one test names itself transition-only')
+  // Fix round 3, item G: the check above reads three named writer-side files, so a legacy descriptor payload built anywhere
+  // else (HARN-OPT-6 fix round 2 put one in test/harn-opt-6-r2.test.js) went unseen. This reads EVERY test file: a payload
+  // object that spreads a captured payload and adds a legacy descriptor key may appear only in the one transition-only test.
+  // (A synthesis response legitimately names spec_bugs and rejected_findings, so the key alone is not the signal.)
+  const SPREAD_LEGACY = /\.\.\.(?:terminal|base|payload|telemetry|good|newPath|rest)\b[^\n]*\b(?:spec_bugs|rejected_findings|open_findings|prior_findings|fixed_findings)\s*:/
+  const stray = []
+  for (const file of files.filter((f) => f !== self)) {
+    for (const chunk of fs.readFileSync(file, 'utf8').split(/\n(?=test\()/)) {
+      if (/^test\((['"`])(?:(?!\1).)*transition-only/.test(chunk)) continue
+      for (const line of chunk.split('\n')) if (!/^\s*\/\//.test(line) && SPREAD_LEGACY.test(line)) stray.push(`${path.relative(ROOT, file)}: ${line.trim().slice(0, 110)}`)
+    }
+  }
+  assert.deepEqual(stray, [], 'a legacy descriptor payload is built outside the single transition-only test')
 })

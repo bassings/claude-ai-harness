@@ -12,6 +12,19 @@ const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
 const { APPEND_SCRIPT, LEDGER_REL, SUITE_TMPDIR, sh, makeTempRepo, runAppend, readLedgerLines, trackTempDir, cleanupTempRepos } = require('./helpers/temp-repo.js')
+
+// The writer refuses every write when HARNESS_LEDGER_READONLY is set (as a review lens sets it), and this file spawns the
+// writer with its own copies of process.env. Dropped here so the file passes with the variable exported; the tests of the
+// read-only behaviour itself pass it explicitly in their spawn environment, which this does not touch.
+delete process.env.HARNESS_LEDGER_READONLY
+
+// HARN-OPT-6: the writer takes finding ids, not descriptors, so the tests below
+// send the id-bearing finding_entries shape directly, as literals. The id of an
+// entry is any 16 lowercase hex digits; the writer hashes nothing.
+const hexId = (n) => n.toString(16).padStart(16, '0')
+const entryOf = (id, disposition, extra = {}) => ({ id, lens: 'lens-security', severity: 'Low', ac_id: null, disposition, ...extra })
+const manyEntries = (count, disposition, extra = {}) => Array.from({ length: count }, (_, i) => entryOf(hexId(i + 1), disposition, extra))
+const AUTH_ID = 'e74fb146b7ddc6cb'
 const {
   makeHostileTempRepo,
   makeHomeLikeHostileTempRepo,
@@ -488,8 +501,8 @@ test('ledger-append: a findings array beyond the stated bound is truncated, with
   // A minimal envelope (no verdicts/trigger_counts padding) so the bounded
   // result reliably fits under MAX_LINE_BYTES and this test proves the
   // bounding behaviour distinctly from the separate degrade-to-minimal path.
-  const many = Array.from({ length: total }, () => ({ lens: 'lens-qa', location: 'f.js:1', claim: 'x' }))
-  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: many })
+  const many = manyEntries(total, 'open', { lens: 'lens-qa' })
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: many })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
@@ -511,16 +524,16 @@ test('ledger-append: a findings array beyond the stated bound is truncated, with
 // another.
 test('ledger-append: MAX_FINDINGS truncation is budgeted fairly across dispositions -- MAX_FINDINGS open findings (already at the cap by itself) plus 20 validly-confirmed fixed findings still records SOME fixed, never zero (fix round 1, finding 4, coordinator repro: 15+ open findings previously starved fixed entirely)', async () => {
   const repo = makeTempRepo()
-  const { findingId, MAX_FINDINGS } = await import(APPEND_MODULE_URL)
-  const priorFindings = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-security', location: `fixed${i}.js:1`, claim: `fixed finding ${i}`, id: findingId('lens-security', `fixed${i}.js:1`, `fixed finding ${i}`) }))
-  const openFindings = Array.from({ length: MAX_FINDINGS }, (_, i) => ({ lens: 'lens-qa', location: `open${i}.js:1`, claim: `open finding ${i}` }))
+  const { MAX_FINDINGS } = await import(APPEND_MODULE_URL)
+  const fixedEntries = Array.from({ length: 20 }, (_, i) => hexId(1000 + i))
+  const openEntries = Array.from({ length: MAX_FINDINGS }, (_, i) => entryOf(hexId(i + 1), 'open', { lens: 'lens-qa' }))
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: openFindings,
-    prior_findings: priorFindings,
-    fixed_findings: priorFindings,
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [...openEntries, ...fixedEntries.map((id) => entryOf(id, 'prior')), ...fixedEntries.map((id) => entryOf(id, 'fixed'))],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const fixedCount = entry.findings.filter((f) => f.disposition === 'fixed').length
@@ -533,17 +546,17 @@ test('ledger-append: MAX_FINDINGS truncation is budgeted fairly across dispositi
 
 test('ledger-append: MAX_FINDINGS truncation fairness -- with fewer open findings than the cap and more fixed findings than the rest of it (the coordinator\'s own smaller repro, scaled to MAX_FINDINGS), both dispositions get real representation, not a cap/0 split (fix round 1, finding 4)', async () => {
   const repo = makeTempRepo()
-  const { findingId, MAX_FINDINGS } = await import(APPEND_MODULE_URL)
+  const { MAX_FINDINGS } = await import(APPEND_MODULE_URL)
   const openN = Math.floor(MAX_FINDINGS * 2 / 3)
-  const priorFindings = Array.from({ length: MAX_FINDINGS * 2 }, (_, i) => ({ lens: 'lens-security', location: `fixed${i}.js:1`, claim: `fixed finding ${i}`, id: findingId('lens-security', `fixed${i}.js:1`, `fixed finding ${i}`) }))
-  const openFindings = Array.from({ length: openN }, (_, i) => ({ lens: 'lens-qa', location: `open${i}.js:1`, claim: `open finding ${i}` }))
+  const fixedIds = Array.from({ length: MAX_FINDINGS * 2 }, (_, i) => hexId(1000 + i))
+  const openEntries = Array.from({ length: openN }, (_, i) => entryOf(hexId(i + 1), 'open', { lens: 'lens-qa' }))
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: openFindings,
-    prior_findings: priorFindings,
-    fixed_findings: priorFindings,
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [...openEntries, ...fixedIds.map((id) => entryOf(id, 'prior')), ...fixedIds.map((id) => entryOf(id, 'fixed'))],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const fixedCount = entry.findings.filter((f) => f.disposition === 'fixed').length
@@ -559,7 +572,7 @@ test('ledger-append: MAX_FINDINGS truncation fairness -- with fewer open finding
 
 test('ledger-append: findings_truncated is a real zero (not null) when findings were computed and none were dropped (M2)', () => {
   const repo = makeTempRepo()
-  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'x' }] })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: [entryOf(hexId(1), 'open', { lens: 'lens-qa' })] })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings_truncated, 0)
 })
@@ -628,7 +641,7 @@ test('ledger-append: a findings[].ac_id that fails the pattern is NULLED with th
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: 'optimise-cycle:AC-SEC-1' }],
+    finding_entries: [entryOf(hexId(1), 'open', { ac_id: 'optimise-cycle:AC-SEC-1' })],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
@@ -659,7 +672,7 @@ test('ledger-append: a findings[].lens value that fails the lens/reviewer patter
     outcome: 'done',
     spec: 'a.md',
     run_id: 'm1t',
-    spec_bugs: [{ lens: 'orchestrator', location: 'a.md:1', claim: 'x' }],
+    finding_entries: [entryOf(hexId(1), 'spec_bug', { lens: 'orchestrator' })],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, `expected the write to succeed with the offending field neutralised, got: ${out.write_error}`)
@@ -687,13 +700,13 @@ test('ledger-append: a findings[].lens value that fails the lens/reviewer patter
 // second pass -- refusing the whole record over one INCOMPLETE (not even
 // malformed) finding descriptor. The exact total-loss class this whole
 // mechanism exists to close, reopened by the fix meant to close it.
-test('ledger-append: a findings descriptor that OMITS "lens" entirely (not merely malformed) still writes -- lens is nulled, lens_raw is left ABSENT (never undefined), and the record is NOT refused (round-7 F2)', () => {
+test('ledger-append: a finding entry that OMITS "lens" entirely (not merely malformed) still writes -- lens is nulled, lens_raw is left ABSENT (never undefined), and the record is NOT refused (round-7 F2)', () => {
   const repo = makeTempRepo()
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ location: 'a.md:1', claim: 'x' }], // no `lens` key at all
+    finding_entries: [{ id: hexId(1), severity: 'Low', ac_id: null, disposition: 'open' }], // no `lens` key at all
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, `expected the write to succeed despite the omitted lens, got: ${out.write_error}`)
@@ -705,10 +718,11 @@ test('ledger-append: a findings descriptor that OMITS "lens" entirely (not merel
   assert.equal('lens_raw' in entry.findings[0], false, 'lens_raw must be ABSENT (nothing to retain), never written as literal undefined -- which would itself fail schema validation')
 })
 
-for (const field of ['open_findings', 'spec_bugs', 'rejected_findings']) {
-  test(`ledger-append: a non-conforming lens in ${field} is neutralised, not fatal to the write (M1, same treatment across all three descriptor arrays)`, () => {
+for (const disposition of ['open', 'spec_bug', 'rejected']) {
+  test(`ledger-append: a non-conforming lens on a ${disposition} entry is neutralised, not fatal to the write (M1, same treatment across all three dispositions)`, () => {
     const repo = makeTempRepo()
-    const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', [field]: [{ lens: 'orchestrator', location: 'a.md:1', claim: 'x' }] })
+    const field = disposition
+    const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: [entryOf(hexId(1), disposition, { lens: 'orchestrator' })] })
     const out = JSON.parse(res.stdout.trim().split('\n').pop())
     assert.equal(out.write_ok, true, `${field}: expected the write to succeed, got: ${out.write_error}`)
     assert.equal(readLedgerLines(repo).length, 1, `${field}: the record must be written`)
@@ -717,7 +731,7 @@ for (const field of ['open_findings', 'spec_bugs', 'rejected_findings']) {
 
 test('ledger-append: a well-formed findings[].lens value is left completely untouched -- never nulled, never counted (M1, not vacuous)', () => {
   const repo = makeTempRepo()
-  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'x' }] })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: [entryOf(hexId(1), 'open')] })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings[0].lens, 'lens-security')
   assert.equal(entry.findings[0].lens_raw, undefined, 'lens_raw must not appear at all when nothing was sanitised')
@@ -733,7 +747,7 @@ test('ledger-append: a findings[].severity value outside the enum is NULLED with
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'x', severity: 'Urgent' }],
+    finding_entries: [entryOf(hexId(1), 'open', { lens: 'lens-qa', severity: 'Urgent' })],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, `expected the write to succeed, got: ${out.write_error}`)
@@ -745,7 +759,7 @@ test('ledger-append: a findings[].severity value outside the enum is NULLED with
 
 test('ledger-append: invalid_finding_fields_dropped is a real zero (not null) when a findings array was supplied and every lens/severity was well-formed (M1, not vacuous)', () => {
   const repo = makeTempRepo()
-  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'x', severity: 'High' }] })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: [entryOf(hexId(1), 'open', { severity: 'High' })] })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.invalid_finding_fields_dropped, 0)
 })
@@ -764,7 +778,7 @@ test('ledger-append: invalid_ac_ids_dropped is a real zero (not null) when ac_ve
     kind: 'review_cycle',
     outcome: 'done',
     ac_verdicts: [{ ac_id: 'AC-SEC-1', verdict: 'PASS' }],
-    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: 'AC-SEC-2' }],
+    finding_entries: [entryOf(hexId(1), 'open', { ac_id: 'AC-SEC-2' })],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.invalid_ac_ids_dropped, 0)
@@ -783,7 +797,7 @@ test('ledger-append: a null ac_id in findings (the ordinary "no AC" case) is lef
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x' }], // no ac_id at all
+    finding_entries: [entryOf(hexId(1), 'open')], // ac_id null
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings[0].ac_id, null)
@@ -913,7 +927,7 @@ test('ledger-append: an explicitly-null ac_id in FINDINGS (not ac_verdicts) is l
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: 'lens-security', location: 'foo.js:1', claim: 'x', ac_id: null }],
+    finding_entries: [entryOf(hexId(1), 'open', { ac_id: null })],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings[0].ac_id, null)
@@ -965,7 +979,7 @@ test('ledger-append: lens_raw and severity_raw are redacted the same way ac_id_r
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: '/Users/someoperator/.aws/credentials', location: 'x', claim: 'y', severity: '/Users/someoperator/.aws/credentials2' }],
+    finding_entries: [entryOf(hexId(1), 'open', { lens: '/Users/someoperator/.aws/credentials', severity: '/Users/someoperator/.aws/credentials2' })],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
@@ -1004,12 +1018,7 @@ function verdictsOfSize(n) {
 test('ledger-append: a realistic 6-lens round with ~20 findings (H3\'s measured shape) keeps lens-level telemetry -- lenses_run, verdicts, trigger_counts, spec, round_key, budget_spent -- fully intact, past the point the OLD cap would have discarded everything (H3 round 2)', () => {
   const repo = makeTempRepo()
   const lenses = ['lens-security', 'lens-qa', 'lens-architecture', 'lens-product', 'lens-data', 'lens-operability']
-  const many = Array.from({ length: 20 }, (_, i) => ({
-    lens: lenses[i % lenses.length],
-    location: `src/file${i}.js:${i + 1}`,
-    claim: `finding number ${i}: a realistic-length claim describing a real defect found in review`,
-    severity: ['Critical', 'High', 'Medium', 'Low'][i % 4],
-  }))
+  const many = Array.from({ length: 20 }, (_, i) => entryOf(hexId(i + 1), 'open', { lens: lenses[i % lenses.length], severity: ['Critical', 'High', 'Medium', 'Low'][i % 4] }))
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
@@ -1021,7 +1030,7 @@ test('ledger-append: a realistic 6-lens round with ~20 findings (H3\'s measured 
     trigger_counts: triggerCountsOfSize(lenses.length),
     verdicts: verdictsOfSize(lenses.length),
     budget_spent: 4.5,
-    open_findings: many,
+    finding_entries: many,
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
@@ -1085,12 +1094,12 @@ test('ledger-append: when trigger_counts/verdicts alone are large enough to leav
   const calibrated = approxEnvelopeBytes(n)
   assert.ok(calibrated >= 14000 && calibrated <= 16384, `calibration failed to converge near the cap: n=${n}, ${calibrated} bytes`)
 
-  const many = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-security', location: `f${i}.js:1`, claim: `finding ${i}` }))
+  const many = manyEntries(20, 'open')
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: many,
+    finding_entries: many,
     trigger_counts: triggerCountsOfSize(n),
     verdicts: verdictsOfSize(n),
   })
@@ -1176,12 +1185,12 @@ test('ledger-append: HARNESS_LEDGER_READONLY does not touch the filesystem in an
 
 test('ledger-append: a payload so large that even dropping every finding cannot rescue it (trigger_counts/verdicts alone hugely exceed the cap) still degrades to the minimal valid record as a last resort, rather than failing the write (H3 round 2, last-resort collapse)', () => {
   const repo = makeTempRepo()
-  const many = Array.from({ length: 20 }, (_, i) => ({ lens: 'lens-security', location: `f${i}.js:1`, claim: `finding ${i}` }))
+  const many = manyEntries(20, 'open')
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: many,
+    finding_entries: many,
     // Deliberately hugely oversized (2000 entries each): comfortably over
     // 16384 bytes even with every finding dropped, so this exercises the
     // genuine last-resort path, not the progressive one.
@@ -1847,20 +1856,22 @@ test('ledger-append: a start record with no matching terminal record (run killed
   assert.equal(terminalOutcomes.length, 0, 'a reader can tell this run_id has a start but no terminal record: aborted/unterminated')
 })
 
-// ---- Finding computation moved from review-cycle.js (workflow scripts have
-// no node:crypto, so they can no longer compute findingId themselves; they
-// send raw spec_bugs/rejected_findings descriptors and ledger-append.mjs
-// computes ids and dispositions -- AC-QA-11's "derived mechanically in
-// script code" is satisfied by this being real-Node script code). ----
+// ---- Finding entries (HARN-OPT-6). review-cycle.js computes finding ids itself
+// (a pure-JS sha256) and sends the writer ids under finding_entries, never the
+// descriptors; the writer hashes nothing. The tests below send finding_entries
+// directly (see entryOf at the top of this file), so what the writer receives is
+// only ids. The id oracle, test/helpers/finding-entries.js findingId, is used by
+// the script-side tests, not here. ----
 
-test('ledger-append: computes findings + counts from raw spec_bugs/rejected_findings arrays (AC-QA-13, AC-QA-11)', () => {
+test('ledger-append: lands spec_bug and rejected entries as findings and carries the counts review-cycle.js computed (AC-QA-13, AC-QA-11)', () => {
   const repo = makeTempRepo()
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: 'no AC covers this' }],
-    rejected_findings: [{ lens: 'lens-security', location: 'bar.js:2', claim: 'false alarm', ac_id: 'AC-SEC-1' }],
+    spec_bug_count: 1,
+    rejected_finding_count: 1,
+    finding_entries: [entryOf(hexId(1), 'spec_bug', { lens: 'lens-qa' }), entryOf(hexId(2), 'rejected', { ac_id: 'AC-SEC-1' })],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.spec_bug_count, 1)
@@ -1869,105 +1880,64 @@ test('ledger-append: computes findings + counts from raw spec_bugs/rejected_find
   assert.ok(entry.findings.every((f) => f.id && f.lens && f.severity && f.disposition))
   assert.ok(entry.findings.some((f) => f.disposition === 'spec_bug'))
   assert.ok(entry.findings.some((f) => f.disposition === 'rejected' && f.ac_id === 'AC-SEC-1'))
-  assert.ok(!('spec_bugs' in entry), 'the raw descriptor array must not itself reach the schema-validated entry')
-  assert.ok(!('rejected_findings' in entry))
+  assert.ok(!('finding_entries' in entry), 'the id-bearing payload key must not itself reach the schema-validated entry')
 })
 
-test('ledger-append: spec_bugs/rejected_findings sent as null (malformed synthesis) yields null counts, not zero (AC-QA-13, AC-OPS-3)', () => {
+test('ledger-append: spec_bug_count and rejected_finding_count sent as null (not measured) stay null, not zero (AC-QA-13, AC-OPS-3)', () => {
   const repo = makeTempRepo()
-  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec_bugs: null, rejected_findings: null })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec_bug_count: null, rejected_finding_count: null, finding_entries: [] })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.spec_bug_count, null)
   assert.equal(entry.rejected_finding_count, null)
   assert.deepEqual(entry.findings, [])
 })
 
-test('ledger-append: a real empty array of spec_bugs/rejected_findings yields a genuine zero count, distinguishable from null (AC-OPS-3)', () => {
+test('ledger-append: spec_bug_count and rejected_finding_count sent as 0 stay a genuine zero, distinguishable from null (AC-OPS-3)', () => {
   const repo = makeTempRepo()
-  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec_bugs: [], rejected_findings: [] })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', spec_bug_count: 0, rejected_finding_count: 0, finding_entries: [] })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.spec_bug_count, 0)
   assert.equal(entry.rejected_finding_count, 0)
 })
 
-// Coordinator FINDING 1 (confirmed pre-existing on BOTH main and this
-// branch's tip, from a non-symlinked path -- verified directly via `git
-// show main:workflows/lib/ledger-append.mjs`, not inferred): a null element
-// in open_findings/spec_bugs/rejected_findings crashed computeFindings()
-// with an unhandled TypeError (f.lens on null) BEFORE validateEntry ever
-// ran -- Node exits non-zero, nothing written, not even a parseable
-// write_ok:false. Different code path from the M-2 findings/ac_verdicts
-// sanitiser (which already degrades cleanly): those arrays are consumed
-// AFTER computeFindings has already built entry.findings. Fixed by
-// null-guarding inside computeFindings's map, consistent with M-2's own
-// pattern: a malformed element becomes `null` in the entries array instead
-// of crashing, which flows through to entry.findings and is caught by
-// validateEntry's existing findings.items.type:'object' check -- the SAME
-// clean write_ok:false degrade, applied once so all three descriptor
-// arrays (they share this one function) get it consistently rather than
-// three separate special cases.
-for (const field of ['open_findings', 'spec_bugs', 'rejected_findings']) {
-  test(`ledger-append: a null element in ${field} degrades to a clean write_ok:false, never crashes the writer (FINDING 1)`, () => {
+// HARN-OPT-6 (AC-QA-10, AC-DATA-5): a malformed element of finding_entries (null,
+// not an object, an id outside ^[0-9a-f]{16}$, an unknown disposition) is dropped
+// and counted under invalid_record_values_dropped; a non-array finding_entries is
+// treated as empty and counted once. The writer always exits 0 and the row lands.
+// (This replaces the earlier "a null descriptor element degrades to write_ok:false"
+// tests: the writer no longer receives descriptors at all.)
+const GOOD_ENTRY = { id: 'e74fb146b7ddc6cb', lens: 'lens-security', severity: 'High', ac_id: null, disposition: 'open' }
+for (const [label, bad] of [['null', null], ['a string', 'x'], ['a number', 7], ['an id of 15 characters', { ...GOOD_ENTRY, id: 'e74fb146b7ddc6c' }], ['an uppercase id', { ...GOOD_ENTRY, id: 'E74FB146B7DDC6CB' }], ['a free-text id', { ...GOOD_ENTRY, id: 'missing auth check' }], ['an unknown disposition', { ...GOOD_ENTRY, disposition: 'wontfix' }]]) {
+  test(`ledger-append: a finding_entries element that is ${label} is dropped and counted, the good sibling is kept, and the row lands (HARN-OPT-6)`, () => {
     const repo = makeTempRepo()
-    const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', [field]: [null] })
-    assert.equal(res.status, 0, `${field}: the writer must always exit 0, even on a malformed descriptor array; got status ${res.status}, stderr: ${res.stderr}`)
-    assert.ok(res.stdout.trim().length > 0, `${field}: expected one line of JSON on stdout, got empty output (stderr: ${res.stderr})`)
+    const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: [GOOD_ENTRY, bad] })
+    assert.equal(res.status, 0, res.stderr)
     const out = JSON.parse(res.stdout.trim().split('\n').pop())
-    assert.equal(out.write_ok, false, `${field}: a null descriptor element must degrade to write_ok:false, not crash silently or succeed with garbage`)
-    assert.equal(readLedgerLines(repo).length, 0, `${field}: a rejected write must not leave a partial or malformed line on disk`)
+    assert.equal(out.write_ok, true, out.write_error)
+    const entry = JSON.parse(readLedgerLines(repo)[0])
+    assert.deepEqual(entry.findings.map((f) => f.id), [GOOD_ENTRY.id])
+    assert.equal(entry.invalid_record_values_dropped, 1)
   })
 }
 
-test('ledger-append: a null element alongside otherwise-valid descriptors in open_findings still degrades the WHOLE entry to write_ok:false, never silently drops just the bad one and keeps the rest (FINDING 1, consistency with M-2)', () => {
+test('ledger-append: a non-array finding_entries is treated as empty and counted once (HARN-OPT-6)', () => {
   const repo = makeTempRepo()
-  const res = runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'a real one' }, null],
-  })
-  assert.equal(res.status, 0)
-  const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.equal(out.write_ok, false, 'a mix of one valid and one null descriptor must still reject the whole entry, matching the M-2 findings/ac_verdicts precedent')
-})
-
-test('ledger-append: finding ids are stable across two separate invocations with identical descriptors (AC-QA-11)', () => {
-  const repoA = makeTempRepo()
-  const repoB = makeTempRepo()
-  const descriptor = { spec_bugs: [{ lens: 'lens-qa', location: 'foo.js:1', claim: 'no AC covers this' }], rejected_findings: [] }
-  runAppend(repoA, { schema_version: 1, kind: 'review_cycle', outcome: 'done', ...descriptor })
-  runAppend(repoB, { schema_version: 1, kind: 'review_cycle', outcome: 'done', ...descriptor })
-  const entryA = JSON.parse(readLedgerLines(repoA)[0])
-  const entryB = JSON.parse(readLedgerLines(repoB)[0])
-  assert.equal(entryA.findings[0].id, entryB.findings[0].id)
-})
-
-test('ledger-append: two different defects at the same file:line yield different finding ids (AC-QA-11)', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    spec_bugs: [
-      { lens: 'lens-qa', location: 'foo.js:10', claim: 'missing input validation' },
-      { lens: 'lens-qa', location: 'foo.js:10', claim: 'SQL injection via string concat' },
-    ],
-    rejected_findings: [],
-  })
+  const out = JSON.parse(runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: { id: 'e74fb146b7ddc6cb' } }).stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.notEqual(entry.findings[0].id, entry.findings[1].id)
+  assert.deepEqual(entry.findings, [])
+  assert.equal(entry.invalid_record_values_dropped, 1)
 })
 
 // ---- specs/record-fixed-findings.md: the 'fixed' disposition (AC-1..AC-4).
-// review-cycle.js's optional prior_findings argument passes through here as
-// two raw payload fields: prior_findings (findings reported open going into
-// this round) and fixed_findings (the synthesis's own claimed-resolved
-// echoes of some of those, same {lens, location, claim, severity?, ac_id?}
-// shape). The id guard (AC-3): a fixed_findings entry is only recorded
-// disposition 'fixed' when its findingId hash matches one already present
-// among prior_findings' own hashes -- fail closed, same sanitiser shape as
-// the rest of this file (drop the offending value, count it, still write
-// the record). ----
+// review-cycle.js's optional prior_findings argument reaches the writer as
+// finding_entries of disposition 'prior' (findings reported open going into
+// this round, their ids already verified in the script) and the synthesis's
+// own claimed-resolved echoes as entries of disposition 'fixed'. The id guard
+// (AC-3): a fixed entry is only recorded as fixed when its id matches one
+// already present among the prior entries' ids -- fail closed, same sanitiser
+// shape as the rest of this file (drop the offending value, count it, still
+// write the record). ----
 
 test('ledger-append: a fixed_findings entry that matches a prior_findings entry (same lens/location/claim) is recorded disposition fixed (AC-2)', () => {
   const repo = makeTempRepo()
@@ -1975,17 +1945,18 @@ test('ledger-append: a fixed_findings entry that matches a prior_findings entry 
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1' }],
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [entryOf(AUTH_ID, 'prior', { severity: 'High', ac_id: 'AC-SEC-1' }), entryOf(AUTH_ID, 'fixed')],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
-  assert.equal(fixed.length, 1, 'the matching fixed_findings entry must be recorded')
+  assert.equal(fixed.length, 1, 'the matching fixed entry must be recorded')
   assert.equal(fixed[0].lens, 'lens-security')
   assert.equal(fixed[0].ac_id, 'AC-SEC-1', 'severity/ac_id come from the matched prior_findings entry itself -- the finding as it was actually reported, not whatever the confirming echo repeats')
   assert.equal(entry.invalid_fixed_ids_dropped, 0, 'a genuinely matching entry must not be counted as dropped')
-  assert.ok(!('prior_findings' in entry), 'the raw prior_findings array must never itself reach the schema-validated entry')
-  assert.ok(!('fixed_findings' in entry), 'the raw fixed_findings array must never itself reach the schema-validated entry')
+  assert.equal(fixed[0].severity, 'High', 'severity comes from the matched prior entry too')
+  assert.ok(!('finding_entries' in entry), 'the id-bearing payload key must never itself reach the schema-validated entry')
 })
 
 test('ledger-append: a prior_findings entry with NO matching fixed_findings confirmation is not recorded fixed, even though it appears in prior_findings -- confirmation is required per finding, presence in prior_findings alone is not enough (AC-2; this does not mean the mechanism cannot be rubber-stamped overall -- see fix round 1, finding 3 -- only that an UNCONFIRMED prior finding specifically is never credited)', () => {
@@ -1994,12 +1965,14 @@ test('ledger-append: a prior_findings entry with NO matching fixed_findings conf
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    prior_findings: [
-      { id: '61c379ab4eba86b4', lens: 'lens-security', location: 'foo.js:10', claim: 'confirmed fixed this round' },
-      { id: '466a3e2f15f7cd0f', lens: 'lens-qa', location: 'bar.js:20', claim: 'still open, never confirmed' },
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [
+      entryOf('61c379ab4eba86b4', 'prior'),
+      entryOf('466a3e2f15f7cd0f', 'prior', { lens: 'lens-qa' }),
+      // Only the first prior finding is echoed back as resolved.
+      entryOf('61c379ab4eba86b4', 'fixed'),
     ],
-    // Only the first prior finding is echoed back as resolved.
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'confirmed fixed this round' }],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
@@ -2014,9 +1987,13 @@ test('ledger-append: the id guard (AC-3) -- a fixed_findings entry with no match
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    // Fabricated: this exact {lens, location, claim} was never reported open.
-    fixed_findings: [{ lens: 'lens-security', location: 'nowhere.js:1', claim: 'a finding that was never open' }],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [
+      entryOf(AUTH_ID, 'prior'),
+      // Fabricated: this id was never reported open.
+      entryOf('00000000000000aa', 'fixed'),
+    ],
   })
   assert.equal(res.status, 0)
   const entry = JSON.parse(readLedgerLines(repo)[0])
@@ -2026,175 +2003,11 @@ test('ledger-append: the id guard (AC-3) -- a fixed_findings entry with no match
   assert.equal(out.write_ok, true, 'the record must still be written -- fail closed drops only the offending value, never the whole line')
 })
 
-// ---- Fix round 2, AC-3 (specs/record-fixed-findings.md): the new trust
-// boundary. The conductor now supplies prior_findings' own `id` field
-// (sourced from a previous round's real ledger write, via review-cycle.js's
-// open_findings return value), so a MISTYPED, STALE or FABRICATED id must
-// never silently become part of the joinable set merely because it is
-// present. ledger-append.mjs recomputes findingId(lens, location, claim)
-// from that SAME entry's own supplied content and compares it to the
-// supplied id -- only an exact match is trusted. ----
-
-test('ledger-append: AC-3 -- a prior_findings entry whose supplied id does NOT match its own recomputed content (a mistyped, stale or fabricated id) is dropped, counted under invalid_prior_ids_dropped, and never becomes joinable, even though its lens/location/claim are genuine', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    // Genuine lens/location/claim, but a WRONG id (not what findingId would
-    // compute for this exact content) -- a stale id from a previous edit,
-    // a typo, or a fabricated one.
-    prior_findings: [{ id: 'wrongwrongwrong0', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-  })
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a mismatched-id prior finding must never become joinable, regardless of how genuine its content looks')
-  assert.equal(entry.invalid_prior_ids_dropped, 1, 'the mismatch must be caught and counted')
-  assert.equal(entry.invalid_fixed_ids_dropped, 1, 'with the prior entry rejected, nothing remains for the fixed_findings claim to match -- cascades correctly')
-})
-
-test('ledger-append: AC-3 -- a prior_findings entry with NO id field at all is dropped the same way as a mismatched one -- a missing id has nothing to verify and must not be trusted by default', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    prior_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }], // no `id` at all
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-  })
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0)
-  assert.equal(entry.invalid_prior_ids_dropped, 1)
-})
-
-test('ledger-append: AC-3 -- a prior_findings entry whose id GENUINELY matches its own recomputed content is trusted and joinable (not vacuous: the guard must not reject everything)', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-  })
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 1)
-  assert.equal(entry.invalid_prior_ids_dropped, 0)
-})
-
-test('ledger-append: invalid_prior_ids_dropped is a real zero (not null) when prior_findings was supplied and every id genuinely matched', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-  })
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.invalid_prior_ids_dropped, 0)
-})
-
-test('ledger-append: invalid_prior_ids_dropped is absent/null when prior_findings was never supplied at all -- verifying supplied ids is meaningful only when there is something to verify', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [] })
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.ok(entry.invalid_prior_ids_dropped === null || entry.invalid_prior_ids_dropped === undefined)
-})
-
-test('ledger-append: invalid_prior_ids_dropped is computed even when fixed_findings is entirely absent -- verifying supplied prior_findings ids does not depend on this round confirming anything', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    prior_findings: [{ id: 'wrongwrongwrong0', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    // fixed_findings omitted entirely
-  })
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.invalid_prior_ids_dropped, 1)
-})
-
-test('ledger-append: invalid_prior_ids_dropped rides on the CLI result too, same as its siblings', () => {
-  const repo = makeTempRepo()
-  const res = runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    prior_findings: [{ id: 'wrongwrongwrong0', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [],
-  })
-  const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.equal(out.invalid_prior_ids_dropped, 1)
-})
-
-// specs/record-fixed-findings.md fix round 2, AC-1: ledger-append.mjs must
-// return the REAL id it computed for each open finding, so review-cycle.js
-// can hand it back to its own caller -- the mechanism the whole cross-round
-// join depends on.
-test('ledger-append: the CLI result includes open_finding_ids -- the real ids computed for open_findings, in the SAME order they were supplied (specs/record-fixed-findings.md fix round 2, AC-1)', () => {
-  const repo = makeTempRepo()
-  const res = runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    open_findings: [
-      { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
-      { lens: 'lens-qa', location: 'bar.js:1', claim: 'a different finding' },
-    ],
-  })
-  const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.ok(Array.isArray(out.open_finding_ids), 'expected open_finding_ids on the CLI result')
-  assert.equal(out.open_finding_ids.length, 2)
-  assert.equal(out.open_finding_ids[0], 'e74fb146b7ddc6cb')
-  assert.notEqual(out.open_finding_ids[0], out.open_finding_ids[1])
-})
-
-test('ledger-append: open_finding_ids is absent/null on the CLI result when open_findings was never supplied at all', () => {
-  const repo = makeTempRepo()
-  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done' })
-  const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  assert.ok(out.open_finding_ids === null || out.open_finding_ids === undefined)
-})
-
-// Fix round 3, finding 2 (HIGH, coordinator repro): openFindingIds used to
-// be computed from EVERY open descriptor, independent of MAX_FINDINGS
-// truncation -- so a busy round (20 open findings, budgetFindings keeping
-// only 15) returned 20 ids on the CLI result while only 15 were ever
-// actually written to entry.findings. A conductor confirming one of the
-// other 5 next round would write a 'fixed' entry with NO open counterpart
-// anywhere in the ledger -- exactly the false-join AC-1 exists to prevent,
-// one layer up from the guard that already checks id authenticity.
-test('ledger-append: open_finding_ids only ever returns ids that actually survived into the written entry.findings -- a truncated-out open finding\'s id comes back null, never a phantom id nothing was recorded under (fix round 3, finding 2)', async () => {
-  const { MAX_FINDINGS } = await import(APPEND_MODULE_URL)
-  const total = MAX_FINDINGS + 5
-  const repo = makeTempRepo()
-  const many = Array.from({ length: total }, (_, i) => ({ lens: 'lens-qa', location: `f${i}.js:1`, claim: `finding ${i}` }))
-  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: many })
-  const out = JSON.parse(res.stdout.trim().split('\n').pop())
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  const writtenOpenIds = new Set(entry.findings.filter((f) => f.disposition === 'open').map((f) => f.id))
-  assert.ok(Array.isArray(out.open_finding_ids), 'expected open_finding_ids on the CLI result')
-  assert.equal(out.open_finding_ids.length, total, `positional alignment with the ${total} supplied descriptors must be preserved`)
-  const nonNullReturned = out.open_finding_ids.filter((id) => id !== null)
-  assert.equal(nonNullReturned.length, writtenOpenIds.size, 'every non-null returned id must correspond to something genuinely written')
-  for (const id of nonNullReturned) {
-    assert.ok(writtenOpenIds.has(id), `returned id ${id} was never actually written to entry.findings -- exactly the phantom-id defect this test exists to catch`)
-  }
-  assert.ok(nonNullReturned.length < total, 'sanity: this fixture must genuinely exceed MAX_FINDINGS to prove anything -- otherwise every id trivially survives')
-})
-
-test('ledger-append: a reworded finding (same lens/location, different claim text) does not match prior_findings -- the safe, undercounting direction, not an overcount (specs/record-fixed-findings.md)', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check on the admin route' }],
-  })
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'reworded text hashes differently and must not match')
-  assert.equal(entry.invalid_fixed_ids_dropped, 1)
-})
+// ---- Fix round 2, AC-3 (specs/record-fixed-findings.md): the trust boundary
+// for supplied prior ids. The check that a supplied id equals the id recomputed
+// from that finding's own lens, location and claim moved into review-cycle.js
+// (HARN-OPT-6), and test/review-cycle-finding-ids.test.js owns it. The writer
+// only reconciles fixed entries against the prior ids it is sent. ----
 
 test('ledger-append: fixed_findings sent as null (no confirmations, or an older caller) yields invalid_fixed_ids_dropped null, not zero (AC-OPS-3\'s null-vs-zero convention)', () => {
   const repo = makeTempRepo()
@@ -2202,9 +2015,7 @@ test('ledger-append: fixed_findings sent as null (no confirmations, or an older 
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [],
-    prior_findings: null,
-    fixed_findings: null,
+    finding_entries: [],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.ok(entry.invalid_fixed_ids_dropped === null || entry.invalid_fixed_ids_dropped === undefined)
@@ -2216,41 +2027,24 @@ test('ledger-append: a real empty fixed_findings array (nothing confirmed this r
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    prior_findings: [{ id: '917ec81504c953ab', lens: 'lens-qa', location: 'a.js:1', claim: 'x' }],
-    fixed_findings: [],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [entryOf('917ec81504c953ab', 'prior', { lens: 'lens-qa' })],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.invalid_fixed_ids_dropped, 0)
 })
 
-// Fix round 1, finding 7: a MALFORMED (non-array) fixed_findings reads
-// identically to "not supplied" -- both yield null, never a confident
-// zero. Distinct from the "sent as null" test above: this fixture sends a
-// genuinely wrong-shaped value (an object), not the literal null the
-// null-vs-zero convention documents most directly, and the two must be
-// proven to behave the same way, not just asserted to in a comment.
-test('ledger-append: a malformed (non-array) fixed_findings -- e.g. an object, not null and not an array -- yields invalid_fixed_ids_dropped null, the same as "not supplied" (fix round 1, finding 7)', () => {
-  const repo = makeTempRepo()
-  runAppend(repo, {
-    schema_version: 1,
-    kind: 'review_cycle',
-    outcome: 'done',
-    prior_findings: [{ id: '917ec81504c953ab', lens: 'lens-qa', location: 'a.js:1', claim: 'x' }],
-    fixed_findings: { not: 'an array' },
-  })
-  const entry = JSON.parse(readLedgerLines(repo)[0])
-  assert.ok(entry.invalid_fixed_ids_dropped === null || entry.invalid_fixed_ids_dropped === undefined, `expected null/absent, got ${entry.invalid_fixed_ids_dropped}`)
-  assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0)
-})
-
-test('ledger-append: fixed_findings is not gated on prior_findings\' own presence -- an absent/malformed prior_findings still drops every claimed-fixed entry (fails closed, never falls open)', () => {
+test('ledger-append: fixed entries are not gated on prior entries\' own presence -- no prior entry still drops every claimed-fixed entry (fails closed, never falls open)', () => {
   const repo = makeTempRepo()
   const res = runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    // prior_findings omitted entirely
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    // no prior entry at all
+    finding_entries: [entryOf(AUTH_ID, 'fixed')],
   })
   assert.equal(res.status, 0)
   const entry = JSON.parse(readLedgerLines(repo)[0])
@@ -2271,12 +2065,9 @@ test('ledger-append: duplicate fixed_findings entries (same lens/location/claim,
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High', ac_id: 'AC-SEC-1' }],
-    fixed_findings: [
-      { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
-      { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
-      { lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' },
-    ],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [entryOf(AUTH_ID, 'prior', { severity: 'High', ac_id: 'AC-SEC-1' }), entryOf(AUTH_ID, 'fixed'), entryOf(AUTH_ID, 'fixed'), entryOf(AUTH_ID, 'fixed')],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
@@ -2291,8 +2082,9 @@ test('ledger-append: duplicate_fixed_ids_dropped is a real zero (not null) when 
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [entryOf(AUTH_ID, 'prior'), entryOf(AUTH_ID, 'fixed')],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.duplicate_fixed_ids_dropped, 0)
@@ -2300,7 +2092,7 @@ test('ledger-append: duplicate_fixed_ids_dropped is a real zero (not null) when 
 
 test('ledger-append: duplicate_fixed_ids_dropped is absent/null when fixed_findings was never supplied at all', () => {
   const repo = makeTempRepo()
-  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: [] })
+  runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: [] })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.ok(entry.duplicate_fixed_ids_dropped === null || entry.duplicate_fixed_ids_dropped === undefined)
 })
@@ -2310,15 +2102,15 @@ test('ledger-append: duplicate_fixed_ids_dropped is absent/null when fixed_findi
 // synthesis (wrongly, or maliciously) confirms it -- open and fixed on the
 // same id, same line, is a contradiction the writer can detect and must
 // refuse, not merely note.
-test('ledger-append: a finding present in BOTH open_findings and a matching fixed_findings confirmation, on the same line, is never recorded fixed -- reconciled to open, the contradiction counted (fix round 1, finding 8)', () => {
+test('ledger-append: a finding present as BOTH an open entry and a matching fixed confirmation, on the same line, is never recorded fixed -- reconciled to open, the contradiction counted (fix round 1, finding 8)', () => {
   const repo = makeTempRepo()
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [entryOf(AUTH_ID, 'open'), entryOf(AUTH_ID, 'prior'), entryOf(AUTH_ID, 'fixed')],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a finding still open this round must never ALSO be recorded fixed')
@@ -2332,15 +2124,15 @@ test('ledger-append: a finding present in BOTH open_findings and a matching fixe
 // fixed on the same line, same id -- "false alarm" and "now fixed" are
 // contradictory, and aggregateRework would otherwise count both against
 // the same lens.
-test('ledger-append: a finding present in BOTH rejected_findings and a matching fixed_findings confirmation, on the same line, is never recorded fixed -- reconciled to rejected, the contradiction counted (fix round 3, finding 5)', () => {
+test('ledger-append: a finding present as BOTH a rejected entry and a matching fixed confirmation, on the same line, is never recorded fixed -- reconciled to rejected, the contradiction counted (fix round 3, finding 5)', () => {
   const repo = makeTempRepo()
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    rejected_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [entryOf(AUTH_ID, 'rejected'), entryOf(AUTH_ID, 'prior'), entryOf(AUTH_ID, 'fixed')],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a finding rejected as a false alarm this round must never ALSO be recorded fixed')
@@ -2349,15 +2141,15 @@ test('ledger-append: a finding present in BOTH rejected_findings and a matching 
 })
 
 // Fix round 3, finding 5: the same reconciliation for spec_bugs.
-test('ledger-append: a finding present in BOTH spec_bugs and a matching fixed_findings confirmation, on the same line, is never recorded fixed -- reconciled to spec_bug, the contradiction counted (fix round 3, finding 5)', () => {
+test('ledger-append: a finding present as BOTH a spec_bug entry and a matching fixed confirmation, on the same line, is never recorded fixed -- reconciled to spec_bug, the contradiction counted (fix round 3, finding 5)', () => {
   const repo = makeTempRepo()
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    prior_findings: [{ id: 'e74fb146b7ddc6cb', lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
-    fixed_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check' }],
+    invalid_fixed_ids_dropped: 0,
+    duplicate_fixed_ids_dropped: 0,
+    finding_entries: [entryOf(AUTH_ID, 'spec_bug'), entryOf(AUTH_ID, 'prior'), entryOf(AUTH_ID, 'fixed')],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings.filter((f) => f.disposition === 'fixed').length, 0, 'a finding flagged as a spec bug this round must never ALSO be recorded fixed')
@@ -2365,29 +2157,9 @@ test('ledger-append: a finding present in BOTH spec_bugs and a matching fixed_fi
   assert.equal(entry.invalid_fixed_ids_dropped, 1, 'the contradictory confirmation must be counted, not silently dropped')
 })
 
-// L10: findingId's location component was never independently exercised --
-// every existing test either held location fixed while varying claim, or
-// varied claim alongside location together, so removing the location
-// argument entirely (or its trim/lowercase normalisation) changed no
-// existing test's outcome.
-test('ledger-append module: findingId varies with location alone, holding lens and claim fixed (L10, AC-QA-11)', async () => {
-  const { findingId } = await import(APPEND_MODULE_URL)
-  const a = findingId('lens-qa', 'foo.js:10', 'same claim text')
-  const b = findingId('lens-qa', 'bar.js:20', 'same claim text')
-  assert.notEqual(a, b, 'two different locations for the identical lens+claim must yield different ids')
-})
-
-test('ledger-append module: findingId normalises location (trim + lowercase) so cosmetic variants of the SAME location yield the SAME id (L10, AC-QA-11)', async () => {
-  const { findingId } = await import(APPEND_MODULE_URL)
-  const base = findingId('lens-qa', 'foo.js:10', 'same claim text')
-  assert.equal(findingId('lens-qa', '  foo.js:10  ', 'same claim text'), base, 'leading/trailing whitespace must not change the id')
-  assert.equal(findingId('lens-qa', 'FOO.JS:10', 'same claim text'), base, 'case must not change the id')
-})
-
 // ---- Unit tests for the pure functions, relocated from the now-deleted
-// workflows/lib/ledger.mjs: they live in ledger-append.mjs now, since it is
-// the sole real-Node script permitted to use node:crypto and own the
-// schema; workflow scripts cannot import them (see docs/pr1-mutation-proofs.md). ----
+// workflows/lib/ledger.mjs: they live in ledger-append.mjs now, since it owns
+// the schema; workflow scripts cannot import them (see docs/pr1-mutation-proofs.md). ----
 
 test('ledger-append module: exposes a hard-coded relative path, not a configurable one (AC-SIMP-2)', async () => {
   const { LEDGER_RELATIVE_PATH } = await import(APPEND_MODULE_URL)
@@ -2451,16 +2223,6 @@ test('ledger-append: invoking the writer through a SYMLINKED path to the script 
   assert.equal(out.write_ok, true, `expected a real write through the symlinked path, got: ${JSON.stringify(out)}`)
   const lines = readLedgerLines(repo)
   assert.equal(lines.length, 1, `expected exactly one real ledger line written through the symlinked invocation, got ${lines.length}`)
-})
-
-test('ledger-append module: findingId is stable for the same lens+location+claim', async () => {
-  const { findingId } = await import(APPEND_MODULE_URL)
-  assert.equal(findingId('lens-security', 'foo.js:10', 'x'), findingId('lens-security', 'foo.js:10', 'x'))
-})
-
-test('ledger-append module: findingId differs across lenses for identical location and claim text', async () => {
-  const { findingId } = await import(APPEND_MODULE_URL)
-  assert.notEqual(findingId('lens-security', 'foo.js:10', 'same'), findingId('lens-qa', 'foo.js:10', 'same'))
 })
 
 test('ledger-append module: validateEntry rejects an entry with an unknown top-level property (additionalProperties:false, AC-SEC-2)', async () => {
@@ -2638,20 +2400,20 @@ test('ledger-append module: MAX_LINE_BYTES is 16 KB (H3 round 2: 2048 made a rea
   assert.equal(MAX_LINE_BYTES, 16384)
 })
 
-test('ledger-append: computes an "open" disposition for open_findings, alongside spec_bug/rejected (H5)', () => {
+test('ledger-append: lands an "open" entry with its disposition, lens and severity (H5)', () => {
   const repo = makeTempRepo()
   runAppend(repo, {
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: 'lens-security', location: 'foo.js:10', claim: 'missing auth check', severity: 'High' }],
+    finding_entries: [entryOf(AUTH_ID, 'open', { severity: 'High' })],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   assert.equal(entry.findings.length, 1)
   assert.equal(entry.findings[0].disposition, 'open')
   assert.equal(entry.findings[0].lens, 'lens-security')
   assert.equal(entry.findings[0].severity, 'High')
-  assert.ok(!('open_findings' in entry), 'the raw descriptor array must not itself reach the schema-validated entry')
+  assert.ok(!('finding_entries' in entry), 'the id-bearing payload key must not itself reach the schema-validated entry')
 })
 
 test('ledger-append: open, spec_bug and rejected findings all coexist in the same findings array with distinct dispositions (H5)', () => {
@@ -2660,9 +2422,7 @@ test('ledger-append: open, spec_bug and rejected findings all coexist in the sam
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: 'lens-security', location: 'a.js:1', claim: 'open one', severity: 'High' }],
-    spec_bugs: [{ lens: 'lens-qa', location: 'b.js:2', claim: 'spec bug one' }],
-    rejected_findings: [{ lens: 'lens-qa', location: 'c.js:3', claim: 'rejected one' }],
+    finding_entries: [entryOf(hexId(1), 'open', { severity: 'High' }), entryOf(hexId(2), 'spec_bug', { lens: 'lens-qa' }), entryOf(hexId(3), 'rejected', { lens: 'lens-qa' })],
   })
   const entry = JSON.parse(readLedgerLines(repo)[0])
   const byDisposition = Object.fromEntries(entry.findings.map((f) => [f.disposition, f]))
@@ -2686,7 +2446,7 @@ test('ledger-append: a finding\'s "lens" field is constrained to the roster patt
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: hostileLens, location: 'x', claim: 'y' }],
+    finding_entries: [entryOf(hexId(1), 'spec_bug', { lens: hostileLens })],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, `expected the write to succeed with the hostile lens sanitised, got: ${out.write_error}`)
@@ -2727,7 +2487,7 @@ test('ledger-append: a finding\'s "ac_id" field is constrained to the AC-<LENS>-
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: 'lens-qa', location: 'x', claim: 'y', ac_id: hostileAcId }],
+    finding_entries: [entryOf(hexId(1), 'spec_bug', { lens: 'lens-qa', ac_id: hostileAcId })],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, `expected the write to succeed with the hostile ac_id sanitized, got: ${out.write_error}`)
@@ -2759,8 +2519,7 @@ test('ledger-append: a genuine lens name and a genuine AC id both pass through n
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    spec_bugs: [{ lens: 'lens-security', location: 'x', claim: 'y', ac_id: 'AC-SEC-1' }],
-    rejected_findings: [{ lens: 'reviewer-verification', location: 'x', claim: 'y' }],
+    finding_entries: [entryOf(hexId(1), 'spec_bug', { ac_id: 'AC-SEC-1' }), entryOf(hexId(2), 'rejected', { lens: 'reviewer-verification' })],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
@@ -3743,14 +3502,8 @@ test('ledger-append: all nine of AC-QA-3\'s hostile spec inputs, driven through 
 // manufacturing exactly the orphan class this PR exists to eliminate. ----
 
 // `findings`/`ac_verdicts` supplied DIRECTLY (the already-computed shape,
-// as the review's own reproduction used), not via spec_bugs/rejected_
-// findings/open_findings -- those raw-input fields route through
-// computeFindings() first, which has its OWN, separate, PRE-EXISTING
-// null-element crash on `main` too (confirmed: `open_findings:[null]`
-// throws identically on both trees at computeFindings' `f.lens` access).
-// That is a real bug, but not a regression this PR introduced and not
-// something the review flagged -- out of scope for this round, noted for
-// the coordinator rather than silently fixed.
+// as the review's own reproduction used). A null element of finding_entries
+// is a counted drop, covered by the finding_entries tests above.
 test('ledger-append: a null element in findings or ac_verdicts degrades to a clean write_ok:false (matching main\'s pre-existing behaviour for this exact input), never a script crash (M-2, regression against main introduced by round-1 M3)', () => {
   const repo = makeTempRepo()
   const cases = [
@@ -4080,7 +3833,7 @@ test('ledger-append (AC-SEC-1, D1): end to end, an AC-A11Y id is stored with no 
     schema_version: 1,
     kind: 'review_cycle',
     outcome: 'done',
-    open_findings: [{ lens: 'lens-accessibility', location: 'a.html:1', claim: 'x', ac_id: 'AC-A11Y-1' }],
+    finding_entries: [entryOf(hexId(1), 'open', { lens: 'lens-accessibility', ac_id: 'AC-A11Y-1' })],
     ac_verdicts: [{ ac_id: 'AC-A11Y-2', verdict: 'PASS' }],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
@@ -4270,12 +4023,8 @@ test('ledger-append (D3): every finding that did not fit the array is counted in
   const repo = makeTempRepo()
   // Findings from two lenses, well past MAX_FINDINGS.
   const total = MAX_FINDINGS + 40
-  const open = Array.from({ length: total }, (_, i) => ({
-    lens: i % 2 === 0 ? 'lens-qa' : 'lens-security',
-    location: `f${i}.js:1`,
-    claim: `finding ${i}`,
-  }))
-  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: open })
+  const open = Array.from({ length: total }, (_, i) => entryOf(hexId(i + 1), 'open', { lens: i % 2 === 0 ? 'lens-qa' : 'lens-security' }))
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: open })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
@@ -4316,12 +4065,10 @@ test('ledger-append (D3): findings_truncated keeps counting through the byte-shr
   // measured 1,814 bytes -- it never entered the loop at all and passed for
   // an unrelated reason. What DOES fill a line is a multi-spec review's
   // ac_verdicts, which is D2's own case, so the pressure comes from there.
-  const open = Array.from({ length: 40 }, (_, i) => ({
-    lens: 'lens-qa', location: `f${i}.js:1`, claim: `finding ${i}`,
-  }))
+  const open = manyEntries(40, 'open', { lens: 'lens-qa' })
   const widePrefix = 'x'.repeat(40)
   const acVerdicts = Array.from({ length: MAX_AC_VERDICTS }, (_, i) => ({ ac_id: `${widePrefix} AC-QA-${i}`, verdict: 'PASS' }))
-  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', open_findings: open, ac_verdicts: acVerdicts })
+  const res = runAppend(repo, { schema_version: 1, kind: 'review_cycle', outcome: 'done', finding_entries: open, ac_verdicts: acVerdicts })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const entry = JSON.parse(readLedgerLines(repo)[0])
@@ -4362,7 +4109,7 @@ test('ledger-append (H2): an oversized ac_id is quarantined and the record survi
   const res = runAppend(repo, {
     schema_version: 1, kind: 'review_cycle', outcome: 'done',
     ac_verdicts: [{ ac_id: huge, verdict: 'PASS' }, { ac_id: 'AC-QA-1', verdict: 'FAIL' }],
-    open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'x' }],
+    finding_entries: [entryOf(hexId(1), 'open', { lens: 'lens-qa' })],
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
@@ -4414,9 +4161,7 @@ test('ledger-append (AC-QA-7): the largest round that must fit is written WHOLE 
   assert.ok(N_FINDINGS <= MAX_FINDINGS, 'the busiest measured round must be within the cap')
   const repo = makeTempRepo()
   const lenses = ['lens-qa', 'lens-security', 'lens-product', 'lens-architecture', 'lens-data', 'lens-operability', 'lens-design', 'lens-accessibility']
-  const open = Array.from({ length: N_FINDINGS }, (_, i) => ({
-    lens: lenses[i % lenses.length], location: `f${i}.js:1`, claim: `finding number ${i}, a realistic sentence of prose`,
-  }))
+  const open = Array.from({ length: N_FINDINGS }, (_, i) => entryOf(hexId(i + 1), 'open', { lens: lenses[i % lenses.length] }))
   // A 25-character spec prefix: the realistic multi-spec citation form the
   // spec's own byte measurement is taken against, not the 40-character
   // pattern maximum (which the boundary guard below measures instead).
@@ -4429,7 +4174,7 @@ test('ledger-append (AC-QA-7): the largest round that must fit is written WHOLE 
     lenses_run: lenses,
     verdicts: Object.fromEntries(lenses.map((l) => [l, 'FINDINGS'])),
     trigger_counts: Object.fromEntries(lenses.map((l) => [l, 1])),
-    open_findings: open,
+    finding_entries: open,
     ac_verdicts: acVerdicts,
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
@@ -4471,9 +4216,7 @@ test('ledger-append (H1, round 3): past the byte budget (the widest accepted 40-
   const { MAX_FINDINGS, MAX_AC_VERDICTS } = await import(APPEND_MODULE_URL)
   const repo = makeTempRepo()
   const lenses = ['lens-qa', 'lens-security', 'lens-product', 'lens-architecture', 'lens-data', 'lens-operability', 'lens-design', 'lens-accessibility']
-  const open = Array.from({ length: MAX_FINDINGS }, (_, i) => ({
-    lens: lenses[i % lenses.length], location: `f${i}.js:1`, claim: `finding number ${i}, a realistic sentence of prose`,
-  }))
+  const open = Array.from({ length: MAX_FINDINGS }, (_, i) => entryOf(hexId(i + 1), 'open', { lens: lenses[i % lenses.length] }))
   // The widest accepted PREFIXED form (decision 2's own bound): a 40-character
   // prefix, the separator, then an ordinary AC-QA-<n> id -- exactly the shape
   // the round-2 report's own repro varied.
@@ -4488,7 +4231,7 @@ test('ledger-append (H1, round 3): past the byte budget (the widest accepted 40-
     outcome: 'done',
     lenses_run: lenses,
     verdicts: Object.fromEntries(lenses.map((l) => [l, 'FINDINGS'])),
-    open_findings: open,
+    finding_entries: open,
     ac_verdicts: acVerdicts,
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
@@ -4528,9 +4271,7 @@ test('ledger-append (H1, fix round 4): 400 findings with 400 DISTINCT lens names
   // the hostile case is not a malformed name, it is a legitimate-looking
   // one arriving 400 times over.
   const lensName = (i) => `lens-${String.fromCharCode(97 + Math.floor(i / 676) % 26)}${String.fromCharCode(97 + Math.floor(i / 26) % 26)}${String.fromCharCode(97 + (i % 26))}`
-  const rejected = Array.from({ length: 400 }, (_, i) => ({
-    lens: lensName(i), location: `f${i}.js:1`, claim: `finding ${i}`,
-  }))
+  const rejected = Array.from({ length: 400 }, (_, i) => entryOf(hexId(i + 1), 'rejected', { lens: lensName(i) }))
   assert.equal(new Set(rejected.map((f) => f.lens)).size, 400, 'precondition: the fixture really does carry 400 DISTINCT lens names')
   for (const f of rejected) {
     assert.match(f.lens, /^(lens|reviewer)-[a-z]+$/, 'precondition: every name is one the lens gate accepts, so the writer cannot dismiss them as malformed')
@@ -4542,7 +4283,8 @@ test('ledger-append (H1, fix round 4): 400 findings with 400 DISTINCT lens names
     lenses_run: ['lens-qa', 'lens-security'],
     verdicts: { 'lens-qa': 'FINDINGS', 'lens-security': 'CLEAN' },
     trigger_counts: { 'lens-qa': 1, 'lens-security': 1 },
-    rejected_findings: rejected,
+    rejected_finding_count: rejected.length, // counted by review-cycle.js, which sends it beside the entries
+    finding_entries: rejected,
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)

@@ -35,7 +35,7 @@ test.before(async () => {
 
 // ---- fake-runtime fixtures (same shapes as test/review-cycle.test.js) ----
 
-const LEDGER_OK = { run_id: 'r1', ts: '2026-10-11T00:00:00.000Z', write_ok: true, write_error: null }
+const LEDGER_OK = { run_id: '3c9d1e62-5a7b-4f08-8e21-9b4d6c0a7f13', ts: '2026-10-11T00:00:00.000Z', write_ok: true, write_error: null }
 const SHA = 'abcdef1234567890'
 const TREE = '1111111111111111111111111111111111111111'
 const SCOPE_OK = {
@@ -98,10 +98,12 @@ test('T4 round: absent writes null on the WRITTEN line for both rows, never 0 an
   }
 })
 
-test('T4 round: the workflow does not validate; hostile values reach the writer verbatim for the schema to neutralise', async () => {
+// HARN-OPT-6 fix round 2 (G) reverses the original T4 behaviour: caller text no longer reaches the payload as a round.
+test('T4 round: only a positive integer reaches the payload; anything else is dropped and counted once', async () => {
   for (const bad of ['2; rm -rf', -1, 1.5, '2', 0]) {
     const { terminal } = await review({ round: bad })
-    assert.deepStrictEqual(terminal.round, bad, `value ${JSON.stringify(bad)}`)
+    assert.ok(!('round' in terminal), `value ${JSON.stringify(bad)}`)
+    assert.equal(terminal.invalid_record_values_dropped, 1, `value ${JSON.stringify(bad)}`)
   }
 })
 

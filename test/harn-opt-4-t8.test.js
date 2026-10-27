@@ -183,9 +183,11 @@ function staleWriter(key, accepted, { alwaysRefuseTerminal = false, error = `rec
     const p = extractLedgerPayload(prompt)
     n += 1
     const terminal = p.outcome !== 'started'
-    if (terminal && (key in p || alwaysRefuseTerminal)) return { run_id: `w${n}`, ts: 't', write_ok: false, write_error: error }
+    // UUID-shaped, as the real writer mints: review-cycle.js reuses a start run_id only when it is (AC-SEC-2).
+    const runId = `7b1e4c52-0a3d-4f6e-9c1b-${String(n).padStart(12, '0')}`
+    if (terminal && (key in p || alwaysRefuseTerminal)) return { run_id: runId, ts: 't', write_ok: false, write_error: error }
     accepted.push(p)
-    return { run_id: `w${n}`, ts: 't', write_ok: true, write_error: null }
+    return { run_id: runId, ts: 't', write_ok: true, write_error: null }
   }
 }
 
