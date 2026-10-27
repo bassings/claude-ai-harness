@@ -89,7 +89,8 @@ test('AC-PROD-1/AC-ARCH-6: result.open_findings is an array carrying in-script i
 })
 
 test('AC-OPS-4: a writer refusing the findings key ends write_ok false and never retries without it', async () => {
-  const refusal = { run_id: null, ts: null, write_ok: false, write_error: `${FINDINGS_KEY}: not an allowed property` }
+  // run_id and ts are strings so the scripted refusal passes the writeLedger response schema and reaches the refused-key retry; null here fails the schema first and the retry is never consulted.
+  const refusal = { run_id: 'r1', ts: '2026-08-10T00:00:00.000Z', write_ok: false, write_error: `${FINDINGS_KEY}: not an allowed property` }
   const { result, calls, logs } = await runWorkflow(WF, { args: {}, agent: agentWithTwoFindings({ 'ledger:write': [LEDGER_OK, refusal, LEDGER_OK] }) })
   assert.ok(Object.hasOwn(terminalPayload(calls), FINDINGS_KEY), 'the terminal payload must carry the findings key for the refusal to be about it')
   assert.equal(calls.filter((c) => c.opts.label === 'ledger:write').length, 2, 'the refused-key retry must not run for the findings key')

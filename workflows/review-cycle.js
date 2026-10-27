@@ -1725,6 +1725,24 @@ const PAYLOAD_ROSTER_LENSES = [
 const PAYLOAD_SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 const PAYLOAD_VERDICTS = ['PASS', 'FAIL', 'UNVERIFIABLE']
 const payloadDrops = { ac_ids: 0, finding_fields: 0, record_values: 0 }
+// AC-SEC-2: round_key and lens_checkout_drift values are commit hashes. The
+// drift values come from lens self-reports, so a non-conforming one is dropped
+// (the writer's schema takes strings only) and counted, never emitted.
+const PAYLOAD_SHA_RE = /^[0-9a-f]{7,64}$/
+function payloadRoundKey(value) {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string' && PAYLOAD_SHA_RE.test(value)) return value
+  payloadDrops.record_values += 1
+  return null
+}
+function payloadCheckoutDrift(drift) {
+  const out = {}
+  for (const [lens, sha] of Object.entries(drift || {})) {
+    if (PAYLOAD_LENS_RE.test(lens) && typeof sha === 'string' && PAYLOAD_SHA_RE.test(sha)) out[lens] = sha
+    else payloadDrops.record_values += 1
+  }
+  return out
+}
 function payloadLens(label, count = true) {
   if (typeof label === 'string' && PAYLOAD_LENS_RE.test(label)) return label
   if (typeof label === 'string') {
@@ -1841,15 +1859,17 @@ try {
   log(`Run ${startRunId || 'unknown'} threw before producing a result: ${redactLogText(e && e.message ? e.message : String(e))}`)
 } // end PR 2 exception guard
 const { __outcome, ...result } = raw
+const payloadRoundKeyValue = payloadRoundKey(headSha)
+const payloadDriftValue = payloadCheckoutDrift(lensCheckoutDrift)
 const telemetry = {
   outcome: __outcome || 'aborted',
   spec: specPath,
   ...roundField,
-  round_key: headSha,
+  round_key: payloadRoundKeyValue,
   lenses_run: result.lenses || lensesRunRaw,
   lenses_skipped: result.skipped || [],
   trigger_counts: triggerCounts,
-  lens_checkout_drift: lensCheckoutDrift,
+  lens_checkout_drift: payloadDriftValue,
   // Omitted entirely, not written as null, when lens-architecture did not run
   // (review I). ledger-append.mjs has additionalProperties:false, so a NEW
   // workflow writing to an OLDER installed copy of that library has its whole
@@ -1894,6 +1914,11 @@ const payloadAcVerdictList = payloadAcVerdicts(acVerdicts)
 {
   // AC-OPS-6: one line naming each non-zero count and its reason, only when
   // something was dropped, the way invalid_ac_ids_dropped is logged.
+  // invalid_fixed_ids_dropped and duplicate_fixed_ids_dropped are not in this
+  // line: the writer computes them while reconciling fixed_findings against the
+  // verified prior ids, and the pinned writeLedger response carries only
+  // run_id, ts, write_ok, write_error and invalid_ac_ids_dropped, so this script
+  // never sees them. They are on the ledger row itself.
   const drops = [
     [priorVerified ? priorVerified.invalid : 0, 'invalid_prior_ids_dropped', 'a prior_findings entry whose id did not match the id recomputed from its own lens, location and claim'],
     [payloadDrops.ac_ids, 'invalid_ac_ids_dropped', 'a non-conforming ac_id was nulled'],

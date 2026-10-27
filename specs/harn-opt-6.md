@@ -44,6 +44,18 @@ review-cycle.js with a pure-JS sha256 (workflow scripts have no
 hash must match Node's for every input, including lone surrogates; it must
 NOT copy `toBase64`'s encoder, which differs on lone surrogates (AC-QA-2).
 
+Payload size (AC-QA-9). The byte sizes of the four stopped HARN-OPT-5
+payloads cannot be recovered: they were stopped before the writer ran and were
+never written anywhere. So
+the limit is measured on the new path instead, from base64 payloads handed to
+the ledger write prompt: a typical review_cycle terminal payload (three
+findings, ASCII text) is 1,376 bytes, and the largest payload the writer
+accepts (60 findings across the dispositions, prior and fixed at 60, 96
+ac_verdicts, seven lenses, compound lens labels, 2000-character non-ASCII
+claims and locations) is 31,888 bytes. The ceiling is 40,000 bytes, about a
+quarter above the largest measured payload; the test in
+test/harn-opt-6-gap.test.js fails if a payload built to those limits reaches it.
+
 ## Not in scope
 
 - Changing the ledger file's location, its gitignore discipline, or the
