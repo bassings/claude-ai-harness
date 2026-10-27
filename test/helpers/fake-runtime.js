@@ -113,6 +113,15 @@ const REJECTIONS = [
   { name: 'process (a Node global, absent from the workflow runtime)', re: /\bprocess\.[A-Za-z_$]/ },
   { name: 'require() (workflow scripts are self-contained; no module loading of any kind)', re: /\brequire\s*\(/ },
   { name: '__dirname/__filename (Node module globals, absent from the workflow runtime)', re: /\b__(dirname|filename)\b/ },
+  // HARN-OPT-6 (AC-QA-8): review-cycle.js now carries a pure-JS sha256 and UTF-8 encoder because the runtime has
+  // none of these. A double that provided them would certify a rewrite that quietly reaches for one (the same way
+  // Buffer did), so a script that mentions any of them as code is refused at load. No live-runtime probe recorded
+  // here shows any of them present; if one does, remove it from this list in the same change that records the probe.
+  { name: 'TextEncoder (absent from the workflow runtime)', re: /\bTextEncoder\b/ },
+  { name: 'TextDecoder (absent from the workflow runtime)', re: /\bTextDecoder\b/ },
+  { name: 'atob (absent from the workflow runtime)', re: /\batob\b/ },
+  { name: 'btoa (absent from the workflow runtime)', re: /\bbtoa\b/ },
+  { name: 'crypto (a bare global or globalThis.crypto; absent from the workflow runtime, which also has no node:crypto)', re: /\bcrypto\b/ },
   // These match USE, not mention. The first cut used /\bBuffer\b/ and
   // /\bprocess\s*\./, and the second immediately failed optimise-cycle.js on
   // the word "process." inside its own prose description ("pipelines or

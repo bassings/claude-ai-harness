@@ -146,7 +146,10 @@ test('seam: review_cycle with prior_findings supplied, whose synthesis confirms 
     },
   })
   const payload = terminalPayload(calls)
-  assert.deepEqual(payload.prior_findings, PRIOR, 'the caller\'s prior_findings must ride through to the ledger payload unchanged')
+  // HARN-OPT-6: the caller's prior_findings ride to the writer as VERIFIED IDS only, never as descriptors.
+  assert.ok(!('prior_findings' in payload), 'the descriptors must not ride through to the ledger payload')
+  assert.deepEqual(payload.finding_entries.filter((e) => e.disposition === 'prior').map((e) => e.id), [PRIOR[0].id], 'the verified prior id rides through')
+  assert.equal(payload.invalid_prior_ids_dropped, 0)
   const entry = pipeAndAssertWritten(payload, 'review_cycle with prior_findings')
   const fixed = entry.findings.filter((f) => f.disposition === 'fixed')
   assert.equal(fixed.length, 1, 'the confirmed finding must reach the ledger line as disposition fixed')
@@ -197,7 +200,7 @@ test('seam: review_cycle with prior_findings supplied, whose synthesis fabricate
 // specs/record-fixed-findings.md, fix round 2, AC-1: the whole point of the
 // feature, proven end to end -- a finding raised open in round one and
 // confirmed fixed in round two must carry the SAME id across BOTH REAL
-// ledger lines, so a reader can join them. Not a unit test of findingId:
+// ledger lines, so a reader can join them. Not a unit test of the id hash:
 // this drives the actual `ledger:write` agent step through the REAL
 // ledger-append.mjs (never a hand-built payload), against ONE real temp
 // repo shared by both rounds, exactly the way a real run and a real
@@ -232,8 +235,9 @@ test('seam: a finding raised open in round one and confirmed fixed in round two 
   // Round one: no prior_findings supplied (round one never has any). One
   // lens reports one finding. The 'ledger:write' step is the REAL
   // ledger-append.mjs, run against `repo` -- so this round's own returned
-  // open_findings (with the REAL id ledger-append.mjs computed) is exactly
-  // what review-cycle.js's own production code would hand a conductor.
+  // open_findings (with the id review-cycle.js computed, which the writer
+  // then wrote verbatim) is exactly what review-cycle.js's own production
+  // code would hand a conductor.
   const round1 = await runWorkflow(WF, {
     args: {},
     agent: {

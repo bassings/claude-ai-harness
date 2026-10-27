@@ -2290,26 +2290,29 @@ test('static: the AC-definition counter recognises every lens prefix the ledger 
   }
 })
 
-// Review round 2 L2: ROSTER_LENSES in workflows/lib/ledger-append.mjs is a
-// hand-copied list of the agents/ files, and its own comment says a name
-// missing there silently costs attribution (a compound label resolves to
+// Review round 2 L2, moved by HARN-OPT-6: PAYLOAD_ROSTER_LENSES in
+// workflows/review-cycle.js is a hand-copied list of the agents/ files (the
+// compound-label resolution moved out of the writer into that script), and a
+// name missing there silently costs attribution (a compound label resolves to
 // null and the finding reads as unattributed) rather than failing anything.
 // A new lens file added without touching that list would therefore drift
-// unnoticed. Checked in BOTH directions: a lens file the set lacks, and a set
+// unnoticed. Checked in BOTH directions: a lens file the list lacks, and a list
 // entry with no file behind it. implementer.md is the one agents/ file that
 // is not a reviewing lens.
-test('ledger-append.mjs ROSTER_LENSES matches the lens files in agents/ in both directions (review round 2 L2)', async () => {
-  const { pathToFileURL } = require('node:url')
-  const { ROSTER_LENSES } = await import(pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'ledger-append.mjs')).href)
+test('review-cycle.js PAYLOAD_ROSTER_LENSES matches the lens files in agents/ in both directions (review round 2 L2, HARN-OPT-6)', () => {
+  const source = readAll('workflows', 'review-cycle.js')
+  const match = /const PAYLOAD_ROSTER_LENSES = \[([^\]]*)\]/.exec(source)
+  assert.ok(match, 'could not locate PAYLOAD_ROSTER_LENSES in review-cycle.js')
+  const roster = new Set([...match[1].matchAll(/'([^']+)'/g)].map((m) => m[1]))
   const expected = new Set(
     fs.readdirSync(path.join(ROOT, 'agents'))
       .filter((f) => f.endsWith('.md') && f !== 'implementer.md')
       .map((f) => f.slice(0, -'.md'.length)),
   )
-  const missing = [...expected].filter((n) => !ROSTER_LENSES.has(n))
-  const extra = [...ROSTER_LENSES].filter((n) => !expected.has(n))
-  assert.deepEqual(missing, [], `agents/ has lens file(s) missing from ROSTER_LENSES in ledger-append.mjs: ${missing.join(', ')}`)
-  assert.deepEqual(extra, [], `ROSTER_LENSES in ledger-append.mjs names lens(es) with no file in agents/: ${extra.join(', ')}`)
+  const missing = [...expected].filter((n) => !roster.has(n))
+  const extra = [...roster].filter((n) => !expected.has(n))
+  assert.deepEqual(missing, [], `agents/ has lens file(s) missing from PAYLOAD_ROSTER_LENSES in review-cycle.js: ${missing.join(', ')}`)
+  assert.deepEqual(extra, [], `PAYLOAD_ROSTER_LENSES in review-cycle.js names lens(es) with no file in agents/: ${extra.join(', ')}`)
 })
 
 // HARN-OPT-4 T4 (AC-QA-14): the conductor's review-invocation step must name

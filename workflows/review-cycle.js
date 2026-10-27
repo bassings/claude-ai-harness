@@ -437,17 +437,18 @@ const roundField = opts.round === undefined ? {} : { round: opts.round }
 // severity?, ac_id?}. Fix round 3, finding 3: `id` is REQUIRED, not
 // optional -- it must be the exact value THIS workflow returned as
 // open_findings[].id in an earlier round (see result.open_findings,
-// below). ledger-append.mjs recomputes findingId(lens, location, claim)
-// from each entry's own content and refuses one whose supplied id does
-// not match: a caller that builds this shape without a genuine, sourced
-// id gets every entry dropped (invalid_prior_ids_dropped), zero fixed
-// entries, and no error -- only two counters as the trace. Absent on
-// round one, and on every caller that predates this argument, in which
-// case every other line touched by this change stays exactly as it ran
-// before: no prior-findings block reaches the synthesis prompt, no
-// fixed_findings field is requested, and the terminal payload's own
-// prior_findings/fixed_findings both stay null (ledger-append.mjs then
-// records nothing 'fixed' and leaves invalid_fixed_ids_dropped absent).
+// below). This script recomputes findingId(lens, location, claim) from
+// each entry's own content and refuses one whose supplied id does not
+// match: a caller that builds this shape without a genuine, sourced id
+// gets every entry dropped (invalid_prior_ids_dropped), zero fixed
+// entries, and no error -- only a counter and a log line as the trace.
+// Absent on round one, and on every caller that predates this argument,
+// in which case every other line touched by this change stays exactly as
+// it ran before: no prior-findings block reaches the synthesis prompt, no
+// fixed_findings field is requested, and the terminal payload carries no
+// prior ids, no invalid_prior_ids_dropped and no fixed baselines
+// (ledger-append.mjs then records nothing 'fixed' and leaves
+// invalid_fixed_ids_dropped absent).
 const priorFindings = Array.isArray(opts.prior_findings) ? opts.prior_findings : null
 
 // Ledger telemetry accumulators, populated inside run() as each value
@@ -468,9 +469,9 @@ let headSha = null
 // switched to its own branch. Null means "not reported", never "did not move".
 let synthesisHeadSha = null
 // Raw finding descriptors ({lens, location, claim, severity?, ac_id?}), or
-// null when the synthesis response was malformed. Passed to
-// ledger-append.mjs as opaque data: workflow scripts have no node:crypto,
-// so finding-id hashing (AC-QA-11) happens there, not here.
+// null when the synthesis response was malformed. They stay in this script:
+// the ledger payload carries only the finding ids computed from them below
+// (HARN-OPT-6), never the descriptor text.
 let specBugsRaw = null
 let rejectedFindingsRaw = null
 let specBugCount = null
@@ -478,9 +479,9 @@ let rejectedFindingCount = null
 // specs/record-fixed-findings.md (AC-2): the synthesis's own claimed-
 // resolved echoes of some of priorFindings, same raw shape -- null when
 // priorFindings was never supplied, or the synthesis response carried no
-// such array. ledger-append.mjs is where these get checked against
-// priorFindings' own ids and turned into 'fixed' entries (the id guard,
-// AC-3): this file never computes a finding id itself.
+// such array. The payload carries their ids, and ledger-append.mjs checks
+// those against the verified prior ids and turns them into 'fixed' entries
+// (AC-3); the check that a prior entry's supplied id is authentic runs here.
 let fixedFindingsRaw = null
 // H5: every finding each lens actually reported, not just the two synthesis
 // dispositions (spec_bug/rejected) -- without this, an accepted finding
@@ -670,16 +671,6 @@ async function writeLedger(payload) {
           // sanitised -- optional, so an agent not carrying this field
           // (an older writer) is unaffected.
           invalid_ac_ids_dropped: { type: ['integer', 'null'] },
-          // Fix round 2 (specs/record-fixed-findings.md AC-1): the REAL ids
-          // ledger-append.mjs computed for this round's open_findings, in
-          // the same order they were supplied -- carried through so a
-          // caller (review-cycle.js) can hand them back to ITS OWN caller
-          // for use as a later round's prior_findings, instead of a
-          // conductor re-typing prose that hashes differently. Byte-
-          // identical across all three workflow files (the L5 pin):
-          // tdd-task.js/plan-cycle.js never send open_findings, so this
-          // field is simply absent from their own responses.
-          open_finding_ids: { type: ['array', 'null'], items: { type: ['string', 'null'] } },
         },
       },
     })
@@ -699,7 +690,7 @@ async function writeLedger(payload) {
   if (typeof response.invalid_ac_ids_dropped === 'number' && response.invalid_ac_ids_dropped > 0) {
     log(`Run ${response.run_id}: invalid_ac_ids_dropped=${response.invalid_ac_ids_dropped} (a lens supplied a non-conforming ac_id; sanitised, not lost -- see ac_id_raw in the ledger line)`)
   }
-  return { write_ok: true, write_error: null, run_id: response.run_id, open_finding_ids: Array.isArray(response.open_finding_ids) ? response.open_finding_ids : null }
+  return { write_ok: true, write_error: null, run_id: response.run_id }
 }
 
 // Review round-2 L-2: the exception guard below previously logged a thrown
@@ -1567,10 +1558,8 @@ const strayReport = (strayNote
 // older or misbehaving agent that only returned prose) must not silently
 // masquerade as "zero spec bugs, zero rejected findings": null means
 // unmeasured, distinguishable from a genuine zero (AC-QA-13, AC-OPS-3).
-// The raw descriptor arrays (not finding ids: no node:crypto here) are
-// carried through to the ledger payload, where ledger-append.mjs computes
-// ids and dispositions (AC-QA-11 -- mechanical, just in real-Node script
-// code instead of a sandboxed one).
+// The raw descriptor arrays are kept here and turned into finding ids when the
+// terminal payload is built (HARN-OPT-6); only the ids reach the ledger.
 synthesisHeadSha = synthesis && typeof synthesis.head_sha_at_synthesis === 'string' ? synthesis.head_sha_at_synthesis : null
 specBugsRaw = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_bugs : null
 rejectedFindingsRaw = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
@@ -1649,6 +1638,169 @@ return {
 
 } // end run()
 
+// HARN-OPT-6 (AC-SEC-1, AC-ARCH-9): finding ids are computed HERE, so the
+// ledger payload carries ids and never finding text. Workflow scripts have no
+// node:crypto, TextEncoder, atob or btoa (measured in the fake runtime, AC-QA-8),
+// so this is a pure-JS SHA-256. It lives outside every block the static checks
+// pin byte-identical across the three workflows, because only review-cycle
+// produces findings (AC-SIMP-3).
+const SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]
+// UTF-8 exactly as Node's Buffer.from(str, 'utf8') produces it. Differs from
+// toBase64's encoder on one input: an unpaired surrogate is U+FFFD (EF BF BD)
+// here, as Node encodes it, where toBase64 emits the invalid ED A0 80. The ids
+// already in the ledger were hashed by Node, so this must agree with Node.
+function utf8Bytes(input) {
+  const bytes = []
+  for (const ch of String(input)) {
+    let cp = ch.codePointAt(0)
+    if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd
+    if (cp < 0x80) bytes.push(cp)
+    else if (cp < 0x800) bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 63))
+    else if (cp < 0x10000) bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63))
+    else bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63))
+  }
+  return bytes
+}
+function sha256Hex(input) {
+  const bytes = utf8Bytes(input)
+  const byteLength = bytes.length
+  bytes.push(0x80)
+  while (bytes.length % 64 !== 56) bytes.push(0)
+  const bitsHigh = Math.floor(byteLength / 0x20000000)
+  const bitsLow = (byteLength * 8) >>> 0
+  bytes.push(bitsHigh >>> 24, (bitsHigh >>> 16) & 255, (bitsHigh >>> 8) & 255, bitsHigh & 255, bitsLow >>> 24, (bitsLow >>> 16) & 255, (bitsLow >>> 8) & 255, bitsLow & 255)
+  const h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+  const w = new Array(64)
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n))
+  for (let offset = 0; offset < bytes.length; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = offset + i * 4
+      w[i] = ((bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3]) | 0
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0
+    }
+    let [a, b, c, d, e, f, g, hh] = h
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + SHA256_K[i] + w[i]) | 0
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0
+      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0
+    }
+    h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0; h[3] = (h[3] + d) | 0
+    h[4] = (h[4] + e) | 0; h[5] = (h[5] + f) | 0; h[6] = (h[6] + g) | 0; h[7] = (h[7] + hh) | 0
+  }
+  return h.map(x => (x >>> 0).toString(16).padStart(8, '0')).join('')
+}
+// The id every finding has carried since ledger-append.mjs first wrote one:
+// sha256 over lens, normalised location and claim, first 16 hex characters.
+// Hashed from the ORIGINAL lens label, so compound-labelled ids do not change.
+function findingId(lens, location, claim) {
+  return sha256Hex(String(lens || '') + ' ' + String(location || '').trim().toLowerCase() + ' ' + String(claim || '')).slice(0, 16)
+}
+
+// HARN-OPT-6 (AC-SEC-2, AC-SEC-4): a lens-authored label reaches the ledger
+// payload only as a value this script has checked against the same closed
+// shapes ledger-append.mjs validates (LENS_PATTERN_STR, AC_ID_PATTERN_STR, the
+// severity and verdict enums, ROSTER_LENSES), or as null. Each neutralisation is
+// counted in the counter the writer has always used for it; the rejected text
+// is not kept anywhere (no *_raw sibling).
+const PAYLOAD_LENS_RE = /^(lens|reviewer)-[a-z]+$/
+const PAYLOAD_AC_ID_RE = /^(?:(?<prefix>[A-Za-z0-9_.-]{1,40})(?<sep>[ /]))?(?<ac>AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6})$/
+const PAYLOAD_ROSTER_LENSES = [
+  'lens-security', 'lens-qa', 'lens-simplicity', 'lens-product', 'lens-design',
+  'lens-accessibility', 'lens-architecture', 'lens-data', 'lens-operability',
+  'reviewer-verification', 'reviewer-experience',
+]
+const PAYLOAD_SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
+const PAYLOAD_VERDICTS = ['PASS', 'FAIL', 'UNVERIFIABLE']
+const payloadDrops = { ac_ids: 0, finding_fields: 0, record_values: 0 }
+function payloadLens(label, count = true) {
+  if (typeof label === 'string' && PAYLOAD_LENS_RE.test(label)) return label
+  if (typeof label === 'string') {
+    const inspected = label.slice(0, 256)
+    if (!/[\u0000-\u001f\u007f`|]/.test(inspected)) {
+      for (const segment of inspected.split(/\+|,|\s+and\s+/)) {
+        const name = segment.trim()
+        if (PAYLOAD_ROSTER_LENSES.includes(name)) return name
+      }
+    }
+  }
+  if (count) payloadDrops.finding_fields += 1
+  return null
+}
+function payloadSeverity(value, count = true) {
+  const severity = value || 'Low'
+  if (PAYLOAD_SEVERITIES.includes(severity)) return severity
+  if (count) payloadDrops.finding_fields += 1
+  return null
+}
+function payloadAcId(value, count = true) {
+  if (value === null || value === undefined || value === '') return null
+  if (typeof value === 'string' && PAYLOAD_AC_ID_RE.test(value)) return value
+  if (count) payloadDrops.ac_ids += 1
+  return null
+}
+// One descriptor in, one {id, lens, severity, ac_id, disposition} entry out.
+// A descriptor that is not an object, or lacks a string lens, location or claim,
+// is dropped and counted rather than hashed from empty strings (AC-QA-10).
+function findingEntry(descriptor, disposition, count = true) {
+  if (!descriptor || typeof descriptor !== 'object' || typeof descriptor.lens !== 'string' || typeof descriptor.location !== 'string' || typeof descriptor.claim !== 'string') {
+    if (count) payloadDrops.record_values += 1
+    return null
+  }
+  return {
+    id: findingId(descriptor.lens, descriptor.location, descriptor.claim),
+    lens: payloadLens(descriptor.lens, count),
+    severity: payloadSeverity(descriptor.severity, count),
+    ac_id: payloadAcId(descriptor.ac_id, count),
+    disposition,
+  }
+}
+// {descriptor, entry} pairs for the descriptors that survive findingEntry.
+function findingPairs(descriptors, disposition) {
+  if (!Array.isArray(descriptors)) return []
+  return descriptors.map(descriptor => ({ descriptor, entry: findingEntry(descriptor, disposition) })).filter(pair => pair.entry)
+}
+// The prior-id guard (AC-ARCH-8): a supplied id must equal the id recomputed
+// from that entry's own lens, location and claim. Only verified ids travel, as
+// disposition 'prior' entries the writer reconciles against; the count of the
+// rest is the one place invalid_prior_ids_dropped is computed.
+function verifiedPriorEntries(prior) {
+  const entries = []
+  let invalid = 0
+  for (const p of prior) {
+    const safe = p && typeof p === 'object' ? p : {}
+    if (typeof safe.id === 'string' && safe.id === findingId(safe.lens, safe.location, safe.claim)) {
+      entries.push({ id: safe.id, lens: payloadLens(safe.lens, false), severity: payloadSeverity(safe.severity, false), ac_id: payloadAcId(safe.ac_id, false), disposition: 'prior' })
+    } else {
+      invalid += 1
+    }
+  }
+  return { entries, invalid }
+}
+function payloadAcVerdicts(verdicts) {
+  return verdicts.map(v => {
+    const acId = payloadAcId(v && v.ac_id)
+    // An explicit or implied null ac_id is as suspect as a malformed one: a
+    // verdict always concerns a criterion. The writer counts it the same way.
+    if (!v || v.ac_id === null || v.ac_id === undefined) payloadDrops.ac_ids += 1
+    const verdict = v && PAYLOAD_VERDICTS.includes(v.verdict) ? v.verdict : null
+    if (verdict === null) payloadDrops.record_values += 1
+    return { ac_id: acId, verdict }
+  })
+}
+
 // Start/terminal record protocol (AC-DATA-5): see tdd-task.js for the same
 // pattern and its rationale.
 // HARN-OPT-4 T8 (AC-QA-28, AC-DATA-17): budget.spent() is SESSION-CUMULATIVE
@@ -1710,9 +1862,10 @@ const telemetry = {
   spec_bug_count: specBugCount,
   rejected_finding_count: rejectedFindingCount,
   budget_spent: budgetSpentDelta(),
-  // H4: already shaped as {ac_id, verdict} pairs (see acVerdicts above), so
-  // -- unlike spec_bugs/rejected_findings/open_findings -- it needs no
-  // further processing by ledger-append.mjs and rides in telemetry proper.
+  // H4: already shaped as {ac_id, verdict} pairs (see acVerdicts above) and
+  // rides in telemetry proper. The terminal entry below replaces it with the
+  // sanitised copy (HARN-OPT-6: ac_id and verdict reach the ledger payload only
+  // as values this script has checked, or null).
   ac_verdicts: acVerdicts,
   // AC-OPS-2: which rule source governed lens triggering on this run, so a
   // later reader of this ledger can report how often overrides are in force
@@ -1723,21 +1876,45 @@ const telemetry = {
   rule_source: ruleSource,
   rule_source_overridden_keys: ruleSourceOverriddenKeys,
 }
-// spec_bugs/rejected_findings ride along as raw descriptors for
-// ledger-append.mjs to hash into finding ids; they are NOT part of the
-// workflow's own public telemetry (which only carries the counts above).
-// prior_findings/fixed_findings are the same shape of rider, for the id
-// guard (AC-3): both null on a run that never used the prior_findings
-// argument, exactly like specBugsRaw/rejectedFindingsRaw stay null on a
-// malformed synthesis response.
+// HARN-OPT-6 (AC-SEC-1, AC-ARCH-4): the payload carries finding IDS only, in
+// one id-bearing key (finding_entries) that a writer predating HARN-OPT-6
+// refuses by name, so a mixed-version install fails loudly instead of landing
+// a row that silently lost its findings. Descriptor text (lens, location,
+// claim, evidence) never leaves this script. Ids are computed here from the
+// original descriptors; labels are resolved or nulled here, and every
+// neutralisation is counted in the existing counters. ledger-append.mjs
+// reconciles the fixed confirmations against the verified prior ids and
+// truncates at MAX_FINDINGS; neither is repeated here (AC-ARCH-8, AC-ARCH-9).
+const specBugPairs = findingPairs(specBugsRaw, 'spec_bug')
+const rejectedPairs = findingPairs(rejectedFindingsRaw, 'rejected')
+const openPairs = findingPairs(openFindingsRaw, 'open')
+const fixedPairs = findingPairs(fixedFindingsRaw, 'fixed')
+const priorVerified = priorFindings ? verifiedPriorEntries(priorFindings) : null
+const payloadAcVerdictList = payloadAcVerdicts(acVerdicts)
+{
+  // AC-OPS-6: one line naming each non-zero count and its reason, only when
+  // something was dropped, the way invalid_ac_ids_dropped is logged.
+  const drops = [
+    [priorVerified ? priorVerified.invalid : 0, 'invalid_prior_ids_dropped', 'a prior_findings entry whose id did not match the id recomputed from its own lens, location and claim'],
+    [payloadDrops.ac_ids, 'invalid_ac_ids_dropped', 'a non-conforming ac_id was nulled'],
+    [payloadDrops.finding_fields, 'invalid_finding_fields_dropped', 'a non-conforming lens or severity was nulled'],
+    [payloadDrops.record_values, 'invalid_record_values_dropped', 'a malformed descriptor was dropped or a non-conforming verdict was nulled'],
+  ].filter(([n]) => n > 0)
+  if (drops.length) log(`Run ${startRunId || 'unknown'}: ${drops.map(([n, name, why]) => `${name}=${n} (${why})`).join('; ')}`)
+}
 const terminalEntry = {
   kind: 'review_cycle',
-  spec_bugs: specBugsRaw,
-  rejected_findings: rejectedFindingsRaw,
-  open_findings: openFindingsRaw,
-  prior_findings: priorFindings,
-  fixed_findings: fixedFindingsRaw,
+  finding_entries: [...specBugPairs, ...rejectedPairs, ...openPairs, ...fixedPairs].map(pair => pair.entry).concat(priorVerified ? priorVerified.entries : []),
   ...telemetry,
+  ac_verdicts: payloadAcVerdictList,
+  invalid_ac_ids_dropped: payloadDrops.ac_ids,
+  invalid_finding_fields_dropped: payloadDrops.finding_fields,
+  invalid_record_values_dropped: payloadDrops.record_values,
+  // Baselines, not counts: a number here tells the writer that fixed_findings
+  // was supplied this round, so it reports its own reconciliation drops
+  // against a real 0 rather than null.
+  ...(fixedFindingsRaw ? { invalid_fixed_ids_dropped: 0, duplicate_fixed_ids_dropped: 0 } : {}),
+  ...(priorVerified ? { invalid_prior_ids_dropped: priorVerified.invalid } : {}),
 }
 if (startRunId) terminalEntry.run_id = startRunId
 // HARN-OPT-4 T8 (T4 round 3 L1, AC-DATA-2): same shape as tdd-task.js's T5
@@ -1749,31 +1926,18 @@ if (startRunId) terminalEntry.run_id = startRunId
 // is an existing field and null is already accepted by every installed writer.
 let terminalWrite = await writeLedger(terminalEntry)
 const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.\[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
-if (refusedKey && !['kind', 'outcome', 'run_id'].includes(refusedKey) && Object.hasOwn(terminalEntry, refusedKey)) {
+if (refusedKey && !['kind', 'outcome', 'run_id', 'finding_entries'].includes(refusedKey) && Object.hasOwn(terminalEntry, refusedKey)) {
   log(`Terminal ledger write refused ${refusedKey} (installed writer predates it); retrying once without it: ${redactLogText(String(terminalWrite.write_error))}`)
   const { [refusedKey]: _refused, ...retryEntry } = terminalEntry
   terminalWrite = await writeLedger(retryEntry)
 }
-// Fix round 2 (specs/record-fixed-findings.md AC-1): openFindingsRaw
-// carries this round's full {lens, location, claim, severity, ac_id}
-// descriptors (H5, above); terminalWrite.open_finding_ids carries the REAL
-// ids ledger-append.mjs computed for them, in the SAME order (index-
-// aligned, since ledger-append.mjs's computeFindings preserves order via
-// .map()). Zipped together here into review-cycle's own return value
-// (result.open_findings, assigned onto `result` the same way
-// checkout_moved/ledger_write_failed already are, below -- never inline in
-// the pinned `return { ...result, telemetry }` line, which stays byte-
-// identical across all three workflow files per AC-ARCH-9), so a caller
-// (the conductor) can pass this EXACT array, untouched, as next round's
-// prior_findings: the real id, never a re-typed one, is what lets a
-// finding raised open in one round carry the SAME id into a later round's
-// confirmation. null when the write did not return ids at all (an older
-// ledger-append.mjs, or the write failed before computing them) -- a
-// caller must not read an ABSENT id list as "zero open findings this
-// round".
-result.open_findings = Array.isArray(terminalWrite.open_finding_ids)
-  ? openFindingsRaw.map((f, i) => (f && terminalWrite.open_finding_ids[i] ? { ...f, id: terminalWrite.open_finding_ids[i] } : null)).filter(Boolean)
-  : null
+// HARN-OPT-6 (AC-PROD-1, AC-ARCH-6): result.open_findings is built from the
+// ids computed in this script, so it is an array whether or not the ledger
+// write landed. Each element is the original descriptor plus its id, in the
+// same order as the 'open' entries on the payload; a caller passes this exact
+// array, untouched, as next round's prior_findings. An empty array means this
+// round produced no open findings.
+result.open_findings = openPairs.map(pair => ({ ...pair.descriptor, id: pair.entry.id }))
 // 2026-08-18: give write_ok:false a CONSUMER -- see plan-cycle.js for the
 // full rationale. It was computed, logged and returned to nobody, so the
 // ledger stopped recording on 2026-08-12 and nothing noticed for six days.

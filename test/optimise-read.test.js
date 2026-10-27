@@ -14,7 +14,14 @@ const assert = require('node:assert/strict')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
-const { makeTempRepo, runAppend, trackTempDir, cleanupTempRepos, SUITE_TMPDIR, sh, LEDGER_REL } = require('./helpers/temp-repo.js')
+const { makeTempRepo, runAppend: runAppendIds, trackTempDir, cleanupTempRepos, SUITE_TMPDIR, sh, LEDGER_REL } = require('./helpers/temp-repo.js')
+const { toFindingEntries } = require('./helpers/finding-entries.js')
+
+// HARN-OPT-6: the writer takes finding ids, so a round described as descriptors
+// is converted to the id-bearing payload review-cycle.js sends.
+function runAppend(repo, payload, ...rest) {
+  return runAppendIds(repo, toFindingEntries(payload), ...rest)
+}
 const fs = require('node:fs')
 const os = require('node:os')
 
