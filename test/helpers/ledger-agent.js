@@ -42,6 +42,13 @@ function instructedCommands(prompt) {
   }
 }
 
+// The agreed text of the three commands the ledger:write prompt instructs (steps 2, 4 and 5).
+const INSTRUCTED = Object.freeze({
+  mktemp: 'mktemp "${TMPDIR:-/tmp}/harn-ledger-XXXXXX"',
+  node: 'node <path-to-ledger-append.mjs> < "<the file>"',
+  rm: 'rm "<the file>"',
+})
+
 function runSh(command, { cwd, env }) {
   return spawnSync('/bin/sh', ['-c', command], { cwd, env, encoding: 'utf8' })
 }
@@ -54,8 +61,14 @@ function actAsCompliantAgent(prompt, { cwd, scratchDir, writerEnvPrefix = '' }) 
   if (cmds.mktemp.length !== 1 || cmds.node.length !== 1 || cmds.rm.length !== 1) {
     throw new Error(`actAsCompliantAgent: expected one mktemp, one node and one rm command in the prompt, got ${JSON.stringify(cmds)}`)
   }
+  // The stand-in runs its OWN fixed copies of the three commands, after checking the prompt instructs exactly these,
+  // character for character. Text lifted out of the prompt never reaches a shell (CodeQL
+  // js/shell-command-injection-from-environment), and a prompt whose commands drift from these fails here loudly.
+  for (const [name, expected] of Object.entries(INSTRUCTED)) {
+    if (cmds[name][0] !== expected) throw new Error(`actAsCompliantAgent: the prompt's ${name} command is not the agreed text: ${JSON.stringify(cmds[name][0])}`)
+  }
   const env = sanitizedGitEnv({ TMPDIR: scratchDir })
-  const made = runSh(cmds.mktemp[0], { cwd, env })
+  const made = runSh(INSTRUCTED.mktemp, { cwd, env })
   const file = made.stdout.trim()
   if (made.status !== 0 || !file) throw new Error(`mktemp failed: ${made.stderr}`)
   fs.writeFileSync(file, extractEncodedPayload(prompt))
@@ -64,13 +77,13 @@ function actAsCompliantAgent(prompt, { cwd, scratchDir, writerEnvPrefix = '' }) 
   // prompt's own quoting is left exactly as written: the script path is unquoted in the prompt, so it is unquoted here
   // too, and a path with a space breaks this stand-in the same way it would break a real agent following the prompt.
   const runEnv = { ...env, HARN_APPEND_SCRIPT: APPEND_SCRIPT, HARN_PAYLOAD_FILE: file }
-  const writerCommand = cmds.node[0].replace('<path-to-ledger-append.mjs>', '$HARN_APPEND_SCRIPT').replace('<the file>', '$HARN_PAYLOAD_FILE')
+  const writerCommand = INSTRUCTED.node.replace('<path-to-ledger-append.mjs>', '$HARN_APPEND_SCRIPT').replace('<the file>', '$HARN_PAYLOAD_FILE')
   if (/<[^>]*>/.test(writerCommand)) throw new Error('unsubstituted placeholder in the instructed writer command: ' + writerCommand)
   const wrote = runSh(writerEnvPrefix + writerCommand, { cwd, env: runEnv })
   const result = JSON.parse(wrote.stdout.trim().split('\n').pop())
   // Review round 2 F2 (AC-SEC-4): the deletion decision comes from the prompt, as a real agent's would, so a step 5
   // weakened to keep the file on a failure path leaves the file behind here too and the end-to-end test goes RED.
-  const rmCommand = cmds.rm[0].replace('<the file>', '$HARN_PAYLOAD_FILE')
+  const rmCommand = INSTRUCTED.rm.replace('<the file>', '$HARN_PAYLOAD_FILE')
   if (deletesOnOutcome(prompt)) runSh(rmCommand, { cwd, env: runEnv })
   return { file, writerCommand: writerEnvPrefix + writerCommand, result, commands: cmds }
 }
