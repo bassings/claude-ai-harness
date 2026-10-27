@@ -24,7 +24,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
 const { execFileSync, spawnSync } = require('node:child_process')
-const { scrubGitEnv, sanitizedGitEnv } = require('./git-env.js')
+const { scrubGitEnv, sanitizedGitEnv, hermeticRepoConfig } = require('./git-env.js')
 
 // At module load, so every call site IN THIS PROCESS is covered, including
 // the child processes that inherit this env. Not suite-wide: node --test
@@ -131,6 +131,8 @@ function makeTempRepo() {
   sh('git config user.name Test', dir)
   // Round 2 F2 (AC-QA-18): hermetic against the operator's global git ignore.
   sh('git config core.excludesFile /dev/null', dir)
+  // No background housekeeping in a fixture (see hermeticRepoConfig).
+  hermeticRepoConfig(dir)
   fs.writeFileSync(path.join(dir, 'README.md'), 'seed\n')
   sh('git add README.md && git commit -q -m seed', dir)
   return dir
