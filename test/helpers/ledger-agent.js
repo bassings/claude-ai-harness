@@ -60,10 +60,11 @@ function actAsCompliantAgent(prompt, { cwd, scratchDir, writerEnvPrefix = '' }) 
   if (made.status !== 0 || !file) throw new Error(`mktemp failed: ${made.stderr}`)
   fs.writeFileSync(file, extractEncodedPayload(prompt))
   // The real paths reach the shell as environment variables, never spliced into the command text (CodeQL
-  // js/shell-command-injection-from-environment): the command string stays exactly the prompt's own text with each
-  // placeholder swapped for a variable reference, so a path holding a quote or a space cannot change what runs.
+  // js/shell-command-injection-from-environment). Each placeholder is swapped for a bare variable reference and the
+  // prompt's own quoting is left exactly as written: the script path is unquoted in the prompt, so it is unquoted here
+  // too, and a path with a space breaks this stand-in the same way it would break a real agent following the prompt.
   const runEnv = { ...env, HARN_APPEND_SCRIPT: APPEND_SCRIPT, HARN_PAYLOAD_FILE: file }
-  const writerCommand = cmds.node[0].replace('<path-to-ledger-append.mjs>', '"$HARN_APPEND_SCRIPT"').replace('<the file>', '$HARN_PAYLOAD_FILE')
+  const writerCommand = cmds.node[0].replace('<path-to-ledger-append.mjs>', '$HARN_APPEND_SCRIPT').replace('<the file>', '$HARN_PAYLOAD_FILE')
   if (/<[^>]*>/.test(writerCommand)) throw new Error('unsubstituted placeholder in the instructed writer command: ' + writerCommand)
   const wrote = runSh(writerEnvPrefix + writerCommand, { cwd, env: runEnv })
   const result = JSON.parse(wrote.stdout.trim().split('\n').pop())
