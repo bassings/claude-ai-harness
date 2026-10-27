@@ -437,12 +437,17 @@ const ciLanePrompt =
   `is that run's \`databaseId\` and MUST be all digits (0-9 and nothing else) and MUST come from THAT repo's own ` +
   `list; skip any run whose databaseId is not all digits, and never put any other text into the command. Count every ` +
   `\`gh\` call you make per repo, and MEASURE each repo's wall-clock seconds rather than estimating them: run \`date +%s\` ` +
-  `before that repo's first gh call and again after its last, and report the difference (round 3 L5, AC-QA-32). From each response keep only each ` +
+  `before that repo's first \`gh\` call and again after its last, and report the difference (round 3 L5, AC-QA-32). From each response keep only each ` +
   `job's name, its conclusion, and its duration in seconds (completedAt minus startedAt). Build one entry per run: ` +
   `{repo: <the label>, workflow: <workflowName>, id: <databaseId>, attempt, status, started_at: <startedAt>, ` +
   `jobs: [{name, conclusion, duration_s}]}. If a per-run \`gh run view\` fails, still emit that run with \`jobs: []\` ` +
   `and \`fetch_error\` set to "rate_limited", "unauthenticated" or "other" by the same tests as above; a failure on ` +
   `one run or one repo never stops the others.\n` +
+  `For each run whose \`attempt\` is greater than 1 (and only those), also run \`gh run view <id> --attempt 1 --json jobs\` ` +
+  `under the same id rules, keep only each job's name and conclusion, and put them on that run as ` +
+  `\`attempt1_jobs: [{name, conclusion}]\`, using each job's name exactly as \`gh\` returned it. If that call fails or returns ` +
+  `no jobs, set \`attempt1_fetch_error\` on the run ("rate_limited", "unauthenticated" or "other" by the same tests as above) and ` +
+  `leave \`attempt1_jobs\` off. Do not store or reuse any result between runs.\n` +
   `Find optimise-read.mjs the same way the ledger lane does (global mirror, then any installed plugin, then this ` +
   `repo's own copy ONLY if this repo is claude-ai-harness itself). Pipe \`{"runs": <the array above>, ` +
   `"requestedLimit": 100, "minRunsNeverFailed": 5}\` as JSON into \`node <path> ci\` and return exactly what it ` +
@@ -840,12 +845,9 @@ function isWeakCiEvidenceRemoval(p) {
   // not know cannot claim "never failed". With the same job in several repos
   // (AC-DATA-13) one weak row is enough: the target names no repo.
   if (!entries.length) return true
-  // Round 1 M1 (AC-OPS-10/11): reRun and partialFetch null neverFailed, so a
-  // removal resting on such a row was ranked as strong evidence beside a
-  // report line saying 'jobs partially fetched'. They join the brake. Keying on
-  // `neverFailed !== true` would close the class for future flags, but the
-  // T6 brake controls (null with every flag false must pass) pin the opposite.
-  return entries.some((entry) => !!(entry.insufficientData || entry.truncated || entry.renameSuspect || entry.reRun || entry.partialFetch))
+  // AC-SIMP-5: the brake reads the verdict. The reader nulls neverFailed for
+  // every weakening condition, so anything but a settled true is weak evidence.
+  return entries.some((entry) => entry.neverFailed !== true)
 }
 const droppedWeakCiEvidence = proposals.filter(isWeakCiEvidenceRemoval)
 proposals = proposals.filter((p) => !isWeakCiEvidenceRemoval(p))
@@ -1461,7 +1463,7 @@ function buildReport(d) {
   // AC-OPS-10, AC-OPS-11: per repo, runs left out as not completed and failed per-run fetches by mode.
   for (const [repo, st] of Object.entries(d.ciRepoStats || {})) {
     const ff = (st && st.fetchFailures) || {}
-    lines.push(`- ${ciFlat(repo)}: ${ciNum((st && st.notCompleted) || 0)} runs not completed (left out); per-run fetch failures: rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}`)
+    lines.push(`- ${ciFlat(repo)}: ${ciNum((st && st.notCompleted) || 0)} runs not completed (left out); per-run fetch failures: rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}; attempt-1 jobs not fetched: ${ciNum((st && st.attempt1Unfetched) || 0)}`)
   }
   // AC-QA-32: the lane's own cost, so the first run after shipping records the baseline.
   for (const g of d.ciGhStats || []) lines.push(`- ${ciFlat(g.repo)}: wall-clock ${g.wall_clock_s == null ? 'n/a' : ciNum(g.wall_clock_s)}s, ${g.gh_calls == null ? 'n/a' : ciNum(g.gh_calls)} gh calls`)

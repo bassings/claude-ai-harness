@@ -1630,14 +1630,57 @@ test('optimise-cycle: a lint removal is dropped if ANY repo\'s row for the job i
   assert.equal(result.proposals_ranked.length, 1, 'two solid rows pass')
 })
 
+// ---- HARN-OPT-5 T7 (AC-QA-21, AC-OPS-14): the brake reads the verdict ----
+// A removal survives only when every matching entry has neverFailed === true.
+// The older controls that fed neverFailed null with every flag false and
+// required survival are restated (AC-QA-22): a null verdict is weak evidence by
+// definition, whatever the flags say.
+const t5Verdict = async (row) => {
+  const responses = baseResponses({ 'lane:ci': t7Rows(row), 'synthesis:proposals': t7LintRemoval() })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  return result
+}
+test('optimise-cycle: the brake table (AC-QA-21): only neverFailed true survives; null, absent, false and null with an unknown flag are all dropped', async () => {
+  const absent = t7LintRow()
+  delete absent.neverFailed
+  const table = [
+    ['neverFailed true, all five flags false', t7LintRow(), 1],
+    ['neverFailed null, all five flags false', t7LintRow({ neverFailed: null }), 0],
+    ['neverFailed key absent', absent, 0],
+    ['neverFailed false (counter-evidence)', t7LintRow({ neverFailed: false }), 0],
+    ['neverFailed null with a flag the brake has never heard of', t7LintRow({ neverFailed: null, someFutureFlag: true }), 0],
+  ]
+  for (const [label, row, expected] of table) {
+    const result = await t5Verdict(row)
+    assert.equal(result.proposals_ranked.length, expected, label)
+  }
+})
+
+test('optimise-cycle: a neverFailed-null entry with every legacy flag false drops the removal into the weak-evidence count (AC-QA-22, restates the T6 and AC-SEC-13 survival controls)', async () => {
+  const result = await t5Verdict(t7LintRow({ neverFailed: null }))
+  assert.equal(result.proposals_ranked.length, 0)
+  assert.match(result.report, /insufficient-data\/truncated\/rename-suspect/i)
+})
+
+test('optimise-cycle: the attempt-1 unfetched count prints in the existing per-repo CI stats line, not a new section (AC-OPS-14, AC-SIMP-11)', async () => {
+  const responses = baseResponses({ 'lane:ci': ciFixture({ repoStats: { demo: { notCompleted: 1, attempt1Unfetched: 3, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } } } }) })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
+  const line = result.report.split('\n').find((l) => l.includes('runs not completed'))
+  assert.ok(line, 'precondition: the per-repo stats line rendered')
+  assert.match(line, /3 runs? with attempt-1 jobs not fetched|attempt-1 jobs not fetched: 3/)
+})
+
 // ---- HARN-OPT-4 T7 (AC-SEC-13): per-job rows make the scheduled gitleaks job visible with its own failures; the security-removal gate must not depend on the weak-CI flags ----
 
 const t7GitleaksRow = (o = {}) => ({ repo: 'demo', workflow: 'Security', job: 'gitleaks', n: 20, failureCount: 1, failedRunIds: ['309'], meanDurationS: 7, windowStart: 'x', windowEnd: 'y', truncated: false, insufficientData: false, renameSuspect: false, neverFailed: false, reRun: false, partialFetch: false, ...o })
 const t7CiWith = (row) => ciFixture({ byJob: { [`demo::${row.workflow}::${row.job}`]: row } })
 
+// HARN-OPT-5 T7 (AC-QA-22): the brake reads the verdict, so a gitleaks row that
+// failed in the window (neverFailed false) is dropped as counter-evidence before
+// the security gate. The row here is the clean shape the gate still sees.
 test('optimise-cycle: a gitleaks removal whose aggregate is neither insufficientData, truncated nor renameSuspect is still flagged security_removal_flagged (AC-SEC-13)', async () => {
   const responses = baseResponses({
-    'lane:ci': t7CiWith(t7GitleaksRow()),
+    'lane:ci': t7CiWith(t7GitleaksRow({ neverFailed: true, failureCount: 0, failedRunIds: [] })),
     'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'Security', job: 'gitleaks' }, statement: 'Remove the scheduled gitleaks job', citations: ['1001'], reinstatement_evidence: 'reinstate if any secret ever leaks', n: 20 })] },
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })

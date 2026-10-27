@@ -194,3 +194,36 @@ test('static: optimise-read.mjs\'s per-record loops (parseLedgerContent, aggrega
     assert.ok(!/\bfs\./.test(body), `${signature} must contain no fs.* call -- got a match in:\n${body}`)
   }
 })
+
+// ---- HARN-OPT-5 T7 (AC-SIMP-5, AC-QA-22, AC-SIMP-11): the brake reads the verdict; the lane gains one gh call ----
+
+test('static: isWeakCiEvidenceRemoval keys on neverFailed !== true, names none of the five flags, and the comment explaining why it did not is gone (AC-SIMP-5, AC-QA-22)', () => {
+  const src = readAll('workflows', 'optimise-cycle.js')
+  const start = src.indexOf('function isWeakCiEvidenceRemoval(')
+  const end = src.indexOf('const droppedWeakCiEvidence', start)
+  assert.ok(start >= 0 && end > start, 'sanity: the function body was located')
+  const body = src.slice(start, end)
+  assert.match(body, /neverFailed\s*!==\s*true/)
+  for (const flag of ['insufficientData', 'truncated', 'renameSuspect', 'reRun', 'partialFetch']) assert.ok(!body.includes(flag), `the brake body must not name ${flag}`)
+  assert.ok(!/pin the opposite|T6 brake controls|Keying on `neverFailed/.test(src), 'the comment explaining why the code did not key on neverFailed is gone')
+})
+
+test('static: the CI lane prompt gains exactly one further gh invocation, the attempt-1 jobs fetch, for runs with attempt > 1, and still caches nothing (AC-SIMP-11, AC-DATA-17)', () => {
+  const src = readAll('workflows', 'optimise-cycle.js')
+  const start = src.indexOf('const ciLanePrompt')
+  const end = src.indexOf('const ciLane = ', start)
+  assert.ok(start >= 0 && end > start, 'sanity: the lane prompt was located')
+  const prompt = src.slice(start, end)
+  assert.equal((prompt.match(/gh run view <id> --attempt 1 --json jobs/g) || []).length, 1, 'the attempt-1 fetch is named once, verbatim')
+  assert.equal((prompt.match(/gh run view <id>/g) || []).length, 2, 'two gh run view invocations in total: latest jobs and attempt-1 jobs')
+  assert.equal((prompt.match(/gh run list/g) || []).length >= 1, true)
+  assert.ok(!/gh (?!run (?:list|view))\w+/.test(prompt.replace(/`gh` /g, '')), 'no other gh subcommand is introduced')
+  const at = prompt.indexOf('--attempt 1')
+  const near = prompt.slice(Math.max(0, at - 300), at + 300)
+  assert.match(near, /attempt[^.]{0,40}(?:> ?1|greater than 1|more than 1|above 1)/i, 'issued only for runs with attempt > 1')
+  assert.ok(prompt.includes('attempt1_jobs') && prompt.includes('attempt1_fetch_error'), 'each such run carries its attempt-1 jobs or a fetch-failed marker')
+})
+
+test('static: SKILL.md describes the attempt-1 re-run qualification (AC-SIMP-5, AC-DATA-16)', () => {
+  assert.ok(readAll('skills', 'optimise-cycle', 'SKILL.md').includes('--attempt 1'))
+})

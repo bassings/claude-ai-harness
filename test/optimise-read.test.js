@@ -3140,3 +3140,107 @@ test('optimise-read CLI (round 2 M1, AC-PROD-10): a ledger output over 70 KB arr
     assert.doesNotThrow(() => JSON.parse(text), `attempt ${attempt}: output did not parse`)
   }
 })
+
+// ---- HARN-OPT-5 T7 (AC-DATA-16, AC-DATA-17, AC-OPS-14, AC-SIMP-11): per-job re-run qualification ----
+//
+// Wire contract assumed here (the spec fixes behaviour, not names): a run at
+// attempt > 1 may carry `attempt1_jobs` (an array of { name, conclusion }, the
+// output of `gh run view <id> --attempt 1 --json jobs`) or `attempt1_fetch_error`
+// (a truthy marker that the fetch failed). The reader joins attempt-1 jobs to
+// the latest attempt's jobs by run id plus RAW job name and sets each job's
+// rerun flag from the join; the per-run attempt flag no longer decides it.
+// Observed through the aggregate (reRun / neverFailed), with one run per
+// fixture and minRunsNeverFailed 1 so neverFailed is not nulled by sample size.
+function t7Ci(runs) {
+  const res = spawnSync('node', [MODULE_PATH, 'ci'], { input: JSON.stringify({ runs, requestedLimit: null, minRunsNeverFailed: 1 }), encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  return JSON.parse(res.stdout.trim())
+}
+function t7Run(id, attempt, names, extra = {}) {
+  return { repo: 'a', workflow: 'CI', id: String(id), attempt, status: 'completed', started_at: `2026-09-0${(Number(id) % 8) + 1}T00:00:00Z`, jobs: names.map((name) => ({ name, conclusion: 'success', duration_s: 10 })), ...extra }
+}
+const t7Row = (out, job) => Object.values(out.byJob).find((r) => r.job === job)
+const t7A1 = (...pairs) => pairs.map(([name, conclusion = 'success']) => ({ name, conclusion }))
+
+test('optimise-read T7 (AC-DATA-16): an attempt-2 run whose job succeeded in attempt 1 is not a re-run for that job, so the claim survives', () => {
+  const row = t7Row(t7Ci([t7Run(1, 2, ['test'], { attempt1_jobs: t7A1(['test']) })]), 'test')
+  assert.equal(row.reRun, false)
+  assert.equal(row.neverFailed, true)
+})
+
+test('optimise-read T7 (AC-DATA-16): two attempt-2 runs, A whose attempt-1 test failed and B whose succeeded: A is a re-run, B is not, and the pooled aggregate is a re-run with no never-failed claim', () => {
+  const a = t7Run(1, 2, ['test'], { attempt1_jobs: t7A1(['test', 'failure']) })
+  const b = t7Run(2, 2, ['test'], { attempt1_jobs: t7A1(['test']) })
+  const onlyA = t7Row(t7Ci([a]), 'test')
+  assert.equal(onlyA.reRun, true)
+  assert.equal(onlyA.neverFailed, null)
+  const onlyB = t7Row(t7Ci([b]), 'test')
+  assert.equal(onlyB.reRun, false)
+  assert.notEqual(onlyB.neverFailed, null, 'B carries a settled claim given no other weakening flag')
+  const both = t7Row(t7Ci([a, b]), 'test')
+  assert.equal(both.reRun, true)
+  assert.notEqual(both.neverFailed, true)
+})
+
+test('optimise-read T7 (AC-DATA-16): the join is per job within a run, so a job missing from attempt 1 is a re-run while its sibling that succeeded is not', () => {
+  const out = t7Ci([t7Run(1, 2, ['test', 'lint'], { attempt1_jobs: t7A1(['test']) })])
+  assert.equal(t7Row(out, 'test').reRun, false)
+  assert.equal(t7Row(out, 'lint').reRun, true)
+  assert.equal(t7Row(out, 'lint').neverFailed, null)
+})
+
+test('optimise-read T7 (AC-DATA-16): the join key is the RAW job name, not the normalised one (a raw name absent from attempt 1 is a re-run even where the normalised names match)', () => {
+  // normaliseJobName folds 'test on PR #4' and 'test on PR #5' to 'test'.
+  const absent = t7Row(t7Ci([t7Run(1, 2, ['test on PR #5'], { attempt1_jobs: t7A1(['test on PR #4']) })]), 'test')
+  assert.equal(absent.reRun, true, 'raw name not in attempt 1')
+  // Two raw names that normalise together are not duplicates: each is unique raw.
+  const distinct = t7Row(t7Ci([t7Run(2, 2, ['test on PR #5'], { attempt1_jobs: t7A1(['test on PR #5'], ['test on PR #6']) })]), 'test')
+  assert.equal(distinct.reRun, false, 'the extra attempt-1 name is a different raw name')
+})
+
+test('optimise-read T7 (AC-DATA-17): a raw job name appearing more than once in either attempt is a re-run', () => {
+  const inLatest = t7Row(t7Ci([t7Run(1, 2, ['test', 'test'], { attempt1_jobs: t7A1(['test']) })]), 'test')
+  assert.equal(inLatest.reRun, true, 'duplicate in the latest attempt')
+  const inFirst = t7Row(t7Ci([t7Run(2, 2, ['test'], { attempt1_jobs: t7A1(['test'], ['test']) })]), 'test')
+  assert.equal(inFirst.reRun, true, 'duplicate in attempt 1')
+})
+
+test('optimise-read T7 (AC-DATA-17, AC-OPS-14): an attempt-1 fetch that failed, returned no jobs, or is absent leaves every job a re-run; a fetch failure never clears reRun', () => {
+  for (const [label, extra] of [['fetch error marker', { attempt1_fetch_error: 'rate_limited' }], ['fetch error marker with stale jobs', { attempt1_fetch_error: 'other', attempt1_jobs: t7A1(['test']) }], ['empty jobs', { attempt1_jobs: [] }], ['field absent', {}]]) {
+    const row = t7Row(t7Ci([t7Run(1, 2, ['test'], extra)]), 'test')
+    assert.equal(row.reRun, true, label)
+    assert.equal(row.neverFailed, null, label)
+  }
+})
+
+test('optimise-read T7 (AC-DATA-17): a malformed attempt-1 payload (non-array, or a job with a non-string name) is a re-run', () => {
+  for (const [label, payload] of [['string', 'test'], ['object', { test: 'success' }], ['null', null], ['non-string name beside a valid one', [{ name: 'test', conclusion: 'success' }, { name: 5, conclusion: 'success' }]], ['missing name beside a valid one', [{ name: 'test', conclusion: 'success' }, { conclusion: 'success' }]]]) {
+    const row = t7Row(t7Ci([t7Run(1, 2, ['test'], { attempt1_jobs: payload })]), 'test')
+    assert.equal(row.reRun, true, label)
+  }
+})
+
+test('optimise-read T7 (AC-DATA-17): an attempt-1 conclusion of skipped, cancelled or neutral (or a failure) is a re-run; only success clears it', () => {
+  for (const conclusion of ['skipped', 'cancelled', 'neutral', 'failure', 'timed_out', null, undefined]) {
+    const row = t7Row(t7Ci([t7Run(1, 2, ['test'], { attempt1_jobs: [{ name: 'test', conclusion }] })]), 'test')
+    assert.equal(row.reRun, true, `attempt-1 conclusion ${String(conclusion)}`)
+  }
+})
+
+test('optimise-read T7 (AC-DATA-17): a run at attempt greater than 2 is a re-run for every job even with a clean attempt-1 payload, since an intermediate failure cannot be seen', () => {
+  for (const attempt of [3, 4, '3']) {
+    const row = t7Row(t7Ci([t7Run(1, attempt, ['test'], { attempt1_jobs: t7A1(['test']) })]), 'test')
+    assert.equal(row.reRun, true, `attempt ${attempt}`)
+    assert.equal(row.neverFailed, null, `attempt ${attempt}`)
+  }
+})
+
+test('optimise-read T7 (AC-OPS-14): the count of attempt>1 runs whose attempt-1 jobs could not be fetched is reported in repoStats, and a first-attempt or well-fetched run is not counted', () => {
+  const out = t7Ci([
+    t7Run(1, 2, ['test'], { attempt1_fetch_error: 'rate_limited' }),
+    t7Run(2, 2, ['test'], { attempt1_jobs: [] }),
+    t7Run(3, 2, ['test'], { attempt1_jobs: t7A1(['test']) }),
+    t7Run(4, 1, ['test']),
+  ])
+  assert.equal(out.repoStats.a.attempt1Unfetched, 2)
+})
