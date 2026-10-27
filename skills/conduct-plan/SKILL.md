@@ -310,6 +310,22 @@ rather than narrating a condition that does not apply here.
       forgotten note parks every later plan in the repo indefinitely, with an
       allow message no one can tell apart from a real block.
 
+   d. When the block follows an escalation round, the question line names the
+      model token the escalation used and the default it escalated from, the
+      tdd-task verdict and blocked_reason, the review verdict with finding
+      counts by severity, and the frame question. A note written when the
+      escalation itself failed to dispatch or ABORTED says so in those words,
+      never as a plain three-round block. The note and the log entry carry
+      outcome codes, round counts and blocked_reason only, never verbatim
+      verifier evidence or a test_defect reason: the plan file and the note
+      can reach a public repository, and that evidence routinely holds
+      absolute paths under the operator's home directory.
+   e. Once the note is written (and only then), append `human_wait_started`
+      through `ledger-append.mjs` as step 3 specifies, so the human-wait
+      decomposition does not depend on memory.
+   f. The moment the answer arrives, delete `.claude/blocked-on-human` and
+      append `human_wait_ended` the same way.
+
    The hook also refuses a symlink at that path, ignores an empty or
    whitespace-only file, reads at most 4096 bytes, and strips control
    characters before quoting the note back.
@@ -344,13 +360,32 @@ rather than narrating a condition that does not apply here.
   before advancing the task's state.
 - Never mark `merged` from memory; only from `gh pr view <n>`.
 - **Rework circuit-breaker. Count rounds in the conductor log and obey the
-  count.** Stop and record the block (step 5) with the frame question,
-  rather than iterating, at whichever of these comes first:
-  - **three fix rounds on one task** (the original rule), or
+  count.** There are two triggers, and they do not behave alike:
+  - **three fix rounds on one task** (the original rule). At three fix rounds
+    the conductor dispatches exactly one escalation round: `/tdd-task` with
+    `model` set to the token stated below, in a fresh implementer,
+    never a direct implementer dispatch. That round is followed by one
+    review-cycle round, and only then a block note or a merge: a clean build
+    and a clean review merge as usual, anything else goes to the block note
+    (step 5). An escalation round whose own build or review is not clean goes
+    straight to the block note. A task whose escalation round has already run
+    goes straight to the block note at its next breaker, never a second
+    escalation. Log the round as the escalation round in the conductor log.
   - **the first time a review round finds a defect that the previous
     round's fix introduced.** One self-inflicted regression is the signal
-    the frame is wrong; do not wait for three. Say plainly whose
-    instruction caused it, including when it was yours.
+    the frame is wrong; do not wait for three. On the first self-inflicted
+    regression the conductor goes straight to the block note with the frame
+    question (record the block, step 5), with no escalation round, because
+    that trigger exists for a value call the owner must make. Say plainly
+    whose instruction caused it, including when it was yours.
+
+  The escalation model token: the default `sonnet` escalates to `opus` (the
+  installed mirror's pin), and the default `opus` escalates to `fable` (the
+  repo implementer's pin, at agents/implementer.md:4). If the default is
+  already the strongest tier, or the runtime refuses the token, the round is
+  skipped and the log and the block note say "escalation skipped: no stronger
+  tier".
+
   Escalate with the cost so far (review rounds, tokens, wall-clock) and what
   the change is protecting, so the human can make a value call rather than a
   correctness one. "The next fix is small" is not a reason to continue: it
