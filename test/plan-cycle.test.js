@@ -46,14 +46,20 @@ const SCOPE_OK = {
 
 const LENS_CLEAN = { verdict: 'CLEAN', coverage: { examined: 'x', verified_by: 'y', could_not_check: 'z' }, acceptance_criteria: [{ id: 'AC-SEC-1', statement: 'x' }] }
 
+// HARN-OPT-5 T8: a run is only `done` when the write-back passed its script check, so the base fixtures carry a valid
+// pre-write-back snapshot (scope) and a clean check tied to it (synthesis). test/harn-opt-5-t8.test.js owns the
+// unhappy paths; here they only keep the pre-T8 expectations (done, blocked, verbatim report) meaningful.
+const T8_SHA = 'a'.repeat(64)
+const T8_SNAPSHOT = JSON.stringify({ file: '/tmp/harn-specwb-base/spec.snapshot', sha256: T8_SHA, headings: ['## Problem'], ac_ids: [] })
+const T8_CHECK_OK = JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: 'b'.repeat(64), snapshot_sha256: T8_SHA })
 function baseAgent(overrides = {}) {
   return {
-    'scope:spec': SCOPE_OK,
+    'scope:spec': { ...SCOPE_OK, spec_snapshot: T8_SNAPSHOT },
     'lens-security': LENS_CLEAN,
     'lens-qa': LENS_CLEAN,
     'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] },
     'lens-product': LENS_CLEAN,
-    'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def' },
+    'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def', surviving_ids: [], writeback_check: T8_CHECK_OK },
     'ledger:write': LEDGER_OK,
     ...overrides,
   }
@@ -98,7 +104,8 @@ test('plan-cycle.js: every lens\'s prompt instructs it to set HARNESS_LEDGER_REA
 // could leak into the public result unnoticed.
 test('plan-cycle.js: the result carries EXACTLY its documented keys plus telemetry -- the internal __outcome sentinel does not leak through (L5, AC-ARCH-10)', async () => {
   const { result } = await runWorkflow(WF, { args: { spec: 'specs/foo.md' }, agent: baseAgent() })
-  assert.deepEqual(Object.keys(result).sort(), ['lenses', 'report', 'skipped', 'spec', 'telemetry', 'verdicts'])
+  // HARN-OPT-5 T8 adds `writeback` ({ok, problems, restored} or null) as a documented key.
+  assert.deepEqual(Object.keys(result).sort(), ['lenses', 'report', 'skipped', 'spec', 'telemetry', 'verdicts', 'writeback'])
 })
 
 // M3: see tdd-task.js for the identical guard gap and rationale -- nothing
@@ -499,7 +506,12 @@ test('plan-cycle.js: AC-QA-1 -- the scope:spec prompt instructs locating install
   // (round-one's MED-1 fix) was not sufficient, because the search order
   // still offered a path inside the reviewed checkout to consider at all.
   // Proven absent by asserting the distinctive (c)-only text is gone.
-  assert.doesNotMatch(scopeCall.prompt, /git rev-parse --show-toplevel/, 'M2: the repo-local resolution branch (c) must be removed entirely, not merely prohibited in prose')
+  // HARN-OPT-5 T8 scoped this assertion (conductor): the scope prompt now also carries the spec-writeback locate
+  // instruction, which names `git rev-parse --show-toplevel` under the same claude-ai-harness-only gate as the ledger
+  // step. M2's guarantee is about the install-consistency instruction, so the slice before the T8 text is checked.
+  const installSlice = scopeCall.prompt.slice(0, scopeCall.prompt.indexOf('Finally, snapshot the spec'))
+  assert.ok(installSlice.length > 0 && installSlice.includes('install-consistency.mjs'), 'precondition: the install-consistency instruction precedes the T8 snapshot instruction')
+  assert.doesNotMatch(installSlice, /git rev-parse --show-toplevel/, 'M2: the repo-local resolution branch (c) must be removed entirely, not merely prohibited in prose')
   assert.match(scopeCall.prompt, /deliberately no repo-local fallback option at all/, 'must state plainly that no repo-local fallback exists at all (M2)')
   assert.match(scopeCall.prompt, /NEVER a path inside the repository currently being planned or reviewed/, 'must forbid branch (b) resolving to anything inside the reviewed checkout (M2)')
   assert.match(scopeCall.prompt, /as its ONE argument/, 'must instruct passing the resolved install root explicitly, not relying on the script\'s own ~/.claude default')

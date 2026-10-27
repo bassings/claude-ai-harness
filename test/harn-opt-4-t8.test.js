@@ -75,9 +75,12 @@ const DRIVERS = {
       'scope:spec': {
         head_sha: 'abc1234567890def', summary: 'adds a widget', ui: false, data: false, architecture: false,
         operability: false, user_facing: true, likely_paths: ['src/widget.js'], consistency: REVIEW_SCOPE.consistency,
+        // HARN-OPT-5 T8: a run is `done` only when the write-back passed its script check, so the fixture carries a
+        // valid snapshot and a clean check tied to it; this test is about the ledger retry, not the write-back.
+        spec_snapshot: JSON.stringify({ file: '/tmp/harn-specwb-fx/spec.snapshot', sha256: 'a'.repeat(64), headings: ['## Problem'], ac_ids: [] }),
       },
       'lens-security': LENS_CLEAN, 'lens-qa': LENS_CLEAN, 'lens-simplicity': { ...LENS_CLEAN, acceptance_criteria: [] }, 'lens-product': LENS_CLEAN,
-      'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def' },
+      'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def', surviving_ids: [], writeback_check: JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: 'b'.repeat(64), snapshot_sha256: 'a'.repeat(64) }) },
       'ledger:write': ledger,
     }),
   },
