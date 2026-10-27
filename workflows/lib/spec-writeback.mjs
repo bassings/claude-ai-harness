@@ -40,7 +40,21 @@ const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
 const fail = (reason) => { process.stderr.write(`spec-writeback: ${reason}\n`); process.exit(1) }
 
 const linesOf = (text) => text.split('\n').map((l) => l.replace(/\r$/, ''))
-const headingsOf = (text) => linesOf(text).filter((l) => l.startsWith('## ')).map((l) => l.trimEnd())
+// Round 4 F2: a "## " line inside a fenced code block is an example, not a heading.
+const headingsOf = (text) => {
+  const out = []
+  let fenced = false
+  for (const l of linesOf(text)) {
+    if (/^\s*(```|~~~)/.test(l)) { fenced = !fenced; continue }
+    if (!fenced && l.startsWith('## ')) out.push(l.trimEnd())
+  }
+  return out
+}
+// Round 4 F1: a spec reached through a symlink is resolved once, so the restore writes through to the real file
+// instead of replacing the link with a regular file and reporting a false restore.
+function realSpecPath(specPath) {
+  try { return fs.realpathSync(specPath) } catch (e) { return fail(`cannot read the spec: ${e.code || e.message}`) }
+}
 const criteriaOf = (text) => linesOf(text).map((l) => AC_LINE.exec(l)).filter(Boolean)
   .map((m) => ({ id: m[1], text: m[2].trim(), line: m[0] }))
 
@@ -81,11 +95,15 @@ function midSentence(text) {
 function problemsOf(now, snapshotText, surviving) {
   const problems = []
   const headingsNow = headingsOf(now)
+  const headingsSnap = headingsOf(snapshotText)
   const count = (h) => headingsNow.filter((x) => x === h).length
-  for (const h of new Set(headingsOf(snapshotText))) {
+  // Round 4 F2: the write-back is judged on what it changed; a heading the snapshot already had twice is the
+  // operator's own and is not a defect here (only a heading the write-back ADDED a copy of, or dropped, is).
+  for (const h of new Set(headingsSnap)) {
     const n = count(h)
+    const had = headingsSnap.filter((x) => x === h).length
     if (n === 0) problems.push(`missing heading: ${h} (the snapshot had it)`)
-    else if (n > 1) problems.push(`duplicate heading: ${h} (${n} times)`)
+    else if (n > had) problems.push(`duplicate heading: ${h} (${n} times, the snapshot had ${had})`)
   }
   if (count(ACCEPTANCE) !== 1) problems.push(`"${ACCEPTANCE}" must appear exactly once, found ${count(ACCEPTANCE)}`)
 
@@ -123,7 +141,8 @@ function restore(specPath, bytes) {
   fs.renameSync(tmp, specPath)
 }
 
-function snapshot(specPath) {
+function snapshot(specPathGiven) {
+  const specPath = realSpecPath(specPathGiven)
   let bytes
   try { bytes = fs.readFileSync(specPath) } catch (e) { fail(`cannot read the spec: ${e.code || e.message}`) }
   const text = bytes.toString('utf8')
@@ -167,8 +186,9 @@ function readIds(idsFile) {
   return [...new Set(ids)].sort()
 }
 
-function verify(specPath, snapFile, idsFile) {
-  if (!specPath || !snapFile || !idsFile) fail('usage: verify <spec-path> <snapshot-file> <surviving-ids-file>')
+function verify(specPathGiven, snapFile, idsFile) {
+  if (!specPathGiven || !snapFile || !idsFile) fail('usage: verify <spec-path> <snapshot-file> <surviving-ids-file>')
+  const specPath = realSpecPath(specPathGiven)
   let snapBytes
   try { snapBytes = fs.readFileSync(snapFile) } catch (e) { fail(`cannot read the snapshot file: ${e.code || e.message}`) }
   if (!snapBytes.length) fail('the snapshot file is empty')

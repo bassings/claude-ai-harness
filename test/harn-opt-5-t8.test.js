@@ -111,16 +111,20 @@ test('plan-cycle T8: a missing or malformed before object (spec_snapshot) gives 
     undefined,
     '',
     'not json',
-    json({ ...BEFORE, sha256: 'xyz' }),
-    json({ ...BEFORE, sha256: 'A'.repeat(64) }),
+    // Round 4 F4: these two carry the check echoing the SAME bad value, so only the sha256 format check can reject
+    // them, and the notice is SKIPPED (no restorable snapshot), never UNCHECKED.
+    [json({ ...BEFORE, sha256: 'xyz' }), 'xyz'],
+    [json({ ...BEFORE, sha256: 'A'.repeat(64) }), 'A'.repeat(64)],
     json({ ...BEFORE, file: '/etc/passwd' }),
     json({ ...BEFORE, file: '/tmp/other-dir/spec.snapshot' }),
     json({ headings: [], ac_ids: [] }),
   ]
-  for (const snapshot of cases) {
-    const { result } = await go(agents({ snapshot }))
+  for (const c of cases) {
+    const [snapshot, echo] = Array.isArray(c) ? c : [c, undefined]
+    const { result } = await go(agents(echo === undefined ? { snapshot } : { snapshot, check: json({ ...CHECK_OK, snapshot_sha256: echo }) }))
     assert.equal(result.telemetry.outcome, 'aborted', String(snapshot))
     assert.equal(result.writeback, null, String(snapshot))
+    if (echo !== undefined) assert.match(result.report, /WRITE-BACK SKIPPED/, String(snapshot))
   }
 })
 

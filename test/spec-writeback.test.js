@@ -235,15 +235,20 @@ test('spec-writeback verify: a missing or malformed snapshot file, or bad surviv
   const cases = [
     ['missing snapshot', [f.specPath, path.join(f.tmp, 'nope'), JSON.stringify(IDS)]],
     ['garbage snapshot', (() => { const g = path.join(f.tmp, 'garbage'); fs.writeFileSync(g, ''); return [f.specPath, g, JSON.stringify(IDS)] })()],
-    ['ids not JSON', [f.specPath, f.snap.file, 'AC-SEC-1']],
-    ['ids not an array of strings', [f.specPath, f.snap.file, '[1,2]']],
-    ['ids an object', [f.specPath, f.snap.file, '{}']],
+    // Round 4 F3: the ids are read from a file since round 2, so these three are written to one (an argv string would
+    // fail as a missing file and pin nothing); each asserts the reason that fired.
+    // The three share one ids path beside the snapshot, so each writes its file when its turn comes.
+    ['ids not JSON', () => [f.specPath, f.snap.file, idsFileFor(f, 'AC-SEC-1')], /not JSON/],
+    ['ids not an array of strings', () => [f.specPath, f.snap.file, idsFileFor(f, '[1,2]')], /must be a JSON array of AC ids/],
+    ['ids an object', () => [f.specPath, f.snap.file, idsFileFor(f, '{}')], /must be a JSON array of AC ids/],
     ['missing arguments', [f.specPath]],
   ]
-  for (const [name, args] of cases) {
+  for (const [name, argsOrThunk, reason] of cases) {
+    const args = typeof argsOrThunk === 'function' ? argsOrThunk() : argsOrThunk
     const v = run(['verify', ...args], f.tmp)
     assert.notEqual(v.res.status, 0, name)
     assert.equal(v.res.stdout, '', name)
+    if (reason) assert.match(v.res.stderr, reason, name)
     assert.equal(v.res.stderr.trim().split('\n').length, 1, `${name}: one reason line, got ${JSON.stringify(v.res.stderr)}`)
     assert.doesNotMatch(v.res.stderr, /Cannot find module/, name)
     assert.equal(fs.readFileSync(f.specPath, 'utf8'), broken, `${name}: nothing restored`)
@@ -442,4 +447,43 @@ test('spec-writeback verify (round 3 F2): a closing code span cut at an anchor o
     assert.ok(v.out.problems.some((p) => /AC-QA-2.*cut at an anchor or opener/.test(p)), `${line} -> ${JSON.stringify(v.out.problems)}`)
     assertRestored(f, v)
   }
+})
+
+// ======================================================================
+// Review round 4 of PR #18 (wf_98612ebb-1e9), adjudicated by the conductor: four Lows fixed, no fifth lens round.
+// ======================================================================
+test('spec-writeback (round 4 F1): a spec reached through a symlink is restored through the link, which stays a link', () => {
+  const dir = tmpRoot()
+  const target = path.join(dir, 'target.md')
+  const link = path.join(dir, 'spec.md')
+  fs.writeFileSync(target, spec())
+  fs.symlinkSync(target, link)
+  const tmp = tmpRoot()
+  const s = run(['snapshot', link], tmp)
+  assert.equal(s.res.status, 0, s.res.stderr)
+  fs.writeFileSync(target, spec([CRITERIA[0], '- **AC-QA-1:** Thing works and']))
+  const f = { specPath: link, tmp, snap: s.out }
+  const v = verify(f)
+  assert.equal(v.out.ok, false)
+  assert.equal(v.out.restored, true)
+  assert.ok(fs.lstatSync(link).isSymbolicLink(), 'the link is still a link')
+  assert.equal(fs.readFileSync(target, 'utf8'), spec(), 'the real file holds the snapshot bytes')
+})
+
+test('spec-writeback (round 4 F2): a heading the snapshot already had twice, and a "## " line inside a code fence, are not write-back defects', () => {
+  const twice = PREAMBLE + '## Notes\n\nA.\n\n## Notes\n\nB.\n\n## Acceptance criteria\n\n' + CRITERIA.join('\n') + '\n\n## Tasks\n\n- [ ] T1: do it.\n'
+  const f = fixture(twice)
+  fs.writeFileSync(f.specPath, twice.replace(CRITERIA[2], CRITERIA[2] + '\n- **AC-QA-3:** Added.'))
+  const v = verify(f, [...IDS, 'AC-QA-3'])
+  assert.deepEqual(v.out.problems, [], JSON.stringify(v.out))
+  const fenced = PREAMBLE + 'Example:\n\n```markdown\n## Acceptance criteria\n\n- **AC-X-1:** example only.\n```\n\n## Acceptance criteria\n\n' + CRITERIA.join('\n') + '\n\n## Tasks\n\n- [ ] T1: do it.\n'
+  const g = fixture(fenced)
+  fs.writeFileSync(g.specPath, fenced.replace(CRITERIA[2], CRITERIA[2] + '\n- **AC-QA-3:** Added.'))
+  const w = verify(g, [...IDS, 'AC-QA-3', 'AC-X-1'])
+  assert.deepEqual(w.out.problems, [], JSON.stringify(w.out))
+  // A heading the write-back ADDED a copy of is still a defect.
+  const h = fixture(twice)
+  fs.writeFileSync(h.specPath, twice + '\n## Notes\n\nC.\n')
+  const x = verify(h)
+  assert.ok(x.out.problems.some((p) => /duplicate heading: ## Notes \(3 times, the snapshot had 2\)/.test(p)), JSON.stringify(x.out.problems))
 })
