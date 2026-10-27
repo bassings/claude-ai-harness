@@ -50,9 +50,9 @@ never written anywhere. So
 the limit is measured on the new path instead, from base64 payloads handed to
 the ledger write prompt: a typical review_cycle terminal payload (three
 findings, ASCII text) is 1,376 bytes, and the largest payload the writer
-accepts (60 findings across the dispositions, prior and fixed at 60, 96
-ac_verdicts, seven lenses, compound lens labels, 2000-character non-ASCII
-claims and locations) is 31,888 bytes. The ceiling is 40,000 bytes, about a
+accepts (60 findings in each of the five dispositions, the script capping
+each at MAX_FINDINGS, 96 ac_verdicts, seven lenses, compound lens labels,
+2000-character non-ASCII claims and locations) is 49,836 bytes. The ceiling is 62,000 bytes, about a
 quarter above the largest measured payload; the test in
 test/harn-opt-6-gap.test.js fails if a payload built to those limits reaches it.
 

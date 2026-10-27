@@ -473,6 +473,7 @@ let synthesisHeadSha = null
 // the ledger payload carries only the finding ids computed from them below
 // (HARN-OPT-6), never the descriptor text.
 let specBugsRaw = null
+let malformedListCount = 0
 let rejectedFindingsRaw = null
 let specBugCount = null
 let rejectedFindingCount = null
@@ -1561,6 +1562,9 @@ const strayReport = (strayNote
 // The raw descriptor arrays are kept here and turned into finding ids when the
 // terminal payload is built (HARN-OPT-6); only the ids reach the ledger.
 synthesisHeadSha = synthesis && typeof synthesis.head_sha_at_synthesis === 'string' ? synthesis.head_sha_at_synthesis : null
+malformedListCount = synthesis
+  ? ['spec_bugs', 'rejected_findings', 'fixed_findings'].filter(key => synthesis[key] !== null && synthesis[key] !== undefined && !Array.isArray(synthesis[key])).length
+  : 0
 specBugsRaw = synthesis && Array.isArray(synthesis.spec_bugs) ? synthesis.spec_bugs : null
 rejectedFindingsRaw = synthesis && Array.isArray(synthesis.rejected_findings) ? synthesis.rejected_findings : null
 specBugCount = specBugsRaw ? specBugsRaw.length : null
@@ -1724,6 +1728,13 @@ const PAYLOAD_ROSTER_LENSES = [
 ]
 const PAYLOAD_SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 const PAYLOAD_VERDICTS = ['PASS', 'FAIL', 'UNVERIFIABLE']
+const PAYLOAD_LENS_VERDICTS = ['CLEAN', 'FINDINGS', 'BLOCKED']
+const PAYLOAD_RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+// The same bound ledger-append.mjs applies to the findings array (its
+// MAX_FINDINGS); a test pins the two together. Capping each disposition here
+// means the 40,000-byte payload ceiling is a bound rather than a hope, and the
+// written row is unchanged because the writer's own cap is never more generous.
+const PAYLOAD_MAX_FINDINGS = 60
 const payloadDrops = { ac_ids: 0, finding_fields: 0, record_values: 0 }
 // AC-SEC-2: round_key and lens_checkout_drift values are commit hashes. The
 // drift values come from lens self-reports, so a non-conforming one is dropped
@@ -1807,6 +1818,13 @@ function verifiedPriorEntries(prior) {
   }
   return { entries, invalid }
 }
+function payloadLensVerdicts(verdicts) {
+  return Object.fromEntries(Object.entries(verdicts || {}).map(([lens, verdict]) => {
+    if (PAYLOAD_LENS_VERDICTS.includes(verdict)) return [lens, verdict]
+    if (verdict !== null && verdict !== undefined) payloadDrops.record_values += 1
+    return [lens, null]
+  }))
+}
 function payloadAcVerdicts(verdicts) {
   return verdicts.map(v => {
     const acId = payloadAcId(v && v.ac_id)
@@ -1878,7 +1896,7 @@ const telemetry = {
   // accepting the line unchanged, and "key absent" already means "the lens did
   // not run", so nothing is lost.
   ...(architectureTriggerSource ? { architecture_trigger_source: architectureTriggerSource } : {}),
-  verdicts: result.verdicts || {},
+  verdicts: payloadLensVerdicts(result.verdicts),
   spec_bug_count: specBugCount,
   rejected_finding_count: rejectedFindingCount,
   budget_spent: budgetSpentDelta(),
@@ -1905,6 +1923,9 @@ const telemetry = {
 // neutralisation is counted in the existing counters. ledger-append.mjs
 // reconciles the fixed confirmations against the verified prior ids and
 // truncates at MAX_FINDINGS; neither is repeated here (AC-ARCH-8, AC-ARCH-9).
+// A list the synthesis returned as something other than an array is a counted
+// drop (AC-QA-10); null or absent is not malformed.
+payloadDrops.record_values += malformedListCount
 const specBugPairs = findingPairs(specBugsRaw, 'spec_bug')
 const rejectedPairs = findingPairs(rejectedFindingsRaw, 'rejected')
 const openPairs = findingPairs(openFindingsRaw, 'open')
@@ -1927,9 +1948,16 @@ const payloadAcVerdictList = payloadAcVerdicts(acVerdicts)
   ].filter(([n]) => n > 0)
   if (drops.length) log(`Run ${startRunId || 'unknown'}: ${drops.map(([n, name, why]) => `${name}=${n} (${why})`).join('; ')}`)
 }
+const cappedFindingCount = [specBugPairs, rejectedPairs, openPairs, fixedPairs].reduce((n, pairs) => n + Math.max(0, pairs.length - PAYLOAD_MAX_FINDINGS), 0)
 const terminalEntry = {
   kind: 'review_cycle',
-  finding_entries: [...specBugPairs, ...rejectedPairs, ...openPairs, ...fixedPairs].map(pair => pair.entry).concat(priorVerified ? priorVerified.entries : []),
+  finding_entries: [
+    ...[specBugPairs, rejectedPairs, openPairs, fixedPairs].flatMap(pairs => pairs.slice(0, PAYLOAD_MAX_FINDINGS).map(pair => pair.entry)),
+    ...(priorVerified ? priorVerified.entries.slice(0, PAYLOAD_MAX_FINDINGS) : []),
+  ],
+  // Entries cut by the cap above, handed to the writer so findings_truncated
+  // still counts every finding the run produced, as it did before the cap.
+  ...(cappedFindingCount > 0 ? { findings_truncated: cappedFindingCount } : {}),
   ...telemetry,
   ac_verdicts: payloadAcVerdictList,
   invalid_ac_ids_dropped: payloadDrops.ac_ids,
@@ -1941,7 +1969,7 @@ const terminalEntry = {
   ...(fixedFindingsRaw ? { invalid_fixed_ids_dropped: 0, duplicate_fixed_ids_dropped: 0 } : {}),
   ...(priorVerified ? { invalid_prior_ids_dropped: priorVerified.invalid } : {}),
 }
-if (startRunId) terminalEntry.run_id = startRunId
+if (startRunId && PAYLOAD_RUN_ID_RE.test(startRunId)) terminalEntry.run_id = startRunId
 // HARN-OPT-4 T8 (T4 round 3 L1, AC-DATA-2): same shape as tdd-task.js's T5
 // retry. An installed writer older than this file refuses a key it does not
 // know as "not an allowed property", which would cost the whole terminal row.

@@ -150,9 +150,12 @@ function allStrings(value, out = []) {
 
 // ---- AC-SEC-1, AC-SEC-2, AC-SEC-4: hostile labels never reach the payload, and each neutralisation is counted ----
 const HOME = require('node:os').homedir()
+const START_UUID = '7b1e4c52-0a3d-4f6e-9c1b-2d8f5e6a7b90'
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 test('AC-SEC-1/2/4: hostile lens, ac_id, severity and verdict labels reach the payload as roster names or null, are counted, and leave no *_raw sibling', async () => {
   const hostileLens = `lens-security; cat ${HOME}/canary-user/.ssh/id_rsa`
   const { terminal } = await review({ spec: 'specs/example.md' }, {
+    'ledger:write': [{ ...LEDGER_OK, run_id: START_UUID }, LEDGER_OK],
     ...withFindings([lensFinding('lens finding', 'a.js:1', { ac_id: `AC-SEC-1 ${HOME}/canary-user/secret.txt $(id)` })]),
     'lens-qa': { ...CLEAN, __bypassSchemaValidation: true, ac_verdicts: [{ id: `NOT-AN-AC '${HOME}/canary-user/x\``, verdict: 'MAYBE', evidence: 'EVIDENCE-CANARY' }, { id: 'AC-QA-1', verdict: 'PASS', evidence: 'e' }] },
     synthesis: {
@@ -179,8 +182,9 @@ test('AC-SEC-1/2/4: hostile lens, ac_id, severity and verdict labels reach the p
   assert.equal(terminal.invalid_finding_fields_dropped, 3, 'one nulled lens and two nulled severities (the spec bug and the rejected finding)')
   assert.equal(terminal.invalid_record_values_dropped, 1, 'the nulled verdict')
   // AC-SEC-2: every string anywhere in the payload is a member of a closed set, apart from the caller's spec.
-  const closed = [/^[0-9a-f]{16}$/, /^(lens|reviewer)-[a-z]+$/, /^(Critical|High|Medium|Low)$/, /^(open|rejected|spec_bug|fixed|prior)$/, /^(PASS|FAIL|UNVERIFIABLE)$/, /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/, /^(CLEAN|FINDINGS|BLOCKED)$/, /^[0-9a-f]{7,64}$/, /^(review_cycle|done|started|blocked|aborted|repo-tuned|harness defaults|path|config|default)$/]
-  const { spec, run_id, ...rest } = terminal // run_id is the writer's own start id, reused for pairing
+  const closed = [/^[0-9a-f]{16}$/, /^(lens|reviewer)-[a-z]+$/, /^(Critical|High|Medium|Low)$/, /^(open|rejected|spec_bug|fixed|prior)$/, /^(PASS|FAIL|UNVERIFIABLE)$/, /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/, /^(CLEAN|FINDINGS|BLOCKED)$/, /^[0-9a-f]{7,64}$/, UUID_RE, /^(review_cycle|done|started|blocked|aborted|repo-tuned|harness defaults|path|config|default)$/]
+  assert.equal(terminal.run_id, START_UUID, 'a UUID-shaped start id is reused to pair the terminal row with it')
+  const { spec, ...rest } = terminal // spec is the caller's argument; run_id is checked against the closed sets like every other string
   for (const s of allStrings(rest)) assert.ok(closed.some((re) => re.test(s)), `payload string outside the closed sets: ${JSON.stringify(s)}`)
 })
 
@@ -303,8 +307,9 @@ function legacyPayload(terminal, descriptors) {
   const { finding_entries, invalid_ac_ids_dropped, invalid_finding_fields_dropped, invalid_record_values_dropped, invalid_fixed_ids_dropped, duplicate_fixed_ids_dropped, invalid_prior_ids_dropped, ...telemetry } = terminal
   return { ...telemetry, ...descriptors }
 }
-function normalise(line) {
+function normalise(line, ignore = []) {
   const row = JSON.parse(line)
+  for (const k of ignore) delete row[k]
   delete row.run_id
   delete row.ts
   delete row.repo
@@ -354,6 +359,272 @@ const GOLDEN = {
     }
   })(),
 }
+// ======================================================================================================
+// Fix round 1 of review round 1
+// ======================================================================================================
+
+// ---- M1: a null severity is data, not a gap to fill. The 06049e4 writer recorded null for a non-enum severity. ----
+test('M1: the writer records a null severity as null on every disposition, and a severity left out as null, never as Low', () => {
+  const repo = makeTempRepo()
+  const ids = ['1111111111111111', '2222222222222222', '3333333333333333', '4444444444444444']
+  const entry = (id, disposition, extra = {}) => ({ id, lens: 'lens-qa', severity: null, ac_id: null, disposition, ...extra })
+  const { severity: _omitted, ...noSeverity } = entry(ids[3], 'spec_bug')
+  const out = JSON.parse(runAppend(repo, {
+    schema_version: 1, kind: 'review_cycle', outcome: 'done', invalid_fixed_ids_dropped: 0, duplicate_fixed_ids_dropped: 0,
+    finding_entries: [entry(ids[0], 'open'), entry(ids[1], 'rejected'), noSeverity, entry(ids[2], 'prior'), entry(ids[2], 'fixed')],
+  }).stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const row = JSON.parse(readLedgerLines(repo)[0])
+  assert.deepEqual(row.findings.map((f) => [f.id, f.disposition, f.severity]).sort(), [
+    [ids[0], 'open', null], [ids[1], 'rejected', null], [ids[2], 'fixed', null], [ids[3], 'spec_bug', null],
+  ].sort())
+})
+
+test('M1: no other default on a finding entry replaces a real value: a conforming severity, ac_id and lens pass through untouched', () => {
+  const repo = makeTempRepo()
+  const out = JSON.parse(runAppend(repo, {
+    schema_version: 1, kind: 'review_cycle', outcome: 'done',
+    finding_entries: ['Critical', 'High', 'Medium', 'Low'].map((severity, i) => ({ id: `${i}`.repeat(16), lens: 'lens-security', severity, ac_id: `AC-SEC-${i + 1}`, disposition: 'open' })),
+  }).stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, true, out.write_error)
+  const row = JSON.parse(readLedgerLines(repo)[0])
+  assert.deepEqual(row.findings.map((f) => [f.severity, f.ac_id, f.lens]), ['Critical', 'High', 'Medium', 'Low'].map((s, i) => [s, `AC-SEC-${i + 1}`, 'lens-security']))
+})
+
+// The prior finding is confirmed fixed, so its severity decides the fixed row. invalid_finding_fields_dropped is left out of
+// that one comparison: the 06049e4 writer counted a prior's bad severity when the prior became a fixed row, and the script
+// cannot know which priors the writer will confirm (reconciliation stays in the writer, AC-ARCH-9), so that count is a
+// recorded divergence rather than something this fixture can hold equal. The fixed row's severity itself IS compared.
+GOLDEN['non-enum severity on a rejected, an open and a prior finding'] = (() => {
+  const priorOdd = { lens: 'lens-qa', location: 'odd.js:9', claim: 'prior with an odd severity', severity: 'Catastrophic', ac_id: null }
+  const synthesis = {
+    report: '### VERDICT\nFINDINGS', spec_bugs: [],
+    rejected_findings: [{ lens: 'lens-qa', location: 'b.js:2', claim: 'odd rejected', severity: 'Nope' }],
+    fixed_findings: [confirm(priorOdd)],
+  }
+  return {
+    args: { spec: 'specs/example.md', prior_findings: [withId(priorOdd)] },
+    over: { 'lens-security': { ...withFindings([lensFinding('odd open', 'c.js:3', { severity: 'Urgent' })])['lens-security'], __bypassSchemaValidation: true }, synthesis },
+    descriptors: () => ({
+      spec_bugs: [], rejected_findings: synthesis.rejected_findings,
+      open_findings: [{ lens: 'lens-security', location: 'c.js:3', claim: 'odd open', severity: 'Urgent', ac_id: null, recurrence: null }],
+      prior_findings: [withId(priorOdd)], fixed_findings: synthesis.fixed_findings,
+    }),
+    ignore: ['invalid_finding_fields_dropped'],
+  }
+})()
+GOLDEN['non-enum severity on a rejected and an open finding, nothing ignored'] = (() => {
+  const synthesis = { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: [{ lens: 'lens-qa', location: 'b.js:2', claim: 'odd rejected', severity: 'Nope' }] }
+  return {
+    args: { spec: 'specs/example.md' },
+    over: { 'lens-security': { ...withFindings([lensFinding('odd open', 'c.js:3', { severity: 'Urgent' })])['lens-security'], __bypassSchemaValidation: true }, synthesis },
+    descriptors: () => ({ spec_bugs: [], rejected_findings: synthesis.rejected_findings, open_findings: [{ lens: 'lens-security', location: 'c.js:3', claim: 'odd open', severity: 'Urgent', ac_id: null, recurrence: null }] }),
+  }
+})()
+// M5: a golden row above the cap on several dispositions at once. Capping what the script sends must not change the row.
+GOLDEN['spec bugs, rejected and open findings each above MAX_FINDINGS'] = (() => {
+  const open = Array.from({ length: 70 }, (_, i) => lensFinding(`open ${i}`, `o${i}.js:${i + 1}`))
+  const mk = (tag, n) => Array.from({ length: n }, (_, i) => ({ lens: 'lens-qa', location: `${tag}${i}.js:1`, claim: `${tag} claim ${i}`, severity: 'Medium' }))
+  const synthesis = { report: '### VERDICT\nFINDINGS', spec_bugs: mk('s', 62), rejected_findings: mk('r', 65) }
+  return {
+    args: { spec: 'specs/example.md' },
+    over: { ...withFindings(open), synthesis },
+    descriptors: () => ({ spec_bugs: synthesis.spec_bugs, rejected_findings: synthesis.rejected_findings, open_findings: open.map((f) => ({ lens: 'lens-security', location: f.location, claim: f.claim, severity: 'High', ac_id: null, recurrence: null })) }),
+  }
+})()
+
+// ---- M2 (AC-SEC-1): prior_findings and the fixed echo carry text too, and none of it may reach the payload ----
+// Every free-text slot of every prior carries a sentinel, the ids are the correct ones for those hostile values, the
+// synthesis echoes each prior back as a fixed_findings entry, and one prior carries a 2 KB claim. The test also runs
+// the same round with one-character values: ids are a fixed 16 characters, so the ledger:write prompt must come out
+// the SAME LENGTH whatever the descriptor text, which catches text added to a prior entry even when it is short.
+function hostilePriors(width) {
+  const filler = 'q'.repeat(width)
+  const mk = (tag, extra = {}) => {
+    const p = {
+      lens: `lens-security + PRIOR-LENS-MID-${tag} + lens-architecture`,
+      location: `${HOME}/canary-user/PRIOR-LOC-${tag}.txt 'q' \`bt\` $(id) ${filler}`,
+      claim: `PRIOR-CLAIM-${tag} '"\`$(id) ${filler}`,
+      evidence: `PRIOR-EVIDENCE-${tag} ${filler}`,
+      consequence: `PRIOR-CONSEQUENCE-${tag}`,
+      fix: `PRIOR-FIX-${tag}`,
+      severity: 'High',
+      ac_id: 'AC-SEC-1',
+      ...extra,
+    }
+    return { ...p, id: oracleId(p.lens, p.location, p.claim) }
+  }
+  return [mk('A'), mk('B', { severity: 'Catastrophic PRIOR-SEV', ac_id: `free text PRIOR-ACID ${HOME}/canary-user/x` }), mk('C', { claim: `TWO-KB-SENTINEL-${filler}` + 'k'.repeat(2048) })]
+}
+async function hostilePriorRun(width) {
+  const priors = hostilePriors(width)
+  const out = await review({ spec: 'specs/example.md', round: 2, prior_findings: priors }, {
+    synthesis: { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [], fixed_findings: priors.map((p) => ({ lens: p.lens, location: p.location, claim: p.claim, ac_id: p.ac_id })) },
+  })
+  return { ...out, priors, prompt: out.calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt }
+}
+test('AC-SEC-1/2/4: hostile prior_findings and their fixed_findings echo reach neither the decoded payload nor the raw ledger:write prompt, and the prompt length does not depend on the text', async () => {
+  const short = await hostilePriorRun(1)
+  const long = await hostilePriorRun(2048)
+  const canaries = ['canary-user', 'PRIOR-LENS-MID', 'PRIOR-LOC', 'PRIOR-CLAIM', 'PRIOR-EVIDENCE', 'PRIOR-CONSEQUENCE', 'PRIOR-FIX', 'PRIOR-SEV', 'PRIOR-ACID', 'TWO-KB-SENTINEL', 'kkkkkkkkkkkkkkkk', 'qqqqqqqq', '$(id)', '`bt`', 'Catastrophic', 'free text']
+  for (const run of [short, long]) {
+    const payloadText = JSON.stringify(run.terminal)
+    for (const c of canaries) {
+      assert.ok(!payloadText.includes(c), `decoded payload carries ${c}`)
+      assert.ok(!run.prompt.includes(c), `ledger:write prompt carries ${c}`)
+    }
+    const entries = run.terminal.finding_entries
+    assert.equal(entries.filter((e) => e.disposition === 'prior').length, 3, 'all three priors verify against their correct ids')
+    assert.equal(entries.filter((e) => e.disposition === 'fixed').length, 3)
+    for (const e of entries) assert.deepEqual(Object.keys(e).sort(), ['ac_id', 'disposition', 'id', 'lens', 'severity'], 'an entry carries ids and closed-set labels only')
+    assert.deepEqual(entries.filter((e) => e.disposition === 'prior').map((e) => [e.lens, e.severity, e.ac_id]), [['lens-security', 'High', 'AC-SEC-1'], ['lens-security', null, null], ['lens-security', 'High', 'AC-SEC-1']])
+    for (const s of allStrings({ ...run.terminal, spec: undefined, run_id: undefined })) assert.ok(/^[0-9a-f]{16}$|^(lens|reviewer)-[a-z]+$|^(Critical|High|Medium|Low)$|^(open|rejected|spec_bug|fixed|prior)$|^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$|^(CLEAN|FINDINGS|BLOCKED|PASS|FAIL|UNVERIFIABLE)$|^[0-9a-f]{7,64}$|^(review_cycle|done|started|blocked|aborted|repo-tuned|harness defaults|path|config|default)$/.test(s), `payload string outside the closed sets: ${JSON.stringify(s).slice(0, 80)}`)
+  }
+  assert.equal(short.prompt.length, long.prompt.length, 'the prompt length must not vary with the length of the descriptor text')
+})
+
+// ---- M3 (AC-SEC-2): payloadLens, extracted from the workflow file, holds the bounds the writer's parser used to hold ----
+const LENS_START = SOURCE.indexOf('// HARN-OPT-6 (AC-SEC-2, AC-SEC-4): a lens-authored label')
+const LENS_END = SOURCE.indexOf('function payloadSeverity(')
+assert.ok(LENS_START > 0 && LENS_END > LENS_START, 'could not locate the payload label block in review-cycle.js')
+const lensBlock = () => new Function(`${SOURCE.slice(LENS_START, LENS_END)}\nreturn { payloadLens, payloadDrops }`)()
+const timed = (fn) => { const t0 = process.hrtime.bigint(); const value = fn(); return { value, ms: Number(process.hrtime.bigint() - t0) / 1e6 } }
+
+test('M3: a 100,000-character label of repeated separators resolves to its leading roster lens quickly (the label is bounded before any regex runs)', () => {
+  const { payloadLens } = lensBlock()
+  const label = 'lens-security' + ' + '.repeat(20000) + ', '.repeat(20000)
+  assert.ok(label.length >= 100000)
+  const { value, ms } = timed(() => payloadLens(label))
+  assert.equal(value, 'lens-security')
+  assert.ok(ms < 500, `payloadLens took ${ms} ms`)
+  const sep = timed(() => payloadLens(' + '.repeat(33000) + ', '.repeat(33000)))
+  assert.equal(sep.value, null)
+  assert.ok(sep.ms < 500, `separator-only input took ${sep.ms} ms`)
+})
+
+test('M3: a 100,001-character whitespace label is bounded too (the " and " split backtracks quadratically on unbounded whitespace)', () => {
+  const { payloadLens, payloadDrops } = lensBlock()
+  const { value, ms } = timed(() => payloadLens(' '.repeat(100001)))
+  assert.equal(value, null)
+  assert.equal(payloadDrops.finding_fields, 1)
+  assert.ok(ms < 500, `payloadLens took ${ms} ms`)
+})
+
+test('M3: only the first 256 characters of a label are read: a roster name starting past character 256 is never resolved, one ending exactly at 256 is', () => {
+  const { payloadLens } = lensBlock()
+  assert.equal(payloadLens('x'.repeat(256) + ' + lens-qa'), null, 'a roster name past the bound is never read')
+  assert.equal(payloadLens('lens-qa + ' + 'x'.repeat(256)), 'lens-qa', 'a roster name inside the bound resolves')
+  const pad = 'x'.repeat(256 - ' + lens-qa'.length)
+  assert.equal((pad + ' + lens-qa').length, 256)
+  assert.equal(payloadLens(pad + ' + lens-qa'), 'lens-qa', 'a name ending exactly at character 256 resolves')
+  assert.equal(payloadLens(`${'x'.repeat(255)}+lens-qa`), null, 'a name that would start at character 257 does not resolve')
+})
+
+for (const label of ['lens-security + lens-architecture', 'lens-security, lens-architecture', 'lens-security and lens-architecture']) {
+  test(`M3: the compound label "${label}" is attributed to the first roster lens it names, uncounted`, () => {
+    const { payloadLens, payloadDrops } = lensBlock()
+    assert.equal(payloadLens(label), 'lens-security')
+    assert.equal(payloadLens('lens-architecture, lens-security'), 'lens-architecture', 'the FIRST named, not the alphabetically first')
+    assert.equal(payloadDrops.finding_fields, 0)
+  })
+}
+
+test('M3: a label carrying a control character, backtick or pipe resolves to null and is counted once; a repeated roster name still resolves', () => {
+  const { payloadLens, payloadDrops } = lensBlock()
+  assert.equal(payloadLens('lens-qa + lens-qa'), 'lens-qa')
+  const hostile = ['lens-security\n+ lens-qa', 'lens-qa + `lens-security`', 'lens-security + a|b', 'lens-security\u0000', 'lens-security\u007f + lens-qa', '', '+', 'orchestrator', 'lens-security-extra x']
+  hostile.forEach((label, i) => {
+    assert.equal(payloadLens(label), null, JSON.stringify(label))
+    assert.equal(payloadDrops.finding_fields, i + 1, `${JSON.stringify(label)} must be counted exactly once`)
+  })
+  assert.equal(payloadLens(undefined), null)
+  assert.equal(payloadLens(42), null)
+})
+
+test('M3 (moved from the writer): compound labels count once under their primary lens in the reader, a compound finding confirmed fixed keeps that lens and its id, and a path-shaped segment never reaches the row', async () => {
+  const mod = await import(path.join('file://', ROOT, 'workflows', 'lib', 'optimise-read.mjs'))
+  const labels = ['lens-security + lens-architecture', 'lens-security, lens-architecture', 'lens-qa and lens-security', 'lens-qa', 'orchestrator', 'lens-security + /Users/someone/private', 'lens-qa+/Users/x']
+  const repo = makeTempRepo()
+  const { terminal } = await review({ spec: 'specs/example.md' }, {
+    synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: labels.map((lens, i) => ({ lens, location: `a${i}.js:1`, claim: `claim ${i}`, severity: 'Low' })) },
+    'ledger:write': realWriter(repo),
+  })
+  assert.ok(terminal)
+  const row = JSON.parse(readLedgerLines(repo).pop())
+  assert.equal(row.findings.length, labels.length)
+  assert.ok(!JSON.stringify(row).includes('/Users/'), 'a path-shaped segment reached the row')
+  assert.ok(row.findings.every((f) => !Object.keys(f).some((k) => k.endsWith('_raw'))))
+  const rework = mod.aggregateRework([{ ...row, repo: 'demo' }])
+  assert.equal(rework.lensDispositionCounts['lens-security']?.rejected, 3, 'three labels lead with lens-security')
+  assert.equal(rework.lensDispositionCounts['lens-qa']?.rejected, 3, 'lens-qa and lens-qa and lens-security, bare lens-qa, and the glued path')
+  assert.equal(rework.lensDispositionCounts['lens-architecture'], undefined, 'the secondary lens is not double counted')
+  assert.equal(rework.unattributedFindings, 1, 'only the label naming no roster lens is unattributed')
+
+  const compound = { lens: 'lens-security + lens-architecture', location: 'a.js:1', claim: 'c', severity: 'Low' }
+  const repo2 = makeTempRepo()
+  await review({ spec: 'specs/example.md' }, { synthesis: { report: '### VERDICT\nFINDINGS', spec_bugs: [], rejected_findings: [compound] }, 'ledger:write': realWriter(repo2) })
+  await review({ spec: 'specs/example.md', round: 2, prior_findings: [withId(compound)] }, { synthesis: { report: '### VERDICT\nCLEAN', spec_bugs: [], rejected_findings: [], fixed_findings: [confirm(compound)] }, 'ledger:write': realWriter(repo2) })
+  const rows = readLedgerLines(repo2).map((l) => JSON.parse(l)).filter((r) => r.outcome !== 'started')
+  const fixed = rows[1].findings.filter((f) => f.disposition === 'fixed')
+  assert.deepEqual(fixed.map((f) => [f.id, f.lens]), [['7c35753185a55bf1', 'lens-security']])
+  assert.equal(rows[1].invalid_prior_ids_dropped, 0)
+  assert.equal(rows[1].invalid_fixed_ids_dropped, 0)
+  assert.equal(mod.aggregateRework([{ ...rows[1], repo: 'demo' }]).lensDispositionCounts['lens-security']?.fixed, 1)
+})
+
+// ---- L1 (AC-SEC-2): verdicts and run_id are mapped or checked in the script ----
+test('L1: a lens verdict outside CLEAN, FINDINGS and BLOCKED reaches the payload as null and is counted under invalid_record_values_dropped; the rest are kept', async () => {
+  const hostile = `ALL-GOOD ${HOME}/canary-user/verdict $(id) \`x\``
+  const { terminal, payloads, result } = await review({}, {
+    'lens-qa': { ...CLEAN, __bypassSchemaValidation: true, verdict: hostile },
+    ...withFindings([lensFinding('real finding', 'a.js:1')]),
+  })
+  assert.ok(result && terminal)
+  assert.ok(!JSON.stringify(payloads).includes('canary-user'), 'the verdict text reached a payload')
+  assert.equal(terminal.verdicts['lens-qa'], null)
+  assert.equal(terminal.verdicts['lens-security'], 'FINDINGS')
+  // No spec is passed, so only lens-security and lens-qa run; lens-product has no verdict to check.
+  assert.equal(terminal.invalid_record_values_dropped, 1)
+  for (const v of Object.values(terminal.verdicts)) assert.ok(v === null || ['CLEAN', 'FINDINGS', 'BLOCKED'].includes(v), `verdict outside the enum: ${JSON.stringify(v)}`)
+})
+
+test('L1: a start run_id is reused for the terminal row only when it is UUID-shaped; a hostile one is dropped and the row is still written', async () => {
+  const hostileId = `${HOME}/canary-user/run $(id)`
+  const hostile = await review({}, { 'ledger:write': [{ ...LEDGER_OK, run_id: hostileId }, LEDGER_OK] })
+  assert.ok(!('run_id' in hostile.terminal), `a non-UUID run_id must not be sent: ${JSON.stringify(hostile.terminal.run_id)}`)
+  assert.ok(!hostile.calls.filter((c) => c.opts.label === 'ledger:write').some((c) => c.prompt.includes('canary-user')))
+  assert.ok(!JSON.stringify(hostile.payloads).includes('canary-user'))
+  assert.equal(hostile.payloads.filter((p) => p.outcome !== 'started').length, 1)
+  const good = await review({}, { 'ledger:write': [{ ...LEDGER_OK, run_id: START_UUID }, LEDGER_OK] })
+  assert.equal(good.terminal.run_id, START_UUID)
+  for (const odd of ['r1', START_UUID.toUpperCase().slice(0, -1), `${START_UUID}-x`, ` ${START_UUID}`, START_UUID.replace(/-/g, '')]) {
+    const r = await review({}, { 'ledger:write': [{ ...LEDGER_OK, run_id: odd }, LEDGER_OK] })
+    assert.ok(!('run_id' in r.terminal), `${JSON.stringify(odd)} is not UUID-shaped and must not be reused`)
+  }
+})
+
+// ---- L2 (AC-QA-10): a non-null, non-array descriptor list is a counted drop ----
+test('L2: a non-null, non-array spec_bugs, rejected_findings or fixed_findings each add one to invalid_record_values_dropped, and the run makes one terminal write', async () => {
+  for (const bad of ['oops', 7, { a: 1 }, true]) {
+    const { terminal, payloads, result } = await review({ spec: 'specs/example.md' }, {
+      synthesis: { __bypassSchemaValidation: true, report: '### VERDICT\nCLEAN', spec_bugs: bad, rejected_findings: bad, fixed_findings: bad },
+    })
+    assert.equal(typeof result.report, 'string')
+    assert.equal(payloads.filter((p) => p.outcome !== 'started').length, 1, `one terminal write for ${JSON.stringify(bad)}`)
+    assert.equal(terminal.invalid_record_values_dropped, 3, `three malformed lists (${JSON.stringify(bad)}) must be counted`)
+    assert.deepEqual(terminal.finding_entries, [])
+  }
+  const one = await review({ spec: 'specs/example.md' }, { synthesis: { __bypassSchemaValidation: true, report: '### VERDICT\nCLEAN', spec_bugs: 'oops', rejected_findings: [] } })
+  assert.equal(one.terminal.invalid_record_values_dropped, 1, 'only the malformed list is counted')
+})
+
+test('L2: a null or absent list is not a malformed one and is not counted', async () => {
+  const { terminal } = await review({ spec: 'specs/example.md' }, { synthesis: { __bypassSchemaValidation: true, report: '### VERDICT\nCLEAN', spec_bugs: null, rejected_findings: null, fixed_findings: null } })
+  assert.equal(terminal.invalid_record_values_dropped, 0)
+  const absent = await review({ spec: 'specs/example.md' }, { synthesis: { __bypassSchemaValidation: true, report: '### VERDICT\nCLEAN' } })
+  assert.equal(absent.terminal.invalid_record_values_dropped, 0)
+})
+
 for (const [name, fixture] of Object.entries(GOLDEN)) {
   test(`AC-DATA-2: golden row equivalence with the writer at 06049e4: ${name}`, { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
     const { terminal } = await review(fixture.args, fixture.over)
@@ -365,6 +636,6 @@ for (const [name, fixture] of Object.entries(GOLDEN)) {
     const oldOut = runOldWriter(oldRepo, legacyPayload(terminal, descriptors))
     assert.equal(oldOut.write_ok, true, oldOut.write_error)
     assert.equal(JSON.parse(runAppend(newRepo, terminal).stdout.trim().split('\n').pop()).write_ok, true)
-    assert.deepEqual(normalise(readLedgerLines(newRepo)[0]), normalise(readLedgerLines(oldRepo)[0]))
+    assert.deepEqual(normalise(readLedgerLines(newRepo)[0], fixture.ignore), normalise(readLedgerLines(oldRepo)[0], fixture.ignore))
   })
 }

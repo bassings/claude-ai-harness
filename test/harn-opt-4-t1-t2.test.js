@@ -11,14 +11,12 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
-const { APPEND_SCRIPT, makeTempRepo, runAppend: runAppendIds, readLedgerLines, cleanupTempRepos } = require('./helpers/temp-repo.js')
-const { toFindingEntries } = require('./helpers/finding-entries.js')
+const { APPEND_SCRIPT, makeTempRepo, runAppend, readLedgerLines, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
-// HARN-OPT-6: the writer takes finding ids, so a round described as descriptors
-// is converted to the id-bearing payload review-cycle.js sends.
-function runAppend(repo, payload, ...rest) {
-  return runAppendIds(repo, toFindingEntries(payload), ...rest)
-}
+// HARN-OPT-6: the writer takes finding ids, so these tests send the id-bearing
+// finding_entries shape directly, as literals. The entry id is any 16 hex digits.
+const hexId = (n) => n.toString(16).padStart(16, '0')
+const openEntry = (n, lens, extra = {}) => ({ id: hexId(n), lens, severity: 'Low', ac_id: null, disposition: 'open', ...extra })
 
 const APPEND_MODULE_URL = pathToFileURL(APPEND_SCRIPT).href
 const READ_MODULE_URL = pathToFileURL(path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')).href
@@ -41,7 +39,7 @@ function writeOpen(lensLabels, extra = {}) {
   const res = runAppend(repo, {
     ...envelope(),
     ...extra,
-    open_findings: lensLabels.map((lens, i) => ({ lens, location: `a.js:${i + 1}`, claim: `claim ${i}` })),
+    finding_entries: lensLabels.map((lens, i) => openEntry(i + 1, lens)),
   })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   const lines = readLedgerLines(repo)
@@ -108,7 +106,7 @@ test('T2: 400 findings with 400 distinct hostile lens strings still write a full
 // compound-label resolution into review-cycle.js, which now keeps no *_raw.)
 test('L3: a path directly after "+" is redacted in ac_id_raw', () => {
   const repo = makeTempRepo()
-  const res = runAppend(repo, { ...envelope(), open_findings: [{ lens: 'lens-qa', location: 'a.js:1', claim: 'c', ac_id: 'AC-QA-1+/Users/x' }] })
+  const res = runAppend(repo, { ...envelope(), finding_entries: [openEntry(1, 'lens-qa', { ac_id: 'AC-QA-1+/Users/x' })] })
   const out = JSON.parse(res.stdout.trim().split('\n').pop())
   assert.equal(out.write_ok, true, out.write_error)
   const raw = readLedgerLines(repo)[0]

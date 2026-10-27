@@ -2353,3 +2353,30 @@ test('static: conduct-plan/SKILL.md review step shows a literal /review-cycle ca
   const warn = step.split(/\n\s*\n/).find((p) => /quoted/i.test(p) && /null/i.test(p) && /direct/i.test(p))
   assert.ok(warn, 'expected a sentence saying a quoted number is nulled by the writer and read as a direct review')
 })
+
+// HARN-OPT-6 (AC-QA-14 clause 1): writer-side tests send the id-bearing finding_entries payload directly. A
+// descriptor-to-entries converter in the test tree would be a second copy of review-cycle.js's logic that about a
+// hundred writer tests then pin instead of the writer, so none may exist, and a legacy descriptor key may appear in a
+// test only inside the single test that names itself transition-only. The node:crypto id oracle is the one export
+// test/helpers/finding-entries.js keeps (AC-QA-2).
+test('no test builds writer payloads through a descriptor converter, and the only test using legacy descriptor keys is the one transition-only test (AC-QA-14)', () => {
+  const testDir = path.join(ROOT, 'test')
+  const files = [...fs.readdirSync(testDir).filter((f) => f.endsWith('.js')).map((f) => path.join(testDir, f)), ...fs.readdirSync(path.join(testDir, 'helpers')).filter((f) => f.endsWith('.js')).map((f) => path.join(testDir, 'helpers', f))]
+  const self = path.join(testDir, 'static-checks.test.js')
+  const converters = files.filter((f) => f !== self && /\btoFindingEntries\b|\bLEGACY_DESCRIPTOR_KEYS\b/.test(fs.readFileSync(f, 'utf8')))
+  assert.deepEqual(converters.map((f) => path.relative(ROOT, f)), [], 'these test files still use a descriptor-to-finding_entries converter')
+  const helper = require(path.join(testDir, 'helpers', 'finding-entries.js'))
+  assert.deepEqual(Object.keys(helper).sort(), ['findingId'], 'test/helpers/finding-entries.js must export only the node:crypto id oracle')
+
+  const LEGACY_KEY = /^\s*(?:spec_bugs|rejected_findings|open_findings|prior_findings|fixed_findings)\s*:|[{,]\s*(?:spec_bugs|rejected_findings|open_findings|prior_findings|fixed_findings)\s*:/m
+  const writerSide = ['ledger-append.test.js', 'optimise-read.test.js', 'harn-opt-4-t1-t2.test.js'].map((f) => path.join(testDir, f))
+  const offenders = []
+  for (const file of writerSide) {
+    for (const chunk of fs.readFileSync(file, 'utf8').split(/\n(?=test\()/)) {
+      if (LEGACY_KEY.test(chunk)) offenders.push(`${path.basename(file)}: ${chunk.slice(0, 110).replace(/\s+/g, ' ')}`)
+    }
+  }
+  assert.deepEqual(offenders, [], 'writer-side tests must send finding_entries, not descriptors')
+  const transitional = files.filter((f) => f !== self).flatMap((f) => [...fs.readFileSync(f, 'utf8').matchAll(/^test\((['"`])(?:(?!\1).)*transition-only(?:(?!\1).)*\1/gm)].map(() => path.basename(f)))
+  assert.deepEqual(transitional, ['harn-opt-6-t1.test.js'], 'exactly one test names itself transition-only')
+})

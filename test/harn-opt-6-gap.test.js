@@ -39,6 +39,8 @@ fs.mkdirSync(path.join(OLD_DIR, 'lib'))
 fs.writeFileSync(path.join(OLD_DIR, 'lib', 'ledger-append.mjs'), gitShow('workflows/lib/ledger-append.mjs'))
 fs.writeFileSync(path.join(OLD_DIR, 'lib', 'optimise-read.mjs'), gitShow('workflows/lib/optimise-read.mjs'))
 fs.writeFileSync(path.join(OLD_DIR, 'review-cycle.js'), gitShow('workflows/review-cycle.js'))
+fs.writeFileSync(path.join(OLD_DIR, 'plan-cycle.js'), gitShow('workflows/plan-cycle.js'))
+fs.writeFileSync(path.join(OLD_DIR, 'tdd-task.js'), gitShow('workflows/tdd-task.js'))
 const OLD_WRITER = path.join(OLD_DIR, 'lib', 'ledger-append.mjs')
 const OLD_WF = path.join(OLD_DIR, 'review-cycle.js')
 const runOldWriter = (repo, payload) => JSON.parse(spawnSync('node', [OLD_WRITER], { cwd: repo, input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv() }).stdout.trim().split('\n').pop())
@@ -90,7 +92,7 @@ function problemSection() {
   assert.ok(start >= 0 && end > start, 'could not find the Problem section')
   return spec.slice(start, end)
 }
-const MAX_FINDINGS = 60
+const WRITER_URL = pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'ledger-append.mjs')).href
 const wide = (tag, i) => `${tag}${i}-` + 'あ\u{1F389}é'.repeat(700) // 2000+ UTF-16 units, 3-, 4- and 2-byte UTF-8
 const trim2000 = (s) => s.slice(0, 2000).replace(/[\uD800-\uDBFF]$/, '')
 
@@ -107,30 +109,30 @@ test('AC-QA-9: the spec records the payload size measurements under a Payload si
   assert.ok(!/Payload size/.test(acSection), 'the paragraph belongs in Problem, never under Acceptance criteria')
 })
 
-test('AC-QA-9: the largest review_cycle terminal payload the writer accepts stays under the ceiling recorded in the spec', async () => {
+test('AC-QA-9: with every disposition driven above MAX_FINDINGS, the script sends at most MAX_FINDINGS of each and the base64 payload stays under the ceiling recorded in the spec', async () => {
+  const { MAX_FINDINGS } = await import(WRITER_URL)
   const m = /ceiling[^0-9\n]*([0-9][0-9,]*)\s*bytes/i.exec(problemSection())
   assert.ok(m, 'no ceiling recorded in the spec (see the previous test)')
   const ceiling = Number(m[1].replace(/,/g, ''))
-  const priors = Array.from({ length: MAX_FINDINGS }, (_, i) => ({ lens: ALL_LENSES[i % 7], location: trim2000(wide('p', i)), claim: trim2000(wide('pc', i)), severity: 'High', ac_id: `AC-SEC-${i + 1}` })).map(withId)
-  const third = MAX_FINDINGS / 3
+  const over = MAX_FINDINGS + 15
+  const priors = Array.from({ length: over }, (_, i) => ({ lens: ALL_LENSES[i % 7], location: trim2000(wide('p', i)), claim: trim2000(wide('pc', i)), severity: 'High', ac_id: `AC-SEC-${i + 1}` })).map(withId)
   const compound = (i) => `${ALL_LENSES[i % 7]} + ${ALL_LENSES[(i + 1) % 7]} + ${ALL_LENSES[(i + 2) % 7]}`
   const desc = (tag, i, lens) => ({ lens, location: trim2000(wide(`${tag}l`, i)), claim: trim2000(wide(`${tag}c`, i)), severity: 'Critical', ac_id: `AC-QA-${i + 1}` })
   const sevenAcVerdicts = (n) => Array.from({ length: 96 }, (_, i) => ({ id: `AC-${['SEC', 'QA', 'DATA', 'OPS', 'ARCH', 'SIMP', 'PROD'][n]}-${i + 1}`, verdict: 'PASS', evidence: wide('ev', i) })).filter((_, i) => i % 7 === n)
   const lensOverrides = Object.fromEntries(ALL_LENSES.slice(0, 7).map((l, n) => [l, { ...CLEAN, __bypassSchemaValidation: true, ac_verdicts: sevenAcVerdicts(n) }]))
   const { terminal, calls, result } = await review({ spec: 'specs/example.md', lenses: ALL_LENSES.slice(0, 7), prior_findings: priors }, {
     ...lensOverrides,
-    'lens-security': { ...lensOverrides['lens-security'], verdict: 'FINDINGS', findings: Array.from({ length: third }, (_, i) => lensFinding(trim2000(wide('oc', i)), trim2000(wide('ol', i)), { ac_id: `AC-SEC-${i + 1}` })) },
+    'lens-security': { ...lensOverrides['lens-security'], verdict: 'FINDINGS', findings: Array.from({ length: over }, (_, i) => lensFinding(trim2000(wide('oc', i)), trim2000(wide('ol', i)), { ac_id: `AC-SEC-${i + 1}` })) },
     synthesis: {
       report: '### VERDICT\nFINDINGS',
-      spec_bugs: Array.from({ length: third }, (_, i) => desc('s', i, compound(i))),
-      rejected_findings: Array.from({ length: third }, (_, i) => desc('r', i, compound(i + 3))),
+      spec_bugs: Array.from({ length: over }, (_, i) => desc('s', i, compound(i))),
+      rejected_findings: Array.from({ length: over }, (_, i) => desc('r', i, compound(i + 3))),
       fixed_findings: priors.map(confirm),
     },
   })
   assert.ok(result && terminal, 'the run must reach a terminal write')
   const by = (d) => terminal.finding_entries.filter((e) => e.disposition === d).length
-  assert.deepEqual([by('prior'), by('fixed')], [MAX_FINDINGS, MAX_FINDINGS], 'prior and fixed must both be at MAX_FINDINGS')
-  assert.equal(by('open') + by('rejected') + by('spec_bug'), MAX_FINDINGS)
+  for (const d of ['open', 'rejected', 'spec_bug', 'prior', 'fixed']) assert.equal(by(d), MAX_FINDINGS, `${d} entries must be capped at MAX_FINDINGS (${MAX_FINDINGS}) in the script, got ${by(d)}`)
   assert.ok(terminal.ac_verdicts.length >= 90, `expected about 96 ac_verdicts, got ${terminal.ac_verdicts.length}`)
   const call = calls.filter((c) => c.opts.label === 'ledger:write').pop()
   const bytes = Buffer.byteLength(extractEncodedPayload(call.prompt))
@@ -273,3 +275,64 @@ test('AC-OPS-12: a conductor-prior-findings.json written after the change is acc
   assert.deepEqual(row.findings.filter((f) => f.disposition === 'fixed').map((f) => f.id), [oracleId(PRIOR.lens, PRIOR.location, PRIOR.claim)])
   assert.ok(r2.result)
 })
+
+// ---- AC-QA-12: plan-cycle.js and tdd-task.js are otherwise unaffected ----
+// The same scripted agents run through each workflow as it stands at 06049e4 (read from git) and as it stands now;
+// every ledger payload must deep-equal apart from run_id (the writer mints it, and here the script reuses the scripted one).
+const OLD_PLAN_WF = path.join(OLD_DIR, 'plan-cycle.js')
+const OLD_TDD_WF = path.join(OLD_DIR, 'tdd-task.js')
+const PLAN_WF = path.join(ROOT, 'workflows', 'plan-cycle.js')
+const TDD_WF = path.join(ROOT, 'workflows', 'tdd-task.js')
+const withoutRunId = ({ run_id, ...rest }) => rest
+async function ledgerPayloads(wf, args, agent) {
+  const out = await runWorkflow(wf, { args, agent })
+  return out.calls.filter((c) => c.opts.label === 'ledger:write').map((c) => withoutRunId(extractLedgerPayload(c.prompt)))
+}
+
+const PLAN_SCOPE = {
+  head_sha: 'abc1234567890def', summary: 'adds a widget', ui: false, data: false, architecture: false, operability: false, user_facing: true, likely_paths: ['src/widget.js'],
+  consistency: { ok: true, consistent: true, blind: false, checked_dir: '/fake/install', lens_files_checked: 9, doc_fields: ['recurrence'], agent_fields: ['recurrence'], missing_in_review_schema: [], missing_in_plan_schema: [], review_only_props: [], plan_only_props: [], error: null },
+}
+const PLAN_LENS = { verdict: 'CLEAN', coverage: COVERAGE, acceptance_criteria: [{ id: 'AC-SEC-1', statement: 'x' }] }
+const PLAN_SHA = 'a'.repeat(64)
+const planAgent = (overrides = {}) => ({
+  'scope:spec': { ...PLAN_SCOPE, spec_snapshot: JSON.stringify({ file: '/tmp/harn-specwb-base/spec.snapshot', sha256: PLAN_SHA, headings: ['## Problem'], ac_ids: [] }) },
+  'lens-security': PLAN_LENS,
+  'lens-qa': PLAN_LENS,
+  'lens-simplicity': { ...PLAN_LENS, acceptance_criteria: [] },
+  'lens-product': PLAN_LENS,
+  'synthesis:write-back': { summary: '### Summary\n4 criteria', head_sha_at_synthesis: 'abc1234567890def', surviving_ids: [], writeback_check: JSON.stringify({ ok: true, problems: [], restored: false, spec_sha256: 'b'.repeat(64), snapshot_sha256: PLAN_SHA, surviving_ids_checked: [] }) },
+  'ledger:write': LEDGER_OK,
+  ...overrides,
+})
+const TDD_DONE = {
+  'write-test#1': { test_files: ['a.test.js'], test_command: 'node a.test.js', expected_failure: 'missing fn' },
+  'verify-red#1': { red: true, right_reason: true, evidence: 'threw', test_hashes: [{ file: 'a.test.js', sha256: 'abc' }] },
+  'implement#1': { summary: 'added fn', files_changed: ['a.js'] },
+  'verify-green#1': { green: true, suite_green: true, hashes_match: true, evidence: 'passed' },
+  commit: { sha: 'deadbeef', message: 'feat: thing' },
+  'ledger:write': LEDGER_OK,
+}
+const TDD_RED_REJECTED = {
+  'write-test#1': TDD_DONE['write-test#1'], 'write-test#2': TDD_DONE['write-test#1'], 'write-test#3': TDD_DONE['write-test#1'],
+  'verify-red#1': { red: false, right_reason: false, evidence: 'passed already', test_hashes: [] },
+  'verify-red#2': { red: false, right_reason: false, evidence: 'passed already', test_hashes: [] },
+  'verify-red#3': { red: false, right_reason: false, evidence: 'passed already', test_hashes: [] },
+  'ledger:write': LEDGER_OK,
+}
+for (const [name, newWf, oldWf, args, agent] of [
+  ['plan-cycle.js, all lenses clean', PLAN_WF, OLD_PLAN_WF, { spec: 'specs/foo.md' }, planAgent()],
+  ['plan-cycle.js, a lens reports findings', PLAN_WF, OLD_PLAN_WF, { spec: 'specs/foo.md' }, planAgent({ 'lens-qa': { ...PLAN_LENS, verdict: 'FINDINGS' } })],
+  ['plan-cycle.js, the scope agent fails', PLAN_WF, OLD_PLAN_WF, { spec: 'specs/foo.md' }, { 'ledger:write': LEDGER_OK }],
+  ['tdd-task.js, done', TDD_WF, OLD_TDD_WF, { task: 'do the thing' }, TDD_DONE],
+  ['tdd-task.js, RED rejected three times', TDD_WF, OLD_TDD_WF, { task: 'do the thing' }, TDD_RED_REJECTED],
+  ['tdd-task.js, the test writer fails', TDD_WF, OLD_TDD_WF, { task: 'do the thing' }, { 'ledger:write': LEDGER_OK }],
+]) {
+  test(`AC-QA-12: ${name}: the ledger payloads at HEAD deep-equal those at ${OLD}, apart from run_id`, async () => {
+    const before = await ledgerPayloads(oldWf, args, agent)
+    const after = await ledgerPayloads(newWf, args, agent)
+    assert.ok(before.length >= 2, `expected a start and a terminal write at ${OLD}, got ${before.length}`)
+    assert.deepEqual(after, before)
+    assert.ok(after.every((p) => !('finding_entries' in p)), 'plan-cycle.js and tdd-task.js carry no finding_entries')
+  })
+}

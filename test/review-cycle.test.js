@@ -160,8 +160,10 @@ test('review-cycle.js: the start-record ledger write is the very first agent() c
 // AC-QA-9: distinct run_ids per call, and the terminal request checked
 // against the START write's run_id, not just a call count -- see
 // tdd-task.test.js's parametrized version for the identical rationale.
+// The writer mints UUIDs, and the script reuses a start run_id for the terminal row only when it is UUID-shaped (AC-SEC-2).
+const START_RUN_ID = '7b1e4c52-0a3d-4f6e-9c1b-2d8f5e6a7b90'
 const PAIRED_LEDGER = [
-  { run_id: 'return-path-start', ts: 't1', write_ok: true, write_error: null },
+  { run_id: START_RUN_ID, ts: 't1', write_ok: true, write_error: null },
   { run_id: 'return-path-terminal', ts: 't2', write_ok: true, write_error: null },
 ]
 
@@ -190,7 +192,7 @@ test('review-cycle.js: a genuinely empty diff (scope succeeded, zero files) stil
   assert.equal(result.telemetry.outcome, 'no-op')
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
-  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
+  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, START_RUN_ID, 'the terminal write must request reuse of the start run_id')
 })
 
 // AC-1: a scope step that returned NOTHING (the agent failed or was
@@ -245,7 +247,7 @@ test('review-cycle.js: "every lens agent failed" early return (line 149 historic
   assert.equal(result.telemetry.outcome, 'aborted')
   const ledgerCalls = calls.filter((c) => c.opts.label === 'ledger:write')
   assert.equal(ledgerCalls.length, 2, 'expected one start write + one terminal write')
-  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, 'return-path-start', 'the terminal write must request reuse of the start run_id')
+  assert.equal(extractLedgerPayload(ledgerCalls[1].prompt).run_id, START_RUN_ID, 'the terminal write must request reuse of the start run_id')
 })
 
 test('review-cycle.js: outcome is blocked when any lens returns BLOCKED', async () => {
@@ -603,7 +605,7 @@ test('review-cycle.js: an exception thrown by an agent() call inside run() still
         agent: baseAgent({
           'scope:diff': () => { throw new Error('agent step crashed mid-run') },
           'ledger:write': [
-            { run_id: 'start-abc', ts: 't1', write_ok: true, write_error: null },
+            { run_id: START_RUN_ID, ts: 't1', write_ok: true, write_error: null },
             { run_id: 'terminal-abc', ts: 't2', write_ok: true, write_error: null },
           ],
         }),
@@ -615,10 +617,10 @@ test('review-cycle.js: an exception thrown by an agent() call inside run() still
       const startPayload = extractLedgerPayload(ledgerCalls[0].prompt)
       const terminalPayload = extractLedgerPayload(ledgerCalls[1].prompt)
       assert.ok(!('run_id' in startPayload), 'the start write does not request an existing run_id')
-      assert.equal(terminalPayload.run_id, 'start-abc', 'the terminal write must reuse the start run_id')
+      assert.equal(terminalPayload.run_id, START_RUN_ID, 'the terminal write must reuse the start run_id')
       assert.equal(terminalPayload.outcome, 'aborted', 'a thrown run() must never be recorded as done or blocked (AC-QA-12)')
       assert.ok(
-        err.logs.some((l) => l.includes('start-abc') && l.includes('agent step crashed mid-run')),
+        err.logs.some((l) => l.includes(START_RUN_ID) && l.includes('agent step crashed mid-run')),
         `expected one log line naming the run_id and the failure, got ${JSON.stringify(err.logs)}`
       )
       return true

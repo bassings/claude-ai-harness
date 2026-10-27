@@ -1107,7 +1107,7 @@ function readFindingEntries(entries) {
     byDisposition[e.disposition].push({
       id: e.id,
       lens: e.lens === undefined ? null : e.lens,
-      severity: e.severity || 'Low',
+      severity: e.severity === undefined ? null : e.severity,
       ac_id: e.ac_id || null,
       disposition: e.disposition,
     })
@@ -2078,7 +2078,9 @@ export function main() {
   const findingsFields = 'finding_entries' in payload
     ? {
         findings: budgetFindings([specBugs, rejected, fixed.entries, open], MAX_FINDINGS),
-        findings_truncated: Math.max(0, allFindings.length - MAX_FINDINGS),
+        // review-cycle.js caps each disposition before sending, and passes the
+        // number it cut as findings_truncated so the recorded count is unchanged.
+        findings_truncated: Math.max(0, allFindings.length - MAX_FINDINGS) + (Number.isSafeInteger(payload.findings_truncated) && payload.findings_truncated > 0 ? payload.findings_truncated : 0),
       }
     : {}
 
