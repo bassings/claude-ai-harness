@@ -24,6 +24,11 @@ const { spawn } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
 const { APPEND_SCRIPT, makeTempRepo, readLedgerLines, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
+// The writer refuses every write when HARNESS_LEDGER_READONLY is set (as a review lens sets it), and this file spawns the
+// writer with the inherited process.env. Dropped here so the file passes with the variable exported; the tests of the
+// read-only behaviour itself pass it explicitly in their spawn environment, which this does not touch.
+delete process.env.HARNESS_LEDGER_READONLY
+
 const OPTIMISE_READ_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
 
 test.after(cleanupTempRepos)

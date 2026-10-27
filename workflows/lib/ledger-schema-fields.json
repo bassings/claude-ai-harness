@@ -59,6 +59,7 @@
     "null"
   ],
   "kind": "string",
+  "legacy_payload": "boolean",
   "lens_checkout_drift": [
     "object",
     "null"

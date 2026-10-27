@@ -126,8 +126,12 @@ function hermeticRepoConfig(dir, run = null) {
   }
 }
 
+// HARNESS_LEDGER_READONLY is also dropped from the INHERITED environment: the writer honours it by refusing every write,
+// so a shell that exports it (as a review lens does) would fail every test that runs the writer for a reason unrelated to
+// what it checks. A test of the read-only behaviour itself passes it through `extra`, which is kept.
 function sanitizedGitEnv(extra = {}) {
-  const env = { ...process.env, ...extra }
+  const { HARNESS_LEDGER_READONLY: _inheritedReadonly, ...inherited } = process.env
+  const env = { ...inherited, ...extra }
   for (const key of gitEnvKeysToStrip(env)) delete env[key]
   return env
 }
