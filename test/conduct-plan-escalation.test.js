@@ -59,7 +59,8 @@ test('breaker: per-trigger rule (three fix rounds escalate; first self-inflicted
   assert.ok(regStart >= 0 && regEnd > regStart, 'sanity: the regression bullet is located')
   const regBullet = b.slice(regStart, regEnd)
   assert.match(regBullet, /with no escalation round/i)
-  assert.doesNotMatch(regBullet.replace(/with no escalation round/i, ''), /escalation round/i, 'the regression trigger never dispatches an escalation round')
+  // Round 3 F1: reject the MECHANISM, not only the name, so a paraphrased dispatch on the regression path is caught.
+  assert.doesNotMatch(regBullet.replace(/with no escalation round/i, ''), /escalation round|\/tdd-task|`model`|fresh implementer|stronger (tier|model|token)|dispatch/i, 'the regression trigger never dispatches an escalation round in any wording')
 })
 
 test('breaker: an escalation round that is not clean, or a task already escalated, goes straight to the block; never a second escalation', () => {
@@ -91,7 +92,7 @@ test('breaker: the old direct-to-block wording is gone for three fix rounds and 
   const bulletStart = b.search(/three fix rounds on one task/i)
   const escAt = b.indexOf('escalation round', bulletStart)
   const preEscalation = b.slice(bulletStart, escAt)
-  assert.doesNotMatch(preEscalation, /\bnote\b|\bowner\b|\bstop\b|\bask\b/i, 'nothing before the escalation sentence stops, writes a note or asks the owner')
+  assert.doesNotMatch(preEscalation, /\bnote\b|\bowner\b|\bstop\b|\bask\b|\bhand\b|\bhuman\b|\bwait\b/i, 'nothing before the escalation sentence stops, writes a note or hands to the owner')
   // Conductor (implementer's own caveat): a reworded direct-to-block phrase INSIDE the three-rounds bullet survived
   // the two pins above, so the bullet's order is pinned: its first mention of the escalation round comes before its
   // first mention of the block note, which is what AC-OPS-16 means by "the escalation round precedes any block".
@@ -121,7 +122,9 @@ test('breaker: the Conductor log line for an escalation round records the four A
   // Round 2 M2 and L5: the line is the durable state (branch or worktree, run id) and records the model the runtime
   // reported, so a restarted session reconciles from the log and a same-tier "escalation" is visible.
   assert.match(logSentence, /model the runtime reported for the escalation implementer/i)
-  assert.match(logSentence, /escalation branch or worktree path and the tdd-task run id/i)
+  // Round 3 F2 (AC-SEC-16): the branch NAME or a repo-relative path, never an absolute path, in a tracked file.
+  assert.match(logSentence, /escalation branch name \(or the worktree path relative to the repo root, never an absolute path/i)
+  assert.match(logSentence, /and the tdd-task run id/i)
   assert.match(b, /durable state a later wake reconciles from/i)
 })
 
@@ -158,7 +161,9 @@ test('breaker and block note: the escalation commits on its own branch, the PR t
 // Review round 1 L1 (AC-SEC-15): the escalation review names lens-security; a non-clean result blocks, never merges.
 test('breaker: the escalation review is the full review cycle with lens-security, and a non-clean result writes the block note', () => {
   const b = flat(breaker())
-  assert.match(b, /full review-cycle round[^.]*lens-security/i)
+  // Round 3 F1: the security-relevant sentence is pinned verbatim after whitespace collapse (T5 round 3's lesson:
+  // a keyword regex passes its own negation).
+  assert.ok(b.includes('That round is followed by one full review-cycle round, lens-security included as on any review, and only then a block note or a merge:'), 'the escalation-review sentence is exactly the agreed text')
   assert.match(b, /not clean goes straight to the block note/i)
 })
 
@@ -171,8 +176,11 @@ test('block-note template: escalation fields, failed/ABORTED wording, and the AC
   assert.match(t, /failed to dispatch or ABORTED[^.]*says so|escalation (round )?(itself )?(failed to dispatch|ABORTED)/)
   assert.match(t, /outcome codes, round counts and blocked_reason only/i)
   assert.match(t, /never verbatim verifier evidence or (a )?test_defect/i)
+  // Round 3 F1: the ban sentence is pinned verbatim after whitespace collapse, so an appended exception is caught.
+  assert.ok(t.includes('The note and the log entry carry outcome codes, round counts and blocked_reason only, never verbatim verifier evidence or a test_defect reason: the plan file and the note can reach a public repository, and that evidence routinely holds absolute paths under the operator\'s home directory.'), 'the AC-SEC-16 sentence is exactly the agreed text')
+  assert.doesNotMatch(t, /(RED gate|failure text|verifier output)[^.]*(owner sees|so the owner)/i, 'no field asks for failure text')
   // Round 2 M2: the note names the escalation branch beside the pre-escalation SHA.
-  assert.match(t, /pre-escalation PR tip SHA[^.]*escalation branch or worktree path/i)
+  assert.match(t, /pre-escalation PR tip SHA[^.]*escalation branch name \(or the worktree path relative to the repo root, never an absolute path\)/i)
   // Round 2 L2 (M6): no sentence anywhere in step 5 asks for verifier output in any wording, except the ban itself.
   const withoutBan = t.replace(/never verbatim verifier evidence or (a )?test_defect reason/i, '')
   assert.doesNotMatch(withoutBan, /(quote|paste|include|copy)[^.]*(verifier|evidence|output|test_defect)/i, 'step 5 never asks for verifier output')
@@ -232,4 +240,26 @@ test('docs/claude-md-section-2-replacement.md exists with the escalation row, no
   assert.match(d, /three-fix-rounds trigger\s+only/i)
   assert.match(d, /never a second escalation round/i)
   assert.match(d, /failed dispatch and the note names the token/i)
+})
+
+// ======================================================================
+// Review round 3 of PR #19 (wf_19465a28-cb4), adjudicated by the conductor: four Lows fixed, no fourth round.
+// ======================================================================
+test('escalation disposal (round 3 F3): the branch and worktree are disposed of after the merge, on abandonment, and at Done', () => {
+  const b = flat(breaker())
+  assert.match(b, /Once that merge has landed and the content is confirmed on main, dispose of the escalation branch and worktree in the same tick/i)
+  assert.match(b, /remove the worktree and delete the branch locally and on the remote/i)
+  const t = flat(step5())
+  assert.match(t, /If the answer abandons an escalation round, dispose of its branch and worktree in the same tick/i)
+  assert.match(t, /until then they are the only copy of that work and stay untouched/i)
+  const s = flat(skill())
+  const done = s.slice(s.indexOf('6. **Done?**'))
+  assert.match(done, /list every escalation branch or worktree the Conductor log names for this plan and dispose of each one that is merged or abandoned/i)
+  assert.match(done, /leaving only one an open block still depends on/i)
+})
+
+test('escalation token (round 3 F4): an unreported or unknown default model is a failed dispatch, never a same-tier escalation', () => {
+  const s = flat(skill())
+  assert.match(s, /If the previous round's transcript reports no model, or a model not in this table, do not escalate/i)
+  assert.match(s, /escalation failed to dispatch: default model unknown \(<the reported value, or not reported>\)/)
 })

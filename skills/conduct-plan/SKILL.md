@@ -320,7 +320,8 @@ rather than narrating a condition that does not apply here.
       model token the escalation used and the default it escalated from, the
       tdd-task verdict and blocked_reason, the review verdict with finding
       counts by severity, the pre-escalation PR tip SHA (the tip the PR still
-      sits at), the escalation branch or worktree path, and the frame
+      sits at), the escalation branch name (or the worktree path relative to
+      the repo root, never an absolute path), and the frame
       question. A note written when the
       escalation itself failed to dispatch or ABORTED says so in those words,
       never as a plain three-round block. The note and the log entry carry
@@ -338,13 +339,21 @@ rather than narrating a condition that does not apply here.
       block, so every start has its end. Step 6 does the same for a leftover
       note it deletes at Done, using the task id of the log entry that
       recorded that block's `human_wait_started` (the note line carries no
-      task id), and only when no end has been written for that block.
+      task id), and only when no end has been written for that block. If
+      the answer abandons an escalation round, dispose of its branch and
+      worktree in the same tick (remove the worktree, delete the branch
+      locally and on the remote); until then they are the only copy of that
+      work and stay untouched.
 
    The hook also refuses a symlink at that path, ignores an empty or
    whitespace-only file, reads at most 4096 bytes, and strips control
    characters before quoting the note back.
 
 6. **Done?** All boxes ticked: delete `<repo>/.claude/active-plan`, and
+   list every escalation branch or worktree the Conductor log names for
+   this plan and dispose of each one that is merged or abandoned (remove
+   the worktree, delete the branch locally and on the remote), leaving only
+   one an open block still depends on;
    delete `<repo>/.claude/blocked-on-human` if it exists, appending
    `human_wait_ended` when you do, under the task id of the log entry that
    recorded that block's `human_wait_started` and only if no end was written
@@ -396,13 +405,17 @@ rather than narrating a condition that does not apply here.
     escalation. The clean path is explicit, not "merge as usual" by itself:
     fast-forward the PR branch to the escalation tip (a plain push, never a
     force-push), return the task to `awaiting-ci`, and merge only on green
-    CI, as for any other push. The tick's Conductor log line for the
+    CI, as for any other push. Once that merge has landed and the content is
+    confirmed on main, dispose of the escalation branch and worktree in the
+    same tick (the §8 worktree rule): remove the worktree and delete the
+    branch locally and on the remote. The tick's Conductor log line for the
     escalation round records (AC-OPS-1): that it was dispatched, the exact
     `model` token passed to /tdd-task, the model the runtime reported for
     the escalation implementer (from its transcript, as AC-PROD-5 reads it,
-    or "not reported"), the escalation branch or worktree path and the
-    tdd-task run id, the tdd-task verdict, and the review verdict and
-    round (or that no review ran). That line is the durable state a later
+    or "not reported"), the escalation branch name (or the worktree path
+    relative to the repo root, never an absolute path, since the log is a
+    tracked file) and the tdd-task run id, the tdd-task verdict, and the
+    review verdict and round (or that no review ran). That line is the durable state a later
     wake reconciles from: a session that restarts mid-escalation finds the
     branch and the run id there, never in memory.
   - **the first time a review round finds a defect that the previous
@@ -423,7 +436,11 @@ rather than narrating a condition that does not apply here.
   If the runtime refuses the token, that is a failed dispatch, not a missing
   tier: the log and the block note say "escalation failed to dispatch:
   runtime refused model `<token>`" with the error code only, and step 5 d's
-  failed-to-dispatch rule applies.
+  failed-to-dispatch rule applies. If the previous round's transcript reports
+  no model, or a model not in this table, do not escalate: the log and the
+  block note say "escalation failed to dispatch: default model unknown
+  (<the reported value, or not reported>)" and the same rule applies, so the
+  owner is never told the strongest tool was tried when it was not.
 
   Escalate with the cost so far (review rounds, tokens, wall-clock) and what
   the change is protecting, so the human can make a value call rather than a
