@@ -100,8 +100,9 @@ test('static: both documented install paths, executed verbatim into a scratch co
     // Manual copy path (README.md's own commands, with the repo root substituted for the cloned checkout).
     fs.mkdirSync(path.join(scratch, 'claude', 'workflows'), { recursive: true })
     fs.mkdirSync(path.join(scratch, 'claude', 'skills'), { recursive: true })
-    execFileSync('/bin/sh', ['-c', `cp -r "${ROOT}/workflows/." "${scratch}/claude/workflows/"`])
-    execFileSync('/bin/sh', ['-c', `cp -r "${ROOT}/skills/." "${scratch}/claude/skills/"`])
+    // The same cp commands README.md documents, run without a shell so no path is ever parsed as shell text.
+    execFileSync('cp', ['-r', `${ROOT}/workflows/.`, `${scratch}/claude/workflows/`])
+    execFileSync('cp', ['-r', `${ROOT}/skills/.`, `${scratch}/claude/skills/`])
     assert.ok(fs.existsSync(path.join(scratch, 'claude', 'workflows', 'optimise-cycle.js')))
     assert.ok(fs.existsSync(path.join(scratch, 'claude', 'workflows', 'lib', 'optimise-read.mjs')))
     assert.ok(fs.existsSync(path.join(scratch, 'claude', 'skills', 'optimise-cycle', 'SKILL.md')))

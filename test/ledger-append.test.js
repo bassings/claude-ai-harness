@@ -297,8 +297,9 @@ test('ledger-append: a properly newline-terminated ledger is NOT healed (no spur
 // conversion is platform-dependent.
 function runAppendWithFsizeLimit(cwd, payload, blocks) {
   const { spawnSync } = require('node:child_process')
-  const script = `ulimit -f ${blocks}; exec node ${JSON.stringify(APPEND_SCRIPT)}`
-  return spawnSync('/bin/sh', ['-c', script], { cwd, input: JSON.stringify(payload), encoding: 'utf8' })
+  // The script path reaches the shell through the environment, never through the command or its arguments (CodeQL
+  // js/shell-command-injection-from-environment); only the numeric block count is an argument.
+  return spawnSync('/bin/sh', ['-c', 'ulimit -f "$1"; exec node "$HARN_APPEND_SCRIPT"', 'sh', String(Number(blocks))], { cwd, env: { ...process.env, HARN_APPEND_SCRIPT: APPEND_SCRIPT }, input: JSON.stringify(payload), encoding: 'utf8' })
 }
 
 test('ledger-append: a SHORT write (fs.writeSync returns fewer bytes than requested, e.g. an ENOSPC-style near-full volume) is reported as write_ok:false, never silently as success (HIGH round 3, contributing cause)', () => {
@@ -369,7 +370,7 @@ function spawnAppendAsync(cwd, payload, { blocks, env } = {}) {
   return new Promise((resolve, reject) => {
     const spawnEnv = { ...process.env, ...(env || {}) }
     const child = blocks
-      ? spawn('/bin/sh', ['-c', `ulimit -f ${blocks}; exec node ${JSON.stringify(APPEND_SCRIPT)}`], { cwd, env: spawnEnv })
+      ? spawn('/bin/sh', ['-c', 'ulimit -f "$1"; exec node "$HARN_APPEND_SCRIPT"', 'sh', String(Number(blocks))], { cwd, env: { ...spawnEnv, HARN_APPEND_SCRIPT: APPEND_SCRIPT } })
       : spawn('node', [APPEND_SCRIPT], { cwd, env: spawnEnv })
     let stdout = ''
     let stderr = ''
