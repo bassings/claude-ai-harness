@@ -2068,7 +2068,7 @@ if (ledgerFailed) {
   // `if (threw) throw runError` / `return { ...result, telemetry }` pair stays
   // byte-identical across all three workflows (AC-ARCH-9).
   result.ledger_write_failed = true
-  result.ledger_write_error = startWrite.write_error || terminalWrite.write_error || 'unknown'
+  result.ledger_write_error = redactLogText(String(startWrite.write_error || terminalWrite.write_error || 'unknown'))
   const why = startWrite.write_error || terminalWrite.write_error || 'unknown'
   // A writer that refuses finding_entries predates HARN-OPT-6; the retry deliberately never strips that key, so name the remedy here.
   const staleWriter = /finding_entries: not an allowed property/.test(String(why)) ? ' The installed ledger-append.mjs predates HARN-OPT-6: run bin/install.sh and bin/install.sh --check, then restart the session (named workflows are cached per session).' : ''
