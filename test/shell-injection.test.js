@@ -50,17 +50,23 @@ function reviewCycleArgsFor(claim) {
 // string the run put into the payload, so each test can prove the hostile text
 // really reached the payload (a vacuous fixture would pass trivially).
 const DRIVERS = {
+  // Review round 4 L1 (AC-QA-14): every driver returns ALL of the run's ledger:write prompts (started and terminal) as
+  // `prompts`; `prompt` stays the one the static tests read (the terminal write for review-cycle, whose payload carries
+  // the finding, the started write for the other two, whose task or spec is in both).
   'review-cycle.js': async (text) => {
     const { calls } = await runWorkflow(WF('review-cycle.js'), { args: {}, agent: reviewCycleArgsFor(text) })
-    return { prompt: calls.filter((c) => c.opts.label === 'ledger:write').pop().prompt, text }
+    const prompts = calls.filter((c) => c.opts.label === 'ledger:write').map((c) => c.prompt)
+    return { prompt: prompts[prompts.length - 1], prompts, text }
   },
   'tdd-task.js': async (text) => {
     const { calls } = await runWorkflow(WF('tdd-task.js'), { args: { task: text }, agent: {} })
-    return { prompt: calls.find((c) => c.opts.label === 'ledger:write').prompt, text }
+    const prompts = calls.filter((c) => c.opts.label === 'ledger:write').map((c) => c.prompt)
+    return { prompt: prompts[0], prompts, text }
   },
   'plan-cycle.js': async (text) => {
     const { calls } = await runWorkflow(WF('plan-cycle.js'), { args: { spec: text }, agent: {} })
-    return { prompt: calls.find((c) => c.opts.label === 'ledger:write').prompt, text }
+    const prompts = calls.filter((c) => c.opts.label === 'ledger:write').map((c) => c.prompt)
+    return { prompt: prompts[0], prompts, text }
   },
 }
 
@@ -97,10 +103,13 @@ for (const [name, drive] of Object.entries(DRIVERS)) {
     assert.equal(prompt.includes(marker), false, 'the marker path (hostile text) must not appear anywhere in the prompt')
   })
 
-  test(`${name}: executing the prompt's steps as a compliant agent creates no marker, and the writer lands one line whose decoded fields equal the payload (AC-SEC-1, AC-QA-14)`, async () => {
+  test(`${name}: executing the prompt's steps as a compliant agent creates no marker, and the writer lands one line whose decoded fields equal the payload, for the started AND the terminal write (AC-SEC-1, AC-QA-14)`, async () => {
     const marker = path.join(SUITE_TMPDIR, `PWNED_${name}_${process.pid}_b`)
     fs.rmSync(marker, { force: true })
-    const { prompt } = await drive(NASTY.replaceAll('$MARKER', marker))
+    const { prompts } = await drive(NASTY.replaceAll('$MARKER', marker))
+    assert.ok(prompts.length >= 2, 'a started and a terminal write')
+    // Review round 4 L1: every write of the run goes through the real steps, each into its own temp repo.
+    for (const prompt of prompts) {
     const payload = extractLedgerPayload(prompt)
     const repo = makeTempRepo()
     const scratch = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'scratch-'))
@@ -118,7 +127,8 @@ for (const [name, drive] of Object.entries(DRIVERS)) {
     // redaction; nested values (a finding list the writer decorates with ids) are compared leaf by leaf.
     const { redactPaths } = await import(pathToFileURL(APPEND_SCRIPT).href)
     const root = fs.realpathSync(repo)
-    const leaves = (v) => (typeof v === 'string' ? [v] : Array.isArray(v) ? v.flatMap(leaves) : v && typeof v === 'object' ? Object.values(v).flatMap(leaves) : [v])
+    // Review round 4 L1: nested values are compared exactly against a redaction-normalised copy, not by leaf membership.
+    const normalised = (v) => JSON.parse(JSON.stringify(v), (k, x) => (typeof x === 'string' ? redactPaths(x, root) : x))
     // The writer folds spec_bugs, rejected_findings, fixed_findings, open_findings and prior_findings into one
     // `findings` array that carries ids, never the claim or location (no free text in the ledger, AC-SEC-2), so each
     // descriptor is checked by the id the writer computes from its lens, location and claim. spec and spec_raw are
@@ -139,14 +149,14 @@ for (const [name, drive] of Object.entries(DRIVERS)) {
       if (typeof value !== 'object') {
         assert.equal(entry[key], expect(value), `field ${key} must land as sent`)
       } else {
-        const got = leaves(entry[key])
-        for (const leaf of leaves(value)) assert.ok(got.includes(expect(leaf)), `leaf ${JSON.stringify(leaf)} of ${key} must land as sent`)
+        assert.deepEqual(entry[key], normalised(value), `nested field ${key} must land exactly as sent (modulo path redaction)`)
       }
       compared++
     }
     assert.ok(compared >= 2, 'at least kind and outcome were compared')
     if (name === 'tdd-task.js') assert.ok(entry.task.includes('it\'s "q" `b` $(touch ') && entry.task.includes('\nEOF\nline3 \u{1F600}'), 'the quotes, backtick, substitution, newline, EOF line and astral character survive')
     assert.equal(fs.existsSync(run.file), false, 'the payload file is deleted afterwards')
+    }
   })
 }
 

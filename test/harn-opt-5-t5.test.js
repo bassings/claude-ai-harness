@@ -10,7 +10,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload, START_DELIMITER, END_DELIMITER } = require('./helpers/extract-ledger-payload.js')
-const { instructedCommands, actAsCompliantAgent, EXPECTED_STEP_2, EXPECTED_STEP_3, EXPECTED_STEP_5 } = require('./helpers/ledger-agent.js')
+const { instructedCommands, actAsCompliantAgent, splitPrompt, EXPECTED_STEP_2, EXPECTED_STEP_3, EXPECTED_STEP_5, EXPECTED_HEAD, EXPECTED_TAIL } = require('./helpers/ledger-agent.js')
 const { makeTempRepo, sh, cleanupTempRepos, readLedgerLines, SUITE_TMPDIR } = require('./helpers/temp-repo.js')
 const { extractEncodedPayload } = require('./helpers/extract-ledger-payload.js')
 
@@ -50,6 +50,20 @@ function l5Block(file) {
 }
 
 for (const file of Object.keys(FILES)) {
+  // Review round 4 F1: the WHOLE prompt is pinned, head and tail, so no step and no closing sentence is open to a
+  // carve-out; the per-step pins below are kept as the readable statement of what each step must say.
+  test(`${file}: the whole ledger:write prompt is the agreed head, one base64 line between the delimiters, and the agreed tail (AC-SEC-1, AC-SEC-3, AC-SEC-4)`, async () => {
+    const prompt = await firstPrompt(file)
+    const parts = splitPrompt(prompt)
+    assert.ok(parts, 'the delimiters are present and in order')
+    assert.equal(parts.head, EXPECTED_HEAD, 'everything before the payload is exactly the agreed text')
+    assert.equal(parts.tail, EXPECTED_TAIL, 'everything after the payload is exactly the agreed text')
+    assert.match(parts.encoded, /^[A-Za-z0-9+/]+={0,2}\n$/, 'between the delimiters: one base64 line and nothing else')
+    for (const must of [EXPECTED_STEP_2, EXPECTED_STEP_3]) assert.ok(EXPECTED_HEAD.includes(must), 'the agreed head carries the agreed steps')
+    assert.ok(EXPECTED_TAIL.includes(EXPECTED_STEP_5) && EXPECTED_TAIL.startsWith('4. '), 'the agreed tail is steps 4 and 5 and the closing paragraph')
+    assert.ok(EXPECTED_TAIL.includes('If the script could not be found or failed to run at all'), 'the closing paragraph is inside the pin')
+  })
+
   test(`${file}: step 2 creates the payload file by exclusive create outside every git working tree, never a fixed or run_id-derived name (AC-SEC-3)`, async () => {
     const prompt = await firstPrompt(file)
     const cmds = instructedCommands(prompt)
