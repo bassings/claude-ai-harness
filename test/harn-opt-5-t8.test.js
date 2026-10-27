@@ -247,7 +247,9 @@ test('plan-cycle T8 (M1): the verify command carries no agent-typed ids; the ids
   const { calls } = await go(agents())
   const p = calls.find((c) => c.opts.label === 'synthesis:write-back').prompt
   assert.doesNotMatch(p, /<surviving_ids as a JSON array>/)
-  assert.match(p, new RegExp(`verify ${SPEC} ${SNAP_FILE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} /tmp/harn-specwb-AbC123/surviving\.json`))
+  // CodeQL js/useless-regexp-character-escape on the first form (a `\.` inside a template literal is a bare `.`):
+  // the expected command is pinned as an exact substring instead of a regex.
+  assert.ok(p.includes(`verify ${SPEC} ${SNAP_FILE} /tmp/harn-specwb-AbC123/surviving.json`), 'the verify command names the spec, the snapshot file and the script-composed ids file')
   assert.match(p, /write the AC ids you kept[^.]*into the file \/tmp\/harn-specwb-AbC123\/surviving\.json with your file-writing tool/)
   assert.match(p, /never via a shell command/)
 })
