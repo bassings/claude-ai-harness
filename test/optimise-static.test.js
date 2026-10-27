@@ -221,9 +221,25 @@ test('static: the CI lane prompt gains exactly one further gh invocation, the at
   const at = prompt.indexOf('--attempt 1')
   const near = prompt.slice(Math.max(0, at - 300), at + 300)
   assert.match(near, /attempt[^.]{0,40}(?:> ?1|greater than 1|more than 1|above 1)/i, 'issued only for runs with attempt > 1')
+  // T7 round 2 L1 (AC-SEC-14): the id restriction is stated inline on the attempt-1 command, not by reference.
+  assert.match(near, /<id> MUST be an all-digit databaseId taken from that repo's own list/, 'the all-digits, own-list id rule is restated on the attempt-1 command')
   assert.ok(prompt.includes('attempt1_jobs') && prompt.includes('attempt1_fetch_error'), 'each such run carries its attempt-1 jobs or a fetch-failed marker')
 })
 
 test('static: SKILL.md describes the attempt-1 re-run qualification (AC-SIMP-5, AC-DATA-16)', () => {
   assert.ok(readAll('skills', 'optimise-cycle', 'SKILL.md').includes('--attempt 1'))
+})
+
+// T7 round 2 L5: the skill's description of the brake is the operator's statement of what the optimiser drops, and it
+// drifted from the code once (round 1 F1); item 6 is pinned to the verdict the brake reads.
+test('static: SKILL.md item 6 says the brake reads neverFailed exactly true and does not restate the old three-flag criterion (AC-SIMP-5)', () => {
+  const skill = readAll('skills', 'optimise-cycle', 'SKILL.md')
+  const start = skill.indexOf('**Weak CI evidence')
+  const end = skill.indexOf('\n7. ', start)
+  assert.ok(start > 0 && end > start, 'sanity: item 6 located')
+  const item6 = skill.slice(start, end)
+  assert.ok(item6.includes('`neverFailed` exactly `true`'), 'names the verdict the brake reads')
+  assert.ok(item6.includes('--attempt 1'), 'names the attempt-1 fetch')
+  assert.doesNotMatch(item6, /insufficient-data, window-truncated, or a suspected rename/, 'the old three-flag criterion is gone')
+  assert.doesNotMatch(item6, /is dropped if[^.]*(insufficientData|truncated|renameSuspect)/, 'no flag is named as the criterion')
 })

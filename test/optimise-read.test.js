@@ -3248,6 +3248,19 @@ test('optimise-read T7 (AC-OPS-14): the count of attempt>1 runs whose attempt-1 
   assert.equal(out.repoStats.a.fetchFailures.other, 0, 'an empty attempt-1 payload is unfetched, not a fetch failure by mode')
 })
 
+// T7 round 2 L2: runs the qualification cannot settle are counted, so the report can say why a job has no verdict.
+test('optimise-read T7 (round 2 L2): runs past attempt 2 and runs with an unreadable attempt are counted as not qualifiable, and their jobs stay re-runs', () => {
+  const out = t7Ci([
+    t7Run(1, 3, ['test'], { attempt1_jobs: t7A1(['test']) }),
+    t7Run(2, 'x', ['test'], { attempt1_jobs: t7A1(['test']) }),
+    t7Run(3, 2, ['test'], { attempt1_jobs: t7A1(['test']) }),
+    t7Run(4, 1, ['test']),
+  ])
+  assert.equal(out.repoStats.a.pastAttempt2, 2, 'the attempt-3 run and the unreadable-attempt run')
+  assert.equal(out.repoStats.a.attempt1Unfetched, 0, 'their attempt-1 payloads were fetched and well formed')
+  assert.equal(t7Row(out, 'test').reRun, true)
+})
+
 test('optimise-read T7 (AC-QA-24): an attempt-1 fetch error of an unknown mode is counted under other, and every such job stays a re-run', () => {
   const out = t7Ci([t7Run(1, 2, ['test'], { attempt1_fetch_error: 'weird' })])
   assert.equal(out.repoStats.a.fetchFailures.other, 1)

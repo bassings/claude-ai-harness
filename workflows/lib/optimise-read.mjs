@@ -2032,7 +2032,7 @@ function runCiCommand(payload) {
   for (const run of runs) {
     if (!run || typeof run.repo !== 'string' || typeof run.workflow !== 'string' || !run.repo || !run.workflow) continue
     if (!validRunId(run.id)) continue
-    const stats = repoStats[run.repo] || (repoStats[run.repo] = { notCompleted: 0, attempt1Unfetched: 0, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } })
+    const stats = repoStats[run.repo] || (repoStats[run.repo] = { notCompleted: 0, attempt1Unfetched: 0, pastAttempt2: 0, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } })
     const id = String(run.id)
     // Round 3 L1 (AC-QA-23): a run the lane emits twice (a retry after a rate
     // limit, overlapping pages, a re-listing) counts once everywhere, not only
@@ -2069,6 +2069,9 @@ function runCiCommand(payload) {
     const rawCounts = (jobs) => jobs.reduce((m, j) => m.set(j.name, (m.get(j.name) || 0) + 1), new Map())
     const a1 = run.attempt1_jobs
     const a1WellFormed = !run.attempt1_fetch_error && Array.isArray(a1) && a1.length > 0 && a1.every((j) => j && typeof j.name === 'string' && j.name)
+    // T7 round 2 L2: a run past attempt 2, or one whose attempt is present but unreadable, fails closed for every job
+    // (AC-DATA-17) and is COUNTED, so the report can say why a job has no settled verdict.
+    if (run.attempt !== undefined && (attemptN === null || attemptN > 2)) stats.pastAttempt2 += 1
     if (attemptN !== null && attemptN > 1 && !a1WellFormed) {
       stats.attempt1Unfetched += 1
       // T7 review round 1 F2 (AC-QA-24): a failed attempt-1 fetch is also counted by mode beside the per-run fetch

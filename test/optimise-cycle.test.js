@@ -1686,7 +1686,7 @@ const t7CiWith = (row) => ciFixture({ byJob: { [`demo::${row.workflow}::${row.jo
 // HARN-OPT-5 T7 (AC-QA-22): the brake reads the verdict, so a gitleaks row that
 // failed in the window (neverFailed false) is dropped as counter-evidence before
 // the security gate. The row here is the clean shape the gate still sees.
-test('optimise-cycle: a gitleaks removal whose aggregate is neither insufficientData, truncated nor renameSuspect is still flagged security_removal_flagged (AC-SEC-13)', async () => {
+test('optimise-cycle: a gitleaks removal with a settled never-failed verdict is still flagged security_removal_flagged (AC-SEC-13; T7 round 2 L4 renamed)', async () => {
   const responses = baseResponses({
     'lane:ci': t7CiWith(t7GitleaksRow({ neverFailed: true, failureCount: 0, failedRunIds: [] })),
     'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'Security', job: 'gitleaks' }, statement: 'Remove the scheduled gitleaks job', citations: ['1001'], reinstatement_evidence: 'reinstate if any secret ever leaks', n: 20 })] },
@@ -1702,7 +1702,9 @@ test('optimise-cycle: a gitleaks removal whose aggregate is neither insufficient
 // the gate. The gate itself is pinned by the test above.
 test('optimise-cycle: the same gitleaks removal with no reinstatement_evidence is dropped by the reinstatement-evidence filter even with a clean aggregate (AC-SEC-13, round 3 L2)', async () => {
   const responses = baseResponses({
-    'lane:ci': t7CiWith(t7GitleaksRow()),
+    // T7 round 2 L4: the aggregate really is clean (a settled never-failed verdict), so the reinstatement filter is
+    // the only reason this proposal can drop; the default row carries neverFailed false, which the brake also drops.
+    'lane:ci': t7CiWith(t7GitleaksRow({ neverFailed: true, failureCount: 0, failedRunIds: [] })),
     'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_remove', workflow: 'Security', job: 'gitleaks' }, statement: 'Remove the scheduled gitleaks job', citations: ['1001'], reinstatement_evidence: null, n: 20 })] },
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })

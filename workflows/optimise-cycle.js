@@ -443,8 +443,8 @@ const ciLanePrompt =
   `jobs: [{name, conclusion, duration_s}]}. If a per-run \`gh run view\` fails, still emit that run with \`jobs: []\` ` +
   `and \`fetch_error\` set to "rate_limited", "unauthenticated" or "other" by the same tests as above; a failure on ` +
   `one run or one repo never stops the others.\n` +
-  `For each run whose \`attempt\` is greater than 1 (and only those), also run \`gh run view <id> --attempt 1 --json jobs\` ` +
-  `under the same id rules, keep only each job's name and conclusion, and put them on that run as ` +
+  `For each run whose \`attempt\` is greater than 1 (and only those), also run \`gh run view <id> --attempt 1 --json jobs\`, ` +
+  `where <id> MUST be an all-digit databaseId taken from that repo's own list above (T7 round 2 L1, AC-SEC-14), keep only each job's name and conclusion, and put them on that run as ` +
   `\`attempt1_jobs: [{name, conclusion}]\`, using each job's name exactly as \`gh\` returned it. If that call fails or returns ` +
   `no jobs, set \`attempt1_fetch_error\` on the run ("rate_limited", "unauthenticated" or "other" by the same tests as above) and ` +
   `leave \`attempt1_jobs\` off. Do not store or reuse any result between runs.\n` +
@@ -1464,7 +1464,7 @@ function buildReport(d) {
   // AC-OPS-10, AC-OPS-11: per repo, runs left out as not completed and failed per-run fetches by mode.
   for (const [repo, st] of Object.entries(d.ciRepoStats || {})) {
     const ff = (st && st.fetchFailures) || {}
-    lines.push(`- ${ciFlat(repo)}: ${ciNum((st && st.notCompleted) || 0)} runs not completed (left out); per-run fetch failures: rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}; attempt-1 jobs not fetched: ${st && typeof st.attempt1Unfetched === 'number' ? ciNum(st.attempt1Unfetched) : 'n/a'}`)  // T7 review F5: a reader that never reported the field prints n/a, never 0
+    lines.push(`- ${ciFlat(repo)}: ${ciNum((st && st.notCompleted) || 0)} runs not completed (left out); per-run fetch failures (incl. attempt-1): rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}; attempt-1 jobs not fetched: ${st && typeof st.attempt1Unfetched === 'number' ? ciNum(st.attempt1Unfetched) : 'n/a'}; runs past attempt 2 or with an unreadable attempt (not qualifiable): ${st && typeof st.pastAttempt2 === 'number' ? ciNum(st.pastAttempt2) : 'n/a'}`)  // T7 review F5 and round 2 L2: a reader that never reported a field prints n/a, never 0
   }
   // AC-QA-32: the lane's own cost, so the first run after shipping records the baseline.
   for (const g of d.ciGhStats || []) lines.push(`- ${ciFlat(g.repo)}: wall-clock ${g.wall_clock_s == null ? 'n/a' : ciNum(g.wall_clock_s)}s, ${g.gh_calls == null ? 'n/a' : ciNum(g.gh_calls)} gh calls`)
