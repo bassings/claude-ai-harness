@@ -13,7 +13,7 @@ does.
 | Round | What changes |
 |---|---|
 | 1 to 3 | Resume the **same** implementer. It holds the context; re-explaining costs more than it buys. |
-| After 3 | One **escalation round**: a **fresh** implementer on a stronger tier, dispatched through `/tdd-task` with its `model` argument (never a direct implementer dispatch), followed by one review round. The default `sonnet` escalates to `opus`, and the default `opus` escalates to `fable`. If the default is already the strongest tier, or the runtime refuses the token, the round is skipped and the note says "escalation skipped: no stronger tier". |
+| After 3 | One **escalation round**: a **fresh** implementer on a stronger tier, dispatched through `/tdd-task` with its `model` argument (never a direct implementer dispatch), on its own branch or worktree with the PR tip unmoved until its review is clean, followed by one full review round with the security lens included. The default `sonnet` escalates to `opus`, and the default `opus` escalates to `fable`. If the default is already the strongest tier, or the runtime refuses the token, the round is skipped and the note says "escalation skipped: no stronger tier". |
 | After the escalation round | Stop fixing. **Adjudicate** each open finding: which are load-bearing, which are parked with a recorded reason. A clean escalation round merges as usual; one whose own build or review is not clean goes straight to the block note. There is never a second escalation round on one task. |
 
 The trigger matters. The escalation round runs on the three-fix-rounds trigger

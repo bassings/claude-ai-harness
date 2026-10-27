@@ -211,7 +211,8 @@ rather than narrating a condition that does not apply here.
    Also log task-level state transitions to the run ledger, so wall-clock can
    later be decomposed into agent compute vs CI wait vs human wait: at each
    `pr-open`→`awaiting-ci` transition and its resolution, and at each
-   `blocked-on-human` entry/exit, PR raised and PR merged, run
+   block entry and exit (step 5 e and f, and step 6 for a leftover note),
+   PR raised and PR merged, run
    `workflows/lib/ledger-append.mjs` (found the same way as any harness file:
    this repo, `~/.claude/workflows/lib/`, or an installed plugin; pipe the
    payload's JSON to its stdin) with a payload of `{kind:
@@ -313,25 +314,32 @@ rather than narrating a condition that does not apply here.
    d. When the block follows an escalation round, the question line names the
       model token the escalation used and the default it escalated from, the
       tdd-task verdict and blocked_reason, the review verdict with finding
-      counts by severity, and the frame question. A note written when the
+      counts by severity, the pre-escalation PR tip SHA (the tip the PR still
+      sits at), and the frame question. A note written when the
       escalation itself failed to dispatch or ABORTED says so in those words,
       never as a plain three-round block. The note and the log entry carry
       outcome codes, round counts and blocked_reason only, never verbatim
       verifier evidence or a test_defect reason: the plan file and the note
       can reach a public repository, and that evidence routinely holds
       absolute paths under the operator's home directory.
-   e. Once the note is written (and only then), append `human_wait_started`
-      through `ledger-append.mjs` as step 3 specifies, so the human-wait
-      decomposition does not depend on memory.
-   f. The moment the answer arrives, delete `.claude/blocked-on-human` and
-      append `human_wait_ended` the same way.
+   e. Once the block is recorded, whether the note was written (c) or the
+      write was refused (b) and the question asked in the reply only, append
+      `human_wait_started` through `ledger-append.mjs` as step 3 specifies,
+      exactly once per block, so the human-wait decomposition does not
+      depend on memory. Append it after the note, never before it.
+   f. The moment the answer arrives, delete `.claude/blocked-on-human` if it
+      exists and append `human_wait_ended` the same way, exactly once per
+      block, so every start has its end. Step 6 does the same for a leftover
+      note it deletes at Done.
 
    The hook also refuses a symlink at that path, ignores an empty or
    whitespace-only file, reads at most 4096 bytes, and strips control
    characters before quoting the note back.
 
 6. **Done?** All boxes ticked: delete `<repo>/.claude/active-plan`, and
-   delete `<repo>/.claude/blocked-on-human` if it exists. That second
+   delete `<repo>/.claude/blocked-on-human` if it exists, appending
+   `human_wait_ended` when you do so that the block's start is not left
+   unpaired (AC-OPS-9). That second
    delete is not housekeeping: the note is not scoped to a session and
    outlives the plan, so a leftover one parks the NEXT plan conducted in
    this repo, silently. Same diagnosis as the prune below, same file, and
@@ -364,13 +372,21 @@ rather than narrating a condition that does not apply here.
   - **three fix rounds on one task** (the original rule). At three fix rounds
     the conductor dispatches exactly one escalation round: `/tdd-task` with
     `model` set to the token stated below, in a fresh implementer,
-    never a direct implementer dispatch. That round is followed by one
-    review-cycle round, and only then a block note or a merge: a clean build
+    never a direct implementer dispatch. The escalation build is dispatched
+    only after the previous implementer's process has exited, and it commits
+    on its own branch or worktree: the PR branch tip is not moved, and is
+    never force-pushed, until the escalation round's review is clean, so a
+    block leaves the PR tip at the pre-escalation SHA (AC-DATA-20). That
+    round is followed by one full review-cycle round, lens-security included
+    as on any review, and only then a block note or a merge: a clean build
     and a clean review merge as usual, anything else goes to the block note
     (step 5). An escalation round whose own build or review is not clean goes
     straight to the block note. A task whose escalation round has already run
     goes straight to the block note at its next breaker, never a second
-    escalation. Log the round as the escalation round in the conductor log.
+    escalation. The tick's Conductor log line for the escalation round records
+    four items (AC-OPS-1): that it was dispatched, the exact `model` token
+    passed to /tdd-task, the tdd-task verdict, and the review verdict and
+    round (or that no review ran).
   - **the first time a review round finds a defect that the previous
     round's fix introduced.** One self-inflicted regression is the signal
     the frame is wrong; do not wait for three. On the first self-inflicted
