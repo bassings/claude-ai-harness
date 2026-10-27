@@ -188,7 +188,10 @@ test('spec-writeback verify: criteria ending in a period, question mark, exclama
     '- **AC-QA-1:** Ends with a question mark?',
     '- **AC-QA-2:** Ends with a note (balanced, and `code` too).',
   ]
-  const f = fixture(spec(ok))
+  // The snapshot is the default spec, so every line below is NEW to the write-back and is judged (a line identical to
+  // the snapshot is the operator's own and is not re-judged; see the grandfathering test).
+  const f = fixture()
+  fs.writeFileSync(f.specPath, spec(ok))
   const v = verify(f)
   assert.deepEqual(v.out && v.out.problems, [], JSON.stringify(v.out))
   assert.equal(v.out.ok, true)
@@ -215,4 +218,90 @@ test('spec-writeback verify: a missing or malformed snapshot file, or bad surviv
     assert.equal(fs.readFileSync(f.specPath, 'utf8'), broken, `${name}: nothing restored`)
   }
   assert.ok(fs.existsSync(f.snap.file), 'a refused verify deletes nothing')
+})
+
+// ======================================================================
+// Review round 1 of PR #18 (wf_9f8826b4-bcb). F1 (High): the sentence-terminal check flagged the merge-note shapes
+// the synthesis prompt asks for, on 2 of 12 real specs. F2 (Medium): the "## Acceptance criteria exactly once" check
+// had no fixture without the heading. F6 (Low): restore's mode preservation was untested.
+// ======================================================================
+test('spec-writeback verify (F1): merge notes after the sentence, emphasised, bracketed or nested, are not flagged', () => {
+  const ok = [
+    '- **AC-SEC-1:** The token is never logged. *(merges AC-ARCH-7)*',
+    '- **AC-QA-1:** A failing check exits non-zero. [merges AC-QA-15]',
+    '- **AC-QA-2:** Two steps, snapshot then verify; both run. (Folds AC-OPS-1.)',
+    '- **AC-QA-3:** Ends with a note (balanced, and `code` too).',
+    '- **AC-QA-4:** A full sentence. *(Amended later (with a nested aside): the change label comes from its XY code.)*',
+  ]
+  const f = fixture()  // snapshot the default spec so every line below is judged, not grandfathered
+  fs.writeFileSync(f.specPath, spec(ok))
+  const v = verify(f, ['AC-SEC-1', 'AC-QA-1', 'AC-QA-2', 'AC-QA-3', 'AC-QA-4'])
+  assert.deepEqual(v.out && v.out.problems, [], JSON.stringify(v.out))
+  assert.equal(v.out.ok, true)
+})
+
+test('spec-writeback verify (F1): a note cut mid-way is still flagged, and the two-direction pin holds', () => {
+  const bad = [...CRITERIA.slice(0, 2), '- **AC-QA-2:** The pattern is anchored. (merges AC-']
+  const f = fixture()  // the snapshot is the good spec; the cut line is what the write-back wrote
+  fs.writeFileSync(f.specPath, spec(bad))
+  const v = verify(f)
+  assert.ok(v.out.problems.some((p) => p.includes('AC-QA-2') && p.includes('mid-sentence')), JSON.stringify(v.out.problems))
+  assertRestored(f, v)
+})
+
+// The strongest regression test for the structural checks: every real spec in this repository, verified against its
+// own snapshot and ids, passes (its hand-written criterion lines are the operator's own and are not re-judged for
+// sentence shape); a spec with no criteria section fails on exactly that one problem and nothing else.
+const SPECS_DIR = path.join(__dirname, '..', 'specs')
+for (const name of fs.readdirSync(SPECS_DIR).filter((n) => n.endsWith('.md')).sort()) {
+  test(`spec-writeback verify (F1 regression): the real spec ${name} passes against its own ids, or fails only for a missing criteria section`, () => {
+    const original = fs.readFileSync(path.join(SPECS_DIR, name), 'utf8')
+    const f = fixture(original)
+    const ids = [...original.matchAll(/^- \*\*(AC-[A-Z]+-\d+):\*\*/gm)].map((m) => m[1])
+    const v = verify(f, ids)
+    assert.equal(v.res.status, 0, v.res.stderr)
+    const hasSection = /^## Acceptance criteria$/m.test(original)
+    if (hasSection) {
+      assert.deepEqual(v.out.problems, [], `${name}: ${JSON.stringify(v.out.problems)}`)
+      assert.equal(v.out.ok, true)
+    } else {
+      assert.deepEqual(v.out.problems, ['"## Acceptance criteria" must appear exactly once, found 0'], name)
+      assert.equal(fs.readFileSync(f.specPath, 'utf8'), original, 'restored byte for byte')
+    }
+  })
+}
+
+test('spec-writeback verify (F2): a snapshot with no criteria section passes once the write-back adds the heading exactly once, and fails for a level-3 heading or none', () => {
+  const noSection = `${PREAMBLE}## Tasks\n\n- [ ] T1: do it.\n`
+  const added = `${PREAMBLE}## Acceptance criteria\n\n${CRITERIA.join('\n')}\n\n## Tasks\n\n- [ ] T1: do it.\n`
+  const f1 = fixture(noSection); fs.writeFileSync(f1.specPath, added)
+  const v1 = verify(f1)
+  assert.deepEqual(v1.out.problems, [], JSON.stringify(v1.out))
+  for (const [label, bad] of [['a level-3 heading', added.replace('## Acceptance criteria', '### Acceptance criteria')], ['no heading', added.replace('## Acceptance criteria\n\n', '')]]) {
+    const f = fixture(noSection); fs.writeFileSync(f.specPath, bad)
+    const v = verify(f)
+    assert.ok(v.out.problems.some((p) => p.includes('"## Acceptance criteria" must appear exactly once, found 0')), `${label}: ${JSON.stringify(v.out.problems)}`)
+    assertRestored(f, v)
+  }
+})
+
+test('spec-writeback verify (F6): a restore keeps the spec file mode it had before the write-back', () => {
+  const f = fixture()
+  fs.chmodSync(f.specPath, 0o640)
+  fs.writeFileSync(f.specPath, spec([...CRITERIA, '- **AC-QA-9:** An extra one.']))
+  const v = verify(f)
+  assertRestored(f, v)
+  assert.equal(fs.statSync(f.specPath).mode & 0o777, 0o640)
+})
+
+test('spec-writeback verify (F1): a hand-written criterion line identical to the snapshot is not re-judged, but the same line changed by the write-back is', () => {
+  const legacy = '- **AC-QA-7:** A legacy multi-line criterion whose first line ends without punctuation, continued'
+  const f = fixture(spec([...CRITERIA, legacy]))
+  const same = verify(f, [...IDS, 'AC-QA-7'])
+  assert.deepEqual(same.out.problems, [], JSON.stringify(same.out))
+  const f2 = fixture(spec([...CRITERIA, legacy]))
+  fs.writeFileSync(f2.specPath, spec([...CRITERIA, legacy + ' and now changed']))
+  const changed = verify(f2, [...IDS, 'AC-QA-7'])
+  assert.ok(changed.out.problems.some((p) => p.includes('AC-QA-7') && p.includes('mid-sentence')), JSON.stringify(changed.out.problems))
+  assertRestored(f2, changed)
 })

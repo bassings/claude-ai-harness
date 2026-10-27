@@ -40,13 +40,27 @@ const fail = (reason) => { process.stderr.write(`spec-writeback: ${reason}\n`); 
 const linesOf = (text) => text.split('\n').map((l) => l.replace(/\r$/, ''))
 const headingsOf = (text) => linesOf(text).filter((l) => l.startsWith('## ')).map((l) => l.trimEnd())
 const criteriaOf = (text) => linesOf(text).map((l) => AC_LINE.exec(l)).filter(Boolean)
-  .map((m) => ({ id: m[1], text: m[2].trim() }))
+  .map((m) => ({ id: m[1], text: m[2].trim(), line: m[0] }))
 
+// T8 review round 1 F1 (High): the first form stripped every trailing closer before reading the last character, so
+// the merge-note shapes the synthesis prompt itself asks for ("Text. *(merges AC-ARCH-7)*", "Text. [merges AC-QA-15]")
+// read their last character as the digit of the id and were flagged; 2 of 12 real specs failed. Trailing emphasis
+// and whole trailing bracketed notes are peeled off, repeatedly, and then trailing closers are stripped, before the
+// sentence-terminal test. The check applies only to criterion lines the write-back wrote or changed: a line byte-
+// identical to one in the snapshot is the operator's own (hand-written specs carry multi-line criteria), and the
+// write-back is judged on what it wrote. test/spec-writeback.test.js runs verify over every real spec under specs/
+// against its own snapshot and ids, so the structural checks are pinned against real input.
 function midSentence(text) {
   if ((text.match(/`/g) || []).length % 2 === 1) return 'an odd number of backticks'
   const bare = text.replace(/`[^`]*`/g, '')
   if ((bare.match(/\(/g) || []).length !== (bare.match(/\)/g) || []).length) return 'unbalanced parentheses'
-  const last = text.replace(/[\s)\]"'*`]+$/, '').slice(-1)
+  let t = text.trimEnd()
+  for (;;) {
+    const peeled = t.replace(/[\s*_"'`]+$/, '').replace(/\s*[([][^()[\]]*[)\]]$/, '')
+    if (peeled === t) break
+    t = peeled
+  }
+  const last = t.replace(/[\s*_"'`)\]]+$/, '').slice(-1)
   if (!last || !'.?!:'.includes(last)) return `the last character is not sentence-terminal (${JSON.stringify(text.slice(-1))})`
   return null
 }
@@ -69,8 +83,9 @@ function problemsOf(now, snapshotText, surviving) {
   for (const id of defined) if (!want.has(id)) problems.push(`unexpected criterion: ${id} is defined in the spec but not in the surviving set`)
 
   const seen = new Map()
+  const snapshotLines = new Set(linesOf(snapshotText))
   for (const c of criteria) {
-    const why = midSentence(c.text)
+    const why = snapshotLines.has(c.line) ? null : midSentence(c.text)
     if (why) problems.push(`criterion line ends mid-sentence: ${c.id} (${why})`)
     seen.set(c.text, [...(seen.get(c.text) || []), c.id])
   }

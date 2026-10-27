@@ -187,3 +187,54 @@ test('plan-cycle T8 static: the workflow cites T8 and the 2026-10-13 incident, a
   assert.ok(fs.existsSync(path.join(WF_DIR, 'lib', 'spec-writeback.mjs')), 'the library exists')
   assert.match(fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8'), /spec-writeback\.mjs/)
 })
+
+// ======================================================================
+// Review round 1 of PR #18 (wf_9f8826b4-bcb). F3 (Medium): the `..` and `.claude` rejections were untested. F4 (Low,
+// security): the spec path and the surviving ids reached shell commands unvalidated. F5 (Low): branches without pins.
+// ======================================================================
+test('plan-cycle T8 (F3): a snapshot file path with a .. segment or a .claude segment under a temp prefix is rejected', async () => {
+  for (const file of ['/tmp/../tmp/harn-specwb-x/spec.snapshot', '/tmp/.claude/harn-specwb-x/spec.snapshot']) {
+    const { result } = await go(agents({ snapshot: json({ ...BEFORE, file }) }))
+    assert.equal(result.telemetry.outcome, 'aborted', file)
+    assert.equal(result.writeback, null, file)
+  }
+})
+
+test('plan-cycle T8 (F4): a spec path with a space, a quote or a command substitution is refused before any agent runs', async () => {
+  for (const spec of ['specs/a b.md', "specs/a'b.md", 'specs/a$(touch PWNED).md', 'specs/../x.md']) {
+    await assert.rejects(runWorkflow(WF, { args: { spec }, agent: agents() }), /refuses args\.spec/, spec)
+  }
+})
+
+test('plan-cycle T8 (F4): a surviving id outside the AC pattern aborts the run with writeback null, even when the check says ok', async () => {
+  for (const surviving of [['AC-SEC-1', "x'; touch PWNED; '"], ['AC-SEC-1', 'AC-sec-1'], ['AC-SEC-1', 'AC-QA-1 && touch PWNED']]) {
+    const { result } = await go(agents({ surviving }))
+    assert.equal(result.telemetry.outcome, 'aborted', JSON.stringify(surviving))
+    assert.equal(result.writeback, null)
+  }
+})
+
+test('plan-cycle T8 (F5): ok true with a non-empty problems list is malformed, so the run is aborted with writeback null', async () => {
+  const { result } = await go(agents({ check: json({ ...CHECK_OK, problems: ['x'] }) }))
+  assert.equal(result.telemetry.outcome, 'aborted')
+  assert.equal(result.writeback, null)
+})
+
+test('plan-cycle T8 (F5): ok false with restored false says NOT confirmed restored in the report', async () => {
+  const { result } = await go(agents({ check: json({ ...CHECK_BAD, restored: false }) }))
+  assert.equal(result.telemetry.outcome, 'aborted')
+  assert.match(result.report, /NOT confirmed restored/)
+  assert.equal(result.writeback.restored, false)
+})
+
+test('plan-cycle T8 (F5): a missing writeback_check puts WRITE-BACK UNCHECKED in the report', async () => {
+  const { result } = await go(agents({ check: undefined }))
+  assert.match(result.report, /WRITE-BACK UNCHECKED/)
+})
+
+test('plan-cycle T8 (F5): without a restorable snapshot the synthesis prompt forbids the edit and names no verify command', async () => {
+  const { calls } = await go(agents({ snapshot: undefined }))
+  const p = calls.find((c) => c.opts.label === 'synthesis:write-back').prompt
+  assert.match(p, /do NOT edit the spec/)
+  assert.doesNotMatch(p, /spec-writeback\.mjs> verify/)
+})

@@ -305,6 +305,12 @@ let opts = args
 if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts = null } }
 opts = opts || {}
 if (typeof opts !== 'object' || !opts.spec) throw new Error('plan-cycle requires args.spec: the path to the spec file to plan against')
+// HARN-OPT-5 T8 review round 1 F4: the spec path is interpolated into two "run exactly" shell commands (the
+// snapshot and the verify), so it is restricted to a plain path with no `..` segment before anything runs; the same
+// shape parseSpecSnapshot applies to the snapshot file. A path with a space, a quote or a substitution is refused.
+if (typeof opts.spec !== 'string' || !/^[\w.+@/-]+$/.test(opts.spec) || opts.spec.split('/').includes('..')) {
+  throw new Error('plan-cycle refuses args.spec: the spec path must be a plain path (letters, digits, . + @ / - _) with no .. segment, because it is passed to a shell command verbatim')
+}
 const specPath = opts.spec
 
 // Review round-2 L-1: `lenses` (the triggered roster) is local to run(), so
@@ -660,7 +666,8 @@ const synthesis = await agent(
   (specBefore ? `After the edit, verify it by script (HARN-OPT-5 T8; the 2026-10-13 write-back pasted the preamble into the criteria and ` +
     `cut lines mid-sentence). ` + SPEC_WB_LOCATE + `Then run exactly ` +
     `\`node <path-to-spec-writeback.mjs> verify ${specPath} ${specBefore.file} '<surviving_ids as a JSON array>'\`, where the last ` +
-    `argument is the AC ids you kept as a JSON array of strings (the same ids you return as surviving_ids), and return its stdout ` +
+    `argument is the AC ids you kept as a JSON array of strings (the same ids you return as surviving_ids; each must match ` +
+    `^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$ and nothing else goes into that argument), and return its stdout ` +
     `verbatim, unedited, as writeback_check. That command restores the spec itself if the write-back is bad: change nothing else, ` +
     `do not retry the edit, and do not repair the spec by hand.\n` : '') +
   `4. Return a markdown summary: a per-lens table (verdict, criteria count, could_not_check), the veto list, any lens ` +
@@ -691,7 +698,10 @@ const synthesis = await agent(
 synthesisHeadSha = synthesis && typeof synthesis.head_sha_at_synthesis === 'string' ? synthesis.head_sha_at_synthesis : null
 const reportOk = synthesis && typeof synthesis.summary === 'string' && synthesis.summary.length > 0
 // HARN-OPT-5 T8: a write-back that could not be checked, or failed its check, is aborted -- never blocked, never done.
-const writeback = parseWritebackCheck(synthesis && synthesis.writeback_check, specBefore)
+// T8 review round 1 F4: an id outside the AC pattern would have reached the verify command's shell argument; the run
+// is aborted (the check is treated as malformed) rather than trusting what the agent typed.
+const survivingIdsOk = synthesis && Array.isArray(synthesis.surviving_ids) && synthesis.surviving_ids.every((id) => typeof id === 'string' && /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/.test(id))
+const writeback = survivingIdsOk ? parseWritebackCheck(synthesis && synthesis.writeback_check, specBefore) : null
 const writebackOk = Boolean(writeback && writeback.ok)
 const outcome = !reportOk || !writebackOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'
 const writebackNotice = writebackOk ? null : writeback

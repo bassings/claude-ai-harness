@@ -200,10 +200,16 @@ const reviewAgents = (claim) => ({
 })
 const RUNS = [
   ['tdd-task.js', { args: { task: BRACEY }, agent: {} }, (p) => p.task],
-  ['plan-cycle.js', { args: { spec: BRACEY }, agent: {} }, (p) => p.spec],
+  // HARN-OPT-5 T8 (F4): plan-cycle refuses BRACEY as a spec path before any agent runs (asserted in its own test
+  // below), so its round-trip runs on a plain path and the carried check is that path.
+  ['plan-cycle.js', { args: { spec: 'specs/plain.md' }, agent: {} }, (p) => (p.spec === 'specs/plain.md' ? BRACEY : null)],
   // With no spec in play, review-cycle reclassifies the synthesis's spec bugs as ordinary open findings (D4).
   ['review-cycle.js', { args: {}, agent: reviewAgents(BRACEY) }, (p) => [...(p.spec_bugs || []), ...(p.open_findings || [])].map((f) => f.claim).find((c) => c === BRACEY) || null],
 ]
+test('plan-cycle.js: BRACEY cannot be its spec path at all (HARN-OPT-5 T8 F4 refuses it before any agent runs), so the round-trip above uses a plain path', async () => {
+  await assert.rejects(runWorkflow(path.join(WF_DIR, 'plan-cycle.js'), { args: { spec: BRACEY }, agent: {} }), /refuses args\.spec/)
+})
+
 for (const [file, opts, carried] of RUNS) {
   test(`${file}: every ledger:write payload round-trips with braces, escaped quotes and the return-contract text in a field, and the delimited text is its canonical base64 (AC-QA-15)`, async () => {
     let calls
