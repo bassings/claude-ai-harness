@@ -208,14 +208,18 @@ test('tdd-task.js: a sentinel in the task appears nowhere in the prompt but surv
 // against the real prompt: build the inline variant, show the detector flags
 // it AND that running it really does execute the hostile text.
 test('mutation: an instructed command that interpolates the payload inline is detected, and really does execute the injection (AC-SEC-6)', async () => {
-  const marker = path.join(SUITE_TMPDIR, `PWNED_inline_${process.pid}`)
-  fs.rmSync(marker, { force: true })
-  const { prompt } = await DRIVERS['tdd-task.js'](`';touch ${marker};'`)
+  // The injected text is deliberate; no absolute path appears in the command text (CodeQL
+  // js/shell-command-injection-from-environment): the marker is a bare name created in the run's cwd, and the
+  // writer's path reaches the shell through the environment.
+  const repo = makeTempRepo()
+  const markerName = `PWNED_inline_${process.pid}`
+  const marker = path.join(repo, markerName)
+  const { prompt } = await DRIVERS['tdd-task.js'](`';touch ${markerName};'`)
   const payload = extractLedgerPayload(prompt)
   const encoded = extractEncodedPayload(prompt)
-  const inline = `printf '%s' '${payload.task}' | node ${APPEND_SCRIPT}`
-  assert.equal(commandCarriesPayload(inline, encoded, [`';touch`, marker]), true, 'the detector must flag an inline-interpolated command')
-  runSh(inline, { cwd: makeTempRepo(), env: sanitizedGitEnv() })
+  const inline = `printf '%s' '${payload.task}' | node "$HARN_APPEND_SCRIPT"`
+  assert.equal(commandCarriesPayload(inline, encoded, [`';touch`, markerName]), true, 'the detector must flag an inline-interpolated command')
+  runSh(inline, { cwd: repo, env: { ...sanitizedGitEnv(), HARN_APPEND_SCRIPT: APPEND_SCRIPT } })
   assert.equal(fs.existsSync(marker), true, 'sanity: the inline form really is injectable, so the file-fed form is a real fix')
   fs.rmSync(marker, { force: true })
 })
