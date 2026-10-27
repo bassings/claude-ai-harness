@@ -200,10 +200,15 @@ const reviewAgents = (claim) => ({
 })
 const RUNS = [
   ['tdd-task.js', { args: { task: BRACEY }, agent: {} }, (p) => p.task],
-  ['plan-cycle.js', { args: { spec: BRACEY }, agent: {} }, (p) => p.spec],
+  // HARN-OPT-5 T8 (F4, round 2 L2): plan-cycle refuses BRACEY as a spec path before any agent runs (asserted in its
+  // own test below) and its payload has no other free-text field, so it has no row in this round-trip.
   // With no spec in play, review-cycle reclassifies the synthesis's spec bugs as ordinary open findings (D4).
   ['review-cycle.js', { args: {}, agent: reviewAgents(BRACEY) }, (p) => [...(p.spec_bugs || []), ...(p.open_findings || [])].map((f) => f.claim).find((c) => c === BRACEY) || null],
 ]
+test('plan-cycle.js: BRACEY cannot be its spec path at all (HARN-OPT-5 T8 F4 refuses it before any agent runs), so the round-trip above uses a plain path', async () => {
+  await assert.rejects(runWorkflow(path.join(WF_DIR, 'plan-cycle.js'), { args: { spec: BRACEY }, agent: {} }), /refuses args\.spec/)
+})
+
 for (const [file, opts, carried] of RUNS) {
   test(`${file}: every ledger:write payload round-trips with braces, escaped quotes and the return-contract text in a field, and the delimited text is its canonical base64 (AC-QA-15)`, async () => {
     let calls
