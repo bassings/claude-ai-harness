@@ -423,3 +423,33 @@ test('git-env: GIT_CONFIG_PARAMETERS cannot inject config into a fixture -- git 
   assert.equal(res.status, 0, `child failed: ${res.stderr}`)
   assert.equal(JSON.parse(res.stdout.trim()).email, 'test@example.com', 'the fixture\'s own identity must win')
 })
+
+// CI flake, 2026-10-13 to 26 (five main-branch runs, the 26 Oct scheduled run
+// among them): git 2.55 on the runners starts detached background maintenance
+// after a fixture's commit and writes .git/objects/maintenance.lock a moment
+// later, so a before/after directory listing around a read-only command sees
+// the lock come or go. Every fixture builder switches that housekeeping off.
+const { hermeticRepoConfig, HERMETIC_REPO_CONFIG } = require('./helpers/git-env.js')
+const { execFileSync } = require('node:child_process')
+const os = require('node:os')
+const { makeHostileRepo } = (() => { try { return require('./helpers/hostile-repo.js') } catch { return {} } })()
+
+test('fixture repos never run background git maintenance: gc.auto is 0 and maintenance.auto is false in every helper-made repo', () => {
+  const repos = [makeTempRepo()]
+  if (typeof makeHostileRepo === 'function') repos.push(makeHostileRepo())
+  assert.deepEqual(HERMETIC_REPO_CONFIG, [['gc.auto', '0'], ['maintenance.auto', 'false']])
+  for (const repo of repos) {
+    for (const [key, value] of HERMETIC_REPO_CONFIG) {
+      assert.equal(execFileSync('git', ['-C', repo, 'config', '--get', key], { encoding: 'utf8' }).trim(), value, `${key} in ${repo}`)
+    }
+  }
+})
+
+test('hermeticRepoConfig applies the same two settings through a caller-supplied runner (the install-consistency fixture shape)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermetic-'))
+  execFileSync('git', ['init', '-q', dir])
+  const seen = []
+  hermeticRepoConfig(dir, (args) => { seen.push(args.join(' ')); execFileSync('git', ['-C', dir, ...args]) })
+  assert.deepEqual(seen, ['config gc.auto 0', 'config maintenance.auto false'])
+  assert.equal(execFileSync('git', ['-C', dir, 'config', '--get', 'gc.auto'], { encoding: 'utf8' }).trim(), '0')
+})

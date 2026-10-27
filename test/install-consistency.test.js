@@ -23,6 +23,7 @@ const { spawnSync } = require('node:child_process')
 // test/helpers/git-env.js's own header for why this is per-file, not
 // suite-wide, and why it must be called (not merely imported) here.
 require('./helpers/git-env.js').scrubGitEnv()
+const { hermeticRepoConfig } = require('./helpers/git-env.js')
 
 const SCRIPT = path.join(__dirname, '..', 'workflows', 'lib', 'install-consistency.mjs')
 const MODULE_URL = pathToFileURL(SCRIPT).href
@@ -608,6 +609,7 @@ function gitInitAndCommit(dir) {
     }
   }
   run(['init', '-q'])
+  hermeticRepoConfig(dir, run)  // no background housekeeping in a fixture (see git-env.js)
   run(['add', '-A'])
   // Throwaway fixture repos only, never the real project history -- the
   // explicit identity and gpgsign=false avoid depending on this machine's

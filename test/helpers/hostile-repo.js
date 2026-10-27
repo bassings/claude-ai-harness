@@ -13,10 +13,12 @@ const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
 const { SUITE_TMPDIR, APPEND_SCRIPT, sh, trackTempDir } = require('./temp-repo.js')
+const { hermeticRepoConfig } = require('./git-env.js')
 
 function initGitRepo(repo) {
   fs.mkdirSync(repo, { recursive: true })
   sh('git init -q -b main', repo)
+  hermeticRepoConfig(repo)  // no background housekeeping in a fixture (see git-env.js)
   sh('git config user.email test@example.com', repo)
   sh('git config user.name Test', repo)
   fs.writeFileSync(path.join(repo, 'README.md'), 'seed\n')

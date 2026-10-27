@@ -97,10 +97,34 @@ function scrubGitEnv() {
   for (const key of gitEnvKeysToStrip(process.env)) delete process.env[key]
 }
 
+// Fixture repos must never start git's own background housekeeping. From git
+// 2.55 on the GitHub runners, a commit in a fresh repo kicks off a detached
+// `git maintenance run --auto`, which writes .git/objects/maintenance.lock in
+// the fixture a moment later. A test that lists a fixture directory before and
+// after a read-only command then sees the lock appear or vanish between the two
+// listings and fails on a race it did not cause (observed 2026-10-13 to 26 on
+// five main-branch CI runs: install-consistency's "--check-staleness never
+// touches either directory"; the command under test runs only `git ls-files`).
+// CLAUDE.md §11 calls this shape "racing the thing it watches". The settings
+// are per-repo config, not environment, because GIT_CONFIG_* is deliberately
+// scrubbed above. Every fixture builder that runs `git init` calls this.
+const HERMETIC_REPO_CONFIG = [
+  ['gc.auto', '0'],
+  ['maintenance.auto', 'false'],
+]
+
+function hermeticRepoConfig(dir, run = null) {
+  const { execFileSync } = require('node:child_process')
+  for (const [key, value] of HERMETIC_REPO_CONFIG) {
+    if (run) run(['config', key, value])
+    else execFileSync('git', ['-C', dir, 'config', key, value], { stdio: 'ignore', env: sanitizedGitEnv() })
+  }
+}
+
 function sanitizedGitEnv(extra = {}) {
   const env = { ...process.env, ...extra }
   for (const key of gitEnvKeysToStrip(env)) delete env[key]
   return env
 }
 
-module.exports = { GIT_ENV_ALLOWLIST, gitEnvKeysToStrip, scrubGitEnv, sanitizedGitEnv }
+module.exports = { GIT_ENV_ALLOWLIST, gitEnvKeysToStrip, scrubGitEnv, sanitizedGitEnv, hermeticRepoConfig, HERMETIC_REPO_CONFIG }
