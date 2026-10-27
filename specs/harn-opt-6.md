@@ -5,7 +5,7 @@
 > A review finding with no AC behind it is a **spec bug**: record it in
 > "Spec gaps found at review" so the planning lens improves.
 
-**Status:** draft (planned by plan-cycle `wf_1106254d-49e`; two owner decisions open, see Vetoes and trade-offs)
+**Status:** agreed 2026-10-27 (planned by plan-cycle `wf_1106254d-49e`; both owner decisions taken, see Vetoes and trade-offs)
 **Lenses run:** security, qa, simplicity, product, data, architecture, operability · **Skipped:** design, accessibility (no UI or user-facing copy; internal telemetry)
 
 ## Problem
@@ -151,12 +151,12 @@ Removal criteria for "What this replaces": row 1 (security) is AC-SEC-1; row 2 (
 ## Vetoes and trade-offs
 
 See "Vetoed at planning" above for the lens vetoes and precedence drops.
-Two items there are the owner's call and are open:
+Two items there were the owner's call; both decided 2026-10-27:
 
 | Item | Raised by | Decision | Rationale |
 |---|---|---|---|
-| Return finding ids even when the review's ledger write fails (AC-PROD-1 over AC-DATA-7) | product, operability vs data | escalated: owner to confirm | Keeps the fix loop's "fixed" tracking alive through a lost write; cost is a "fixed" row that may join to no "open" row on disk. |
-| Drop the `*_raw` label fields from new review rows (AC-SEC-4) | security vs data | escalated: owner to confirm | Keeps lens-authored text out of the ledger; cost is losing the original text of a malformed lens label or AC id. |
+| Return finding ids even when the review's ledger write fails (AC-PROD-1 over AC-DATA-7) | product, operability vs data | accepted by the owner 2026-10-27 | Keeps the fix loop's "fixed" tracking alive through a lost write; cost is a "fixed" row that may join to no "open" row on disk. |
+| Drop the `*_raw` label fields from new review rows (AC-SEC-4) | security vs data | accepted by the owner 2026-10-27 | Keeps lens-authored text out of the ledger; cost is losing the original text of a malformed lens label or AC id. |
 
 ## Spec gaps found at review
 
@@ -165,3 +165,4 @@ Two items there are the owner's call and are open:
 - [ ] T2: conduct-plan SKILL.md and README.md: no hand-written replacement rows, new failure signals and remedies, null cases rewritten (AC-OPS-9, AC-OPS-11, AC-ARCH-11) — state: queued (needs: T1)
 - [ ] T3: live acceptance after install and a session restart: twenty writes tallied, zero stopped or FAIL (AC-QA-13) — state: queued (needs: T1, T2)
 ## Conductor log
+- 2026-10-27 planning closed: owner accepted AC-PROD-1 over AC-DATA-7 and the removal of the *_raw fields (AC-SEC-4). Not yet conducted: the owner restarts the session first so named workflows load the installed files, then runs `/loop /conduct-plan specs/harn-opt-6.md`.
