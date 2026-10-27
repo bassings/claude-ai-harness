@@ -202,7 +202,7 @@ const SEVERITIES = ['Critical', 'High', 'Medium', 'Low']
 // prior_findings argument). It records that a lens, this round, confirmed
 // a specific PRIOR finding is resolved in the built change -- a confirmation,
 // not proof of repair. Where a finding was reworded rather than fixed, its
-// findingId hash differs from the one this round computes for it, the id
+// id differs from the one review-cycle.js computes for it this round, the id
 // guard does not match, and it is never recorded fixed: this measure can
 // undercount a genuine fix, never overcount one, which is the safe
 // direction for a number that feeds rework attribution.
@@ -419,9 +419,9 @@ export const LEDGER_ENTRY_SCHEMA = {
     invalid_record_values_dropped: { type: ['integer', 'null'] },
     // specs/record-fixed-findings.md, the id guard (AC-3): how many entries
     // in a supplied fixed_findings array were dropped because their
-    // findingId hash was not among the ids computed from the caller's own
-    // prior_findings -- a claimed-fixed finding that was never reported
-    // open this round, or reworded enough that the hash no longer matches.
+    // id was not among the verified prior ids review-cycle.js sent from the
+    // caller's own prior_findings -- a claimed-fixed finding that was never
+    // reported open this round, or reworded enough that its id no longer matches.
     // Fix round 1, finding 8 (widened, fix round 3, finding 5): also
     // counts a claim that DOES match a prior finding but whose id is ALSO
     // present in this same round's own open_findings, rejected_findings or
@@ -451,9 +451,10 @@ export const LEDGER_ENTRY_SCHEMA = {
     duplicate_fixed_ids_dropped: { type: ['integer', 'null'] },
     // Fix round 2, AC-3 (specs/record-fixed-findings.md): how many
     // prior_findings entries were dropped because their supplied `id` did
-    // not match findingId recomputed from that SAME entry's own
+    // not match the id review-cycle.js computes from that SAME entry's own
     // lens/location/claim -- a mistyped, stale or fabricated id, caught
-    // before it could ever enter the joinable set. Gated on prior_findings'
+    // there before it could ever enter the joinable set; this writer only
+    // stores the count it is sent. Gated on prior_findings'
     // OWN presence (not fixed_findings'), since verifying supplied ids is
     // meaningful even on a request that never confirmed anything this
     // round. Same null-vs-zero convention as its siblings.
@@ -519,6 +520,13 @@ export const LEDGER_ENTRY_SCHEMA = {
     // line still writes. null means "no round was supplied" (a direct review),
     // never 0.
     round: { type: ['integer', 'null'], minimum: 1 },
+    // HARN-OPT-6 (AC-DATA-6b): true only on a row built from a payload that
+    // carried the legacy raw-descriptor keys, which a workflow script predating
+    // HARN-OPT-6 sends and this writer cannot turn into findings. Such a row
+    // has no findings whatever the round found, so a reader needs this marker to
+    // tell it from a genuinely clean round. Absent on every row the new path
+    // writes; never null.
+    legacy_payload: { type: 'boolean' },
     // HARN-OPT-4 T5 (AC-OPS-5, AC-QA-17): why a tdd_task run ended BLOCKED, one
     // code per BLOCKED exit; null on a done or aborted row. A closed enum so
     // free text can never reach the durable line: anything outside it is
@@ -2052,7 +2060,10 @@ export function main() {
   // names the cause. Counted per key present, so a null-valued key counts too.
   const legacyKeysPresent = LEGACY_DESCRIPTOR_KEYS.filter((k) => k in payload)
   const sameRoundOtherDispositionIds = new Set([...specBugs, ...rejected, ...open].map((e) => e.id))
-  const fixedSupplied = fixedClaims.length > 0 || Number.isInteger(payload.invalid_fixed_ids_dropped)
+  // fixed_findings_supplied is the explicit signal that the synthesis returned a
+  // fixed_findings array this round (possibly empty), so the reconciliation drops
+  // below read as a real 0 rather than null. It is a payload signal only.
+  const fixedSupplied = fixedClaims.length > 0 || payload.fixed_findings_supplied === true
   const fixed = computeFixedFindings(priorEntries, fixedClaims, fixedSupplied, sameRoundOtherDispositionIds)
   // The script-side neutralisation counts (labels nulled before the payload was
   // built, AC-SEC-4) are captured here because degradeEntry recomputes these
@@ -2065,7 +2076,7 @@ export function main() {
   scriptDrops.invalid_record_values_dropped += read.dropped + legacyKeysPresent.length
   // finding_entries and the legacy keys never reach the schema-validated entry
   // (additionalProperties:false would refuse the whole line), nor does event_scope.
-  const { finding_entries, event_scope, ...restPayloadWithLegacy } = payload
+  const { finding_entries, event_scope, fixed_findings_supplied, ...restPayloadWithLegacy } = payload
   const restPayload = Object.fromEntries(Object.entries(restPayloadWithLegacy).filter(([k]) => !LEGACY_DESCRIPTOR_KEYS.includes(k)))
   const allFindings = [...specBugs, ...rejected, ...open, ...fixed.entries]
   // M2: bound the findings array at MAX_FINDINGS rather than letting an
@@ -2087,6 +2098,7 @@ export function main() {
   const entry = {
     ...restPayload,
     ...findingsFields,
+    ...(legacyKeysPresent.length ? { legacy_payload: true } : {}),
     schema_version: SCHEMA_VERSION,
     run_id,
     ts,
@@ -2161,9 +2173,14 @@ export function main() {
   // invalid_record_values_dropped (verdict is not ac_id -- same counter
   // round-5 already routes every other non-ac_id/lens/severity
   // neutralisation through).
+  //
+  // HARN-OPT-6 (fix round 2, C): a payload carrying finding_entries comes from
+  // review-cycle.js, which nulls and counts these itself before the payload is
+  // built (scriptDrops, below). Counting the nulls it left would count each one
+  // twice, so this loop runs only for payloads that did not pass through it.
   let explicitNullAcVerdictAcId = 0
   let explicitNullVerdict = 0
-  if (Array.isArray(entry.ac_verdicts)) {
+  if (!('finding_entries' in payload) && Array.isArray(entry.ac_verdicts)) {
     for (const v of entry.ac_verdicts) {
       if (!v || typeof v !== 'object') continue
       if (v.ac_id === null) explicitNullAcVerdictAcId += 1

@@ -24,75 +24,88 @@ const WF = path.join(ROOT, 'workflows', 'review-cycle.js')
 test.after(cleanupTempRepos)
 
 // ---- the functions under test, extracted from the workflow file itself, not copied ----
+// AC-QA-8: the extracted block runs through test/helpers/fake-runtime.js, which refuses a script that mentions TextEncoder,
+// TextDecoder, atob, btoa or a crypto global, so a rewrite that quietly reaches for one fails to load here as it would in
+// the real runtime. The inputs go in through `args` and the results come back as the workflow's return value; the expected
+// values are computed out here with node:crypto, which the extracted block never sees.
 const SOURCE = fs.readFileSync(WF, 'utf8')
 const START = SOURCE.indexOf('const SHA256_K = [')
 const END = SOURCE.indexOf('// HARN-OPT-6 (AC-SEC-2, AC-SEC-4): a lens-authored label')
 assert.ok(START > 0 && END > START, 'could not locate the sha256 and finding-id block in review-cycle.js')
-const { sha256Hex, findingId, utf8Bytes } = new Function(`${SOURCE.slice(START, END)}\nreturn { sha256Hex, findingId, utf8Bytes }`)()
+const BLOCK_FILE = path.join(fs.mkdtempSync(path.join(SUITE_TMPDIR, 'sha-block-')), 'sha-block.js')
+fs.writeFileSync(BLOCK_FILE, `${SOURCE.slice(START, END)}\nreturn { sha: (args.sha || []).map(sha256Hex), ids: (args.ids || []).map(t => findingId(t[0], t[1], t[2])), bytes: (args.bytes || []).map(utf8Bytes) }\n`)
+async function inRuntime({ sha = [], ids = [], bytes = [] }) {
+  return (await runWorkflow(BLOCK_FILE, { args: { sha, ids, bytes }, agent: {} })).result
+}
 const nodeSha = (s) => createHash('sha256').update(s, 'utf8').digest('hex')
 
-test('AC-QA-1: sha256 returns the published digests for the empty string, abc, the 448-bit message and one million a', () => {
-  assert.equal(sha256Hex(''), 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
-  assert.equal(sha256Hex('abc'), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
-  assert.equal(sha256Hex('abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq'), '248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1')
-  assert.equal(sha256Hex('a'.repeat(1000000)), 'cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0')
+test('AC-QA-1: sha256 returns the published digests for the empty string, abc, the 448-bit message and one million a', async () => {
+  const inputs = ['', 'abc', 'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq', 'a'.repeat(1000000)]
+  const { sha } = await inRuntime({ sha: inputs })
+  assert.deepEqual(sha, [
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+    '248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1',
+    'cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0',
+  ])
 })
 
-test('AC-QA-1: sha256 matches node:crypto on the padding boundaries (55, 56, 63, 64, 65, 119, 120 bytes)', () => {
-  for (const n of [0, 1, 54, 55, 56, 57, 63, 64, 65, 118, 119, 120, 121, 127, 128, 129, 1000]) {
-    const input = 'x'.repeat(n)
-    assert.equal(sha256Hex(input), nodeSha(input), `${n} bytes`)
-  }
+test('AC-QA-1: sha256 matches node:crypto on the padding boundaries (55, 56, 63, 64, 65, 119, 120 bytes)', async () => {
+  const lengths = [0, 1, 54, 55, 56, 57, 63, 64, 65, 118, 119, 120, 121, 127, 128, 129, 1000]
+  const inputs = lengths.map((n) => 'x'.repeat(n))
+  const { sha } = await inRuntime({ sha: inputs })
+  lengths.forEach((n, i) => assert.equal(sha[i], nodeSha(inputs[i]), `${n} bytes`))
 })
 
-test('AC-QA-2: utf8Bytes agrees with Buffer.from for every kind of input, and encodes a lone surrogate as EF BF BD (not the ED A0 80 toBase64 emits)', () => {
+test('AC-QA-2: utf8Bytes agrees with Buffer.from for every kind of input, and encodes a lone surrogate as EF BF BD (not the ED A0 80 toBase64 emits)', async () => {
   const inputs = ['', 'ascii', 'café', '€', '😀', '\ud800', '\udfff', 'x\ud800y', 'a\udc00', '\ud83d', '\ud83dx', '\ude00\ud83d', 'mixed é€😀\ud800 end']
-  for (const s of inputs) assert.deepEqual(Buffer.from(utf8Bytes(s)), Buffer.from(s, 'utf8'), JSON.stringify(s))
-  assert.deepEqual(utf8Bytes('\ud800'), [0xef, 0xbf, 0xbd])
+  const { bytes } = await inRuntime({ bytes: inputs })
+  inputs.forEach((s, i) => assert.deepEqual(Buffer.from(bytes[i]), Buffer.from(s, 'utf8'), JSON.stringify(s)))
+  assert.deepEqual(bytes[inputs.indexOf('\ud800')], [0xef, 0xbf, 0xbd])
 })
 
 const LONE = ['x\ud800y', 'x\udfffy', '\ud800', 'tail\ud83d', '\ude00head']
 const FALSY = [undefined, null, 0, false, '', 7, 'a']
-test('AC-QA-2: the in-script id equals the node:crypto id for a hostile corpus (surrogates, multibyte, falsy, trim, case, long)', () => {
+test('AC-QA-2: the in-script id equals the node:crypto id for a hostile corpus (surrogates, multibyte, falsy, trim, case, long)', async () => {
   const claims = ['plain', 'café € 😀', 'line1\r\nline2\ttab', ...LONE, 'q'.repeat(100 * 1024), ...FALSY]
   const locations = ['foo.js:10', '  FOO.js:İ ', 'straße.js:1', 'ΣIGMA.js:2', 'a\ud800b.js:1', ...FALSY]
   const lenses = ['lens-security', 'lens-security + lens-architecture', 'lens-é', ...FALSY]
-  let checked = 0
+  const triples = []
   for (const lens of lenses) for (const location of locations) for (const claim of claims) {
     if (claim === 'q'.repeat(100 * 1024) && (lens !== 'lens-security' || location !== 'foo.js:10')) continue
-    assert.equal(findingId(lens, location, claim), oracleId(lens, location, claim), JSON.stringify([lens, location, claim]).slice(0, 80))
-    checked++
+    triples.push([lens, location, claim])
   }
-  assert.ok(checked > 400, `only ${checked} corpus cases ran`)
+  const { ids } = await inRuntime({ ids: triples })
+  triples.forEach((t, i) => assert.equal(ids[i], oracleId(...t), JSON.stringify(t).slice(0, 80)))
+  assert.ok(triples.length > 400, `only ${triples.length} corpus cases ran`)
 })
 
-test('AC-QA-2: message lengths of 55, 56, 63, 64, 65, 119 and 120 bytes hash to the same id as node:crypto', () => {
-  for (const total of [55, 56, 63, 64, 65, 119, 120]) {
-    const claim = 'c'.repeat(total - 'lens-qa'.length - 2)
-    assert.equal(findingId('lens-qa', '', claim), oracleId('lens-qa', '', claim), `${total} bytes`)
-  }
+test('AC-QA-2: message lengths of 55, 56, 63, 64, 65, 119 and 120 bytes hash to the same id as node:crypto', async () => {
+  const triples = [55, 56, 63, 64, 65, 119, 120].map((total) => ['lens-qa', '', 'c'.repeat(total - 'lens-qa'.length - 2)])
+  const { ids } = await inRuntime({ ids: triples })
+  triples.forEach((t, i) => assert.equal(ids[i], oracleId(...t), `${[55, 56, 63, 64, 65, 119, 120][i]} bytes`))
 })
 
-test('AC-QA-2: a seeded random differential of 1,500 triples agrees with node:crypto', () => {
+test('AC-QA-2: a seeded random differential of 1,500 triples agrees with node:crypto', async () => {
   let seed = 0x2f6e2b1
   const next = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed }
   const alphabet = ['a', 'Z', ' ', '\t', '\n', 'é', 'İ', 'Σ', '€', '😀', '\ud800', '\udc00', '.', ':', '1']
   const word = (max) => Array.from({ length: next() % max }, () => alphabet[next() % alphabet.length]).join('')
-  for (let i = 0; i < 1500; i++) {
-    const [lens, location, claim] = [word(20), word(30), word(200)]
-    assert.equal(findingId(lens, location, claim), oracleId(lens, location, claim), JSON.stringify([lens, location, claim]))
-  }
+  const triples = Array.from({ length: 1500 }, () => [word(20), word(30), word(200)])
+  const { ids } = await inRuntime({ ids: triples })
+  triples.forEach((t, i) => assert.equal(ids[i], oracleId(...t), JSON.stringify(t)))
 })
 
-test('AC-QA-3: the ids already pinned in the ledger are reproduced', () => {
-  assert.equal(findingId('lens-security', 'foo.js:10', 'missing auth check'), 'e74fb146b7ddc6cb')
-  assert.equal(findingId('lens-security + lens-architecture', 'a.js:1', 'c'), '7c35753185a55bf1')
+test('AC-QA-3: the ids already pinned in the ledger are reproduced', async () => {
+  const { ids } = await inRuntime({ ids: [['lens-security', 'foo.js:10', 'missing auth check'], ['lens-security + lens-architecture', 'a.js:1', 'c']] })
+  assert.deepEqual(ids, ['e74fb146b7ddc6cb', '7c35753185a55bf1'])
 })
 
-test('AC-QA-2: two claims one character apart, and a location differing only in case and whitespace, behave as the data criterion requires (AC-DATA-3)', () => {
-  assert.notEqual(findingId('lens-qa', 'a.js:1', 'claim a'), findingId('lens-qa', 'a.js:1', 'claim b'))
-  assert.equal(findingId('lens-qa', ' A.js:1 ', 'c'), findingId('lens-qa', 'a.js:1', 'c'))
-  assert.notEqual(findingId('lens-qa', 'a.js:1', 'c'), findingId('lens-security', 'a.js:1', 'c'))
+test('AC-QA-2: two claims one character apart, and a location differing only in case and whitespace, behave as the data criterion requires (AC-DATA-3)', async () => {
+  const { ids: [a, b, c, d, e, f] } = await inRuntime({ ids: [['lens-qa', 'a.js:1', 'claim a'], ['lens-qa', 'a.js:1', 'claim b'], ['lens-qa', ' A.js:1 ', 'c'], ['lens-qa', 'a.js:1', 'c'], ['lens-qa', 'a.js:1', 'c'], ['lens-security', 'a.js:1', 'c']] })
+  assert.notEqual(a, b)
+  assert.equal(c, d)
+  assert.notEqual(e, f)
 })
 
 // ---- AC-QA-8: the runtime double refuses what the real runtime lacks ----
@@ -304,7 +317,7 @@ test('AC-OPS-4: through the 06049e4 writer the terminal write ends write_ok fals
 // AC-DATA-2: the same round, described as descriptors to the writer at 06049e4 and as ids to the new writer, lands
 // the same row apart from run_id, ts and the *_raw siblings.
 function legacyPayload(terminal, descriptors) {
-  const { finding_entries, invalid_ac_ids_dropped, invalid_finding_fields_dropped, invalid_record_values_dropped, invalid_fixed_ids_dropped, duplicate_fixed_ids_dropped, invalid_prior_ids_dropped, ...telemetry } = terminal
+  const { finding_entries, invalid_ac_ids_dropped, invalid_finding_fields_dropped, invalid_record_values_dropped, invalid_fixed_ids_dropped, duplicate_fixed_ids_dropped, invalid_prior_ids_dropped, fixed_findings_supplied, ...telemetry } = terminal
   return { ...telemetry, ...descriptors }
 }
 function normalise(line, ignore = []) {

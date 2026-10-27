@@ -424,14 +424,14 @@ if (typeof opts === 'string') { try { opts = JSON.parse(opts) } catch (e) { opts
 opts = opts || {}
 
 const specPath = opts.spec || null
-// HARN-OPT-4 T4 (AC-QA-13, AC-SIMP-11): passed through RAW. ledger-append.mjs owns
-// validation (integer >= 1 or null) and counts what it neutralises, so this file
-// never decides what a valid round is. Round 2 L1 (spec bug S5): spread onto
-// the payloads ONLY when supplied. A stale installed writer that predates the
-// field rejects an unknown key structurally (the whole line is refused), so a
-// direct review must not send `round: null`; the writer normalises absent to
-// null itself, which is why absent reads as null on the line, never 0.
-const roundField = opts.round === undefined ? {} : { round: opts.round }
+// HARN-OPT-4 T4 (AC-QA-13, AC-SIMP-11), narrowed by HARN-OPT-6 fix round 2 (G):
+// `round` is caller text, so it reaches the payloads only as a positive integer
+// (payloadRoundField, below); anything else is dropped and counted once. Round 2
+// L1 (spec bug S5): spread onto the payloads ONLY when supplied. A stale
+// installed writer that predates the field rejects an unknown key structurally
+// (the whole line is refused), so a direct review must not send `round: null`;
+// the writer normalises absent to null itself, which is why absent reads as
+// null on the line, never 0.
 // specs/record-fixed-findings.md (AC-1/AC-3): the caller's own findings,
 // reported open going into this round -- {id, lens, location, claim,
 // severity?, ac_id?}. Fix round 3, finding 3: `id` is REQUIRED, not
@@ -446,8 +446,8 @@ const roundField = opts.round === undefined ? {} : { round: opts.round }
 // in which case every other line touched by this change stays exactly as
 // it ran before: no prior-findings block reaches the synthesis prompt, no
 // fixed_findings field is requested, and the terminal payload carries no
-// prior ids, no invalid_prior_ids_dropped and no fixed baselines
-// (ledger-append.mjs then records nothing 'fixed' and leaves
+// prior ids, no invalid_prior_ids_dropped and no fixed_findings_supplied
+// flag (ledger-append.mjs then records nothing 'fixed' and leaves
 // invalid_fixed_ids_dropped absent).
 const priorFindings = Array.isArray(opts.prior_findings) ? opts.prior_findings : null
 
@@ -1731,9 +1731,13 @@ const PAYLOAD_VERDICTS = ['PASS', 'FAIL', 'UNVERIFIABLE']
 const PAYLOAD_LENS_VERDICTS = ['CLEAN', 'FINDINGS', 'BLOCKED']
 const PAYLOAD_RUN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // The same bound ledger-append.mjs applies to the findings array (its
-// MAX_FINDINGS); a test pins the two together. Capping each disposition here
-// means the 40,000-byte payload ceiling is a bound rather than a hope, and the
-// written row is unchanged because the writer's own cap is never more generous.
+// MAX_FINDINGS); a test pins the two together. Only the written dispositions
+// (open, rejected, spec_bug) are capped here, so the payload size ceiling
+// recorded in specs/harn-opt-6.md is a bound for them rather than a hope, and
+// the written row is unchanged because the writer's own cap is never more
+// generous. Verified prior ids and fixed confirmations are never cut: the
+// writer reconciles them on ids alone, and a cut would drop a valid
+// confirmation (AC-QA-9 and AC-ARCH-9 as amended 2026-10-28).
 const PAYLOAD_MAX_FINDINGS = 60
 const payloadDrops = { ac_ids: 0, finding_fields: 0, record_values: 0 }
 // AC-SEC-2: round_key and lens_checkout_drift values are commit hashes. The
@@ -1755,8 +1759,11 @@ function payloadCheckoutDrift(drift) {
   return out
 }
 function payloadLens(label, count = true) {
-  if (typeof label === 'string' && PAYLOAD_LENS_RE.test(label)) return label
-  if (typeof label === 'string') {
+  // A label shaped like a lens is still held to the roster and the 256-character
+  // bound (fix round 2, F): the shape alone admits 'lens-madeup' or 5,000 letters.
+  if (typeof label === 'string' && PAYLOAD_LENS_RE.test(label)) {
+    if (label.length <= 256 && PAYLOAD_ROSTER_LENSES.includes(label)) return label
+  } else if (typeof label === 'string') {
     const inspected = label.slice(0, 256)
     if (!/[\u0000-\u001f\u007f`|]/.test(inspected)) {
       for (const segment of inspected.split(/\+|,|\s+and\s+/)) {
@@ -1780,6 +1787,9 @@ function payloadAcId(value, count = true) {
   if (count) payloadDrops.ac_ids += 1
   return null
 }
+// `round` reaches the payloads only as a positive integer; a supplied value that
+// is anything else is dropped and counted once (fix round 2, G).
+const roundField = opts.round === undefined ? {} : Number.isInteger(opts.round) && opts.round > 0 ? { round: opts.round } : (payloadDrops.record_values += 1, {})
 // One descriptor in, one {id, lens, severity, ac_id, disposition} entry out.
 // A descriptor that is not an object, or lacks a string lens, location or claim,
 // is dropped and counted rather than hashed from empty strings (AC-QA-10).
@@ -1827,10 +1837,13 @@ function payloadLensVerdicts(verdicts) {
 }
 function payloadAcVerdicts(verdicts) {
   return verdicts.map(v => {
-    const acId = payloadAcId(v && v.ac_id)
-    // An explicit or implied null ac_id is as suspect as a malformed one: a
-    // verdict always concerns a criterion. The writer counts it the same way.
-    if (!v || v.ac_id === null || v.ac_id === undefined) payloadDrops.ac_ids += 1
+    // The one counting site for a neutralised ac_verdict (fix round 2, C): an
+    // absent, null or non-conforming ac_id, or a verdict outside the enum, is
+    // nulled and counted here, once. The log line and the payload counters read
+    // payloadDrops, and the writer does not count these nulls again on a payload
+    // that carries finding_entries.
+    const acId = payloadAcId(v && v.ac_id, false)
+    if (acId === null) payloadDrops.ac_ids += 1
     const verdict = v && PAYLOAD_VERDICTS.includes(v.verdict) ? v.verdict : null
     if (verdict === null) payloadDrops.record_values += 1
     return { ac_id: acId, verdict }
@@ -1922,7 +1935,9 @@ const telemetry = {
 // original descriptors; labels are resolved or nulled here, and every
 // neutralisation is counted in the existing counters. ledger-append.mjs
 // reconciles the fixed confirmations against the verified prior ids and
-// truncates at MAX_FINDINGS; neither is repeated here (AC-ARCH-8, AC-ARCH-9).
+// truncates the row at MAX_FINDINGS; neither is repeated here. This script caps
+// only the written dispositions (open, rejected, spec_bug) and never cuts
+// verified prior ids or fixed confirmations (AC-ARCH-8, AC-ARCH-9 as amended).
 // A list the synthesis returned as something other than an array is a counted
 // drop (AC-QA-10); null or absent is not malformed.
 payloadDrops.record_values += malformedListCount
@@ -1948,12 +1963,13 @@ const payloadAcVerdictList = payloadAcVerdicts(acVerdicts)
   ].filter(([n]) => n > 0)
   if (drops.length) log(`Run ${startRunId || 'unknown'}: ${drops.map(([n, name, why]) => `${name}=${n} (${why})`).join('; ')}`)
 }
-const cappedFindingCount = [specBugPairs, rejectedPairs, openPairs, fixedPairs].reduce((n, pairs) => n + Math.max(0, pairs.length - PAYLOAD_MAX_FINDINGS), 0)
+const cappedFindingCount = [specBugPairs, rejectedPairs, openPairs].reduce((n, pairs) => n + Math.max(0, pairs.length - PAYLOAD_MAX_FINDINGS), 0)
 const terminalEntry = {
   kind: 'review_cycle',
   finding_entries: [
-    ...[specBugPairs, rejectedPairs, openPairs, fixedPairs].flatMap(pairs => pairs.slice(0, PAYLOAD_MAX_FINDINGS).map(pair => pair.entry)),
-    ...(priorVerified ? priorVerified.entries.slice(0, PAYLOAD_MAX_FINDINGS) : []),
+    ...[specBugPairs, rejectedPairs, openPairs].flatMap(pairs => pairs.slice(0, PAYLOAD_MAX_FINDINGS).map(pair => pair.entry)),
+    ...fixedPairs.map(pair => pair.entry),
+    ...(priorVerified ? priorVerified.entries : []),
   ],
   // Entries cut by the cap above, handed to the writer so findings_truncated
   // still counts every finding the run produced, as it did before the cap.
@@ -1963,10 +1979,10 @@ const terminalEntry = {
   invalid_ac_ids_dropped: payloadDrops.ac_ids,
   invalid_finding_fields_dropped: payloadDrops.finding_fields,
   invalid_record_values_dropped: payloadDrops.record_values,
-  // Baselines, not counts: a number here tells the writer that fixed_findings
-  // was supplied this round, so it reports its own reconciliation drops
-  // against a real 0 rather than null.
-  ...(fixedFindingsRaw ? { invalid_fixed_ids_dropped: 0, duplicate_fixed_ids_dropped: 0 } : {}),
+  // Tells the writer that fixed_findings was supplied this round (possibly
+  // empty), so it reports its own reconciliation drops against a real 0 rather
+  // than null. A flag, not a count: the counts are the writer's alone.
+  ...(fixedFindingsRaw ? { fixed_findings_supplied: true } : {}),
   ...(priorVerified ? { invalid_prior_ids_dropped: priorVerified.invalid } : {}),
 }
 if (startRunId && PAYLOAD_RUN_ID_RE.test(startRunId)) terminalEntry.run_id = startRunId

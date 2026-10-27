@@ -98,10 +98,12 @@ test('T4 round: absent writes null on the WRITTEN line for both rows, never 0 an
   }
 })
 
-test('T4 round: the workflow does not validate; hostile values reach the writer verbatim for the schema to neutralise', async () => {
+// HARN-OPT-6 fix round 2 (G) reverses the original T4 behaviour: caller text no longer reaches the payload as a round.
+test('T4 round: only a positive integer reaches the payload; anything else is dropped and counted once', async () => {
   for (const bad of ['2; rm -rf', -1, 1.5, '2', 0]) {
     const { terminal } = await review({ round: bad })
-    assert.deepStrictEqual(terminal.round, bad, `value ${JSON.stringify(bad)}`)
+    assert.ok(!('round' in terminal), `value ${JSON.stringify(bad)}`)
+    assert.equal(terminal.invalid_record_values_dropped, 1, `value ${JSON.stringify(bad)}`)
   }
 })
 

@@ -10,7 +10,7 @@ const { createHash } = require('node:crypto')
 const { execFileSync, spawnSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
-const { extractLedgerPayload, extractEncodedPayload } = require('./helpers/extract-ledger-payload.js')
+const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
 const { findingId: oracleId } = require('./helpers/finding-entries.js')
 const { sanitizedGitEnv } = require('./helpers/git-env.js')
 const { makeTempRepo, runAppend, readLedgerLines, cleanupTempRepos, SUITE_TMPDIR } = require('./helpers/temp-repo.js')
@@ -92,9 +92,6 @@ function problemSection() {
   assert.ok(start >= 0 && end > start, 'could not find the Problem section')
   return spec.slice(start, end)
 }
-const WRITER_URL = pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'ledger-append.mjs')).href
-const wide = (tag, i) => `${tag}${i}-` + 'あ\u{1F389}é'.repeat(700) // 2000+ UTF-16 units, 3-, 4- and 2-byte UTF-8
-const trim2000 = (s) => s.slice(0, 2000).replace(/[\uD800-\uDBFF]$/, '')
 
 test('AC-QA-9: the spec records the payload size measurements under a Payload size paragraph in Problem, and states a byte ceiling', () => {
   const problem = problemSection()
@@ -109,36 +106,8 @@ test('AC-QA-9: the spec records the payload size measurements under a Payload si
   assert.ok(!/Payload size/.test(acSection), 'the paragraph belongs in Problem, never under Acceptance criteria')
 })
 
-test('AC-QA-9: with every disposition driven above MAX_FINDINGS, the script sends at most MAX_FINDINGS of each and the base64 payload stays under the ceiling recorded in the spec', async () => {
-  const { MAX_FINDINGS } = await import(WRITER_URL)
-  const m = /ceiling[^0-9\n]*([0-9][0-9,]*)\s*bytes/i.exec(problemSection())
-  assert.ok(m, 'no ceiling recorded in the spec (see the previous test)')
-  const ceiling = Number(m[1].replace(/,/g, ''))
-  const over = MAX_FINDINGS + 15
-  const priors = Array.from({ length: over }, (_, i) => ({ lens: ALL_LENSES[i % 7], location: trim2000(wide('p', i)), claim: trim2000(wide('pc', i)), severity: 'High', ac_id: `AC-SEC-${i + 1}` })).map(withId)
-  const compound = (i) => `${ALL_LENSES[i % 7]} + ${ALL_LENSES[(i + 1) % 7]} + ${ALL_LENSES[(i + 2) % 7]}`
-  const desc = (tag, i, lens) => ({ lens, location: trim2000(wide(`${tag}l`, i)), claim: trim2000(wide(`${tag}c`, i)), severity: 'Critical', ac_id: `AC-QA-${i + 1}` })
-  const sevenAcVerdicts = (n) => Array.from({ length: 96 }, (_, i) => ({ id: `AC-${['SEC', 'QA', 'DATA', 'OPS', 'ARCH', 'SIMP', 'PROD'][n]}-${i + 1}`, verdict: 'PASS', evidence: wide('ev', i) })).filter((_, i) => i % 7 === n)
-  const lensOverrides = Object.fromEntries(ALL_LENSES.slice(0, 7).map((l, n) => [l, { ...CLEAN, __bypassSchemaValidation: true, ac_verdicts: sevenAcVerdicts(n) }]))
-  const { terminal, calls, result } = await review({ spec: 'specs/example.md', lenses: ALL_LENSES.slice(0, 7), prior_findings: priors }, {
-    ...lensOverrides,
-    'lens-security': { ...lensOverrides['lens-security'], verdict: 'FINDINGS', findings: Array.from({ length: over }, (_, i) => lensFinding(trim2000(wide('oc', i)), trim2000(wide('ol', i)), { ac_id: `AC-SEC-${i + 1}` })) },
-    synthesis: {
-      report: '### VERDICT\nFINDINGS',
-      spec_bugs: Array.from({ length: over }, (_, i) => desc('s', i, compound(i))),
-      rejected_findings: Array.from({ length: over }, (_, i) => desc('r', i, compound(i + 3))),
-      fixed_findings: priors.map(confirm),
-    },
-  })
-  assert.ok(result && terminal, 'the run must reach a terminal write')
-  const by = (d) => terminal.finding_entries.filter((e) => e.disposition === d).length
-  for (const d of ['open', 'rejected', 'spec_bug', 'prior', 'fixed']) assert.equal(by(d), MAX_FINDINGS, `${d} entries must be capped at MAX_FINDINGS (${MAX_FINDINGS}) in the script, got ${by(d)}`)
-  assert.ok(terminal.ac_verdicts.length >= 90, `expected about 96 ac_verdicts, got ${terminal.ac_verdicts.length}`)
-  const call = calls.filter((c) => c.opts.label === 'ledger:write').pop()
-  const bytes = Buffer.byteLength(extractEncodedPayload(call.prompt))
-  assert.ok(bytes < ceiling, `the largest terminal payload is ${bytes} base64 bytes, over the spec's ceiling of ${ceiling}`)
-  assert.ok(ceiling < 4 * bytes + 4096, `the ceiling ${ceiling} is not derived from the measured largest payload (${bytes} bytes): it is more than 4x it`)
-})
+// The payload-size measurement itself (the largest payload of conforming values) lives in test/harn-opt-6-r2.test.js, rebuilt
+// at fix round 2 after the owner's amendment of AC-QA-9 (verified prior ids are never capped).
 
 // ---- AC-SEC-2: round_key and lens_checkout_drift values are in the closed allowlist, enforced in the script ----
 const SHA_ALLOW = /^[0-9a-f]{7,64}$/
