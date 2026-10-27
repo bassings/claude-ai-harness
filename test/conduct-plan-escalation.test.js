@@ -71,6 +71,17 @@ test('breaker: the old direct-to-block wording is gone for three fix rounds and 
   const b = flat(breaker())
   const intro = b.slice(0, b.search(/three fix rounds/i))
   assert.doesNotMatch(intro, /Stop and record the block \(step 5\)/, 'no direct stop-and-block as the first action at three fix rounds')
+  // Conductor (implementer's own caveat): a reworded direct-to-block phrase INSIDE the three-rounds bullet survived
+  // the two pins above, so the bullet's order is pinned: its first mention of the escalation round comes before its
+  // first mention of the block note, which is what AC-OPS-16 means by "the escalation round precedes any block".
+  const threeStart = b.search(/three fix rounds on one task/i)
+  const threeEnd = b.search(/the first time a review round finds/i)
+  assert.ok(threeStart >= 0 && threeEnd > threeStart, 'sanity: the three-rounds bullet is located')
+  const bullet = b.slice(threeStart, threeEnd)
+  const esc = bullet.search(/escalation round/i)
+  const block = bullet.search(/block( note)?|stop and record/i)
+  assert.ok(esc >= 0, 'the three-rounds bullet names the escalation round')
+  assert.ok(block < 0 || esc < block, 'in the three-rounds bullet the escalation round is named before any block')
   assert.doesNotMatch(b, /Stop and record the block \(step 5\) with the frame question, rather than iterating, at whichever/)
   const reg = b.slice(b.search(/first (self-inflicted regression|time a review round)/i))
   assert.match(reg, /record the block \(step 5\)|straight to the block note/i)
