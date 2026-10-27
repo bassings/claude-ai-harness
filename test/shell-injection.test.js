@@ -17,7 +17,8 @@ const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload, extractEncodedPayload } = require('./helpers/extract-ledger-payload.js')
-const { instructedCommands, runSh, actAsCompliantAgent, backtickSpans } = require('./helpers/ledger-agent.js')
+const { spawnSync } = require('node:child_process')
+const { instructedCommands, actAsCompliantAgent, backtickSpans } = require('./helpers/ledger-agent.js')
 const { START_DELIMITER, END_DELIMITER } = require('./helpers/extract-ledger-payload.js')
 const { makeTempRepo, cleanupTempRepos, readLedgerLines, APPEND_SCRIPT, SUITE_TMPDIR, sanitizedGitEnv } = require('./helpers/temp-repo.js')
 
@@ -219,7 +220,8 @@ test('mutation: an instructed command that interpolates the payload inline is de
   const encoded = extractEncodedPayload(prompt)
   const inline = `printf '%s' '${payload.task}' | node "$HARN_APPEND_SCRIPT"`
   assert.equal(commandCarriesPayload(inline, encoded, [`';touch`, markerName]), true, 'the detector must flag an inline-interpolated command')
-  runSh(inline, { cwd: repo, env: { ...sanitizedGitEnv(), HARN_APPEND_SCRIPT: APPEND_SCRIPT } })
+  // Deliberately executes prompt-derived text: proving the inline form is injectable is this test's whole point.
+  spawnSync('/bin/sh', ['-c', inline], { cwd: repo, env: { ...sanitizedGitEnv(), HARN_APPEND_SCRIPT: APPEND_SCRIPT }, encoding: 'utf8' })
   assert.equal(fs.existsSync(marker), true, 'sanity: the inline form really is injectable, so the file-fed form is a real fix')
   fs.rmSync(marker, { force: true })
 })
