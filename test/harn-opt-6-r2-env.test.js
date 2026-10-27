@@ -15,7 +15,9 @@ const FILES = ['harn-opt-6-t1.test.js', 'harn-opt-6-gap.test.js', 'review-cycle-
 test('I: the HARN-OPT-6 test files pass with HARNESS_LEDGER_READONLY=1 in the invoking environment', () => {
   // NODE_TEST_CONTEXT is how the outer runner marks its children; left in place, the inner `node --test` runs nothing.
   const { NODE_TEST_CONTEXT, ...inherited } = process.env
-  const res = spawnSync(process.execPath, ['--test', ...FILES], {
+  // The reporter is pinned: Node 22 defaults to TAP when stdout is not a terminal, and the parsing below reads the
+  // spec reporter's ✖ and ℹ lines, so without the flag this check reads nothing on Node 22.
+  const res = spawnSync(process.execPath, ['--test', '--test-reporter=spec', ...FILES], {
     cwd: path.join(__dirname, '..'),
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
