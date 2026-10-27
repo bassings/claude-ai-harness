@@ -85,6 +85,13 @@ test('breaker: the old direct-to-block wording is gone for three fix rounds and 
   const b = flat(breaker())
   const intro = b.slice(0, b.search(/three fix rounds/i))
   assert.doesNotMatch(intro, /Stop and record the block \(step 5\)/, 'no direct stop-and-block as the first action at three fix rounds')
+  // Round 2 L2 (M3, M4): the intro sentence is pinned verbatim, and in the three-rounds bullet nothing before the
+  // escalation sentence mentions a note, the owner or stopping.
+  assert.match(intro, /count\.\*\* There are two triggers, and they do not behave alike:\s*-?\s*\**\s*$/)
+  const bulletStart = b.search(/three fix rounds on one task/i)
+  const escAt = b.indexOf('escalation round', bulletStart)
+  const preEscalation = b.slice(bulletStart, escAt)
+  assert.doesNotMatch(preEscalation, /\bnote\b|\bowner\b|\bstop\b|\bask\b/i, 'nothing before the escalation sentence stops, writes a note or asks the owner')
   // Conductor (implementer's own caveat): a reworded direct-to-block phrase INSIDE the three-rounds bullet survived
   // the two pins above, so the bullet's order is pinned: its first mention of the escalation round comes before its
   // first mention of the block note, which is what AC-OPS-16 means by "the escalation round precedes any block".
@@ -111,6 +118,30 @@ test('breaker: the Conductor log line for an escalation round records the four A
   assert.match(logSentence, /exact `model` token passed to \/tdd-task/)
   assert.match(logSentence, /tdd-task verdict/)
   assert.match(logSentence, /review verdict and round/i)
+  // Round 2 M2 and L5: the line is the durable state (branch or worktree, run id) and records the model the runtime
+  // reported, so a restarted session reconciles from the log and a same-tier "escalation" is visible.
+  assert.match(logSentence, /model the runtime reported for the escalation implementer/i)
+  assert.match(logSentence, /escalation branch or worktree path and the tdd-task run id/i)
+  assert.match(b, /durable state a later wake reconciles from/i)
+})
+
+// Round 2 M2: the clean path is explicit (fast-forward, awaiting-ci, merge only on green), never a bare "merge as usual".
+test('breaker: a clean escalation round fast-forwards the PR branch, returns to awaiting-ci and merges only on green CI', () => {
+  const b = flat(breaker())
+  assert.match(b, /fast-forward the PR branch to the escalation tip \(a plain push, never a force-push\)/i)
+  assert.match(b, /return the task to `awaiting-ci`, and merge only on green CI/i)
+})
+
+// Round 2 M1: a refused token is a failed dispatch that names the token; "no stronger tier" is only the strongest-default case.
+test('escalation token: a refused token is reported as a failed dispatch naming the token, never as no stronger tier', () => {
+  const s = flat(skill())
+  assert.match(s, /If the runtime refuses the token, that is a failed dispatch, not a missing tier/i)
+  assert.match(s, /escalation failed to dispatch: runtime refused model `<token>`/)
+  const refusal = s.slice(s.indexOf('If the runtime refuses the token'), s.indexOf("step 5 d's failed-to-dispatch rule applies") + 40)
+  assert.doesNotMatch(refusal, /no stronger tier/i, 'the refusal sentence never says no stronger tier')
+  assert.doesNotMatch(s, /or the runtime refuses the token, the round is skipped/i)
+  // Round 2 L5: "the default" is the model the previous round's transcript reports, never a pin read off a file.
+  assert.match(s, /"The default" is the model the previous round's implementer transcript reports/i)
 })
 
 // Review round 1 M3 (AC-DATA-20): the escalation keeps the round-3 state, and the block note records the tip.
@@ -140,6 +171,11 @@ test('block-note template: escalation fields, failed/ABORTED wording, and the AC
   assert.match(t, /failed to dispatch or ABORTED[^.]*says so|escalation (round )?(itself )?(failed to dispatch|ABORTED)/)
   assert.match(t, /outcome codes, round counts and blocked_reason only/i)
   assert.match(t, /never verbatim verifier evidence or (a )?test_defect/i)
+  // Round 2 M2: the note names the escalation branch beside the pre-escalation SHA.
+  assert.match(t, /pre-escalation PR tip SHA[^.]*escalation branch or worktree path/i)
+  // Round 2 L2 (M6): no sentence anywhere in step 5 asks for verifier output in any wording, except the ban itself.
+  const withoutBan = t.replace(/never verbatim verifier evidence or (a )?test_defect reason/i, '')
+  assert.doesNotMatch(withoutBan, /(quote|paste|include|copy)[^.]*(verifier|evidence|output|test_defect)/i, 'step 5 never asks for verifier output')
   // Review round 1 L2 (M7): no sentence anywhere in step 5 asks for verbatim evidence; the only "verbatim" is the ban.
   const mentions = t.match(/verbatim/gi) || []
   assert.equal(mentions.length, 1, 'the word verbatim appears once in step 5, in the ban')
@@ -165,6 +201,13 @@ test('step 5: human_wait_started and human_wait_ended are numbered (lettered) su
   const s = flat(skill())
   const done = s.slice(s.indexOf('6. **Done?**'))
   assert.match(done, /blocked-on-human[^.]*appending `human_wait_ended`/i, 'step 6 pairs the start of a leftover note it deletes')
+  // Round 2 L1 (AC-OPS-9): the end is keyed by the task id of the start it closes, and written at most once per block.
+  assert.match(done, /under the task id of the log entry that recorded that block's `human_wait_started`/i)
+  assert.match(done, /only if no end was written for it/i)
+  assert.match(flat(ended), /task id of the log entry that recorded that block's `human_wait_started`/i)
+  assert.match(flat(ended), /only when no end has been written for that block/i)
+  // Round 2 L4: a refused or stopped event write is recorded in the tick's log entry.
+  assert.match(s, /Check the writer's response every time: on `write_ok: false`, or a call that was stopped before it ran, record `<event> not written: <write_error>`/i)
   const step3 = s.slice(s.indexOf('Also log task-level state transitions'), s.indexOf('`<plan file>` must be repo-relative'))
   assert.match(step3, /block entry and exit \(step 5 e and f, and step 6/i, 'step 3 defers to the numbered sub-steps rather than its own entry/exit wording')
 })
@@ -178,4 +221,15 @@ test('docs/claude-md-section-2-replacement.md exists with the escalation row, no
   assert.match(d, /by hand/i)
   assert.doesNotMatch(d, /\|\s*4 to 5\s*\|/)
   assert.match(d, /\|\s*1 to 3\s*\|/)
+  // Round 2 L3: the hand-applied mirror's token pairs equal the skill's, each escalating to a different model, and
+  // the mirror states the trigger rule and the single-round rule.
+  const pairs = (text) => Object.fromEntries([...flat(text).matchAll(/default `([a-z0-9.-]+)` escalates to `([a-z0-9.-]+)`/gi)].map((m) => [m[1], m[2]]))
+  const inSkill = pairs(skill())
+  const inDoc = pairs(d)
+  assert.deepEqual(inDoc, inSkill, 'the mirror text carries the same escalation pairs as the skill')
+  assert.ok(Object.keys(inSkill).length >= 2)
+  for (const [from, to] of Object.entries(inSkill)) assert.notEqual(from, to, `${from} must escalate to a different model`)
+  assert.match(d, /three-fix-rounds trigger\s+only/i)
+  assert.match(d, /never a second escalation round/i)
+  assert.match(d, /failed dispatch and the note names the token/i)
 })
