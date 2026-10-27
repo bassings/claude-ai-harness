@@ -13,7 +13,7 @@
 Every plan-cycle, review-cycle and tdd-task run appends a started row and a
 terminal row to `.claude/harness-ledger.jsonl` by having a workflow agent
 write a base64 payload to a temp file (Write tool) and pipe it to
-`workflows/lib/ledger-append.mjs` (HARN-OPT-5 T5). HARN-OPT-5's AC-OPS-13
+`workflows/lib/ledger-append.mjs` (HARN-OPT-5 T5). HARN-OPT-5's ledger-write criterion (its operability criterion 13)
 measured that transport live: of twelve writes, four were stopped by the
 runtime's safety classifier before the writer ran. All four were review-cycle
 runs, and the stopped payloads were the ones carrying lens text: the terminal
@@ -51,9 +51,9 @@ workflow scripts have no `node:crypto`), so the descriptors never travel.
 
 | What goes | Owning lens | Removal criterion |
 |---|---|---|
-| Raw finding descriptors (`lens`, `location`, `claim`) in review-cycle's terminal ledger payload | security | AC-SEC-<n> |
-| ledger-append.mjs hashing descriptors it receives from a payload, for review_cycle rows | data | AC-DATA-<n> |
-| Conductor hand-written replacement rows for classifier-stopped review writes, as a routine step | operability | AC-OPS-<n> |
+| Raw finding descriptors (`lens`, `location`, `claim`) in review-cycle's terminal ledger payload | security | (criterion id set by plan-cycle) |
+| ledger-append.mjs hashing descriptors it receives from a payload, for review_cycle rows | data | (criterion id set by plan-cycle) |
+| Conductor hand-written replacement rows for classifier-stopped review writes, as a routine step | operability | (criterion id set by plan-cycle) |
 
 ---
 
