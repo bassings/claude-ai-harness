@@ -431,12 +431,14 @@ test('git-env: GIT_CONFIG_PARAMETERS cannot inject config into a fixture -- git 
 // the lock come or go. Every fixture builder switches that housekeeping off.
 const { hermeticRepoConfig, HERMETIC_REPO_CONFIG } = require('./helpers/git-env.js')
 const { execFileSync } = require('node:child_process')
-const os = require('node:os')
-const { makeHostileRepo } = (() => { try { return require('./helpers/hostile-repo.js') } catch { return {} } })()
+// Review finding 1 (Medium): the first form of this test imported a name hostile-repo.js does not export, inside a
+// try/catch and behind a typeof guard, so the hostile fixtures were silently never checked (CLAUDE.md §11, the
+// conditional-body shape). Every builder is imported by its real name, with no guard, and pushed unconditionally.
+const { makeHostileTempRepo, makeHomeLikeHostileTempRepo, makeSpacyTempRepo, makeSymlinkAncestorTempRepo } = require('./helpers/hostile-repo.js')
 
 test('fixture repos never run background git maintenance: gc.auto is 0 and maintenance.auto is false in every helper-made repo', () => {
-  const repos = [makeTempRepo()]
-  if (typeof makeHostileRepo === 'function') repos.push(makeHostileRepo())
+  const repos = [makeTempRepo(), makeHostileTempRepo(), makeHomeLikeHostileTempRepo().repo, makeSpacyTempRepo(), makeSymlinkAncestorTempRepo().repo]
+  assert.equal(repos.length, 5)
   assert.deepEqual(HERMETIC_REPO_CONFIG, [['gc.auto', '0'], ['maintenance.auto', 'false']])
   for (const repo of repos) {
     for (const [key, value] of HERMETIC_REPO_CONFIG) {
@@ -446,7 +448,8 @@ test('fixture repos never run background git maintenance: gc.auto is 0 and maint
 })
 
 test('hermeticRepoConfig applies the same two settings through a caller-supplied runner (the install-consistency fixture shape)', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermetic-'))
+  const dir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'hermetic-'))  // review finding 4: under the suite's tracked temp root, not the system one
+  trackTempDir(dir)
   execFileSync('git', ['init', '-q', dir])
   const seen = []
   hermeticRepoConfig(dir, (args) => { seen.push(args.join(' ')); execFileSync('git', ['-C', dir, ...args]) })

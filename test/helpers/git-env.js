@@ -107,7 +107,12 @@ function scrubGitEnv() {
 // touches either directory"; the command under test runs only `git ls-files`).
 // CLAUDE.md §11 calls this shape "racing the thing it watches". The settings
 // are per-repo config, not environment, because GIT_CONFIG_* is deliberately
-// scrubbed above. Every fixture builder that runs `git init` calls this.
+// scrubbed above. Called by the three shared fixture builders: makeTempRepo
+// (temp-repo.js), initGitRepo (hostile-repo.js) and install-consistency's
+// gitInitAndCommit. Ad-hoc `git init` sites elsewhere under test/ are NOT
+// covered (review finding 3, 2026-10-27); none of them lists its own .git
+// today, and routing them through here, or a static guard that flags a
+// `git init` under test/ with no hermeticRepoConfig, is on the follow-up list.
 const HERMETIC_REPO_CONFIG = [
   ['gc.auto', '0'],
   ['maintenance.auto', 'false'],
