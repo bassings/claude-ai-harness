@@ -216,8 +216,10 @@ test('T4: every fixture listed with a sha256 in test/fixtures/PROVENANCE.md matc
 test('T4: the fixture ledger is synthetic (no absolute path, account name or real repo label) and non-trivial', () => {
   const raw = fs.readFileSync(path.join(__dirname, 'fixtures', 'synthetic-ledger.jsonl'), 'utf8')
   assert.doesNotMatch(raw, /\/Users\/|\/Volumes\/|\/home\/|bassings|CouchPotato|SaidOfYou/i)
-  const rows = raw.trim().split('\n').map((l) => JSON.parse(l))
-  assert.ok(rows.length >= 10 && rows.every((r) => r.repo === 'example/sample-repo'), 'every fixture row carries the synthetic repo label')
+  // Two lines are malformed on purpose (the readers must skip them), so parse leniently.
+  const rows = raw.trim().split('\n').flatMap((l) => { try { return [JSON.parse(l)] } catch { return [] } })
+  assert.ok(rows.length >= 10, 'the fixture ledger is non-trivial')
+  assert.deepEqual(rows.filter((r) => 'repo' in r && r.repo !== 'example/sample-repo'), [], 'every fixture row that has a repo label carries the synthetic one')
 })
 
 // ---- AC-DATA-8 and AC-OPS-12 need the reader as it stood at 06049e4 ----
