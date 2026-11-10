@@ -14,7 +14,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
-const { execFileSync, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload, extractEncodedPayload } = require('./helpers/extract-ledger-payload.js')
@@ -27,17 +27,11 @@ const WF = path.join(ROOT, 'workflows', 'review-cycle.js')
 const WRITER_FILE = path.join(ROOT, 'workflows', 'lib', 'ledger-append.mjs')
 const WRITER_URL = pathToFileURL(WRITER_FILE).href
 const SPEC = path.join(ROOT, 'specs', 'harn-opt-6.md')
-const OLD = '06049e4'
 
 test.after(cleanupTempRepos)
 
-function gitShow(rel) {
-  return execFileSync('git', ['show', `${OLD}:${rel}`], { cwd: ROOT, encoding: 'utf8', env: sanitizedGitEnv(), maxBuffer: 64 * 1024 * 1024 })
-}
-const OLD_DIR = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'old-r2-'))
-fs.mkdirSync(path.join(OLD_DIR, 'lib'))
-fs.writeFileSync(path.join(OLD_DIR, 'lib', 'ledger-append.mjs'), gitShow('workflows/lib/ledger-append.mjs'))
-fs.writeFileSync(path.join(OLD_DIR, 'review-cycle.js'), gitShow('workflows/review-cycle.js'))
+// The 06049e4 writer and review-cycle.js are vendored byte-for-byte (see test/fixtures/PROVENANCE.md).
+const OLD_DIR = path.join(__dirname, 'fixtures', 'writer-06049e4')
 const OLD_WRITER = path.join(OLD_DIR, 'lib', 'ledger-append.mjs')
 const OLD_WF = path.join(OLD_DIR, 'review-cycle.js')
 const lastJson = (stdout) => JSON.parse(stdout.trim().split('\n').pop())

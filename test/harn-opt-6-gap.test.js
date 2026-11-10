@@ -1,12 +1,12 @@
 // HARN-OPT-6 T1 gap round (specs/harn-opt-6.md): AC-QA-9, AC-SEC-2 (round_key and lens_checkout_drift),
 // AC-OPS-6, AC-DATA-8 and AC-OPS-12. The AC-OPS-4 strengthening lives in test/harn-opt-6-t1.test.js.
-// The 06049e4 reader, writer and review-cycle.js are read from git into a temp directory, never from the working tree.
+// The 06049e4 reader, writer and review-cycle.js come from the vendored copies in test/fixtures/writer-06049e4/ (provenance and
+// sha256 in test/fixtures/PROVENANCE.md), never from git history or from the working tree.
 require('./helpers/git-env.js').scrubGitEnv()
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
-const { createHash } = require('node:crypto')
 const { execFileSync, spawnSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
@@ -24,29 +24,11 @@ function liveLedgerPath(cwd) {
   const commonDir = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd, encoding: 'utf8', env: sanitizedGitEnv() }).trim()
   return path.join(path.dirname(commonDir), '.claude', 'harness-ledger.jsonl')
 }
-const LIVE_LEDGER = liveLedgerPath(ROOT)
 const OLD = '06049e4'
 
 test.after(cleanupTempRepos)
 
-// ---- the live ledger must be untouched by this whole file (AC-DATA-8) ----
-const ledgerStamp = () => (fs.existsSync(LIVE_LEDGER) ? { size: fs.statSync(LIVE_LEDGER).size, sha: createHash('sha256').update(fs.readFileSync(LIVE_LEDGER)).digest('hex') } : null)
-const LEDGER_BEFORE = ledgerStamp()
-const LIVE_COPY = LEDGER_BEFORE ? fs.readFileSync(LIVE_LEDGER, 'utf8') : null
-test.after(() => {
-  assert.deepEqual(ledgerStamp(), LEDGER_BEFORE, 'the live ledger changed size or sha256 during this test file')
-})
-
-function gitShow(rel) {
-  return execFileSync('git', ['show', `${OLD}:${rel}`], { cwd: ROOT, encoding: 'utf8', env: sanitizedGitEnv(), maxBuffer: 64 * 1024 * 1024 })
-}
-const OLD_DIR = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'old-06049e4-'))
-fs.mkdirSync(path.join(OLD_DIR, 'lib'))
-fs.writeFileSync(path.join(OLD_DIR, 'lib', 'ledger-append.mjs'), gitShow('workflows/lib/ledger-append.mjs'))
-fs.writeFileSync(path.join(OLD_DIR, 'lib', 'optimise-read.mjs'), gitShow('workflows/lib/optimise-read.mjs'))
-fs.writeFileSync(path.join(OLD_DIR, 'review-cycle.js'), gitShow('workflows/review-cycle.js'))
-fs.writeFileSync(path.join(OLD_DIR, 'plan-cycle.js'), gitShow('workflows/plan-cycle.js'))
-fs.writeFileSync(path.join(OLD_DIR, 'tdd-task.js'), gitShow('workflows/tdd-task.js'))
+const OLD_DIR = path.join(__dirname, 'fixtures', 'writer-06049e4')
 const OLD_WRITER = path.join(OLD_DIR, 'lib', 'ledger-append.mjs')
 const OLD_WF = path.join(OLD_DIR, 'review-cycle.js')
 const runOldWriter = (repo, payload) => JSON.parse(spawnSync('node', [OLD_WRITER], { cwd: repo, input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv() }).stdout.trim().split('\n').pop())
@@ -217,6 +199,25 @@ test('C: no test file joins the checkout root to .claude/harness-ledger.jsonl di
   assert.deepEqual(offenders, [], 'resolve the live ledger through git --git-common-dir, as the writer does')
 })
 
+// HARN-AUDIT-1 T4 (AC-QA-9, AC-SEC-16): the suite reads no repository history and no live ledger. The vendored files must stay
+// byte-identical to the blobs they replaced, and the fixture ledger must stay synthetic.
+test('T4: vendored 06049e4 fixtures match the sha256 values recorded in test/fixtures/PROVENANCE.md', () => {
+  const { createHash } = require('node:crypto')
+  const fixtures = path.join(__dirname, 'fixtures')
+  const recorded = [...fs.readFileSync(path.join(fixtures, 'PROVENANCE.md'), 'utf8').matchAll(/^([0-9a-f]{64})\s+(writer-06049e4\/\S+)/gm)]
+  assert.equal(recorded.length, 5, 'PROVENANCE.md must record the sha256 of all five vendored files')
+  for (const [, sha, rel] of recorded) {
+    assert.equal(createHash('sha256').update(fs.readFileSync(path.join(fixtures, rel))).digest('hex'), sha, `${rel} is not byte-identical to the blob it was vendored from`)
+  }
+})
+
+test('T4: the fixture ledger is synthetic (no absolute path, account name or real repo label) and non-trivial', () => {
+  const raw = fs.readFileSync(path.join(__dirname, 'fixtures', 'synthetic-ledger.jsonl'), 'utf8')
+  assert.doesNotMatch(raw, /\/Users\/|\/Volumes\/|\/home\/|bassings|CouchPotato|SaidOfYou/i)
+  const rows = raw.trim().split('\n').map((l) => JSON.parse(l))
+  assert.ok(rows.length >= 10 && rows.every((r) => r.repo === 'example/sample-repo'), 'every fixture row carries the synthetic repo label')
+})
+
 // ---- AC-DATA-8 and AC-OPS-12 need the reader as it stood at 06049e4 ----
 const importFresh = (file) => import(pathToFileURL(file).href)
 const plain = (x) => JSON.stringify(x, (k, v) => (v instanceof Map ? [...v] : v instanceof Set ? [...v] : v))
@@ -254,16 +255,17 @@ test('AC-DATA-8: an open row from the 06049e4 writer and fixed rows from the new
   assert.match(plain(counts), /"fixed":1|\["fixed",1\]/, `expected exactly one fixed (the repeat is a duplicate): ${plain(counts)}`)
 })
 
-test('AC-DATA-8: optimise-read over a copy of the live ledger gives the same rework aggregates as the 06049e4 reader, and the live ledger is not read-modified', { skip: !LIVE_COPY && `UNVERIFIED: no live ledger at ${LIVE_LEDGER} (it is untracked), so the live-copy comparison against the 06049e4 reader did not run` }, async () => {
-  const copyDir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'live-copy-'))
+test('AC-DATA-8: optimise-read over a copy of the synthetic fixture ledger gives the same rework aggregates as the 06049e4 reader, and the reader does not modify the copy', async () => {
+  const copyDir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'ledger-copy-'))
   const copy = path.join(copyDir, 'harness-ledger.jsonl')
-  fs.writeFileSync(copy, LIVE_COPY)
+  const FIXTURE_LEDGER = fs.readFileSync(path.join(__dirname, 'fixtures', 'synthetic-ledger.jsonl'), 'utf8')
+  fs.writeFileSync(copy, FIXTURE_LEDGER)
   const raw = fs.readFileSync(copy, 'utf8')
   const before = plain(rework(await importFresh(path.join(OLD_DIR, 'lib', 'optimise-read.mjs')), raw))
   const after = plain(rework(await importFresh(path.join(ROOT, 'workflows', 'lib', 'optimise-read.mjs')), raw))
   assert.equal(after, before)
-  assert.equal(fs.readFileSync(copy, 'utf8'), LIVE_COPY, 'the reader rewrote a line of the ledger copy')
-  assert.deepEqual(ledgerStamp(), LEDGER_BEFORE, 'the live ledger changed during the test')
+  assert.notEqual(JSON.parse(before).n, 0, 'the fixture ledger must yield review rows, or the equality above compares two empty results')
+  assert.equal(fs.readFileSync(copy, 'utf8'), FIXTURE_LEDGER, 'the reader rewrote a line of the ledger copy')
 })
 
 // ---- AC-OPS-12: rollback ----
