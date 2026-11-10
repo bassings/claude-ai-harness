@@ -28,15 +28,17 @@ import importlib.util
 import json
 import os
 import re
-import statistics
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
 GUARD_PATH = os.path.join(HOOKS_DIR, 'destructive-git-guard.py')
+
+# HARN-AUDIT-1 T1: every subprocess here carries this deadline only so a hung child fails the test with a clear message instead
+# of freezing the suite. It is generous for a loaded two-core runner and asserts nothing about speed.
+HANG_DEADLINE_SECONDS = 60
 CORPUS_PATH = os.path.join(HOOKS_DIR, 'destructive-git-cases.json')
 
 _spec = importlib.util.spec_from_file_location('destructive_git_guard', GUARD_PATH)
@@ -81,7 +83,7 @@ def clean_env():
 def run_git(args, cwd):
     result = subprocess.run(
         ['git'] + args, cwd=cwd, env=clean_env(),
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=HANG_DEADLINE_SECONDS,
     )
     if result.returncode != 0:
         raise RuntimeError('fixture setup failed: git %s (in %s)\nstdout: %s\nstderr: %s'
@@ -813,7 +815,7 @@ class TestLeakedGitDirCannotMakeTheGuardReadAnotherRepo(unittest.TestCase):
         env.update(self._leaked)
         result = subprocess.run(
             [sys.executable, GUARD_PATH],
-            input=payload, capture_output=True, text=True, env=env, timeout=10,
+            input=payload, capture_output=True, text=True, env=env, timeout=HANG_DEADLINE_SECONDS,
         )
         self.assertEqual(
             result.returncode, 2,
@@ -823,15 +825,18 @@ class TestLeakedGitDirCannotMakeTheGuardReadAnotherRepo(unittest.TestCase):
 
 
 class TestHookProcessContract(unittest.TestCase):
-    """AC-QA-7 (timing) plus the exit-code contract, driven as REAL
-    subprocesses of the guard (the actual deployed hook path), not just
-    evaluate() -- proves main()'s JSON-in/exit-code-out dispatch agrees
-    with evaluate()'s own verdict for the same corpus, and measures the
-    real per-invocation wall time against the 57-98ms baseline measured
-    2026-09-19."""
+    """AC-QA-7 plus the exit-code contract, driven as REAL subprocesses of
+    the guard (the actual deployed hook path), not just evaluate() -- proves
+    main()'s JSON-in/exit-code-out dispatch agrees with evaluate()'s own
+    verdict for the same corpus.
 
-    def test_every_case_as_a_process_within_the_time_budget(self):
-        durations = []
+    HARN-AUDIT-1 T1: the per-invocation 1000ms wall-clock assertion (and the
+    1.0s subprocess timeout that enforced it) is gone, because a loaded
+    runner could fail it with nothing wrong. AC-QA-7's cost property is
+    pinned as a count in TestSubprocessCallsPerSegment below; the timeout
+    here only bounds a hang."""
+
+    def test_every_case_as_a_process_agrees_with_evaluate(self):
         tmp = tempfile.mkdtemp(prefix='destructive-git-cases-proc-')
         try:
             for case in CASES:
@@ -843,19 +848,12 @@ class TestHookProcessContract(unittest.TestCase):
                     'cwd': root,
                     'hook_event_name': 'PreToolUse',
                 })
-                start = time.monotonic()
                 result = subprocess.run(
                     [sys.executable, GUARD_PATH],
                     input=payload, capture_output=True, text=True,
-                    env=clean_env(), timeout=1.0,
+                    env=clean_env(), timeout=HANG_DEADLINE_SECONDS,
                 )
-                elapsed_ms = (time.monotonic() - start) * 1000.0
-                durations.append(elapsed_ms)
                 with self.subTest(command=case['command']):
-                    self.assertLess(
-                        elapsed_ms, 1000.0,
-                        '%r took %.1fms, over the 1000ms per-invocation budget (AC-QA-7)'
-                        % (case['command'], elapsed_ms))
                     self.assertIn(result.returncode, (0, 2),
                                   '%r exited %s, must be 0 or 2' % (case['command'], result.returncode))
                     expected_exit = 2 if case['expect'] == 'block' else 0
@@ -867,9 +865,43 @@ class TestHookProcessContract(unittest.TestCase):
                         self.assertTrue(result.stderr.strip(), '%r: refusal must print a reason on stderr' % (case['command'],))
         finally:
             subprocess.run(['rm', '-rf', tmp])
-        if durations:
-            print('\ndestructive-git-cases timing: n=%d max=%.1fms median=%.1fms'
-                  % (len(durations), max(durations), statistics.median(durations)), file=sys.stderr)
+
+
+class TestSubprocessCallsPerSegment(unittest.TestCase):
+    """HARN-AUDIT-1 T1: what the per-invocation 1000ms assertion protected, as a count. The guard's cost is the git
+    subprocesses it starts, and its own budget is MAX_SUBPROCESS_CALLS_PER_SEGMENT per segment (the constant
+    hooks/test_hook_timeout_budget.py pins hooks.json's timeout against). Every case in the corpus is decided in this
+    process with subprocess.run wrapped to count, and the count must stay within that budget for the command's segments.
+    No clock is read."""
+
+    def test_every_case_starts_at_most_the_budgeted_subprocesses_per_segment(self):
+        real_run = guard.subprocess.run
+        tmp = tempfile.mkdtemp(prefix='destructive-git-cases-count-')
+        observed_max = 0
+        try:
+            for case in CASES:
+                root = tempfile.mkdtemp(dir=tmp)
+                apply_setup(root, case['setup'], DECLARED_SETUP_OPS)
+                calls = []
+
+                def counting(*args, **kwargs):
+                    calls.append(args[0] if args else None)
+                    return real_run(*args, **kwargs)
+                guard.subprocess.run = counting
+                try:
+                    guard.evaluate(case['command'], root)
+                finally:
+                    guard.subprocess.run = real_run
+                segments = max(1, len(guard.split_segments(case['command'])))
+                observed_max = max(observed_max, len(calls))
+                with self.subTest(command=case['command']):
+                    self.assertLessEqual(
+                        len(calls), guard.MAX_SUBPROCESS_CALLS_PER_SEGMENT * segments,
+                        '%r started %d subprocesses over %d segment(s), over the budget of %d per segment (AC-QA-7): %r'
+                        % (case['command'], len(calls), segments, guard.MAX_SUBPROCESS_CALLS_PER_SEGMENT, calls))
+        finally:
+            subprocess.run(['rm', '-rf', tmp])
+        self.assertGreater(observed_max, 0, 'sanity: the counter must observe the guard starting git at least once across the corpus')
 
 
 if __name__ == '__main__':
