@@ -226,7 +226,7 @@ test('T6 AC-DATA-4: replacement is a rename from a uniquely named temp file besi
   const original = fs.readFileSync(exclude)
   const a = spawnWriter(repo, 1, { [WINDOW]: '60000' })
   const b = spawnWriter(repo, 2, { [WINDOW]: '60000' })
-  const temps = await waitFor(() => (strayFiles(infoDir).length >= 2 ? strayFiles(infoDir) : null), 15000, 'two temp files beside the exclude target')
+  const temps = await waitFor(() => (strayFiles(infoDir).length >= 2 ? strayFiles(infoDir) : null), 30000, 'two temp files beside the exclude target')
   assert.equal(new Set(temps).size, temps.length, 'temp names are unique per writer')
   assert.ok(fs.readFileSync(exclude).equals(original), 'target untouched while the temp files exist')
   a.child.kill('SIGKILL')
@@ -274,7 +274,7 @@ test('T6 AC-DATA-5: a symlinked exclude stays a symlink to the same target, whic
 
   // Temp placement: while paused, the stray file sits in the target's directory.
   const paused = spawnWriter(repo, 1, { [WINDOW]: '60000' })
-  const temp = await waitFor(() => strayFiles(elsewhere).filter((n) => n !== 'shared-exclude')[0], 15000, 'temp file in the target directory')
+  const temp = await waitFor(() => strayFiles(elsewhere).filter((n) => n !== 'shared-exclude')[0], 30000, 'temp file in the target directory')
   assert.ok(temp)
   assert.deepEqual(strayFiles(path.dirname(exclude)), [], 'no temp file in .git/info when the target lives elsewhere')
   paused.child.kill('SIGKILL')
@@ -524,7 +524,7 @@ test('T6 round 2 F5 AC-DATA-4: an operator line appended while the writer sits i
   const exclude = excludePathOf(repo)
   fs.writeFileSync(exclude, OPERATOR_LINES)
   const w = spawnWriter(repo, 1, { [WINDOW]: '1500' })
-  await waitFor(() => strayFiles(path.dirname(exclude))[0], 15000, 'temp file in .git/info')
+  await waitFor(() => strayFiles(path.dirname(exclude))[0], 30000, 'temp file in .git/info')
   fs.appendFileSync(exclude, '*.added-during-window\n')
   const r = await w.done
   assert.ok(r.out, `no result: ${r.stdout} ${r.stderr}`)

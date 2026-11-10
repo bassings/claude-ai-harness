@@ -222,6 +222,10 @@ test('ledger-append: the path resolves via git rev-parse --git-common-dir, never
 // them can exit, and each is held for 500ms between its fstat and its write by the writer's own test-only window
 // (LEDGER_APPEND_TEST_RACE_WINDOW_MS, the one the short-write race test uses), so all 50 appends are in flight together
 // whether the machine is fast or loaded. That is what makes a torn or interleaved write observable here (AC-DATA-16).
+//
+// This guard is probabilistic, and one green run is not proof of atomicity. Against a writer that splits its one write into
+// two, it failed in 5 of 5 runs on one machine and 7 of 8 on another, about one miss in eight. The deterministic guard for
+// "one append is one write() of the whole line" is the preload-counting test below ("exactly one write() of the whole line").
 test('ledger-append: 50 concurrent writers all land, each parses as JSON, each run_id appears exactly once (AC-DATA-3)', async () => {
   const repo = makeTempRepo()
   const N = 50
@@ -250,6 +254,34 @@ test('ledger-append: 50 concurrent writers all land, each parses as JSON, each r
   const parsed = lines.map((l) => JSON.parse(l))
   const runIds = new Set(parsed.map((e) => e.run_id))
   assert.equal(runIds.size, N, 'every run_id must be unique and present exactly once')
+})
+
+// The 50-writer test above catches a split write only when the interleaving happens to land: measured by mutation, it
+// failed in 5 of 5 runs here and 7 of 8 on the conductor's run, so one green run is not proof of atomicity. This test is
+// the deterministic one (HARN-AUDIT-1 T1, AC-DATA-16). The writer runs with a preload that records each Buffer passed to
+// fs.writeSync, and one append must be exactly one write, holding the whole line and its newline. A mutation that splits
+// the write in two fails here every time, however the processes are scheduled.
+test('ledger-append: one append is exactly one write() of the whole line, counted by a preload, not left to chance (AC-DATA-3, AC-DATA-16)', () => {
+  const { spawnSync } = require('node:child_process')
+  const repo = makeTempRepo()
+  const log = path.join(repo, '..', `write-log-${process.pid}-${Date.now()}.jsonl`)
+  trackTempDir(log)
+  for (let i = 0; i < 2; i++) { // the second append runs against a non-empty ledger, the path that reads the last byte first
+    fs.rmSync(log, { force: true })
+    const res = spawnSync(process.execPath, ['--require', path.join(__dirname, 'helpers', 'count-writes.cjs'), APPEND_SCRIPT], {
+      cwd: repo,
+      encoding: 'utf8',
+      input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: `single-write-${i}` }),
+      env: { ...process.env, WRITE_LOG: log },
+    })
+    assert.equal(JSON.parse(res.stdout.trim().split('\n').pop()).write_ok, true, res.stderr)
+    const writes = fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    assert.equal(writes.length, 1, `append ${i} made ${writes.length} write() calls of a Buffer, expected exactly one: ${JSON.stringify(writes)}`)
+    assert.equal(writes[0].endsWithNewline, true, 'the one write must carry the line and its terminating newline')
+    const lines = readLedgerLines(repo)
+    assert.equal(lines.length, i + 1)
+    assert.equal(writes[0].length, Buffer.byteLength(lines[i], 'utf8') + 1, 'the one write must be the whole line plus its newline')
+  }
 })
 
 test('ledger-append: seeding 100 known lines then writing once leaves the first 100 byte-identical, exactly one added (AC-DATA-2)', () => {
@@ -3954,77 +3986,43 @@ test('ledger-append (AC-SEC-2): a rejected ac_id is still quarantined into ac_id
   assert.equal(entry.invalid_ac_ids_dropped, 1)
 })
 
-test('ledger-append (AC-SEC-4): the pattern is linear -- 1024 adversarial characters evaluate well under 10ms with no super-linear growth', async () => {
+// HARN-AUDIT-1 T1 (AC-QA-1): the two timing tests that stood here (1024 characters under 10ms, and a growth ratio between
+// lengths) are replaced by a property of the pattern itself, which does not depend on a clock. A regular expression can
+// only backtrack super-linearly if some repetition is unbounded: with every quantifier bounded ({m,n} or ?), the work per
+// match is capped by a constant fixed by the pattern, whatever the input length. So the pattern must carry no `*`, no `+`
+// and no `{n,}`. The shape this guards against is a nested quantifier over an optional separator, such as
+// ^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$, which the planning cycle measured doubling per added character.
+function unboundedQuantifiers(source) {
+  const bare = source.replace(/\\./g, 'E').replace(/\[(?:\\.|[^\]\\])*\]/g, 'C') // escapes and character classes hold no quantifier
+  return bare.match(/[*+]|\{\d+,\}/g) || []
+}
+
+test('ledger-append (AC-SEC-4): the AC id pattern has no unbounded quantifier, so its work per match is capped whatever the input length', async () => {
   const re = await acIdPattern()
-  // The shape the planning cycle measured as dangerous, kept here as the
-  // reason this test exists: ^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$ took
-  // 0.51ms at 20 characters, 7.91ms at 24 and 31.67ms at 26 -- doubling per
-  // added character. A nested quantifier over an optional separator is how
-  // this fix could have shipped a denial of service.
-  const timings = []
-  for (const n of [16, 24, 32, 64, 128, 256, 512, 1024]) {
-    const hostile = 'A-'.repeat(Math.ceil(n / 2)).slice(0, n)
-    const t0 = process.hrtime.bigint()
-    for (let i = 0; i < 200; i++) re.test(hostile)
-    timings.push({ n, ms: Number(process.hrtime.bigint() - t0) / 1e6 / 200 })
-  }
-  for (const { n, ms } of timings) {
-    assert.ok(ms < 10, `${n} characters took ${ms.toFixed(3)}ms, over the 10ms bound`)
-  }
-  const worst = Math.max(...timings.map((t) => t.ms))
-  assert.ok(worst < 10, `worst case ${worst.toFixed(3)}ms`)
+  assert.deepEqual(unboundedQuantifiers(re.source), [], `the pattern ${re.source} has an unbounded quantifier`)
+  // The detector sees the shapes it exists to catch, so an empty result above is not a detector that finds nothing.
+  assert.ok(unboundedQuantifiers('^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$').length >= 3)
+  assert.deepEqual(unboundedQuantifiers('^[a-z]{1,40}\\+[ /]?$'), [], 'a bounded quantifier, an escaped plus and a class are not unbounded')
+  assert.deepEqual(unboundedQuantifiers('^[+*]{1,4}x{2,}$'), ['{2,}'], 'a plus inside a class is not counted, an open-ended repeat is')
 })
 
-// M6 (round 2 review): the test above cannot actually catch a nested-
-// quantifier regression. Its hostile input, 'A-'.repeat(n/2), is a CLEAN
-// match for `([A-Za-z0-9]+[-/ ]?)*` at every prefix -- each "A-" chunk is
-// consumed unambiguously (one or more alphanumerics, then exactly the
-// optional separator), so there is nothing for the engine to backtrack
-// over. Measured directly (round-2 report): applying QA's mutation
-// (AC_ID_PATTERN_STR replaced with the nested shape
-// `^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$` the comment above already
-// names) left the existing test green.
-//
-// Catastrophic backtracking needs AMBIGUITY: a run of characters that could
-// be split among repetitions of the outer group in many different ways, with
-// no terminating match to short-circuit the search. A long run of the SAME
-// character with no separator at all (or with a would-be-separator that
-// never lines up with a real boundary), followed by something that breaks
-// the match, is exactly that shape.
-test('ledger-append (AC-SEC-4, M6 round 3): the pattern stays linear against inputs AMBIGUOUS for a nested/optional-separator quantifier, with a growth bound between lengths, not just the original test\'s unambiguous hostile shape', async () => {
+test('ledger-append (AC-SEC-4, M6 round 3): inputs ambiguous for a nested or optional-separator quantifier, and inputs of very different lengths, are all refused, and a real id still matches', async () => {
   const re = await acIdPattern()
+  // Checked first, and fatally: against a pattern with a nested quantifier the hostile inputs below would not fail, they
+  // would run for longer than anyone waits, so they are only run once the shape check has passed.
+  assert.deepEqual(unboundedQuantifiers(re.source), [], 'refusing to run hostile inputs against a pattern with an unbounded quantifier')
   const shapes = [
     (n) => 'A'.repeat(n) + '!',
     (n) => 'a1'.repeat(Math.ceil(n / 2)).slice(0, n) + '!',
     (n) => 'A '.repeat(Math.ceil(n / 2)).slice(0, n) + 'x',
+    (n) => 'A-'.repeat(Math.ceil(n / 2)).slice(0, n),
   ]
-  const lengths = [16, 20, 22, 24, 26, 28]
   for (const shape of shapes) {
-    const timings = []
-    for (const n of lengths) {
-      const hostile = shape(n)
-      const t0 = process.hrtime.bigint()
-      re.test(hostile)
-      const ms = Number(process.hrtime.bigint() - t0) / 1e6
-      timings.push({ n, ms })
-      assert.ok(ms < 10, `${JSON.stringify(hostile)} (length ${n}) took ${ms.toFixed(3)}ms, over the 10ms bound`)
-    }
-    // A growth bound, not just the absolute one above: a genuinely linear
-    // (or low-polynomial) pattern's time barely moves as length grows a
-    // handful of characters at a time. A catastrophic nested quantifier
-    // multiplies by roughly 4x for every two added characters at exactly
-    // these lengths (measured on the mutation named above). Only compared
-    // once a timing clears a noise floor, so sub-millisecond jitter on the
-    // real (fast) pattern can never itself fail this assertion -- the real
-    // pattern's timings at these lengths never approach the floor at all.
-    for (let i = 1; i < timings.length; i++) {
-      const prev = timings[i - 1]
-      const curr = timings[i]
-      if (curr.ms < 0.5) continue
-      const ratio = curr.ms / Math.max(prev.ms, 0.001)
-      assert.ok(ratio < 3, `growth from ${prev.n} to ${curr.n} characters (input ${JSON.stringify(shape(curr.n))}) was ${ratio.toFixed(1)}x (${prev.ms.toFixed(3)}ms -> ${curr.ms.toFixed(3)}ms) -- looks super-linear`)
+    for (const n of [16, 26, 256, 1024, 100000]) {
+      assert.equal(re.test(shape(n)), false, `${JSON.stringify(shape(n).slice(0, 40))} (length ${n}) must not match`)
     }
   }
+  assert.equal(re.test('AC-SEC-4'), true)
 })
 
 // --- specs/harn-ledger-validators.md D3 -----------------------------------

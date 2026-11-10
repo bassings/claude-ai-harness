@@ -1040,54 +1040,56 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combine
   assert.equal(perRepoSum, out.n, 'with no window truncation, perRepo\'s summed counts must equal n exactly -- no starvation, no divergence')
 })
 
-// Round-4 review L8 (AC-QA-20): the AC states a 0.5s wall-clock bound over
-// a 2000-record ledger, but the ONLY thing enforcing it was a structural
-// guard (test/optimise-static.test.js: the per-record loops contain no fs
-// call) -- real, but it proves an O(1)-per-record SHAPE, not a wall-clock
-// NUMBER; an algorithmic regression that stayed fs-free but went quadratic
-// in record count would pass every existing check. This is the timing
-// assertion itself, generous (2s, not 0.5s) so it cannot flake under
-// parallel suite load the way a tight bound would -- both lenses measured
-// one to two orders of magnitude inside 0.5s (3.9-6.6ms via the exported
-// functions, 43-50ms via the real CLI), so 2s leaves ample headroom while
-// still catching a genuine quadratic-blowup regression.
-test('optimise-read CLI: aggregating a real 2000-record ledger through the CLI stays well under a generous 2s wall-clock ceiling, three consecutive runs (L8, AC-QA-20)', () => {
+// Round-4 review L8 (AC-QA-20) asked for a guard against an algorithmic regression that stays free of fs calls (which
+// test/optimise-static.test.js already pins) but goes quadratic in record count. The first version timed the CLI against
+// a wall-clock ceiling (2s, then the median of three runs under 500ms); it failed on loaded and shallow-clone runners at
+// 855ms and 2512ms (HARN-AUDIT-1 T1, AC-QA-1). The property is now a deterministic work count: every record handed to
+// the pipeline's aggregators is a Proxy that counts each property read, and the reads per record must not grow with the
+// number of records. A single pass costs the same reads per record at 500 and at 2000 records (ratio 1); the sort adds a
+// log factor (about 1.2); a nested scan over records would multiply the ratio by the size factor (4).
+const ledgerRecord = (i) => ({
+  schema_version: 2, run_id: `r${i}`, ts: `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+  repo: 'demo', kind: 'review_cycle', outcome: 'done', spec: `specs/${i % 20}.md`, plan_key: `specs/${i % 20}.md`,
+  lenses_run: ['lens-security', 'lens-qa'], lenses_skipped: [],
+  findings: [{ id: `f${i}`, lens: 'lens-qa', severity: 'Low', ac_id: `AC-QA-${(i % 5) + 1}`, disposition: 'open' }],
+  ac_verdicts: [{ ac_id: `AC-QA-${(i % 5) + 1}`, verdict: i % 7 === 0 ? 'FAIL' : 'PASS' }],
+  write_ok: true, write_error: null,
+})
+
+function countedReadsPerRecord(n) {
+  let reads = 0
+  const counting = (target) => new Proxy(target, {
+    get(t, key, receiver) { reads += 1; const v = Reflect.get(t, key, receiver); return v !== null && typeof v === 'object' ? counting(v) : v },
+    has(t, key) { reads += 1; return Reflect.has(t, key) },
+    ownKeys(t) { reads += 1; return Reflect.ownKeys(t) },
+  })
+  const records = Array.from({ length: n }, (_, i) => counting(ledgerRecord(i)))
+  const { windowed } = mod.windowRecords(mod.sortRecordsByTime(records), n)
+  mod.aggregateRework(windowed, { root: '/r' })
+  mod.aggregateWallClock(windowed, { root: '/r' })
+  mod.aggregateBlockedUnresolved(windowed, { root: '/r' })
+  mod.aggregateTriggerAccuracy(windowed)
+  mod.aggregateProposalOutcomes(windowed)
+  mod.citationPool(windowed)
+  return reads / n
+}
+
+test('optimise-read: the ledger pipeline reads each record a bounded number of times however many records there are (L8, AC-QA-20, counted, not timed)', () => {
+  const small = countedReadsPerRecord(500)
+  const large = countedReadsPerRecord(2000)
+  assert.ok(small > 10, `sanity: the counter must observe the pipeline reading records, saw ${small} reads per record`)
+  assert.ok(large / small < 2, `reads per record grew ${(large / small).toFixed(2)}x for 4x the records (${small.toFixed(1)} -> ${large.toFixed(1)}); a single pass keeps it near 1, a nested scan near 4`)
+})
+
+test('optimise-read CLI: aggregating a real 2000-record ledger through the CLI reaches aggregation and reports all 2000 records (L8, AC-QA-20)', () => {
   const repo = makeTempRepo()
   const ledgerPath = path.join(repo, LEDGER_REL)
   fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
-  const lines = []
-  for (let i = 0; i < 2000; i++) {
-    lines.push(JSON.stringify({
-      schema_version: 2, run_id: `r${i}`, ts: `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
-      repo: 'demo', kind: 'review_cycle', outcome: 'done', spec: `specs/${i % 20}.md`, plan_key: `specs/${i % 20}.md`,
-      lenses_run: ['lens-security', 'lens-qa'], lenses_skipped: [],
-      findings: [{ id: `f${i}`, lens: 'lens-qa', severity: 'Low', ac_id: `AC-QA-${(i % 5) + 1}`, disposition: 'open' }],
-      ac_verdicts: [{ ac_id: `AC-QA-${(i % 5) + 1}`, verdict: i % 7 === 0 ? 'FAIL' : 'PASS' }],
-      write_ok: true, write_error: null,
-    }))
-  }
-  fs.writeFileSync(ledgerPath, lines.join('\n') + '\n')
-  const elapsedMs = []
-  for (let run = 0; run < 3; run++) {
-    const before = Date.now()
-    const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
-    elapsedMs.push(Date.now() - before)
-    assert.equal(res.status, 0, res.stderr)
-    const out = JSON.parse(res.stdout.trim())
-    assert.equal(out.n, 2000, 'sanity: the real fixture must actually reach aggregation, not be windowed/skipped away')
-  }
-  // Round-7 review F13: AC-QA-20 states the bound as 0.5s ("current
-  // measured: 0.05s"), but this test enforced 2s -- a round-4 L8 anti-
-  // flake relaxation that, measured at the pinned tip, left roughly 40x
-  // headroom rather than the AC's own ~10x. Tightened to the AC's actual
-  // number (still ~10x headroom over the ~45ms baseline measured in
-  // round-7's own review), asserted against the MEDIAN of the three runs
-  // rather than each individually, so one slow-scheduled run on a loaded
-  // CI box cannot flake the whole guard while a genuine quadratic
-  // regression (which would move every run, not just one) still trips it.
-  const sorted = [...elapsedMs].sort((a, b) => a - b)
-  const median = sorted[1]
-  assert.ok(median < 500, `expected the median of 3 runs under 500ms (AC-QA-20's own stated bound), got ${elapsedMs.join(', ')}ms (median ${median}ms)`)
+  fs.writeFileSync(ledgerPath, Array.from({ length: 2000 }, (_, i) => JSON.stringify(ledgerRecord(i))).join('\n') + '\n')
+  const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.n, 2000, 'the real fixture must actually reach aggregation, not be windowed or skipped away')
 })
 
 test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal targets from stdin and returns a stable id per target, in order', () => {

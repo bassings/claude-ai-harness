@@ -207,17 +207,32 @@ test('T7 normaliser: instance names merge into one row through the ci command, m
   assert.equal(kept.n, 2)
 })
 
-test('T7 normaliser: a 10,000-character name of repeated " - Update #1" normalises in under 50 ms, and so does a hostile digit run (AC-SEC-12)', () => {
+// HARN-AUDIT-1 T1 (AC-QA-1): this used to time normaliseJobName on hostile 10,000-character names against a 50ms bound. The
+// property is now pinned without a clock, in two parts. The results on those hostile inputs are exact (a wrong result on
+// them would be a behaviour bug, whatever the speed). And the regex literal carries no unbounded quantifier (no `*`, `+` or
+// `{n,}`; each repetition is `{1,10}` or a fixed alternation), so the work at each of the n start positions is capped by a
+// constant and the whole is linear in the name length, with nothing for a hostile name to make super-linear. The next test
+// pins the anchoring and the absence of a quantified group on the same function.
+test('T7 normaliser: hostile 10,000-character names normalise exactly, and the regex has no unbounded quantifier, so its cost is linear in the name (AC-SEC-12, counted, not timed)', () => {
   const n = reader.normaliseJobName
   assert.equal(typeof n, 'function')
-  n('warm up - Update #1')
-  for (const hostile of [' - Update #1'.repeat(Math.ceil(10000 / 12)).slice(0, 10000), 'x - Update #' + '9'.repeat(10000), ' on PR #'.repeat(1250), '#'.repeat(10000)]) {
-    const t0 = process.hrtime.bigint()
-    const res = n(hostile)
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6
-    assert.equal(typeof res, 'string')
-    assert.ok(ms < 50, `${ms} ms for a ${hostile.length}-char name`)
-  }
+  const unit = ' - Update #1'
+  assert.equal(n(unit.repeat(833)), unit.repeat(832), 'only the trailing suffix is stripped from a name of repeated suffixes')
+  const digits = 'x - Update #' + '9'.repeat(10000)
+  assert.equal(n(digits), digits, 'a digit run beyond the cap of 10 is not a suffix')
+  const onPr = ' on PR #'.repeat(1250)
+  assert.equal(n(onPr), onPr)
+  const hashes = '#'.repeat(10000)
+  assert.equal(n(hashes), hashes)
+
+  const unbounded = (literal) => literal.replace(/\\./g, 'E').replace(/\[(?:\\.|[^\]\\])*\]/g, 'C').match(/[*+]|\{\d+,\}/g) || []
+  const src = fs.readFileSync(MODULE_PATH, 'utf8')
+  const body = /function normaliseJobName[\s\S]*?\n}\n/.exec(src)[0]
+  const literals = body.match(/\/(?:\\.|[^/\\\n])+\/(?=[gimsuy]*[,)])/g) || []
+  assert.equal(literals.length, 1, `normaliseJobName must hold exactly one regex literal, found ${literals.length}`)
+  assert.deepEqual(unbounded(literals[0]), [], `the regex ${literals[0]} has an unbounded quantifier`)
+  // The detector sees what it exists to catch.
+  assert.ok(unbounded('/( - Update)+ #\\d+$/').length >= 2)
 })
 
 test('T7 normaliser: the source regex is anchored at the end and carries no nested quantifier (AC-SEC-12)', () => {
