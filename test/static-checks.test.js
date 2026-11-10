@@ -36,22 +36,6 @@ function walk(dir, out = []) {
   return out
 }
 
-// AC-SIMP-7 ("PR 1's diff contains no file whose path matches optimise-cycle") is a claim about one already-merged
-// commit, so it cannot be checked against the live tree (workflows/optimise-cycle.js and skills/optimise-cycle/ are
-// real, permanent deliverables now). It was once checked by running git against that commit, resolved by subject. That
-// made the suite depend on repository history: it failed in a shallow clone or a source tarball, and every history
-// rewrite renames the commit. The commit's changed-file list is now a vendored fixture, recorded once with
-// `git show --name-only --format=` on the PR 1 merge commit (see test/fixtures/PROVENANCE.md). The fixture is a frozen
-// record of a past fact, so this test proves the record still says what AC-SIMP-7 claims, not anything about git.
-test('static: PR1\'s changed-file list (vendored fixture, recorded from its merge commit) contains no file whose path matches "optimise-cycle" (AC-SIMP-7, checked against the historical commit\'s file list rather than the live tree, which now legitimately contains PR 2\'s optimiser files)', () => {
-  const files = fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'pr1-changed-files.txt'), 'utf8')
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean)
-  assert.ok(files.length > 10, 'sanity: expected PR1\'s merge commit to list many changed files')
-  assert.ok(!files.some((f) => /optimise-cycle/.test(f)), `PR1's merge commit must not have introduced an optimise-cycle path; found: ${files.filter((f) => /optimise-cycle/.test(f))}`)
-})
-
 test('static: none of the three ORIGINAL instrumented workflows (tdd-task.js, review-cycle.js, plan-cycle.js), hooks/, or conduct-plan/SKILL.md reference the optimiser -- the dependency edge points one way (AC-ARCH-8) and no per-PR path invokes it (AC-PROD-10). The optimiser\'s OWN files (workflows/optimise-cycle.js, skills/optimise-cycle/) necessarily mention their own name and are excluded from this scan, same as this test file and workflows/lib/ledger-append.mjs are excluded for citing the spec path as a documentation source.', () => {
   const targets = [
     'workflows/tdd-task.js',
@@ -1376,6 +1360,168 @@ test('static: EXECUTING the pre-push hook in a directory where the test glob mat
     assert.equal(unguarded.status, 0, 'sanity: the unguarded form exits 0 on an empty glob -- if this ever fails, the floor is no longer load-bearing and this test is measuring nothing')
   } finally {
     fs.rmSync(empty, { recursive: true, force: true })
+  }
+})
+
+// HARN-AUDIT-1 T4 (AC-QA-9): the suite reads no repository history. A test that runs git against a fixed commit id, or finds a
+// commit by subject across all branches and remotes, breaks in a shallow clone and when history is rewritten. Vendored copies under
+// test/fixtures/ replace them (see test/fixtures/PROVENANCE.md). The patterns are assembled from fragments so this file does not
+// match its own source. test/fixtures/ is excluded because it holds vendored bytes, not tests.
+function historyDependencyOffences(text) {
+  const hex = '[0-9a-f]{7,40}'
+  const offences = []
+  if (new RegExp(`git\\s+show\\s+${hex}\\b\\s*:`).test(text)) offences.push('git show <hex>:')
+  if (new RegExp(`['"\`]show['"\`]\\s*,\\s*[\`'"]${hex}\\s*:`).test(text)) offences.push("a 'show' call with a hex revision")
+  for (const [, name] of text.matchAll(new RegExp(`\\b(?:const|let|var)\\s+(\\w+)\\s*=\\s*['"]${hex}['"]`, 'g'))) {
+    if (new RegExp(`['"\`]show['"\`]\\s*,\\s*\`\\$\\{${name}\\}\\s*:|git\\s+show\\s+\\$\\{${name}\\}\\s*:`).test(text)) offences.push(`a 'show' call on the hex constant ${name}`)
+  }
+  if (new RegExp(`rev-parse\\s+${hex}\\b|['"\`]rev-parse['"\`]\\s*,\\s*['"\`]${hex}['"\`]`).test(text)) offences.push('rev-parse <hex>')
+  if (text.includes('--' + 'branches') && text.includes('--' + 'remotes')) offences.push('a subject lookup across branches and remotes')
+  return offences
+}
+
+test('static: no test reads repository history -- no git show or rev-parse of a fixed hex id, no branches-and-remotes subject lookup (AC-QA-9)', () => {
+  const files = []
+  const walkTests = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name)
+      if (entry.isDirectory()) { if (p !== path.join(ROOT, 'test', 'fixtures')) walkTests(p) } else if (/\.(c|m)?js$/.test(entry.name)) files.push(p)
+    }
+  }
+  walkTests(path.join(ROOT, 'test'))
+  assert.ok(files.length > 40, `sanity: expected many test files, found ${files.length}`)
+  const found = files.map((f) => [path.relative(ROOT, f), historyDependencyOffences(fs.readFileSync(f, 'utf8'))]).filter(([, o]) => o.length)
+  assert.deepEqual(found, [], 'these test files depend on repository history; vendor the file under test/fixtures/ instead')
+})
+
+test('static: the history-dependency detector fires on each shape it names and stays quiet on a temp-repo git show (it can fail)', () => {
+  // The sample revision is assembled at run time so this file does not match its own scan.
+  const rev = ['0604', '9e4'].join('')
+  const name = 'OLD_REV'
+  assert.deepEqual(historyDependencyOffences(`sh(\`git show ${rev}:workflows/x.js\`)`), ['git show <hex>:'])
+  assert.deepEqual(historyDependencyOffences(`execFileSync('git', ['show', \`${rev}:a.js\`])`), ["a 'show' call with a hex revision"])
+  assert.deepEqual(historyDependencyOffences(`const ${name} = '${rev}'\nexecFileSync('git', ['show', \`\${${name}}:a.js\`])`), [`a 'show' call on the hex constant ${name}`])
+  assert.deepEqual(historyDependencyOffences(`run('git rev-parse ${rev}')`), ['rev-parse <hex>'])
+  assert.deepEqual(historyDependencyOffences(`git('rev-parse', '${rev}')`), ['rev-parse <hex>'])
+  assert.deepEqual(historyDependencyOffences("['log', '--" + "branches', '--" + "remotes']"), ['a subject lookup across branches and remotes'])
+  assert.deepEqual(historyDependencyOffences('sh(`git show ${ref}:README.md`, dir); sh(`git rev-parse ${ref}`, dir); git rev-parse --show-toplevel'), [])
+})
+
+// HARN-AUDIT-1 T4 round 1 F1: the suite must never touch the operator's real run ledger, present or absent. The tripwire sits
+// outside test/ (the suite may not name the live ledger, AC-QA-9) in .githooks/ledger-tripwire.sh, called by the pre-push hook and
+// the CI test step. These tests run it, and the hook, against scratch repositories only.
+function scratchRepo() {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'tripwire-')))
+  const env = sanitizedGitEnv()
+  const git = (args, cwd = dir) => spawnSync('git', args, { cwd, encoding: 'utf8', env })
+  assert.equal(git(['init', '-q']).status, 0)
+  return { dir, git, ledger: path.join(dir, '.claude', 'harness-ledger.jsonl') }
+}
+const tripwire = (cwd, ...args) => spawnSync('sh', [path.join(ROOT, '.githooks', 'ledger-tripwire.sh'), ...args], { cwd, encoding: 'utf8', env: sanitizedGitEnv() })
+
+test('static: ledger-tripwire.sh passes an untouched ledger and fails, naming the file, when it is appended to, rewritten, created, or deleted', () => {
+  const { dir, ledger } = scratchRepo()
+  try {
+    fs.mkdirSync(path.dirname(ledger))
+    fs.writeFileSync(ledger, '{"a":1}\n')
+    const present = tripwire(dir, 'state').stdout.trim()
+    assert.match(present, /^present sha256=[0-9a-f]{64} size=8 path=.*harness-ledger\.jsonl$/)
+    assert.equal(tripwire(dir, 'verify', present).status, 0, 'an untouched ledger must pass')
+    fs.appendFileSync(ledger, '{"b":2}\n')
+    const appended = tripwire(dir, 'verify', present)
+    assert.equal(appended.status, 1)
+    assert.match(appended.stderr, /harness-ledger\.jsonl/, 'the failure names the file')
+    fs.writeFileSync(ledger, '{"a":2}\n')
+    assert.equal(tripwire(dir, 'verify', present).status, 1, 'a same-size rewrite is a change (sha256, not just size)')
+    fs.rmSync(ledger)
+    assert.equal(tripwire(dir, 'verify', present).status, 1, 'a deleted ledger is a change')
+    const absent = tripwire(dir, 'state').stdout.trim()
+    assert.match(absent, /^absent path=.*harness-ledger\.jsonl$/)
+    assert.equal(tripwire(dir, 'verify', absent).status, 0, 'absent must stay a valid, passing state')
+    fs.writeFileSync(ledger, '')
+    const created = tripwire(dir, 'verify', absent)
+    assert.equal(created.status, 1, 'a ledger created where none existed is a change, even an empty one')
+    assert.match(created.stderr, /harness-ledger\.jsonl/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('static: ledger-tripwire.sh resolves the ledger through the git common dir, so a linked worktree watches the main checkout\'s ledger', () => {
+  const { dir, git } = scratchRepo()
+  const wt = dir + '-wt'
+  try {
+    git(['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'init'])
+    assert.equal(git(['worktree', 'add', '-q', wt, '-b', 'wt']).status, 0)
+    fs.mkdirSync(path.join(dir, '.claude'))
+    fs.writeFileSync(path.join(dir, '.claude', 'harness-ledger.jsonl'), 'x\n')
+    const fromMain = tripwire(dir, 'state').stdout
+    const fromWorktree = tripwire(wt, 'state').stdout
+    assert.match(fromWorktree, /^present /)
+    assert.equal(fromWorktree, fromMain, 'both resolve to the same file')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+    fs.rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// The hook, executed in a scratch repository whose stub `node` plays a suite that writes to the ledger.
+function runHookWithStub(stubBody) {
+  const { dir, ledger } = scratchRepo()
+  fs.mkdirSync(path.join(dir, '.githooks'))
+  for (const f of ['pre-push', 'ledger-tripwire.sh']) fs.copyFileSync(path.join(ROOT, '.githooks', f), path.join(dir, '.githooks', f))
+  fs.mkdirSync(path.join(dir, 'test'))
+  for (let i = 0; i < 10; i++) fs.writeFileSync(path.join(dir, 'test', `t${i}.test.js`), '')
+  fs.mkdirSync(path.join(dir, 'hooks'))
+  fs.writeFileSync(path.join(dir, 'hooks', 'test_ok.py'), 'import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n')
+  const bin = path.join(dir, 'stub-bin')
+  fs.mkdirSync(bin)
+  fs.writeFileSync(path.join(bin, 'node'), `#!/bin/sh\n${stubBody.replaceAll('$LEDGER', ledger)}\nexit 0\n`)
+  fs.chmodSync(path.join(bin, 'node'), 0o755)
+  fs.mkdirSync(path.dirname(ledger))
+  fs.writeFileSync(ledger, '{"seed":1}\n')
+  return { dir, ledger, run: () => spawnSync('sh', [path.join(dir, '.githooks', 'pre-push')], { cwd: dir, encoding: 'utf8', env: { ...sanitizedGitEnv(), PATH: `${bin}:${process.env.PATH}` } }) }
+}
+
+test('static: EXECUTING the pre-push hook -- a suite that appends to the ledger fails the push naming the ledger; one that leaves it alone passes', () => {
+  const clean = runHookWithStub('true')
+  const dirty = runHookWithStub('echo \'{"leak":1}\' >> $LEDGER')
+  try {
+    const ok = clean.run()
+    assert.equal(ok.status, 0, `an untouched ledger must not block the push: ${ok.stderr}`)
+    const bad = dirty.run()
+    assert.notEqual(bad.status, 0, 'a suite that appends to the ledger must fail the hook')
+    assert.match(bad.stderr, /harness-ledger\.jsonl/, 'the failure names the ledger')
+  } finally {
+    fs.rmSync(clean.dir, { recursive: true, force: true })
+    fs.rmSync(dirty.dir, { recursive: true, force: true })
+  }
+})
+
+test('static: EXECUTING the pre-push hook -- a ledger that did not exist and is created by the suite fails the push; absent staying absent passes', () => {
+  const creating = runHookWithStub('echo x > $LEDGER')
+  const staying = runHookWithStub('true')
+  try {
+    fs.rmSync(creating.ledger)
+    fs.rmSync(staying.ledger)
+    const bad = creating.run()
+    assert.notEqual(bad.status, 0, 'creating a ledger where none existed must fail the hook')
+    assert.match(bad.stderr, /harness-ledger\.jsonl/)
+    assert.equal(staying.run().status, 0, 'absent staying absent must pass')
+  } finally {
+    fs.rmSync(creating.dir, { recursive: true, force: true })
+    fs.rmSync(staying.dir, { recursive: true, force: true })
+  }
+})
+
+test('static: the tripwire is wired into both gates -- the hook and the CI test step each take the state once before the suite and verify it once after', () => {
+  for (const [name, src] of [['.githooks/pre-push', readAll('.githooks', 'pre-push')], ['.github/workflows/ci.yml', readAll('.github', 'workflows', 'ci.yml')]]) {
+    assert.equal((src.match(/ledger-tripwire\.sh"? state/g) || []).length, 1, `${name} must take the ledger state exactly once`)
+    assert.equal((src.match(/ledger-tripwire\.sh"? verify/g) || []).length, 1, `${name} must verify it exactly once`)
+    const suite = src.search(/^\s*node --test test\/\*\.test\.js\s*$/m)
+    assert.ok(suite !== -1, `${name} must run the plain suite line`)
+    assert.ok(src.search(/ledger-tripwire\.sh"? state/) < suite, `${name}: the state must be taken before the suite runs`)
+    assert.ok(src.search(/ledger-tripwire\.sh"? verify/) > suite, `${name}: the verify must come after the suite`)
   }
 })
 

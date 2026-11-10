@@ -46,6 +46,10 @@ if [ "${_count:-0}" -lt 10 ]; then
   exit 1
 fi
 
+# Tripwire: no test may change the operator's real run ledger, present or absent
+# (see .githooks/ledger-tripwire.sh). Checked after both suites below.
+_ledger_before=$(sh "$(dirname "$0")/ledger-tripwire.sh" state)
+
 echo "pre-push: running the test suite (${_count} files)"
 node --test test/*.test.js
 
@@ -68,3 +72,5 @@ if [ "${_pycount:-0}" -lt 1 ]; then
 fi
 echo "pre-push: running the hooks suite (${_pycount} tests)"
 python3 -m unittest discover -s hooks -p 'test_*.py'
+
+sh "$(dirname "$0")/ledger-tripwire.sh" verify "$_ledger_before"

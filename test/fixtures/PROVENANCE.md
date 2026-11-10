@@ -5,8 +5,9 @@ Fixtures in this directory exist so the test suite never reads repository histor
 
 Each historical file is kept byte-for-byte pristine, with no header comment added, because these are executable
 workflow scripts and a header would change what the tests compare against. Provenance lives here instead. The sha256 of
-each vendored file is recorded below and is checked by the test "T4: vendored 06049e4 fixtures match the sha256 values
-recorded in test/fixtures/PROVENANCE.md" in `test/harn-opt-6-gap.test.js`.
+each fixture is recorded below as a line of `<sha256>  <path relative to this directory>`. The test "T4: every fixture
+listed with a sha256 in test/fixtures/PROVENANCE.md matches its recorded value" in `test/harn-opt-6-gap.test.js` checks every such line, so a
+fixture listed here cannot drift unnoticed.
 
 ## writer-06049e4/
 
@@ -24,20 +25,16 @@ fed512bf2213c015b196826279be2cbd6812110c8b83756f009372791d0fb365  writer-06049e4
 b95bdbbcbad0fbcc9de0e0fddaa3ba04ade8866591bdf895de9eb5abdbee17d0  writer-06049e4/tdd-task.js             (from workflows/tdd-task.js)
 ```
 
-## pr1-changed-files.txt
-
-The changed-file list of the PR 1 merge commit (subject ends "(PR 1 of HARN-OPT-1) (#1)", `c33bd76` when recorded),
-from `git show --name-only --format=<commit>`. Used by the AC-SIMP-7 test in `test/static-checks.test.js`. This is a
-frozen record of a past fact.
-
-```
-8f0ff1c7a41a269c16c8737cd8d2837f56fe317f515d8ea0aea213dd86d6937e  pr1-changed-files.txt
-```
-
 ## synthetic-ledger.jsonl
 
-A hand-built, synthetic run ledger of 15 rows (plan_cycle, review_cycle across several rounds with open, fixed,
-spec_bug and rejected findings, tdd_task, conduct_plan_event). Every value is invented: the repo label is
-`example/sample-repo`, run ids are sequential placeholder UUIDs, round keys are repeated hex characters, and spec paths
-are `specs/example-*.md`. Nothing was copied from a real `.claude/harness-ledger.jsonl`. It replaces the test's former
-read of the live ledger, so the optimise-read comparison runs everywhere.
+A hand-built, synthetic run ledger (plan_cycle, review_cycle across several rounds with open, fixed, spec_bug and rejected
+findings, tdd_task, conduct_plan_event, and review rows built to drive every counter the 06049e4 reader reports: an
+unattributed FAIL at each of its two sites, truncation, dropped-value counters, a non-roster lens, no-spec runs of each
+round kind, a degraded row, and two malformed lines). Every value is invented: the repo label is `example/sample-repo`, run
+ids are sequential placeholder UUIDs, round keys are repeated hex characters, and spec paths are `specs/example-*.md`.
+Nothing was copied from a real `.claude/harness-ledger.jsonl`. It replaces the test's former read of the live ledger, so the
+optimise-read comparison runs everywhere.
+
+```
+05174fed6ff30b213bbfe8c963d94dbf0e872ffeb34fec30419b70b01a3aed04  synthetic-ledger.jsonl
+```

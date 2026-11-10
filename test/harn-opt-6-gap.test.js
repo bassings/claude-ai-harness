@@ -201,13 +201,15 @@ test('C: no test file joins the checkout root to .claude/harness-ledger.jsonl di
 
 // HARN-AUDIT-1 T4 (AC-QA-9, AC-SEC-16): the suite reads no repository history and no live ledger. The vendored files must stay
 // byte-identical to the blobs they replaced, and the fixture ledger must stay synthetic.
-test('T4: vendored 06049e4 fixtures match the sha256 values recorded in test/fixtures/PROVENANCE.md', () => {
+test('T4: every fixture listed with a sha256 in test/fixtures/PROVENANCE.md matches its recorded value', () => {
   const { createHash } = require('node:crypto')
   const fixtures = path.join(__dirname, 'fixtures')
-  const recorded = [...fs.readFileSync(path.join(fixtures, 'PROVENANCE.md'), 'utf8').matchAll(/^([0-9a-f]{64})\s+(writer-06049e4\/\S+)/gm)]
-  assert.equal(recorded.length, 5, 'PROVENANCE.md must record the sha256 of all five vendored files')
+  const recorded = [...fs.readFileSync(path.join(fixtures, 'PROVENANCE.md'), 'utf8').matchAll(/^([0-9a-f]{64})\s+(\S+)/gm)]
+  assert.ok(recorded.length >= 6, `PROVENANCE.md must record the sha256 of all five vendored files and the fixture ledger, found ${recorded.length}`)
+  assert.ok(recorded.some(([, , rel]) => rel === 'synthetic-ledger.jsonl') && recorded.filter(([, , rel]) => rel.startsWith('writer-06049e4/')).length === 5)
   for (const [, sha, rel] of recorded) {
-    assert.equal(createHash('sha256').update(fs.readFileSync(path.join(fixtures, rel))).digest('hex'), sha, `${rel} is not byte-identical to the blob it was vendored from`)
+    assert.ok(fs.existsSync(path.join(fixtures, rel)), `${rel} is listed in PROVENANCE.md but missing`)
+    assert.equal(createHash('sha256').update(fs.readFileSync(path.join(fixtures, rel))).digest('hex'), sha, `${rel} does not match the sha256 recorded in PROVENANCE.md`)
   }
 })
 
@@ -264,7 +266,21 @@ test('AC-DATA-8: optimise-read over a copy of the synthetic fixture ledger gives
   const before = plain(rework(await importFresh(path.join(OLD_DIR, 'lib', 'optimise-read.mjs')), raw))
   const after = plain(rework(await importFresh(path.join(ROOT, 'workflows', 'lib', 'optimise-read.mjs')), raw))
   assert.equal(after, before)
-  assert.notEqual(JSON.parse(before).n, 0, 'the fixture ledger must yield review rows, or the equality above compares two empty results')
+  // Equality passes on any field where both readers say 0, so every figure the 06049e4 reader reports must be non-zero on this
+  // fixture, or a counter could be broken in the new reader and nothing here would notice. Nothing is excluded: the old reader
+  // can produce a non-zero value for each of them.
+  const old = JSON.parse(before)
+  const numeric = Object.entries({ ...old, ...Object.fromEntries(Object.entries(old.schemaV4).map(([k, v]) => [`schemaV4.${k}`, v])) }).filter(([, v]) => typeof v === 'number')
+  assert.ok(numeric.length >= 25, `expected the reader's numeric counters, found ${numeric.length}`)
+  assert.deepEqual(numeric.filter(([, v]) => v === 0).map(([k]) => k), [], 'a counter is zero in the 06049e4 reader on the fixture, so equality on it proves nothing; add a fixture row that drives it')
+  for (const k of ['unattributedFailBuckets', 'truncatedBuckets', 'verdictDisagreements', 'acVerdicts']) assert.ok(old[k].length > 0, `${k} is empty on the fixture`)
+  assert.equal(old.unattributedFailBuckets.length, 2, 'one bucket per unattributed-FAIL site (null ac_id, and a malformed ac_id)')
+  const modOld = await importFresh(path.join(OLD_DIR, 'lib', 'optimise-read.mjs'))
+  const modNew = await importFresh(path.join(ROOT, 'workflows', 'lib', 'optimise-read.mjs'))
+  const [pOld, pNew] = [modOld.parseLedgerContent(raw), modNew.parseLedgerContent(raw)]
+  assert.equal(pOld.skipped.length, 2, 'the fixture carries one malformed line and one line missing envelope fields')
+  assert.deepEqual(pNew.skipped, pOld.skipped, 'both readers skip the same lines for the same reasons')
+  assert.equal(pNew.records.length, pOld.records.length)
   assert.equal(fs.readFileSync(copy, 'utf8'), FIXTURE_LEDGER, 'the reader rewrote a line of the ledger copy')
 })
 
