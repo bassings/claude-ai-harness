@@ -210,13 +210,25 @@ test('ledger-append: the path resolves via git rev-parse --git-common-dir, never
   assert.equal(lines.length, 1)
 })
 
+// Diagnosis of the CI flake (8 failures on main, 11 to 13 October 2026, always "49 !== 50" or similar): the writer of that
+// date rewrote .git/info/exclude with a truncating in-place write and then ran `git check-ignore`, so a writer that read
+// the file while a sibling had it truncated got "not ignored" and refused with write_ok:false and exit 0. This test then
+// counted lines and never looked at write_ok, so the refusal surfaced only as a missing line, and only when the runner was
+// slow enough for the writers to collide. The production race was fixed on 13 October by writing the exclude file through
+// a temp file and a rename (b1595bc, HARN-OPT-5 T6), and the per-writer write_ok assertion below is what keeps a
+// recurrence loud and named rather than a bare count.
+//
+// The overlap does not rest on the runner's scheduling: every writer is spawned in one synchronous loop, before any of
+// them can exit, and each is held for 500ms between its fstat and its write by the writer's own test-only window
+// (LEDGER_APPEND_TEST_RACE_WINDOW_MS, the one the short-write race test uses), so all 50 appends are in flight together
+// whether the machine is fast or loaded. That is what makes a torn or interleaved write observable here (AC-DATA-16).
 test('ledger-append: 50 concurrent writers all land, each parses as JSON, each run_id appears exactly once (AC-DATA-3)', async () => {
   const repo = makeTempRepo()
   const N = 50
   const runs = Array.from({ length: N }, (_, i) =>
     new Promise((resolve, reject) => {
       const { spawn } = require('node:child_process')
-      const child = spawn('node', [APPEND_SCRIPT], { cwd: repo })
+      const child = spawn('node', [APPEND_SCRIPT], { cwd: repo, env: { ...process.env, LEDGER_APPEND_TEST_RACE_WINDOW_MS: '500' } })
       child.stdin.end(JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: `writer-${i}` }))
       let stderr = ''
       let stdout = ''
@@ -3725,18 +3737,39 @@ test('ledger-append module: a declared integer field REFUSES a non-integer numbe
 // canonicalPlanKey and passed while never reaching the regex at all, which is
 // the seam problem: a function reachable only through a path that bypasses it
 // is a function nothing is testing.
+//
+// The property is pinned by a deterministic count, not a clock (AC-QA-1). The first version compared wall-clock time at
+// two input sizes; on a loaded two-core runner the small run rounded to its 0.01ms floor and the ratio came out at 67x
+// against a limit of 30 (CI run 40598215039), and the same failure reached test/harn-opt-6-r2-env.test.js through its
+// nested run. The quadratic cost lived in the regex engine retrying from every position, so what matters is that no
+// regular expression is evaluated at all. Every entry point a regex-based strip reaches (RegExp.prototype exec and test,
+// plus the Symbol.match, matchAll, replace, search and split protocol methods) is counted while the helper runs on the
+// input that was quadratic, and the count must be zero. The loop that replaced the regex is linear by construction.
+// Everything is synchronous, and node:test runs the tests of one file one at a time, so no other test sees the patches.
+function countRegexEvaluations(fn) {
+  const keys = ['exec', 'test', Symbol.match, Symbol.matchAll, Symbol.replace, Symbol.search, Symbol.split]
+  const originals = keys.map((key) => [key, Object.getOwnPropertyDescriptor(RegExp.prototype, key)])
+  let count = 0
+  for (const [key, descriptor] of originals) {
+    Object.defineProperty(RegExp.prototype, key, { ...descriptor, value: function (...args) { count += 1; return descriptor.value.apply(this, args) } })
+  }
+  try {
+    fn()
+  } finally {
+    for (const [key, descriptor] of originals) Object.defineProperty(RegExp.prototype, key, descriptor)
+  }
+  return count
+}
+
 test('ledger-append module: stripTrailingSeparators is linear on the input that made the old regex quadratic', async () => {
   const { stripTrailingSeparators } = await import(APPEND_MODULE_URL)
-  const time = (n) => {
-    const s = '/'.repeat(n) + 'x'          // separators THEN a non-separator
-    const t = process.hrtime.bigint()
-    for (let i = 0; i < 50; i += 1) stripTrailingSeparators(s)
-    return Number(process.hrtime.bigint() - t) / 1e6
-  }
-  time(2000)
-  const small = Math.max(time(2000), 0.01)
-  const large = Math.max(time(20000), 0.01)
-  assert.ok(large / small < 30, `10x the input cost ${(large / small).toFixed(0)}x the time (${small.toFixed(2)}ms -> ${large.toFixed(2)}ms); the old regex was ~190x`)
+  const hostile = '/'.repeat(20000) + 'x' + '\\/'.repeat(10000) // separators, then a non-separator, then 20000 more of both kinds
+  let stripped
+  const evaluations = countRegexEvaluations(() => { stripped = stripTrailingSeparators(hostile) })
+  assert.equal(evaluations, 0, 'stripTrailingSeparators must not evaluate a regular expression: the one it replaced was quadratic on a long run of separators')
+  assert.equal(stripped, '/'.repeat(20000) + 'x', 'and it still strips every trailing separator, of both kinds, from the hostile input')
+  // The counter really sees a regex-based strip, so the zero above is not a patch that never took effect.
+  assert.ok(countRegexEvaluations(() => 'a//'.replace(/[\\/]+$/, '')) > 0, 'sanity: the counter must observe a regex-based strip, or the zero above proves nothing')
 })
 
 test('ledger-append module: stripTrailingSeparators strips what the regex stripped, and nothing else', async () => {
