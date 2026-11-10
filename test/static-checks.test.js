@@ -1400,7 +1400,7 @@ test('static: the history-dependency detector fires on each shape it names and s
   const name = 'OLD_REV'
   assert.deepEqual(historyDependencyOffences(`sh(\`git show ${rev}:workflows/x.js\`)`), ['git show <hex>:'])
   assert.deepEqual(historyDependencyOffences(`execFileSync('git', ['show', \`${rev}:a.js\`])`), ["a 'show' call with a hex revision"])
-  assert.deepEqual(historyDependencyOffences(`const ${name} = '${rev}'\nexecFileSync('git', ['show', \`\${${name}}:a.js\`])`), [`a 'show' call on the hex constant ${name}`])
+  assert.deepEqual(historyDependencyOffences(`const ${name} = '${rev}'\nexecFileSync('git', ['show', \`` + '$' + '{' + name + '}' + `:a.js\`])`), [`a 'show' call on the hex constant ${name}`])
   assert.deepEqual(historyDependencyOffences(`run('git rev-parse ${rev}')`), ['rev-parse <hex>'])
   assert.deepEqual(historyDependencyOffences(`git('rev-parse', '${rev}')`), ['rev-parse <hex>'])
   assert.deepEqual(historyDependencyOffences("['log', '--" + "branches', '--" + "remotes']"), ['a subject lookup across branches and remotes'])
