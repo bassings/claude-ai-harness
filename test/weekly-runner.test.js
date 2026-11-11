@@ -212,6 +212,32 @@ esac
 `
 fs.writeFileSync(path.join(STUB_DIR, 'claude'), STUB_CLAUDE, { mode: 0o755 })
 
+// T11 (AC-OPS-1): a stub notifier. The runner raises its FAIL notification
+// through `osascript`, so a stub of that name sits in STUB_DIR, which every
+// spawn in this file puts ahead of the real PATH: no test can ever raise a
+// real operating-system notification. Each invocation appends one CALL line
+// and one ARG line per argument to $OSA_RECORD, and exits with $OSA_EXIT
+// (default 0). Both variables belong to the test harness, never the runner.
+const STUB_OSASCRIPT = `#!/bin/sh
+if [ -n "$OSA_RECORD" ]; then
+  echo CALL >> "$OSA_RECORD"
+  for a in "$@"; do printf 'ARG\t%s\n' "$a" >> "$OSA_RECORD"; done
+fi
+exit "\${OSA_EXIT:-0}"
+`
+fs.writeFileSync(path.join(STUB_DIR, 'osascript'), STUB_OSASCRIPT, { mode: 0o755 })
+
+// Parses an OSA_RECORD file into one array of arguments per notifier call.
+function readNotifyCalls(recordPath) {
+  if (!fs.existsSync(recordPath)) return []
+  const calls = []
+  for (const line of fs.readFileSync(recordPath, 'utf8').split('\n')) {
+    if (line === 'CALL') calls.push([])
+    else if (line.startsWith('ARG\t')) calls[calls.length - 1].push(line.slice(4))
+  }
+  return calls
+}
+
 function setMarker(repo, marker) {
   fs.writeFileSync(path.join(repo, '.optimise-weekly-test-marker'), `${marker}\n`)
 }
@@ -255,7 +281,11 @@ function runWeeklyScript(repos, opts = {}) {
     OPTIMISE_WEEKLY_LOG: log,
     HOME: opts.home || ISOLATED_HOME,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: opts.stalenessRemote || NO_STALENESS_REMOTE,
+    OSA_RECORD: `${log}.notify`,
+    OSA_EXIT: String(opts.notifierExit || 0),
+    ...(opts.env || {}),
   }
+  for (const name of opts.unsetEnv || []) delete env[name]
   if (opts.claudeHome) {
     env.CLAUDE_HOME = opts.claudeHome
   } else {
@@ -268,7 +298,7 @@ function runWeeklyScript(repos, opts = {}) {
   }
   const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 20000, env })
   const logContents = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
-  return { ...res, log, logContents }
+  return { ...res, log, logContents, notifyCalls: readNotifyCalls(`${log}.notify`) }
 }
 
 function resultLineRegex(verdict, repoLabel) {
@@ -607,13 +637,13 @@ test('weekly runner (subtraction round, item 5): when the redaction step fails, 
 
 // --- Group 8: small, cheap fixes -------------------------------------------
 
-test('weekly runner (Group 8): an empty REPOS array (all-whitespace OPTIMISE_WEEKLY_REPOS) does not crash under bash 3.2 + set -u -- clean start/done with no RESULT or SKIP lines', () => {
+test('weekly runner (Group 8): an empty REPOS array (all-whitespace OPTIMISE_WEEKLY_REPOS) does not crash under bash 3.2 + set -u -- clean start/done, and since T11 (AC-OPS-2) exactly one RESULT line, the no-repos FAIL', () => {
   const { status, logContents, stderr } = runWeeklyScript([], { rawRepos: '   \n\n\t \n' })
-  assert.equal(status, 0, logContents + stderr)
+  assert.notEqual(status, 0, logContents + stderr)
   assert.ok(!/unbound variable/.test(stderr || ''), `must not hit bash's unbound-variable error:\n${stderr}`)
   assert.match(logContents, /weekly optimise-cycle starting/, logContents)
   assert.match(logContents, /=== done/, logContents)
-  assert.ok(!logContents.includes('RESULT'), 'an empty repo list must produce no verdict lines')
+  assert.deepEqual(logContents.match(/^RESULT .*$/gm), ['RESULT FAIL - reason="no repos configured"'], 'an empty repo list produces only the no-repos FAIL')
   assert.ok(!logContents.includes('SKIP'), 'an empty repo list must produce no skip lines')
 })
 
@@ -726,7 +756,7 @@ test('weekly runner (subtraction round, item 9): the default repo list is read f
   assert.equal(resultCount, 1, `expected exactly one verdict line (blank config lines ignored), got:\n${logContents}`)
 })
 
-test('weekly runner (subtraction round, item 9): no $HOME/.claude/optimise-weekly-repos file and no OPTIMISE_WEEKLY_REPOS -- clean start/done with no RESULT or SKIP lines, exit 0 (a missing config file is not a crash)', () => {
+test('weekly runner (subtraction round, item 9): no $HOME/.claude/optimise-weekly-repos file and no OPTIMISE_WEEKLY_REPOS -- clean start/done, no SKIP lines, and since T11 (AC-OPS-2) the no-repos FAIL rather than exit 0 (a missing config file is not a crash)', () => {
   const fakeHome = fs.mkdtempSync(path.join(RUN_TMPDIR, 'fake-home-empty-'))
   trackTempDir(fakeHome)
   const log = freshLogPath()
@@ -741,8 +771,8 @@ test('weekly runner (subtraction round, item 9): no $HOME/.claude/optimise-weekl
   delete env.CLAUDE_HOME
   const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 20000, env })
   const logContents = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
-  assert.equal(res.status, 0, logContents)
-  assert.ok(!logContents.includes('RESULT'), 'no config file must produce no verdict lines')
+  assert.notEqual(res.status, 0, logContents)
+  assert.deepEqual(logContents.match(/^RESULT .*$/gm), ['RESULT FAIL - reason="no repos configured"'], 'no config file produces only the no-repos FAIL')
   assert.ok(!logContents.includes('SKIP'), 'no config file must produce no skip lines')
 })
 
@@ -957,7 +987,8 @@ test('weekly runner (AC-OPS-1): with ZERO delivery repos configured, the stalene
   const published = makePublishedRepo()
   const install = identicalInstallOf(published)
   const { status, logContents } = runWeeklyScript([], { stalenessRemote: published, claudeHome: install })
-  assert.equal(status, 0, logContents)
+  // T11 (AC-OPS-2): zero repos is now a FAIL; the staleness check is unaffected.
+  assert.notEqual(status, 0, logContents)
   const stalenessLines = logContents.match(/^STALENESS /gm) || []
   assert.equal(stalenessLines.length, 1, `expected exactly one staleness report with zero repos configured, got ${stalenessLines.length}:\n${logContents}`)
 })
@@ -1259,4 +1290,456 @@ test('weekly runner: says so and carries on when there is no global script to st
     'a plugin install has no ~/.claude/workflows/ copy and still resolves the skill; staging is an aid, not a precondition')
   assert.match(res.logContents, /no global optimise-cycle\.js to stage/)
   assert.equal(stagedWasSeen(repo), false, 'nothing to stage means nothing staged')
+})
+
+// --- T11 (specs/harn-audit-1.md): the guard stays on, an explicit allowlist,
+// a FAIL is notified, and the run cleans up after itself ---------------------
+//
+// Nothing in this section raises a real notification, schedules a job or
+// launches a real claude session: the notifier is the `osascript` stub in
+// STUB_DIR, and every claude is a stub.
+
+const { spawn } = require('node:child_process')
+const LAST_RESULT_REL = path.join('.claude', 'logs', 'optimise-cycle-weekly.last-result')
+const OLD_SCRIPT_VERSION = '2026-08-23.1'
+
+function freshDir(prefix) {
+  const dir = fs.mkdtempSync(path.join(RUN_TMPDIR, prefix))
+  trackTempDir(dir)
+  return dir
+}
+
+function freshHome() {
+  return freshDir('home-')
+}
+
+// AC-OPS-1 ------------------------------------------------------------------
+
+test('T11 AC-OPS-1: a FAIL raises exactly one notification naming the failing repo label and the first reason, and never an absolute path', () => {
+  const repo = makeTempRepo()
+  setMarker(repo, 'noop')
+  const res = runWeeklyScript([repo])
+  assert.notEqual(res.status, 0, res.logContents)
+  assert.equal(res.notifyCalls.length, 1, `expected exactly one notification:\n${JSON.stringify(res.notifyCalls)}`)
+  const text = res.notifyCalls[0].join('\n')
+  assert.ok(text.includes(label(repo)), `the notification must name the failing repo label:\n${text}`)
+  assert.match(text, /report file missing at \.claude\/optimise-cycle-report\.md/, 'and the first reason')
+  assert.ok(!text.includes(path.dirname(repo)), `AC-SEC-10: never an absolute path:\n${text}`)
+})
+
+test('T11 AC-OPS-1: two failing repos still raise exactly one notification, naming both', () => {
+  const a = makeTempRepo()
+  const b = makeTempRepo()
+  setMarker(a, 'noop')
+  setMarker(b, 'noop')
+  const res = runWeeklyScript([a, b])
+  assert.equal(res.notifyCalls.length, 1, JSON.stringify(res.notifyCalls))
+  const text = res.notifyCalls[0].join('\n')
+  assert.ok(text.includes(label(a)) && text.includes(label(b)), text)
+})
+
+test('T11 AC-OPS-1: a PASS calls the notifier zero times', () => {
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const res = runWeeklyScript([repo])
+  assert.equal(res.status, 0, res.logContents)
+  assert.equal(res.notifyCalls.length, 0, JSON.stringify(res.notifyCalls))
+})
+
+test('T11 AC-OPS-1: one PASS and one FAIL notifies once and names only the failing label', () => {
+  const good = makeTempRepo()
+  const bad = makeTempRepo()
+  setMarker(good, 'pass')
+  setMarker(bad, 'noop')
+  const res = runWeeklyScript([good, bad])
+  assert.equal(res.notifyCalls.length, 1, JSON.stringify(res.notifyCalls))
+  const text = res.notifyCalls[0].join('\n')
+  assert.ok(text.includes(label(bad)), text)
+  assert.ok(!text.includes(label(good)), `the passing repo must not be named:\n${text}`)
+})
+
+test('T11 AC-OPS-1: a notifier that exits non-zero leaves NOTIFY-FAILED <exit code> in the run log, with the code it really exited with', () => {
+  const repo = makeTempRepo()
+  setMarker(repo, 'noop')
+  const res = runWeeklyScript([repo], { notifierExit: 7 })
+  assert.equal(res.notifyCalls.length, 1)
+  assert.match(res.logContents, /^NOTIFY-FAILED 7$/m, res.logContents)
+  assert.notEqual(res.status, 0, 'a failed notification must not turn a FAIL run into an exit 0')
+})
+
+test('T11 AC-OPS-1: a notifier that succeeds leaves no NOTIFY-FAILED line', () => {
+  const repo = makeTempRepo()
+  setMarker(repo, 'noop')
+  const res = runWeeklyScript([repo])
+  assert.equal(res.notifyCalls.length, 1)
+  assert.ok(!/NOTIFY-FAILED/.test(res.logContents), res.logContents)
+})
+
+test('T11 AC-OPS-1: a repo label holding quotes and backslashes reaches the notifier as its own argument, never spliced into script text', () => {
+  const hostile = 'q"uote\\back'
+  const dir = path.join(freshDir('hostile-label-'), hostile)
+  fs.mkdirSync(dir)
+  execFileSync('git', ['init', '-q', dir])
+  setMarker(dir, 'noop')
+  const res = runWeeklyScript([dir])
+  assert.equal(res.notifyCalls.length, 1, `${res.logContents}\n${JSON.stringify(res.notifyCalls)}`)
+  const args = res.notifyCalls[0]
+  const carriers = args.filter((a) => a.includes(hostile))
+  assert.ok(carriers.length >= 1, `the label must be passed verbatim as data:\n${JSON.stringify(args)}`)
+  for (const a of carriers) {
+    assert.ok(!/display notification/.test(a), `the label must never sit inside AppleScript source:\n${a}`)
+  }
+})
+
+test('T11 AC-OPS-1: the last-result file holds exactly one line (UTC timestamp, FAIL, label, reason) under $HOME/.claude/logs', () => {
+  const repo = makeTempRepo()
+  setMarker(repo, 'noop')
+  const home = freshHome()
+  const res = runWeeklyScript([repo], { home })
+  const file = path.join(home, LAST_RESULT_REL)
+  assert.ok(fs.existsSync(file), `missing ${LAST_RESULT_REL}:\n${res.logContents}`)
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean)
+  assert.equal(lines.length, 1, lines.join('\n'))
+  assert.match(lines[0], /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z FAIL /, lines[0])
+  assert.ok(lines[0].includes(label(repo)), lines[0])
+  assert.match(lines[0], /report file missing/, lines[0])
+})
+
+test('T11 AC-OPS-1: the last-result file survives the run and the next run overwrites it (FAIL then PASS leaves one PASS line)', () => {
+  const repo = makeTempRepo()
+  const home = freshHome()
+  setMarker(repo, 'noop')
+  runWeeklyScript([repo], { home })
+  const file = path.join(home, LAST_RESULT_REL)
+  assert.match(fs.readFileSync(file, 'utf8'), / FAIL /, 'the FAIL result must persist after the process exits')
+  setMarker(repo, 'pass')
+  runWeeklyScript([repo], { home })
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean)
+  assert.equal(lines.length, 1, lines.join('\n'))
+  assert.match(lines[0], /^\S+ PASS /, lines[0])
+  assert.ok(lines[0].includes(label(repo)), lines[0])
+})
+
+// AC-OPS-2 ------------------------------------------------------------------
+
+// The env var UNSET (runWeeklyScript always exports it), with an optional
+// $HOME/.claude/optimise-weekly-repos body.
+function runWithEnvUnset(configBody) {
+  const home = freshHome()
+  if (configBody !== null) {
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+    fs.writeFileSync(path.join(home, '.claude', 'optimise-weekly-repos'), configBody)
+  }
+  const log = freshLogPath()
+  const env = {
+    ...process.env,
+    PATH: `${STUB_DIR}:${process.env.PATH}`,
+    OPTIMISE_WEEKLY_LOG: log,
+    HOME: home,
+    OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
+    OSA_RECORD: `${log}.notify`,
+  }
+  delete env.OPTIMISE_WEEKLY_REPOS
+  delete env.CLAUDE_HOME
+  const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 20000, env })
+  const logContents = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
+  return { ...res, logContents, notifyCalls: readNotifyCalls(`${log}.notify`) }
+}
+
+const NO_REPOS_LINE = /^RESULT FAIL - reason="no repos configured"$/m
+
+for (const [name, run] of [
+  ['the env var holding only blank lines', () => runWeeklyScript([], { rawRepos: '   \n\n\t \n' })],
+  ['the env var unset and the config file missing', () => runWithEnvUnset(null)],
+  ['the env var unset and the config file holding only blank lines', () => runWithEnvUnset('\n  \n\t\n')],
+]) {
+  test(`T11 AC-OPS-2: ${name} -- RESULT FAIL "no repos configured", non-zero exit, one notification`, () => {
+    const res = run()
+    assert.match(res.logContents, NO_REPOS_LINE, res.logContents)
+    assert.notEqual(res.status, 0, res.logContents)
+    assert.equal(res.notifyCalls.length, 1, JSON.stringify(res.notifyCalls))
+    assert.match(res.notifyCalls[0].join('\n'), /no repos configured/)
+  })
+}
+
+test('T11 AC-OPS-2: a configured repo list produces no "no repos configured" line', () => {
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const res = runWeeklyScript([repo])
+  assert.ok(!/no repos configured/.test(res.logContents), res.logContents)
+})
+
+// AC-OPS-6 ------------------------------------------------------------------
+
+test('T11 AC-OPS-6: the first log line of every run carries a SCRIPT_VERSION newer than the pre-T11 value, and it is the value the script declares', () => {
+  const declared = fs.readFileSync(SCRIPT_PATH, 'utf8').match(/^SCRIPT_VERSION="([^"]+)"/m)[1]
+  assert.match(declared, /^\d{4}-\d{2}-\d{2}\.\d+$/)
+  assert.ok(declared > OLD_SCRIPT_VERSION, `SCRIPT_VERSION ${declared} must be bumped past ${OLD_SCRIPT_VERSION}`)
+  const passRepo = makeTempRepo()
+  setMarker(passRepo, 'pass')
+  for (const res of [runWeeklyScript([passRepo]), runWeeklyScript([], { rawRepos: '' })]) {
+    const first = res.logContents.split('\n')[0]
+    assert.ok(first.includes(`version=${declared}`), `first line must carry version=${declared}:\n${first}`)
+  }
+})
+
+// AC-SEC-8 ------------------------------------------------------------------
+
+function argvRecordingClaude() {
+  const dir = freshDir('argv-stub-')
+  const body = `#!/bin/sh
+: > .claude-argv
+for a in "$@"; do printf '%s\\n' "$a" >> .claude-argv; done
+mkdir -p .claude
+cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF
+exit 0
+`
+  fs.writeFileSync(path.join(dir, 'claude'), body, { mode: 0o755 })
+  return dir
+}
+
+function capturedArgv(repo) {
+  return fs.readFileSync(path.join(repo, '.claude-argv'), 'utf8').split('\n').filter((l) => l !== '')
+}
+
+function flagValues(argv, flag) {
+  const i = argv.indexOf(flag)
+  if (i < 0) return null
+  const out = []
+  for (let j = i + 1; j < argv.length && !argv[j].startsWith('--'); j += 1) out.push(argv[j])
+  return out
+}
+
+test('T11 AC-SEC-8: the claude invocation passes an explicit --allowedTools list and a mode that denies the rest, with no hooks disabled and no bypass', () => {
+  const repo = makeTempRepo()
+  const res = runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
+  assert.equal(res.status, 0, res.logContents)
+  const argv = capturedArgv(repo)
+  const allowed = flagValues(argv, '--allowedTools')
+  assert.ok(allowed && allowed.length > 0, `--allowedTools must be passed with entries:\n${argv.join('\n')}`)
+  assert.deepEqual(flagValues(argv, '--permission-mode'), ['dontAsk'], 'unlisted tools must be denied, not prompted for or auto-approved')
+  for (const bad of ['--dangerously-skip-permissions', 'bypassPermissions', 'auto', 'acceptEdits']) {
+    assert.ok(!argv.includes(bad), `argv must not contain ${bad}`)
+  }
+  assert.ok(!argv.join('\n').includes('disableAllHooks'), 'the guard and snapshot hooks must stay on')
+  const settings = flagValues(argv, '--settings')
+  assert.ok(settings === null || !settings.join('').includes('disableAllHooks'))
+})
+
+test('T11 AC-SEC-8: the allowlist names no bare tool that would grant everything, and scopes writes to the report file', () => {
+  const repo = makeTempRepo()
+  runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
+  const allowed = flagValues(capturedArgv(repo), '--allowedTools')
+  for (const bare of ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', '*']) {
+    assert.ok(!allowed.includes(bare), `a bare ${bare} entry would grant the whole tool:\n${allowed.join('\n')}`)
+  }
+  for (const entry of allowed.filter((e) => /^(Write|Edit)\(/.test(e))) {
+    assert.equal(entry.replace(/^(Write|Edit)\(|\)$/g, ''), '.claude/optimise-cycle-report.md', `writes are allowed to the report file only: ${entry}`)
+  }
+  assert.ok(allowed.some((e) => e.startsWith('Write(')), 'the report must be writable or the run can never PASS')
+  for (const entry of allowed.filter((e) => /^Bash\(/.test(e))) {
+    assert.match(entry, /^Bash\([a-z][a-z -]*:\*\)$/, `Bash entries are command prefixes: ${entry}`)
+    assert.ok(!/^Bash\((rm|sudo|curl|wget|git push|git commit|git reset)\b/.test(entry), `a denied command must not be allowed: ${entry}`)
+  }
+})
+
+test('T11 AC-SEC-8: neither the runner nor its plist contains disableAllHooks, even in a comment', () => {
+  for (const f of ['optimise-cycle-weekly.sh', 'com.local.optimise-cycle-weekly.plist']) {
+    const text = fs.readFileSync(path.join(__dirname, '..', 'bin', f), 'utf8')
+    assert.ok(!text.includes('disableAllHooks'), `${f} must not mention disableAllHooks`)
+  }
+})
+
+// AC-SIMP-3 -----------------------------------------------------------------
+
+test('T11 AC-SIMP-3: the runner adds no overlap lock and no log rotation', () => {
+  const text = fs.readFileSync(SCRIPT_PATH, 'utf8')
+  for (const banned of [/\bflock\b/, /\.lock\b/, /\.pid\b/, /mv "\$LOG"/, /logrotate/, /mkdir [^\n]*lock/i]) {
+    assert.ok(!banned.test(text), `the runner must not contain ${banned}`)
+  }
+})
+
+// AC-OPS-4 and AC-DATA-14: cleanup -----------------------------------------
+
+function waitFor(predicate, what, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now()
+    const tick = () => {
+      if (predicate()) return resolve()
+      if (Date.now() - started > timeoutMs) return reject(new Error(`timed out waiting for ${what}`))
+      setTimeout(tick, 50)
+    }
+    tick()
+  })
+}
+
+// A claude that announces it is running, then waits to be killed.
+function hangingClaude() {
+  const dir = freshDir('hang-stub-')
+  const body = `#!/bin/sh
+echo $$ > .claude-pid
+: > .ready
+exec sleep 30
+`
+  fs.writeFileSync(path.join(dir, 'claude'), body, { mode: 0o755 })
+  return dir
+}
+
+function startRunner(repo, { home, claudeHome, tmpdir, extraPath }) {
+  const log = freshLogPath()
+  const env = {
+    ...process.env,
+    PATH: `${extraPath}:${STUB_DIR}:${process.env.PATH}`,
+    OPTIMISE_WEEKLY_LOG: log,
+    HOME: home,
+    CLAUDE_HOME: claudeHome,
+    TMPDIR: tmpdir,
+    OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
+    OPTIMISE_WEEKLY_REPOS: repo,
+  }
+  const child = spawn(SCRIPT_PATH, [], { env, stdio: 'ignore' })
+  const done = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })))
+  return { child, log, done }
+}
+
+function transcripts(dir) {
+  return fs.readdirSync(dir).filter((n) => n.startsWith('optimise-weekly-transcript.'))
+}
+
+function killIfAlive(pidFile) {
+  try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGKILL') } catch (e) { /* already gone */ }
+}
+
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  test(`T11 AC-OPS-4: after ${sig} mid-run no transcript temp file and no staged workflow remain, and claude is stopped`, async () => {
+    const repo = makeTempRepo()
+    const claudeHome = freshDir('claudehome-')
+    withGlobalWorkflow(claudeHome, '// global v1\n')
+    const tmp = freshDir('tmp-')
+    const run = startRunner(repo, { home: freshHome(), claudeHome, tmpdir: tmp, extraPath: hangingClaude() })
+    const pidFile = path.join(repo, '.claude-pid')
+    try {
+      await waitFor(() => fs.existsSync(path.join(repo, '.ready')), 'claude to start')
+      assert.equal(transcripts(tmp).length, 1, 'guard against vacuity: the transcript exists while claude runs')
+      assert.equal(fs.existsSync(stagedPath(repo)), true, 'guard against vacuity: the staged copy exists while claude runs')
+      run.child.kill(sig)
+      await Promise.race([run.done, new Promise((_, rej) => setTimeout(() => rej(new Error('runner did not exit after the signal')), 20000))])
+      assert.deepEqual(transcripts(tmp), [], 'the transcript temp file must be gone')
+      assert.equal(fs.existsSync(stagedPath(repo)), false, 'the staged workflow must be gone')
+      assert.equal(fs.existsSync(path.join(repo, '.claude', 'workflows')), false, 'and the directory the run created')
+      let alive = true
+      try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 0) } catch (e) { alive = false }
+      assert.equal(alive, false, 'claude must not be left running after the runner is told to stop')
+    } finally {
+      killIfAlive(pidFile)
+    }
+  })
+}
+
+test('T11 AC-OPS-4: the timeout killing claude leaves no transcript temp file and no staged workflow', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// global v1\n')
+  const tmp = freshDir('tmp-')
+  const killed = freshDir('killed-stub-')
+  fs.writeFileSync(path.join(killed, 'claude'), '#!/bin/sh\nif [ -f .claude/workflows/optimise-cycle.js ]; then : > .staged-seen; fi\nkill -KILL $$\n', { mode: 0o755 })
+  const res = runWeeklyScript([repo], { claudeHome, extraPath: killed, env: { TMPDIR: tmp } })
+  assert.equal(fs.existsSync(path.join(repo, '.staged-seen')), true, 'guard against vacuity: it was staged during the run')
+  assert.match(res.logContents, resultLineRegex('FAIL', label(repo)))
+  assert.deepEqual(transcripts(tmp), [])
+  assert.equal(fs.existsSync(stagedPath(repo)), false)
+})
+
+test('T11 AC-OPS-4: after SIGKILL the next run deletes the staged copy it left, logs REMOVED-LEFTOVER-STAGED <label>, never calls it the repo\'s own, and re-stages from the global copy', async () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// global v1\n')
+  const home = freshHome()
+  const run = startRunner(repo, { home, claudeHome, tmpdir: freshDir('tmp-'), extraPath: hangingClaude() })
+  const pidFile = path.join(repo, '.claude-pid')
+  try {
+    await waitFor(() => fs.existsSync(path.join(repo, '.ready')), 'claude to start')
+    run.child.kill('SIGKILL')
+    await run.done
+  } finally {
+    killIfAlive(pidFile)
+  }
+  assert.equal(fs.existsSync(stagedPath(repo)), true, 'guard against vacuity: SIGKILL cannot be trapped, so the copy is left behind')
+  withGlobalWorkflow(claudeHome, '// global v2\n')
+  const res = runWeeklyScript([repo], { home, claudeHome, extraPath: witnessingClaudeStub('pass') })
+  assert.match(res.logContents, new RegExp(`^REMOVED-LEFTOVER-STAGED ${escapeRegExp(label(repo))}$`, 'm'), res.logContents)
+  assert.ok(!/repo ships its own/.test(res.logContents), `a leftover must never be logged as the repo's own:\n${res.logContents}`)
+  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'), '// global v2\n', 're-staged from the CURRENT global copy')
+  assert.equal(fs.existsSync(stagedPath(repo)), false, 'and removed again at the end of this run')
+  assert.match(res.logContents, resultLineRegex('PASS', label(repo)))
+})
+
+test('T11 AC-DATA-14: a staged file that is no longer byte-identical to the global source (replaced during the run) is kept, with nothing else left beside it', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// global v1\n')
+  const replacer = freshDir('replace-stub-')
+  fs.writeFileSync(path.join(replacer, 'claude'), `#!/bin/sh
+printf '// REPLACED DURING THE RUN\\n' > .claude/workflows/optimise-cycle.js
+cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF
+exit 0
+`, { mode: 0o755 })
+  runWeeklyScript([repo], { claudeHome, extraPath: replacer })
+  assert.equal(fs.readFileSync(stagedPath(repo), 'utf8'), '// REPLACED DURING THE RUN\n', 'a file that is no longer our copy must survive the run')
+  assert.deepEqual(fs.readdirSync(path.dirname(stagedPath(repo))), ['optimise-cycle.js'], 'and the run leaves no marker or other litter beside it')
+})
+
+test('T11 AC-DATA-14: with nothing staged and no transcript yet, the exit cleanup deletes nothing (an unrelated optimise-weekly-transcript.* file survives)', () => {
+  const tmp = freshDir('tmp-')
+  const decoy = path.join(tmp, 'optimise-weekly-transcript.decoy')
+  fs.writeFileSync(decoy, 'not ours\n')
+  const res = runWeeklyScript([], { rawRepos: '', env: { TMPDIR: tmp } })
+  assert.match(res.logContents, NO_REPOS_LINE, 'guard against vacuity: the run really ended through the exit path')
+  assert.equal(fs.readFileSync(decoy, 'utf8'), 'not ours\n')
+})
+
+test('T11 AC-SEC-10: the transcript temp file lives under CLAUDE_HOME when TMPDIR is unset, never in a shared /tmp', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  const lister = freshDir('ls-stub-')
+  fs.writeFileSync(path.join(lister, 'claude'), `#!/bin/sh
+ls "$CLAUDE_HOME" > .home-listing
+cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF
+exit 0
+`, { mode: 0o755 })
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  const res = runWeeklyScript([repo], { claudeHome, unsetEnv: ['TMPDIR'], extraPath: lister })
+  assert.equal(res.status, 0, res.logContents)
+  const listing = fs.readFileSync(path.join(repo, '.home-listing'), 'utf8').split('\n')
+  assert.ok(listing.some((n) => n.startsWith('optimise-weekly-transcript.')), `expected a transcript under CLAUDE_HOME while running:\n${listing.join('\n')}`)
+})
+
+test('T11 AC-DATA-14: the runner has exactly one cleanup function, every rm sits inside it, and the exit and signal traps all reach it', () => {
+  const lines = fs.readFileSync(SCRIPT_PATH, 'utf8').split('\n')
+  const code = lines.map((l, i) => ({ l, i })).filter(({ l }) => !/^\s*#/.test(l))
+  const defs = code.filter(({ l }) => /^cleanup\w*\(\) \{/.test(l))
+  assert.equal(defs.length, 1, 'exactly one cleanup function')
+  const name = defs[0].l.match(/^(\w+)\(\)/)[1]
+  const start = defs[0].i
+  const end = lines.findIndex((l, i) => i > start && l === '}')
+  const outside = code.filter(({ l, i }) => (i < start || i > end) && /(^|&&\s*|\|\|\s*|;\s*|then\s+)(rm|rmdir)\s/.test(l))
+  assert.deepEqual(outside.map(({ l }) => l.trim()), [], 'no rm outside the cleanup function')
+  assert.ok(code.some(({ l }) => /^trap /.test(l) && l.includes(name) && l.includes('EXIT')), 'the EXIT trap runs the cleanup function')
+  for (const sigName of ['TERM', 'INT']) {
+    assert.ok(code.some(({ l }) => /^trap /.test(l) && l.includes(sigName)), `a trap for ${sigName}`)
+  }
+})
+
+test('T11 AC-DATA-14: the staleness check\'s clone directory is gone after a run (it goes through the same cleanup function as the transcript and the staged copy)', () => {
+  const published = makePublishedRepo()
+  const install = identicalInstallOf(published)
+  const tmp = freshDir('tmp-')
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const res = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install, env: { TMPDIR: tmp } })
+  assert.match(res.logContents, /^STALENESS ok /m, `guard against vacuity: the clone really happened:\n${res.logContents}`)
+  assert.deepEqual(fs.readdirSync(tmp), [], 'no optimise-weekly-staleness.* directory may be left behind')
 })

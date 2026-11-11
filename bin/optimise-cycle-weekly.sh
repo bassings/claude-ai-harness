@@ -36,13 +36,13 @@
 #   repo (not a delivery repo) with both flags applied: a well-formed report
 #   was still produced, exit 0, and no file outside .claude/optimise-cycle-
 #   report.md was created or modified.
-#   Group 5 -- the run must be read-only w.r.t. the repo it analyses.
+#   Group 5 -- the run should be read-only w.r.t. the repo it analyses.
 #   Measured: the conductor plan-guard Stop hook (installed globally, not
 #   by this script) touched .claude/active-plan on both real repos during
-#   the 2026-08-16 run. --settings '{"disableAllHooks": true}' stops the
-#   hook firing for this invocation (verified empirically: active-plan's
-#   mtime was unchanged after a real run against a repo with the identical
-#   hook wired and an open-task plan active).
+#   the 2026-08-16 run. This group used to switch every hook off to stop
+#   that; T11 (specs/harn-audit-1.md) reversed it, because the same switch
+#   also removed the destructive-command guard and the snapshot hook from
+#   an unattended session. Hooks now stay on; see the invocation below.
 #   Group 6 -- the optimiser runs as a BACKGROUND workflow inside
 #   `claude -p`, so the real governing budget is
 #   CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (~600s unstated default), not the
@@ -87,22 +87,16 @@
 #     walk cost ~94s and its reason-string join was QUADRATIC, extrapolating
 #     to ~44 minutes and a ~3.6 MB single log line -- it would have wedged
 #     this job long after `claude` returned, for a check that a `touch -d`
-#     already defeated. --settings '{"disableAllHooks": true}' (kept, below)
-#     is real defence in depth against the ONE measured mutation source (the
-#     plan-guard Stop hook); it is not a general read-only boundary, and
-#     nothing here claims it is one.
+#     already defeated.
 #
 # Round-2 fixes to what SURVIVED review round 2 (same conductor log ticks):
-#   - `--disallowedTools` and `--settings disableAllHooks` are KEPT: both
-#     genuinely block their literal targets (proven by real `claude -p`
-#     runs), which is real defence in depth. What was false is the CLAIM
-#     that they bound the job, not the controls themselves: under the
-#     shipped flag set, a real run against a throwaway repo showed `Write`,
-#     `Edit`, `mv` and `python3 -c` all succeed, and `--settings` MERGES
-#     with the global `defaultMode: auto` rather than replacing it. This is
-#     defence in depth behind the PROMPT's read-only instruction, not a
-#     boundary -- test/static-checks.test.js pins the exact deny tokens and
-#     the disableAllHooks blob so neither can be quietly dropped.
+#   - `--disallowedTools` is KEPT: it genuinely blocks its literal targets
+#     (proven by real `claude -p` runs), which is real defence in depth.
+#     What was false was the CLAIM that a denylist bounds the job: under
+#     that flag set alone a real run against a throwaway repo showed
+#     `Write`, `Edit`, `mv` and `python3 -c` all succeed. T11 adds the
+#     allowlist below, so a tool that is not listed is refused rather than
+#     reachable -- test/static-checks.test.js pins the deny tokens.
 #   - The background-wait ceiling detector no longer greps for the bare
 #     `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` variable NAME, which false-
 #     positived on any transcript merely mentioning it (this repo's own
@@ -152,7 +146,7 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # was indistinguishable in the log from one that had it. Bump this whenever
 # this script's behaviour changes materially; test/static-checks.test.js
 # pins that it has moved past the pre-staleness-check value.
-SCRIPT_VERSION="2026-08-23.1"
+SCRIPT_VERSION="2026-11-12.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REDACT_SCRIPT="$SCRIPT_DIR/redact-transcript.mjs"
@@ -201,6 +195,129 @@ else
 fi
 
 mkdir -p "$(dirname "$LOG")"
+
+# T11: where this run's temporary files go. $TMPDIR is per-user on macOS and
+# is what launchd supplies; without it the harness's own directory is used,
+# never a fixed name in a shared /tmp.
+CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+WORK_DIR="${TMPDIR:-$CLAUDE_HOME}"
+mkdir -p "$WORK_DIR"
+LAST_RESULT="$HOME/.claude/logs/optimise-cycle-weekly.last-result"
+
+# Everything this run creates that must not outlive it. Each variable is empty
+# until the run creates the thing it names, and cleanup_run deletes only what
+# is named, so with every variable empty it deletes nothing.
+TRANSCRIPT_FILE=""
+STAGED_WORKFLOW=""      # the staged copy of optimise-cycle.js
+STAGED_MARKER=""        # byte copy of what was staged, left so a SIGKILL leftover is recognisable
+STAGED_SOURCE=""        # what the staged copy must still equal for it to be deleted
+STAGED_WORKFLOW_DIR=""  # set only when this run created .claude/workflows
+STALE_TMPDIR=""
+CLAUDE_PID=""
+
+# The one cleanup function: the exit trap, the signal handlers and the end of
+# every repo's iteration all come through here, and it holds every rm in this
+# script. The staged copy goes only if it is still byte-identical to its
+# source, so a file the repo ships, or one replaced during the run, is kept.
+cleanup_run() {
+  if [ -n "$TRANSCRIPT_FILE" ]; then
+    rm -f "$TRANSCRIPT_FILE"
+  fi
+  if [ -n "$STALE_TMPDIR" ]; then
+    rm -rf "$STALE_TMPDIR"
+  fi
+  if [ -n "$STAGED_WORKFLOW" ] && [ -f "$STAGED_WORKFLOW" ] && cmp -s "$STAGED_WORKFLOW" "$STAGED_SOURCE"; then
+    rm -f "$STAGED_WORKFLOW"
+  fi
+  if [ -n "$STAGED_MARKER" ]; then
+    rm -f "$STAGED_MARKER"
+  fi
+  if [ -n "$STAGED_WORKFLOW_DIR" ]; then
+    rmdir "$STAGED_WORKFLOW_DIR" 2>/dev/null
+  fi
+  TRANSCRIPT_FILE=""
+  STALE_TMPDIR=""
+  STAGED_WORKFLOW=""
+  STAGED_MARKER=""
+  STAGED_SOURCE=""
+  STAGED_WORKFLOW_DIR=""
+  return 0
+}
+
+# A trapped signal is only acted on once a foreground child returns, so
+# claude runs in the background and is waited on; this stops it and exits,
+# and the EXIT trap then runs the cleanup.
+on_signal() {
+  if [ -n "$CLAUDE_PID" ]; then
+    kill "$CLAUDE_PID" 2>/dev/null
+    wait "$CLAUDE_PID" 2>/dev/null
+  fi
+  exit "$1"
+}
+trap cleanup_run EXIT
+trap 'on_signal 143' TERM
+trap 'on_signal 130' INT
+
+# The tools the unattended optimiser may use, and nothing else (the run passes
+# --permission-mode dontAsk). Writes are scoped to the one report file. Bash is
+# limited to read-only git and gh queries, the node helpers the workflow
+# invokes, and the plain read-only commands around them.
+ALLOWED_TOOLS=(
+  "Skill" "Workflow" "Agent" "Read" "Grep" "Glob"
+  "Write($REPORT_REL)" "Edit($REPORT_REL)"
+  "Bash(git log:*)" "Bash(git status:*)" "Bash(git rev-parse:*)" "Bash(git remote:*)"
+  "Bash(git show:*)" "Bash(git diff:*)" "Bash(git ls-files:*)" "Bash(git check-ignore:*)"
+  "Bash(gh run list:*)" "Bash(gh run view:*)" "Bash(gh repo view:*)"
+  "Bash(node:*)" "Bash(openssl rand:*)"
+  "Bash(ls:*)" "Bash(cat:*)" "Bash(head:*)" "Bash(wc:*)" "Bash(date:*)"
+)
+
+# What the run reports about its own outcome. note_fail is the only place a
+# failure is recorded, so the exit status, the notification and the
+# last-result file cannot disagree. Labels and reasons are flattened to one
+# line: a repo label is a directory name and may hold anything.
+overall_fail=0
+PASS_LABELS=""
+FAIL_LABELS=""
+FAIL_DETAIL=""
+FIRST_FAIL_REASON=""
+VERDICT_FIRST=""
+VERDICT_ALL=""
+note_fail() {
+  local label="${1//[$'\n\r']/ }" first="${2//[$'\n\r']/ }" all="${3:-$2}"
+  all="${all//[$'\n\r']/ }"
+  overall_fail=1
+  FAIL_LABELS="${FAIL_LABELS:+$FAIL_LABELS, }$label"
+  FAIL_DETAIL="${FAIL_DETAIL:+$FAIL_DETAIL | }$label: $all"
+  if [ -z "$FIRST_FAIL_REASON" ]; then
+    FIRST_FAIL_REASON="$first"
+  fi
+}
+
+# One line, overwritten each run: UTC timestamp, verdict, labels, reasons.
+write_last_result() {
+  mkdir -p "$(dirname "$LAST_RESULT")"
+  printf '%s %s labels="%s" reasons="%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" > "$LAST_RESULT"
+}
+
+# Raises one operating-system notification for the whole run. The text goes to
+# osascript as an argument to the script's run handler, never spliced into the
+# AppleScript source, because a repo label is a directory name and a quote in
+# it would otherwise end the string. It names repo labels and the first reason
+# only, never a path or any transcript text. A notifier that fails is logged
+# and never changes the run's own result.
+notify_fail() {
+  local rc
+  timeout 30 osascript \
+    -e 'on run argv' \
+    -e 'display notification (item 1 of argv) with title (item 2 of argv)' \
+    -e 'end run' \
+    "$FAIL_LABELS: $FIRST_FAIL_REASON" "Weekly optimise-cycle FAILED" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "NOTIFY-FAILED $rc" >> "$LOG"
+  fi
+}
 
 # Per-repo verdict, decided entirely from the report artefact, claude's exit
 # code, and this script's own observations of the repo -- never from what
@@ -284,6 +401,8 @@ verdict_repo() {
   for r in "${reasons[@]}"; do
     if [ -z "$joined" ]; then joined="$r"; else joined="$joined; $r"; fi
   done
+  VERDICT_FIRST="${reasons[0]}"
+  VERDICT_ALL="$joined"
   echo "RESULT FAIL $repo_label reason=\"$joined\""
   return 1
 }
@@ -299,11 +418,9 @@ verdict_repo() {
 # CLAUDE_HOME is the SAME override install-consistency.mjs's own
 # resolveInstallDir() reads (see that file's header comment) -- one
 # variable, one meaning, shared by both mechanisms.
-CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 LIB_SCRIPT="$SCRIPT_DIR/../workflows/lib/install-consistency.mjs"
 
 echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting version=$SCRIPT_VERSION ===" >> "$LOG"
-overall_fail=0
 
 log_staleness() {
   echo "STALENESS $1 $2" >> "$LOG"
@@ -324,12 +441,6 @@ log_staleness() {
 # is read-only throughout (AC-OPS-2), proven by test/weekly-runner.test.js
 # hashing every file under a fixture install before and after a run that
 # reports drift.
-STALE_TMPDIR=""
-cleanup_stale_tmpdir() {
-  [ -n "$STALE_TMPDIR" ] && rm -rf "$STALE_TMPDIR"
-}
-trap cleanup_stale_tmpdir EXIT
-
 # OPTIMISE_WEEKLY_STALENESS_REMOTE is a test seam, exactly like
 # OPTIMISE_WEEKLY_REPOS/OPTIMISE_WEEKLY_LOG above -- never operator-facing
 # configuration. Unset, it defaults to this repo's real published home.
@@ -346,7 +457,7 @@ elif ! command -v node >/dev/null 2>&1; then
 elif ! command -v git >/dev/null 2>&1; then
   log_staleness could-not-check '{"error":"git not found on PATH"}'
 else
-  STALE_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/optimise-weekly-staleness.XXXXXX")
+  STALE_TMPDIR=$(mktemp -d "$WORK_DIR/optimise-weekly-staleness.XXXXXX")
   if git clone --depth 1 --quiet "$STALENESS_REMOTE" "$STALE_TMPDIR/src" >/dev/null 2>&1; then
     result_json=$(node "$LIB_SCRIPT" --check-staleness "$STALE_TMPDIR/src" "$CLAUDE_HOME" 2>/dev/null)
     node_status=$?
@@ -402,10 +513,17 @@ else
     # a staleness check that could not run never fails the weekly run.
     log_staleness could-not-check '{"error":"git clone of the staleness remote failed"}'
   fi
-  rm -rf "$STALE_TMPDIR"
-  STALE_TMPDIR=""
+  cleanup_run
 fi
 # ---- end AC-OPS-1..5 staleness check ---------------------------------
+
+# T11: an empty repo list used to end the run with exit 0 and no RESULT line,
+# which reads as "nothing to do" when the real state is "nothing is being
+# checked". It is a FAIL, so it is logged, notified and non-zero like any other.
+if [ ${#REPOS[@]} -eq 0 ]; then
+  echo 'RESULT FAIL - reason="no repos configured"' >> "$LOG"
+  note_fail "-" "no repos configured"
+fi
 
 # Group 8: bash 3.2's `set -u` treats "${REPOS[@]}" on a genuinely empty
 # array as an unbound-variable error; the ${arr[@]+"${arr[@]}"} idiom below
@@ -418,7 +536,7 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # deliberately not a repo (SKIP, below).
   if [ ! -e "$repo" ]; then
     echo "RESULT FAIL $repo_label reason=\"configured repo path does not exist\"" >> "$LOG"
-    overall_fail=1
+    note_fail "$repo_label" "configured repo path does not exist"
     continue
   fi
 
@@ -433,7 +551,7 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   echo "--- $repo_label ---" >> "$LOG"
   if ! cd "$repo"; then
     echo "RESULT FAIL $repo_label reason=\"cd into repo failed\"" >> "$LOG"
-    overall_fail=1
+    note_fail "$repo_label" "cd into repo failed"
     continue
   fi
 
@@ -454,10 +572,27 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # Two things this must never do: overwrite a repo that deliberately ships
   # its own tuned copy (repo-local wins on name collision, per the harness
   # contract), or delete a file it did not create. Both are pinned by tests.
-  staged_workflow=""
   global_workflow="$CLAUDE_HOME/workflows/optimise-cycle.js"
   repo_workflow="$repo/.claude/workflows/optimise-cycle.js"
-  staged_workflow_dir=""
+  staged_marker="$repo/.claude/workflows/.optimise-cycle.js.staged"
+
+  # T11: a SIGKILL cannot be trapped, so a run killed that way leaves its
+  # staged copy behind. Staging therefore also leaves a marker: a byte copy of
+  # what was staged. A copy that still matches its marker is our own
+  # leftover, and is deleted here, by the one cleanup function, before this
+  # run stages afresh. A file with no marker, or one that no longer matches
+  # it, is the repo's own and is never touched.
+  if [ -e "$staged_marker" ]; then
+    STAGED_MARKER="$staged_marker"
+    STAGED_WORKFLOW="$repo_workflow"
+    STAGED_SOURCE="$staged_marker"
+    STAGED_WORKFLOW_DIR="$repo/.claude/workflows"
+    if [ -f "$repo_workflow" ] && cmp -s "$repo_workflow" "$staged_marker"; then
+      echo "REMOVED-LEFTOVER-STAGED $repo_label" >> "$LOG"
+    fi
+    cleanup_run
+  fi
+
   if [ -e "$repo_workflow" ]; then
     echo "repo ships its own optimise-cycle.js; leaving it alone" >> "$LOG"
   elif [ ! -f "$global_workflow" ]; then
@@ -465,15 +600,18 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     # Staging is an aid, not a precondition, so this is a note, not a failure.
     echo "no global optimise-cycle.js to stage ($global_workflow)" >> "$LOG"
   else
+    # The state is recorded BEFORE anything is created, so a signal between
+    # two of the steps below still reaches the cleanup with the full picture.
+    STAGED_SOURCE="$global_workflow"
+    STAGED_MARKER="$staged_marker"
+    STAGED_WORKFLOW="$repo_workflow"
     if [ ! -d "$repo/.claude/workflows" ]; then
-      staged_workflow_dir="$repo/.claude/workflows"
+      STAGED_WORKFLOW_DIR="$repo/.claude/workflows"
     fi
-    if mkdir -p "$repo/.claude/workflows" && cp "$global_workflow" "$repo_workflow"; then
-      staged_workflow="$repo_workflow"
+    if mkdir -p "$repo/.claude/workflows" && cp "$global_workflow" "$staged_marker" && cp "$global_workflow" "$repo_workflow"; then
       echo "staged .claude/workflows/optimise-cycle.js from $global_workflow" >> "$LOG"
     else
-      staged_workflow=""
-      staged_workflow_dir=""
+      cleanup_run
       echo "could not stage optimise-cycle.js; the run may copy one itself" >> "$LOG"
     fi
   fi
@@ -481,7 +619,8 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   start_epoch=$(date +%s)
   if ! [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
     echo "RESULT FAIL $repo_label reason=\"could not capture a valid run start time (start_epoch)\"" >> "$LOG"
-    overall_fail=1
+    note_fail "$repo_label" "could not capture a valid run start time (start_epoch)"
+    cleanup_run
     continue
   fi
 
@@ -489,42 +628,34 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # capture the transcript as diagnostic context only -- verdict_repo above
   # is what actually decides PASS/FAIL.
   #
-  # Group 4 -- defence in depth, not a boundary (subtraction round): a real
-  # `claude -p` run under exactly this flag set still succeeded at `Write`,
-  # `Edit`, `mv` and `python3 -c` writing outside the repo, since these
-  # flags deny only their LITERAL enumerated targets and `--settings`
-  # merges with (does not replace) the global defaultMode: auto. They still
-  # genuinely block their listed targets (rm, sudo, git push/commit/reset,
-  # gh pr/issue/release/workflow write commands, curl/wget), which is real
-  # value; --permission-mode plan was considered and rejected, since plan
-  # mode would block the optimiser writing the very report this script's
-  # verdict depends on.
+  # T11 -- the hooks stay ON. The destructive-command guard and the snapshot
+  # hook are what stand between an unattended session and a destroyed
+  # working tree, so nothing here switches them off. The permission model is
+  # an explicit allowlist: --allowedTools names every tool the optimiser
+  # needs, and --permission-mode dontAsk refuses everything else instead of
+  # prompting (nobody is there to answer) or auto-approving it. Write and
+  # Edit are scoped to the one report file. --disallowedTools stays as a
+  # second, explicit refusal of the destructive and outward-facing commands
+  # (a deny rule wins over an allow rule); --permission-mode plan was
+  # considered and rejected, since plan mode would block the optimiser
+  # writing the very report this script's verdict depends on.
   #
-  # Group 5 -- disables all hooks for this one invocation, so the globally-
-  # installed conductor plan-guard Stop hook cannot touch this repo's
-  # .claude/active-plan as a side effect of the background workflow this
-  # prompt launches (verified empirically). This is the one measured
-  # mutation source; it is not a general read-only guarantee, and nothing
-  # here checks for one after the fact (see the subtraction-round note at
-  # the top of this file for why that check was removed rather than fixed
-  # again).
-  transcript_file="$(mktemp "${TMPDIR:-/tmp}/optimise-weekly-transcript.XXXXXX")"
+  # The plan-guard Stop hook can still rewrite .claude/active-plan in a repo
+  # with a conducted plan open (the 2026-08-16 measurement above); that is
+  # the cost of leaving the guard on, and docs/release-checklist.md records
+  # the real-run check of it.
+  TRANSCRIPT_FILE="$(mktemp "$WORK_DIR/optimise-weekly-transcript.XXXXXX")"
   timeout -k 60 "$TIMEOUT_S" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
+    --allowedTools "${ALLOWED_TOOLS[@]}" \
+    --permission-mode dontAsk \
     --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" \
-    --settings '{"disableAllHooks": true}' \
-    > "$transcript_file" 2>&1
+    > "$TRANSCRIPT_FILE" 2>&1 &
+  # Backgrounded and waited on, so a SIGTERM or SIGINT to this script is
+  # handled at once (on_signal) rather than after claude finishes.
+  CLAUDE_PID=$!
+  wait "$CLAUDE_PID"
   claude_exit=$?
-
-  # Remove ONLY what was staged above, never a pre-existing file, and never a
-  # directory that already existed. Runs on the success path and on every
-  # failure path below, because a failing run is when a leftover is most
-  # likely and least noticed.
-  if [ -n "$staged_workflow" ] && [ -f "$staged_workflow" ]; then
-    rm -f "$staged_workflow"
-  fi
-  if [ -n "$staged_workflow_dir" ] && [ -d "$staged_workflow_dir" ]; then
-    rmdir "$staged_workflow_dir" 2>/dev/null || true
-  fi
+  CLAUDE_PID=""
 
   # Subtraction round: anchored to the CLI's OWN message rather than a bare
   # grep for the ceiling variable's name (which false-positived on any
@@ -532,7 +663,7 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # FAIL reason states what actually happened, not just that it happened.
   ceiling_hit=0
   ceiling_message=""
-  if ceiling_message=$(grep -Eo 'Background tasks still running after [0-9]+s; terminating' "$transcript_file" 2>/dev/null | head -n1) && [ -n "$ceiling_message" ]; then
+  if ceiling_message=$(grep -Eo 'Background tasks still running after [0-9]+s; terminating' "$TRANSCRIPT_FILE" 2>/dev/null | head -n1) && [ -n "$ceiling_message" ]; then
     ceiling_hit=1
   fi
 
@@ -544,20 +675,32 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # privacy leak. The relative script name is used in the placeholder, not
   # $REDACT_SCRIPT's absolute path, so the fallback message itself never
   # leaks the account path it exists to protect.
-  if [ -f "$REDACT_SCRIPT" ] && node "$REDACT_SCRIPT" "$repo" < "$transcript_file" >> "$LOG" 2>/dev/null; then
+  if [ -f "$REDACT_SCRIPT" ] && node "$REDACT_SCRIPT" "$repo" < "$TRANSCRIPT_FILE" >> "$LOG" 2>/dev/null; then
     :
   else
     echo "[transcript omitted: redaction step failed or is unavailable -- see bin/redact-transcript.mjs]" >> "$LOG"
   fi
-  rm -f "$transcript_file"
+  cleanup_run
 
   echo "exit=$claude_exit $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"
 
-  if ! verdict_repo "$repo" "$repo_label" "$claude_exit" "$start_epoch" "$ceiling_hit" "$ceiling_message" >> "$LOG"; then
-    overall_fail=1
+  if verdict_repo "$repo" "$repo_label" "$claude_exit" "$start_epoch" "$ceiling_hit" "$ceiling_message" >> "$LOG"; then
+    PASS_LABELS="${PASS_LABELS:+$PASS_LABELS, }$repo_label"
+  else
+    note_fail "$repo_label" "$VERDICT_FIRST" "$VERDICT_ALL"
   fi
 done
 echo "=== done $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG"
+
+# T11: the outcome outlives the log. The last-result file holds one line and
+# is overwritten by the next run, and a FAIL raises an operating-system
+# notification, so a broken weekly run is seen without anyone tailing the log.
+if [ "$overall_fail" -ne 0 ]; then
+  write_last_result FAIL "$FAIL_LABELS" "$FAIL_DETAIL"
+  notify_fail
+else
+  write_last_result PASS "$PASS_LABELS" ""
+fi
 
 # One line on stderr when anything failed, so the plist's already-wired
 # StandardErrorPath channel (0 bytes since 11 Aug) turns non-empty exactly

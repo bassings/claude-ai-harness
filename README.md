@@ -1368,46 +1368,39 @@ anchored to that specific message, not a bare grep for the ceiling
 variable's name, which used to false-positive on any transcript merely
 mentioning it (this README does, right here).
 
-**Permission constraints on the unattended job -- defence in depth, not a
-boundary.** `claude -p` runs here with `--disallowedTools` denying the
-destructive and outward-facing operations this read-only job never needs:
-`Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`, `Bash(git commit:*)`,
-`Bash(git reset:*)`, `Bash(gh pr merge:*)`, `Bash(gh pr create:*)`,
-`Bash(gh issue create:*)`, `Bash(gh release create:*)`,
-`Bash(gh workflow run:*)`, `Bash(curl:*)`, `Bash(wget:*)`, alongside
-`--settings '{"disableAllHooks": true}'` (see the plan-guard note below).
-Both are real: verified empirically, end to end, against a throwaway repo
-with both flags applied, a well-formed report was still produced (exit 0),
-and every one of the listed tools genuinely refused when invoked directly.
-**They are not a sandbox, and nothing here claims they are one.** The same
-real run showed `Write`, `Edit`, `mv` and `python3 -c` all succeed under
-this exact flag set -- `--disallowedTools` denies only its literal
-enumerated targets, and `--settings` **merges** with (does not replace)
-the global `defaultMode: auto`, so a tool not on the list is still
-reachable. The actual containment for this job is the prompt's own
-read-only instruction plus the fact that the verdict never trusts what the
-model says (PASS/FAIL above); these flags are real, additional defence in
-depth behind that, not a second, independent boundary. `--permission-mode
-plan` was considered and rejected: plan mode would prevent the optimiser
-writing the report this script's own verdict depends on, silently trading
-a permission problem for a job that runs and produces nothing.
-`test/static-checks.test.js` pins the exact deny tokens and the
-`disableAllHooks` blob in the script text, so neither can be quietly
-dropped -- deleting either previously left the whole weekly-runner test
-suite green, since every test there drives a stub `claude`, never the real
-flags.
+**Permission constraints on the unattended job -- an explicit allowlist, with
+the hooks left on.** `claude -p` runs here with `--allowedTools` naming every
+tool the optimiser needs (read-only git and gh queries, the node helpers the
+workflow invokes, and `Write`/`Edit` scoped to the one report file) and
+`--permission-mode dontAsk`, which refuses every tool not on the list rather
+than prompting or auto-approving it. `--disallowedTools` stays as a second,
+explicit refusal of `Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`,
+`Bash(git commit:*)`, `Bash(git reset:*)`, `Bash(gh pr merge:*)`,
+`Bash(gh pr create:*)`, `Bash(gh issue create:*)`,
+`Bash(gh release create:*)`, `Bash(gh workflow run:*)`, `Bash(curl:*)` and
+`Bash(wget:*)`. The hooks are **not** disabled: the destructive-command guard
+and the snapshot hook stay active for the unattended session.
+`test/static-checks.test.js` pins the deny tokens and the allowlist flags in
+the script text, and `test/weekly-runner.test.js` captures the real argument
+list. The allowlist has not been exercised by a real headless run from this
+repository's tests (every test drives a stub `claude`); the real-run check is
+recorded in `docs/release-checklist.md` when it has been done.
 
-**The plan-guard Stop hook is the one measured mutation source, and
-`disableAllHooks` genuinely stops it.** Measured 2026-08-16: the
-globally-installed conductor plan-guard Stop hook touched
-`.claude/active-plan` in both delivery repos during the real run, as a
-side effect of the background workflow the optimiser launches -- nothing
-this script does, but a mutation of the analysed repo all the same.
-`--settings '{"disableAllHooks": true}'` stops that hook firing for this
-one invocation (verified empirically: `.claude/active-plan`'s mtime was
-unchanged after a real run against a repo with the identical hook wired
-and an open-task plan active). There is no postcondition checking this
-after the fact any more (see the subtraction-round note above for why).
+**The plan-guard Stop hook is the one measured mutation source.** Measured
+2026-08-16: the globally-installed conductor plan-guard Stop hook rewrote
+`.claude/active-plan` in both delivery repos during the real run, as a side
+effect of the background workflow the optimiser launches. With the hooks left
+on, a repo that has a conducted plan open can still see that happen.
+
+**A FAIL is announced, and cleanup is the runner's job.** When any repo's
+verdict is FAIL, or no repos are configured, the run raises one macOS
+notification naming the failing repo labels and the first reason, and writes
+one line to `~/.claude/logs/optimise-cycle-weekly.last-result` (UTC timestamp,
+PASS or FAIL, labels, reasons) that stays until the next run overwrites it. A
+notifier that fails leaves `NOTIFY-FAILED <exit code>` in the run log. The
+transcript temp file and the staged `optimise-cycle.js` are removed on exit
+and on SIGTERM or SIGINT; after a SIGKILL the next run recognises its own
+leftover by a marker, removes it and logs `REMOVED-LEFTOVER-STAGED <label>`.
 
 **Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
 and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
