@@ -36,67 +36,6 @@ function walk(dir, out = []) {
   return out
 }
 
-// PR2 note: these two checks originally enforced AC-SIMP-7 ("PR 1's diff
-// contains no file whose path matches optimise-cycle") by scanning the LIVE
-// tree, which was correct only while PR 2 did not exist yet. Now that
-// workflows/optimise-cycle.js and skills/optimise-cycle/ are real,
-// permanent, in-scope deliverables, a live-tree scan of this kind can never
-// pass again -- it would forever fail as written, for a reason with no
-// bearing on either PR's correctness. AC-SIMP-7 is a claim about the PR 1
-// DIFF specifically: checking it against that commit's own file list, rather
-// than the live tree, keeps the guard meaningful and lets it stay true
-// forever, exactly like checking any other already-merged commit's shape.
-//
-// The commit is resolved by its SUBJECT, not by its hash. An earlier revision
-// pinned d7eb2cc7e732cbab5c4d31441c04c6c037fa7cb9 and called it "immutable
-// historical". It was not: on 2026-08-18 a git filter-branch run (purging a
-// credential fingerprint from this public repo's history) renamed every
-// commit, and this test began failing with "fatal: Not a valid object name"
-// -- but only once the filter-branch backup refs were expired, because until
-// then refs/original still made the old object reachable and the suite stayed
-// green over a guard that was already broken. A commit hash is immutable only
-// as long as nobody rewrites history, which is exactly the circumstance under
-// which you most want your guards to still work. The subject survives a
-// rewrite; the hash does not. Resolution asserts EXACTLY ONE match, so an
-// ambiguous or missing anchor fails by name rather than silently checking
-// some other commit. This also incidentally fixes a
-// latent path-based bug in the original form: it matched the FULL absolute
-// path, so running the suite from a checkout whose own directory name
-// happens to contain "optimise-cycle" (e.g. a worktree named
-// t2-optimise-cycle, as PR 2's own build happened in) made it fail
-// regardless of repo contents -- git's own file list is always
-// repo-relative, so that failure mode cannot recur here.
-const PR1_SUBJECT_ANCHOR = '(PR 1 of HARN-OPT-1) (#1)'
-
-test('static: PR1\'s merge commit (resolved by subject, not by hash) introduced no file whose path matches "optimise-cycle" (AC-SIMP-7, checked against the historical commit rather than the live tree, which now legitimately contains PR 2\'s optimiser files)', () => {
-  const exec = require('node:child_process').execFileSync
-  // --branches --remotes, deliberately NOT --all. --all includes
-  // refs/original/, so during a filter-branch backup window BOTH the
-  // rewritten and the original commit carry this subject and the
-  // exactly-one assertion below hard-fails -- in precisely the operation this
-  // resolution was written to survive. Note the symmetry: refs/original
-  // previously kept a broken hash-pinned guard silently GREEN, and would now
-  // keep a correct subject-pinned guard RED.
-  const candidates = exec('git', ['log', '--branches', '--remotes', '--format=%H\t%s'], { cwd: ROOT, encoding: 'utf8' })
-    .split('\n')
-    .filter((l) => l.includes(PR1_SUBJECT_ANCHOR))
-  assert.strictEqual(
-    candidates.length,
-    1,
-    `expected exactly one commit whose subject contains ${JSON.stringify(PR1_SUBJECT_ANCHOR)}; found ${candidates.length}. ` +
-      'If the count is 0, history was rewritten or the subject changed: re-derive the anchor rather than pinning a hash. ' +
-      'If the count is above 1, the likeliest cause is leftover history-rewrite backup refs (refs/original/) or a stale ' +
-      'remote branch carrying the pre-rewrite commit; expire those rather than changing the anchor.'
-  )
-  const sha = candidates[0].split('\t')[0]
-  const files = exec('git', ['show', '--name-only', '--format=', sha], { cwd: ROOT, encoding: 'utf8' })
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean)
-  assert.ok(files.length > 10, 'sanity: expected PR1\'s merge commit to list many changed files')
-  assert.ok(!files.some((f) => /optimise-cycle/.test(f)), `PR1's merge commit must not have introduced an optimise-cycle path; found: ${files.filter((f) => /optimise-cycle/.test(f))}`)
-})
-
 test('static: none of the three ORIGINAL instrumented workflows (tdd-task.js, review-cycle.js, plan-cycle.js), hooks/, or conduct-plan/SKILL.md reference the optimiser -- the dependency edge points one way (AC-ARCH-8) and no per-PR path invokes it (AC-PROD-10). The optimiser\'s OWN files (workflows/optimise-cycle.js, skills/optimise-cycle/) necessarily mention their own name and are excluded from this scan, same as this test file and workflows/lib/ledger-append.mjs are excluded for citing the spec path as a documentation source.', () => {
   const targets = [
     'workflows/tdd-task.js',
@@ -1269,6 +1208,10 @@ test('static: every test file that invokes git loads the git-environment scrub, 
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const p = path.join(dir, entry.name)
+      // test/fixtures/writer-06049e4/ holds vendored byte-for-byte copies of old
+      // workflow scripts (see test/fixtures/PROVENANCE.md). They are data the
+      // tests run, not test files, and a scrub line would change their bytes.
+      if (p === path.join(testDir, 'fixtures', 'writer-06049e4')) continue
       if (entry.isDirectory()) walk(p)
       else if (entry.name.endsWith('.js')) files.push(p)
     }
@@ -1394,11 +1337,17 @@ test('static: every CI guarantee is asserted by COUNT or by structure, because p
     assert.match(ci, new RegExp(`${v}:`), `the hostile step must set ${v}`)
   }
 
-  // (d) Deleting fetch-depth from the test job stayed green because the
-  //     secrets job's copy satisfied a file-level regex. Both need it, for
-  //     different reasons.
-  assert.equal(count(/^\s*fetch-depth:\s*0\s*$/gm), 2,
-    'both the test job (subject-anchored commit resolution) and the secrets job (scheduled history sweep) need full history')
+  // (d) Full history is needed by the secrets job alone (the scheduled sweep
+  //     walks every commit, AC-SEC-19). The test job reads no history since
+  //     HARN-AUDIT-1 T4 vendored its fixtures, so it must NOT carry it
+  //     (AC-SIMP-14). Pinned to a count and to the secrets job's own section,
+  //     so deleting it there while leaving it elsewhere cannot pass.
+  assert.equal(count(/^\s*fetch-depth:\s*0\s*$/gm), 1,
+    'only the secrets job (scheduled history sweep) needs full history; the test job reads none')
+  const secretsStart = ci.search(/^ {2}secrets:\s*$/m)
+  const nextJobStart = ci.slice(secretsStart + 1).search(/^ {2}[A-Za-z0-9_-]+:\s*$/m)
+  const secretsSection = ci.slice(secretsStart, nextJobStart === -1 ? undefined : secretsStart + 1 + nextJobStart)
+  assert.ok(secretsStart !== -1 && /^\s*fetch-depth:\s*0\s*$/m.test(secretsSection), 'the fetch-depth: 0 must sit in the secrets job')
 
   // M1: on push and pull_request, gitleaks-action supplies its own
   // --log-opts range and never walks all refs. Only a trigger it passes no
@@ -1600,6 +1549,50 @@ test('static: EXECUTING the pre-push hook in a directory where the test glob mat
   } finally {
     fs.rmSync(empty, { recursive: true, force: true })
   }
+})
+
+// HARN-AUDIT-1 T4 (AC-QA-9): the suite reads no repository history. A test that runs git against a fixed commit id, or finds a
+// commit by subject across all branches and remotes, breaks in a shallow clone and when history is rewritten. Vendored copies under
+// test/fixtures/ replace them (see test/fixtures/PROVENANCE.md). The patterns are assembled from fragments so this file does not
+// match its own source. test/fixtures/ is excluded because it holds vendored bytes, not tests.
+function historyDependencyOffences(text) {
+  const hex = '[0-9a-f]{7,40}'
+  const offences = []
+  if (new RegExp(`git\\s+show\\s+${hex}\\b\\s*:`).test(text)) offences.push('git show <hex>:')
+  if (new RegExp(`['"\`]show['"\`]\\s*,\\s*[\`'"]${hex}\\s*:`).test(text)) offences.push("a 'show' call with a hex revision")
+  for (const [, name] of text.matchAll(new RegExp(`\\b(?:const|let|var)\\s+(\\w+)\\s*=\\s*['"]${hex}['"]`, 'g'))) {
+    if (new RegExp(`['"\`]show['"\`]\\s*,\\s*\`\\$\\{${name}\\}\\s*:|git\\s+show\\s+\\$\\{${name}\\}\\s*:`).test(text)) offences.push(`a 'show' call on the hex constant ${name}`)
+  }
+  if (new RegExp(`rev-parse\\s+${hex}\\b|['"\`]rev-parse['"\`]\\s*,\\s*['"\`]${hex}['"\`]`).test(text)) offences.push('rev-parse <hex>')
+  if (text.includes('--' + 'branches') && text.includes('--' + 'remotes')) offences.push('a subject lookup across branches and remotes')
+  return offences
+}
+
+test('static: no test reads repository history -- no git show or rev-parse of a fixed hex id, no branches-and-remotes subject lookup (AC-QA-9)', () => {
+  const files = []
+  const walkTests = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name)
+      if (entry.isDirectory()) { if (p !== path.join(ROOT, 'test', 'fixtures')) walkTests(p) } else if (/\.(c|m)?js$/.test(entry.name)) files.push(p)
+    }
+  }
+  walkTests(path.join(ROOT, 'test'))
+  assert.ok(files.length > 40, `sanity: expected many test files, found ${files.length}`)
+  const found = files.map((f) => [path.relative(ROOT, f), historyDependencyOffences(fs.readFileSync(f, 'utf8'))]).filter(([, o]) => o.length)
+  assert.deepEqual(found, [], 'these test files depend on repository history; vendor the file under test/fixtures/ instead')
+})
+
+test('static: the history-dependency detector fires on each shape it names and stays quiet on a temp-repo git show (it can fail)', () => {
+  // The sample revision is assembled at run time so this file does not match its own scan.
+  const rev = ['0604', '9e4'].join('')
+  const name = 'OLD_REV'
+  assert.deepEqual(historyDependencyOffences(`sh(\`git show ${rev}:workflows/x.js\`)`), ['git show <hex>:'])
+  assert.deepEqual(historyDependencyOffences(`execFileSync('git', ['show', \`${rev}:a.js\`])`), ["a 'show' call with a hex revision"])
+  assert.deepEqual(historyDependencyOffences(`const ${name} = '${rev}'\nexecFileSync('git', ['show', \`` + '$' + '{' + name + '}' + `:a.js\`])`), [`a 'show' call on the hex constant ${name}`])
+  assert.deepEqual(historyDependencyOffences(`run('git rev-parse ${rev}')`), ['rev-parse <hex>'])
+  assert.deepEqual(historyDependencyOffences(`git('rev-parse', '${rev}')`), ['rev-parse <hex>'])
+  assert.deepEqual(historyDependencyOffences("['log', '--" + "branches', '--" + "remotes']"), ['a subject lookup across branches and remotes'])
+  assert.deepEqual(historyDependencyOffences('sh(`git show ${ref}:README.md`, dir); sh(`git rev-parse ${ref}`, dir); git rev-parse --show-toplevel'), [])
 })
 
 // H1 from review round 2: a committed hook is inert in every fresh clone,
