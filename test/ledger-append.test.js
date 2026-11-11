@@ -322,7 +322,7 @@ function fakeGitShim(mode, failFirst, failFrom = 1e9) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-git-shim-'))
   trackTempDir(dir)
   const counter = path.join(dir, 'check-ignore-calls')
-  const misbehave = mode === 'sleep' ? 'exec sleep 30' : 'exit 128'
+  const misbehave = { sleep: 'exec sleep 30', exit128: 'exit 128', kill: 'kill -9 $$' }[mode]
   fs.writeFileSync(path.join(dir, 'git'),
     `#!/bin/sh\nif [ "$1" = check-ignore ]; then\n  n=$(cat "${counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${counter}"\n  if [ "$n" -le ${failFirst} ] || [ "$n" -ge ${failFrom} ]; then ${misbehave}; fi\nfi\nexec "${real}" "$@"\n`,
     { mode: 0o755 })
@@ -359,6 +359,40 @@ test('ledger-append: a git check-ignore that times out once is retried, the chec
   assert.ok(shim.calls() >= 2, `sanity: the shim must have slowed the first check-ignore and seen the retry, saw ${shim.calls()} calls`)
   assert.match(r.stderr, /^ledger-append: git check-ignore timed out after 500ms, retry succeeded\n$/m, 'a recovered timeout leaves one stderr line')
   assert.equal(r.stdout, '', 'stdout carries the single JSON result line and nothing else')
+})
+
+// The commonest real recovery: the path is already ignored, so the retry returns normally (exit 0) rather than by git's
+// exit 1. The stderr line must be left on this path too, or a loaded machine leaves no trace of the retry.
+test('ledger-append: a timed-out check-ignore whose retry returns normally (path already ignored) leaves the stderr line and no stdout (HARN-AUDIT-1 T1)', async () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.git', 'info'), { recursive: true })
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
+  const shim = slowGitShim(1)
+  const r = await ensureGitignoredThroughSlowGit(shim, repo)
+  assert.equal(r.verdict, true)
+  assert.equal(shim.calls(), 2, 'the first check-ignore timed out and the one retry answered')
+  assert.equal(r.stderr, 'ledger-append: git check-ignore timed out after 500ms, retry succeeded\n')
+  assert.equal(r.stdout, '')
+})
+
+// Same recovery through the whole writer, with a git that is killed by a signal instead of timing out (no wait needed):
+// the row is written, stdout is exactly one JSON line, and stderr carries the signal wording.
+test('ledger-append: a check-ignore killed by a signal and retried successfully writes the row, keeps stdout to one JSON line, and says it was killed (HARN-AUDIT-1 T1)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.git', 'info'), { recursive: true })
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
+  const shim = fakeGitShim('kill', 1)
+  const res = spawnSync(process.execPath, [APPEND_SCRIPT], {
+    cwd: repo,
+    encoding: 'utf8',
+    input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'killed-git' }),
+    env: { ...require('./helpers/temp-repo.js').sanitizedGitEnv(), PATH: `${shim.dir}${path.delimiter}${process.env.PATH}` },
+  })
+  assert.equal(res.stdout.trim().split('\n').length, 1, 'stdout is one line')
+  assert.equal(JSON.parse(res.stdout).write_ok, true)
+  assert.match(res.stderr, /^ledger-append: git check-ignore was killed by SIGKILL, retry succeeded$/m)
+  assert.equal(shim.calls(), 2)
+  assert.equal(readLedgerLines(repo).length, 1)
 })
 
 test('ledger-append: a git check-ignore that times out twice refuses the write with a message that says it timed out, never the negation message (HARN-AUDIT-1 T1)', async () => {
