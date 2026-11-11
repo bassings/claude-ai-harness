@@ -389,3 +389,662 @@ test('install.sh (M6): no path is interpolated into JavaScript source -- the sea
   assert.ok(/pathToFileURL/.test(code),
     'the library path must be resolved from an argv entry via pathToFileURL, the convention bin/optimise-cycle-weekly.sh already uses')
 })
+
+// --- T14 (audit O1, O5): first install, backup on overwrite, branch warning ---
+//
+// Every run below points CLAUDE_HOME at a mkdtemp directory. The stub checkout
+// replaces the file list with a handful of named files so a test can overwrite,
+// kill, or lose a specific one; the real-repo tests further down use run().
+
+const { hermeticRepoConfig } = require('./helpers/git-env.js')
+
+const STUB_LIB = `
+export function listInstallFiles() { return { files: JSON.parse(process.env.STUB_FILES), required: [], optional: [], blind: false } }
+export function checkStaleness() { return { missing: [], drifted: [], drift: [], blind: false, unmatched_patterns: [], status: 'ok' } }
+`
+
+function stubCheckout(files, { listed = Object.keys(files), branch = 'main', dirName = '', originHead = '' } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-stub-'))
+  test.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const dir = dirName ? path.join(root, dirName) : root
+  fs.mkdirSync(dir, { recursive: true })
+  fs.mkdirSync(path.join(dir, 'bin'), { recursive: true })
+  fs.mkdirSync(path.join(dir, 'workflows', 'lib'), { recursive: true })
+  fs.copyFileSync(SCRIPT, path.join(dir, 'bin', 'install.sh'))
+  fs.writeFileSync(path.join(dir, 'workflows', 'lib', 'install-consistency.mjs'), STUB_LIB)
+  for (const [rel, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true })
+    fs.writeFileSync(path.join(dir, rel), body)
+  }
+  const git = (...a) => spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' })
+  git('init', '-q', '-b', 'main')
+  hermeticRepoConfig(dir)
+  git('add', '-A')
+  git('commit', '-qm', 'x')
+  if (originHead) {
+    // A real bare origin whose default branch is `originHead`, so
+    // refs/remotes/origin/HEAD is set the way a clone sets it.
+    const bare = path.join(root, 'origin.git')
+    git('init', '-q', '--bare', '-b', originHead, bare)
+    git('remote', 'add', 'origin', bare)
+    git('push', '-q', 'origin', `main:${originHead}`)
+    git('fetch', '-q', 'origin')
+    git('remote', 'set-head', 'origin', originHead)
+  }
+  if (branch !== 'main') git('checkout', '-q', '-b', branch)
+  return { dir, listed }
+}
+
+function runStub(co, dest, args = [], { env = {}, shims = {} } = {}) {
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-shim-'))
+  test.after(() => fs.rmSync(shimDir, { recursive: true, force: true }))
+  for (const [name, body] of Object.entries(shims)) {
+    fs.writeFileSync(path.join(shimDir, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 })
+  }
+  return spawnSync('/bin/sh', [path.join(co.dir, 'bin', 'install.sh'), ...args], {
+    encoding: 'utf8',
+    cwd: co.dir,
+    env: { ...process.env, CLAUDE_HOME: dest, STUB_FILES: JSON.stringify(co.listed), PATH: `${shimDir}:${process.env.PATH}`, ...env },
+  })
+}
+
+function snapshot(root) {
+  const out = {}
+  const walk = (d, rel = '') => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${e.name}` : e.name
+      if (e.isDirectory()) { out[`${r}/`] = 'dir'; walk(path.join(d, e.name), r) }
+      else out[r] = require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(d, e.name))).digest('hex')
+    }
+  }
+  walk(root)
+  return out
+}
+
+function filesUnder(root) {
+  return Object.keys(snapshot(root)).filter((k) => !k.endsWith('/'))
+}
+
+// A destination the marker guard already recognises as a Claude home, so these
+// tests exercise backup, atomicity and warnings and not the first-install guard.
+function existingHome() {
+  const d = tmpInstall()
+  fs.mkdirSync(path.join(d, 'workflows'))
+  return d
+}
+
+const FIXED_DATE = { date: 'echo 20260101T000000Z' }
+const KEEP_NEWEST = 10
+
+test('install.sh (AC-DATA-10): an overwritten file is backed up byte-for-byte under .harness-backups/<timestamp>/<rel>, and the install says where', () => {
+  const co = stubCheckout({ 'skills/x/SKILL.md': 'new\n' })
+  const dest = existingHome()
+  fs.mkdirSync(path.join(dest, 'skills', 'x'), { recursive: true })
+  fs.writeFileSync(path.join(dest, 'skills', 'x', 'SKILL.md'), 'old\n')
+  const res = runStub(co, dest, [], { shims: FIXED_DATE })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.equal(fs.readFileSync(path.join(dest, 'skills', 'x', 'SKILL.md'), 'utf8'), 'new\n')
+  const backup = path.join(dest, '.harness-backups', '20260101T000000Z', 'skills', 'x', 'SKILL.md')
+  assert.equal(fs.readFileSync(backup, 'utf8'), 'old\n')
+  assert.ok(res.stdout.includes(path.join(dest, '.harness-backups', '20260101T000000Z')), `the backup directory must be printed:\n${res.stdout}`)
+})
+
+test('install.sh (AC-DATA-10): a file that does not differ, and a file that does not yet exist, make no backup and no backup directory', () => {
+  const co = stubCheckout({ 'a.md': 'same\n', 'b.md': 'fresh\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'same\n')
+  const res = runStub(co, dest)
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.equal(fs.existsSync(path.join(dest, '.harness-backups')), false)
+})
+
+test('install.sh (AC-DATA-10): when the backup cannot be written (read-only backup directory) the destination file is left byte-identical and the install exits non-zero', (t) => {
+  if (process.getuid && process.getuid() === 0) return t.skip('root ignores directory permissions, so a read-only directory cannot make the write fail')
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const bk = path.join(dest, '.harness-backups')
+  fs.mkdirSync(bk)
+  fs.chmodSync(bk, 0o555)
+  try {
+    const res = runStub(co, dest)
+    assert.notEqual(res.status, 0, 'a backup that cannot be written must stop the overwrite')
+    assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'old\n')
+    assert.match(res.stderr, /incomplete/i)
+  } finally {
+    fs.chmodSync(bk, 0o755)
+  }
+})
+
+test('install.sh (AC-DATA-10): two installs in the same second each overwrite a different version, and both earlier versions stay recoverable', () => {
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'v0\n')
+  // Same clock reading for both runs: the timestamp alone cannot tell them apart.
+  for (const body of ['v1\n', 'v2\n']) {
+    const res = runStub(stubCheckout({ 'a.md': body }), dest, [], { shims: FIXED_DATE })
+    assert.equal(res.status, 0, res.stdout + res.stderr)
+  }
+  const bodies = filesUnder(path.join(dest, '.harness-backups'))
+    .map((f) => fs.readFileSync(path.join(dest, '.harness-backups', f), 'utf8')).sort()
+  assert.deepEqual(bodies, ['v0\n', 'v1\n'], 'the second backup must not replace the first')
+})
+
+test('install.sh (AC-OPS-20): after an overwrite nothing loadable is duplicated: agents/, skills/, workflows/ and hooks/ hold exactly the published files', () => {
+  const files = { 'agents/a.md': 'new\n', 'skills/s/SKILL.md': 'new\n', 'workflows/w.js': 'new\n', 'hooks/h.py': 'new\n' }
+  const co = stubCheckout(files)
+  const dest = existingHome()
+  for (const rel of Object.keys(files)) {
+    fs.mkdirSync(path.dirname(path.join(dest, rel)), { recursive: true })
+    fs.writeFileSync(path.join(dest, rel), 'old\n')
+  }
+  const res = runStub(co, dest, [], { shims: FIXED_DATE })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  const loadable = filesUnder(dest).filter((f) => /^(agents|skills|workflows|hooks)\//.test(f)).sort()
+  assert.deepEqual(loadable, Object.keys(files).sort())
+  const backups = filesUnder(path.join(dest, '.harness-backups'))
+  assert.equal(backups.length, 4, 'every overwritten file is backed up, under the dedicated directory only')
+})
+
+test(`install.sh (AC-OPS-20): only the newest ${KEEP_NEWEST} backup directories are kept, and the one just made survives`, () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const names = []
+  for (let i = 1; i <= 12; i++) names.push(`202501${String(i).padStart(2, '0')}T000000Z`)
+  for (const n of names) {
+    fs.mkdirSync(path.join(dest, '.harness-backups', n), { recursive: true })
+    fs.writeFileSync(path.join(dest, '.harness-backups', n, 'a.md'), `old-${n}\n`)
+  }
+  const res = runStub(co, dest, [], { shims: FIXED_DATE })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  const kept = fs.readdirSync(path.join(dest, '.harness-backups')).sort()
+  assert.equal(kept.length, KEEP_NEWEST)
+  assert.ok(kept.includes('20260101T000000Z'), 'the backup just made is never pruned')
+  assert.ok(!kept.includes(names[0]) && !kept.includes(names[1]), 'the oldest are the ones pruned')
+  assert.ok(kept.includes(names[11]), 'the newer ones stay')
+  for (const gone of names.slice(0, 3)) assert.ok(res.stderr.includes(path.join(dest, '.harness-backups', gone)), `the pruned ${gone} must be named on stderr:\n${res.stderr}`)
+  assert.ok(!res.stderr.includes(path.join(dest, '.harness-backups', names[3])), 'a directory that was kept must not be reported as pruned')
+})
+
+test('install.sh (AC-DATA-10): a backup whose bytes do not match the original stops the overwrite: destination untouched, exit non-zero', () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  // A cp that "succeeds" into the backup directory while writing nothing.
+  const res = runStub(co, dest, [], {
+    shims: { cp: 'for _last; do :; done\ncase "$_last" in *.harness-backups*) : > "$_last"; exit 0;; esac\nexec /bin/cp "$@"' },
+  })
+  assert.notEqual(res.status, 0)
+  assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'old\n')
+})
+
+test('install.sh (AC-OPS-20): a clock that is behind the existing backups does not get the backup just made pruned', () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  for (let i = 1; i <= 12; i++) fs.mkdirSync(path.join(dest, '.harness-backups', `202501${String(i).padStart(2, '0')}T000000Z`), { recursive: true })
+  const res = runStub(co, dest, [], { shims: { date: 'echo 20200101T000000Z' } })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.equal(fs.readFileSync(path.join(dest, '.harness-backups', '20200101T000000Z', 'a.md'), 'utf8'), 'old\n')
+})
+
+test('install.sh (AC-OPS-20): --check does not count the backup directory as drift, and leaves the destination untouched', () => {
+  const real = tmpInstall()
+  assert.equal(run([], { CLAUDE_HOME: real }).status, 0)
+  fs.mkdirSync(path.join(real, '.harness-backups', '20260101T000000Z', 'agents'), { recursive: true })
+  fs.writeFileSync(path.join(real, '.harness-backups', '20260101T000000Z', 'agents', 'old.md'), 'old\n')
+  const before = snapshot(real)
+  const res = run(['--check'], { CLAUDE_HOME: real })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.deepEqual(snapshot(real), before)
+})
+
+test('install.sh (AC-QA-25): --check on a drifted destination changes neither the listing nor any hash', () => {
+  const dest = tmpInstall()
+  fs.writeFileSync(path.join(dest, 'settings.json'), '{}\n')
+  fs.mkdirSync(path.join(dest, 'projects'))
+  const before = snapshot(dest)
+  const res = run(['--check'], { CLAUDE_HOME: dest })
+  assert.notEqual(res.status, 0)
+  assert.deepEqual(snapshot(dest), before)
+})
+
+test('install.sh (AC-DATA-11): an install killed after the temp write and before the rename leaves the old file byte-identical and nothing partial at its path', () => {
+  const co = stubCheckout({ 'skills/x/a.md': 'new content\n' })
+  const dest = existingHome()
+  fs.mkdirSync(path.join(dest, 'skills', 'x'), { recursive: true })
+  fs.writeFileSync(path.join(dest, 'skills', 'x', 'a.md'), 'old content\n')
+  const rec = path.join(tmpInstall(), 'mv-source')
+  // The shim stands in for the instant between "temp file written" and
+  // "renamed into place": it records what it was asked to rename (a rename is
+  // only atomic within one filesystem, so the source must sit in the
+  // destination's own directory) and kills the installer instead of renaming.
+  const res = runStub(co, dest, [], {
+    env: { MV_REC: rec },
+    shims: { mv: 'printf %s "$2" > "$MV_REC"; cat "$2" > "$MV_REC.bytes"; kill -9 $PPID; exit 1' },
+  })
+  assert.equal(res.signal, 'SIGKILL', `the installer must have reached a rename step to be killed at:\n${res.stdout}${res.stderr}`)
+  assert.equal(fs.readFileSync(path.join(dest, 'skills', 'x', 'a.md'), 'utf8'), 'old content\n')
+  const renamed = fs.readFileSync(rec, 'utf8')
+  assert.equal(path.dirname(renamed), path.join(dest, 'skills', 'x'), 'the temp file must be in the destination file\'s own directory')
+  assert.equal(fs.readFileSync(`${rec}.bytes`, 'utf8'), 'new content\n', 'and it must already hold the new bytes when renamed')
+})
+
+test('install.sh (AC-DATA-12): a first install into a home holding only settings.json and projects/ exits 0 with every published file present, and settings.json untouched', async () => {
+  const dest = tmpInstall()
+  fs.writeFileSync(path.join(dest, 'settings.json'), '{"hooks":{}}\n')
+  fs.mkdirSync(path.join(dest, 'projects'))
+  const res = run([], { CLAUDE_HOME: dest })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  const mod = await import(require('node:url').pathToFileURL(path.join(ROOT, 'workflows', 'lib', 'install-consistency.mjs')).href)
+  const { files } = mod.listInstallFiles(ROOT)
+  assert.ok(files.length > 10)
+  for (const rel of files) assert.ok(fs.existsSync(path.join(dest, rel)), `${rel} missing after the first install`)
+  assert.equal(fs.readFileSync(path.join(dest, 'settings.json'), 'utf8'), '{"hooks":{}}\n')
+})
+
+test('install.sh (AC-DATA-12, AC-QA-25): a home with Documents/ and .zshrc is still refused with nothing written, and the printed command is runnable and completes the install', () => {
+  const dest = tmpInstall()
+  fs.mkdirSync(path.join(dest, 'Documents'))
+  fs.writeFileSync(path.join(dest, '.zshrc'), 'export A=1\n')
+  const before = snapshot(dest)
+  const res = run([], { CLAUDE_HOME: dest })
+  assert.notEqual(res.status, 0)
+  assert.deepEqual(snapshot(dest), before, 'a refusal writes zero files and creates no hook')
+  const cmds = res.stderr.split('\n').filter((l) => l.includes('HARNESS_INSTALL_REQUIRE_MARKER=0'))
+  assert.equal(cmds.length, 1, `stderr must print exactly one override command:\n${res.stderr}`)
+  const again = spawnSync('/bin/sh', ['-c', cmds[0].trim()], { encoding: 'utf8', cwd: os.tmpdir() })
+  assert.equal(again.status, 0, again.stdout + again.stderr)
+  assert.ok(fs.existsSync(path.join(dest, 'AGENT-HARNESS.md')), 'the printed command must complete the install into the same destination')
+})
+
+test('install.sh (AC-DATA-12): a destination holding only one unrelated file is refused with nothing written', () => {
+  const dest = tmpInstall()
+  fs.writeFileSync(path.join(dest, 'notes.txt'), 'n\n')
+  const before = snapshot(dest)
+  const res = run([], { CLAUDE_HOME: dest })
+  assert.notEqual(res.status, 0)
+  assert.deepEqual(snapshot(dest), before)
+})
+
+test('install.sh (AC-QA-25): installing from a dirty tree warns and names the changed file; the install still proceeds', () => {
+  const co = stubCheckout({ 'a.md': 'v1\n' })
+  fs.writeFileSync(path.join(co.dir, 'a.md'), 'v2 uncommitted\n')
+  const res = runStub(co, existingHome())
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.match(res.stderr, /warning.*uncommitted/i)
+  assert.ok(res.stderr.includes('a.md'), `the warning must name the dirty file:\n${res.stderr}`)
+})
+
+test('install.sh (AC-QA-25): installing from a non-default branch warns and names that branch', () => {
+  const co = stubCheckout({ 'a.md': 'v1\n' }, { branch: 'feature/wip' })
+  const res = runStub(co, existingHome())
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.match(res.stderr, /warning.*feature\/wip/i)
+})
+
+test('install.sh (AC-QA-25): a clean checkout on the default branch prints no warning', () => {
+  const co = stubCheckout({ 'a.md': 'v1\n' })
+  const res = runStub(co, existingHome())
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.doesNotMatch(res.stderr, /warning/i)
+})
+
+test('install.sh (AC-OPS-20): a listed source file that is not copied is printed by name, not skipped silently', () => {
+  const co = stubCheckout({ 'a.md': 'v1\n' }, { listed: ['a.md', 'gone/missing.md'] })
+  const res = runStub(co, existingHome())
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.ok((res.stdout + res.stderr).includes('gone/missing.md'), `the skipped file must be named:\n${res.stdout}${res.stderr}`)
+})
+
+// --- T14 fix round 1 ---------------------------------------------------------
+
+// F1: a typical user-home entry makes the destination a home directory, not a
+// Claude home, whatever markers it also holds. `~/projects` is common, so
+// projects/ alone proves nothing.
+for (const [label, entries] of [
+  ['projects/ + Documents/ + .zshrc', ['projects/', 'Documents/', '.zshrc']],
+  ['settings.json + .zshrc', ['settings.json', '.zshrc']],
+  ['workflows/ + Documents/', ['workflows/', 'Documents/']],
+  ['skills/ + Library/', ['skills/', 'Library/']],
+  ['settings.json + Downloads/ + Desktop/', ['settings.json', 'Downloads/', 'Desktop/']],
+  ['projects/ + .ssh/', ['projects/', '.ssh/']],
+  ['settings.json + .config/', ['settings.json', '.config/']],
+  ['projects/ + .bashrc + .bash_profile + .profile', ['projects/', '.bashrc', '.bash_profile', '.profile']],
+]) {
+  test(`install.sh (AC-DATA-12, F1): a destination holding ${label} is refused with nothing written, and the printed override still works`, () => {
+    const dest = tmpInstall()
+    for (const e of entries) {
+      if (e.endsWith('/')) fs.mkdirSync(path.join(dest, e))
+      else fs.writeFileSync(path.join(dest, e), 'user data\n')
+    }
+    const before = snapshot(dest)
+    const res = run([], { CLAUDE_HOME: dest })
+    assert.notEqual(res.status, 0, 'a markers-plus-home-entry destination must be refused')
+    assert.deepEqual(snapshot(dest), before, 'zero files written, no hook created')
+    assert.equal(res.stderr.split('\n').filter((l) => l.includes('HARNESS_INSTALL_REQUIRE_MARKER=0')).length, 1)
+    const cmd = res.stderr.split('\n').find((l) => l.includes('HARNESS_INSTALL_REQUIRE_MARKER=0'))
+    const again = spawnSync('/bin/sh', ['-c', cmd.trim()], { encoding: 'utf8', cwd: os.tmpdir() })
+    assert.equal(again.status, 0, again.stdout + again.stderr)
+    assert.ok(fs.existsSync(path.join(dest, 'AGENT-HARNESS.md')), 'someone who means it can still install')
+  })
+}
+
+test('install.sh (AC-DATA-12, F1): a real-shaped Claude home (settings.json, projects/, todos/, .DS_Store) still installs without an override', () => {
+  const dest = tmpInstall()
+  fs.writeFileSync(path.join(dest, 'settings.json'), '{}\n')
+  fs.writeFileSync(path.join(dest, '.DS_Store'), 'x')
+  fs.mkdirSync(path.join(dest, 'projects'))
+  fs.mkdirSync(path.join(dest, 'todos'))
+  const res = run([], { CLAUDE_HOME: dest })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.ok(fs.existsSync(path.join(dest, 'AGENT-HARNESS.md')))
+})
+
+// F2: the override line is pasted into a shell, so every path in it must be
+// quoted. Both paths carry a space, an apostrophe, a $ and a command
+// substitution that would create PWNED if the shell ever evaluated it.
+test('install.sh (F2): the printed override survives a destination and checkout path with a space, an apostrophe, a $ and a $(touch PWNED) segment', () => {
+  const hostile = "it's $HOME $(touch PWNED) dir"
+  const co = stubCheckout({ 'a.md': 'new\n' }, { listed: ['a.md', 'gone/missing.md'], dirName: hostile })
+  const destRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-hostile-'))
+  test.after(() => fs.rmSync(destRoot, { recursive: true, force: true }))
+  // Backslash-t and backslash-c are what a printing `echo` rewrites into a tab and a cut-off.
+  const dest = path.join(destRoot, `${hostile} \\t \\c`)
+  fs.mkdirSync(path.join(dest, 'Documents'), { recursive: true })
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const refused = runStub(co, dest)
+  assert.notEqual(refused.status, 0)
+  const cmds = refused.stderr.split('\n').filter((l) => l.includes('HARNESS_INSTALL_REQUIRE_MARKER=0'))
+  assert.equal(cmds.length, 1, refused.stderr)
+  const probe = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-probe-'))
+  test.after(() => fs.rmSync(probe, { recursive: true, force: true }))
+  const again = spawnSync('/bin/sh', ['-c', cmds[0].trim()], {
+    encoding: 'utf8', cwd: probe, env: { ...process.env, STUB_FILES: JSON.stringify(co.listed) },
+  })
+  assert.equal(again.status, 0, again.stdout + again.stderr)
+  assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'new\n', 'the install landed in exactly the directory that was refused')
+  assert.ok(again.stdout.includes(path.join(dest, '.harness-backups')), `the printed backup path must be the real one:\n${again.stdout}`)
+  assert.ok(again.stderr.includes(co.dir), `the skipped-file message must name the real checkout:\n${again.stderr}`)
+  for (const where of [probe, dest, co.dir, destRoot, path.dirname(co.dir), os.tmpdir()]) {
+    assert.equal(fs.existsSync(path.join(where, 'PWNED')), false, `PWNED was created in ${where}`)
+  }
+})
+
+// F4 (round 2): there is no start-up sweep. A stray <file>.harness-tmp.<pid>
+// from a SIGKILL may belong to a LIVE concurrent install, so no install ever
+// deletes a temp file it did not create itself.
+test('install.sh (F4): an install never deletes a pre-existing *.harness-tmp.* file, in or out of the published directories, and says nothing about one', () => {
+  const co = stubCheckout({ 'skills/x/a.md': 'new\n' })
+  const dest = existingHome()
+  fs.mkdirSync(path.join(dest, 'skills', 'x'), { recursive: true })
+  fs.mkdirSync(path.join(dest, 'other'))
+  const strays = [
+    path.join(dest, 'skills', 'x', 'a.md.harness-tmp.4242'),
+    path.join(dest, 'skills', 'x', 'notes.harness-tmp'),
+    path.join(dest, 'other', 'b.md.harness-tmp.4242'),
+  ]
+  for (const k of strays) fs.writeFileSync(k, 'not mine')
+  const res = runStub(co, dest)
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  for (const k of strays) assert.equal(fs.readFileSync(k, 'utf8'), 'not mine', `${k} must be untouched`)
+  assert.doesNotMatch(res.stderr, /leftover|removed/i)
+  runStub(co, dest, ['--check'])
+  for (const k of strays) assert.equal(fs.readFileSync(k, 'utf8'), 'not mine', `${k} must survive --check`)
+})
+
+// Two installs at once, with the first held between "temp file written" and
+// "renamed" by a slow cp, so its temp file is on disk for a second while the
+// second install runs start to finish. Nothing may remove it.
+test('install.sh (F4): an install started while another is between its temp write and its rename does not delete that install\'s temp file', async () => {
+  const { spawn } = require('node:child_process')
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-shim-'))
+  test.after(() => fs.rmSync(shimDir, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(shimDir, 'cp'),
+    '#!/bin/sh\nfor _last; do :; done\n/bin/cp "$@"\ncase "$_last" in *.harness-tmp.*) if [ -n "${SLOW:-}" ]; then sleep 1; fi;; esac\n', { mode: 0o755 })
+  const start = (extra) => {
+    const child = spawn('/bin/sh', [path.join(co.dir, 'bin', 'install.sh')], {
+      cwd: co.dir,
+      env: { ...process.env, CLAUDE_HOME: dest, STUB_FILES: JSON.stringify(co.listed), PATH: `${shimDir}:${process.env.PATH}`, ...extra },
+    })
+    let out = ''
+    child.stdout.on('data', (d) => { out += d })
+    child.stderr.on('data', (d) => { out += d })
+    return new Promise((resolve) => child.on('close', (status) => resolve({ status, out })))
+  }
+  const first = start({ SLOW: '1' })
+  const deadline = Date.now() + 10000
+  while (!fs.readdirSync(dest).some((n) => n.includes('.harness-tmp.')) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 20))
+  }
+  assert.ok(fs.readdirSync(dest).some((n) => n.includes('.harness-tmp.')), 'the first install must be holding a temp file')
+  const second = await start({})
+  const firstDone = await first
+  assert.equal(second.status, 0, second.out)
+  assert.equal(firstDone.status, 0, `the first install lost its temp file:\n${firstDone.out}`)
+  assert.doesNotMatch(firstDone.out + second.out, /leftover|removed|could not (write|replace)/i)
+  assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'new\n')
+  assert.deepEqual(fs.readdirSync(dest).filter((n) => n.includes('.harness-tmp.')), [])
+})
+
+test('install.sh (F4): a SIGTERM between the temp write and the rename removes the temp file', () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const res = runStub(co, dest, [], { shims: { mv: 'kill -TERM $PPID; exit 0' } })
+  assert.equal(res.status, 143, `${res.status} ${res.signal}\n${res.stdout}${res.stderr}`)
+  assert.deepEqual(fs.readdirSync(dest).filter((n) => n.includes('.harness-tmp.')), [], 'no temp file may be left behind')
+  assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'old\n')
+})
+
+// F5: the two boundaries of the warning.
+test('install.sh (F5): the default branch is the one origin names (trunk), not a hard-coded main', () => {
+  const onTrunk = runStub(stubCheckout({ 'a.md': 'v1\n' }, { originHead: 'trunk', branch: 'trunk' }), existingHome())
+  assert.equal(onTrunk.status, 0, onTrunk.stdout + onTrunk.stderr)
+  assert.doesNotMatch(onTrunk.stderr, /warning/i, 'trunk is the default here, so no warning')
+  const onMain = runStub(stubCheckout({ 'a.md': 'v1\n' }, { originHead: 'trunk' }), existingHome())
+  assert.equal(onMain.status, 0, onMain.stdout + onMain.stderr)
+  assert.match(onMain.stderr, /warning.*'main'.*'trunk'/i, 'main is not the default here, so it warns, naming both')
+})
+
+test('install.sh (F5): an untracked file alone is not a dirty tree', () => {
+  const co = stubCheckout({ 'a.md': 'v1\n' })
+  fs.writeFileSync(path.join(co.dir, 'scratch.txt'), 'untracked\n')
+  const res = runStub(co, existingHome())
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.doesNotMatch(res.stderr, /warning/i)
+})
+
+// F6: retention counts only the timestamp directories it would delete.
+test('install.sh (F6): strays in .harness-backups do not reduce the number of timestamp directories kept, and are never deleted', () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const bk = path.join(dest, '.harness-backups')
+  const names = []
+  for (let i = 1; i <= 12; i++) names.push(`202501${String(i).padStart(2, '0')}T000000Z`)
+  for (const n of names) fs.mkdirSync(path.join(bk, n), { recursive: true })
+  fs.writeFileSync(path.join(bk, '.DS_Store'), 'x')
+  fs.mkdirSync(path.join(bk, 'my-own-notes'))
+  fs.writeFileSync(path.join(bk, 'my-own-notes', 'n.txt'), 'mine')
+  // '0-mine' sorts before every timestamp name, so a deleter that did not
+  // filter by name would reach it first.
+  fs.mkdirSync(path.join(bk, '0-mine'))
+  fs.mkdirSync(path.join(bk, 'archive'))
+  const res = runStub(co, dest, [], { shims: FIXED_DATE })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  const entries = fs.readdirSync(bk)
+  assert.equal(entries.filter((n) => /^\d{8}T\d{6}Z/.test(n)).length, KEEP_NEWEST)
+  for (const stray of ['.DS_Store', 'my-own-notes', 'archive', '0-mine']) assert.ok(entries.includes(stray), `${stray} must survive`)
+  assert.equal(fs.readFileSync(path.join(bk, 'my-own-notes', 'n.txt'), 'utf8'), 'mine')
+})
+
+// F7: a mid-install failure says how far it got and how to recover.
+test('install.sh (F7): a failure after some files were updated says how many, that the install is incomplete, and both ways out', () => {
+  const co = stubCheckout({ 'a.md': 'new-a\n', 'b.md': 'new-b\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old-a\n')
+  const res = runStub(co, dest, [], {
+    shims: {
+      ...FIXED_DATE,
+      cp: 'for _last; do :; done\ncase "$_last" in *b.md.harness-tmp*) exit 1;; esac\nexec /bin/cp "$@"',
+    },
+  })
+  assert.notEqual(res.status, 0)
+  assert.match(res.stderr, /incomplete/i)
+  assert.match(res.stderr, /1 file\(s\) (were )?updated/i)
+  assert.match(res.stderr, /re-run/i)
+  assert.equal((res.stderr.match(/INCOMPLETE/g) || []).length, 1, `the notice must print once, not once per path:\n${res.stderr}`)
+  assert.match(res.stderr, /restores files this run overwrote/i)
+  assert.match(res.stderr, /files this run added are not in the backup.*'updated:' lines.*delete them by hand/i)
+  assert.ok(res.stderr.includes(path.join(dest, '.harness-backups', '20260101T000000Z')), `the restore source must be named:\n${res.stderr}`)
+})
+
+// --- T14 fix round 2 ---------------------------------------------------------
+
+for (const [label, make] of [
+  ['settings.json', (d) => fs.writeFileSync(path.join(d, 'settings.json'), '{}\n')],
+  ['projects/', (d) => fs.mkdirSync(path.join(d, 'projects'))],
+]) {
+  test(`install.sh (AC-DATA-12): ${label} on its own is a Claude-home marker, so the install proceeds without an override`, () => {
+    const dest = tmpInstall()
+    make(dest)
+    const res = run([], { CLAUDE_HOME: dest })
+    assert.equal(res.status, 0, res.stdout + res.stderr)
+    assert.ok(fs.existsSync(path.join(dest, 'AGENT-HARNESS.md')))
+  })
+}
+
+test('install.sh (round 2): an exit under set -e after some files were updated prints the INCOMPLETE notice, exactly once', () => {
+  const co = stubCheckout({ 'a.md': 'new-a\n', 'workflows/lib/x.md': 'new-x\n' })
+  const dest = existingHome()
+  // workflows/lib is a regular file, so the mkdir -p for the second file fails
+  // outside any fail_install path.
+  fs.writeFileSync(path.join(dest, 'workflows', 'lib'), 'in the way')
+  const res = runStub(co, dest)
+  assert.notEqual(res.status, 0)
+  assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'new-a\n', 'the first file was updated')
+  assert.equal((res.stderr.match(/INCOMPLETE/g) || []).length, 1, res.stderr)
+  assert.match(res.stderr, /files this run added .*'updated:' lines.*delete them by hand/i)
+  assert.match(res.stderr, /1 file\(s\) updated/)
+})
+
+test('install.sh (round 2): a set -e exit before any file was updated prints no INCOMPLETE notice', () => {
+  const co = stubCheckout({ 'workflows/lib/x.md': 'new-x\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'workflows', 'lib'), 'in the way')
+  const res = runStub(co, dest)
+  assert.notEqual(res.status, 0, 'the mkdir -p must fail for this test to mean anything')
+  assert.doesNotMatch(res.stderr, /INCOMPLETE/, 'nothing was updated, so nothing is incomplete')
+})
+
+test('install.sh (round 2): a SIGTERM after some files were updated prints the INCOMPLETE notice, exactly once, and removes the temp file', () => {
+  const co = stubCheckout({ 'a.md': 'new-a\n', 'b.md': 'new-b\n' })
+  const dest = existingHome()
+  const res = runStub(co, dest, [], {
+    shims: { mv: 'case "$2" in *b.md.harness-tmp.*) kill -TERM $PPID; exit 0;; esac\nexec /bin/mv "$@"' },
+  })
+  assert.equal(res.status, 143, `${res.status} ${res.signal}\n${res.stderr}`)
+  assert.equal((res.stderr.match(/INCOMPLETE/g) || []).length, 1, res.stderr)
+  assert.match(res.stderr, /1 file\(s\) updated/)
+  assert.deepEqual(fs.readdirSync(dest).filter((n) => n.includes('.harness-tmp.')), [])
+})
+
+test('install.sh (round 2): a failure before any file was updated still says so exactly once (no duplicate from the exit trap)', (t) => {
+  if (process.getuid && process.getuid() === 0) return t.skip('root ignores directory permissions')
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const bk = path.join(dest, '.harness-backups')
+  fs.mkdirSync(bk)
+  fs.chmodSync(bk, 0o555)
+  try {
+    const res = runStub(co, dest)
+    assert.equal((res.stderr.match(/INCOMPLETE/g) || []).length, 1, res.stderr)
+  } finally {
+    fs.chmodSync(bk, 0o755)
+  }
+})
+
+test('install.sh (round 2): the recovery notice says a symlinked destination is replaced by a regular file and the backup holds the target\'s bytes', () => {
+  const co = stubCheckout({ 'a.md': 'new-a\n', 'workflows/lib/x.md': 'new-x\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'workflows', 'lib'), 'in the way')
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const res = runStub(co, dest)
+  assert.match(res.stderr, /symlink was replaced by a regular file, and its backup holds the target's bytes, not the link/)
+})
+
+// --- T14 fix round 3 ---------------------------------------------------------
+
+test('install.sh (round 3 F-1): a backup directory that cannot be pruned is a warning, not a failure: exit 0, no INCOMPLETE, the directory named, and --check still runs', (t) => {
+  if (process.getuid && process.getuid() === 0) return t.skip('root ignores directory permissions')
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const names = []
+  for (let i = 1; i <= 10; i++) names.push(`202501${String(i).padStart(2, '0')}T000000Z`)
+  for (const n of names) fs.mkdirSync(path.join(dest, '.harness-backups', n), { recursive: true })
+  // The oldest holds a read-only subdirectory with a file in it: rm -rf cannot empty it.
+  const stuck = path.join(dest, '.harness-backups', names[0])
+  fs.mkdirSync(path.join(stuck, 'sub'))
+  fs.writeFileSync(path.join(stuck, 'sub', 'f'), 'x')
+  fs.chmodSync(path.join(stuck, 'sub'), 0o555)
+  try {
+    const res = runStub(co, dest, [], { shims: FIXED_DATE })
+    assert.equal(res.status, 0, res.stdout + res.stderr)
+    assert.doesNotMatch(res.stderr, /INCOMPLETE/)
+    assert.ok(res.stderr.includes(`could not prune old backup directory ${stuck}; delete it by hand`), res.stderr)
+    assert.match(res.stdout, /matches this checkout/, '--check must still have run')
+  } finally {
+    fs.chmodSync(path.join(stuck, 'sub'), 0o755)
+  }
+})
+
+test('install.sh (round 3 F-3, F-4): a symlinked destination file is replaced by a regular file, the install says so naming the link target, the target outside is untouched, and the backup is a regular file holding the target\'s bytes', () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  const outside = path.join(tmpInstall(), 'outside.md')
+  fs.writeFileSync(outside, 'outside bytes\n')
+  fs.symlinkSync(outside, path.join(dest, 'a.md'))
+  const res = runStub(co, dest, [], { shims: FIXED_DATE })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'outside bytes\n', 'the file the link pointed at is untouched')
+  assert.ok(fs.lstatSync(path.join(dest, 'a.md')).isFile(), 'the destination is now a regular file, not a link')
+  assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'new\n')
+  const backup = path.join(dest, '.harness-backups', '20260101T000000Z', 'a.md')
+  assert.ok(fs.lstatSync(backup).isFile(), 'the backup is a regular file, not a link to the original target')
+  assert.equal(fs.readFileSync(backup, 'utf8'), 'outside bytes\n')
+  assert.ok(res.stderr.includes(path.join(dest, 'a.md')) && res.stderr.includes(outside) && /regular file/.test(res.stderr),
+    `the notice must name the path and its link target:\n${res.stderr}`)
+})
+
+test('install.sh (round 3 F-3): an ordinary destination file prints no symlink notice', () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const res = runStub(co, dest)
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.doesNotMatch(res.stderr, /symlink/i)
+})
+
+for (const shape of ['a directory', 'a symlink to a directory']) {
+  test(`install.sh (round 3 F-5): ${shape} at a destination file path stops the install, with no temp file inside it or its target and the file not listed as updated`, () => {
+    const co = stubCheckout({ 'a.md': 'new\n' })
+    const dest = existingHome()
+    const elsewhere = path.join(tmpInstall(), 'target-dir')
+    fs.mkdirSync(elsewhere)
+    if (shape === 'a directory') fs.mkdirSync(path.join(dest, 'a.md'))
+    else fs.symlinkSync(elsewhere, path.join(dest, 'a.md'))
+    const res = runStub(co, dest)
+    assert.notEqual(res.status, 0)
+    assert.ok(res.stderr.includes('a.md is a directory at the destination; it was left unchanged'), res.stderr)
+    assert.doesNotMatch(res.stdout, /updated: a\.md/)
+    for (const d of [path.join(dest, 'a.md'), elsewhere]) {
+      assert.deepEqual(fs.readdirSync(d), [], `${d} must hold nothing`)
+    }
+  })
+}

@@ -36,6 +36,11 @@ REPO="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 DEST="${CLAUDE_HOME:-$HOME/.claude}"
 LIB="$REPO/workflows/lib/install-consistency.mjs"
 
+# printf, never echo: where /bin/sh's echo interprets backslash escapes (macOS),
+# a path containing a backslash would print as a different path.
+say() { printf '%s\n' "$1"; }
+warn() { printf '%s\n' "$1" >&2; }
+
 usage() {
   cat >&2 <<'USAGE'
 usage: bin/install.sh [--check]
@@ -63,7 +68,7 @@ USAGE
 # spelling that cannot be a typo of something else.
 CHECK_ONLY=0
 if [ "$#" -gt 1 ]; then
-  echo "install: too many arguments (expected at most one)." >&2
+  warn "install: too many arguments (expected at most one)."
   usage
   exit 2
 fi
@@ -72,14 +77,14 @@ case "${1:-}" in
   --check) CHECK_ONLY=1 ;;
   -h|--help) usage; exit 0 ;;
   *)
-    echo "install: unrecognised argument '$1'." >&2
+    warn "install: unrecognised argument '$1'."
     usage
     exit 2
     ;;
 esac
 
 if [ ! -f "$LIB" ]; then
-  echo "install: cannot find $LIB; run this from a claude-ai-harness checkout." >&2
+  warn "install: cannot find $LIB; run this from a claude-ai-harness checkout."
   exit 2
 fi
 
@@ -173,7 +178,7 @@ for (const f of r.files) console.log(f)
 " "$REPO" "$LIB")
 
 if [ -z "$FILES" ]; then
-  echo "install: the consumer subset came back empty; refusing to 'install' nothing." >&2
+  warn "install: the consumer subset came back empty; refusing to 'install' nothing."
   exit 2
 fi
 
@@ -189,31 +194,213 @@ fi
 # exited 0. The comment above said "opt in with ...=0", which was already
 # describing the opt-OUT direction this now actually implements: the guard
 # is ON by default, and =0 is how a genuinely fresh install opts out of it.
+#
+# A first install is a destination holding nothing, or holding the markers of a
+# Claude home: settings.json or projects/ (what Claude Code itself creates
+# before any harness is installed), or the harness's own files. Anything else
+# is refused, and the refusal prints the one command that proceeds.
+#
+# One thing outranks every marker: a typical user-home entry (a shell rc file,
+# Documents, Desktop, Library, Downloads) means this is somebody's home
+# directory, not a Claude home, however many markers it also holds. A plain
+# ~/projects is common, so a marker alone proves nothing.
+shquote() {
+  _s=$1
+  _out=
+  _sq="'"
+  while :; do
+    case $_s in
+      *"$_sq"*)
+        _pre=${_s%%"$_sq"*}
+        _out="$_out$_pre$_sq\\$_sq$_sq"
+        _s=${_s#*"$_sq"}
+        ;;
+      *) _out="$_out$_s"; break ;;
+    esac
+  done
+  printf "'%s'" "$_out"
+}
+
+refuse_destination() {
+  warn "install: $DEST does not look like a Claude install: $1. Refusing."
+  warn "         If this really is where the harness should go, run:"
+  warn "HARNESS_INSTALL_REQUIRE_MARKER=0 CLAUDE_HOME=$(shquote "$DEST") $(shquote "$REPO/bin/install.sh")"
+  exit 2
+}
+
 if [ "$CHECK_ONLY" -eq 0 ] && [ "${HARNESS_INSTALL_REQUIRE_MARKER:-1}" = "1" ]; then
   if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
-    if [ ! -e "$DEST/AGENT-HARNESS.md" ] && [ ! -d "$DEST/workflows" ] && [ ! -d "$DEST/skills" ]; then
-      echo "install: $DEST is not empty and does not look like a Claude install" >&2
-      echo "         (no AGENT-HARNESS.md, workflows/ or skills/). Refusing." >&2
-      exit 2
+    for _entry in .zshrc .bashrc .bash_profile .profile .ssh .config Documents Desktop Library Downloads; do
+      if [ -e "$DEST/$_entry" ] || [ -L "$DEST/$_entry" ]; then
+        refuse_destination "it holds $_entry, which belongs to a user's home directory"
+      fi
+    done
+    if [ ! -e "$DEST/AGENT-HARNESS.md" ] && [ ! -d "$DEST/workflows" ] && [ ! -d "$DEST/skills" ] \
+      && [ ! -e "$DEST/settings.json" ] && [ ! -d "$DEST/projects" ]; then
+      refuse_destination "it holds none of settings.json, projects/, AGENT-HARNESS.md, workflows/ or skills/"
     fi
   fi
 fi
 
+# Installing a checkout that is not the reviewed default branch, or that holds
+# uncommitted changes, puts that code live on the next session. Warn, naming
+# which, and carry on: it is a legitimate thing to do, just not silently.
+_default=$(git -C "$REPO" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)
+_default=${_default#origin/}
+[ -n "$_default" ] || _default=main
+_branch=$(git -C "$REPO" symbolic-ref --short -q HEAD 2>/dev/null || true)
+[ -n "$_branch" ] || _branch="(detached HEAD)"
+if [ "$_branch" != "$_default" ]; then
+  warn "install: warning: installing from branch '$_branch', not the default branch '$_default'."
+fi
+_dirty=$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null || true)
+if [ -n "$_dirty" ]; then
+  warn "install: warning: installing from a checkout with uncommitted changes to tracked files:"
+  printf '%s\n' "$_dirty" >&2
+fi
+
+# Overwritten files are first copied under one dedicated directory, never
+# beside the original, so a backup cannot be loaded as an agent, skill,
+# workflow or hook. Only the newest KEEP_BACKUPS timestamp directories are kept.
+KEEP_BACKUPS=10
+BK_ROOT="$DEST/.harness-backups"
+BK_DIR=""
 installed=0
+tmp=""
+
+# What an install that stopped part-way tells the operator: how far it got, that
+# the result is a mix, and the two ways out. Printed once, either by
+# fail_install (which also covers a failure before any file was updated) or by
+# the exit trap below (set -e exits, INT, TERM) when at least one file was.
+notified=0
+print_incomplete() {
+  notified=1
+  warn "install: INCOMPLETE: $installed file(s) updated before this stop, so $DEST may hold a mix of old and new files."
+  warn "         To finish: fix the cause above and re-run this installer."
+  if [ -n "$BK_DIR" ]; then
+    warn "         To undo: copy the files back from $BK_DIR (same relative paths); that restores files this run overwrote."
+    warn "         Files this run added are not in the backup: they are the 'updated:' lines above, and stay until you delete them by hand."
+    warn "         A destination that was a symlink was replaced by a regular file, and its backup holds the target's bytes, not the link."
+  else
+    warn "         No file was overwritten in this run, so there is nothing to restore."
+    warn "         Files this run added are the 'updated:' lines above, and stay until you delete them by hand."
+  fi
+}
+
+fail_install() {
+  warn "install: $1"
+  print_incomplete
+  exit 1
+}
+
+# Timestamp-named directories are the only entries retention counts or deletes.
+is_backup_name() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z*) return 0 ;;
+  esac
+  return 1
+}
+
+make_backup_dir() {
+  mkdir -p "$BK_ROOT" || fail_install "cannot create $BK_ROOT; nothing was overwritten by this step."
+  _ts=$(date -u +%Y%m%dT%H%M%SZ)
+  _cand=$_ts
+  _n=0
+  # mkdir without -p fails if the name exists, so a second install in the same
+  # second takes the next suffix instead of reusing (and overwriting into) the
+  # first one's directory.
+  while ! mkdir "$BK_ROOT/$_cand" 2>/dev/null; do
+    if [ ! -e "$BK_ROOT/$_cand" ]; then
+      fail_install "cannot create a backup directory under $BK_ROOT; nothing was overwritten by this step."
+    fi
+    _n=$((_n + 1))
+    _cand="$_ts-$_n"
+  done
+  BK_DIR="$BK_ROOT/$_cand"
+  say "install: previous versions of overwritten files are backed up in $BK_DIR"
+}
+
+# A SIGKILL can leave one <file>.harness-tmp.<pid> beside its destination. It
+# is never at the destination path and no loader matches its name, so it is
+# safe to delete by hand. No install sweeps for these: a stray may belong to a
+# live concurrent install, and deleting it would make that install fail.
+#
+# Anything else that stops the install (a set -e exit, INT, TERM) removes the
+# current temp file and, once a file has been updated, says the install is
+# incomplete, unless fail_install already did.
+on_exit() {
+  _rc=$?
+  if [ -n "$tmp" ]; then rm -f "$tmp"; fi
+  if [ "$_rc" -ne 0 ] && [ "$installed" -gt 0 ] && [ "$notified" -eq 0 ]; then
+    print_incomplete
+  fi
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 for rel in $FILES; do
   src="$REPO/$rel"
   dst="$DEST/$rel"
-  [ -f "$src" ] || continue
+  if [ ! -f "$src" ]; then
+    warn "install: skipped $rel (listed as published, but not found in $REPO)"
+    continue
+  fi
   mkdir -p "$(dirname -- "$dst")"
+  # A directory here (or a link to one) would swallow the temp file in the mv
+  # below and be reported as an update.
+  if [ -d "$dst" ]; then
+    fail_install "$rel is a directory at the destination; it was left unchanged."
+  fi
   # Only copy what actually differs, so an install is quiet and its output
   # says what genuinely moved.
-  if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
-    cp "$src" "$dst"
-    echo "updated: $rel"
-    installed=$((installed + 1))
+  if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+    continue
   fi
+  if [ -f "$dst" ]; then
+    [ -n "$BK_DIR" ] || make_backup_dir
+    mkdir -p "$(dirname -- "$BK_DIR/$rel")" \
+      && cp -p "$dst" "$BK_DIR/$rel" \
+      && cmp -s "$dst" "$BK_DIR/$rel" \
+      || fail_install "could not back up $rel; it was left unchanged."
+  fi
+  if [ -L "$dst" ]; then
+    warn "install: $dst is a symlink to $(readlink "$dst"); replacing it with a regular file."
+  fi
+  # Written beside the destination (same filesystem, so the rename is atomic)
+  # under a name no loader matches, then renamed over it: a kill at any point
+  # leaves the old file whole.
+  tmp="$dst.harness-tmp.$$"
+  cp "$src" "$tmp" && cmp -s "$src" "$tmp" \
+    || fail_install "could not write $rel; it was left unchanged."
+  mv -f "$tmp" "$dst" \
+    || fail_install "could not replace $rel; it was left unchanged."
+  tmp=""
+  say "updated: $rel"
+  installed=$((installed + 1))
 done
 
-echo "install: $installed file(s) updated in $DEST."
+if [ -n "$BK_DIR" ]; then
+  _count=0
+  for _name in $(ls -1 "$BK_ROOT"); do
+    if is_backup_name "$_name"; then _count=$((_count + 1)); fi
+  done
+  _excess=$((_count - KEEP_BACKUPS))
+  for _name in $(ls -1 "$BK_ROOT"); do
+    [ "$_excess" -gt 0 ] || break
+    is_backup_name "$_name" || continue
+    [ "$BK_ROOT/$_name" != "$BK_DIR" ] || continue
+    # Best effort: the install is already complete, so a directory that cannot
+    # be deleted is reported, not treated as a failure.
+    if rm -rf "$BK_ROOT/$_name"; then
+      warn "install: pruned old backup directory: $BK_ROOT/$_name"
+    else
+      warn "install: could not prune old backup directory $BK_ROOT/$_name; delete it by hand."
+    fi
+    _excess=$((_excess - 1))
+  done
+fi
+
+say "install: $installed file(s) updated in $DEST."
 # Verify what we just did, rather than assuming the copies landed.
 exec "$0" --check
