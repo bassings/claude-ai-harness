@@ -1187,11 +1187,14 @@ async function compiledGlobCount(glob) {
 test('review-cycle.js: the pathological glob from the security review measurement (7x "**", 5060ms to compile) is rejected by the bound check and never compiled (item 1, counted, not timed)', async () => {
   assert.ok((await compiledGlobCount('**/*.js')) > 0, 'sanity: the counter must observe a valid glob being compiled, or the zero below proves nothing')
   const glob = '**a**a**a**a**a**a**b'
+  const started = process.hrtime.bigint()
   await assert.rejects(
     () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: [glob] } } }) }),
     /HarnessTriggersShapeInvalid/
   )
   assert.equal(await compiledGlobCount(glob), 0, 'the pathological glob must be rejected before any regular expression is built from it')
+  // Informational only (no threshold, nothing asserted on it): how long the rejection took, as the old test printed.
+  process.stderr.write(`    (pathological glob rejected in ${(Number(process.hrtime.bigint() - started) / 1e6).toFixed(3)}ms)\n`)
 })
 
 // Item 2 [MEDIUM]: `?` was unescaped -- globToRe('?') threw a SyntaxError

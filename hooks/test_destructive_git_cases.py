@@ -28,9 +28,11 @@ import importlib.util
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -834,9 +836,11 @@ class TestHookProcessContract(unittest.TestCase):
     1.0s subprocess timeout that enforced it) is gone, because a loaded
     runner could fail it with nothing wrong. AC-QA-7's cost property is
     pinned as a count in TestSubprocessCallsPerSegment below; the timeout
-    here only bounds a hang."""
+    here only bounds a hang. The per-invocation timing summary the old test
+    printed is kept as informational stderr output: it asserts nothing."""
 
     def test_every_case_as_a_process_agrees_with_evaluate(self):
+        durations = []
         tmp = tempfile.mkdtemp(prefix='destructive-git-cases-proc-')
         try:
             for case in CASES:
@@ -848,11 +852,13 @@ class TestHookProcessContract(unittest.TestCase):
                     'cwd': root,
                     'hook_event_name': 'PreToolUse',
                 })
+                start = time.monotonic()
                 result = subprocess.run(
                     [sys.executable, GUARD_PATH],
                     input=payload, capture_output=True, text=True,
                     env=clean_env(), timeout=HANG_DEADLINE_SECONDS,
                 )
+                durations.append((time.monotonic() - start) * 1000.0)
                 with self.subTest(command=case['command']):
                     self.assertIn(result.returncode, (0, 2),
                                   '%r exited %s, must be 0 or 2' % (case['command'], result.returncode))
@@ -865,6 +871,9 @@ class TestHookProcessContract(unittest.TestCase):
                         self.assertTrue(result.stderr.strip(), '%r: refusal must print a reason on stderr' % (case['command'],))
         finally:
             subprocess.run(['rm', '-rf', tmp])
+        if durations:
+            print('\ndestructive-git-cases timing: n=%d max=%.1fms median=%.1fms'
+                  % (len(durations), max(durations), statistics.median(durations)), file=sys.stderr)
 
 
 class TestSubprocessCallsPerSegment(unittest.TestCase):

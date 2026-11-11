@@ -73,15 +73,43 @@ test('I: the writer really does refuse when the variable reaches it, so the chec
   assert.equal(readLedgerLines(repo).length, 0)
 })
 
-// One line in each gate: the variable, the runner and every file, so the line can be read and compared whole.
-const READONLY_RUN = /HARNESS_LEDGER_READONLY=1 node --test ((?:test\/[\w.-]+\.test\.js ?)+)$/m
+// One executable line in each gate: the variable, the runner and every file, so the line can be read and compared whole.
+// Anchored to the start of the line (after an optional `run: ` in ci.yml), so a commented-out copy, which would leave the
+// gate unrun, cannot satisfy it.
+const READONLY_RUN = /^[ \t]*(?:run: )?HARNESS_LEDGER_READONLY=1 node --test ((?:test\/[\w.-]+\.test\.js ?)+)[ \t]*$/m
+
+test('I: the READONLY_RUN pattern rejects a commented-out line and accepts a real one (self-check)', () => {
+  const files = 'test/a.test.js test/b.test.js'
+  assert.equal(READONLY_RUN.exec(`# HARNESS_LEDGER_READONLY=1 node --test ${files}\n`), null, 'a "# " line must not count')
+  assert.equal(READONLY_RUN.exec(`  #HARNESS_LEDGER_READONLY=1 node --test ${files}\n`), null, 'an indented comment must not count')
+  assert.equal(READONLY_RUN.exec(`# run: HARNESS_LEDGER_READONLY=1 node --test ${files}\n`), null, 'a commented run: line must not count')
+  assert.equal(READONLY_RUN.exec(`HARNESS_LEDGER_READONLY=1 node --test ${files} || true\n`), null, 'a line that swallows failure must not count')
+  assert.ok(READONLY_RUN.exec(`HARNESS_LEDGER_READONLY=1 node --test ${files}\n`), 'a bare executable line counts')
+  assert.ok(READONLY_RUN.exec(`        run: HARNESS_LEDGER_READONLY=1 node --test ${files}\n`), 'a ci.yml run: line counts')
+})
 
 for (const rel of ['.github/workflows/ci.yml', '.githooks/pre-push']) {
   test(`I: ${rel} runs exactly the writer's test files with HARNESS_LEDGER_READONLY=1 exported`, () => {
     const text = fs.readFileSync(path.join(ROOT, rel), 'utf8')
     const match = READONLY_RUN.exec(text)
-    assert.ok(match, `${rel} has no line of the form "HARNESS_LEDGER_READONLY=1 node --test <files>"`)
+    assert.ok(match, `${rel} has no executable line of the form "HARNESS_LEDGER_READONLY=1 node --test <files>"`)
     assert.deepEqual(match[1].trim().split(' ').sort(), [...FILES].sort())
     for (const file of FILES) assert.ok(fs.existsSync(path.join(ROOT, file)), `${file} is listed but does not exist`)
   })
 }
+
+// A CI step that cannot fail the job is a gate that does not gate: the step holding the run line must carry neither an
+// `if:` (it could be skipped) nor `continue-on-error` (its failure would be swallowed).
+test('I: the ci.yml step that runs the READONLY line has no if: and no continue-on-error', () => {
+  const lines = fs.readFileSync(path.join(ROOT, '.github/workflows/ci.yml'), 'utf8').split('\n')
+  const at = lines.findIndex((l) => READONLY_RUN.test(l))
+  assert.ok(at >= 0, 'ci.yml has no executable READONLY line')
+  let start = at
+  while (start > 0 && !/^\s*- /.test(lines[start])) start--
+  const indent = lines[start].match(/^\s*/)[0].length
+  let end = at + 1
+  while (end < lines.length && !(lines[end].trim() !== '' && lines[end].match(/^\s*/)[0].length <= indent)) end++
+  const step = lines.slice(start, end).filter((l) => !/^\s*#/.test(l))
+  assert.ok(step.length >= 2 && step.some((l) => READONLY_RUN.test(l)), 'the step block was not located')
+  for (const l of step) assert.doesNotMatch(l, /^\s*(?:- )?(?:if|continue-on-error)\s*:/, `the READONLY step must not be skippable or failure-swallowing: ${l.trim()}`)
+})
