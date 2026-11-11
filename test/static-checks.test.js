@@ -284,17 +284,36 @@ const BINARY_ALLOWLIST = []
 // The leak scan as a function of a repository root, so it can be pointed at a
 // throwaway repo (AC-QA-24) as well as this one. Returns what it scanned and
 // every violation rather than asserting, so a caller can assert on either.
+function isValidUtf8(buf) {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buf)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function scanTrackedForLeaks(root, { binaryAllowlist = BINARY_ALLOWLIST, minFiles = 50 } = {}) {
   const violations = []
   let scanned = 0
   for (const rel of trackedFiles(root, { minFiles })) {
     const abs = path.join(root, rel)
-    if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) continue
-    const raw = fs.readFileSync(abs)
-    // A NUL byte in the first 4 KB means the scan cannot read this as text
-    // (gzip, UTF-16, an image). It used to mean "skip", which let a binary
-    // carry a home path unseen; now it is a violation unless allow-listed.
-    if (raw.subarray(0, 4096).includes(0) && !binaryAllowlist.some((e) => e.path === rel)) {
+    // lstat, never stat: a tracked symlink is stored by git as its link text, so
+    // that text is what gets scanned. Following it would skip a dangling link
+    // (the target is missing on CI) and read a file git does not track here.
+    const st = fs.lstatSync(abs, { throwIfNoEntry: false })
+    if (!st || st.isDirectory()) continue
+    const isLink = st.isSymbolicLink()
+    const raw = isLink ? Buffer.from(fs.readlinkSync(abs, 'buffer')) : fs.readFileSync(abs)
+    // "Binary" here is a heuristic with a known limit, not a proof of
+    // unreadability: a NUL byte in the first 4 KB (gzip, UTF-16, images), or
+    // content that is not valid UTF-8 at all. Small headerless compressed data
+    // that happens to be valid UTF-8 and carries no NUL is therefore scanned as
+    // text, where an encoded path would not match. It used to mean "skip",
+    // which let a binary carry a home path unseen; now it is a violation unless
+    // allow-listed. A symlink's link text is always text.
+    const unreadable = !isLink && (raw.subarray(0, 4096).includes(0) || !isValidUtf8(raw))
+    if (unreadable && !binaryAllowlist.some((e) => e.path === rel)) {
       violations.push({ rel, kind: 'binary', name: 'a tracked binary the scan cannot read as text' })
     }
     // Every file, listed binaries included, is also matched as raw bytes. The
@@ -340,7 +359,9 @@ function withTempRepo(files, fn) {
     git(['init', '-q'])
     for (const [rel, bytes] of Object.entries(files)) {
       fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true })
-      fs.writeFileSync(path.join(dir, rel), bytes)
+      // { symlink: target } makes a tracked symlink; the target need not exist.
+      if (bytes && bytes.symlink !== undefined) fs.symlinkSync(bytes.symlink, path.join(dir, rel))
+      else fs.writeFileSync(path.join(dir, rel), bytes)
       git(['add', rel])
     }
     return fn(dir)
@@ -373,7 +394,7 @@ test('static: the leak scan reads allow-listed binaries for home paths, failing 
   })
 })
 
-test('static: a tracked binary the scan cannot read as text fails unless it is on the allow-list; allow-listing it does not hide a path inside it (AC-QA-24 c, d; AC-SEC-11)', () => {
+test('static: a tracked binary the scan cannot read as text fails unless it is on the allow-list; allow-listing is a deliberate, recorded exemption that stops the scan looking inside that file, so an allow-listed gzip holding a path passes (AC-QA-24 c, d; AC-SEC-11)', () => {
   const gz = require('node:zlib').gzipSync(Buffer.from(`${syntheticHome}/project\n`))
   assert.ok(gz.subarray(0, 4096).includes(0), 'fixture precondition: the gzip has a NUL byte in its first 4 KB')
   assert.ok(!gz.toString('latin1').includes('/Users/'), 'fixture precondition: the path is NOT visible as raw bytes, so only the binary rule can catch this')
@@ -391,6 +412,38 @@ test('static: a tracked binary the scan cannot read as text fails unless it is o
     const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
     assert.equal(r.violations.length, 1, `UTF-16LE text holds NUL bytes and must trip the binary rule, got ${JSON.stringify(r)}`)
     assert.match(r.violations[0].name, BINARY_RULE)
+  })
+})
+
+test('static: content that is not valid UTF-8 is a binary even with no NUL byte in it; valid UTF-8 text, accents included, is not (AC-SEC-11)', () => {
+  // A raw deflate-style blob with no NUL byte anywhere: the NUL heuristic alone passes it as text.
+  const noNul = Buffer.from([0x78, 0x9c, 0xab, 0xff, 0xfe, 0x8b, 0x1f, 0x42])
+  assert.ok(!noNul.includes(0), 'fixture precondition: no NUL byte')
+  withTempRepo({ 'assets/blob.dat': noNul }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.equal(r.violations.length, 1, `invalid UTF-8 must trip the binary rule, got ${JSON.stringify(r)}`)
+    assert.match(r.violations[0].name, BINARY_RULE)
+    const listed = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [{ path: 'assets/blob.dat', why: 'fixture' }] })
+    assert.deepEqual(listed.violations, [], 'the allow-list must still exempt it')
+  })
+  withTempRepo({ 'notes.txt': 'caf\u00e9 \u2014 na\u00efve \u65e5\u672c\n' }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.deepEqual(r.violations, [], `valid UTF-8 text must not be called binary, got ${JSON.stringify(r)}`)
+  })
+})
+
+test('static: a tracked symlink is scanned by its link text, never followed: a home-path target fails even when dangling, a relative target passes (AC-SEC-11)', () => {
+  withTempRepo({ 'link-home': { symlink: `${syntheticHome}/project` } }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.deepEqual(r.violations.map((v) => v.rel), ['link-home'], `a dangling symlink to a home path must be reported, got ${JSON.stringify(r)}`)
+    assert.match(r.violations[0].name, /\/Users\//)
+    assert.equal(r.violations[0].kind, 'path')
+    assert.equal(r.scanned, 1, 'the symlink must count as scanned, not skipped')
+  })
+  withTempRepo({ 'docs/readme.md': 'harmless\n', 'link-rel': { symlink: 'docs/readme.md' }, 'link-gone': { symlink: '../elsewhere/none.txt' } }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.deepEqual(r.violations, [], `symlinks with harmless relative targets must pass, got ${JSON.stringify(r)}`)
+    assert.equal(r.scanned, 3, 'both symlinks and the file must have been scanned')
   })
 })
 
