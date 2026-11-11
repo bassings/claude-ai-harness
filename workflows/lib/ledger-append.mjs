@@ -1567,35 +1567,39 @@ function resolveWorkingTreeRoot(cwd) {
 // fail-closed refusal rather than a frozen writer (see the note at the call).
 const GIT_CALL_TIMEOUT_MS = 10_000
 
-// TEST-ONLY seam, a no-op unless a test sets this exact env var (same style as LEDGER_APPEND_TEST_RACE_WINDOW_MS): a
-// positive value replaces GIT_CALL_TIMEOUT_MS so a test of the timeout path need not wait ten seconds. Never set outside
-// this repo's own test suite.
-function gitCallTimeoutMs() {
-  const override = Number(process.env.LEDGER_APPEND_TEST_GIT_TIMEOUT_MS || 0)
-  return override > 0 ? override : GIT_CALL_TIMEOUT_MS
-}
-
 // A timed-out or signal-killed git child has no exit status, which is not an answer: it must never read as "git said the
 // path is not ignored" (HARN-AUDIT-1 T1: on a loaded machine a slow check-ignore was reported as a negation pattern and a
 // real row was dropped). The call is retried once; a second interruption is thrown with gitCheckTimedOut set so the caller
-// can refuse with a message that says what happened. Fail closed is unchanged: nothing is written either way.
-function retryOnceIfInterrupted(run) {
+// can refuse with a message that says what happened. Fail closed is unchanged: nothing is written either way. A retry that
+// succeeds is noted on stderr (never stdout, which carries the one JSON result line) so a loaded machine leaves a trace.
+function retryOnceIfInterrupted(run, timeoutMs) {
   const interrupted = (e) => !!e && (e.code === 'ETIMEDOUT' || (e.status == null && !!e.signal))
   try {
     return run()
   } catch (first) {
     if (!interrupted(first)) throw first
+    // The retry succeeded if it produced an answer: a normal return, or git's exit 1 (a thrown "not ignored" verdict).
+    const cause = first.code === 'ETIMEDOUT' ? `timed out after ${timeoutMs}ms` : `was killed by ${first.signal}`
+    const note = () => process.stderr.write(`ledger-append: git check-ignore ${cause}, retry succeeded\n`)
     try {
-      return run()
+      const value = run()
+      note()
+      return value
     } catch (second) {
       if (interrupted(second)) second.gitCheckTimedOut = true
+      else if (second.status === 1) note()
       throw second
     }
   }
 }
-const gitCheckTimeoutRefusal = () => `the git ignore check timed out after ${gitCallTimeoutMs()}ms and was retried once; refusing to write because the ledger could not be confirmed ignored`
+const gitCheckTimeoutRefusal = (timeoutMs) => `the git ignore check timed out after ${timeoutMs}ms and was retried once; refusing to write because the ledger could not be confirmed ignored`
+// Any other thrown git failure (exit 128 for a corrupt index, ENOENT for a missing binary) is not a verdict on the path
+// either. Names the failure class and never a path (AC-SEC-13).
+const gitCheckFailedRefusal = (e) => `git check-ignore failed (${e.status != null ? `exit ${e.status}` : e.code || 'no exit status'}) -- refusing to write because the ledger could not be confirmed ignored`
 
-function ensureGitignored(root) {
+// timeoutMs is a parameter, not an environment variable, so a test can drive the slow-git paths in-process without waiting
+// out the real bound; main() never passes it.
+export function ensureGitignored(root, timeoutMs = GIT_CALL_TIMEOUT_MS) {
   // AC-DATA-1/AC-QA-18: ask git first and touch nothing when the ledger is
   // already ignored (by this file or a tracked .gitignore). The old
   // read-modify-write truncated the exclude file in place, so a concurrent
@@ -1620,15 +1624,15 @@ function ensureGitignored(root) {
     // capped runs since. Every git call here carries a timeout so a recurrence
     // fails closed (a thrown, non-1 status below) instead of freezing the
     // caller.
-    const hit = retryOnceIfInterrupted(() => execFileSync('git', ['check-ignore', '-v', '-z', '--stdin'], { cwd: root, encoding: 'utf8', input: LEDGER_RELATIVE_PATH + '\0', stdio: ['pipe', 'pipe', 'ignore'], timeout: gitCallTimeoutMs() }))
+    const hit = retryOnceIfInterrupted(() => execFileSync('git', ['check-ignore', '-v', '-z', '--stdin'], { cwd: root, encoding: 'utf8', input: LEDGER_RELATIVE_PATH + '\0', stdio: ['pipe', 'pipe', 'ignore'], timeout: timeoutMs }), timeoutMs)
     const pattern = hit.split('\0')[2] || ''
     verdict = pattern.startsWith('!') ? 'negated' : 'ignored'
   } catch (e) {
     // M1 (AC-SEC-13): only exit 1 means "no pattern matches". Any other status
     // (128 for a corrupt index or a path beyond a symlink) is an error, and
     // treating it as unmatched failed open.
-    if (e.gitCheckTimedOut) return gitCheckTimeoutRefusal()
-    if (e.status !== 1) return false
+    if (e.gitCheckTimedOut) return gitCheckTimeoutRefusal(timeoutMs)
+    if (e.status !== 1) return gitCheckFailedRefusal(e)
   }
   if (verdict === 'ignored') return true
   if (verdict === 'negated') return false
@@ -1742,9 +1746,11 @@ function ensureGitignored(root) {
   // the path is now ignored (exit 0) or refuse; security outranks the extra
   // subprocess (AC-QA-20). Runs whether or not this writer changed the file.
   try {
-    retryOnceIfInterrupted(() => execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root, stdio: 'ignore', timeout: gitCallTimeoutMs() }))
+    retryOnceIfInterrupted(() => execFileSync('git', ['check-ignore', '-q', LEDGER_RELATIVE_PATH], { cwd: root, stdio: 'ignore', timeout: timeoutMs }), timeoutMs)
   } catch (e) {
-    if (e.gitCheckTimedOut) return gitCheckTimeoutRefusal()
+    if (e.gitCheckTimedOut) return gitCheckTimeoutRefusal(timeoutMs)
+    // Exit 1 is git's verdict that the path is still not ignored (a tracked ledger); anything else is a failure.
+    if (e.status !== 1) return gitCheckFailedRefusal(e)
     return false
   }
   return true

@@ -376,7 +376,9 @@ test('T6 M1 AC-SEC-13: a corrupt .git/index (check-ignore exits non-1) fails clo
   fs.writeFileSync(excludePath, '# untouched\n')
   const { out } = runOne(repo)
   assert.equal(out.write_ok, false)
-  assert.match(out.write_error, /not actually gitignored/)
+  // HARN-AUDIT-1 T1: a git failure is named as one, not reported as a negation pattern.
+  assert.match(out.write_error, /git check-ignore failed \(exit 128\)/)
+  assert.doesNotMatch(out.write_error, /not actually gitignored|negation/)
   assert.equal(readLedgerLines(repo).length, 0)
   assert.equal(fs.readFileSync(excludePath, 'utf8'), '# untouched\n', 'a non-1 check-ignore exit must not write the exclude file')
 })
@@ -550,10 +552,10 @@ test('T6 conductor: every git subprocess in ensureGitignored carries a timeout, 
   const body = src.slice(start, end)
   const calls = body.match(/execFileSync\('git'[^\n]*/g) || []
   assert.ok(calls.length >= 2, `expected the classifying and post-write git calls, found ${calls.length}`)
-  // HARN-AUDIT-1 T1: the calls read the timeout through gitCallTimeoutMs(), which returns GIT_CALL_TIMEOUT_MS unless the
-  // test-only LEDGER_APPEND_TEST_GIT_TIMEOUT_MS seam is set, so a slow git can be retried once and a test need not wait ten
-  // seconds. The pin is on the same property as before: no call without a timeout, and the default stays the constant.
-  for (const c of calls) assert.match(c, /timeout: (GIT_CALL_TIMEOUT_MS|gitCallTimeoutMs\(\))/, `git call without a timeout: ${c}`)
+  // HARN-AUDIT-1 T1: the calls take their bound from ensureGitignored's timeoutMs parameter (so a test can pass a short one
+  // in-process), and that parameter's default is the constant. No call without a timeout, and no environment variable.
+  for (const c of calls) assert.match(c, /timeout: timeoutMs\b/, `git call without a timeout: ${c}`)
   assert.match(src, /const GIT_CALL_TIMEOUT_MS = \d+/)
-  assert.match(src, /function gitCallTimeoutMs\(\) \{[^}]*: GIT_CALL_TIMEOUT_MS\s*\}/, 'the helper must fall back to GIT_CALL_TIMEOUT_MS')
+  assert.match(src, /function ensureGitignored\(root, timeoutMs = GIT_CALL_TIMEOUT_MS\) \{/, 'the parameter must default to GIT_CALL_TIMEOUT_MS')
+  assert.doesNotMatch(src, /process\.env\.LEDGER_APPEND_TEST_GIT/, 'no environment variable controls the git timeout')
 })
