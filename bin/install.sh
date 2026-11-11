@@ -189,30 +189,131 @@ fi
 # exited 0. The comment above said "opt in with ...=0", which was already
 # describing the opt-OUT direction this now actually implements: the guard
 # is ON by default, and =0 is how a genuinely fresh install opts out of it.
+#
+# A first install is a destination holding nothing, or holding the markers of a
+# Claude home: settings.json or projects/ (what Claude Code itself creates
+# before any harness is installed), or the harness's own files. Anything else
+# is refused, and the refusal prints the one command that proceeds.
+shquote() {
+  _s=$1
+  _out=
+  _sq="'"
+  while :; do
+    case $_s in
+      *"$_sq"*)
+        _pre=${_s%%"$_sq"*}
+        _out="$_out$_pre$_sq\\$_sq$_sq"
+        _s=${_s#*"$_sq"}
+        ;;
+      *) _out="$_out$_s"; break ;;
+    esac
+  done
+  printf "'%s'" "$_out"
+}
+
 if [ "$CHECK_ONLY" -eq 0 ] && [ "${HARNESS_INSTALL_REQUIRE_MARKER:-1}" = "1" ]; then
   if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
-    if [ ! -e "$DEST/AGENT-HARNESS.md" ] && [ ! -d "$DEST/workflows" ] && [ ! -d "$DEST/skills" ]; then
+    if [ ! -e "$DEST/AGENT-HARNESS.md" ] && [ ! -d "$DEST/workflows" ] && [ ! -d "$DEST/skills" ] \
+      && [ ! -e "$DEST/settings.json" ] && [ ! -d "$DEST/projects" ]; then
       echo "install: $DEST is not empty and does not look like a Claude install" >&2
-      echo "         (no AGENT-HARNESS.md, workflows/ or skills/). Refusing." >&2
+      echo "         (no settings.json, projects/, AGENT-HARNESS.md, workflows/ or skills/). Refusing." >&2
+      echo "         If this really is where the harness should go, run:" >&2
+      echo "HARNESS_INSTALL_REQUIRE_MARKER=0 CLAUDE_HOME=$(shquote "$DEST") $(shquote "$REPO/bin/install.sh")" >&2
       exit 2
     fi
   fi
 fi
 
+# Installing a checkout that is not the reviewed default branch, or that holds
+# uncommitted changes, puts that code live on the next session. Warn, naming
+# which, and carry on: it is a legitimate thing to do, just not silently.
+_default=$(git -C "$REPO" symbolic-ref --short -q refs/remotes/origin/HEAD 2>/dev/null || true)
+_default=${_default#origin/}
+[ -n "$_default" ] || _default=main
+_branch=$(git -C "$REPO" symbolic-ref --short -q HEAD 2>/dev/null || true)
+[ -n "$_branch" ] || _branch="(detached HEAD)"
+if [ "$_branch" != "$_default" ]; then
+  echo "install: warning: installing from branch '$_branch', not the default branch '$_default'." >&2
+fi
+_dirty=$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null || true)
+if [ -n "$_dirty" ]; then
+  echo "install: warning: installing from a checkout with uncommitted changes to tracked files:" >&2
+  printf '%s\n' "$_dirty" >&2
+fi
+
+# Overwritten files are first copied under one dedicated directory, never
+# beside the original, so a backup cannot be loaded as an agent, skill,
+# workflow or hook. Only the newest KEEP_BACKUPS timestamp directories are kept.
+KEEP_BACKUPS=10
+BK_ROOT="$DEST/.harness-backups"
+BK_DIR=""
+
+make_backup_dir() {
+  mkdir -p "$BK_ROOT" || { echo "install: cannot create $BK_ROOT; nothing overwritten." >&2; exit 1; }
+  _ts=$(date -u +%Y%m%dT%H%M%SZ)
+  _cand=$_ts
+  _n=0
+  # mkdir without -p fails if the name exists, so a second install in the same
+  # second takes the next suffix instead of reusing (and overwriting into) the
+  # first one's directory.
+  while ! mkdir "$BK_ROOT/$_cand" 2>/dev/null; do
+    if [ ! -e "$BK_ROOT/$_cand" ]; then
+      echo "install: cannot create a backup directory under $BK_ROOT; nothing overwritten." >&2
+      exit 1
+    fi
+    _n=$((_n + 1))
+    _cand="$_ts-$_n"
+  done
+  BK_DIR="$BK_ROOT/$_cand"
+  echo "install: previous versions of overwritten files are backed up in $BK_DIR"
+}
+
 installed=0
 for rel in $FILES; do
   src="$REPO/$rel"
   dst="$DEST/$rel"
-  [ -f "$src" ] || continue
+  if [ ! -f "$src" ]; then
+    echo "install: skipped $rel (listed as published, but not found in $REPO)" >&2
+    continue
+  fi
   mkdir -p "$(dirname -- "$dst")"
   # Only copy what actually differs, so an install is quiet and its output
   # says what genuinely moved.
-  if [ ! -f "$dst" ] || ! cmp -s "$src" "$dst"; then
-    cp "$src" "$dst"
-    echo "updated: $rel"
-    installed=$((installed + 1))
+  if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+    continue
   fi
+  if [ -f "$dst" ]; then
+    [ -n "$BK_DIR" ] || make_backup_dir
+    mkdir -p "$(dirname -- "$BK_DIR/$rel")" \
+      && cp -p "$dst" "$BK_DIR/$rel" \
+      && cmp -s "$dst" "$BK_DIR/$rel" \
+      || { echo "install: could not back up $rel; left it unchanged." >&2; exit 1; }
+  fi
+  # Written beside the destination (same filesystem, so the rename is atomic)
+  # under a name no loader matches, then renamed over it: a kill at any point
+  # leaves the old file whole.
+  tmp="$dst.harness-tmp.$$"
+  cp "$src" "$tmp" && cmp -s "$src" "$tmp" \
+    || { rm -f "$tmp"; echo "install: could not write $rel; left it unchanged." >&2; exit 1; }
+  mv -f "$tmp" "$dst" \
+    || { rm -f "$tmp"; echo "install: could not replace $rel; left it unchanged." >&2; exit 1; }
+  echo "updated: $rel"
+  installed=$((installed + 1))
 done
+
+if [ -n "$BK_DIR" ]; then
+  _excess=$(( $(ls -1 "$BK_ROOT" | wc -l) - KEEP_BACKUPS ))
+  for _name in $(ls -1 "$BK_ROOT"); do
+    [ "$_excess" -gt 0 ] || break
+    case "$_name" in
+      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z*)
+        [ "$BK_ROOT/$_name" != "$BK_DIR" ] || continue
+        rm -rf "$BK_ROOT/$_name"
+        _excess=$((_excess - 1))
+        ;;
+    esac
+  done
+fi
 
 echo "install: $installed file(s) updated in $DEST."
 # Verify what we just did, rather than assuming the copies landed.

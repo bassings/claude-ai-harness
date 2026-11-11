@@ -52,6 +52,15 @@ Then run the workflows namespaced:
 
 ### Manual copy (per-user, unnamespaced)
 
+The installer accepts a fresh `~/.claude` (empty, or holding only
+`settings.json` and `projects/`) and an existing install. Into any other
+non-empty directory it refuses, writes nothing, and prints the one command that
+proceeds anyway. Before it replaces a file that differs, it copies the old
+version under `~/.claude/.harness-backups/<UTC timestamp>/` and prints that
+path; the newest 10 backup directories are kept. It warns, naming which, when
+the checkout is not on the default branch or has uncommitted changes to tracked
+files, because that code goes live on your next session.
+
 ```bash
 git clone https://github.com/bassings/claude-ai-harness
 claude-ai-harness/bin/install.sh            # install, then verify
