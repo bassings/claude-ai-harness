@@ -2066,7 +2066,7 @@ test('optimise-read: a hand-seeded pre-PR1 line whose spec is a verbatim "../" t
   assert.equal(result.totals.unattributableRuns, 1)
   const stdout = JSON.stringify([...result.byPlan.entries()]) + JSON.stringify(result.totals)
   assert.ok(!stdout.includes('/home/'), 'must not leak /home/')
-  assert.ok(!stdout.includes('scott.b'), 'must not leak the account name')
+  assert.ok(!stdout.includes('some-operator'), 'must not leak the account name')
   assert.ok(!stdout.includes('.ssh'), 'must not leak the traversal\'s target file name')
 })
 
