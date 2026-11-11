@@ -412,13 +412,15 @@ conductor pieces make that state unrepresentable:
   not (see `docs/plan-guard-reasons-mutation-proofs.md`).
 
 Installing as a plugin wires the hook automatically. For manual installs,
-copy the hook and add to `~/.claude/settings.json`:
+copy the hook and add to `~/.claude/settings.json`, substituting your own
+home directory for the placeholder (`args` is not tilde-expanded, see the
+destructive git guard section below):
 
 ```json
 {
   "hooks": {
     "Stop": [{ "hooks": [{ "type": "command", "command": "python3",
-      "args": ["~/.claude/hooks/plan-guard-stop.py"], "timeout": 10 }] }]
+      "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/plan-guard-stop.py"], "timeout": 10 }] }]
   }
 }
 ```
@@ -651,13 +653,21 @@ exits 2. Substitute your own home directory below.
   "hooks": {
     "PreToolUse": [{ "matcher": "Bash", "hooks": [
       { "type": "command", "command": "python3",
-        "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/destructive-git-guard.py"], "timeout": 10 },
+        "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/destructive-git-guard.py"], "timeout": 60 },
       { "type": "command", "command": "python3",
         "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/git-snapshot.py"], "timeout": 10 }
     ] }]
   }
 }
 ```
+
+**Already installed by hand from an earlier README?** Raise the guard's
+`timeout` in your `settings.json` to 60 (earlier copies of this snippet said
+10) and replace any `~` in `args` with an absolute path. A PreToolUse hook that
+times out does not block the command, it lets it run, so a 10 second timeout
+turns a slow git call into a silent allow of the command the guard exists to
+refuse; and `args` is not tilde-expanded, so a `~` path makes the hook exit 2
+and refuse every Bash call.
 
 **What is, and is not, protected before you rely on either mechanism:**
 the snapshot mechanism below does NOT cover untracked files, ignored files
