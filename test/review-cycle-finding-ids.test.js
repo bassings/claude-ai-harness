@@ -11,7 +11,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { createHash } = require('node:crypto')
-const { execFileSync, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
 const { findingId: oracleId } = require('./helpers/finding-entries.js')
@@ -281,18 +281,11 @@ test('AC-QA-6: through the real writer, a confirmed prior records one fixed entr
 })
 
 // ---- AC-DATA-6a and AC-DATA-2 need the writer as it stood before this change ----
-const OLD_WRITER_COMMIT = '06049e4'
-let oldWriterPath = null
-try {
-  const dir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'old-writer-'))
-  oldWriterPath = path.join(dir, 'ledger-append.mjs')
-  fs.writeFileSync(oldWriterPath, execFileSync('git', ['show', `${OLD_WRITER_COMMIT}:workflows/lib/ledger-append.mjs`], { cwd: ROOT, encoding: 'utf8', env: sanitizedGitEnv(), maxBuffer: 64 * 1024 * 1024 }))
-} catch {
-  oldWriterPath = null
-}
+// Vendored byte-for-byte from that commit (see test/fixtures/PROVENANCE.md), so it is always present.
+const oldWriterPath = path.join(__dirname, 'fixtures', 'writer-06049e4', 'lib', 'ledger-append.mjs')
 const runOldWriter = (repo, payload) => JSON.parse(spawnSync('node', [oldWriterPath], { cwd: repo, input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv() }).stdout.trim().split('\n').pop())
 
-test('AC-DATA-6a: the new payload fed to the writer at 06049e4 is refused by name and never lands a row with merged or missing findings', { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+test('AC-DATA-6a: the new payload fed to the writer at 06049e4 is refused by name and never lands a row with merged or missing findings', async () => {
   const { terminal } = await review({}, withFindings([lensFinding('first claim', 'a.js:1'), lensFinding('second claim', 'a.js:2')]))
   assert.equal(terminal.finding_entries.filter((e) => e.disposition === 'open').length, 2)
   const repo = makeTempRepo()
@@ -302,7 +295,7 @@ test('AC-DATA-6a: the new payload fed to the writer at 06049e4 is refused by nam
   assert.equal(readLedgerLines(repo).length, 0, 'no row lands')
 })
 
-test('AC-OPS-4: through the 06049e4 writer the terminal write ends write_ok false, is logged, and never retries without the findings key', { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+test('AC-OPS-4: through the 06049e4 writer the terminal write ends write_ok false, is logged, and never retries without the findings key', async () => {
   const repo = makeTempRepo()
   const { result, logs, calls } = await review({}, {
     ...withFindings([lensFinding('first claim', 'a.js:1')]),
@@ -466,7 +459,7 @@ GOLDEN['unconfirmed prior with a non-enum severity, a free-text ac_id and an unk
   }
 })()
 
-test('E (round 3): a confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens records a fixed row with null severity, ac_id and lens, and the same three counters as the 06049e4 writer', { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+test('E (round 3): a confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens records a fixed row with null severity, ac_id and lens, and the same three counters as the 06049e4 writer', async () => {
   const fixture = GOLDEN['confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens']
   const { terminal } = await review(fixture.args, fixture.over)
   const oldRepo = makeTempRepo()
@@ -710,7 +703,7 @@ test('L2: a null or absent list is not a malformed one and is not counted', asyn
 })
 
 for (const [name, fixture] of Object.entries(GOLDEN)) {
-  test(`AC-DATA-2: golden row equivalence with the writer at 06049e4: ${name}`, { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+  test(`AC-DATA-2: golden row equivalence with the writer at 06049e4: ${name}`, async () => {
     const { terminal } = await review(fixture.args, fixture.over)
     const descriptors = fixture.descriptors()
     // The script nulls spec_bugs on a no-spec run and moves them to open; the fixtures here keep to what the
