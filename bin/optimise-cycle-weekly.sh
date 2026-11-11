@@ -214,12 +214,27 @@ STAGED_SOURCE=""        # what the staged copy must still equal for it to be del
 STAGED_WORKFLOW_DIR=""  # set only when this run created .claude/workflows
 STALE_TMPDIR=""
 CLAUDE_PID=""
+RUNNER_TMP=""           # the runner-owned mode-700 directory every temp file lives in
+SWEEP_PENDING=0         # set once at start-up: clear what a SIGKILLed run left in RUNNER_TMP
+RUN_COMPLETE=0          # set only when the normal end is reached
+EXIT_REASON=""          # why the run ended abnormally, when the runner knows
 
 # The one cleanup function: the exit trap, the signal handlers and the end of
 # every repo's iteration all come through here, and it holds every rm in this
 # script. The staged copy goes only if it is still byte-identical to its
 # source, so a file the repo ships, or one replaced during the run, is kept.
+# The one-off start-up sweep clears only the contents of RUNNER_TMP, a
+# directory only this runner writes to, never anything outside it.
 cleanup_run() {
+  if [ "$SWEEP_PENDING" = 1 ]; then
+    SWEEP_PENDING=0
+    for leftover in "$RUNNER_TMP"/* "$RUNNER_TMP"/.[!.]*; do
+      if [ -e "$leftover" ] || [ -L "$leftover" ]; then
+        echo "REMOVED-LEFTOVER-TMP ${leftover##*/}" >> "$LOG"
+        rm -rf "$leftover"
+      fi
+    done
+  fi
   if [ -n "$TRANSCRIPT_FILE" ]; then
     rm -f "$TRANSCRIPT_FILE"
   fi
@@ -243,20 +258,6 @@ cleanup_run() {
   STAGED_WORKFLOW_DIR=""
   return 0
 }
-
-# A trapped signal is only acted on once a foreground child returns, so
-# claude runs in the background and is waited on; this stops it and exits,
-# and the EXIT trap then runs the cleanup.
-on_signal() {
-  if [ -n "$CLAUDE_PID" ]; then
-    kill "$CLAUDE_PID" 2>/dev/null
-    wait "$CLAUDE_PID" 2>/dev/null
-  fi
-  exit "$1"
-}
-trap cleanup_run EXIT
-trap 'on_signal 143' TERM
-trap 'on_signal 130' INT
 
 # The tools the unattended optimiser may use, and nothing else (the run passes
 # --permission-mode dontAsk). Every entry is here because workflows/
@@ -334,6 +335,12 @@ note_fail() {
   fi
 }
 
+# Creates $2 as a copy of $1 only if nothing exists at $2: noclobber makes the
+# redirection an exclusive create, so it fails rather than overwrite.
+copy_new() {
+  ( set -o noclobber; cat "$1" > "$2" ) 2>/dev/null
+}
+
 # One line, overwritten each run: UTC timestamp, verdict, labels, reasons.
 write_last_result() {
   mkdir -p "$(dirname "$LAST_RESULT")"
@@ -358,6 +365,52 @@ notify_fail() {
     echo "NOTIFY-FAILED $rc" >> "$LOG"
   fi
 }
+
+# A trapped signal is only acted on once a foreground child returns, so
+# claude runs in the background and is waited on; this stops it and exits,
+# and the EXIT trap (on_exit) then cleans up and reports the outcome.
+on_signal() {
+  EXIT_REASON="killed by signal $1"
+  if [ -n "$CLAUDE_PID" ]; then
+    kill "$CLAUDE_PID" 2>/dev/null
+    wait "$CLAUDE_PID" 2>/dev/null
+  fi
+  exit "$2"
+}
+
+# Every way out of the script comes through here. The outcome defaults to
+# FAIL: only a run that reached its normal end (RUN_COMPLETE) reports what its
+# repos decided, so a signal, a `set -u` abort or any other early exit cannot
+# leave the previous run's PASS standing. Order, per the T11 review ruling:
+# cleanup first (the unredacted transcript is the privacy concern), then the
+# fast file writes, and the notification, which can take up to 30 seconds,
+# last.
+on_exit() {
+  local status=$?
+  cleanup_run
+  if [ "$RUN_COMPLETE" -eq 0 ]; then
+    local reason="${EXIT_REASON:-aborted before completion (exit status $status)}"
+    echo "RESULT FAIL - reason=\"$reason\"" >> "$LOG"
+    note_fail "-" "$reason"
+    if [ "$status" -eq 0 ]; then
+      status=1
+    fi
+  fi
+  if [ "$overall_fail" -ne 0 ]; then
+    write_last_result FAIL "$FAIL_LABELS" "$FAIL_DETAIL"
+    # One line on stderr when anything failed, so the plist's already-wired
+    # StandardErrorPath channel (0 bytes since 11 Aug) turns non-empty exactly
+    # when there is something an operator needs to see.
+    echo "weekly optimise-cycle FAILED -- see $LOG" >&2
+    notify_fail
+  else
+    write_last_result PASS "$PASS_LABELS" ""
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+trap 'on_signal 15 143' TERM
+trap 'on_signal 2 130' INT
 
 # Per-repo verdict, decided entirely from the report artefact, claude's exit
 # code, and this script's own observations of the repo -- never from what
@@ -462,6 +515,19 @@ LIB_SCRIPT="$SCRIPT_DIR/../workflows/lib/install-consistency.mjs"
 
 echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting version=$SCRIPT_VERSION ===" >> "$LOG"
 
+# T11: every temp file goes in one subdirectory only this runner writes to,
+# mode 700, so anything found in it is provably the runner's own. That is what
+# makes the one-off sweep of a SIGKILLed run's leftovers safe: it clears this
+# directory's contents and nothing outside it. A path that is a symlink or not
+# owned by this user is refused rather than used.
+RUNNER_TMP="$WORK_DIR/optimise-weekly-runner"
+if [ -L "$RUNNER_TMP" ] || ! mkdir -p "$RUNNER_TMP" 2>/dev/null || ! chmod 700 "$RUNNER_TMP" 2>/dev/null || [ ! -O "$RUNNER_TMP" ]; then
+  EXIT_REASON="runner temp directory is not a directory this user owns"
+  exit 1
+fi
+SWEEP_PENDING=1
+cleanup_run
+
 log_staleness() {
   echo "STALENESS $1 $2" >> "$LOG"
 }
@@ -497,7 +563,7 @@ elif ! command -v node >/dev/null 2>&1; then
 elif ! command -v git >/dev/null 2>&1; then
   log_staleness could-not-check '{"error":"git not found on PATH"}'
 else
-  STALE_TMPDIR=$(mktemp -d "$WORK_DIR/optimise-weekly-staleness.XXXXXX")
+  STALE_TMPDIR=$(mktemp -d "$RUNNER_TMP/optimise-weekly-staleness.XXXXXX")
   if git clone --depth 1 --quiet "$STALENESS_REMOTE" "$STALE_TMPDIR/src" >/dev/null 2>&1; then
     result_json=$(node "$LIB_SCRIPT" --check-staleness "$STALE_TMPDIR/src" "$CLAUDE_HOME" 2>/dev/null)
     node_status=$?
@@ -616,19 +682,35 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   repo_workflow="$repo/.claude/workflows/optimise-cycle.js"
   staged_marker="$repo/.claude/workflows/.optimise-cycle.js.staged"
 
+  # T11: nothing here may write through a symlink. A committer to an analysed
+  # repo could otherwise point one of these paths at any file the operator can
+  # write, and the run would create it. `[ -e ]` reports a dangling link as
+  # absent, so the links are tested for directly, and a repo holding one is
+  # refused outright rather than staged into.
+  for linked in ".claude" ".claude/workflows" ".claude/workflows/.optimise-cycle.js.staged" ".claude/workflows/optimise-cycle.js"; do
+    if [ -L "$repo/$linked" ]; then
+      echo "RESULT FAIL $repo_label reason=\"refusing to stage: $linked is a symlink\"" >> "$LOG"
+      note_fail "$repo_label" "refusing to stage: $linked is a symlink"
+      continue 2
+    fi
+  done
+
   # T11: a SIGKILL cannot be trapped, so a run killed that way leaves its
   # staged copy behind. Staging therefore also leaves a marker: a byte copy of
-  # what was staged. A copy that still matches its marker is our own
-  # leftover, and is deleted here, by the one cleanup function, before this
-  # run stages afresh. A file with no marker, or one that no longer matches
-  # it, is the repo's own and is never touched.
+  # what was staged. A copy that still matches its marker, and that git does
+  # not track, is our own leftover, and is deleted here, by the one cleanup
+  # function, before this run stages afresh. A file with no marker, one that no
+  # longer matches it, or one the repo has committed is the repo's own and is
+  # never touched.
   if [ -e "$staged_marker" ]; then
     STAGED_MARKER="$staged_marker"
-    STAGED_WORKFLOW="$repo_workflow"
-    STAGED_SOURCE="$staged_marker"
-    STAGED_WORKFLOW_DIR="$repo/.claude/workflows"
-    if [ -f "$repo_workflow" ] && cmp -s "$repo_workflow" "$staged_marker"; then
-      echo "REMOVED-LEFTOVER-STAGED $repo_label" >> "$LOG"
+    if ! git -C "$repo" ls-files --error-unmatch -- .claude/workflows/optimise-cycle.js >/dev/null 2>&1; then
+      STAGED_WORKFLOW="$repo_workflow"
+      STAGED_SOURCE="$staged_marker"
+      STAGED_WORKFLOW_DIR="$repo/.claude/workflows"
+      if [ -f "$repo_workflow" ] && cmp -s "$repo_workflow" "$staged_marker"; then
+        echo "REMOVED-LEFTOVER-STAGED $repo_label" >> "$LOG"
+      fi
     fi
     cleanup_run
   fi
@@ -640,15 +722,17 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     # Staging is an aid, not a precondition, so this is a note, not a failure.
     echo "no global optimise-cycle.js to stage ($global_workflow)" >> "$LOG"
   else
-    # The state is recorded BEFORE anything is created, so a signal between
-    # two of the steps below still reaches the cleanup with the full picture.
+    # Each file is created exclusively (copy_new), so one that appears after
+    # the checks above is never overwritten, and each is recorded for cleanup
+    # only once this run has really created it, so a file that is not ours is
+    # never deleted.
     STAGED_SOURCE="$global_workflow"
-    STAGED_MARKER="$staged_marker"
-    STAGED_WORKFLOW="$repo_workflow"
     if [ ! -d "$repo/.claude/workflows" ]; then
       STAGED_WORKFLOW_DIR="$repo/.claude/workflows"
     fi
-    if mkdir -p "$repo/.claude/workflows" && cp "$global_workflow" "$staged_marker" && cp "$global_workflow" "$repo_workflow"; then
+    if mkdir -p "$repo/.claude/workflows" \
+      && copy_new "$global_workflow" "$staged_marker" && STAGED_MARKER="$staged_marker" \
+      && copy_new "$global_workflow" "$repo_workflow" && STAGED_WORKFLOW="$repo_workflow"; then
       echo "staged .claude/workflows/optimise-cycle.js from $global_workflow" >> "$LOG"
     else
       cleanup_run
@@ -679,15 +763,20 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # (a deny rule wins over an allow rule); --permission-mode plan was
   # considered and rejected, since plan mode would block the optimiser
   # writing the very report this script's verdict depends on.
+  # --setting-sources user loads only the user's own settings, so an analysed
+  # repo's committed or local settings can neither widen the allowlist nor add
+  # hooks. The guard, snapshot and plan-guard hooks are registered at user
+  # level, so they stay.
   #
   # The plan-guard Stop hook can still rewrite .claude/active-plan in a repo
   # with a conducted plan open (the 2026-08-16 measurement above); that is
   # the cost of leaving the guard on, and docs/release-checklist.md records
   # the real-run check of it.
-  TRANSCRIPT_FILE="$(mktemp "$WORK_DIR/optimise-weekly-transcript.XXXXXX")"
+  TRANSCRIPT_FILE="$(mktemp "$RUNNER_TMP/optimise-weekly-transcript.XXXXXX")"
   timeout -k 60 "$TIMEOUT_S" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
     --allowedTools "${ALLOWED_TOOLS[@]}" \
     --permission-mode dontAsk \
+    --setting-sources user \
     --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" "Bash(git -c:*)" "Bash(git * --output*)" "Bash(git * --ext-diff*)" \
     > "$TRANSCRIPT_FILE" 2>&1 &
   # Backgrounded and waited on, so a SIGTERM or SIGINT to this script is
@@ -732,22 +821,8 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
 done
 echo "=== done $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG"
 
-# T11: the outcome outlives the log. The last-result file holds one line and
-# is overwritten by the next run, and a FAIL raises an operating-system
-# notification, so a broken weekly run is seen without anyone tailing the log.
-if [ "$overall_fail" -ne 0 ]; then
-  write_last_result FAIL "$FAIL_LABELS" "$FAIL_DETAIL"
-  notify_fail
-else
-  write_last_result PASS "$PASS_LABELS" ""
-fi
-
-# One line on stderr when anything failed, so the plist's already-wired
-# StandardErrorPath channel (0 bytes since 11 Aug) turns non-empty exactly
-# when there is something an operator needs to see, without them having to
-# tail the log speculatively every week.
-if [ "$overall_fail" -ne 0 ]; then
-  echo "weekly optimise-cycle FAILED -- see $LOG" >&2
-fi
-
+# T11: the outcome is reported by on_exit, which runs on every way out of this
+# script and defaults to FAIL; reaching this line is what lets a run report what
+# its repos decided.
+RUN_COMPLETE=1
 exit "$overall_fail"

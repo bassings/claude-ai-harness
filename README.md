@@ -1373,7 +1373,10 @@ the hooks left on.** `claude -p` runs here with `--allowedTools` naming every
 tool the optimiser needs (read-only git and gh queries, the node helpers the
 workflow invokes, and `Write`/`Edit` scoped to the one report file) and
 `--permission-mode dontAsk`, which refuses every tool not on the list rather
-than prompting or auto-approving it. `--disallowedTools` stays as a second,
+than prompting or auto-approving it, and `--setting-sources user`, so only the
+user's own settings load and an analysed repo's committed or local settings
+cannot widen the list or add hooks (the guard, snapshot and plan-guard hooks
+are registered at user level, so they stay). `--disallowedTools` stays as a second,
 explicit refusal of `Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`,
 `Bash(git commit:*)`, `Bash(git reset:*)`, `Bash(gh pr merge:*)`,
 `Bash(gh pr create:*)`, `Bash(gh issue create:*)`,
@@ -1399,8 +1402,13 @@ one line to `~/.claude/logs/optimise-cycle-weekly.last-result` (UTC timestamp,
 PASS or FAIL, labels, reasons) that stays until the next run overwrites it. A
 notifier that fails leaves `NOTIFY-FAILED <exit code>` in the run log. The
 transcript temp file and the staged `optimise-cycle.js` are removed on exit
-and on SIGTERM or SIGINT; after a SIGKILL the next run recognises its own
-leftover by a marker, removes it and logs `REMOVED-LEFTOVER-STAGED <label>`.
+and on SIGTERM or SIGINT, and a run that is stopped that way records FAIL and
+notifies like any other FAIL. Temp files live in a mode-700 directory only the
+runner writes to (`optimise-weekly-runner` under `$TMPDIR`, or under
+`~/.claude` when that is unset). After a SIGKILL the next run clears that
+directory's contents, logging `REMOVED-LEFTOVER-TMP <name>`, and recognises
+its staged copy by a marker, removes it if git does not track it, and logs
+`REMOVED-LEFTOVER-STAGED <label>`.
 
 **Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
 and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
@@ -1477,6 +1485,13 @@ rm ~/Library/LaunchAgents/com.local.optimise-cycle-weekly.plist
 ```
 
 To reinstate it later, re-run the two-line `sed`/`bootstrap` install above.
+
+If the job was ever killed with SIGKILL before the rollback, also delete
+`.claude/workflows/.optimise-cycle.js.staged` in each configured repo, and
+`.claude/workflows/optimise-cycle.js` there if it is byte-identical to that
+marker and untracked. The pre-T11 runner knows nothing of the marker and reads
+any existing workflow file as the repo's own, so a stale copy would otherwise
+stay pinned and override later global updates with no log line.
 
 **This rollback has been executed, not merely documented** (2026-08-18, per
 CLAUDE.md §11: a documented rollback nobody has run is an assumption). The

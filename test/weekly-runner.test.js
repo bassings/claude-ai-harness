@@ -1629,27 +1629,40 @@ function startRunner(repo, { home, claudeHome, tmpdir, extraPath }) {
     TMPDIR: tmpdir,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
     OPTIMISE_WEEKLY_REPOS: repo,
+    OSA_RECORD: `${log}.notify`,
+    OSA_EXIT: '0',
   }
   const child = spawn(SCRIPT_PATH, [], { env, stdio: 'ignore' })
   const done = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })))
-  return { child, log, done }
+  return { child, log, done, notifyCalls: () => readNotifyCalls(`${log}.notify`) }
 }
 
+// The runner keeps its own temp files in one subdirectory of TMPDIR (L3).
+const RUNNER_DIR = 'optimise-weekly-runner'
+
 function transcripts(dir) {
-  return fs.readdirSync(dir).filter((n) => n.startsWith('optimise-weekly-transcript.'))
+  const inner = path.join(dir, RUNNER_DIR)
+  if (!fs.existsSync(inner)) return []
+  return fs.readdirSync(inner).filter((n) => n.startsWith('optimise-weekly-transcript.'))
 }
 
 function killIfAlive(pidFile) {
   try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 'SIGKILL') } catch (e) { /* already gone */ }
 }
 
+const SIGNAL_NUMBER = { SIGTERM: 15, SIGINT: 2, SIGHUP: 1 }
+
 for (const sig of ['SIGTERM', 'SIGINT']) {
-  test(`T11 AC-OPS-4: after ${sig} mid-run no transcript temp file and no staged workflow remain, and claude is stopped`, async () => {
+  test(`T11 AC-OPS-4: after ${sig} mid-run no transcript temp file and no staged workflow remain, claude is stopped, and the outcome is recorded as FAIL and notified (M1)`, async () => {
     const repo = makeTempRepo()
     const claudeHome = freshDir('claudehome-')
     withGlobalWorkflow(claudeHome, '// global v1\n')
     const tmp = freshDir('tmp-')
-    const run = startRunner(repo, { home: freshHome(), claudeHome, tmpdir: tmp, extraPath: hangingClaude() })
+    const home = freshHome()
+    const lastResult = path.join(home, LAST_RESULT_REL)
+    fs.mkdirSync(path.dirname(lastResult), { recursive: true })
+    fs.writeFileSync(lastResult, '2026-01-01T00:00:00Z PASS labels="earlier" reasons=""\n')
+    const run = startRunner(repo, { home, claudeHome, tmpdir: tmp, extraPath: hangingClaude() })
     const pidFile = path.join(repo, '.claude-pid')
     try {
       await waitFor(() => fs.existsSync(path.join(repo, '.ready')), 'claude to start')
@@ -1663,13 +1676,45 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
       let alive = true
       try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 0) } catch (e) { alive = false }
       assert.equal(alive, false, 'claude must not be left running after the runner is told to stop')
+      const n = SIGNAL_NUMBER[sig]
+      const lines = fs.readFileSync(lastResult, 'utf8').split('\n').filter(Boolean)
+      assert.equal(lines.length, 1, lines.join('\n'))
+      assert.match(lines[0], / FAIL /, `the pre-seeded PASS must not survive a killed run:\n${lines[0]}`)
+      assert.ok(lines[0].includes(`killed by signal ${n}`), lines[0])
+      assert.match(fs.readFileSync(run.log, 'utf8'), new RegExp(`^RESULT FAIL - reason="killed by signal ${n}"$`, 'm'))
+      assert.equal(run.notifyCalls().length, 1, 'the notifier is called once')
     } finally {
       killIfAlive(pidFile)
     }
   })
 }
 
-test('T11 AC-OPS-4: the timeout killing claude leaves no transcript temp file and no staged workflow', () => {
+// The class, not only the signals the runner traps: any abnormal end (a
+// SIGHUP here, which has no handler of its own) reaches the EXIT path and
+// must read as FAIL, never leave the previous PASS standing.
+test('T11 AC-OPS-4: an abnormal end the runner has no handler for (SIGHUP) still records FAIL and notifies, because the outcome is written from the EXIT path and defaults to FAIL (M1)', async () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  const home = freshHome()
+  const lastResult = path.join(home, LAST_RESULT_REL)
+  fs.mkdirSync(path.dirname(lastResult), { recursive: true })
+  fs.writeFileSync(lastResult, '2026-01-01T00:00:00Z PASS labels="earlier" reasons=""\n')
+  const run = startRunner(repo, { home, claudeHome, tmpdir: freshDir('tmp-'), extraPath: hangingClaude() })
+  const pidFile = path.join(repo, '.claude-pid')
+  try {
+    await waitFor(() => fs.existsSync(path.join(repo, '.ready')), 'claude to start')
+    run.child.kill('SIGHUP')
+    await Promise.race([run.done, new Promise((_, rej) => setTimeout(() => rej(new Error('runner did not exit after SIGHUP')), 20000))])
+    const line = fs.readFileSync(lastResult, 'utf8')
+    assert.match(line, / FAIL /, line)
+    assert.equal(run.notifyCalls().length, 1)
+    assert.match(fs.readFileSync(run.log, 'utf8'), /^RESULT FAIL - reason="/m)
+  } finally {
+    killIfAlive(pidFile)
+  }
+})
+
+test('T11 AC-OPS-4: a claude that is SIGKILLed mid-run (the shape of the timeout\'s second-stage kill; the timeout itself is not exercised, since TIMEOUT_S has no test seam) leaves no transcript temp file and no staged workflow, and the repo FAILs', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
   withGlobalWorkflow(claudeHome, '// global v1\n')
@@ -1737,7 +1782,7 @@ test('T11 AC-SEC-10: the transcript temp file lives under CLAUDE_HOME when TMPDI
   const claudeHome = freshDir('claudehome-')
   const lister = freshDir('ls-stub-')
   fs.writeFileSync(path.join(lister, 'claude'), `#!/bin/sh
-ls "$CLAUDE_HOME" > .home-listing
+ls "$CLAUDE_HOME/optimise-weekly-runner" > .home-listing
 cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0
@@ -1746,7 +1791,7 @@ exit 0
   const res = runWeeklyScript([repo], { claudeHome, unsetEnv: ['TMPDIR'], extraPath: lister })
   assert.equal(res.status, 0, res.logContents)
   const listing = fs.readFileSync(path.join(repo, '.home-listing'), 'utf8').split('\n')
-  assert.ok(listing.some((n) => n.startsWith('optimise-weekly-transcript.')), `expected a transcript under CLAUDE_HOME while running:\n${listing.join('\n')}`)
+  assert.ok(listing.some((n) => n.startsWith('optimise-weekly-transcript.')), `expected a transcript under CLAUDE_HOME's runner directory while running:\n${listing.join('\n')}`)
 })
 
 test('T11 AC-DATA-14: the runner has exactly one cleanup function, every rm sits inside it, and the exit and signal traps all reach it', () => {
@@ -1759,7 +1804,12 @@ test('T11 AC-DATA-14: the runner has exactly one cleanup function, every rm sits
   const end = lines.findIndex((l, i) => i > start && l === '}')
   const outside = code.filter(({ l, i }) => (i < start || i > end) && /(^|&&\s*|\|\|\s*|;\s*|then\s+)(rm|rmdir)\s/.test(l))
   assert.deepEqual(outside.map(({ l }) => l.trim()), [], 'no rm outside the cleanup function')
-  assert.ok(code.some(({ l }) => /^trap /.test(l) && l.includes(name) && l.includes('EXIT')), 'the EXIT trap runs the cleanup function')
+  const exitTrap = code.find(({ l }) => /^trap /.test(l) && l.includes('EXIT'))
+  assert.ok(exitTrap, 'an EXIT trap')
+  const handler = exitTrap.l.match(/^trap '?(\w+)'? EXIT/)[1]
+  const handlerStart = lines.findIndex((l) => l.startsWith(`${handler}() {`))
+  const handlerEnd = lines.findIndex((l, i) => i > handlerStart && l === '}')
+  assert.ok(handler === name || lines.slice(handlerStart, handlerEnd).some((l) => l.trim() === name), 'the EXIT trap runs the cleanup function')
   for (const sigName of ['TERM', 'INT']) {
     assert.ok(code.some(({ l }) => /^trap /.test(l) && l.includes(sigName)), `a trap for ${sigName}`)
   }
@@ -1773,5 +1823,172 @@ test('T11 AC-DATA-14: the staleness check\'s clone directory is gone after a run
   setMarker(repo, 'pass')
   const res = runWeeklyScript([repo], { stalenessRemote: published, claudeHome: install, env: { TMPDIR: tmp } })
   assert.match(res.logContents, /^STALENESS ok /m, `guard against vacuity: the clone really happened:\n${res.logContents}`)
-  assert.deepEqual(fs.readdirSync(tmp), [], 'no optimise-weekly-staleness.* directory may be left behind')
+  assert.deepEqual(fs.readdirSync(path.join(tmp, RUNNER_DIR)), [], 'no optimise-weekly-staleness.* directory may be left behind')
+})
+
+// --- T11 fix round 1 -------------------------------------------------------
+
+// M3: the cleanup after each repo is pinned by a two-repo run. With one repo
+// the EXIT trap cleans the same state whether or not the in-loop call runs.
+function listingClaude() {
+  const dir = freshDir('listing-stub-')
+  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh
+ls "\${TMPDIR:-$CLAUDE_HOME}/optimise-weekly-runner" > .runner-listing
+mkdir -p .claude
+cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF
+exit 0
+`, { mode: 0o755 })
+  return dir
+}
+
+test('T11 M3: with two repos, the first repo\'s transcript, staged copy, marker and created directory are gone before the second repo starts', () => {
+  const a = makeTempRepo()
+  const b = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// global v1\n')
+  const tmp = freshDir('tmp-')
+  const res = runWeeklyScript([a, b], { claudeHome, extraPath: listingClaude(), env: { TMPDIR: tmp } })
+  assert.equal(res.status, 0, res.logContents)
+  const seenByB = fs.readFileSync(path.join(b, '.runner-listing'), 'utf8').split('\n').filter((n) => n.startsWith('optimise-weekly-transcript.'))
+  assert.equal(seenByB.length, 1, `while B ran only B's own transcript may exist, saw: ${seenByB.join(', ')}`)
+  assert.equal(fs.existsSync(path.join(a, '.claude', 'workflows')), false, "the first repo must have no staged copy, marker or created directory")
+  assert.equal(fs.existsSync(path.join(b, '.claude', 'workflows')), false)
+})
+
+test('T11 M3: a repo that fails on its start time still has its staged copy removed before the next repo (the start_epoch path)', () => {
+  const a = makeTempRepo()
+  const b = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// global v1\n')
+  const dateDir = freshDir('bad-date-')
+  fs.writeFileSync(path.join(dateDir, 'date'), '#!/bin/sh\nif [ "$1" = "+%s" ]; then\n  echo ""\nelse\n  exec /bin/date "$@"\nfi\n', { mode: 0o755 })
+  runWeeklyScript([a, b], { claudeHome, extraPath: dateDir })
+  assert.equal(fs.existsSync(path.join(a, '.claude', 'workflows')), false, 'the first repo must be left exactly as found')
+  assert.equal(fs.existsSync(path.join(b, '.claude', 'workflows')), false)
+})
+
+// L1 ------------------------------------------------------------------------
+
+test('T11 L1: claude is told to load user settings only, so an analysed repo\'s own settings cannot widen the allowlist or add hooks', () => {
+  const repo = makeTempRepo()
+  runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
+  assert.deepEqual(flagValues(capturedArgv(repo), '--setting-sources'), ['user'])
+})
+
+// L2 + L7 -------------------------------------------------------------------
+
+function danglingTarget() {
+  return path.join(freshDir('link-target-'), 'created-through-the-link')
+}
+
+function symlinkCase(name, build) {
+  test(`T11 L2: a dangling symlink at ${name} is refused: nothing is created at its target, and the repo FAILs with a reason`, () => {
+    const repo = makeTempRepo()
+    const claudeHome = freshDir('claudehome-')
+    withGlobalWorkflow(claudeHome, '// global v1\n')
+    const target = danglingTarget()
+    build(repo, target)
+    const res = runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
+    assert.equal(fs.existsSync(target), false, 'the run must never write through the link')
+    assert.match(res.logContents, resultLineRegex('FAIL', label(repo)), res.logContents)
+    assert.match(res.logContents, /refusing to stage: .*symlink/, res.logContents)
+    assert.notEqual(res.status, 0)
+  })
+}
+
+symlinkCase('the staged marker', (repo, target) => {
+  fs.mkdirSync(path.join(repo, '.claude', 'workflows'), { recursive: true })
+  fs.symlinkSync(target, path.join(repo, '.claude', 'workflows', '.optimise-cycle.js.staged'))
+})
+symlinkCase('the workflow file', (repo, target) => {
+  fs.mkdirSync(path.join(repo, '.claude', 'workflows'), { recursive: true })
+  fs.symlinkSync(target, path.join(repo, '.claude', 'workflows', 'optimise-cycle.js'))
+})
+symlinkCase('.claude/workflows', (repo, target) => {
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.symlinkSync(target, path.join(repo, '.claude', 'workflows'))
+})
+symlinkCase('.claude', (repo, target) => {
+  fs.symlinkSync(target, path.join(repo, '.claude'))
+})
+
+test('T11 L7: a workflow file that appears between the existence check and the copy is never overwritten, and is kept', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// global v1\n')
+  // A mkdir shim that, once the staging directory exists, drops a repo-owned
+  // file into it: the file appears AFTER the runner decided there was none.
+  const shim = freshDir('mkdir-shim-')
+  fs.writeFileSync(path.join(shim, 'mkdir'), `#!/bin/sh
+/bin/mkdir "$@" || exit $?
+for last in "$@"; do :; done
+case "$last" in
+  */.claude/workflows) printf '// APPEARED IN THE WINDOW\\n' > "$last/optimise-cycle.js" ;;
+esac
+`, { mode: 0o755 })
+  const res = runWeeklyScript([repo], { claudeHome, extraPath: shim })
+  assert.equal(fs.readFileSync(stagedPath(repo), 'utf8'), '// APPEARED IN THE WINDOW\n', `must be kept untouched:\n${res.logContents}`)
+  assert.match(res.logContents, /could not stage optimise-cycle\.js/, res.logContents)
+})
+
+// L3 ------------------------------------------------------------------------
+
+test('T11 L3: the runner\'s temp files live in a runner-owned mode-700 subdirectory', () => {
+  const repo = makeTempRepo()
+  const tmp = freshDir('tmp-')
+  const modeProbe = freshDir('mode-stub-')
+  fs.writeFileSync(path.join(modeProbe, 'claude'), `#!/bin/sh
+ls -ld "$TMPDIR/optimise-weekly-runner" > .runner-mode
+mkdir -p .claude
+cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF
+exit 0
+`, { mode: 0o755 })
+  const res = runWeeklyScript([repo], { extraPath: modeProbe, env: { TMPDIR: tmp } })
+  assert.equal(res.status, 0, res.logContents)
+  assert.match(fs.readFileSync(path.join(repo, '.runner-mode'), 'utf8'), /^drwx------/, 'mode 700')
+})
+
+test('T11 L3: after a SIGKILL the next run removes the transcript left in the runner directory and names it in the log, while an unrelated same-named file outside it survives', async () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  const tmp = freshDir('tmp-')
+  const home = freshHome()
+  const decoy = path.join(tmp, 'optimise-weekly-transcript.decoy')
+  fs.writeFileSync(decoy, 'not ours\n')
+  const run = startRunner(repo, { home, claudeHome, tmpdir: tmp, extraPath: hangingClaude() })
+  const pidFile = path.join(repo, '.claude-pid')
+  let leftover
+  try {
+    await waitFor(() => fs.existsSync(path.join(repo, '.ready')), 'claude to start')
+    run.child.kill('SIGKILL')
+    await run.done
+    leftover = transcripts(tmp)
+    assert.equal(leftover.length, 1, 'guard against vacuity: SIGKILL leaves the transcript behind')
+  } finally {
+    killIfAlive(pidFile)
+  }
+  const res = runWeeklyScript([repo], { home, claudeHome, extraPath: witnessingClaudeStub('pass'), env: { TMPDIR: tmp } })
+  assert.deepEqual(transcripts(tmp), [], 'the leftover transcript must be gone')
+  assert.match(res.logContents, new RegExp(`^REMOVED-LEFTOVER-TMP ${escapeRegExp(leftover[0])}$`, 'm'), res.logContents)
+  assert.equal(fs.readFileSync(decoy, 'utf8'), 'not ours\n', 'a same-named file outside the runner directory is never touched')
+})
+
+// L6 ------------------------------------------------------------------------
+
+test('T11 L6: a leftover that is byte-identical to its marker but tracked by git is never deleted', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// global v2\n')
+  const dir = path.dirname(stagedPath(repo))
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(stagedPath(repo), '// committed by a developer\n')
+  fs.writeFileSync(path.join(dir, '.optimise-cycle.js.staged'), '// committed by a developer\n')
+  sh('git add .claude/workflows/optimise-cycle.js', repo)
+  sh('git commit -q -m "ship the workflow"', repo)
+  const res = runWeeklyScript([repo], { claudeHome, extraPath: witnessingClaudeStub('pass') })
+  assert.equal(fs.readFileSync(stagedPath(repo), 'utf8'), '// committed by a developer\n', `the tracked file must survive:\n${res.logContents}`)
+  assert.ok(!/REMOVED-LEFTOVER-STAGED/.test(res.logContents), res.logContents)
+  assert.match(res.logContents, /repo ships its own optimise-cycle\.js/)
 })
