@@ -467,7 +467,7 @@ T24 and T25 were vetoed at planning and are not tasks. T15 onward (Phases 2 and 
 - [ ] T11: weekly runner keeps the guard on, allowlist, failure notification, cleanup (audit S5, O2) — state: queued
 - [x] T12: .coverage untracked and ignored; leak scan covers binaries (audit S7) — state: merged #27
 - [ ] T13: public history rewritten per the runbook; owner confirms at steps 6 and 8 (audit S7) — state: queued (needs: T4, T12)
-- [ ] T14: installer first install, backup on overwrite, branch warning (audit O1, O5) — state: queued
+- [x] T14: installer first install, backup on overwrite, branch warning (audit O1, O5) — state: merged #29
 - [ ] T15: helper program edges and optimiser id pairing (audit G5, G7, A4) — state: queued (needs: T1)
 - [ ] T16: ledger writer restructured into named stages, history moved to docs (audit A1, A2) — state: queued (needs: T1, T15)
 - [ ] T17: ledger reader aggregateRework restructured (audit A2) — state: queued (needs: T15)
