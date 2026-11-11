@@ -550,6 +550,10 @@ test('T6 conductor: every git subprocess in ensureGitignored carries a timeout, 
   const body = src.slice(start, end)
   const calls = body.match(/execFileSync\('git'[^\n]*/g) || []
   assert.ok(calls.length >= 2, `expected the classifying and post-write git calls, found ${calls.length}`)
-  for (const c of calls) assert.match(c, /timeout: GIT_CALL_TIMEOUT_MS/, `git call without a timeout: ${c}`)
+  // HARN-AUDIT-1 T1: the calls read the timeout through gitCallTimeoutMs(), which returns GIT_CALL_TIMEOUT_MS unless the
+  // test-only LEDGER_APPEND_TEST_GIT_TIMEOUT_MS seam is set, so a slow git can be retried once and a test need not wait ten
+  // seconds. The pin is on the same property as before: no call without a timeout, and the default stays the constant.
+  for (const c of calls) assert.match(c, /timeout: (GIT_CALL_TIMEOUT_MS|gitCallTimeoutMs\(\))/, `git call without a timeout: ${c}`)
   assert.match(src, /const GIT_CALL_TIMEOUT_MS = \d+/)
+  assert.match(src, /function gitCallTimeoutMs\(\) \{[^}]*: GIT_CALL_TIMEOUT_MS\s*\}/, 'the helper must fall back to GIT_CALL_TIMEOUT_MS')
 })

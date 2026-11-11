@@ -284,6 +284,80 @@ test('ledger-append: one append is exactly one write() of the whole line, counte
   }
 })
 
+// A slow git must not be reported as "the ledger is not ignored" (HARN-AUDIT-1 T1). On a loaded machine `git check-ignore`
+// once took longer than the writer's 10s timeout, the timed-out child has no exit status, and the writer treated it as
+// "not ignored" and refused with a message blaming a negation pattern, dropping a real row. A `git` shim on PATH sleeps in
+// `check-ignore` for its first SLOW_FIRST calls (counted in a file) and otherwise runs the real git; the timeout is cut to
+// 500ms through the writer's test-only LEDGER_APPEND_TEST_GIT_TIMEOUT_MS so the test does not wait ten seconds. `exec sleep`
+// replaces the shim process so no grandchild holds the pipes open after the kill. Nothing here reads a clock.
+function slowGitShim(slowFirst, slowFrom = 1e9) {
+  const { execFileSync } = require('node:child_process')
+  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slow-git-shim-'))
+  trackTempDir(dir)
+  const counter = path.join(dir, 'check-ignore-calls')
+  fs.writeFileSync(path.join(dir, 'git'),
+    `#!/bin/sh\nif [ "$1" = check-ignore ]; then\n  n=$(cat "${counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${counter}"\n  if [ "$n" -le ${slowFirst} ] || [ "$n" -ge ${slowFrom} ]; then exec sleep 30; fi\nfi\nexec "${real}" "$@"\n`,
+    { mode: 0o755 })
+  return { dir, calls: () => Number(fs.existsSync(counter) ? fs.readFileSync(counter, 'utf8') : 0) }
+}
+
+function appendThroughSlowGit(shim, repo) {
+  const { spawnSync } = require('node:child_process')
+  const res = spawnSync(process.execPath, [APPEND_SCRIPT], {
+    cwd: repo,
+    encoding: 'utf8',
+    input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'slow-git' }),
+    env: { ...require('./helpers/temp-repo.js').sanitizedGitEnv(), PATH: `${shim.dir}${path.delimiter}${process.env.PATH}`, LEDGER_APPEND_TEST_GIT_TIMEOUT_MS: '500' },
+  })
+  return JSON.parse(res.stdout.trim().split('\n').pop())
+}
+
+test('ledger-append: a git check-ignore that times out once is retried, and the row is written exactly once (HARN-AUDIT-1 T1)', () => {
+  const repo = makeTempRepo()
+  const shim = slowGitShim(1)
+  const out = appendThroughSlowGit(shim, repo)
+  assert.equal(out.write_ok, true, `a single slow git must not drop the row: ${out.write_error}`)
+  assert.ok(shim.calls() >= 2, `sanity: the shim must have slowed the first check-ignore and seen the retry, saw ${shim.calls()} calls`)
+  assert.equal(readLedgerLines(repo).length, 1)
+})
+
+test('ledger-append: a git check-ignore that times out twice refuses the write with a message that says it timed out, never the negation message (HARN-AUDIT-1 T1)', () => {
+  const repo = makeTempRepo()
+  const shim = slowGitShim(999)
+  const out = appendThroughSlowGit(shim, repo)
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /timed out/i)
+  assert.match(out.write_error, /retried/i)
+  assert.doesNotMatch(out.write_error, /not actually gitignored|negation/i, 'a slow git is not a negation pattern')
+  assert.equal(shim.calls(), 2, 'exactly one retry: two check-ignore calls in all')
+  assert.equal(readLedgerLines(repo).length, 0, 'fail closed: nothing is written when the ignore check could not be completed')
+})
+
+test('ledger-append: the verifying check-ignore after the exclude line is written is retried and then reported as a timeout too (HARN-AUDIT-1 T1)', () => {
+  const repo = makeTempRepo()
+  const shim = slowGitShim(0, 2) // the first (classifying) call answers; the second (verifying) call and its retry both time out
+  const out = appendThroughSlowGit(shim, repo)
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /timed out/i)
+  assert.doesNotMatch(out.write_error, /not actually gitignored|negation/i)
+  assert.equal(shim.calls(), 3, 'classify once, verify once, one retry of the verify')
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
+test('ledger-append: a genuine negation pattern still refuses with the negation message, not the timeout one (HARN-AUDIT-1 T1)', () => {
+  const { spawnSync } = require('node:child_process')
+  const repo = makeTempRepo()
+  fs.writeFileSync(path.join(repo, '.gitignore'), '!' + LEDGER_REL + '\n')
+  sh('git add .gitignore && git commit -q -m negate', repo)
+  const res = spawnSync(process.execPath, [APPEND_SCRIPT], { cwd: repo, encoding: 'utf8', input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done' }), env: require('./helpers/temp-repo.js').sanitizedGitEnv() })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /not actually gitignored/)
+  assert.doesNotMatch(out.write_error, /timed out/i)
+  assert.equal(readLedgerLines(repo).length, 0)
+})
+
 test('ledger-append: seeding 100 known lines then writing once leaves the first 100 byte-identical, exactly one added (AC-DATA-2)', () => {
   const repo = makeTempRepo()
   fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
