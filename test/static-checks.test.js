@@ -140,7 +140,7 @@ const LEAK_PATTERNS = [
 // The literal placeholder an install instruction is SUPPOSED to contain.
 // Stripped before matching rather than exempting the whole /Users/ clause: a
 // file allowed to say "/Users/YOUR_USERNAME" must still be caught if it says
-// "/Users/scott.b". An exemption that turns a clause off entirely is the
+// "/Users/some-operator". An exemption that turns a clause off entirely is the
 // difference between a documented placeholder and a real leak going unnoticed.
 const PLACEHOLDER_RE = /\/Users\/YOUR_USERNAME/g
 
@@ -200,33 +200,220 @@ function exemptionFor(rel) {
   return EXEMPTIONS.find((e) => e.paths.some((p) => (p.endsWith('/') ? rel.startsWith(p) : rel === p)))
 }
 
-function trackedFiles() {
-  const out = spawnSync('git', ['-C', ROOT, 'ls-files', '-z'], { encoding: 'utf8', env: sanitizedGitEnv() })
+function trackedFiles(root = ROOT, { minFiles = 50 } = {}) {
+  const out = spawnSync('git', ['-C', root, 'ls-files', '-z'], { encoding: 'utf8', env: sanitizedGitEnv() })
   assert.equal(out.status, 0, `git ls-files failed: ${out.stderr}`)
   const files = out.stdout.split('\0').filter(Boolean)
   // A guard that scans nothing passes. This is the "absence reads as success"
-  // shape the harness exists to catch, so the floor is asserted explicitly.
-  assert.ok(files.length > 50, `expected the repo to track more than 50 files, got ${files.length} -- a scan of nothing passes trivially`)
+  // shape the harness exists to catch, so the floor is asserted by default. A
+  // deliberately tiny fixture repo must switch it off at the call site
+  // (`{ minFiles: 0 }`), where the choice is visible.
+  assert.ok(files.length > minFiles || minFiles === 0, `expected the repo to track more than ${minFiles} files, got ${files.length} -- a scan of nothing passes trivially`)
   return files
 }
 
-test('static: NO tracked file leaks an absolute /Users/, /Volumes/ or /home/<name> path or a private target repo name, outside the explicitly recorded EXEMPTIONS (AC-ARCH-9, inverted round-two review M1)', () => {
+// Tracked binaries the scan is knowingly allowed to hold. Empty today: every
+// tracked file is text. A binary the scan cannot read as text fails the suite
+// unless its repo-relative path is listed here with a `why` (AC-SEC-11). A
+// listed binary is still scanned as raw bytes for the path patterns, but that
+// cannot see inside compressed or wide-encoded content, which is exactly why
+// the default is to refuse rather than to trust.
+const BINARY_ALLOWLIST = []
+
+// The leak scan as a function of a repository root, so it can be pointed at a
+// throwaway repo (AC-QA-24) as well as this one. Returns what it scanned and
+// every violation rather than asserting, so a caller can assert on either.
+function isValidUtf8(buf) {
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(buf)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function scanTrackedForLeaks(root, { binaryAllowlist = BINARY_ALLOWLIST, minFiles = 50 } = {}) {
+  const violations = []
   let scanned = 0
-  for (const rel of trackedFiles()) {
-    const abs = path.join(ROOT, rel)
-    if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) continue
-    const raw = fs.readFileSync(abs)
-    // Skip binaries: a NUL byte in the first 4KB is the usual heuristic.
-    if (raw.subarray(0, 4096).includes(0)) continue
+  for (const rel of trackedFiles(root, { minFiles })) {
+    const abs = path.join(root, rel)
+    // lstat, never stat: a tracked symlink is stored by git as its link text, so
+    // that text is what gets scanned. Following it would skip a dangling link
+    // (the target is missing on CI) and read a file git does not track here.
+    const st = fs.lstatSync(abs, { throwIfNoEntry: false })
+    if (!st || st.isDirectory()) continue
+    const isLink = st.isSymbolicLink()
+    const raw = isLink ? Buffer.from(fs.readlinkSync(abs, 'buffer')) : fs.readFileSync(abs)
+    // "Binary" here is a heuristic with a known limit, not a proof of
+    // unreadability: a NUL byte in the first 4 KB (gzip, UTF-16, images), or
+    // content that is not valid UTF-8 at all. Small headerless compressed data
+    // that happens to be valid UTF-8 and carries no NUL is therefore scanned as
+    // text, where an encoded path would not match. It used to mean "skip",
+    // which let a binary carry a home path unseen; now it is a violation unless
+    // allow-listed. A symlink's link text is always text.
+    const unreadable = !isLink && (raw.subarray(0, 4096).includes(0) || !isValidUtf8(raw))
+    if (unreadable && !binaryAllowlist.some((e) => e.path === rel)) {
+      violations.push({ rel, kind: 'binary', name: 'a tracked binary the scan cannot read as text' })
+    }
+    // Every file, listed binaries included, is also matched as raw bytes. The
+    // UTF-8 decode keeps ASCII bytes intact, so a plain-ASCII path inside a
+    // binary matches; a path that is compressed or UTF-16 encoded does NOT,
+    // and only the binary rule above catches that.
     const ex = exemptionFor(rel) || { skip: [], placeholder: false }
     const text = ex.placeholder ? raw.toString('utf8').replace(PLACEHOLDER_RE, '/Users/') : raw.toString('utf8')
     scanned += 1
     for (const { key, name, re } of LEAK_PATTERNS) {
       if (ex.skip.includes(key)) continue
-      assert.ok(!re.test(text), `${rel} hardcodes ${name}. If that is deliberate, add it to EXEMPTIONS with a reason; do not widen the pattern.`)
+      if (re.test(text)) violations.push({ rel, kind: 'path', name })
     }
   }
+  return { scanned, violations }
+}
+
+// What a violation says and what to do about it differ by kind: a binary is
+// fixed in BINARY_ALLOWLIST, a path pattern in EXEMPTIONS. Sending a reader to
+// the wrong list is a remedy that does nothing.
+function leakFailureMessage({ rel, kind, name }) {
+  if (kind === 'binary') {
+    return `${rel} is ${name}. If it must stay tracked, add an entry to BINARY_ALLOWLIST with a why; a listed binary is still scanned only for plain ASCII paths, so compressed or UTF-16 content is not checked.`
+  }
+  return `${rel} hardcodes ${name}. If that is deliberate, add it to EXEMPTIONS with a reason; do not widen the pattern.`
+}
+
+test('static: NO tracked file leaks an absolute /Users/, /Volumes/ or /home/<name> path or a private target repo name, outside the explicitly recorded EXEMPTIONS (AC-ARCH-9, inverted round-two review M1)', () => {
+  const { scanned, violations } = scanTrackedForLeaks(ROOT)
+  for (const v of violations) assert.fail(leakFailureMessage(v))
   assert.ok(scanned > 50, `only ${scanned} files were actually scanned`)
+})
+
+// AC-QA-24 / AC-SEC-11: a throwaway git repo outside the test/ blanket
+// exemption. Every home path is built at run time so no tracked file holds one.
+function withTempRepo(files, fn) {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'leakscan-bin-'))
+  try {
+    const git = (args) => {
+      const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8', env: sanitizedGitEnv() })
+      assert.equal(r.status, 0, `git ${args.join(' ')} failed: ${r.stderr}`)
+    }
+    git(['init', '-q'])
+    for (const [rel, bytes] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true })
+      // { symlink: target } makes a tracked symlink; the target need not exist.
+      if (bytes && bytes.symlink !== undefined) fs.symlinkSync(bytes.symlink, path.join(dir, rel))
+      else fs.writeFileSync(path.join(dir, rel), bytes)
+      git(['add', rel])
+    }
+    return fn(dir)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+const syntheticHome = ['', 'Users', 'some-operator'].join('/')
+const nulBytes = Buffer.from([0, 1, 2, 0])
+const BINARY_RULE = /binary/i
+
+test('static: the leak scan reads allow-listed binaries for home paths, failing one that holds a path and passing the same binary without it (AC-QA-24 a, b)', () => {
+  const allow = [{ path: 'assets/leaky.bin', why: 'fixture' }]
+  const leakyBytes = Buffer.concat([nulBytes, Buffer.from(`${syntheticHome}/project\n`), nulBytes])
+  withTempRepo({ 'assets/leaky.bin': leakyBytes }, (dir) => {
+    const leaky = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: allow })
+    assert.deepEqual(
+      leaky.violations.map((v) => v.rel),
+      ['assets/leaky.bin'],
+      `an allow-listed binary holding a home path must fail on the PATH pattern alone, got ${JSON.stringify(leaky)}`,
+    )
+    assert.match(leaky.violations[0].name, /\/Users\//)
+    assert.doesNotMatch(leaky.violations[0].name, BINARY_RULE)
+  })
+  withTempRepo({ 'assets/leaky.bin': Buffer.concat([nulBytes, Buffer.from('no path here\n'), nulBytes]) }, (dir) => {
+    const clean = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: allow })
+    assert.deepEqual(clean.violations, [], 'the same binary without a path must pass the scan')
+    assert.equal(clean.scanned, 1, 'the clean binary must have been scanned, not skipped, or a pass proves nothing')
+  })
+})
+
+test('static: a tracked binary the scan cannot read as text fails unless it is on the allow-list; allow-listing is a deliberate, recorded exemption that stops the scan looking inside that file, so an allow-listed gzip holding a path passes (AC-QA-24 c, d; AC-SEC-11)', () => {
+  const gz = require('node:zlib').gzipSync(Buffer.from(`${syntheticHome}/project\n`))
+  assert.ok(gz.subarray(0, 4096).includes(0), 'fixture precondition: the gzip has a NUL byte in its first 4 KB')
+  assert.ok(!gz.toString('latin1').includes('/Users/'), 'fixture precondition: the path is NOT visible as raw bytes, so only the binary rule can catch this')
+  withTempRepo({ 'assets/packed.gz': gz }, (dir) => {
+    const refused = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.equal(refused.violations.length, 1, `an unlisted gzip must fail, got ${JSON.stringify(refused)}`)
+    assert.equal(refused.violations[0].rel, 'assets/packed.gz')
+    assert.match(refused.violations[0].name, BINARY_RULE)
+
+    const allowed = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [{ path: 'assets/packed.gz', why: 'fixture' }] })
+    assert.deepEqual(allowed.violations, [], 'an allow-listed binary must not fail the binary rule')
+  })
+  // UTF-16LE text is the other spelling a UTF-8 decode cannot see.
+  withTempRepo({ 'assets/wide.txt': Buffer.from(`${syntheticHome}/project`, 'utf16le') }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.equal(r.violations.length, 1, `UTF-16LE text holds NUL bytes and must trip the binary rule, got ${JSON.stringify(r)}`)
+    assert.match(r.violations[0].name, BINARY_RULE)
+  })
+})
+
+test('static: content that is not valid UTF-8 is a binary even with no NUL byte in it; valid UTF-8 text, accents included, is not (AC-SEC-11)', () => {
+  // A raw deflate-style blob with no NUL byte anywhere: the NUL heuristic alone passes it as text.
+  const noNul = Buffer.from([0x78, 0x9c, 0xab, 0xff, 0xfe, 0x8b, 0x1f, 0x42])
+  assert.ok(!noNul.includes(0), 'fixture precondition: no NUL byte')
+  withTempRepo({ 'assets/blob.dat': noNul }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.equal(r.violations.length, 1, `invalid UTF-8 must trip the binary rule, got ${JSON.stringify(r)}`)
+    assert.match(r.violations[0].name, BINARY_RULE)
+    const listed = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [{ path: 'assets/blob.dat', why: 'fixture' }] })
+    assert.deepEqual(listed.violations, [], 'the allow-list must still exempt it')
+  })
+  withTempRepo({ 'notes.txt': 'caf\u00e9 \u2014 na\u00efve \u65e5\u672c\n' }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.deepEqual(r.violations, [], `valid UTF-8 text must not be called binary, got ${JSON.stringify(r)}`)
+  })
+})
+
+test('static: a tracked symlink is scanned by its link text, never followed: a home-path target fails even when dangling, a relative target passes (AC-SEC-11)', () => {
+  withTempRepo({ 'link-home': { symlink: `${syntheticHome}/project` } }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.deepEqual(r.violations.map((v) => v.rel), ['link-home'], `a dangling symlink to a home path must be reported, got ${JSON.stringify(r)}`)
+    assert.match(r.violations[0].name, /\/Users\//)
+    assert.equal(r.violations[0].kind, 'path')
+    assert.equal(r.scanned, 1, 'the symlink must count as scanned, not skipped')
+  })
+  withTempRepo({ 'docs/readme.md': 'harmless\n', 'link-rel': { symlink: 'docs/readme.md' }, 'link-gone': { symlink: '../elsewhere/none.txt' } }, (dir) => {
+    const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    assert.deepEqual(r.violations, [], `symlinks with harmless relative targets must pass, got ${JSON.stringify(r)}`)
+    assert.equal(r.scanned, 3, 'both symlinks and the file must have been scanned')
+  })
+})
+
+test('static: the failure message names the right remedy for each kind of violation -- BINARY_ALLOWLIST for a binary, EXEMPTIONS for a path pattern', () => {
+  withTempRepo({ 'assets/packed.gz': require('node:zlib').gzipSync(Buffer.from(`${syntheticHome}/p`)), 'notes.txt': `${syntheticHome}/p\n` }, (dir) => {
+    const { violations } = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    const bin = leakFailureMessage(violations.find((v) => v.rel === 'assets/packed.gz'))
+    const pat = leakFailureMessage(violations.find((v) => v.rel === 'notes.txt'))
+    assert.match(bin, /BINARY_ALLOWLIST/)
+    assert.match(bin, /why/)
+    assert.match(bin, /plain ASCII/)
+    assert.doesNotMatch(bin, /EXEMPTIONS|hardcodes/)
+    assert.match(pat, /hardcodes an absolute \/Users\/ path/)
+    assert.match(pat, /EXEMPTIONS/)
+    assert.doesNotMatch(pat, /BINARY_ALLOWLIST/)
+  })
+})
+
+test('static: every real BINARY_ALLOWLIST entry names a tracked path and carries a reason (AC-SEC-11)', () => {
+  const tracked = trackedFiles()
+  for (const e of BINARY_ALLOWLIST) {
+    assert.ok(tracked.includes(e.path), `BINARY_ALLOWLIST names ${e.path}, which is not tracked -- a stale entry is a gap nobody is watching`)
+    assert.ok(typeof e.why === 'string' && e.why.trim().length > 0, `BINARY_ALLOWLIST entry ${e.path} needs a why`)
+  }
+})
+
+test('static: the scan-nothing floor fires on the default call, and a fixture must switch it off explicitly (F3)', () => {
+  withTempRepo({ 'a.txt': 'hello\n' }, (dir) => {
+    assert.throws(() => scanTrackedForLeaks(dir), /more than 50 files/)
+    assert.doesNotThrow(() => scanTrackedForLeaks(dir, { minFiles: 0 }))
+  })
 })
 
 test('static: every EXEMPTIONS entry names a real tracked path, waives only known pattern keys, and gives a reason -- so a stale or blanket exemption cannot quietly hide a whole directory', () => {
@@ -969,7 +1156,8 @@ test('static: bin/com.local.optimise-cycle-weekly.plist is tracked in the repo a
   const plistPath = path.join(ROOT, 'bin', 'com.local.optimise-cycle-weekly.plist')
   assert.ok(fs.existsSync(plistPath), 'bin/com.local.optimise-cycle-weekly.plist must exist and be tracked -- a code revert cannot stop a scheduled job that only exists outside version control')
   const plist = fs.readFileSync(plistPath, 'utf8')
-  assert.ok(!/\/Volumes\/|\/home\/scott\.b|scott\.b/.test(plist), 'the tracked plist must never contain a real, non-placeholder account path')
+  const realPath = plist.replace(/\/Users\/YOUR_USERNAME/g, '').match(/\/(Users|Volumes|home)\/[^\s<"]*/)
+  assert.equal(realPath, null, 'the tracked plist must never contain a real, non-placeholder account path')
   assert.match(plist, /YOUR_USERNAME/, 'the tracked plist must use a placeholder path, not a real one, since this repo is public')
 })
 
