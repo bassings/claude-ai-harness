@@ -457,15 +457,15 @@ T24 and T25 were vetoed at planning and are not tasks. T15 onward (Phases 2 and 
 - [ ] T1: stabilise the four flaky tests, no retries (audit T1) — state: queued
 - [ ] T2: stand-in runtime fails closed on unknown features (audit T2) — state: queued (needs: T3)
 - [ ] T3: real-runtime smoke checklist, first run recorded (audit T2) — state: queued
-- [ ] T4: tests no longer depend on repository history or the live ledger (audit T4) — state: queued
+- [x] T4: tests no longer depend on repository history or the live ledger (audit T4) — state: merged #25
 - [ ] T5: guard parsing holes closed, zsh looked through (audit S1, S2, S4, A3) — state: queued (needs: T1)
-- [ ] T6: documented hook timeout and args corrected, tested against the guard's worst case (audit S3, D2) — state: queued
+- [x] T6: documented hook timeout and args corrected, tested against the guard's worst case (audit S3, D2) — state: merged #28
 - [ ] T7: forced worktree removal covered; sibling hooks tolerate a non-object payload (audit S6) — state: queued (needs: T5)
 - [ ] T8: plan-cycle refuses on a missing always-on lens; lenses_run truthful (audit G1) — state: queued (needs: T3)
 - [ ] T9: tdd-task decides the freeze in script and verifies the commit (audit G2, G3) — state: queued (needs: T2)
 - [ ] T10: review-cycle argument validation, fenced untrusted text, simplicity check reported when unverified (audit G4, S9, S10) — state: queued (needs: T2, T3)
 - [ ] T11: weekly runner keeps the guard on, allowlist, failure notification, cleanup (audit S5, O2) — state: queued
-- [ ] T12: .coverage untracked and ignored; leak scan covers binaries (audit S7) — state: queued
+- [x] T12: .coverage untracked and ignored; leak scan covers binaries (audit S7) — state: merged #27
 - [ ] T13: public history rewritten per the runbook; owner confirms at steps 6 and 8 (audit S7) — state: queued (needs: T4, T12)
 - [ ] T14: installer first install, backup on overwrite, branch warning (audit O1, O5) — state: queued
 - [ ] T15: helper program edges and optimiser id pairing (audit G5, G7, A4) — state: queued (needs: T1)
