@@ -295,7 +295,7 @@ function scanTrackedForLeaks(root, { binaryAllowlist = BINARY_ALLOWLIST, minFile
     // (gzip, UTF-16, an image). It used to mean "skip", which let a binary
     // carry a home path unseen; now it is a violation unless allow-listed.
     if (raw.subarray(0, 4096).includes(0) && !binaryAllowlist.some((e) => e.path === rel)) {
-      violations.push({ rel, name: 'a tracked binary the scan cannot read as text (not on BINARY_ALLOWLIST)' })
+      violations.push({ rel, kind: 'binary', name: 'a tracked binary the scan cannot read as text' })
     }
     // Every file, listed binaries included, is also matched as raw bytes. The
     // UTF-8 decode keeps ASCII bytes intact, so a plain-ASCII path inside a
@@ -306,17 +306,25 @@ function scanTrackedForLeaks(root, { binaryAllowlist = BINARY_ALLOWLIST, minFile
     scanned += 1
     for (const { key, name, re } of LEAK_PATTERNS) {
       if (ex.skip.includes(key)) continue
-      if (re.test(text)) violations.push({ rel, name })
+      if (re.test(text)) violations.push({ rel, kind: 'path', name })
     }
   }
   return { scanned, violations }
 }
 
+// What a violation says and what to do about it differ by kind: a binary is
+// fixed in BINARY_ALLOWLIST, a path pattern in EXEMPTIONS. Sending a reader to
+// the wrong list is a remedy that does nothing.
+function leakFailureMessage({ rel, kind, name }) {
+  if (kind === 'binary') {
+    return `${rel} is ${name}. If it must stay tracked, add an entry to BINARY_ALLOWLIST with a why; a listed binary is still scanned only for plain ASCII paths, so compressed or UTF-16 content is not checked.`
+  }
+  return `${rel} hardcodes ${name}. If that is deliberate, add it to EXEMPTIONS with a reason; do not widen the pattern.`
+}
+
 test('static: NO tracked file leaks an absolute /Users/, /Volumes/ or /home/<name> path or a private target repo name, outside the explicitly recorded EXEMPTIONS (AC-ARCH-9, inverted round-two review M1)', () => {
   const { scanned, violations } = scanTrackedForLeaks(ROOT)
-  for (const { rel, name } of violations) {
-    assert.fail(`${rel} hardcodes ${name}. If that is deliberate, add it to EXEMPTIONS with a reason; do not widen the pattern.`)
-  }
+  for (const v of violations) assert.fail(leakFailureMessage(v))
   assert.ok(scanned > 50, `only ${scanned} files were actually scanned`)
 })
 
@@ -383,6 +391,21 @@ test('static: a tracked binary the scan cannot read as text fails unless it is o
     const r = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
     assert.equal(r.violations.length, 1, `UTF-16LE text holds NUL bytes and must trip the binary rule, got ${JSON.stringify(r)}`)
     assert.match(r.violations[0].name, BINARY_RULE)
+  })
+})
+
+test('static: the failure message names the right remedy for each kind of violation -- BINARY_ALLOWLIST for a binary, EXEMPTIONS for a path pattern', () => {
+  withTempRepo({ 'assets/packed.gz': require('node:zlib').gzipSync(Buffer.from(`${syntheticHome}/p`)), 'notes.txt': `${syntheticHome}/p\n` }, (dir) => {
+    const { violations } = scanTrackedForLeaks(dir, { minFiles: 0, binaryAllowlist: [] })
+    const bin = leakFailureMessage(violations.find((v) => v.rel === 'assets/packed.gz'))
+    const pat = leakFailureMessage(violations.find((v) => v.rel === 'notes.txt'))
+    assert.match(bin, /BINARY_ALLOWLIST/)
+    assert.match(bin, /why/)
+    assert.match(bin, /plain ASCII/)
+    assert.doesNotMatch(bin, /EXEMPTIONS|hardcodes/)
+    assert.match(pat, /hardcodes an absolute \/Users\/ path/)
+    assert.match(pat, /EXEMPTIONS/)
+    assert.doesNotMatch(pat, /BINARY_ALLOWLIST/)
   })
 })
 
