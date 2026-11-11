@@ -708,6 +708,8 @@ for (const [label, entries] of [
   ['workflows/ + Documents/', ['workflows/', 'Documents/']],
   ['skills/ + Library/', ['skills/', 'Library/']],
   ['settings.json + Downloads/ + Desktop/', ['settings.json', 'Downloads/', 'Desktop/']],
+  ['projects/ + .ssh/', ['projects/', '.ssh/']],
+  ['settings.json + .config/', ['settings.json', '.config/']],
   ['projects/ + .bashrc + .bash_profile + .profile', ['projects/', '.bashrc', '.bash_profile', '.profile']],
 ]) {
   test(`install.sh (AC-DATA-12, F1): a destination holding ${label} is refused with nothing written, and the printed override still works`, () => {
@@ -896,6 +898,8 @@ test('install.sh (F7): a failure after some files were updated says how many, th
   assert.match(res.stderr, /1 file\(s\) (were )?updated/i)
   assert.match(res.stderr, /re-run/i)
   assert.equal((res.stderr.match(/INCOMPLETE/g) || []).length, 1, `the notice must print once, not once per path:\n${res.stderr}`)
+  assert.match(res.stderr, /restores files this run overwrote/i)
+  assert.match(res.stderr, /files this run added are not in the backup.*'updated:' lines.*delete them by hand/i)
   assert.ok(res.stderr.includes(path.join(dest, '.harness-backups', '20260101T000000Z')), `the restore source must be named:\n${res.stderr}`)
 })
 
@@ -924,6 +928,7 @@ test('install.sh (round 2): an exit under set -e after some files were updated p
   assert.notEqual(res.status, 0)
   assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'new-a\n', 'the first file was updated')
   assert.equal((res.stderr.match(/INCOMPLETE/g) || []).length, 1, res.stderr)
+  assert.match(res.stderr, /files this run added .*'updated:' lines.*delete them by hand/i)
   assert.match(res.stderr, /1 file\(s\) updated/)
 })
 
@@ -970,5 +975,76 @@ test('install.sh (round 2): the recovery notice says a symlinked destination is 
   fs.writeFileSync(path.join(dest, 'workflows', 'lib'), 'in the way')
   fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
   const res = runStub(co, dest)
-  assert.match(res.stderr, /symlink/i)
+  assert.match(res.stderr, /symlink was replaced by a regular file, and its backup holds the target's bytes, not the link/)
 })
+
+// --- T14 fix round 3 ---------------------------------------------------------
+
+test('install.sh (round 3 F-1): a backup directory that cannot be pruned is a warning, not a failure: exit 0, no INCOMPLETE, the directory named, and --check still runs', (t) => {
+  if (process.getuid && process.getuid() === 0) return t.skip('root ignores directory permissions')
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const names = []
+  for (let i = 1; i <= 10; i++) names.push(`202501${String(i).padStart(2, '0')}T000000Z`)
+  for (const n of names) fs.mkdirSync(path.join(dest, '.harness-backups', n), { recursive: true })
+  // The oldest holds a read-only subdirectory with a file in it: rm -rf cannot empty it.
+  const stuck = path.join(dest, '.harness-backups', names[0])
+  fs.mkdirSync(path.join(stuck, 'sub'))
+  fs.writeFileSync(path.join(stuck, 'sub', 'f'), 'x')
+  fs.chmodSync(path.join(stuck, 'sub'), 0o555)
+  try {
+    const res = runStub(co, dest, [], { shims: FIXED_DATE })
+    assert.equal(res.status, 0, res.stdout + res.stderr)
+    assert.doesNotMatch(res.stderr, /INCOMPLETE/)
+    assert.ok(res.stderr.includes(`could not prune old backup directory ${stuck}; delete it by hand`), res.stderr)
+    assert.match(res.stdout, /matches this checkout/, '--check must still have run')
+  } finally {
+    fs.chmodSync(path.join(stuck, 'sub'), 0o755)
+  }
+})
+
+test('install.sh (round 3 F-3, F-4): a symlinked destination file is replaced by a regular file, the install says so naming the link target, the target outside is untouched, and the backup is a regular file holding the target\'s bytes', () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  const outside = path.join(tmpInstall(), 'outside.md')
+  fs.writeFileSync(outside, 'outside bytes\n')
+  fs.symlinkSync(outside, path.join(dest, 'a.md'))
+  const res = runStub(co, dest, [], { shims: FIXED_DATE })
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'outside bytes\n', 'the file the link pointed at is untouched')
+  assert.ok(fs.lstatSync(path.join(dest, 'a.md')).isFile(), 'the destination is now a regular file, not a link')
+  assert.equal(fs.readFileSync(path.join(dest, 'a.md'), 'utf8'), 'new\n')
+  const backup = path.join(dest, '.harness-backups', '20260101T000000Z', 'a.md')
+  assert.ok(fs.lstatSync(backup).isFile(), 'the backup is a regular file, not a link to the original target')
+  assert.equal(fs.readFileSync(backup, 'utf8'), 'outside bytes\n')
+  assert.ok(res.stderr.includes(path.join(dest, 'a.md')) && res.stderr.includes(outside) && /regular file/.test(res.stderr),
+    `the notice must name the path and its link target:\n${res.stderr}`)
+})
+
+test('install.sh (round 3 F-3): an ordinary destination file prints no symlink notice', () => {
+  const co = stubCheckout({ 'a.md': 'new\n' })
+  const dest = existingHome()
+  fs.writeFileSync(path.join(dest, 'a.md'), 'old\n')
+  const res = runStub(co, dest)
+  assert.equal(res.status, 0, res.stdout + res.stderr)
+  assert.doesNotMatch(res.stderr, /symlink/i)
+})
+
+for (const shape of ['a directory', 'a symlink to a directory']) {
+  test(`install.sh (round 3 F-5): ${shape} at a destination file path stops the install, with no temp file inside it or its target and the file not listed as updated`, () => {
+    const co = stubCheckout({ 'a.md': 'new\n' })
+    const dest = existingHome()
+    const elsewhere = path.join(tmpInstall(), 'target-dir')
+    fs.mkdirSync(elsewhere)
+    if (shape === 'a directory') fs.mkdirSync(path.join(dest, 'a.md'))
+    else fs.symlinkSync(elsewhere, path.join(dest, 'a.md'))
+    const res = runStub(co, dest)
+    assert.notEqual(res.status, 0)
+    assert.ok(res.stderr.includes('a.md is a directory at the destination; it was left unchanged'), res.stderr)
+    assert.doesNotMatch(res.stdout, /updated: a\.md/)
+    for (const d of [path.join(dest, 'a.md'), elsewhere]) {
+      assert.deepEqual(fs.readdirSync(d), [], `${d} must hold nothing`)
+    }
+  })
+}

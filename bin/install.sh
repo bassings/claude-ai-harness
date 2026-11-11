@@ -230,7 +230,7 @@ refuse_destination() {
 
 if [ "$CHECK_ONLY" -eq 0 ] && [ "${HARNESS_INSTALL_REQUIRE_MARKER:-1}" = "1" ]; then
   if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
-    for _entry in .zshrc .bashrc .bash_profile .profile Documents Desktop Library Downloads; do
+    for _entry in .zshrc .bashrc .bash_profile .profile .ssh .config Documents Desktop Library Downloads; do
       if [ -e "$DEST/$_entry" ] || [ -L "$DEST/$_entry" ]; then
         refuse_destination "it holds $_entry, which belongs to a user's home directory"
       fi
@@ -278,10 +278,12 @@ print_incomplete() {
   warn "install: INCOMPLETE: $installed file(s) updated before this stop, so $DEST may hold a mix of old and new files."
   warn "         To finish: fix the cause above and re-run this installer."
   if [ -n "$BK_DIR" ]; then
-    warn "         To undo: copy the files back from $BK_DIR (same relative paths)."
+    warn "         To undo: copy the files back from $BK_DIR (same relative paths); that restores files this run overwrote."
+    warn "         Files this run added are not in the backup: they are the 'updated:' lines above, and stay until you delete them by hand."
     warn "         A destination that was a symlink was replaced by a regular file, and its backup holds the target's bytes, not the link."
   else
-    warn "         No file was backed up in this run, so there is nothing to restore."
+    warn "         No file was overwritten in this run, so there is nothing to restore."
+    warn "         Files this run added are the 'updated:' lines above, and stay until you delete them by hand."
   fi
 }
 
@@ -345,6 +347,11 @@ for rel in $FILES; do
     continue
   fi
   mkdir -p "$(dirname -- "$dst")"
+  # A directory here (or a link to one) would swallow the temp file in the mv
+  # below and be reported as an update.
+  if [ -d "$dst" ]; then
+    fail_install "$rel is a directory at the destination; it was left unchanged."
+  fi
   # Only copy what actually differs, so an install is quiet and its output
   # says what genuinely moved.
   if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
@@ -356,6 +363,9 @@ for rel in $FILES; do
       && cp -p "$dst" "$BK_DIR/$rel" \
       && cmp -s "$dst" "$BK_DIR/$rel" \
       || fail_install "could not back up $rel; it was left unchanged."
+  fi
+  if [ -L "$dst" ]; then
+    warn "install: $dst is a symlink to $(readlink "$dst"); replacing it with a regular file."
   fi
   # Written beside the destination (same filesystem, so the rename is atomic)
   # under a name no loader matches, then renamed over it: a kill at any point
@@ -380,8 +390,13 @@ if [ -n "$BK_DIR" ]; then
     [ "$_excess" -gt 0 ] || break
     is_backup_name "$_name" || continue
     [ "$BK_ROOT/$_name" != "$BK_DIR" ] || continue
-    rm -rf "$BK_ROOT/$_name"
-    warn "install: pruned old backup directory: $BK_ROOT/$_name"
+    # Best effort: the install is already complete, so a directory that cannot
+    # be deleted is reported, not treated as a failure.
+    if rm -rf "$BK_ROOT/$_name"; then
+      warn "install: pruned old backup directory: $BK_ROOT/$_name"
+    else
+      warn "install: could not prune old backup directory $BK_ROOT/$_name; delete it by hand."
+    fi
     _excess=$((_excess - 1))
   done
 fi
