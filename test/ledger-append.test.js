@@ -313,9 +313,12 @@ test('ledger-append: one append is exactly one write() of the whole line, counte
 // once took longer than the writer's 10s timeout, the timed-out child has no exit status, and the writer treated it as
 // "not ignored" and refused with a message blaming a negation pattern, dropping a real row. A `git` shim on PATH misbehaves
 // in `check-ignore` for its first FAIL_FIRST calls and from its FAIL_FROM-th call on (calls counted in a file) and otherwise
-// runs the real git. The timeout tests call the exported ensureGitignored() in this process with a 500ms timeout passed as
-// an argument, so the test neither waits ten seconds nor needs an environment variable in the shipped writer. `exec sleep`
-// replaces the shim process so no grandchild holds the pipes open after the kill. Nothing here reads a clock.
+// runs the real git. The tests call the exported ensureGitignored() in this process with the timeout passed as an argument,
+// so no test waits ten seconds and the shipped writer needs no environment variable. The timeout bounds EVERY git call
+// under it, the real ones the shim passes through included, so it is short (500ms) only where nothing but the shim's sleep
+// runs, and 3000ms in the one test where real git runs after the timed-out call. Every other recovery is driven by the
+// shim's `kill` mode, which needs no timeout to elapse. `exec sleep` replaces the shim process so no grandchild holds the
+// pipes open after the kill. No test asserts on elapsed time; the one test that waits out a real timeout waits about 3s.
 function fakeGitShim(mode, failFirst, failFrom = 1e9) {
   const { execFileSync } = require('node:child_process')
   const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
@@ -330,9 +333,9 @@ function fakeGitShim(mode, failFirst, failFrom = 1e9) {
 }
 const slowGitShim = (failFirst, failFrom) => fakeGitShim('sleep', failFirst, failFrom)
 
-// Runs the writer's own ensureGitignored(repo, 500) in this process with the shim first on PATH, capturing what it writes
-// to stdout and stderr. The 500ms goes in as an argument; the shipped default is GIT_CALL_TIMEOUT_MS, pinned elsewhere.
-async function ensureGitignoredThroughSlowGit(shim, repo) {
+// Runs the writer's own ensureGitignored(repo, timeoutMs) in this process with the shim first on PATH, capturing what it
+// writes to stdout and stderr. The timeout goes in as an argument; the shipped default is GIT_CALL_TIMEOUT_MS, pinned elsewhere.
+async function ensureGitignoredThroughSlowGit(shim, repo, timeoutMs) {
   const { ensureGitignored } = await import(APPEND_MODULE_URL)
   const savedPath = process.env.PATH
   const realOut = process.stdout.write
@@ -343,7 +346,7 @@ async function ensureGitignoredThroughSlowGit(shim, repo) {
   process.stdout.write = (chunk) => { out.push(String(chunk)); return true }
   process.stderr.write = (chunk) => { err.push(String(chunk)); return true }
   try {
-    return { verdict: ensureGitignored(repo, 500), stdout: out.join(''), stderr: err.join('') }
+    return { verdict: ensureGitignored(repo, timeoutMs), stdout: out.join(''), stderr: err.join('') }
   } finally {
     process.stdout.write = realOut
     process.stderr.write = realErr
@@ -351,13 +354,15 @@ async function ensureGitignoredThroughSlowGit(shim, repo) {
   }
 }
 
-test('ledger-append: a git check-ignore that times out once is retried, the check then succeeds, and the retry is reported on stderr only (HARN-AUDIT-1 T1)', async () => {
+// Here the retry ends in git's exit 1 (the ledger is not yet ignored), which the writer reads as an answer. The first
+// failure is the shim's kill, so no real git runs under a tight bound.
+test('ledger-append: an interrupted git check-ignore is retried, the retry answers "not ignored", the check then succeeds, and the retry is reported on stderr only (HARN-AUDIT-1 T1)', async () => {
   const repo = makeTempRepo()
-  const shim = slowGitShim(1)
-  const r = await ensureGitignoredThroughSlowGit(shim, repo)
-  assert.equal(r.verdict, true, 'a single slow git must not drop the row')
-  assert.ok(shim.calls() >= 2, `sanity: the shim must have slowed the first check-ignore and seen the retry, saw ${shim.calls()} calls`)
-  assert.match(r.stderr, /^ledger-append: git check-ignore timed out after 500ms, retry succeeded\n$/m, 'a recovered timeout leaves one stderr line')
+  const shim = fakeGitShim('kill', 1)
+  const r = await ensureGitignoredThroughSlowGit(shim, repo, 5000)
+  assert.equal(r.verdict, true, 'a single interrupted git must not drop the row')
+  assert.ok(shim.calls() >= 2, `sanity: the shim must have killed the first check-ignore and seen the retry, saw ${shim.calls()} calls`)
+  assert.equal(r.stderr, 'ledger-append: git check-ignore was killed by SIGKILL, retry succeeded\n', 'a recovered interruption leaves one stderr line')
   assert.equal(r.stdout, '', 'stdout carries the single JSON result line and nothing else')
 })
 
@@ -367,11 +372,11 @@ test('ledger-append: a timed-out check-ignore whose retry returns normally (path
   const repo = makeTempRepo()
   fs.mkdirSync(path.join(repo, '.git', 'info'), { recursive: true })
   fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
-  const shim = slowGitShim(1)
-  const r = await ensureGitignoredThroughSlowGit(shim, repo)
+  const shim = slowGitShim(1) // the one test that waits out a real timeout (about 3s): the first call sleeps 30s and is killed at the bound
+  const r = await ensureGitignoredThroughSlowGit(shim, repo, 3000)
   assert.equal(r.verdict, true)
   assert.equal(shim.calls(), 2, 'the first check-ignore timed out and the one retry answered')
-  assert.equal(r.stderr, 'ledger-append: git check-ignore timed out after 500ms, retry succeeded\n')
+  assert.equal(r.stderr, 'ledger-append: git check-ignore timed out after 3000ms, retry succeeded\n')
   assert.equal(r.stdout, '')
 })
 
@@ -397,8 +402,8 @@ test('ledger-append: a check-ignore killed by a signal and retried successfully 
 
 test('ledger-append: a git check-ignore that times out twice refuses the write with a message that says it timed out, never the negation message (HARN-AUDIT-1 T1)', async () => {
   const repo = makeTempRepo()
-  const shim = slowGitShim(999)
-  const r = await ensureGitignoredThroughSlowGit(shim, repo)
+  const shim = slowGitShim(999) // every call sleeps, so no real git runs under the 500ms bound
+  const r = await ensureGitignoredThroughSlowGit(shim, repo, 500)
   assert.equal(typeof r.verdict, 'string', 'a named refusal, not plain false')
   assert.match(r.verdict, /timed out/i)
   assert.match(r.verdict, /retried/i)
@@ -408,10 +413,10 @@ test('ledger-append: a git check-ignore that times out twice refuses the write w
   assert.equal(fs.existsSync(path.join(repo, '.git', 'info', 'exclude')) && fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8').includes(LEDGER_REL), false, 'fail closed: no exclude line is written when the ignore check could not be completed')
 })
 
-test('ledger-append: the verifying check-ignore after the exclude line is written is retried and then reported as a timeout too (HARN-AUDIT-1 T1)', async () => {
+test('ledger-append: the verifying check-ignore after the exclude line is written is retried and, when interrupted again, refused with the timed-out message too (HARN-AUDIT-1 T1)', async () => {
   const repo = makeTempRepo()
-  const shim = slowGitShim(0, 2) // the first (classifying) call answers; the second (verifying) call and its retry both time out
-  const r = await ensureGitignoredThroughSlowGit(shim, repo)
+  const shim = fakeGitShim('kill', 0, 2) // the first (classifying) call is real git and answers; the verifying call and its retry are both killed
+  const r = await ensureGitignoredThroughSlowGit(shim, repo, 5000)
   assert.equal(typeof r.verdict, 'string')
   assert.match(r.verdict, /timed out/i)
   assert.doesNotMatch(r.verdict, /not actually gitignored|negation/i)
@@ -3962,16 +3967,17 @@ function countRegexEvaluations(fn) {
   return count
 }
 
-// The property guarded here is "stripTrailingSeparators evaluates no regular expression", counted below, and not a measured
-// linear cost: the regex it replaced was quadratic on a long run of separators, and the loop that replaced it has no regex
-// to go quadratic. The hang deadline only bounds a regression to a slow regex; the count is what fails first.
-test('ledger-append module: stripTrailingSeparators evaluates no regular expression on the input that made the old regex quadratic, and still strips it correctly', async () => {
+// Two properties are guarded. "No regular expression is evaluated" is counted below. Linear cost is guarded by the size of
+// the input: about a million characters finish in milliseconds in a single pass, while any super-linear implementation, with
+// or without a regex, needs minutes and is stopped by the hang deadline. That is a hang deadline and not a timing assertion:
+// a slow machine lengthens a linear run by a small factor and cannot approach it.
+test('ledger-append module: stripTrailingSeparators handles a million-character run of separators within the hang deadline, evaluates no regular expression, and still strips it correctly', async () => {
   const { stripTrailingSeparators } = await import(APPEND_MODULE_URL)
-  const hostile = '/'.repeat(20000) + 'x' + '\\/'.repeat(10000) // separators, then a non-separator, then 20000 more of both kinds
+  const hostile = '/'.repeat(500000) + 'x' + '\\/'.repeat(250000) // 500000 separators, a non-separator, then 500000 more of both kinds
   let stripped
   const evaluations = hangDeadline(() => countRegexEvaluations(() => { stripped = stripTrailingSeparators(hostile) }))
   assert.equal(evaluations, 0, 'stripTrailingSeparators must not evaluate a regular expression: the one it replaced was quadratic on a long run of separators')
-  assert.equal(stripped, '/'.repeat(20000) + 'x', 'and it still strips every trailing separator, of both kinds, from the hostile input')
+  assert.equal(stripped, '/'.repeat(500000) + 'x', 'and it still strips every trailing separator, of both kinds, from the hostile input')
   // The counter really sees a regex-based strip, so the zero above is not a patch that never took effect.
   assert.ok(countRegexEvaluations(() => 'a//'.replace(/[\\/]+$/, '')) > 0, 'sanity: the counter must observe a regex-based strip, or the zero above proves nothing')
 })
@@ -4163,7 +4169,12 @@ test('ledger-append (AC-SEC-2): a rejected ac_id is still quarantined into ac_id
 // event loop the regex is blocking). A slow machine only lengthens a run that is still finishing; it throws only for a hang.
 const HANG_DEADLINE_MS = 5000
 function hangDeadline(fn) {
-  return require('node:vm').runInNewContext('fn()', { fn }, { timeout: HANG_DEADLINE_MS })
+  try {
+    return require('node:vm').runInNewContext('fn()', { fn }, { timeout: HANG_DEADLINE_MS })
+  } catch (e) {
+    if (e && e.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw new Error(`hang deadline of ${HANG_DEADLINE_MS}ms exceeded: the code under test did not finish, which a linear implementation does in milliseconds`)
+    throw e
+  }
 }
 
 // HARN-AUDIT-1 T1 (AC-QA-1): the two timing tests that stood here (1024 characters under 10ms, and a growth ratio between

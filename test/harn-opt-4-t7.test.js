@@ -212,7 +212,12 @@ test('T7 normaliser: instance names merge into one row through the ci command, m
 // event loop the regex is blocking). A slow machine only lengthens a run that is still finishing; it throws only for a hang.
 const HANG_DEADLINE_MS = 5000
 function hangDeadline(fn) {
-  return require('node:vm').runInNewContext('fn()', { fn }, { timeout: HANG_DEADLINE_MS })
+  try {
+    return require('node:vm').runInNewContext('fn()', { fn }, { timeout: HANG_DEADLINE_MS })
+  } catch (e) {
+    if (e && e.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw new Error(`hang deadline of ${HANG_DEADLINE_MS}ms exceeded: the code under test did not finish, which a linear implementation does in milliseconds`)
+    throw e
+  }
 }
 
 // Same detector as test/ledger-append.test.js (kept as a copy: no shared helper file is added for it).

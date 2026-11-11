@@ -1571,7 +1571,9 @@ const GIT_CALL_TIMEOUT_MS = 10_000
 // path is not ignored" (HARN-AUDIT-1 T1: on a loaded machine a slow check-ignore was reported as a negation pattern and a
 // real row was dropped). The call is retried once; a second interruption is thrown with gitCheckTimedOut set so the caller
 // can refuse with a message that says what happened. Fail closed is unchanged: nothing is written either way. A retry that
-// succeeds is noted on stderr (never stdout, which carries the one JSON result line) so a loaded machine leaves a trace.
+// succeeds is noted on stderr (never stdout, which carries the one JSON result line). That line is visible to whoever runs
+// the writer and in the transcript of the agent that invoked it; the workflows' ledger steps return only the JSON line, so
+// it is not surfaced by them.
 function retryOnceIfInterrupted(run, timeoutMs) {
   const interrupted = (e) => !!e && (e.code === 'ETIMEDOUT' || (e.status == null && !!e.signal))
   try {
