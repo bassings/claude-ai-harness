@@ -1,0 +1,2192 @@
+#!/usr/bin/env node
+// The optimiser's read/aggregate helper: a standalone, ordinary Node
+// script, NOT a dynamic-workflow script -- same reason and same pattern as
+// workflows/lib/ledger-append.mjs (see that file's header): workflow
+// scripts have no filesystem access, no imports, and the runtime statically
+// rejects Date.now()/new Date()/Math.random() before execution, so all
+// ledger reading, hostile-input tolerance, aggregation arithmetic and gh
+// output parsing live here instead, invoked via Bash from an agent step
+// inside workflows/optimise-cycle.js.
+//
+// AC-ARCH-8: this file is the optimiser's own reading of "the ledger
+// envelope, git and gh" -- it deliberately reuses none of the three
+// original PR1 workflows' own internals (plan cycle, review cycle, or the
+// TDD task runner), and none of those three reference this file in turn
+// (see test/optimise-static.test.js). It DOES read the envelope constants
+// ledger-append.mjs already defines as the single definition site
+// (AC-ARCH-5), rather than re-declaring them, since ledger-append.mjs is
+// not one of the three workflows AC-ARCH-8 fences off.
+//
+// AC-SEC-9: every function below is READ-ONLY. Nothing in this file
+// modifies a file on disk, in any form. Proven directly in
+// test/optimise-read.test.js (sha256/mtime identity before and after a
+// real CLI invocation against a real repo) and mechanically in
+// test/optimise-static.test.js (a grep for write-shaped fs calls by name).
+//
+// AC-QA-21: every number the optimiser reports is computed here, in real
+// script code, from parsed records -- never asserted by an agent. The same
+// fixture fed through these functions twice yields byte-identical output
+// (proven in test/optimise-read.test.js).
+
+import fs from 'node:fs'
+import path from 'node:path'
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, wasNoSpecInPlay, BLOCKED_REASONS, MODEL_PATTERN_STR } from './ledger-append.mjs'
+
+// Round-7 review F1 (§12 reframe, corrected a second time): round-6's
+// isNeutralised(obj, field) asked a SHAPE question -- "is this value null
+// AND does a *_raw sibling happen to be present?" -- when the real
+// question is SEMANTIC: "is this a value I can actually treat as
+// evidence?" The two are NOT the same test. A bare `verdict: null` with
+// NO verdict_raw sibling (a caller can supply this directly; it never
+// touches degradeEntry at all, since null is a schema-legal value for
+// verdict) sailed straight past isNeutralised and was still counted as a
+// real, unknown-shaped verdict -- n incremented, pass/fail untouched,
+// insufficient_data/unattributed_verdict_in_entry both false, and five
+// such records cleared MIN_RUNS_FOR_NEVER_FAILED and reported
+// never_failed:true. The exact round-6 bug, reproduced verbatim, because
+// the guard matched the FIX's own assumption about what a neutralised
+// value looks like rather than asking whether the value was real.
+//
+// THE STANDING RULE, so this is not lost a third time: an "is this
+// evidence?" test must enumerate the VALID values and treat everything
+// else -- null, undefined, missing, a neutralised value with its sibling
+// present, a neutralised value with no sibling at all, a hand-typed
+// ledger line predating any of this, an arbitrary junk string -- as not
+// evidence. It must never match on the shape a particular fix happens to
+// produce. See the KNOWN_VERDICTS check below and the LENS_RE check in
+// bumpDisposition's caller for the two live examples; see
+// test/optimise-read.test.js's NEUTRALISED-VALUE TABLE for the test-side
+// half of this rule.
+const KNOWN_VERDICTS = new Set(['PASS', 'FAIL', 'UNVERIFIABLE'])
+// Round-7 sweep: the SAME shape-vs-value confusion existed one field over.
+// `f.lens` feeding bumpDisposition asked "was this neutralised" instead of
+// "is this a real lens name" -- a bare `lens: null` (no lens_raw) would
+// have stringified to the bucket key "null" exactly like the verdict bug,
+// merging two different neutralised findings' dispositions into one fake
+// shared bucket. Value-based: imports the writer's own pattern (one
+// definition site, AC-ARCH-1-style) rather than a truthiness check, so a
+// hand-typed or otherwise-malformed lens string that never went through
+// degradeEntry at all is excluded too, not merely a literal null.
+const LENS_RE = new RegExp(LENS_PATTERN_STR)
+
+// AC-ARCH-14: the default bound on how much ledger history a single
+// aggregation pass reads -- proven against a >=2000-line synthetic ledger
+// in test/optimise-read.test.js. Not configurable via env or a config file
+// (AC-SIMP-2); a caller may override it via the optimiser workflow's own
+// `args` (the same input surface the other PR1 workflows already expose
+// for their own options), which is passed through to this CLI as an
+// explicit --window flag.
+export const DEFAULT_LEDGER_WINDOW_LINES = 2000
+
+// AC-SIMP-10 / AC-QA-17: below this many usable ledger records, the
+// optimiser emits zero harness-side proposals and reports insufficient
+// data instead, naming this exact number. Five is chosen as the smallest
+// sample from which "this lens's findings are mostly rejected" or "this AC
+// never fails" stops being a single anecdote -- a documented, stated
+// threshold, not a tuned performance ceiling (the same class of number
+// AC-QA-22 vetoed at planning for being invented; this one is a minimum
+// EVIDENCE size, not a latency budget).
+export const MIN_RECORDS_FOR_PROPOSALS = 5
+
+// AC-DATA-8: the minimum number of recorded runs before a "has never
+// failed" claim about a CI job or an AC is treated as meaningful rather
+// than insufficient data.
+export const MIN_RUNS_FOR_NEVER_FAILED = 5
+
+// AC-QA-20 / AC-ARCH-14: the citation pool is the ONLY set of ids the
+// synthesis prompt ever sees and the ONLY set a proposal's citation is
+// checked against -- capped small and separately from the (larger, up to
+// DEFAULT_LEDGER_WINDOW_LINES) aggregation window, so a proposal's
+// citation is always both real (present in what the optimiser actually
+// processed) and cheap to embed in a prompt (never the full window).
+export const CITATION_POOL_SIZE = 50
+
+const ENVELOPE_REQUIRED = ['schema_version', 'run_id', 'ts', 'repo', 'kind']
+
+// Parses raw ledger file content into usable records and a counted,
+// reasoned skip list (AC-QA-16). Tolerates blank lines, a truncated final
+// line, unknown extra fields, an unknown `kind`, and any `schema_version`
+// (older or newer than this script's own understanding) -- only a line that
+// is not valid JSON, or is valid JSON missing one of the envelope's own
+// required identity fields, is skipped. Never throws.
+export function parseLedgerContent(raw) {
+  const records = []
+  const skipped = []
+  const schemaVersionsSeen = new Map()
+  if (!raw) return { records, skipped, schemaVersionsSeen, truncatedFinalLine: false }
+  const lines = raw.split('\n')
+  // A file written by ledger-append.mjs always ends with a trailing '\n',
+  // so split() yields one empty trailing element -- not a real line, and
+  // must not be reported as a skip. A genuinely truncated final line (no
+  // trailing '\n') instead yields a non-empty last element that is not
+  // valid JSON, which the loop below counts normally.
+  let truncatedFinalLine = false
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const lineNo = i + 1
+    if (!line.trim()) continue
+    let parsed
+    try {
+      parsed = JSON.parse(line)
+    } catch (e) {
+      // Review round-1 L1: JSON.parse's own SyntaxError message embeds a
+      // snippet of the RAW (corrupt) input it failed on -- for a torn or
+      // hand-edited line beginning with an absolute path, that snippet is
+      // the leak itself, reaching this reader's JSON output and, from
+      // there, a model prompt. A fixed reason naming only the line number,
+      // never the parser's own message text, closes it.
+      skipped.push({ line: lineNo, reason: `line ${lineNo} failed JSON parse (invalid JSON syntax)` })
+      if (i === lines.length - 1) truncatedFinalLine = true
+      continue
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      skipped.push({ line: lineNo, reason: `line ${lineNo} is valid JSON but not an object` })
+      continue
+    }
+    const missing = ENVELOPE_REQUIRED.filter((k) => !(k in parsed))
+    if (missing.length) {
+      skipped.push({ line: lineNo, reason: `line ${lineNo} is missing required envelope field(s): ${missing.join(', ')}` })
+      continue
+    }
+    records.push(parsed)
+    const v = parsed.schema_version
+    schemaVersionsSeen.set(v, (schemaVersionsSeen.get(v) || 0) + 1)
+  }
+  return { records, skipped, schemaVersionsSeen, truncatedFinalLine }
+}
+
+// Bounds how many records proceed to aggregation (AC-ARCH-14): keeps the
+// LAST `maxLines` records by array order. This windowing happens here, in
+// script code, BEFORE any of this content is placed into an agent prompt
+// string.
+//
+// Array order equals time order only for records read from a SINGLE ledger
+// file, which is append-only. It does NOT hold across files: a caller that
+// concatenates several roots produces a repo-major array, and slicing its
+// tail then selects by argument position rather than by time. Supplying
+// time-ordered input is the caller's responsibility -- see
+// sortRecordsByTime, which runLedgerCommand applies before calling this.
+export function windowRecords(records, maxLines = DEFAULT_LEDGER_WINDOW_LINES) {
+  if (records.length <= maxLines) return { windowed: records, truncated: false, droppedCount: 0 }
+  const droppedCount = records.length - maxLines
+  return { windowed: records.slice(droppedCount), truncated: true, droppedCount }
+}
+
+// Puts records from any number of roots into one true time order, so that
+// windowRecords' tail slice means "the most recent runs" rather than
+// "whichever root was listed last".
+//
+// Array.prototype.sort has been stable by specification since ES2019, so
+// records sharing a timestamp keep the order they were read in, which for a
+// single root is its append order. An earlier version decorated each record
+// with its original index and tie-broke on that, described as not leaning on
+// that guarantee -- but the decoration was untestable: changing the tiebreak
+// to `return 0` left the whole suite green, because the language already
+// promised what it was re-implementing. Removed rather than kept as
+// decoration; what remains is load-bearing (see the equality branch below).
+//
+// A record whose `ts` is missing or unparseable sorts as OLDEST. The ledger
+// envelope only requires `ts` to be a non-empty string, so a non-ISO value
+// is reachable; treating it as oldest means the least trustworthy input can
+// never displace a record with a known, recent time. It is dropped first
+// rather than silently outranking real data.
+export function sortRecordsByTime(records) {
+  const timeOf = (record) => {
+    const parsed = typeof record.ts === 'string' ? Date.parse(record.ts) : Number.NaN
+    return Number.isFinite(parsed) ? parsed : -Infinity
+  }
+  // The equality branch guards a real hazard that this runtime happens to
+  // tolerate, and the distinction is stated rather than glossed. Two records
+  // with an unusable ts both key to -Infinity, and `-Infinity - -Infinity` is
+  // NaN: an inconsistent comparator, for which the specification leaves the
+  // resulting order implementation-defined. Returning 0 for equal keys is
+  // what makes the stable-sort guarantee apply to them.
+  //
+  // MEASURED, and not what the first version of this comment claimed:
+  // replacing this branch with a plain `ta - tb` leaves the suite at 125/125
+  // green, because V8 treats a NaN comparator result as 0. So on this engine
+  // the branch is unobservable and no test here can prove it load-bearing.
+  // It stays because the guarantee it relies on is the language's, not
+  // V8's, and a different engine may order those records differently -- but
+  // it is defensive rather than proven, and calling it proven would be the
+  // exact false claim this file's other comments warn about.
+  //
+  // Copy first, so the caller's array is never reordered.
+  return records.slice().sort((a, b) => {
+    const ta = timeOf(a)
+    const tb = timeOf(b)
+    if (ta === tb) return 0
+    return ta < tb ? -1 : 1
+  })
+}
+
+// One finding, one increment. The `by` parameter this took while the
+// writer-computed tally existed (which supplied whole counts rather than
+// findings) went with it at fix round 4: a count nothing passes is a
+// parameter the next reader has to prove is unused before touching it.
+function bumpDisposition(counts, lens, disposition) {
+  if (!counts[lens]) counts[lens] = { fixed: 0, rejected: 0, spec_bug: 0, open: 0 }
+  if (disposition in counts[lens]) counts[lens][disposition] += 1
+}
+
+// M2 (round 3 review): derived from ledger-append.mjs's own exported
+// AC_ID_PATTERN_STR rather than a second, independently maintained copy of
+// that shape -- see that export's own comment for why two copies is a real
+// hazard, not merely untidy. L4's sibling Set over the writer's DISPOSITIONS
+// went with the tally at fix round 4: only the tally loop needed to ask
+// whether an arbitrary key was a known disposition, because only it read
+// dispositions as map keys rather than from a schema-validated field.
+const AC_ID_RE = new RegExp(AC_ID_PATTERN_STR)
+
+// H3: strip a leading spec prefix from an ac_id, but ONLY when it names the
+// record's own spec.
+//
+// The prefix is how a lens disambiguates when one review spans several specs,
+// and it is carried inside ac_id deliberately (a separate field would let the
+// same attribution arrive in two shapes). But two citation forms of ONE
+// criterion must aggregate to one bucket, or a criterion that failed under one
+// form is reported as never having failed under the other.
+//
+// Matched against the spec's basename without extension, which is the form a
+// lens actually emits ("FEAT-011 AC-QA-1" for specs/FEAT-011.md). Anything
+// else is left exactly as it arrived: an unrecognised prefix is a different
+// criterion, not a malformed one, and guessing would merge buckets that must
+// stay apart.
+//
+// M2 (round 3 review): extracted via AC_ID_PATTERN_STR's own named groups
+// (`prefix`, `ac`) rather than a second, looser regex literal -- any ac_id
+// reaching here already passed the writer's validation (or came from a
+// hand-edited/foreign ledger line, per the spec's own documented
+// possibility), so matching it against the SAME pattern that accepted it in
+// the first place cannot be blind to a form the writer itself widened to
+// accept. A value that does not match at all (should not happen for a
+// writer-validated line) is left exactly as it arrived, same as before.
+function stripOwnSpecPrefix(acId, planKey) {
+  if (typeof acId !== 'string' || typeof planKey !== 'string') return acId
+  const m = AC_ID_RE.exec(acId)
+  if (!m || !m.groups.prefix) return acId
+  const base = planKey.replace(/^.*\//, '').replace(/\.[^.]*$/, '')
+  return base && m.groups.prefix === base ? m.groups.ac : acId
+}
+
+// HARN-OPT-2 PR1 (AC-ARCH-1, AC-ARCH-4): the ONE place every plan-keyed
+// aggregation below derives its bucket key from -- routes through the
+// single shared canonicalPlanKey (imported from ledger-append.mjs, never
+// redeclared here). Prefers a post-PR1 record's own `plan_key` (computed
+// writer-side, so it already accounts for the ACTUAL working tree the
+// record was authored from -- see ledger-append.mjs's AC-ARCH-3 worktree
+// handling, which this reader cannot reproduce after the fact); falls back
+// to re-deriving it from the retained `spec` field for a historical
+// (pre-PR1) line that has no plan_key at all (AC-ARCH-5: one code path, no
+// branch on schema_version).
+//
+// Returns null for a record with no attributable identity left at all
+// (AC-QA-7): a `degraded:true` line drops spec/plan_key entirely to fit
+// the minimal envelope, so there is nothing to canonicalise -- the caller
+// must count this separately, never fold it into the no-spec bucket.
+function planKeyForRecord(record, root = '') {
+  if (!record || record.degraded) return null
+  // Review round-1 M1 (read-side defence in depth): a STORED plan_key is
+  // re-canonicalised, never trusted verbatim. A hand-edited or foreign
+  // ledger line (the spec itself documents hand-injected records) can carry
+  // a plan_key that itself leaks -- re-running it through the same shared
+  // function costs nothing for an already-clean value (canonicalPlanKey is
+  // idempotent) and closes that route the same way a hostile `spec` is
+  // closed.
+  if (typeof record.plan_key === 'string' && record.plan_key) return canonicalPlanKey(record.plan_key, root)
+  return canonicalPlanKey(record.spec, root)
+}
+
+// HARN-OPT-4 T5 (AC-QA-18, AC-DATA-9, AC-SIMP-6): tdd_task runs that ended
+// blocked and have no LATER done tdd_task row for the same (repo, canonical
+// spec, task), from ledger rows alone (each entry also carries a non-clearing
+// laterDoneSameSpec hint, round 1 M1). The join key includes the task, so a
+// done row for task B never clears a blocked task A under the same spec. An
+// upper bound: a task finished by hand leaves no resolution row. Classifies on
+// key presence (T4 round 1 M1): a pre-T5 row has no blocked_reason key, still
+// joins by outcome, and its reason is 'not recorded', never a value; a
+// non-enum value (hand-edited ledger) is likewise never echoed. byReason counts
+// the unresolved rows that carry a recorded enum reason.
+// HARN-OPT-5 T1 (AC-ARCH-5): BLOCKED_REASONS is imported from ledger-append.mjs, the one definition site.
+export function aggregateBlockedUnresolved(records, { root = '' } = {}) {
+  const open = new Map()
+  // Round 1 M1 (AC-PROD-6, AC-DATA-9): every done row in time order, so an
+  // unresolved entry can carry a NON-clearing hint. The join key is the full
+  // task text, so a task re-briefed after a block and then finished is never
+  // cleared (BUG-018 on the real ledger); per-task clearing stays, the hint
+  // tells the operator a later done run exists for the same spec.
+  const doneRows = []
+  let seq = 0
+  for (const r of sortRecordsByTime(records)) {
+    if (!r || r.kind !== 'tdd_task' || r.degraded || typeof r.task !== 'string') continue
+    if (r.outcome !== 'blocked' && r.outcome !== 'done') continue
+    seq += 1
+    const key = JSON.stringify([r.repo, planKeyForRecord(r, root), r.task])
+    if (r.outcome === 'done') { open.delete(key); doneRows.push({ seq, repo: r.repo, spec: planKeyForRecord(r, root), task: r.task, ts: r.ts }); continue }
+    const recorded = 'blocked_reason' in r && BLOCKED_REASONS.includes(r.blocked_reason)
+    open.set(key, { repo: r.repo, spec: planKeyForRecord(r, root), task: r.task, reason: recorded ? r.blocked_reason : 'not recorded', seq })
+  }
+  const unresolved = [...open.values()].map(({ seq: blockedSeq, ...u }) => {
+    // Round 3 F3: every spec-null run canonicalises to the one no-spec bucket,
+    // where a later done run says nothing about this task, so the hint is
+    // never offered there.
+    const noSpecKey = planKeyForRecord({ spec: null }, root)
+    const later = u.spec === noSpecKey ? undefined : doneRows.find((d) => d.seq > blockedSeq && d.repo === u.repo && d.spec === u.spec && d.task !== u.task)
+    // One shape, always: the hint fields are present on every entry, false
+    // and null when no later done row for the spec exists, so a consumer
+    // never has to test for the key (conductor edit after fix round 1).
+    return { ...u, laterDoneSameSpec: !!later, laterDoneSameSpecTs: later ? later.ts : null }
+  })
+  const byReason = Object.fromEntries(BLOCKED_REASONS.map((x) => [x, 0]))
+  let reasonNotRecorded = 0
+  for (const u of unresolved) {
+    if (u.reason === 'not recorded') reasonNotRecorded += 1
+    else byReason[u.reason] += 1
+  }
+  // HARN-OPT-5 T1 (AC-PROD-8): terminal tdd_task rows counted by requested
+  // model crossed with outcome and blocked_reason, so the weekly report shows
+  // how many runs asked for a non-default model and how they ended. Folded in
+  // here rather than a new section. A row with no model key (pre-v6, none given,
+  // or stripped for a stale writer) or a value outside the token pattern (a
+  // degraded row) reads as null and is never echoed; the same holds for a
+  // reason outside the enum. Null therefore means no model was recorded
+  // (round 1 F5, AC-PROD-8).
+  const modelRe = new RegExp(MODEL_PATTERN_STR)
+  const byModelCounts = new Map()
+  for (const r of records) {
+    if (!r || r.kind !== 'tdd_task' || !['done', 'blocked', 'aborted'].includes(r.outcome)) continue
+    const model = typeof r.model === 'string' && modelRe.test(r.model) ? r.model : null
+    const blocked_reason = BLOCKED_REASONS.includes(r.blocked_reason) ? r.blocked_reason : null
+    const key = JSON.stringify([model, r.outcome, blocked_reason])
+    byModelCounts.set(key, (byModelCounts.get(key) || 0) + 1)
+  }
+  const byModel = [...byModelCounts].map(([k, count]) => {
+    const [model, outcome, blocked_reason] = JSON.parse(k)
+    return { model, outcome, blocked_reason, count }
+  })
+  return { count: unresolved.length, unresolved, byReason, reasonNotRecorded, byModel }
+}
+
+// Rework attribution (spec item 1) + AC-verdict aggregation keyed by
+// (repo, spec, ac_id) -- AC-DATA-7: never by AC id alone, so the same AC id
+// in two different specs (or the same spec name reused across two repos)
+// reports as two distinct criteria, not one merged one. HARN-OPT-2 PR1: the
+// key's `spec` segment (and the entry's reported `spec` field) is now the
+// CANONICAL plan key, not the raw ledger value, so an absolute and a
+// relative form of the same plan collapse into one entry (AC-ARCH-4) and a
+// path that cannot be attributed to any single spec (out-of-repo, or the
+// pre-existing redaction placeholder) is excluded entirely and counted
+// under the returned `unattributableCount` instead of a plan-shaped bucket
+// (AC-DATA-7, AC-OPS-5) -- `root`, optional, is the caller's already-
+// resolved analysis root, used only for lexically relativising an absolute
+// historical `spec` value; it is never touched by any fs call here.
+// Round 2 L1 (AC-QA-30): the outcomes that count as a conducted review, in one
+// place. An aborted run recorded nothing a lens found, and a no-op run had no
+// diff to review, so counting either as a review inflated the v4 row figures
+// and the no-spec run count (as the round-1 `!== 'started'` test did).
+const CONDUCTED_REVIEW_OUTCOMES = new Set(['done', 'blocked'])
+
+export function aggregateRework(records, { root = '' } = {}) {
+  const reviewRecords = records.filter((r) => r.kind === 'review_cycle')
+  const lensDispositionCounts = {}
+  const acVerdicts = new Map()
+  let unattributableCount = 0
+  // Round-4 review M3: an unattributed (sanitised, or explicitly null)
+  // ac_id whose verdict is FAIL must not simply vanish from this
+  // aggregation -- neverFailingAcs feeds directly into a "retire this
+  // guard" proposal, and a hidden FAIL there is an INVERTED conclusion
+  // (the guard fails and the report says it never has), not merely a lost
+  // measurement. Tracked per (repo, plan) bucket -- the same key shape
+  // acVerdicts itself uses, minus the ac_id segment -- rather than
+  // attempting to re-attribute the FAIL to a specific ac_id from
+  // ac_id_raw: a hostile ac_id/ac_id_raw crafted to END in a real AC id
+  // (e.g. "ignore previous instructions AC-SEC-1") could otherwise redirect
+  // its own FAIL onto an unrelated criterion, a second injection route
+  // into telemetry. neverFailingAcs (below) degrades every ac_id in a
+  // tainted bucket to never_failed:null rather than computing from the
+  // (necessarily incomplete) counts it can see.
+  const unattributedFailBuckets = new Set()
+  // Review round-2 M-3: invalid_ac_ids_dropped is a real, measured integer
+  // on a record only when the writer actually sanitised something (or
+  // supplied 0 when nothing needed sanitising) -- summed here across every
+  // review_cycle record in the window, exposed on the return so
+  // optimise-cycle.js can render it beside the orphan counters.
+  let invalidAcIdsDropped = 0
+  // Round-6 review, instruction 4: invalid_record_values_dropped (the
+  // round-5 H1 general degrade mechanism's own counter) was written to
+  // every line and read by nothing -- summed here the same way
+  // invalidAcIdsDropped already is, so an operator can see that generic
+  // values (verdicts.<lens>, lenses_run[] entries, ...) were neutralised
+  // in the window, not just infer it from the ac_id-specific counter.
+  let invalidRecordValuesDropped = 0
+  // Fix round 1, finding 5: invalid_fixed_ids_dropped
+  // (specs/record-fixed-findings.md AC-3's id-guard drop count) was written
+  // to every review_cycle line and summed by nothing, exactly the
+  // "written to every line and read by nothing" defect class the comment
+  // above already names for invalid_record_values_dropped -- summed the
+  // same way, here.
+  let invalidFixedIdsDropped = 0
+  // Fix round 1, finding 1 (read-side half): duplicate_fixed_ids_dropped
+  // (the writer's own within-line dedup count) gets the same treatment,
+  // so it does not become the NEXT field this exact defect class recurs
+  // on.
+  let duplicateFixedIdsDropped = 0
+  // Fix round 1, finding 2: the ledger has no memory across lines -- each
+  // review_cycle write is independent, and a conductor that re-supplies an
+  // already-confirmed finding as prior_findings on a LATER round (a real
+  // risk in SKILL.md's own prose instruction, not eliminable by wording
+  // alone) produces a SECOND line recording the SAME finding id 'fixed'
+  // again. The writer structurally cannot see this: it only ever sees one
+  // line at a time. Deduplicated HERE instead, across the whole window,
+  // scoped per repo (not globally) so the same id in two unrelated repos
+  // is not treated as one giant coincidence.
+  const seenFixedIds = new Set()
+  let duplicateFixedAcrossRounds = 0
+  // Fix round 2, AC-3 (specs/record-fixed-findings.md): invalid_prior_ids_dropped
+  // (the writer's own supplied-id-doesn't-match-its-content counter) gets
+  // the same treatment as its siblings above, so it does not become the
+  // NEXT "written to every line and read by nothing" field.
+  let invalidPriorIdsDropped = 0
+  // H3 (round 3 review): findings_truncated/ac_verdicts_truncated were
+  // written to every line and summed by nothing -- the same shape every
+  // counter above already closed, one field over, for the two counters the
+  // byte-rescue loop itself produces.
+  let findingsTruncated = 0
+  let acVerdictsTruncated = 0
+  // M3: a finding whose `lens` is not a real lens name was thrown away
+  // uncounted by the LENS_RE gate below -- summed here instead, separately
+  // from lensDispositionCounts (never as a fake lens bucket in that map).
+  let unattributedFindings = 0
+  // H4: how many review runs had no spec in play, and how many of their
+  // findings were reclassified from spec_bug to open as a result -- the
+  // signal "this round was reviewed with no spec" existed only as an
+  // absence before this, exactly the shape the whole spec exists to close.
+  let noSpecReviewRuns = 0
+  let noSpecFindingsReclassified = 0
+  // HARN-OPT-4 T4 (AC-QA-30, AC-OPS-4): the no-spec figure split by who invoked
+  // the review. A conducted review recorded a positive-integer round; a row with
+  // round null (key present) counts as direct. Round 1 M1 (AC-QA-30): a row with
+  // NO round key at all (every row written before T4) says nothing about who
+  // invoked it, so it is a third bucket, never direct.
+  let noSpecReviewRunsConducted = 0
+  let noSpecReviewRunsDirect = 0
+  let noSpecReviewRunsRoundNotRecorded = 0
+  let v4NoSpecReviewRunsConducted = 0
+  let v4NoSpecReviewRunsDirect = 0
+  let v4NoSpecReviewRunsRoundNotRecorded = 0
+  // Round 2 M1 (AC-PROD-4): terminal rows with a positive-integer round
+  // REGARDLESS of spec, so the amended success measure (rows carrying a round
+  // equal the conducted reviews in the conductor log) is readable from the
+  // report. The *Seen flags make "no terminal row carried the key" null, not 0.
+  let reviewRunsWithRound = 0
+  let roundKeySeen = false
+  let v4ReviewRunsWithRound = 0
+  let v4RoundKeySeen = false
+  // H3: which (repo, plan) buckets saw a truncated ac_verdicts array in this
+  // window -- the surplus could have held the FAIL for any criterion in
+  // that bucket, so neverFailingAcs must not report a confident
+  // never_failed:true for any of them. Same shape as unattributedFailBuckets
+  // above, a different cause.
+  const truncatedBuckets = new Set()
+  // HARN-OPT-4 T3 (AC-QA-10, AC-DATA-7): per-key count of runs in which two
+  // usable verdicts for one canonical ac_id differed. Kept apart from the
+  // verdict counts so worst-of collapsing never hides that a run disagreed
+  // with itself (AC-PROD-3).
+  const verdictDisagreements = new Map()
+  // Round 2 L2 (AC-QA-10, AC-DATA-7): verdict groups are keyed by
+  // (repo, run_id, canonical ac_id) ACROSS ledger records and resolved after
+  // the record loop, so two terminal rows for one run count once. A record
+  // with no usable run_id falls back to its own index: it cannot be shown to
+  // share a run with anything, so it must never be merged.
+  const runVerdicts = new Map()
+  // AC-PROD-10: the completeness figures for schema_version >= 4 rows alone.
+  // Older rows cannot have recorded them, so they are excluded by count and
+  // never folded in as a measured zero (AC-QA-30).
+  let v4Rows = 0
+  let v4FindingsTruncated = 0
+  let v4UnattributedFindings = 0
+  let v4DuplicateVerdictPairs = 0
+  let v4NoSpecReviewRuns = 0
+  let terminalRows = 0
+  for (const [recordIndex, r] of reviewRecords.entries()) {
+    // Round 1 M2: a run is written as a 'started' row and then a terminal
+    // row, so counting both double-counted rows and no-spec runs (27 against
+    // 17 done rows on the real ledger). Only terminal rows count toward the
+    // v4 split and the no-spec run figures.
+    // Round 2 L1: narrowed from "not started" to the conducted set.
+    const isTerminal = CONDUCTED_REVIEW_OUTCOMES.has(r.outcome)
+    if (isTerminal) terminalRows += 1
+    const isV4 = isTerminal && typeof r.schema_version === 'number' && r.schema_version >= 4
+    if (isV4) {
+      v4Rows += 1
+      if (typeof r.findings_truncated === 'number') v4FindingsTruncated += r.findings_truncated
+    }
+    if (typeof r.invalid_ac_ids_dropped === 'number') invalidAcIdsDropped += r.invalid_ac_ids_dropped
+    if (typeof r.invalid_record_values_dropped === 'number') invalidRecordValuesDropped += r.invalid_record_values_dropped
+    if (typeof r.invalid_fixed_ids_dropped === 'number') invalidFixedIdsDropped += r.invalid_fixed_ids_dropped
+    if (typeof r.duplicate_fixed_ids_dropped === 'number') duplicateFixedIdsDropped += r.duplicate_fixed_ids_dropped
+    if (typeof r.invalid_prior_ids_dropped === 'number') invalidPriorIdsDropped += r.invalid_prior_ids_dropped
+    if (typeof r.findings_truncated === 'number') findingsTruncated += r.findings_truncated
+    if (typeof r.ac_verdicts_truncated === 'number') acVerdictsTruncated += r.ac_verdicts_truncated
+    // Fix round 4: the per-finding loop below is the ONE source of these
+    // counts again. For three fix rounds this branched on the writer's
+    // `findings_by_lens` tally first, to beat the MAX_FINDINGS cap -- and
+    // that branch produced a defect in every review round it existed
+    // (double-counted fixes, then a collapsed record, then zero fixes on the
+    // busy rounds), because a second source for the same number has to
+    // re-implement every rule the first one applies, and the cross-round
+    // `fixed` dedupe below is one it structurally cannot. `r.findings` is
+    // capped at MAX_FINDINGS and shrunk further by the byte loop, so these
+    // counts DO undercount a truncated round -- by up to 82%, measured. What
+    // says so is `findingsTruncated`, summed just above and rendered in the
+    // same report section (AC-QA-8's reported-shortfall branch). A named
+    // shortfall beside a smaller number is honest; a second tally that
+    // silently disagreed with the array beside it was not.
+    // M2 (review round one): D4 fixed the WRITER, so lines written from now on
+    // are right. Every line already in a 90-day window is not, and those are
+    // the lines this month's report reads -- so the spec_bug figure stays
+    // conflated for the whole retained history unless the reader applies the
+    // same rule. It can, because the rule is computable from fields the line
+    // already carries. That is precisely why D4's trigger was defined as
+    // observable state rather than a new stored flag: a read-side fix reaches
+    // the history a write-side fix never can.
+    // L3: the shared predicate, imported from ledger-append.mjs rather than
+    // a second copy of decision 4's rule.
+    // M1 (round-4 review): the record's own evidence about whether its
+    // ac_verdicts can be read at face value is handed to the predicate, which
+    // owns what that evidence means. `r.ac_verdicts_truncated` is the same
+    // field this loop already summed twenty-five lines above and used to taint
+    // truncatedBuckets -- it was in hand and simply not consulted here.
+    const noSpecWasInPlay = wasNoSpecInPlay(r.spec, r.ac_verdicts, {
+      acVerdictsTruncated: r.ac_verdicts_truncated,
+      degraded: r.degraded,
+    })
+    if (isTerminal && 'round' in r) roundKeySeen = true
+    if (isV4 && 'round' in r) v4RoundKeySeen = true
+    if (isTerminal && Number.isInteger(r.round) && r.round >= 1) reviewRunsWithRound += 1
+    if (isV4 && Number.isInteger(r.round) && r.round >= 1) v4ReviewRunsWithRound += 1
+    if (isTerminal && noSpecWasInPlay) noSpecReviewRuns += 1
+    if (isV4 && noSpecWasInPlay) v4NoSpecReviewRuns += 1
+    if (isTerminal && noSpecWasInPlay) {
+      const conducted = Number.isInteger(r.round) && r.round >= 1
+      const notRecorded = !('round' in r)
+      if (conducted) noSpecReviewRunsConducted += 1
+      else if (notRecorded) noSpecReviewRunsRoundNotRecorded += 1
+      else noSpecReviewRunsDirect += 1
+      if (isV4) {
+        if (conducted) v4NoSpecReviewRunsConducted += 1
+        else if (notRecorded) v4NoSpecReviewRunsRoundNotRecorded += 1
+        else v4NoSpecReviewRunsDirect += 1
+      }
+    }
+    const reclassify = (d) => (noSpecWasInPlay && d === 'spec_bug' ? 'open' : d)
+
+    for (const f of r.findings || []) {
+      // Round-6 H1 (read-side sweep), corrected round-7 F1 (value-based,
+      // not shape-based -- see this file's own header comment): a `lens`
+      // that is not a real, pattern-matching lens name must not be read
+      // as one. Unguarded, `bumpDisposition(counts, null, ...)` (or any
+      // other non-matching value) stringifies to a fake shared bucket key,
+      // merging DIFFERENT findings' dispositions together -- the
+      // identical "different things merge" defect class already closed
+      // for ac_id, one field over. `typeof f.lens === 'string'` short-
+      // circuits before the regex so `null`/`undefined`/a non-string never
+      // reach it.
+      if (typeof f.lens === 'string' && LENS_RE.test(f.lens)) {
+        // Fix round 1, finding 2: a 'fixed' disposition finding whose id
+        // (repo-scoped) has already been counted once in this window is a
+        // cross-round repeat, not a new fix -- skip the bump, but count the
+        // skip so it stays visible rather than silently vanishing.
+        if (f.disposition === 'fixed' && typeof f.id === 'string' && f.id) {
+          const dedupeKey = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(f.id)}`
+          if (seenFixedIds.has(dedupeKey)) {
+            duplicateFixedAcrossRounds += 1
+            continue
+          }
+          seenFixedIds.add(dedupeKey)
+        }
+        if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
+        bumpDisposition(lensDispositionCounts, f.lens, reclassify(f.disposition))
+      } else if (f && typeof f === 'object') {
+        // M3: a finding whose lens could not be attributed used to vanish
+        // here with nothing recording it -- this spec's own defect class
+        // (a value a check could not parse, discarded, its absence then
+        // reported as a measurement) inside the reader this spec added.
+        // Counted instead, and rendered under its own heading.
+        unattributedFindings += 1
+        if (isV4) v4UnattributedFindings += 1
+        if (noSpecWasInPlay && f.disposition === 'spec_bug') noSpecFindingsReclassified += 1
+      }
+    }
+    const verdicts = r.ac_verdicts || []
+    // H3: taint this (repo, plan) bucket whenever THIS record's ac_verdicts
+    // were truncated, regardless of whether any verdicts survived the cut --
+    // the dropped surplus could have held the FAIL for any criterion the
+    // bucket contains. Computed before the "nothing to bucket" shortcut
+    // below, since a truncated-to-EMPTY array must still taint.
+    if (typeof r.ac_verdicts_truncated === 'number' && r.ac_verdicts_truncated > 0) {
+      const truncatedPlanKey = planKeyForRecord(r, root)
+      if (truncatedPlanKey !== null && truncatedPlanKey !== REDACTED_PATH_MARKER) {
+        truncatedBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(truncatedPlanKey)}`)
+      }
+    }
+    if (!verdicts.length) continue
+    const planKey = planKeyForRecord(r, root)
+    if (planKey === null || planKey === REDACTED_PATH_MARKER) {
+      unattributableCount += verdicts.length
+      continue
+    }
+    // AC-QA-10: usable verdicts are gathered per (repo, run, canonical ac_id)
+    // across records and resolved after the loop (round 2 L2), so a run counts
+    // at most once however many times a lens or a row repeated it.
+    const runPart = typeof r.run_id === 'string' && r.run_id !== '' ? `run:${r.run_id}` : `record:${recordIndex}`
+    for (const v of verdicts) {
+      // Review round-2 M-3: a sanitised entry (ac_id nulled by the writer,
+      // AC-DATA-4-style ac_id_raw retained instead) must never reach the
+      // bucket key -- `escapeKeyComponent(null)` stringifies to the
+      // literal "null", which would silently merge EVERY sanitised
+      // verdict from every different plan into one fake shared bucket,
+      // exactly the "different plans merge" defect class this spec exists
+      // to close. Excluded from bucketing entirely; already counted once
+      // via invalidAcIdsDropped above, never counted twice.
+      if (v.ac_id === null || v.ac_id === undefined) {
+        // Round-4 review M3: a FAIL (or, round-7 F4 below, anything that
+        // is not provably a clean PASS/UNVERIFIABLE) is real data sitting
+        // two lines away in the same window -- taint this (repo, plan)
+        // bucket so neverFailingAcs never reports a confident
+        // never_failed:true while it exists. A genuine PASS/UNVERIFIABLE
+        // unattributed verdict carries no inversion risk and is left
+        // exactly as before.
+        //
+        // Round-7 review F4: this used to test `v.verdict === 'FAIL'`
+        // literally, so DUAL corruption -- an unattributed ac_id AND a
+        // non-evidence verdict on the SAME entry (both null, or a model
+        // writing a combined id+verdict like {ac_id:'AC-QA-8 (partial)',
+        // verdict:'PARTIAL'}, which degradeEntry independently neutralises
+        // to {ac_id:null, verdict:null}) -- produced NO taint at all: the
+        // literal FAIL string never matched. More corruption than a
+        // single unattributed FAIL, but LESS confidence, produced MORE
+        // confidence (a bare never_failed:true) than the single-corruption
+        // case. Fixed the same way F1 fixed the verdict branch one level
+        // up: value-based -- taint unless the verdict is affirmatively
+        // clean (PASS or UNVERIFIABLE), so an unknown verdict is treated
+        // exactly like an unknown ac_id's own worst case, not exonerated
+        // by ALSO being unknown.
+        if (v.verdict !== 'PASS' && v.verdict !== 'UNVERIFIABLE') {
+          unattributedFailBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}`)
+        }
+        continue
+      }
+      // M1 (round-3 review): the same VALUE-based gate the lens path applies,
+      // one field over. A ledger line is untrusted data on disk: the writer
+      // validates every ac_id it writes, but the reader also reads lines it
+      // did not write (hand-edited, restored from a backup written by another
+      // version, or produced in any of the several repos it aggregates
+      // across). Ungated, a forged value flowed into the aggregation key and
+      // out into the operator's report verbatim, newlines included -- and
+      // that report drives "retire this check" proposals, so a forged row
+      // there is an INVERTED conclusion, not a lost measurement. Costs a
+      // writer-produced line nothing: every id the writer accepted already
+      // matches this same exported pattern.
+      //
+      // Dropped like the explicit-null case above rather than silently: the
+      // verdict is counted as unattributable, and a FAIL that could not be
+      // attributed taints the bucket, because a discarded FAIL must degrade a
+      // never_failed claim to unknown rather than leave it confidently true.
+      if (typeof v.ac_id !== 'string' || !AC_ID_RE.test(v.ac_id)) {
+        unattributableCount += 1
+        if (v.verdict !== 'PASS' && v.verdict !== 'UNVERIFIABLE') {
+          unattributedFailBuckets.add(`${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}`)
+        }
+        continue
+      }
+      // Review round-2 M4: same injective-escaping fix as planBucketKey.
+      // H3 (review round one): widening the ac_id pattern let the SAME
+      // criterion arrive in two citation forms -- `AC-QA-1` on one round and
+      // `FEAT-011 AC-QA-1` on the next, when a lens disambiguated because the
+      // review spanned several specs. Keyed verbatim, those became two buckets,
+      // and neverFailingAcs then reported the pass-only one as never having
+      // failed while the other held the failure. That feeds a "retire this
+      // check" proposal, so it is an INVERTED conclusion, not a lost
+      // measurement -- strictly worse than the defect it replaced, and created
+      // by this change: before it, both forms were nulled and no bucket existed.
+      //
+      // Only a prefix naming THIS record's own spec is stripped. A prefix
+      // naming a different spec is a different criterion and keeps its bucket:
+      // merging two specs' AC-QA-1 is the inversion in the other direction,
+      // and is why the prefix is carried inside ac_id at all.
+      const canonicalAcId = stripOwnSpecPrefix(v.ac_id, planKey)
+      const key = `${escapeKeyComponent(r.repo)}|${escapeKeyComponent(planKey)}|${escapeKeyComponent(canonicalAcId)}`
+      if (!acVerdicts.has(key)) acVerdicts.set(key, { repo: r.repo, spec: planKey, ac_id: canonicalAcId, pass: 0, fail: 0, unverifiable: 0, n: 0, unattributedVerdicts: 0 })
+      const entry = acVerdicts.get(key)
+      // Round-6 H1: the ac_id is known (we are inside this branch because
+      // it is), but the VERDICT itself may not be usable evidence -- round-
+      // 5's own repro (null, with verdict_raw retained). Round-7 F1
+      // (corrected a second time, see this file's header comment): the
+      // test is now VALUE-based -- is v.verdict one of the three known
+      // verdicts? -- not shape-based ("was it neutralised with a sibling
+      // present"). This single change subsumes null WITH a sibling, a
+      // BARE null with no sibling at all (schema-legal, never touches
+      // degradeEntry, and is exactly the case round-6's own verification
+      // missed), undefined, a missing key read as undefined, and any
+      // arbitrary junk string a hand-edited or pre-degradeEntry ledger
+      // line could carry -- no enumeration of neutralisation shapes to
+      // maintain. A non-evidence verdict must not count toward n (the
+      // "how many runs support this claim" figure feeding
+      // MIN_RUNS_FOR_NEVER_FAILED) and must not move pass/fail, or
+      // unknowns clear the run-count floor and report never_failed:true
+      // on zero real evidence -- the exact inversion H1 reproduced. The
+      // entry is still created/kept above (not skipped entirely) so this
+      // ac_id remains VISIBLE in the report even when EVERY verdict seen
+      // for it was unusable, rather than silently disappearing the way an
+      // entry that never existed would.
+      if (!KNOWN_VERDICTS.has(v.verdict)) {
+        entry.unattributedVerdicts += 1
+        continue
+      }
+      const groupKey = JSON.stringify([runPart, key])
+      if (!runVerdicts.has(groupKey)) runVerdicts.set(groupKey, { key, seen: [], v4: false })
+      const group = runVerdicts.get(groupKey)
+      group.seen.push(v.verdict)
+      if (isV4) group.v4 = true
+    }
+  }
+  // Worst-of: FAIL over UNVERIFIABLE over PASS. Best-of would let a PASS
+  // mask a FAIL and feed a "retire this check" proposal (AC-DATA-7).
+  for (const { key, seen, v4 } of runVerdicts.values()) {
+    const entry = acVerdicts.get(key)
+    const worst = seen.includes('FAIL') ? 'FAIL' : seen.includes('UNVERIFIABLE') ? 'UNVERIFIABLE' : 'PASS'
+    entry.n += 1
+    if (worst === 'PASS') entry.pass += 1
+    else if (worst === 'FAIL') entry.fail += 1
+    else entry.unverifiable += 1
+    if (new Set(seen).size > 1) verdictDisagreements.set(key, (verdictDisagreements.get(key) || 0) + 1)
+    if (v4 && seen.length > 1) v4DuplicateVerdictPairs += 1
+  }
+  // Round 1 M1: null, never 0, when every no-spec row lacked the round key.
+  const splitUnmeasured = (runs, notRecorded) => runs > 0 && notRecorded === runs
+  const windowUnmeasured = splitUnmeasured(noSpecReviewRuns, noSpecReviewRunsRoundNotRecorded)
+  const v4Unmeasured = splitUnmeasured(v4NoSpecReviewRuns, v4NoSpecReviewRunsRoundNotRecorded)
+  return { n: reviewRecords.length, lensDispositionCounts, acVerdicts, unattributableCount, invalidAcIdsDropped, invalidRecordValuesDropped, invalidFixedIdsDropped, duplicateFixedIdsDropped, duplicateFixedAcrossRounds, invalidPriorIdsDropped, unattributedFailBuckets, findingsTruncated, acVerdictsTruncated, unattributedFindings, noSpecReviewRuns, noSpecReviewRunsConducted: windowUnmeasured ? null : noSpecReviewRunsConducted, noSpecReviewRunsDirect: windowUnmeasured ? null : noSpecReviewRunsDirect, noSpecReviewRunsRoundNotRecorded, reviewRunsWithRound: roundKeySeen ? reviewRunsWithRound : null, noSpecFindingsReclassified, truncatedBuckets, verdictDisagreements,
+    // AC-QA-30: null, never 0, when no row could have recorded the figure.
+    schemaV4: {
+      rows: v4Rows,
+      excludedRows: terminalRows - v4Rows,
+      findingsTruncated: v4Rows ? v4FindingsTruncated : null,
+      unattributedFindings: v4Rows ? v4UnattributedFindings : null,
+      duplicateVerdictPairs: v4Rows ? v4DuplicateVerdictPairs : null,
+      noSpecReviewRuns: v4Rows ? v4NoSpecReviewRuns : null,
+      noSpecReviewRunsConducted: v4Rows && !v4Unmeasured ? v4NoSpecReviewRunsConducted : null,
+      noSpecReviewRunsDirect: v4Rows && !v4Unmeasured ? v4NoSpecReviewRunsDirect : null,
+      noSpecReviewRunsRoundNotRecorded: v4Rows ? v4NoSpecReviewRunsRoundNotRecorded : null,
+      reviewRunsWithRound: v4RoundKeySeen ? v4ReviewRunsWithRound : null,
+    },
+  }
+}
+
+// AC-DATA-8: a "has never failed" claim states its window (here: the run
+// count backing it) and is insufficient_data below minRuns, regardless of
+// whether every recorded verdict happens to be PASS.
+//
+// Round-4 review M3: `unattributedFailBuckets` (aggregateRework's own
+// return value, above) degrades every ac_id sharing a (repo, plan) window
+// with an unattributed FAIL to never_failed:null -- computing PASS/FAIL
+// from `entry` alone is exactly the inversion this fix closes, since
+// `entry` by construction never saw the hidden FAIL. Defaults to an empty
+// Set so every pre-existing call site (none of which knows this option
+// exists) behaves identically to before: no tainted buckets, no change.
+export function neverFailingAcs(acVerdicts, { minRuns = MIN_RUNS_FOR_NEVER_FAILED, unattributedFailBuckets = new Set(), truncatedBuckets = new Set(), verdictDisagreements = new Map() } = {}) {
+  const out = []
+  for (const [key, entry] of acVerdicts.entries()) {
+    const insufficient_data = entry.n < minRuns
+    const bucketKey = `${escapeKeyComponent(entry.repo)}|${escapeKeyComponent(entry.spec)}`
+    const unattributed_fail_in_window = unattributedFailBuckets.has(bucketKey)
+    // H3 (round 3 review): a truncated ac_verdicts array in this (repo,
+    // plan) window could have dropped the FAIL for THIS criterion -- the
+    // same inversion class unattributed_fail_in_window already closes for
+    // a sanitised ac_id, one cause over. Defaults to an empty Set so every
+    // pre-existing call site behaves identically to before.
+    const truncated_in_window = truncatedBuckets.has(bucketKey)
+    // Round-6 H1: this ac_id's OWN entry saw at least one neutralised
+    // verdict (aggregateRework's unattributedVerdicts, above) -- a
+    // DIFFERENT taint reason from unattributed_fail_in_window (that one
+    // fires on an unattributed ac_id ANYWHERE in the window; this one
+    // fires on a known ac_id whose verdict value itself could not be
+    // trusted). Both degrade never_failed to null; neither is folded into
+    // the other, so the render can name the right cause.
+    const unattributed_verdict_in_entry = (entry.unattributedVerdicts || 0) > 0
+    out.push({
+      key,
+      repo: entry.repo,
+      spec: entry.spec,
+      ac_id: entry.ac_id,
+      n: entry.n,
+      insufficient_data,
+      unattributed_fail_in_window,
+      unattributed_verdict_in_entry,
+      truncated_in_window,
+      // Round 1 L1 (AC-DATA-8): a truncated verdict array may have dropped
+      // the disagreeing verdict, so a measured 0 would be a false claim.
+      verdict_disagreements: truncated_in_window ? null : (verdictDisagreements.get(key) || 0),
+      never_failed: insufficient_data || unattributed_fail_in_window || unattributed_verdict_in_entry || truncated_in_window ? null : entry.fail === 0,
+    })
+  }
+  return out
+}
+
+const WAIT_EVENTS = ['ci_wait_started', 'ci_wait_ended', 'human_wait_started', 'human_wait_ended']
+
+function planKeyFromEventKey(eventKey) {
+  // event_key shape: "<plan file>:<task id>:<event>:<occurrence>" (see
+  // skills/conduct-plan/SKILL.md). Rolled up to plan-file granularity only
+  // (dropping task id): the ledger's own conduct_plan_event schema does not
+  // carry a separate structured task-id field, only this composite string,
+  // and per-task decomposition is not required by any AC in this PR --
+  // stated here, and in the report, as a known simplification. The plan
+  // file is the first colon-delimited segment (a repo-relative spec path,
+  // per SKILL.md's instruction that it is never absolute, so it cannot
+  // itself contain a colon on any platform this harness runs on).
+  if (typeof eventKey !== 'string' || !eventKey.includes(':')) return null
+  return eventKey.slice(0, eventKey.indexOf(':'))
+}
+
+function tsMs(ts) {
+  const ms = Date.parse(ts)
+  return Number.isFinite(ms) ? ms : null
+}
+
+// Review round-2 M1 (reframe, not a third patch): the shared key a
+// started/ended PAIR carries -- "<plan>:<task>:<occurrence>", with the
+// event-name segment removed, so a ci_wait_started and its matching
+// ci_wait_ended (same occurrence) produce the IDENTICAL key even though
+// their own event_key strings differ only in that segment. This is what
+// makes correct pairing possible without ever touching sort order: two
+// events pair if and only if they share this key, never by adjacency.
+function occurrenceKeyFromEventKey(eventKey, eventName) {
+  if (typeof eventKey !== 'string') return null
+  const marker = `:${eventName}:`
+  const idx = eventKey.indexOf(marker)
+  if (idx === -1) return null
+  return eventKey.slice(0, idx) + ':' + eventKey.slice(idx + marker.length)
+}
+
+// Review round-2 M4: a bare `|`-join is not injective -- a literal "|"
+// inside a repo identity (a remoteless repo's basename fallback, or a
+// deliberately named checkout) or a spec path merges two DISTINCT (repo,
+// plan) pairs into one bucket, summing durations and merging AC verdicts.
+// Backslash-escaping "\" and "|" within each component before joining
+// fixes this while staying IDENTICAL to the plain join whenever neither
+// component actually contains "|" (the overwhelming common case) -- every
+// `${repo}|${plan}`-shaped key elsewhere in this codebase and its tests
+// keeps working unchanged.
+function escapeKeyComponent(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/\|/g, '\\|')
+}
+
+// Review round-1 M5 (AC-DATA-7): the wall-clock bucket key, mirroring
+// aggregateRework's `${repo}|${spec}` scheme exactly -- the same plan/spec
+// path recurring in two different repos (a realistic case once this
+// harness's own specs/ layout is mirrored into other repos) must never
+// merge their waits into one bucket.
+function planBucketKey(repo, plan) {
+  return `${escapeKeyComponent(repo)}|${escapeKeyComponent(plan)}`
+}
+
+function ensurePlan(byPlan, key, repo, plan) {
+  if (!byPlan.has(key)) {
+    byPlan.set(key, {
+      repo, plan,
+      ciWaitSeconds: 0, ciWaitN: 0, ciWaitUnmeasuredN: 0,
+      humanWaitSeconds: 0, humanWaitN: 0, humanWaitUnmeasuredN: 0,
+      agentComputeSeconds: 0, agentComputeN: 0, agentComputeUnmeasuredN: 0,
+      // Review round-1 H1: a well-formed start+terminal pair whose terminal
+      // outcome is not 'done' (a crash the PR2 exception guard turned into
+      // a pair instead of an orphan, or a deliberate BLOCKED/ABORTED
+      // return) is real elapsed time but not a completion -- counted here,
+      // under its own name, never folded into agentComputeSeconds/N.
+      agentComputeAbortedSeconds: 0, agentComputeAbortedN: 0,
+      unterminatedWaits: 0,
+      unusableIntervals: [],
+    })
+  }
+  return byPlan.get(key)
+}
+
+// Wall-clock decomposition (spec item 2). AC-ARCH-13: every segment here
+// comes from exactly ONE source -- the ledger's own conduct_plan_event pairs
+// for ci_wait/human_wait, and tdd_task/review_cycle/plan_cycle start/
+// terminal run_id pairs for agent_compute. gh data never enters this
+// function; CI duration/queue time (a distinct measure from ci_wait, which
+// tracks how long the CONDUCTOR was in the waiting state, not how long the
+// CI run itself took) is aggregated separately by aggregateCi, from gh only.
+//
+// Review round-1 M3/M4 (AC-QA-10, AC-OPS-3): every pair with an unparseable
+// timestamp on EITHER side, or an orphan start/terminal with no partner at
+// all, is counted as an UNMEASURED attempt (never silently dropped, never
+// turned into a fabricated duration by doing arithmetic on a null) --
+// tracked per segment so totals can report null (unmeasured) rather than a
+// misleadingly measured-looking 0 when a segment has zero measured runs but
+// at least one unmeasured attempt.
+// HARN-OPT-2 PR1 (AC-ARCH-4): `root`, optional, is the caller's already-
+// resolved analysis root, used only to lexically relativise an absolute
+// historical spec/event_key plan segment via the shared canonicalPlanKey --
+// never touched by any fs call here.
+export function aggregateWallClock(records, { root = '' } = {}) {
+  const byPlan = new Map()
+
+  // ---- ci_wait / human_wait, from conduct_plan_event pairs ----
+  //
+  // Review round-2 M1: pairing used to sort each bucket's starts and ends
+  // by timestamp and zip them by INDEX -- so an orphan (a started with no
+  // ended, or vice versa, e.g. a crash/resume or a torn ledger line) could
+  // mispair with an unrelated event and both fabricate a wrong duration
+  // AND silently drop the real event it belonged with. Pairing by the
+  // shared occurrence key (see occurrenceKeyFromEventKey) makes that whole
+  // class of bug unrepresentable: two events pair if and only if they
+  // share a key, independent of sort order or how many of each exist.
+  // Review round-1 H2: two DIFFERENT out-of-repo plans must never merge
+  // into one ci_wait/human_wait bucket -- shared across both event names
+  // below, mirroring agentComputeUnattributed's own counter in shape.
+  let unattributableWaits = 0
+  for (const eventName of ['ci_wait', 'human_wait']) {
+    const startedByBucket = new Map() // bucketKey -> Map(occKey -> {ms, repo, plan}); a null-occKey event can never be matched, kept in its own list
+    const endedByBucket = new Map()
+    const nullOccByBucket = new Map() // bucketKey -> {starts: [...], ends: [...]}
+    for (const r of records) {
+      if (r.kind !== 'conduct_plan_event') continue
+      const rawPlan = planKeyFromEventKey(r.event_key)
+      if (!rawPlan) continue
+      // Only a record actually relevant to THIS pass (this loop runs once
+      // per eventName, and `records` is the same full array each time) --
+      // checked BEFORE the marker/count logic below so an unattributable
+      // record is never counted once per eventName it is irrelevant to.
+      const isStarted = r.event === `${eventName}_started`
+      const isEnded = r.event === `${eventName}_ended`
+      if (!isStarted && !isEnded) continue
+      // AC-ARCH-4: the ci_wait/human_wait bucket key routes through the
+      // SAME shared canonicalisation as agent_compute and aggregateRework,
+      // so an absolute and a relative form of the same plan file's
+      // event_key segment collapse into one bucket here too.
+      const plan = canonicalPlanKey(rawPlan, root)
+      // Review round-1 H2: an out-of-repo (or otherwise unattributable)
+      // plan is never bucketed -- agent_compute already had this guard;
+      // ci_wait/human_wait did not, so two DIFFERENT out-of-repo plans
+      // collapsed into one bucket literally named "<redacted-path>" and had
+      // their durations SUMMED. Counted here instead, never merged.
+      if (plan === REDACTED_PATH_MARKER) {
+        unattributableWaits += 1
+        continue
+      }
+      const repo = r.repo || 'unknown'
+      const bucketKey = planBucketKey(repo, plan)
+      const ms = tsMs(r.ts)
+      const occKey = occurrenceKeyFromEventKey(r.event_key, r.event)
+      const target = isStarted ? startedByBucket : endedByBucket
+      if (occKey === null) {
+        if (!nullOccByBucket.has(bucketKey)) nullOccByBucket.set(bucketKey, { starts: [], ends: [], repo, plan })
+        nullOccByBucket.get(bucketKey)[isStarted ? 'starts' : 'ends'].push({ ms })
+        continue
+      }
+      if (!target.has(bucketKey)) target.set(bucketKey, new Map())
+      target.get(bucketKey).set(occKey, { ms, repo, plan })
+    }
+
+    const bucketKeys = new Set([...startedByBucket.keys(), ...endedByBucket.keys(), ...nullOccByBucket.keys()])
+    for (const bucketKey of bucketKeys) {
+      const starts = startedByBucket.get(bucketKey) || new Map()
+      const ends = endedByBucket.get(bucketKey) || new Map()
+      const nullOcc = nullOccByBucket.get(bucketKey) || { starts: [], ends: [] }
+      // repo/plan are identical for every event sharing a bucketKey (both
+      // are inputs to the key itself), so any one entry's values suffice.
+      const anyEntry = [...starts.values()][0] || [...ends.values()][0] || nullOcc
+      const bucket = ensurePlan(byPlan, bucketKey, anyEntry.repo, anyEntry.plan)
+      const unmeasuredField = `${eventName === 'ci_wait' ? 'ciWait' : 'humanWait'}UnmeasuredN`
+
+      const occKeys = new Set([...starts.keys(), ...ends.keys()])
+      for (const occKey of occKeys) {
+        const s = starts.get(occKey)
+        const e = ends.get(occKey)
+        if (s && e) {
+          if (s.ms === null || e.ms === null) {
+            bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} interval has an unparseable timestamp on the ${s.ms === null ? 'started' : 'ended'} event` })
+            bucket[unmeasuredField] += 1
+            continue
+          }
+          const durationS = (e.ms - s.ms) / 1000
+          if (!(durationS >= 0)) {
+            bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} interval is negative or out of order (end before start)` })
+            bucket[unmeasuredField] += 1
+            continue
+          }
+          if (eventName === 'ci_wait') { bucket.ciWaitSeconds += durationS; bucket.ciWaitN += 1 }
+          else { bucket.humanWaitSeconds += durationS; bucket.humanWaitN += 1 }
+        } else if (s && !e) {
+          // A started with no matching ended at this occurrence: unterminated.
+          bucket.unterminatedWaits += 1
+          bucket[unmeasuredField] += 1
+        } else if (!s && e) {
+          // Round-2 M1: an ended with no matching started at this
+          // occurrence -- NEVER paired with an unrelated started event.
+          // Recorded with a reason, counted as unmeasured, not silently
+          // dropped and not treated as a valid measurement.
+          bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} ended event has no matching started event (occurrence key: ${occKey})` })
+          bucket[unmeasuredField] += 1
+        }
+      }
+      // A malformed event_key (no parseable occurrence) can never be
+      // trusted to pair with anything -- each one is its own unmeasured
+      // attempt, never guessed at by adjacency.
+      // Counting, not iterating: the loop bound a variable it never used
+      // (SonarQube S1854). Arithmetic says what this does.
+      bucket.unterminatedWaits += nullOcc.starts.length
+      bucket[unmeasuredField] += nullOcc.starts.length
+      // Counted, not bound: the body never uses the element, it records one
+      // unusable interval per malformed end event (SonarQube S1854).
+      for (let i = 0; i < nullOcc.ends.length; i += 1) {
+        bucket.unusableIntervals.push({ event: eventName, reason: `${eventName} ended event has a malformed event_key and cannot be paired` })
+        bucket[unmeasuredField] += 1
+      }
+    }
+  }
+
+  // ---- agent_compute, from tdd_task/review_cycle/plan_cycle start/terminal pairs ----
+  const RUN_KINDS = ['tdd_task', 'review_cycle', 'plan_cycle']
+  const byRunId = new Map()
+  for (const r of records) {
+    if (!RUN_KINDS.includes(r.kind) || !r.run_id) continue
+    if (!byRunId.has(r.run_id)) byRunId.set(r.run_id, [])
+    byRunId.get(r.run_id).push(r)
+  }
+  // HARN-OPT-2 PR1 (AC-ARCH-4, AC-DATA-7, AC-OPS-5, AC-QA-7): plan identity
+  // for the pair routes through the single shared planKeyForRecord helper,
+  // preferring whichever record in the pair carries a real identity. Three
+  // outcomes, counted and named distinctly, never conflated:
+  //   - every record in the pair is degraded (no spec/plan_key survives at
+  //     all): counted under degradedUnattributedRuns, never folded into
+  //     the no-spec bucket (AC-QA-7);
+  //   - the canonical key is the out-of-repo/redaction marker: counted
+  //     under unattributableRuns, never rendered as a plan-shaped bucket,
+  //     and never merged with a DIFFERENT out-of-repo plan (AC-DATA-7,
+  //     AC-OPS-5);
+  //   - otherwise, a real (possibly no-spec-sentinel) plan key: bucketed
+  //     as before.
+  let degradedUnattributedRuns = 0
+  let unattributableRuns = 0
+  // HARN-OPT-2 PR2 (AC-OPS-2): the two orphan classes named and counted
+  // SEPARATELY, in addition to the combined agentComputeUnmeasuredN/Runs
+  // total below -- a start-only orphan and a terminal-only orphan (the
+  // START write itself failed) are different defects with different fixes,
+  // so a fix landed for one must never read as progress on the other. "By
+  // kind" breaks each down by tdd_task/review_cycle/plan_cycle.
+  //
+  // M1 (round 4 remainder): this comment used to name "an exception
+  // escaped run() before the terminal write" as a start-only-orphan cause.
+  // That is now WRONG: PR2's try/finally means an exception escaping run()
+  // always attempts a terminal write, which lands as a PAIRED `aborted`
+  // record, not a start-only orphan. A start-only orphan today means either
+  // the process was killed before the terminal write ran (no JS-level
+  // unwind occurs at all), or the terminal write's own payload was refused
+  // -- which used to include a single malformed descriptor element (a
+  // model-supplied `lens`/`ac_id` failing the schema), now neutralised
+  // field-by-field by ledger-append.mjs before validateEntry runs (see its
+  // own comments on invalid_ac_ids_dropped/invalid_finding_fields_dropped).
+  let agentComputeStartOnlyRuns = 0
+  let agentComputeTerminalOnlyRuns = 0
+  // Review round-1 M1: accumulated in whatever order run_ids are first
+  // encountered (record order), then re-serialised in RUN_KINDS' fixed
+  // order below -- so JSON.stringify(totals) is byte-identical regardless
+  // of input order, which the AC-QA-13 fixture now actually exercises with
+  // two different kinds per class.
+  const agentComputeStartOnlyByKindRaw = {}
+  const agentComputeTerminalOnlyByKindRaw = {}
+  // Review round-1 H1: real elapsed time for a crashed/aborted/blocked
+  // pair, excluded from agentComputeSeconds (that statistic means
+  // completed-run duration only).
+  let agentComputeAbortedPairs = 0
+  for (const [, pair] of byRunId.entries()) {
+    const repo = pair[0]?.repo || 'unknown'
+    // Review round-1 M4: orphan SHAPE is classified before either identity
+    // `continue` below, using only starts.length/terminals.length -- no
+    // plan key required -- so an orphan whose plan identity is
+    // unattributable or fully degraded still lands in exactly one counted
+    // bucket instead of neither. This does not change byPlan bucketing,
+    // which still requires a real identity and is computed further down.
+    const starts = pair.filter((p) => p.outcome === 'started')
+    const terminals = pair.filter((p) => p.outcome !== 'started')
+    if (pair.length === 1 && starts.length === 1) {
+      agentComputeStartOnlyRuns += 1
+      const k = pair[0].kind
+      agentComputeStartOnlyByKindRaw[k] = (agentComputeStartOnlyByKindRaw[k] || 0) + 1
+    } else if (pair.length === 1 && terminals.length === 1) {
+      agentComputeTerminalOnlyRuns += 1
+      const k = pair[0].kind
+      agentComputeTerminalOnlyByKindRaw[k] = (agentComputeTerminalOnlyByKindRaw[k] || 0) + 1
+    }
+    // Review round-1 M3: order-independent, main's own semantics restored
+    // (`pair.find(p => p.spec)?.spec`). The PREVIOUS "first non-null wins"
+    // rule treated NO_SPEC_PLAN_KEY as "non-null" too, so a no-spec record
+    // sitting first in file/array order won over a partner that DID carry a
+    // real spec -- order-DEPENDENT, and the no-spec sentinel won by default
+    // rather than by any real evidence. Collect every key in the pair, then
+    // prefer the first one that is neither null (degraded) NOR the no-spec
+    // sentinel; fall back to the sentinel only when nothing in the pair has
+    // a real one, and to "fully degraded" only when EVERY record in the
+    // pair is degraded (nothing at all survives to attribute).
+    const keys = pair.map((p) => planKeyForRecord(p, root))
+    if (keys.every((k) => k === null)) {
+      degradedUnattributedRuns += 1
+      continue
+    }
+    const plan = keys.find((k) => k !== null && k !== NO_SPEC_PLAN_KEY) ?? NO_SPEC_PLAN_KEY
+    if (plan === REDACTED_PATH_MARKER) {
+      unattributableRuns += 1
+      continue
+    }
+    const key = planBucketKey(repo, plan)
+    // HARN-OPT-2 PR2 (AC-DATA-10): a measured duration is only ever
+    // computed for a run_id shared by EXACTLY one 'started' record and
+    // EXACTLY one terminal (non-'started') record. Every other shape --
+    // a lone record of either kind, two started, two terminal, or three or
+    // more sharing one run_id -- is unmeasured, and arithmetic is never
+    // performed on it. Before this, `pair.length` alone gated whether a
+    // duration was computed, so e.g. two 'started' records sharing a
+    // run_id (their timestamps subtracted anyway) fabricated a duration for
+    // an attempt that never actually finished.
+    if (!(pair.length === 2 && starts.length === 1 && terminals.length === 1)) {
+      ensurePlan(byPlan, key, repo, plan).agentComputeUnmeasuredN += 1
+      continue
+    }
+    const times = pair.map((p) => tsMs(p.ts)).filter((t) => t !== null)
+    const bucket = ensurePlan(byPlan, key, repo, plan)
+    if (times.length < 2) {
+      bucket.agentComputeUnmeasuredN += 1
+      continue
+    }
+    // Math.max(...times) - Math.min(...times) is the SPAN between the two
+    // parseable timestamps regardless of which record carried which value,
+    // so unlike the ci_wait/human_wait pairing above (which subtracts a
+    // specific end from a specific start, and so CAN go negative on a
+    // corrupted or reordered pair) this can never be negative -- there is
+    // no unreachable branch to guard here.
+    const durationS = (Math.max(...times) - Math.min(...times)) / 1000
+    // Review round-1 H1, corrected by round-2 M-4: a well-formed pair whose
+    // terminal outcome is a genuine CRASH is excluded from the measured
+    // completion statistic. PR2's own exception-guard fix (the three
+    // instrumented workflow scripts) turns a crash from an orphan into
+    // exactly this shape -- a real start paired with a real terminal whose
+    // outcome is 'aborted' -- so treating it as measured would let a
+    // workflow that crashes on EVERY run report as a fully measured,
+    // healthy repo, and would silently disarm isUnmeasuredSegmentMotivated
+    // (optimise-cycle.js), the gate that exists to stop a proposal being
+    // built on unmeasurable data.
+    //
+    // Round-2 M-4: round-1 gated on `outcome !== 'done'`, which wrongly
+    // swept up 'blocked' (a legitimate terminating verdict one of the
+    // instrumented workflows returns) and 'no-op' (another's ordinary
+    // no-changes-found case, __outcome:'no-op') as if they were
+    // crashes -- both are genuine COMPLETIONS with real, meaningful
+    // durations. 'aborted' is the ONLY outcome the exception guard actually
+    // produces for a crash (AC-SIMP-6: no new OUTCOMES value was ever
+    // added), so it is the only value excluded here. done/blocked/no-op are
+    // all measured; their real duration is real and known -- reported
+    // under agentComputeSeconds/agentComputeN like any other completion.
+    // The crash-only path's duration is still real and known (not null),
+    // but it is a crash duration, not a work duration: reported under its
+    // own name, EXCLUDED from agentComputeSeconds/agentComputeN, and
+    // counted a second time toward agentComputeUnmeasuredN so the segment
+    // still reads as unmeasured for the safety gate's purposes.
+    if (terminals[0].outcome === 'aborted') {
+      bucket.agentComputeAbortedSeconds += durationS
+      bucket.agentComputeAbortedN += 1
+      bucket.agentComputeUnmeasuredN += 1
+      agentComputeAbortedPairs += 1
+      continue
+    }
+    bucket.agentComputeSeconds += durationS
+    bucket.agentComputeN += 1
+  }
+  // Review round-1 M1: rebuild both byKind maps in RUN_KINDS' fixed order,
+  // regardless of which run_id was first encountered in the input records
+  // -- the raw accumulation above is order-dependent (insertion order),
+  // this rebuild is not.
+  function orderByKind(raw) {
+    const ordered = {}
+    for (const k of RUN_KINDS) {
+      if (k in raw) ordered[k] = raw[k]
+    }
+    for (const k of Object.keys(raw)) {
+      if (!(k in ordered)) ordered[k] = raw[k]
+    }
+    return ordered
+  }
+  const agentComputeStartOnlyByKind = orderByKind(agentComputeStartOnlyByKindRaw)
+  const agentComputeTerminalOnlyByKind = orderByKind(agentComputeTerminalOnlyByKindRaw)
+
+  const totals = {
+    ciWaitSeconds: 0, ciWaitMeasuredRuns: 0, ciWaitUnmeasuredRuns: 0,
+    humanWaitSeconds: 0, humanWaitMeasuredRuns: 0, humanWaitUnmeasuredRuns: 0,
+    agentComputeSeconds: 0, agentComputeMeasuredRuns: 0, agentComputeUnmeasuredRuns: 0,
+    unterminatedWaits: 0,
+    degradedUnattributedRuns,
+    unattributableRuns,
+    unattributableWaits,
+    agentComputeStartOnlyRuns,
+    agentComputeTerminalOnlyRuns,
+    agentComputeStartOnlyByKind,
+    agentComputeTerminalOnlyByKind,
+    agentComputeAbortedPairs,
+    agentComputeAbortedSeconds: 0,
+  }
+  for (const bucket of byPlan.values()) {
+    totals.ciWaitSeconds += bucket.ciWaitSeconds
+    totals.ciWaitMeasuredRuns += bucket.ciWaitN
+    totals.ciWaitUnmeasuredRuns += bucket.ciWaitUnmeasuredN
+    totals.humanWaitSeconds += bucket.humanWaitSeconds
+    totals.humanWaitMeasuredRuns += bucket.humanWaitN
+    totals.humanWaitUnmeasuredRuns += bucket.humanWaitUnmeasuredN
+    totals.agentComputeSeconds += bucket.agentComputeSeconds
+    totals.agentComputeMeasuredRuns += bucket.agentComputeN
+    totals.agentComputeUnmeasuredRuns += bucket.agentComputeUnmeasuredN
+    totals.agentComputeAbortedSeconds += bucket.agentComputeAbortedSeconds
+    totals.unterminatedWaits += bucket.unterminatedWaits
+  }
+  // AC-OPS-3: unmeasured is never silently reported as a measured zero. A
+  // segment with ZERO measured runs but AT LEAST ONE unmeasured attempt
+  // reports null (genuinely unknown), distinguishable from a segment with
+  // zero measured AND zero unmeasured runs (nothing of that kind happened
+  // in the window at all -- a real, measured zero). A segment with at
+  // least one MEASURED run keeps its real sum regardless of unmeasured
+  // attempts elsewhere: partial measurement is reported, not nulled out.
+  if (totals.ciWaitMeasuredRuns === 0 && totals.ciWaitUnmeasuredRuns > 0) totals.ciWaitSeconds = null
+  if (totals.humanWaitMeasuredRuns === 0 && totals.humanWaitUnmeasuredRuns > 0) totals.humanWaitSeconds = null
+  if (totals.agentComputeMeasuredRuns === 0 && totals.agentComputeUnmeasuredRuns > 0) totals.agentComputeSeconds = null
+
+  // Review round-2 L-7: byPlan (a Map) previously followed record-
+  // ENCOUNTER order, not a stable sorted order -- AC-QA-13's byte-identity
+  // requirement held for `.totals` (a plain sum, order-independent by
+  // construction) but not for byPlan itself, so a future consumer that
+  // merges or re-orders records (a multi-repo aggregate, a resumed read)
+  // would produce a differently-ordered report. Sorted by key here, the
+  // single place byPlan is ever returned, rather than at each call site.
+  const sortedByPlan = new Map([...byPlan.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+
+  return {
+    byPlan: sortedByPlan,
+    totals,
+    source: {
+      ci_wait: 'ledger:conduct_plan_event',
+      human_wait: 'ledger:conduct_plan_event',
+      agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair',
+    },
+  }
+}
+
+// Trigger accuracy (spec item 4): per lens, how often it ran and returned
+// CLEAN with nothing in its own trigger surface (a candidate for narrowing
+// harness-triggers.json) versus CLEAN after genuinely examining matched
+// files, versus returning FINDINGS.
+//
+// Review round-1 L1 (AC-OPS-3): a CLEAN run with a null (unmeasured)
+// trigger_count -- the lens ran but never reported one -- is neither
+// "nothing in scope" (triggerCount===0) nor "examined matched files and
+// found nothing" (a real positive count); it is unmeasured, and folding it
+// into cleanWithMatches would erase that distinction and quietly treat
+// missing instrumentation as evidence for a narrow-this-trigger proposal.
+export function aggregateTriggerAccuracy(records) {
+  const byLens = {}
+  for (const r of records) {
+    if (r.kind !== 'review_cycle') continue
+    for (const lens of r.lenses_run || []) {
+      // M1 (review round one): this path was ungated while aggregateRework's
+      // equivalent was gated, and these keys reach a RENDERED report line. A
+      // ledger line is untrusted data on disk, so a lens name from it is gated
+      // before it can become a key anywhere. One gated path and one ungated
+      // path reading the same file is the uniformity failure a gate exists to
+      // prevent, and it is the third instance of this exact shape in this
+      // change alone.
+      if (typeof lens !== 'string' || !LENS_RE.test(lens)) continue
+      if (!byLens[lens]) byLens[lens] = { cleanWithZeroTrigger: 0, cleanWithMatches: 0, findingsWithMatches: 0, cleanTriggerUnmeasured: 0, total: 0 }
+      const bucket = byLens[lens]
+      bucket.total += 1
+      const triggerCount = r.trigger_counts && lens in r.trigger_counts ? r.trigger_counts[lens] : null
+      const verdict = r.verdicts && r.verdicts[lens]
+      if (verdict === 'CLEAN' && triggerCount === 0) bucket.cleanWithZeroTrigger += 1
+      else if (verdict === 'CLEAN' && triggerCount === null) bucket.cleanTriggerUnmeasured += 1
+      else if (verdict === 'CLEAN') bucket.cleanWithMatches += 1
+      else if (verdict === 'FINDINGS') bucket.findingsWithMatches += 1
+    }
+  }
+  return { byLens }
+}
+
+// HARN-OPT-4 T7 (AC-SEC-12, AC-QA-24): strips a per-instance suffix so
+// `Deploy on PR #301` and `Deploy on PR #302` are one job. One regex literal,
+// anchored at the end, no quantified group, digits capped: it cannot backtrack
+// badly on a hostile 10,000-character name. A `#` anywhere else, and matrix
+// legs such as `test (18.x)`, are left alone. A name that would be empty
+// after stripping is returned unchanged, never merged into an empty key.
+export function normaliseJobName(name) {
+  const stripped = name.replace(/(?: on PR| - Update) #\d{1,10}$/, '')
+  return stripped.trim() === '' ? name : stripped
+}
+
+// HARN-OPT-4 T7 (AC-SEC-11): a run id is interpolated into
+// `gh run view <id>` by the lane, so only an integer or an all-digit string
+// is ever accepted; anything else is ignored and never echoed.
+const RUN_ID_RE = /^[0-9]+$/
+const validRunId = (id) => (typeof id === 'number' ? Number.isSafeInteger(id) && id >= 0 : typeof id === 'string' && RUN_ID_RE.test(id))
+const FETCH_MODES = ['rate_limited', 'unauthenticated', 'other']
+
+// CI waste (spec item 3): expects an array of {workflow, job, conclusion,
+// started_at, duration_s} already extracted by the agent step from `gh`
+// output (this script never calls gh itself -- agents do I/O, per the
+// runtime facts). Tolerant of missing fields on an individual run (skips
+// that run from the aggregate rather than throwing).
+//
+// HARN-OPT-4 T7: each entry may also carry `repo`, `run_id` and `rerun`
+// (AC-DATA-13: rows are keyed by repo as well, so two repos never pool), and
+// `partialWorkflows` names the `repo::workflow` pairs with a failed per-run
+// fetch (AC-OPS-11). A re-run (AC-OPS-10) or a partial fetch nulls
+// neverFailed: the unseen or superseded attempt may be the failing one.
+//
+// Review round-1 M6 (AC-DATA-8): a "never failed" claim is gated on THREE
+// conditions, not just the sample-size floor -- insufficientData (too few
+// runs), truncated (the window boundary was hit, so history older than
+// what was fetched is invisible: a failure at run 101 of a 100-run fetch
+// cannot be seen), and renameSuspect (this job's own first observed run
+// starts strictly after its WORKFLOW's earliest run in the window (AC-QA-25:
+// per workflow, so a workflow that merely started later than another is not
+// suspect), suggesting either a genuinely new job or one renamed from
+// something with its own, unexamined failure history -- either way, "never
+// failed" oversells what is actually known). Any one of the three nulls the
+// claim.
+const CI_FAILURE_CONCLUSIONS = new Set(['failure', 'timed_out', 'startup_failure'])
+const CI_NON_FAILURE_UNSETTLED = new Set(['skipped', 'cancelled', 'neutral'])
+export function aggregateCi(runs, { minRunsNeverFailed = MIN_RUNS_FOR_NEVER_FAILED, requestedLimit = null, partialWorkflows = new Set() } = {}) {
+  const byJob = new Map()
+  for (const run of runs || []) {
+    if (!run || !run.workflow || !run.job) continue
+    const key = run.repo ? `${run.repo}::${run.workflow}::${run.job}` : `${run.workflow}::${run.job}`
+    if (!byJob.has(key)) byJob.set(key, { repo: run.repo, workflow: run.workflow, job: run.job, runs: [] })
+    byJob.get(key).runs.push(run)
+  }
+  const out = new Map()
+  for (const [key, group] of byJob.entries()) {
+    const jobRuns = group.runs.slice().sort((a, b) => (a.started_at || '').localeCompare(b.started_at || ''))
+    const n = jobRuns.length
+    const insufficientData = n < minRunsNeverFailed
+    const truncated = requestedLimit !== null && n >= requestedLimit
+    const reRun = jobRuns.some((r) => r.rerun === true)
+    const partialFetch = partialWorkflows.has(`${group.repo}::${group.workflow}`)
+    const rawNeverFailed = insufficientData || reRun || partialFetch ? null : jobRuns.every((r) => r.conclusion === 'success')
+    // Round 1 L1 (AC-OPS-9): only a real failure conclusion counts as a
+    // failure. skipped, cancelled and neutral are reported separately
+    // (`skipped`) and still withhold the never-failed claim (rawNeverFailed
+    // above requires every run to be a success).
+    const failed = jobRuns.filter((r) => CI_FAILURE_CONCLUSIONS.has(r.conclusion))
+    const skipped = jobRuns.filter((r) => CI_NON_FAILURE_UNSETTLED.has(r.conclusion)).length
+    const durations = jobRuns.map((r) => r.duration_s).filter((d) => typeof d === 'number' && Number.isFinite(d))
+    const meanDurationS = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null
+    const entry = {
+      workflow: group.workflow,
+      job: group.job,
+      n,
+      failureCount: failed.length,
+      skipped,
+      failedRunIds: failed.filter((r) => r.run_id !== undefined).map((r) => String(r.run_id)),
+      windowStart: jobRuns.length ? jobRuns[0].started_at : null,
+      windowEnd: jobRuns.length ? jobRuns[jobRuns.length - 1].started_at : null,
+      truncated,
+      insufficientData,
+      renameSuspect: false, // filled in below, once every job's windowStart is known
+      reRun,
+      partialFetch,
+      neverFailed: truncated ? null : rawNeverFailed,
+      meanDurationS,
+    }
+    if (group.repo) entry.repo = group.repo
+    out.set(key, entry)
+  }
+  // renameSuspect needs every job's windowStart computed first, to find each
+  // workflow's earliest run to compare its jobs' own starts against.
+  const earliestByWorkflow = new Map()
+  for (const entry of out.values()) {
+    const ms = tsMs(entry.windowStart)
+    const wk = `${entry.repo}::${entry.workflow}`
+    if (ms !== null && (!earliestByWorkflow.has(wk) || ms < earliestByWorkflow.get(wk))) earliestByWorkflow.set(wk, ms)
+  }
+  for (const entry of out.values()) {
+    const ms = tsMs(entry.windowStart)
+    const earliest = earliestByWorkflow.get(`${entry.repo}::${entry.workflow}`)
+    entry.renameSuspect = earliest !== undefined && ms !== null && ms > earliest
+    if (entry.renameSuspect) entry.neverFailed = null
+  }
+  return { byJob: out }
+}
+
+// Review round-1 M7 (AC-DATA-10): reads a proposal's recorded outcome
+// events, so a rejected proposal is not silently re-raised and a proposal
+// adopted-then-reverted twice is flagged. Per skills/optimise-cycle/
+// SKILL.md, a human (or the conductor, at the moment of the decision)
+// appends a `conduct_plan_event` line shaped
+// {event: "proposal_adopted"|"proposal_rejected"|"proposal_reverted",
+// event_scope: "<proposal_id>:<event>"}; ledger-append.mjs mints
+// event_key as "<event_scope>:<occurrence>" = "<proposal_id>:<event>:<n>".
+// proposal_id is a 16-hex-char sha256 slice (stableProposalId) and so
+// never itself contains a colon, making the first colon-delimited segment
+// an unambiguous key.
+const PROPOSAL_OUTCOME_EVENTS = ['proposal_adopted', 'proposal_rejected', 'proposal_reverted']
+export function aggregateProposalOutcomes(records) {
+  const byProposalId = new Map()
+  for (const r of records) {
+    if (r.kind !== 'conduct_plan_event') continue
+    if (!PROPOSAL_OUTCOME_EVENTS.includes(r.event)) continue
+    if (typeof r.event_key !== 'string') continue
+    const parts = r.event_key.split(':')
+    if (parts.length < 2 || parts[1] !== r.event) continue // malformed or inconsistent event_key: not trusted
+    const proposalId = parts[0]
+    if (!byProposalId.has(proposalId)) byProposalId.set(proposalId, { adopted: [], rejected: [], reverted: [] })
+    const bucket = byProposalId.get(proposalId)
+    if (r.event === 'proposal_adopted') bucket.adopted.push(r.ts)
+    else if (r.event === 'proposal_rejected') bucket.rejected.push(r.ts)
+    else if (r.event === 'proposal_reverted') bucket.reverted.push(r.ts)
+  }
+  const out = new Map()
+  for (const [id, bucket] of byProposalId.entries()) {
+    // Records are processed in ledger (append) order, so the LAST pushed
+    // rejection is the most recent one, not necessarily the max by string
+    // comparison (which would be wrong across a DST boundary or a mixed
+    // timestamp format) -- ledger append order is the correct ordering.
+    const lastRejectionTs = bucket.rejected.length ? bucket.rejected[bucket.rejected.length - 1] : null
+    // Round 1 F1 (AC-PROD-8, AC-DATA-14): adoption was recorded but never
+    // read; the report needs its date. Same append-order rule as above.
+    const lastAdoptionTs = bucket.adopted.length ? bucket.adopted[bucket.adopted.length - 1] : null
+    out.set(id, {
+      adoptedCount: bucket.adopted.length,
+      rejectedCount: bucket.rejected.length,
+      revertedCount: bucket.reverted.length,
+      lastRejectionTs,
+      lastAdoptionTs,
+      revertedTwiceOrMore: bucket.reverted.length >= 2,
+    })
+  }
+  return out
+}
+
+// The bounded pool of real, citable ledger run_ids (AC-QA-20, AC-ARCH-14):
+// deduplicated, most-recent-first, capped at CITATION_POOL_SIZE. This is
+// the ONLY set of ids the synthesis prompt is shown and the ONLY set a
+// proposal's citation is checked against.
+export function citationPool(records, size = CITATION_POOL_SIZE) {
+  const seen = new Set()
+  const pool = []
+  for (let i = records.length - 1; i >= 0 && pool.length < size; i--) {
+    const id = records[i].run_id
+    if (typeof id === 'string' && id && !seen.has(id)) {
+      seen.add(id)
+      pool.push(id)
+    }
+  }
+  return pool
+}
+
+// AC-PROD-7's escaped-defect counter-metric, derived from git history: a
+// deliberately named HEURISTIC PROXY, not a causal per-PR attribution --
+// counts commit subjects using the conventional-commit "fix:" type
+// (optionally scoped, e.g. "fix(ledger):"), which is the closest thing this
+// codebase's own commit convention (§6: "Conventional commits (feat:,
+// fix:, test:, docs:, refactor:)") gives for "a change that repaired
+// something already shipped" without requiring a real causal link back to
+// a specific merged PR, which nothing in the ledger or git history
+// captures today. Matches only at the START of the subject line (a commit
+// merely mentioning "fix:" in prose, e.g. a docs commit, must not count).
+const FIX_COMMIT_RE = /^fix(\([^)]*\))?:/i
+
+// AC-1/AC-2: the RAW figure above
+// counts a "fix:" commit that repairs the pipeline itself (CI config, a
+// flaky test, a hook) exactly the same as one that repairs a real defect a
+// user hit -- measured on this repo's own recent history, roughly a third
+// of "fix:" commits are the former. Tightening the harness inflates the
+// very number meant to brake harness changes, which is backwards. This is
+// a SECOND, narrower figure alongside the raw one (never a replacement --
+// AC-2), counting only "fix:" commits whose changed paths include at least
+// one path OUTSIDE the configured pipeline/tooling exclude globs.
+//
+// AC-3: what counts as "pipeline/tooling" differs by repo (a Python media
+// server, a web app, and this harness itself all keep different things in
+// different places), so it is per-repo configuration, read from the same
+// per-repo override file the harness already uses elsewhere for its own
+// per-repo tuning, `.claude/harness-triggers.json` -- under a NEW key,
+// `escapedDefectExcludePaths`, so it does not collide with that file's
+// existing ui/data/architecture/operability keys. AC-ARCH-8 keeps this
+// file from naming the OTHER reader of those keys by filename, but that
+// reader's own allowlist for them is widened to accept this new key too
+// (see that reader's own CUSTOM_RULE_KEYS), since both consumers read the
+// same file and an unrecognised key there aborts that reader entirely.
+//
+// The default below is deliberately conservative: it excludes only paths
+// that are pipeline/tooling in EVERY repo (CI provider config, dependency
+// lockfiles, and test files/dirs by common naming convention, plus this
+// harness's own `.claude/` bookkeeping directory) and leaves out anything
+// repo-dependent -- e.g. `scripts/**`, `Dockerfile*` or `hooks/**`, any of
+// which is real shipped product in some repo and pure tooling in another.
+// A repo that needs more excluded configures it via the override key.
+export const DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS = [
+  '.github/**',
+  '.gitlab-ci.yml',
+  '.circleci/**',
+  'Jenkinsfile',
+  '.pre-commit-config.yaml',
+  '**/*.lock',
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  'poetry.lock',
+  '**/test/**',
+  '**/tests/**',
+  '**/__tests__/**',
+  '**/*.test.*',
+  '**/*.spec.*',
+  '.claude/**',
+]
+
+const PRODUCT_SOURCE_EXCLUDE_KEY = 'escapedDefectExcludePaths'
+const HARNESS_TRIGGERS_RELATIVE_PATH = '.claude/harness-triggers.json'
+
+// Same measured ReDoS bounds as this harness's other harness-triggers.json
+// reader applies to its own glob keys (an unbounded "**"/"*"/"?" glob
+// compiles to a regex whose backtracking cost grows ~9-10x per added
+// wildcard). This key lives in the SAME file, which on a public repo is as
+// attacker-influenceable as any other harness-triggers.json key, so it
+// gets the same bounds here too.
+const MAX_GLOB_LENGTH = 200
+const MAX_GLOB_WILDCARDS = 6
+const MAX_GLOB_DOUBLESTAR = 3
+const MAX_GLOBS_PER_KEY = 50
+
+// Trims and bounds untrusted glob text before it can reach an error
+// message that flows into the operator-visible report -- same rationale as
+// the harness's other harness-triggers.json reader's own neutralise().
+function neutraliseGlobText(text) {
+  const collapsed = String(text).replace(/\s+/g, ' ').trim()
+  return collapsed.length > 60 ? collapsed.slice(0, 60) + '…' : collapsed
+}
+
+function validateGlobArray(value) {
+  if (!Array.isArray(value)) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" must be an array of glob strings, got ${typeof value}`
+  if (value.length === 0) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" is an empty array, which would exclude nothing -- omit the key entirely to use the default excludes rather than an empty override`
+  if (value.length > MAX_GLOBS_PER_KEY) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" has too many globs: ${value.length}, over the limit of ${MAX_GLOBS_PER_KEY}`
+  for (const g of value) {
+    if (typeof g !== 'string') return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains a non-string glob`
+    if (g.trim() === '') return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains an empty glob string`
+    if (g.length > MAX_GLOB_LENGTH) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains a glob longer than ${MAX_GLOB_LENGTH} characters: ${neutraliseGlobText(g)}`
+    const wildcards = (g.match(/[*?]/g) || []).length
+    if (wildcards > MAX_GLOB_WILDCARDS) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains a glob with too many wildcards (${wildcards}, over ${MAX_GLOB_WILDCARDS}): ${neutraliseGlobText(g)}`
+    const doubleStars = g.split('**').length - 1
+    if (doubleStars > MAX_GLOB_DOUBLESTAR) return `"${PRODUCT_SOURCE_EXCLUDE_KEY}" contains a glob with too many "**" segments (${doubleStars}, over ${MAX_GLOB_DOUBLESTAR}): ${neutraliseGlobText(g)}`
+  }
+  return null
+}
+
+// Same glob->regex expansion as the harness's other harness-triggers.json
+// reader's own globToRe: "**" becomes ".*", a single "*" becomes "[^/]*",
+// "?" becomes "[^/]". Every glob reaching this point has already passed
+// validateGlobArray's bounds, so the backtracking cost this shape can
+// otherwise incur is capped.
+function globToRe(g) {
+  let s = g.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+  s = s.replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*').replace(/\u0001/g, '.*')
+  s = s.replace(/\?/g, '[^/]')
+  return new RegExp('^' + s + '$')
+}
+function pathMatchesAny(p, globs) {
+  return globs.some((g) => globToRe(g).test(p))
+}
+
+// AC-3/AC-4: resolves the exclude-glob list for ONE repo root, reading
+// `.claude/harness-triggers.json` directly (this module has real fs
+// access, unlike the workflow scripts -- see the file header) rather than
+// via an agent round-trip. Fails CLOSED on anything that looks like a
+// genuine override the operator intended but that could not be honoured:
+// the file exists but could not be read, is not valid JSON, does not
+// parse to an object, or its escapedDefectExcludePaths value fails shape
+// validation -- each of those returns excludeGlobs:null and a configError
+// string, which the caller must surface as "scoped figure unavailable"
+// rather than silently falling back to the default (a fallback here would
+// look like a real measurement of a repo that configured something
+// different). A MISSING file, or a file that simply does not carry this
+// key, is the ordinary "no override" case: default excludes, no error.
+export function resolveProductSourceExcludeGlobs(root) {
+  const triggersPath = path.join(root, HARNESS_TRIGGERS_RELATIVE_PATH)
+  let exists = false
+  try {
+    exists = fs.existsSync(triggersPath)
+  } catch (e) {
+    return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
+  }
+  if (!exists) return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
+
+  let raw
+  try {
+    raw = fs.readFileSync(triggersPath, 'utf8')
+  } catch (e) {
+    return { excludeGlobs: null, configSource: 'repo-override', configError: `.claude/harness-triggers.json exists but could not be read (${e && e.code ? e.code : 'read error'})` }
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch (e) {
+    return { excludeGlobs: null, configSource: 'repo-override', configError: '.claude/harness-triggers.json is not valid JSON' }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { excludeGlobs: null, configSource: 'repo-override', configError: '.claude/harness-triggers.json did not parse to a JSON object' }
+  }
+  if (!(PRODUCT_SOURCE_EXCLUDE_KEY in parsed)) {
+    return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
+  }
+  const value = parsed[PRODUCT_SOURCE_EXCLUDE_KEY]
+  const error = validateGlobArray(value)
+  if (error) return { excludeGlobs: null, configSource: 'repo-override', configError: error }
+  return { excludeGlobs: value, configSource: 'repo-override', configError: null }
+}
+
+// AC-1: parses the raw stdout of exactly
+//   git log --max-count=<N> --name-only --pretty=format:'%x1e%P%x1f%s'
+// (metadata only -- parent hashes, subject line, changed-file paths;
+// NEVER a diff, NEVER file contents) into one {subject, paths} record per
+// commit. %P is the space-separated list of parent hashes: a commit with
+// 2+ parents is a merge, and `--name-only` with no other flags reports NO
+// changed files for a merge commit by git's own default combined-diff
+// suppression -- so a merge commit's paths are UNAVAILABLE by
+// construction, not genuinely empty, and (AC-4) must be told apart from
+// an ordinary commit that really touched nothing (e.g. an --allow-empty
+// commit): paths is `null` for a merge commit, `[]` (or a real list) for
+// everything else.
+const GIT_LOG_RECORD_SEP = '\u001e'
+const GIT_LOG_HEADER_SEP = '\u001f'
+export function parseGitLogRaw(raw) {
+  const text = typeof raw === 'string' ? raw : ''
+  if (!text) return []
+  // The format string starts every record with the separator, so the
+  // FIRST split segment (everything before the first separator) is always
+  // empty and is dropped here.
+  const blocks = text.split(GIT_LOG_RECORD_SEP).slice(1)
+  return blocks.map((block) => {
+    const lines = block.split('\n')
+    const header = lines[0] || ''
+    const sepIndex = header.indexOf(GIT_LOG_HEADER_SEP)
+    const parentsField = sepIndex === -1 ? '' : header.slice(0, sepIndex)
+    const subject = sepIndex === -1 ? header : header.slice(sepIndex + 1)
+    const isMerge = parentsField.split(' ').filter(Boolean).length >= 2
+    const paths = lines.slice(1).filter((l) => l.trim() !== '')
+    return { subject, paths: isMerge ? null : paths }
+  })
+}
+
+export function countEscapedDefectCandidates(commits, options = {}) {
+  const list = Array.isArray(commits) ? commits : []
+  const fixCommits = list.filter((c) => c && typeof c.subject === 'string' && FIX_COMMIT_RE.test(c.subject.trim()))
+  const count = fixCommits.length
+
+  // AC-2: the raw figure/method above is UNCHANGED -- this block only adds
+  // the scoped figure alongside it, never redefines what `count` means.
+  const configSource = options.configSource === 'repo-override' ? 'repo-override' : 'default'
+  const configError = typeof options.configError === 'string' ? options.configError : null
+  const excludeGlobs = configError ? null : (Array.isArray(options.excludeGlobs) ? options.excludeGlobs : DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS)
+
+  let scopedCount = null
+  let scopedExcludedCount = null
+  let scopedUnavailableCount = null
+  if (excludeGlobs) {
+    scopedCount = 0
+    scopedExcludedCount = 0
+    scopedUnavailableCount = 0
+    for (const c of fixCommits) {
+      // AC-4: a commit whose paths are unavailable (not an array -- absent,
+      // or explicitly null for a detected merge) is counted in NEITHER
+      // direction, only in scoped_unavailable_count.
+      if (!Array.isArray(c.paths)) {
+        scopedUnavailableCount++
+        continue
+      }
+      const touchesProduct = c.paths.some((p) => typeof p === 'string' && p !== '' && !pathMatchesAny(p, excludeGlobs))
+      if (touchesProduct) scopedCount++
+      else scopedExcludedCount++
+    }
+  }
+
+  const scopedMethod = configError
+    ? `unavailable: ${configError}`
+    : `scoped heuristic: of the same "fix:" commits counted above, counts only those touching product source -- whose changed paths include at least one path OUTSIDE the configured pipeline/tooling exclude globs (source: ${configSource === 'repo-override' ? '.claude/harness-triggers.json escapedDefectExcludePaths' : 'harness default excludes'}) -- STILL not a verified causal attribution to a specific proposal or merged PR, and a genuine escaped defect fixed under a commit type other than "fix:" is still missed. A commit whose changed paths could not be determined (most commonly a merge commit) is counted in neither scoped_count nor scoped_excluded_count, only scoped_unavailable_count.`
+
+  return {
+    count,
+    n_commits_examined: list.length,
+    method: 'heuristic proxy: count of commit subjects starting with the conventional-commit "fix:" type (optionally scoped) within the examined window -- NOT a verified causal attribution to a specific merged PR; a fix: commit unrelated to any recent proposal still counts, and a genuine escaped defect fixed under a different commit-message type is missed. A second, narrower scoped_count is reported alongside this raw figure -- see scoped_method.',
+    scoped_count: scopedCount,
+    scoped_excluded_count: scopedExcludedCount,
+    scoped_unavailable_count: scopedUnavailableCount,
+    scoped_config_source: configSource,
+    scoped_exclude_globs: excludeGlobs || [],
+    scoped_method: scopedMethod,
+  }
+}
+
+// Review round-2 M2: `JSON.stringify(value, Object.keys(target).sort())`
+// looked like it canonicalised the whole object, but a replacer ARRAY is
+// applied identically at EVERY nesting level of JSON.stringify's own
+// traversal, not just the top level -- so a key present only inside a
+// nested object (never in the top-level target's own key list) is
+// filtered OUT at that inner level, and every nested object serialises to
+// "{}" regardless of its content. Two targets differing only in a nested
+// field (e.g. {trigger:{glob:'*.js'}} vs {trigger:{glob:'*.py'}}) hashed
+// identically as a result. Recurses and sorts keys at EVERY level instead,
+// so nested content is never silently dropped and key order never matters
+// at any depth.
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+// HARN-OPT-4 T6 (AC-QA-20, AC-DATA-15): a proposal target is a FIXED key set
+// (kind, component, concern, lens, workflow, job, plus the two gate booleans
+// touches_always_on_lens and security_purposed). Identity is the six string
+// fields only, in this fixed order; the booleans are gate inputs, and `repo`
+// is deliberately not identity, so a rejection recorded in one roster repo is
+// found for the same target proposed in another (the skill documents this).
+export const PROPOSAL_IDENTITY_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+const identityValue = (v) => (typeof v === 'string' ? v : v === null || v === undefined ? '' : String(v)).trim().toLowerCase()
+
+// A stable proposal id derived from the TARGET a proposal is about (never
+// its prose wording), so the same target re-proposed across cycles is
+// recognisable as the same proposal (AC-DATA-10). Real-Node sha256, same
+// pattern as ledger-append.mjs's findingId. Case-folding, trimming and the
+// fixed key order mean key order, letter case and stray whitespace in the
+// drafted target cannot mint a second id for one target (AC-QA-20).
+export function stableProposalId(target) {
+  const t = target && typeof target === 'object' ? target : {}
+  // A target carrying none of the six identity keys is a pre-T6 free shape
+  // (the pre-T6 id tests still exercise it); the script rejects those before
+  // the id step, so this branch is reachable only by direct callers.
+  if (!PROPOSAL_IDENTITY_KEYS.some((k) => k in t)) return createHash('sha256').update(canonicalJson(target)).digest('hex').slice(0, 16)
+  const canonical = canonicalJson(PROPOSAL_IDENTITY_KEYS.map((k) => identityValue(t[k])))
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 16)
+}
+
+// AC-DATA-14: the conductor re-records outcome events under the new ids, and
+// computes the mapping from this code rather than by hand. Old free shapes
+// map onto the fixed set where they can: workflow_component -> component,
+// feature -> concern; kind, component, concern, lens, workflow and job as
+// given; missing strings empty. Any other key (e.g. the 5 Oct {cycle, change})
+// holds information the fixed set cannot carry, so the answer is null with the
+// key names rather than a lossy id. The two gate booleans and `repo` are not
+// identity and are ignored here.
+const LEGACY_RENAMES = { workflow_component: 'component', feature: 'concern' }
+const LEGACY_IGNORED = ['touches_always_on_lens', 'security_purposed', 'repo']
+// Round 3 L4 (AC-PROD-8): alongside the id, a `sidecar_entry` in the fixed key
+// set, so the conductor can seed the proposal-target sidecar when it
+// re-records outcome events under the new ids; otherwise the first post-ship
+// cycle would show the drafter no prior targets at all. Identity strings as
+// given (the drafter must reuse them exactly), missing ones empty; the gate
+// booleans kept only when the legacy target carried them as booleans.
+export function mapLegacyTarget(target) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return { proposal_id: null, reason: 'target is not an object', sidecar_entry: null }
+  const mapped = {}
+  const unmappable = []
+  for (const [k, v] of Object.entries(target)) {
+    const to = LEGACY_RENAMES[k] || k
+    if (LEGACY_IGNORED.includes(k)) continue
+    if (!PROPOSAL_IDENTITY_KEYS.includes(to)) { unmappable.push(k); continue }
+    if (to in mapped && identityValue(mapped[to]) !== identityValue(v)) { unmappable.push(`${k} (conflicts with ${to})`); continue }
+    mapped[to] = v
+  }
+  if (unmappable.length) return { proposal_id: null, reason: `fields the fixed key set cannot hold: ${unmappable.join(', ')}`, sidecar_entry: null }
+  const sidecar_entry = Object.fromEntries(PROPOSAL_IDENTITY_KEYS.map((k) => [k, typeof mapped[k] === 'string' ? mapped[k] : mapped[k] === null || mapped[k] === undefined ? '' : String(mapped[k])]))
+  for (const k of ['touches_always_on_lens', 'security_purposed']) sidecar_entry[k] = target[k] === true
+  return { proposal_id: stableProposalId(mapped), reason: null, sidecar_entry }
+}
+
+// ---- CLI ----
+
+function readStdin() {
+  try {
+    return fs.readFileSync(0, 'utf8')
+  } catch (e) {
+    return ''
+  }
+}
+
+function parseArgs(argv) {
+  const positional = []
+  let window = DEFAULT_LEDGER_WINDOW_LINES
+  for (const a of argv) {
+    const m = /^--window=(\d+)$/.exec(a)
+    if (m) window = Number(m[1])
+    else positional.push(a)
+  }
+  return { positional, window }
+}
+
+function mapToObject(m) {
+  return Object.fromEntries([...m.entries()])
+}
+
+// AC-SEC-3 (round 2): perRepo[].root used to be the raw, caller-supplied
+// analysis path verbatim -- a real leak, not merely "the caller's own
+// already-known argument": workflows/optimise-cycle.js renders it directly
+// into the persisted report and the synthesis prompt whenever no friendlier
+// label has been resolved elsewhere (`d.repoLabels[entry.root] ||
+// entry.root`), so an operator's home-directory-bearing checkout path
+// reached both. Derives a non-identifying handle instead, from data this
+// file already has no fs-privileged reason to withhold: the `repo` identity
+// the WRITER already resolved and redacted for its own records (the same
+// value every other part of this output already keys on -- byPlan, rework),
+// falling back to a bare basename (never the full path) when no record
+// exists to derive one from (an uninstrumented repo, or one whose every
+// line was skipped). No git/gh call is made here (this file stays read-only
+// and shells out to nothing, per AC-SEC-9/AC-ARCH-8) -- purely a string/
+// array read over records already parsed.
+function derivePerRepoLabel(records, root) {
+  const withRepo = records.find((r) => typeof r.repo === 'string' && r.repo)
+  if (withRepo) return withRepo.repo
+  // Review round-1 M7: the fallback used to be the root's own basename --
+  // but for a home-shaped analysis root (e.g. `<scratch>/Users/<user>`,
+  // the operator's own home directory or one directly beneath it), the
+  // basename CAN BE the account name itself, leaking exactly what AC-SEC-3
+  // exists to redact. This branch fires for precisely the common
+  // "uninstrumented" case (no ledger file at all, so no record to derive a
+  // real identity from), so it must never fall back to any part of the raw
+  // path -- a fixed, non-identifying constant instead.
+  return REDACTED_PATH_MARKER
+}
+
+function ledgerIdentityForRoot(root) {
+  const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
+  const raw = fs.existsSync(ledgerPath) ? fs.readFileSync(ledgerPath, 'utf8') : ''
+  return derivePerRepoLabel(parseLedgerContent(raw).records, root)
+}
+
+// Round 2 F2 (AC-PROD-8, AC-SEC-10): the ledger holds only proposal ids, so the
+// optimiser writes a per-run sidecar of id -> fixed-key target beside its
+// report. This is a per-run OUTPUT like the report, overwritten each run, not a
+// cache of ledger or gh reads. The reader treats it as hostile data: it never
+// throws, spawns nothing, refuses anything that is not a plain bounded file,
+// accepts an entry only if it is exactly the fixed key set, and flattens and
+// bounds every string it hands on. Mirrors PROPOSAL_TARGET_KEYS in
+// workflows/optimise-cycle.js (a workflow script cannot import this file).
+export const PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
+const SIDECAR_MAX_BYTES = 1024 * 1024
+const SIDECAR_STRING_MAX = 200
+const SIDECAR_BOOLEAN_KEYS = ['touches_always_on_lens', 'security_purposed']
+function sidecarTargetOrReason(t) {
+  if (!t || typeof t !== 'object' || Array.isArray(t)) return { reason: 'sidecar entry is not an object' }
+  const keys = Object.keys(t)
+  const fixed = [...PROPOSAL_IDENTITY_KEYS, ...SIDECAR_BOOLEAN_KEYS]
+  if (keys.length !== fixed.length || !fixed.every((k) => keys.includes(k))) return { reason: 'sidecar entry is not the fixed key set' }
+  const out = {}
+  for (const k of PROPOSAL_IDENTITY_KEYS) {
+    const v = t[k]
+    if (v !== null && typeof v !== 'string') return { reason: 'sidecar entry has a non-string identity field' }
+    if (typeof v === 'string' && v.length > SIDECAR_STRING_MAX) return { reason: 'sidecar entry has an over-long identity field' }
+    out[k] = typeof v === 'string' ? v.replace(/\s+/g, ' ') : v
+  }
+  for (const k of SIDECAR_BOOLEAN_KEYS) {
+    if (typeof t[k] !== 'boolean') return { reason: 'sidecar entry has a non-boolean gate field' }
+    out[k] = t[k]
+  }
+  return { target: out }
+}
+function readProposalTargetsSidecar(roots) {
+  let firstFailure = 'proposal-target sidecar not found'
+  const merged = {}
+  let anyRead = false
+  roots.forEach((root, i) => {
+    const file = path.join(root, PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH)
+    let parsed
+    try {
+      const st = fs.lstatSync(file)
+      if (!st.isFile() || st.size > SIDECAR_MAX_BYTES) throw new Error('not a plain bounded file')
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch (e) {
+      // ENOENT is the ordinary "not written yet"; anything else is unreadable
+      // or malformed. The message is never echoed (it can carry the path).
+      if (i === 0) firstFailure = e && e.code === 'ENOENT' ? 'proposal-target sidecar not found' : 'proposal-target sidecar unreadable or not valid JSON'
+      return
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (i === 0) firstFailure = 'proposal-target sidecar is not a JSON object'
+      return
+    }
+    anyRead = true
+    for (const [id, t] of Object.entries(parsed)) if (!(id in merged)) merged[id] = t
+  })
+  return anyRead ? { entries: merged } : { reason: firstFailure }
+}
+// Attach `target` (or `targetUnavailableReason`) to each outcome, and only to
+// ids that already have an outcome event: the sidecar never creates one.
+function attachSidecarTargets(outcomes, roots) {
+  const sidecar = readProposalTargetsSidecar(roots)
+  for (const [id, o] of Object.entries(outcomes)) {
+    let reason = sidecar.reason
+    if (sidecar.entries) {
+      if (!Object.prototype.hasOwnProperty.call(sidecar.entries, id)) reason = 'proposal-target sidecar has no entry for this proposal'
+      else {
+        const r = sidecarTargetOrReason(sidecar.entries[id])
+        if (r.target) { o.target = r.target; continue }
+        reason = r.reason
+      }
+    }
+    o.targetUnavailableReason = reason
+  }
+  return outcomes
+}
+
+function runLedgerCommand(roots, window) {
+  const perRepo = []
+  let combinedRecords = []
+  let combinedSkipped = []
+  for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
+    const root = roots[rootIndex]
+    const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
+    let raw = ''
+    let exists = false
+    if (fs.existsSync(ledgerPath)) {
+      exists = true
+      raw = fs.readFileSync(ledgerPath, 'utf8')
+    }
+    const { records, skipped, schemaVersionsSeen, truncatedFinalLine } = parseLedgerContent(raw)
+    const label = derivePerRepoLabel(records, root)
+    // Review round-1 M5: rootIndex is the stable, positional, non-
+    // identifying key a caller (optimise-cycle.js) can use to look up its
+    // OWN friendlier label for this same root -- `root` here is a derived
+    // identity/basename (AC-SEC-3), not the raw path, so a caller cannot
+    // key its own lookup by it any more.
+    perRepo.push({ root: label, rootIndex, uninstrumented: !exists, recordCount: records.length, skippedCount: skipped.length, schemaVersionsSeen: mapToObject(schemaVersionsSeen), truncatedFinalLine })
+    combinedRecords = combinedRecords.concat(records)
+    combinedSkipped = combinedSkipped.concat(skipped)
+  }
+  // combinedRecords is repo-major: root 0's records, then root 1's, and so
+  // on, time-ordered only WITHIN each root. windowRecords keeps the tail, so
+  // without this sort the window is selected by argument position: the
+  // last-listed root's OLDEST records outrank the first-listed root's
+  // NEWEST. Every downstream aggregate, and citationPool's
+  // "most-recent-first" contract, assume the window means recent runs.
+  const { windowed, truncated, droppedCount } = windowRecords(sortRecordsByTime(combinedRecords), window)
+  // HARN-OPT-2 PR1: plan-identity canonicalisation of an absolute historical
+  // spec value needs the actual analysis root as a lexical string to strip.
+  // Simplification, stated here rather than hidden: when MULTIPLE roots are
+  // analysed in one invocation, only the FIRST one is used for this -- an
+  // absolute historical spec belonging to a DIFFERENT listed root falls
+  // through to the safe out-of-repo marker (never merged, never leaked)
+  // rather than being relativised against the wrong root. The common case
+  // (one root per invocation, per AC-SEC-3's own documented usage) is
+  // unaffected.
+  const canonicalRoot = roots[0] || ''
+  const rework = aggregateRework(windowed, { root: canonicalRoot })
+  const neverFailing = neverFailingAcs(rework.acVerdicts, { unattributedFailBuckets: rework.unattributedFailBuckets, truncatedBuckets: rework.truncatedBuckets, verdictDisagreements: rework.verdictDisagreements })
+  const wallClock = aggregateWallClock(windowed, { root: canonicalRoot })
+  const blockedUnresolved = aggregateBlockedUnresolved(windowed, { root: canonicalRoot })
+  const trigger = aggregateTriggerAccuracy(windowed)
+  const proposalOutcomes = aggregateProposalOutcomes(windowed)
+  return {
+    n: windowed.length,
+    windowTruncated: truncated,
+    windowDroppedCount: droppedCount,
+    perRepo,
+    skipped: combinedSkipped,
+    rework: { n: rework.n, lensDispositionCounts: rework.lensDispositionCounts, acVerdicts: [...rework.acVerdicts.values()], unattributableCount: rework.unattributableCount, invalidAcIdsDropped: rework.invalidAcIdsDropped, invalidRecordValuesDropped: rework.invalidRecordValuesDropped, invalidFixedIdsDropped: rework.invalidFixedIdsDropped, duplicateFixedIdsDropped: rework.duplicateFixedIdsDropped, duplicateFixedAcrossRounds: rework.duplicateFixedAcrossRounds, invalidPriorIdsDropped: rework.invalidPriorIdsDropped, findingsTruncated: rework.findingsTruncated, acVerdictsTruncated: rework.acVerdictsTruncated, unattributedFindings: rework.unattributedFindings, noSpecReviewRuns: rework.noSpecReviewRuns, noSpecReviewRunsConducted: rework.noSpecReviewRunsConducted, noSpecReviewRunsDirect: rework.noSpecReviewRunsDirect, noSpecReviewRunsRoundNotRecorded: rework.noSpecReviewRunsRoundNotRecorded, reviewRunsWithRound: rework.reviewRunsWithRound, noSpecFindingsReclassified: rework.noSpecFindingsReclassified, schemaV4: rework.schemaV4 },
+    blockedUnresolved,
+    neverFailingAcs: neverFailing,
+    proposalOutcomes: attachSidecarTargets(mapToObject(proposalOutcomes), roots),
+    wallClock: { byPlan: mapToObject(new Map([...wallClock.byPlan.entries()])), totals: wallClock.totals, source: wallClock.source },
+    triggerAccuracy: trigger,
+    citationPool: citationPool(windowed),
+  }
+}
+
+function runCiCommand(payload) {
+  const runs = Array.isArray(payload && payload.runs) ? payload.runs : []
+  const requestedLimit = payload && typeof payload.requestedLimit === 'number' ? payload.requestedLimit : null
+  const minRunsNeverFailed = payload && typeof payload.minRunsNeverFailed === 'number' ? payload.minRunsNeverFailed : MIN_RUNS_FOR_NEVER_FAILED
+  // HARN-OPT-4 T7: the payload is one entry per RUN with its jobs nested
+  // (AC-OPS-12). Flatten to one row per job here, copying only the fields the
+  // aggregate needs, so an actor, title, branch or commit field fed in (or a
+  // step name) cannot come back out (AC-SEC-14).
+  const flat = []
+  // Round 1 L3 (AC-OPS-11): keyed by an agent-supplied repo string, so a
+  // null-prototype object; `__proto__`, `constructor` and `toString` are then
+  // ordinary keys and nothing reaches Object.prototype.
+  const repoStats = Object.create(null)
+  const partialWorkflows = new Set()
+  const seen = new Set()
+  // Round 2 M1 (AC-QA-23): the pool is built by failure and recency, not array
+  // position (gh lists newest first and the lane sends several repos).
+  const poolRuns = []
+  for (const run of runs) {
+    if (!run || typeof run.repo !== 'string' || typeof run.workflow !== 'string' || !run.repo || !run.workflow) continue
+    if (!validRunId(run.id)) continue
+    const stats = repoStats[run.repo] || (repoStats[run.repo] = { notCompleted: 0, attempt1Unfetched: 0, pastAttempt2: 0, fetchFailures: { rate_limited: 0, unauthenticated: 0, other: 0 } })
+    const id = String(run.id)
+    // Round 3 L1 (AC-QA-23): a run the lane emits twice (a retry after a rate
+    // limit, overlapping pages, a re-listing) counts once everywhere, not only
+    // in the pool; otherwise three real runs could clear the minimum-runs floor
+    // and read as never failed, and the removal brake trusts that floor.
+    if (seen.has(id)) continue
+    seen.add(id)
+    poolRuns.push({ id, repo: run.repo, completed: run.status === 'completed', t: typeof run.started_at === 'string' ? Date.parse(run.started_at) : NaN })
+    // AC-OPS-10: an in-flight run has unsettled conclusions.
+    if (run.status !== 'completed') {
+      stats.notCompleted += 1
+      continue
+    }
+    // AC-OPS-11: a failed per-run fetch is counted by mode; an unknown mode is "other".
+    if (run.fetch_error) {
+      stats.fetchFailures[FETCH_MODES.includes(run.fetch_error) ? run.fetch_error : 'other'] += 1
+      partialWorkflows.add(`${run.repo}::${run.workflow}`)
+      continue
+    }
+    // Round 1 L4 (AC-OPS-10): a digit-string attempt is read the way
+    // validRunId reads ids, and any other present-but-unreadable attempt
+    // fails closed as a re-run. Only an absent attempt, or a first one, is not.
+    const attemptN = typeof run.attempt === 'number' ? run.attempt : typeof run.attempt === 'string' && /^[0-9]+$/.test(run.attempt) ? Number(run.attempt) : null
+    // HARN-OPT-5 T7 (AC-DATA-16, AC-DATA-17, AC-SIMP-11): the re-run flag is
+    // per job, joined to the run's attempt-1 jobs by run id plus RAW job name
+    // (the run is one id; normalising first would let two distinct jobs share
+    // a key). A job is NOT a re-run only when the run is at attempt exactly 2,
+    // its raw name appears exactly once in both attempts, the attempt-1 payload
+    // is well formed, and its attempt-1 conclusion is success. Everything else
+    // fails closed: a fetch failure, an empty or malformed payload, a missing
+    // or duplicated name, a non-success attempt 1, or attempt > 2 (an
+    // intermediate failure cannot be seen) all leave the job a re-run.
+    const latestJobs = (Array.isArray(run.jobs) ? run.jobs : []).filter((job) => job && typeof job.name === 'string' && job.name)
+    const rawCounts = (jobs) => jobs.reduce((m, j) => m.set(j.name, (m.get(j.name) || 0) + 1), new Map())
+    const a1 = run.attempt1_jobs
+    const a1WellFormed = !run.attempt1_fetch_error && Array.isArray(a1) && a1.length > 0 && a1.every((j) => j && typeof j.name === 'string' && j.name)
+    // T7 round 2 L2: a run past attempt 2, or one whose attempt is present but unreadable, fails closed for every job
+    // (AC-DATA-17) and is COUNTED, so the report can say why a job has no settled verdict.
+    if (run.attempt !== undefined && (attemptN === null || attemptN > 2)) stats.pastAttempt2 += 1
+    if (attemptN !== null && attemptN > 1 && !a1WellFormed) {
+      stats.attempt1Unfetched += 1
+      // T7 review round 1 F2 (AC-QA-24): a failed attempt-1 fetch is also counted by mode beside the per-run fetch
+      // failures, so a token problem and a quota problem stay distinguishable on the stats line.
+      if (run.attempt1_fetch_error) stats.fetchFailures[FETCH_MODES.includes(run.attempt1_fetch_error) ? run.attempt1_fetch_error : 'other'] += 1
+    }
+    const latestCounts = rawCounts(latestJobs)
+    const a1Counts = a1WellFormed ? rawCounts(a1) : new Map()
+    const a1Success = a1WellFormed ? new Map(a1.map((j) => [j.name, j.conclusion === 'success'])) : new Map()
+    for (const job of latestJobs) {
+      const rerun = run.attempt === undefined || attemptN === 1 ? false : attemptN !== 2 ? true : !(a1WellFormed && latestCounts.get(job.name) === 1 && a1Counts.get(job.name) === 1 && a1Success.get(job.name) === true)
+      flat.push({ repo: run.repo, workflow: run.workflow, job: normaliseJobName(job.name), run_id: id, rerun, conclusion: job.conclusion, started_at: run.started_at, duration_s: job.duration_s })
+    }
+  }
+  const { byJob } = aggregateCi(flat, { minRunsNeverFailed, requestedLimit, partialWorkflows })
+  // Every failed run id first (all repos), then each repo's most recent
+  // completed runs by started_at descending (id tie-break), deduplicated.
+  const pool = []
+  const inPool = new Set()
+  const add = (id) => { if (/^[0-9]+$/.test(id) && !inPool.has(id) && pool.length < CITATION_POOL_SIZE) { inPool.add(id); pool.push(id) } }
+  for (const row of Object.values(mapToObject(byJob))) for (const id of Array.isArray(row.failedRunIds) ? row.failedRunIds : []) add(String(id))
+  const byRepo = new Map()
+  for (const r of poolRuns) if (r.completed) (byRepo.get(r.repo) || byRepo.set(r.repo, []).get(r.repo)).push(r)
+  const newest = (a, b) => (Number.isNaN(b.t) ? -Infinity : b.t) - (Number.isNaN(a.t) ? -Infinity : a.t) || (BigInt(b.id) > BigInt(a.id) ? 1 : BigInt(b.id) < BigInt(a.id) ? -1 : 0)
+  const lists = [...byRepo.values()].map((l) => l.sort(newest))
+  // Round-robin across repos so no repo's recent runs crowd out another's.
+  for (let i = 0; pool.length < CITATION_POOL_SIZE && lists.some((l) => i < l.length); i++) for (const l of lists) if (i < l.length) add(l[i].id)
+  return { byJob: mapToObject(byJob), citationPool: pool, repoStats }
+}
+
+export function main() {
+  const argv = process.argv.slice(2)
+  const command = argv[0]
+  const { positional, window } = parseArgs(argv.slice(1))
+  if (command === 'ledger') {
+    const roots = positional.length ? positional : [process.cwd()]
+    return runLedgerCommand(roots, window)
+  }
+  if (command === 'ci') {
+    const raw = readStdin()
+    let payload
+    try {
+      payload = raw.trim() ? JSON.parse(raw) : {}
+    } catch (e) {
+      // Review round-2 L2: JSON.parse's own SyntaxError message embeds a
+      // snippet of the RAW input it failed on -- matching L1's already-
+      // fixed ledger-line-parser leak, applied here too. This command is
+      // fed agent-assembled `gh` output, which optimise-cycle.js carries
+      // into the synthesis prompt and the report.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', byJob: {} }
+    }
+    return runCiCommand(payload)
+  }
+  if (command === 'escaped-defects') {
+    const raw = readStdin()
+    let payload
+    try {
+      payload = raw.trim() ? JSON.parse(raw) : {}
+    } catch (e) {
+      // Review round-2 L2: same fix as the `ci` command above.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', count: null }
+    }
+    // AC-1: the agent no longer parses
+    // git log output itself -- it captures `git log --name-only
+    // --pretty=format:'%x1e%P%x1f%s'`'s raw stdout verbatim into
+    // git_log_raw, and this script does all parsing/scoring deterministically
+    // (parseGitLogRaw), so a mis-parse can never silently misattribute a
+    // changed path to the wrong commit.
+    const commits = parseGitLogRaw(typeof payload.git_log_raw === 'string' ? payload.git_log_raw : '')
+    const root = typeof payload.root === 'string' && payload.root ? payload.root : process.cwd()
+    // Round 1 F5 (AC-SEC-10 integrity): the lane reports `git -C <root>
+    // rev-parse --show-toplevel`; if that is not this root (after realpath on
+    // both, fs only), git read an enclosing or different repo, so the figures
+    // are about the wrong history. Rejected with a reason, never figures, and
+    // the reason echoes no path.
+    // Round 2 F3 (AC-QA-19, AC-SEC-10): this check used to be skipped when
+    // `toplevel` was missing or empty, so a lane that omitted it (or a failed
+    // rev-parse) got figures with no integrity check at all. It now fails
+    // closed: no toplevel is the same no-figures rejection as a mismatch.
+    let same = false
+    if (typeof payload.toplevel === 'string' && payload.toplevel) {
+      try { same = fs.realpathSync(payload.toplevel) === fs.realpathSync(root) } catch (e) { same = false }
+    }
+    if (!same) return { rejected: true, reason: 'git toplevel is missing or does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null, repo: ledgerIdentityForRoot(root) }
+    const config = resolveProductSourceExcludeGlobs(root)
+    // HARN-OPT-4 T6 (AC-DATA-11, AC-SEC-10): attach the ledger repo identity
+    // for this root, derived exactly as the ledger command derives perRepo[].root,
+    // so the script can match this figure to its roster entry. The root path
+    // itself is never echoed.
+    return { ...countEscapedDefectCandidates(commits, config), repo: ledgerIdentityForRoot(root) }
+  }
+  if (command === 'ids') {
+    const raw = readStdin()
+    let payload
+    try {
+      payload = raw.trim() ? JSON.parse(raw) : {}
+    } catch (e) {
+      // Review round-2 L2: same fix as the `ci` command above.
+      return { error: 'stdin was not valid JSON (invalid JSON syntax)', ids: [] }
+    }
+    const targets = Array.isArray(payload && payload.targets) ? payload.targets : []
+    if (Array.isArray(payload && payload.legacy_targets)) {
+      return { legacy_ids: payload.legacy_targets.map((target) => ({ target, ...mapLegacyTarget(target) })) }
+    }
+    return { ids: targets.map((target) => ({ target, proposal_id: stableProposalId(target) })) }
+  }
+  return { error: `unknown command "${command}"; expected "ledger", "ci", "escaped-defects" or "ids"` }
+}
+
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+if (isMain) {
+  const out = main()
+  process.stdout.write(JSON.stringify(out) + '\n')
+  // Round 2 M1: process.exit() straight after a large write cut the JSON at
+  // the 64 KB pipe buffer about half the time. Set the code and let the
+  // event loop drain stdout before the process ends naturally.
+  process.exitCode = 0
+}

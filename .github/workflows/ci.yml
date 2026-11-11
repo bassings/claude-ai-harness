@@ -33,13 +33,10 @@ jobs:
       matrix:
         node: ['22', '26']
     steps:
+      # Default shallow checkout: the suite reads no repository history
+      # (historical files are vendored under test/fixtures/). Only the
+      # gitleaks job below needs full history.
       - uses: actions/checkout@v4
-        with:
-          # The suite resolves a historical commit by subject across
-          # --branches --remotes (test/static-checks.test.js). A shallow clone
-          # has no such commit and the guard fails for a reason unrelated to
-          # the change under test.
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
