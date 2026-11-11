@@ -68,6 +68,9 @@ to an install that is still running. A destination file that was a symlink is
 replaced by a regular file, and its backup holds the target's bytes, not the
 link. If an install stops part-way it says so ("INCOMPLETE"), how many files it
 had updated, and to re-run it or restore from the printed backup directory.
+Run one install at a time: two installs into the same destination at once can
+stop each other with INCOMPLETE, because each checks its backup against a file
+the other has just replaced. Nothing is lost; re-run the installer.
 Before it replaces a file that differs, it copies the old
 version under `~/.claude/.harness-backups/<UTC timestamp>/` and prints that
 path; the newest 10 backup directories are kept. It warns, naming which, when
