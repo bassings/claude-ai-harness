@@ -36,6 +36,11 @@ REPO="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 DEST="${CLAUDE_HOME:-$HOME/.claude}"
 LIB="$REPO/workflows/lib/install-consistency.mjs"
 
+# printf, never echo: where /bin/sh's echo interprets backslash escapes (macOS),
+# a path containing a backslash would print as a different path.
+say() { printf '%s\n' "$1"; }
+warn() { printf '%s\n' "$1" >&2; }
+
 usage() {
   cat >&2 <<'USAGE'
 usage: bin/install.sh [--check]
@@ -63,7 +68,7 @@ USAGE
 # spelling that cannot be a typo of something else.
 CHECK_ONLY=0
 if [ "$#" -gt 1 ]; then
-  echo "install: too many arguments (expected at most one)." >&2
+  warn "install: too many arguments (expected at most one)."
   usage
   exit 2
 fi
@@ -72,14 +77,14 @@ case "${1:-}" in
   --check) CHECK_ONLY=1 ;;
   -h|--help) usage; exit 0 ;;
   *)
-    echo "install: unrecognised argument '$1'." >&2
+    warn "install: unrecognised argument '$1'."
     usage
     exit 2
     ;;
 esac
 
 if [ ! -f "$LIB" ]; then
-  echo "install: cannot find $LIB; run this from a claude-ai-harness checkout." >&2
+  warn "install: cannot find $LIB; run this from a claude-ai-harness checkout."
   exit 2
 fi
 
@@ -173,7 +178,7 @@ for (const f of r.files) console.log(f)
 " "$REPO" "$LIB")
 
 if [ -z "$FILES" ]; then
-  echo "install: the consumer subset came back empty; refusing to 'install' nothing." >&2
+  warn "install: the consumer subset came back empty; refusing to 'install' nothing."
   exit 2
 fi
 
@@ -217,9 +222,9 @@ shquote() {
 }
 
 refuse_destination() {
-  echo "install: $DEST does not look like a Claude install: $1. Refusing." >&2
-  echo "         If this really is where the harness should go, run:" >&2
-  echo "HARNESS_INSTALL_REQUIRE_MARKER=0 CLAUDE_HOME=$(shquote "$DEST") $(shquote "$REPO/bin/install.sh")" >&2
+  warn "install: $DEST does not look like a Claude install: $1. Refusing."
+  warn "         If this really is where the harness should go, run:"
+  warn "HARNESS_INSTALL_REQUIRE_MARKER=0 CLAUDE_HOME=$(shquote "$DEST") $(shquote "$REPO/bin/install.sh")"
   exit 2
 }
 
@@ -246,11 +251,11 @@ _default=${_default#origin/}
 _branch=$(git -C "$REPO" symbolic-ref --short -q HEAD 2>/dev/null || true)
 [ -n "$_branch" ] || _branch="(detached HEAD)"
 if [ "$_branch" != "$_default" ]; then
-  echo "install: warning: installing from branch '$_branch', not the default branch '$_default'." >&2
+  warn "install: warning: installing from branch '$_branch', not the default branch '$_default'."
 fi
 _dirty=$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null || true)
 if [ -n "$_dirty" ]; then
-  echo "install: warning: installing from a checkout with uncommitted changes to tracked files:" >&2
+  warn "install: warning: installing from a checkout with uncommitted changes to tracked files:"
   printf '%s\n' "$_dirty" >&2
 fi
 
@@ -263,17 +268,26 @@ BK_DIR=""
 installed=0
 tmp=""
 
-# The one way an install fails part-way: say what was done, that the result is
-# a mix, and the two ways out.
-fail_install() {
-  echo "install: $1" >&2
-  echo "install: INCOMPLETE: $installed file(s) updated before this failure, so $DEST holds a mix of old and new files." >&2
-  echo "         To finish: fix the cause above and re-run this installer." >&2
+# What an install that stopped part-way tells the operator: how far it got, that
+# the result is a mix, and the two ways out. Printed once, either by
+# fail_install (which also covers a failure before any file was updated) or by
+# the exit trap below (set -e exits, INT, TERM) when at least one file was.
+notified=0
+print_incomplete() {
+  notified=1
+  warn "install: INCOMPLETE: $installed file(s) updated before this stop, so $DEST may hold a mix of old and new files."
+  warn "         To finish: fix the cause above and re-run this installer."
   if [ -n "$BK_DIR" ]; then
-    echo "         To undo: copy the files back from $BK_DIR (same relative paths)." >&2
+    warn "         To undo: copy the files back from $BK_DIR (same relative paths)."
+    warn "         A destination that was a symlink was replaced by a regular file, and its backup holds the target's bytes, not the link."
   else
-    echo "         No file was backed up in this run, so there is nothing to restore." >&2
+    warn "         No file was backed up in this run, so there is nothing to restore."
   fi
+}
+
+fail_install() {
+  warn "install: $1"
+  print_incomplete
   exit 1
 }
 
@@ -301,28 +315,25 @@ make_backup_dir() {
     _cand="$_ts-$_n"
   done
   BK_DIR="$BK_ROOT/$_cand"
-  echo "install: previous versions of overwritten files are backed up in $BK_DIR"
+  say "install: previous versions of overwritten files are backed up in $BK_DIR"
 }
 
-# An interrupted earlier install (a kill, which no trap can catch) leaves
-# <file>.harness-tmp.<pid> beside its destination. Remove those, only in the
-# directories this install publishes into and only with exactly that suffix,
-# and name each one.
-_seen="|"
-for rel in $FILES; do
-  _d="$DEST/$(dirname -- "$rel")"
-  case "$_seen" in *"|$_d|"*) continue ;; esac
-  _seen="$_seen$_d|"
-  [ -d "$_d" ] || continue
-  for _stale in "$_d"/*.harness-tmp.[0-9]*; do
-    [ -f "$_stale" ] || continue
-    rm -f "$_stale"
-    echo "install: removed leftover temp file from an interrupted install: $_stale" >&2
-  done
-done
-
-# A signal between the temp write and the rename must not leave the temp file.
-trap 'if [ -n "$tmp" ]; then rm -f "$tmp"; fi' EXIT
+# A SIGKILL can leave one <file>.harness-tmp.<pid> beside its destination. It
+# is never at the destination path and no loader matches its name, so it is
+# safe to delete by hand. No install sweeps for these: a stray may belong to a
+# live concurrent install, and deleting it would make that install fail.
+#
+# Anything else that stops the install (a set -e exit, INT, TERM) removes the
+# current temp file and, once a file has been updated, says the install is
+# incomplete, unless fail_install already did.
+on_exit() {
+  _rc=$?
+  if [ -n "$tmp" ]; then rm -f "$tmp"; fi
+  if [ "$_rc" -ne 0 ] && [ "$installed" -gt 0 ] && [ "$notified" -eq 0 ]; then
+    print_incomplete
+  fi
+}
+trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -330,7 +341,7 @@ for rel in $FILES; do
   src="$REPO/$rel"
   dst="$DEST/$rel"
   if [ ! -f "$src" ]; then
-    echo "install: skipped $rel (listed as published, but not found in $REPO)" >&2
+    warn "install: skipped $rel (listed as published, but not found in $REPO)"
     continue
   fi
   mkdir -p "$(dirname -- "$dst")"
@@ -355,7 +366,7 @@ for rel in $FILES; do
   mv -f "$tmp" "$dst" \
     || fail_install "could not replace $rel; it was left unchanged."
   tmp=""
-  echo "updated: $rel"
+  say "updated: $rel"
   installed=$((installed + 1))
 done
 
@@ -370,10 +381,11 @@ if [ -n "$BK_DIR" ]; then
     is_backup_name "$_name" || continue
     [ "$BK_ROOT/$_name" != "$BK_DIR" ] || continue
     rm -rf "$BK_ROOT/$_name"
+    warn "install: pruned old backup directory: $BK_ROOT/$_name"
     _excess=$((_excess - 1))
   done
 fi
 
-echo "install: $installed file(s) updated in $DEST."
+say "install: $installed file(s) updated in $DEST."
 # Verify what we just did, rather than assuming the copies landed.
 exec "$0" --check

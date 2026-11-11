@@ -58,8 +58,16 @@ or `projects/` (a fresh `~/.claude`), and an existing install (`AGENT-HARNESS.md
 command that proceeds anyway, for any other non-empty directory and for any
 directory holding a typical home-directory entry (`.zshrc`, `.bashrc`,
 `.bash_profile`, `.profile`, `Documents`, `Desktop`, `Library` or `Downloads`),
-whatever markers it also holds. It also removes any `*.harness-tmp.<pid>` file
-an interrupted install left in the directories it publishes into, naming each.
+whatever markers it also holds. Each file is written to a temporary name beside
+its destination and renamed into place, so a stopped install never leaves a
+half-written file at the destination. If an install is killed outright
+(`SIGKILL`), one `<file>.harness-tmp.<pid>` stray can remain beside the
+destination; it is never at the destination path, nothing loads it, and it is
+safe to delete by hand. The installer never deletes one, because it may belong
+to an install that is still running. A destination file that was a symlink is
+replaced by a regular file, and its backup holds the target's bytes, not the
+link. If an install stops part-way it says so ("INCOMPLETE"), how many files it
+had updated, and to re-run it or restore from the printed backup directory.
 Before it replaces a file that differs, it copies the old
 version under `~/.claude/.harness-backups/<UTC timestamp>/` and prints that
 path; the newest 10 backup directories are kept. It warns, naming which, when
