@@ -259,18 +259,58 @@ trap 'on_signal 143' TERM
 trap 'on_signal 130' INT
 
 # The tools the unattended optimiser may use, and nothing else (the run passes
-# --permission-mode dontAsk). Writes are scoped to the one report file. Bash is
-# limited to read-only git and gh queries, the node helpers the workflow
-# invokes, and the plain read-only commands around them.
+# --permission-mode dontAsk). Every entry is here because workflows/
+# optimise-cycle.js instructs it:
+#   - Write and Edit: the report and its sidecar, nothing else.
+#   - node: only the two helper scripts the workflow runs (optimise-read.mjs
+#     and optimise-report-ignore.mjs), by absolute path under $CLAUDE_HOME. A
+#     bare node entry would allow `node -e <anything>`, which is arbitrary
+#     code with network and write access, so it is never listed. The
+#     workflow also permits a repo-local copy when the repo is the harness
+#     itself; that is deliberately NOT allowed here, since a repo's own
+#     script is code the run did not install. A plugin-only install (no
+#     $CLAUDE_HOME mirror) therefore FAILS loudly, and is notified.
+#   - git log and git rev-parse (with -C <root>, which the workflow uses):
+#     the workflow's git lane. cat, head, ls, wc and date were dropped
+#     because Read, Grep and Glob cover reading, and each of those commands
+#     takes any path. status, show, diff, ls-files and check-ignore were
+#     dropped as unused by the agent (the helper runs check-ignore itself);
+#     remote was dropped because `git remote set-url` writes config.
+#   - gh run list, gh run view, gh repo view: read-only queries.
+#   - openssl rand -hex 16, exactly: the per-run containment nonce. Any other
+#     openssl rand would allow `-out <file>`.
+# What this list does NOT prevent, stated plainly: Read, Grep and Glob can
+# read any file this user can read, so the boundary against exfiltration is
+# that no network tool is allowed (WebFetch, curl and wget are refused), not
+# that nothing sensitive is readable. The two node helpers take arbitrary
+# arguments; optimise-report-ignore.mjs appends a path to the .git/info/
+# exclude of whatever root it is given. git log accepts options such as
+# --output=<file> and --ext-diff that write a file or run a configured
+# program; a prefix rule cannot see inside the arguments, so the deny entries
+# below are best effort and not a guarantee. Shell chaining and command
+# substitution inside an allowed command are judged by the CLI's own parser,
+# not by this script. Agent and Workflow start further sessions whose
+# permissions are the CLI's to inherit; this script has not verified how.
+# The list was written from the workflow's text and has not been exercised by
+# a real headless run in this repository's tests.
 ALLOWED_TOOLS=(
   "Skill" "Workflow" "Agent" "Read" "Grep" "Glob"
   "Write($REPORT_REL)" "Edit($REPORT_REL)"
-  "Bash(git log:*)" "Bash(git status:*)" "Bash(git rev-parse:*)" "Bash(git remote:*)"
-  "Bash(git show:*)" "Bash(git diff:*)" "Bash(git ls-files:*)" "Bash(git check-ignore:*)"
+  "Write(.claude/optimise-proposal-targets.json)" "Edit(.claude/optimise-proposal-targets.json)"
+  "Bash(git log:*)" "Bash(git -C * log:*)" "Bash(git rev-parse:*)" "Bash(git -C * rev-parse:*)"
   "Bash(gh run list:*)" "Bash(gh run view:*)" "Bash(gh repo view:*)"
-  "Bash(node:*)" "Bash(openssl rand:*)"
-  "Bash(ls:*)" "Bash(cat:*)" "Bash(head:*)" "Bash(wc:*)" "Bash(date:*)"
+  "Bash(node $CLAUDE_HOME/workflows/lib/optimise-read.mjs:*)"
+  "Bash(node $CLAUDE_HOME/workflows/lib/optimise-report-ignore.mjs:*)"
+  "Bash(openssl rand -hex 16)"
 )
+# The workflow tells the agent the global mirror is ~/.claude/workflows/lib;
+# when that is where CLAUDE_HOME points, the tilde spelling is allowed too.
+if [ "$CLAUDE_HOME" = "$HOME/.claude" ]; then
+  ALLOWED_TOOLS+=(
+    "Bash(node ~/.claude/workflows/lib/optimise-read.mjs:*)"
+    "Bash(node ~/.claude/workflows/lib/optimise-report-ignore.mjs:*)"
+  )
+fi
 
 # What the run reports about its own outcome. note_fail is the only place a
 # failure is recorded, so the exit status, the notification and the
@@ -648,7 +688,7 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   timeout -k 60 "$TIMEOUT_S" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
     --allowedTools "${ALLOWED_TOOLS[@]}" \
     --permission-mode dontAsk \
-    --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" \
+    --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" "Bash(git -c:*)" "Bash(git * --output*)" "Bash(git * --ext-diff*)" \
     > "$TRANSCRIPT_FILE" 2>&1 &
   # Backgrounded and waited on, so a SIGTERM or SIGINT to this script is
   # handled at once (on_signal) rather than after claude finishes.

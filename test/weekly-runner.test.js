@@ -1535,13 +1535,45 @@ test('T11 AC-SEC-8: the allowlist names no bare tool that would grant everything
     assert.ok(!allowed.includes(bare), `a bare ${bare} entry would grant the whole tool:\n${allowed.join('\n')}`)
   }
   for (const entry of allowed.filter((e) => /^(Write|Edit)\(/.test(e))) {
-    assert.equal(entry.replace(/^(Write|Edit)\(|\)$/g, ''), '.claude/optimise-cycle-report.md', `writes are allowed to the report file only: ${entry}`)
+    const target = entry.replace(/^(Write|Edit)\(|\)$/g, '')
+    assert.ok(['.claude/optimise-cycle-report.md', '.claude/optimise-proposal-targets.json'].includes(target), `writes are allowed to the report and its sidecar only: ${entry}`)
   }
   assert.ok(allowed.some((e) => e.startsWith('Write(')), 'the report must be writable or the run can never PASS')
   for (const entry of allowed.filter((e) => /^Bash\(/.test(e))) {
-    assert.match(entry, /^Bash\([a-z][a-z -]*:\*\)$/, `Bash entries are command prefixes: ${entry}`)
     assert.ok(!/^Bash\((rm|sudo|curl|wget|git push|git commit|git reset)\b/.test(entry), `a denied command must not be allowed: ${entry}`)
+    for (const reader of ['cat', 'head', 'tail', 'ls', 'wc', 'date', 'echo', 'printf']) {
+      assert.ok(!entry.startsWith(`Bash(${reader}`), `Read, Grep and Glob already cover reading; ${entry} would add an unscoped path`)
+    }
   }
+})
+
+const HELPER_ENTRY = /^Bash\(node (\/|~\/)[^ *]*\/workflows\/lib\/optimise-(read|report-ignore)\.mjs:\*\)$/
+
+test('T11 AC-SEC-8: no Bash(node...) entry may run arbitrary code -- each names one helper script path, never bare node, node -e or a repo-local copy', () => {
+  const repo = makeTempRepo()
+  runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
+  const allowed = flagValues(capturedArgv(repo), '--allowedTools')
+  const nodeEntries = allowed.filter((e) => /^Bash\(node/.test(e))
+  assert.ok(nodeEntries.length > 0, 'the optimiser runs two node helpers, so some node entry must exist')
+  for (const entry of nodeEntries) {
+    assert.match(entry, HELPER_ENTRY, `a node entry must name one helper script path: ${entry}`)
+    assert.ok(!entry.includes(repo), `a repo-local copy of a helper must never be allowed to run: ${entry}`)
+  }
+  assert.ok(!allowed.some((e) => /^Bash\(node:/.test(e) || e === 'Bash(node *)'), 'no bare node entry')
+})
+
+test('T11 AC-SEC-8: the node entries name exactly the two helpers the optimiser workflow runs, under CLAUDE_HOME', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
+  const allowed = flagValues(capturedArgv(repo), '--allowedTools')
+  assert.deepEqual(
+    allowed.filter((e) => /^Bash\(node/.test(e)).sort(),
+    [
+      `Bash(node ${claudeHome}/workflows/lib/optimise-read.mjs:*)`,
+      `Bash(node ${claudeHome}/workflows/lib/optimise-report-ignore.mjs:*)`,
+    ],
+  )
 })
 
 test('T11 AC-SEC-8: neither the runner nor its plist contains disableAllHooks, even in a comment', () => {
