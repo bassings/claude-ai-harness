@@ -312,26 +312,82 @@ test('ledger-append: one append is exactly one write() of the whole line, counte
 // A slow git must not be reported as "the ledger is not ignored" (HARN-AUDIT-1 T1). On a loaded machine `git check-ignore`
 // once took longer than the writer's 10s timeout, the timed-out child has no exit status, and the writer treated it as
 // "not ignored" and refused with a message blaming a negation pattern, dropping a real row. A `git` shim on PATH misbehaves
-// in `check-ignore` for its first FAIL_FIRST calls and from its FAIL_FROM-th call on (calls counted in a file) and otherwise
-// runs the real git. The tests call the exported ensureGitignored() in this process with the timeout passed as an argument,
-// so no test waits ten seconds and the shipped writer needs no environment variable. The timeout bounds EVERY git call
-// under it, the real ones the shim passes through included, so it is short (500ms) only where nothing but the shim's sleep
-// runs, and 3000ms in the one test where real git runs after the timed-out call. Every other recovery is driven by the
-// shim's `kill` mode, which needs no timeout to elapse. `exec sleep` replaces the shim process so no grandchild holds the
-// pipes open after the kill. No test asserts on elapsed time; the one test that waits out a real timeout waits about 3s.
-function fakeGitShim(mode, failFirst, failFrom = 1e9) {
+// in `check-ignore` as its per-call script says, and answers EVERY `check-ignore` call itself: script[n-1] is the behaviour
+// of the n-th call (counted in a file), and a call beyond the script exits 97, so an unexpected extra call surfaces as a
+// "failed (exit 97)" refusal rather than passing silently. No real `git check-ignore` runs under any shim, so no real git
+// runs under a test-chosen timeout: on a loaded machine real check-ignore has taken over 10 seconds, and any bound a test
+// picks for it can be exceeded. Other subcommands (the spawned writer's own rev-parse and remote calls, which carry no
+// timeout) pass through to the real git. The answers are the ones real git gives for the two call shapes the writer makes,
+// pinned byte for byte against real git by the faithfulness test below:
+//   ignored    `-q`: exit 0, no output. `-v -z --stdin`: exit 0 and the record `.git/info/exclude\0<line>\0<pattern>\0<path>\0`,
+//              the line being the last one in .git/info/exclude that lists the ledger (exit 99 if none does, so a test that
+//              scripts "ignored" for a repo whose exclude does not list it fails loudly).
+//   unignored  exit 1, no output (git's "no pattern matches").
+//   sleep      outlives any bound (`exec sleep` replaces the shim so no grandchild holds the pipes open after the kill).
+//   kill       killed by SIGKILL, so the child has a signal and no exit status, with no timeout needing to elapse.
+//   exit128    exit 128 (git's own failure status, as for a corrupt index).
+// The tests call the exported ensureGitignored() in this process with the timeout passed as an argument, so the shipped
+// writer needs no environment variable. A test that scripts no `sleep` passes no bound and runs under the shipped default.
+function fakeGitShim(script) {
   const { execFileSync } = require('node:child_process')
   const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-git-shim-'))
   trackTempDir(dir)
   const counter = path.join(dir, 'check-ignore-calls')
-  const misbehave = { sleep: 'exec sleep 30', exit128: 'exit 128', kill: 'kill -9 $$' }[mode]
+  const act = {
+    sleep: 'exec sleep 30',
+    kill: 'kill -9 $$',
+    exit128: 'exit 128',
+    unignored: 'cat >/dev/null; exit 1',
+    ignored: [
+      'if [ "$2" = -q ]; then exit 0; fi',
+      'cat >/dev/null',
+      `l=$(grep -n -x -F -e '${LEDGER_REL}' .git/info/exclude | tail -n 1 | cut -d: -f1)`,
+      'if [ -z "$l" ]; then exit 99; fi',
+      `printf '.git/info/exclude\\0%s\\0%s\\0%s\\0' "$l" '${LEDGER_REL}' '${LEDGER_REL}'`,
+      'exit 0',
+    ].join('; '),
+  }
+  const cases = script.map((b, i) => {
+    if (!act[b]) throw new Error(`fakeGitShim: unknown behaviour ${b}`)
+    return `  ${i + 1}) ${act[b]} ;;\n`
+  }).join('')
   fs.writeFileSync(path.join(dir, 'git'),
-    `#!/bin/sh\nif [ "$1" = check-ignore ]; then\n  n=$(cat "${counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${counter}"\n  if [ "$n" -le ${failFirst} ] || [ "$n" -ge ${failFrom} ]; then ${misbehave}; fi\nfi\nexec "${real}" "$@"\n`,
+    `#!/bin/sh\nif [ "$1" != check-ignore ]; then exec "${real}" "$@"; fi\n` +
+    `n=$(cat "${counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${counter}"\n` +
+    `case $n in\n${cases}  *) exit 97 ;;\nesac\n`,
     { mode: 0o755 })
   return { dir, calls: () => Number(fs.existsSync(counter) ? fs.readFileSync(counter, 'utf8') : 0) }
 }
-const slowGitShim = (failFirst, failFrom) => fakeGitShim('sleep', failFirst, failFrom)
+
+// The bound for the tests that script a `sleep`. It bounds only the shim, never real git: every call under it is the shim
+// doing its own few milliseconds of work (bump the counter, then answer, kill itself, or exec sleep) before it misbehaves
+// or answers, and a `sleep` call always outlives it. It must exceed that work under load, or a `kill` call would be
+// reported as a timeout and a counter bump could be cut off; measured well under it with one busy process per core.
+const SHIM_TIMEOUT_MS = 1000
+
+// The shim's canned answers are what real git prints, byte for byte, for both call shapes and both verdicts. Real git
+// runs here with no timeout, so it cannot flake on a loaded machine.
+test('ledger-append: the fake git shim answers check-ignore exactly as real git does for an ignored and a not-ignored ledger (HARN-AUDIT-1 T1)', () => {
+  const env = require('./helpers/temp-repo.js').sanitizedGitEnv()
+  const calls = [['check-ignore', '-v', '-z', '--stdin'], ['check-ignore', '-q', LEDGER_REL]]
+  const run = (bin, repo, args) => {
+    const r = spawnSync(bin, args, { cwd: repo, env, encoding: 'utf8', input: args.includes('--stdin') ? LEDGER_REL + '\0' : '' })
+    return { status: r.status, signal: r.signal, stdout: r.stdout }
+  }
+  const ignoredRepo = makeTempRepo()
+  fs.mkdirSync(path.join(ignoredRepo, '.git', 'info'), { recursive: true })
+  fs.appendFileSync(path.join(ignoredRepo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
+  for (const [repo, verdict, status] of [[ignoredRepo, 'ignored', 0], [makeTempRepo(), 'unignored', 1]]) {
+    const shim = fakeGitShim(calls.map(() => verdict))
+    for (const args of calls) {
+      const expected = run('git', repo, args)
+      assert.equal(expected.status, status, `sanity: real git ${args.join(' ')} must exit ${status} for this repo`)
+      assert.deepEqual(run(path.join(shim.dir, 'git'), repo, args), expected, `the shim's "${verdict}" answer to ${args.join(' ')} differs from real git's`)
+    }
+    assert.equal(shim.calls(), calls.length)
+  }
+})
 
 // Runs the writer's own ensureGitignored(repo, timeoutMs) in this process with the shim first on PATH, capturing what it
 // writes to stdout and stderr. The timeout goes in as an argument; the shipped default is GIT_CALL_TIMEOUT_MS, pinned elsewhere.
@@ -354,14 +410,14 @@ async function ensureGitignoredThroughSlowGit(shim, repo, timeoutMs) {
   }
 }
 
-// Here the retry ends in git's exit 1 (the ledger is not yet ignored), which the writer reads as an answer. The first
-// failure is the shim's kill, so no real git runs under a tight bound.
+// Here the retry ends in git's exit 1 (the ledger is not yet ignored), which the writer reads as an answer; the writer then
+// adds the exclude line and the verifying call finds the ledger ignored.
 test('ledger-append: an interrupted git check-ignore is retried, the retry answers "not ignored", the check then succeeds, and the retry is reported on stderr only (HARN-AUDIT-1 T1)', async () => {
   const repo = makeTempRepo()
-  const shim = fakeGitShim('kill', 1)
-  const r = await ensureGitignoredThroughSlowGit(shim, repo, 5000)
+  const shim = fakeGitShim(['kill', 'unignored', 'ignored'])
+  const r = await ensureGitignoredThroughSlowGit(shim, repo)
   assert.equal(r.verdict, true, 'a single interrupted git must not drop the row')
-  assert.ok(shim.calls() >= 2, `sanity: the shim must have killed the first check-ignore and seen the retry, saw ${shim.calls()} calls`)
+  assert.equal(shim.calls(), 3, 'the killed classifying call, its one retry, then the verifying call')
   assert.equal(r.stderr, 'ledger-append: git check-ignore was killed by SIGKILL, retry succeeded\n', 'a recovered interruption leaves one stderr line')
   assert.equal(r.stdout, '', 'stdout carries the single JSON result line and nothing else')
 })
@@ -372,11 +428,11 @@ test('ledger-append: a timed-out check-ignore whose retry returns normally (path
   const repo = makeTempRepo()
   fs.mkdirSync(path.join(repo, '.git', 'info'), { recursive: true })
   fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
-  const shim = slowGitShim(1) // the one test that waits out a real timeout (about 3s): the first call sleeps 30s and is killed at the bound
-  const r = await ensureGitignoredThroughSlowGit(shim, repo, 3000)
+  const shim = fakeGitShim(['sleep', 'ignored'])
+  const r = await ensureGitignoredThroughSlowGit(shim, repo, SHIM_TIMEOUT_MS)
   assert.equal(r.verdict, true)
   assert.equal(shim.calls(), 2, 'the first check-ignore timed out and the one retry answered')
-  assert.equal(r.stderr, 'ledger-append: git check-ignore timed out after 3000ms, retry succeeded\n')
+  assert.equal(r.stderr, `ledger-append: git check-ignore timed out after ${SHIM_TIMEOUT_MS}ms, retry succeeded\n`)
   assert.equal(r.stdout, '')
 })
 
@@ -386,7 +442,7 @@ test('ledger-append: a check-ignore killed by a signal and retried successfully 
   const repo = makeTempRepo()
   fs.mkdirSync(path.join(repo, '.git', 'info'), { recursive: true })
   fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
-  const shim = fakeGitShim('kill', 1)
+  const shim = fakeGitShim(['kill', 'ignored'])
   const res = spawnSync(process.execPath, [APPEND_SCRIPT], {
     cwd: repo,
     encoding: 'utf8',
@@ -402,20 +458,20 @@ test('ledger-append: a check-ignore killed by a signal and retried successfully 
 
 // A second interruption is refused with wording that names the real cause: a timeout points at a slow git, a signal kill
 // points at something killing git, and the operator must not be sent to the wrong one. Both causes, both call sites (the
-// classifying call, then the verifying call after the exclude line is written). Real git runs only where the shim lets it
-// (the classifying call of the verifying cases), so those use the generous bounds the shim notes above explain.
+// classifying call, then the verifying call after the exclude line is written). The shim answers every call, so the bound
+// in the timeout cases bounds only the shim.
 const TIMED_OUT_WORDING = /timed out after \d+ms/
 const KILLED_WORDING = /was killed by SIGKILL/
 const interruptedCases = [
-  { site: 'classifying', cause: 'timeout', shim: () => slowGitShim(999), timeoutMs: 500, calls: 2 },
-  { site: 'classifying', cause: 'signal', shim: () => fakeGitShim('kill', 999), timeoutMs: 5000, calls: 2 },
-  { site: 'verifying', cause: 'timeout', shim: () => slowGitShim(0, 2), timeoutMs: 3000, calls: 3 }, // first (classifying) call is real git and answers
-  { site: 'verifying', cause: 'signal', shim: () => fakeGitShim('kill', 0, 2), timeoutMs: 5000, calls: 3 },
+  { site: 'classifying', cause: 'timeout', script: ['sleep', 'sleep'], timeoutMs: SHIM_TIMEOUT_MS },
+  { site: 'classifying', cause: 'signal', script: ['kill', 'kill'] },
+  { site: 'verifying', cause: 'timeout', script: ['unignored', 'sleep', 'sleep'], timeoutMs: SHIM_TIMEOUT_MS },
+  { site: 'verifying', cause: 'signal', script: ['unignored', 'kill', 'kill'] },
 ]
 for (const c of interruptedCases) {
   test(`ledger-append: a ${c.site} git check-ignore interrupted twice by ${c.cause === 'timeout' ? 'a timeout' : 'a signal'} is refused with the ${c.cause === 'timeout' ? 'timed-out' : 'killed-by-signal'} wording only, never the negation message (HARN-AUDIT-1 T1)`, async () => {
     const repo = makeTempRepo()
-    const shim = c.shim()
+    const shim = fakeGitShim(c.script)
     const r = await ensureGitignoredThroughSlowGit(shim, repo, c.timeoutMs)
     assert.equal(typeof r.verdict, 'string', 'a named refusal, not plain false')
     assert.match(r.verdict, /retried once/i)
@@ -427,7 +483,7 @@ for (const c of interruptedCases) {
       assert.match(r.verdict, KILLED_WORDING)
       assert.doesNotMatch(r.verdict, /timed out/i, 'a signal kill must not be reported as a timeout')
     }
-    assert.equal(shim.calls(), c.calls, 'exactly one retry of the interrupted call')
+    assert.equal(shim.calls(), c.script.length, 'exactly one retry of the interrupted call')
     assert.equal(r.stderr, '', 'the retry line is for a recovered interruption only')
     if (c.site === 'classifying') {
       assert.equal(fs.existsSync(path.join(repo, '.git', 'info', 'exclude')) && fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8').includes(LEDGER_REL), false, 'fail closed: no exclude line is written when the ignore check could not be completed')
@@ -435,12 +491,57 @@ for (const c of interruptedCases) {
   })
 }
 
+// Two different interruptions: the refusal names the cause of the second (the retry's), which is the one the writer
+// last saw. No retry recovered, so stderr stays empty.
+for (const [first, second] of [['timeout', 'signal'], ['signal', 'timeout']]) {
+  const behaviour = { timeout: 'sleep', signal: 'kill' }
+  test(`ledger-append: a check-ignore interrupted by a ${first} and then by a ${second} is refused naming the ${second} only (HARN-AUDIT-1 T1)`, async () => {
+    const repo = makeTempRepo()
+    const shim = fakeGitShim([behaviour[first], behaviour[second]])
+    const r = await ensureGitignoredThroughSlowGit(shim, repo, SHIM_TIMEOUT_MS)
+    assert.equal(typeof r.verdict, 'string', 'a named refusal, not plain false')
+    assert.match(r.verdict, /retried once/i)
+    if (second === 'timeout') {
+      assert.match(r.verdict, new RegExp(`timed out after ${SHIM_TIMEOUT_MS}ms`))
+      assert.doesNotMatch(r.verdict, /killed/i, 'the first cause (a kill) must not be the one named')
+    } else {
+      assert.match(r.verdict, KILLED_WORDING)
+      assert.doesNotMatch(r.verdict, /timed out/i, 'the first cause (a timeout) must not be the one named')
+    }
+    assert.equal(shim.calls(), 2, 'exactly one retry')
+    assert.equal(r.stderr, '', 'no retry recovered, so no retry line')
+  })
+}
+
+// An interruption whose retry then fails outright (exit 128) is not a recovery: the refusal names the exit 128, no
+// "retry succeeded" line is written, and nothing is written to the exclude file or the ledger.
+test('ledger-append: a check-ignore interrupted once whose retry exits 128 refuses naming exit 128, leaves no retry-succeeded line, and writes nothing (HARN-AUDIT-1 T1)', () => {
+  const repo = makeTempRepo()
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  const excludeBefore = fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null
+  const shim = fakeGitShim(['kill', 'exit128'])
+  const res = spawnSync(process.execPath, [APPEND_SCRIPT], {
+    cwd: repo,
+    encoding: 'utf8',
+    input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'killed-then-128' }),
+    env: { ...require('./helpers/temp-repo.js').sanitizedGitEnv(), PATH: `${shim.dir}${path.delimiter}${process.env.PATH}` },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /git check-ignore failed \(exit 128\)/)
+  assert.doesNotMatch(out.write_error, /killed|retried once/i, 'the interruption was recovered from; the failure is the exit 128')
+  assert.doesNotMatch(res.stderr, /retry succeeded/, 'a retry that failed is not reported as a success')
+  assert.equal(shim.calls(), 2, 'the killed call and its one retry')
+  assert.equal(fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null, excludeBefore, 'the exclude file is untouched')
+  assert.equal(readLedgerLines(repo).length, 0, 'fail closed: nothing is written')
+})
+
 // A git that fails outright (exit 128 for a corrupt index, ENOENT for a missing binary) is not a negation pattern either.
 // Both check-ignore calls are covered, end to end through the writer, and neither names a path (AC-SEC-13).
-for (const [label, failFirst, failFrom] of [['classifying', 1, 1e9], ['verifying', 0, 2]]) {
+for (const [label, script] of [['classifying', ['exit128']], ['verifying', ['unignored', 'exit128']]]) {
   test(`ledger-append: a ${label} git check-ignore that exits 128 refuses with a message naming the failure, never the negation message, and writes nothing (HARN-AUDIT-1 T1)`, () => {
     const repo = makeTempRepo()
-    const shim = fakeGitShim('exit128', failFirst, failFrom)
+    const shim = fakeGitShim(script)
     const res = spawnSync(process.execPath, [APPEND_SCRIPT], {
       cwd: repo,
       encoding: 'utf8',
