@@ -1047,8 +1047,10 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combine
 // real CLI (`ledger <repo>`: parse, window, sort, every aggregator, the sidecar and label steps) runs as a child with a
 // preload that adds the length of the array to a counter each time an Array.prototype method that walks or copies an array
 // is called (includes, indexOf, find, filter, concat, slice, iteration and the rest). That is the work an accumulator
-// built on an array costs, so a linear pass costs about the same per record at 500 and at 2000 records (ratio 1) and a scan
-// of a growing array inside a per-record loop multiplies the ratio by the size factor (4). The fixture's distinct keys (spec,
+// built on those methods costs, so a linear pass costs about the same per record at 500 and at 2000 records (ratio 1) and a
+// per-record call to one of them on a growing array (a find or includes over an accumulator) multiplies the ratio by the
+// size factor (4). It sees only those Array.prototype calls: a hand-written indexed loop (`for (let i = 0; ...)`) over a
+// growing array, or a scan of a Map, Set or object, adds nothing to the count and is NOT caught. The fixture's distinct keys (spec,
 // plan, finding id, AC id) grow with n, because an accumulator keyed on a few values stays small however many records
 // there are and would hide the very quadratic this is for.
 const ledgerRecord = (i) => ({
@@ -1091,11 +1093,11 @@ function arrayWorkPerRecord(n) {
   return Number(fs.readFileSync(log, 'utf8')) / n
 }
 
-test('optimise-read CLI: the whole ledger command does a bounded amount of array work per record however many records there are (L8, AC-QA-20, counted, not timed)', () => {
+test('optimise-read CLI: the whole ledger command does a bounded amount of Array.prototype work per record however many records there are (L8, AC-QA-20, counted, not timed)', () => {
   const small = arrayWorkPerRecord(500)
   const large = arrayWorkPerRecord(2000)
   assert.ok(small > 5, `sanity: the counter must observe the command walking arrays, saw ${small.toFixed(1)} per record`)
-  assert.ok(large / small < 2, `array work per record grew ${(large / small).toFixed(2)}x for 4x the records (${small.toFixed(1)} -> ${large.toFixed(1)}); a linear pass keeps it near 1, a scan of a growing array near 4`)
+  assert.ok(large / small < 2, `array work per record grew ${(large / small).toFixed(2)}x for 4x the records (${small.toFixed(1)} -> ${large.toFixed(1)}); a linear pass keeps it near 1, a per-record Array.prototype scan of a growing array near 4`)
 })
 
 test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal targets from stdin and returns a stable id per target, in order', () => {

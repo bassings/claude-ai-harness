@@ -400,28 +400,40 @@ test('ledger-append: a check-ignore killed by a signal and retried successfully 
   assert.equal(readLedgerLines(repo).length, 1)
 })
 
-test('ledger-append: a git check-ignore that times out twice refuses the write with a message that says it timed out, never the negation message (HARN-AUDIT-1 T1)', async () => {
-  const repo = makeTempRepo()
-  const shim = slowGitShim(999) // every call sleeps, so no real git runs under the 500ms bound
-  const r = await ensureGitignoredThroughSlowGit(shim, repo, 500)
-  assert.equal(typeof r.verdict, 'string', 'a named refusal, not plain false')
-  assert.match(r.verdict, /timed out/i)
-  assert.match(r.verdict, /retried/i)
-  assert.doesNotMatch(r.verdict, /not actually gitignored|negation/i, 'a slow git is not a negation pattern')
-  assert.equal(shim.calls(), 2, 'exactly one retry: two check-ignore calls in all')
-  assert.equal(r.stderr, '', 'the retry line is for a recovered timeout only')
-  assert.equal(fs.existsSync(path.join(repo, '.git', 'info', 'exclude')) && fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8').includes(LEDGER_REL), false, 'fail closed: no exclude line is written when the ignore check could not be completed')
-})
-
-test('ledger-append: the verifying check-ignore after the exclude line is written is retried and, when interrupted again, refused with the timed-out message too (HARN-AUDIT-1 T1)', async () => {
-  const repo = makeTempRepo()
-  const shim = fakeGitShim('kill', 0, 2) // the first (classifying) call is real git and answers; the verifying call and its retry are both killed
-  const r = await ensureGitignoredThroughSlowGit(shim, repo, 5000)
-  assert.equal(typeof r.verdict, 'string')
-  assert.match(r.verdict, /timed out/i)
-  assert.doesNotMatch(r.verdict, /not actually gitignored|negation/i)
-  assert.equal(shim.calls(), 3, 'classify once, verify once, one retry of the verify')
-})
+// A second interruption is refused with wording that names the real cause: a timeout points at a slow git, a signal kill
+// points at something killing git, and the operator must not be sent to the wrong one. Both causes, both call sites (the
+// classifying call, then the verifying call after the exclude line is written). Real git runs only where the shim lets it
+// (the classifying call of the verifying cases), so those use the generous bounds the shim notes above explain.
+const TIMED_OUT_WORDING = /timed out after \d+ms/
+const KILLED_WORDING = /was killed by SIGKILL/
+const interruptedCases = [
+  { site: 'classifying', cause: 'timeout', shim: () => slowGitShim(999), timeoutMs: 500, calls: 2 },
+  { site: 'classifying', cause: 'signal', shim: () => fakeGitShim('kill', 999), timeoutMs: 5000, calls: 2 },
+  { site: 'verifying', cause: 'timeout', shim: () => slowGitShim(0, 2), timeoutMs: 3000, calls: 3 }, // first (classifying) call is real git and answers
+  { site: 'verifying', cause: 'signal', shim: () => fakeGitShim('kill', 0, 2), timeoutMs: 5000, calls: 3 },
+]
+for (const c of interruptedCases) {
+  test(`ledger-append: a ${c.site} git check-ignore interrupted twice by ${c.cause === 'timeout' ? 'a timeout' : 'a signal'} is refused with the ${c.cause === 'timeout' ? 'timed-out' : 'killed-by-signal'} wording only, never the negation message (HARN-AUDIT-1 T1)`, async () => {
+    const repo = makeTempRepo()
+    const shim = c.shim()
+    const r = await ensureGitignoredThroughSlowGit(shim, repo, c.timeoutMs)
+    assert.equal(typeof r.verdict, 'string', 'a named refusal, not plain false')
+    assert.match(r.verdict, /retried once/i)
+    assert.doesNotMatch(r.verdict, /not actually gitignored|negation/i, 'an interrupted git is not a negation pattern')
+    if (c.cause === 'timeout') {
+      assert.match(r.verdict, TIMED_OUT_WORDING)
+      assert.doesNotMatch(r.verdict, /killed/i, 'a timeout must not be reported as a kill')
+    } else {
+      assert.match(r.verdict, KILLED_WORDING)
+      assert.doesNotMatch(r.verdict, /timed out/i, 'a signal kill must not be reported as a timeout')
+    }
+    assert.equal(shim.calls(), c.calls, 'exactly one retry of the interrupted call')
+    assert.equal(r.stderr, '', 'the retry line is for a recovered interruption only')
+    if (c.site === 'classifying') {
+      assert.equal(fs.existsSync(path.join(repo, '.git', 'info', 'exclude')) && fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8').includes(LEDGER_REL), false, 'fail closed: no exclude line is written when the ignore check could not be completed')
+    }
+  })
+}
 
 // A git that fails outright (exit 128 for a corrupt index, ENOENT for a missing binary) is not a negation pattern either.
 // Both check-ignore calls are covered, end to end through the writer, and neither names a path (AC-SEC-13).
