@@ -632,6 +632,14 @@ exits 2. Substitute your own home directory below.
 }
 ```
 
+**Already installed by hand from an earlier README?** Raise the guard's
+`timeout` in your `settings.json` to 60 (earlier copies of this snippet said
+10) and replace any `~` in `args` with an absolute path. A PreToolUse hook that
+times out does not block the command, it lets it run, so a 10 second timeout
+turns a slow git call into a silent allow of the command the guard exists to
+refuse; and `args` is not tilde-expanded, so a `~` path makes the hook exit 2
+and refuse every Bash call.
+
 **What is, and is not, protected before you rely on either mechanism:**
 the snapshot mechanism below does NOT cover untracked files, ignored files
 (a gitignored `.env` included), work that was never written to disk, a

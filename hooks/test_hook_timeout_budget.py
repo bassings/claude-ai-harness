@@ -51,8 +51,9 @@ def find_hook_entry_by_script(hooks_json, script_basename):
 GUARD_SCRIPT = 'destructive-git-guard.py'
 HOOKS_JSON_ORIGIN = 'hooks/hooks.json'
 
-# A fenced json block, at any indentation of the fence.
-_FENCE_RE = re.compile(r'^[ \t]*```json[ \t]*\n(.*?)^[ \t]*```', re.DOTALL | re.MULTILINE)
+# A fenced block of ANY info string (json, JSON, jsonc, `json title=...`,
+# untagged), at any indentation of the fence. Selection is by content, not tag.
+_FENCE_RE = re.compile(r'^[ \t]*```[^\n]*\n(.*?)^[ \t]*```[ \t]*$', re.DOTALL | re.MULTILINE)
 
 
 def hook_entries(snippet):
@@ -74,14 +75,21 @@ def hook_entries(snippet):
 
 
 def extract_hook_snippets(text, origin):
-    """Parse every fenced json block in `text` that names the guard or carries
-    `args`, returning [(origin, parsed)]. A matching block that does not parse
-    RAISES rather than being skipped: a snippet this test cannot read is a
-    snippet it cannot vouch for."""
+    """Parse every fenced block in `text`, whatever its tag, whose body names
+    the guard or carries `"args"` and starts like JSON (`{`, `[`, or a `/`
+    comment), returning [(origin, parsed)]. A candidate
+    that does not parse as JSON RAISES rather than being skipped (jsonc
+    comments included): a snippet this test cannot read is a snippet it cannot
+    vouch for."""
     snippets = []
     for match in _FENCE_RE.finditer(text):
         body = match.group(1)
         if GUARD_SCRIPT not in body and '"args"' not in body:
+            continue
+        if body.lstrip()[:1] not in ('{', '[', '/'):
+            # Shell, prose or other non-JSON text that merely mentions the
+            # guard. `/` is kept as a candidate start so a jsonc block that
+            # opens with a comment fails loudly as unparseable.
             continue
         try:
             snippets.append((origin, json.loads(body)))
@@ -118,7 +126,7 @@ def snippet_problems(snippets, worst_case_seconds):
             for arg in args:
                 if '~' in arg:
                     problems.append('%s: args contains "~" (%r); a tilde is not expanded in args, so the hook exits 2 and refuses every Bash call' % (origin, arg))
-            if args and os.path.basename(args[0]) == GUARD_SCRIPT:
+            if any(os.path.basename(arg) == GUARD_SCRIPT for arg in args):
                 if origin != HOOKS_JSON_ORIGIN:
                     guard_seen += 1
                 timeout = entry.get('timeout')
@@ -175,6 +183,47 @@ class TestHookTimeoutBudget(unittest.TestCase):
         self.assertEqual(len(snippet_problems(absent, worst)), 1)
         manifest_only = [(HOOKS_JSON_ORIGIN, {'hooks': [{'args': ['/p/destructive-git-guard.py'], 'timeout': worst + 1}]})]
         self.assertEqual(len(snippet_problems(manifest_only, worst)), 1)
+
+    def test_a_guard_snippet_at_timeout_10_is_found_whatever_its_fence_tag(self):
+        worst = guard.WORST_CASE_SEGMENT_SECONDS
+        bad = '{"hooks": [{"args": ["/h/destructive-git-guard.py"], "timeout": 10}]}'
+        for tag in ('json title="settings.json"', 'JSON', 'jsonc', 'json5', ''):
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, 'docs'))
+                os.makedirs(os.path.join(root, 'hooks'))
+                with open(os.path.join(root, 'hooks', 'hooks.json'), 'w') as fh:
+                    fh.write('{"hooks": {}}')
+                with open(os.path.join(root, 'README.md'), 'w') as fh:
+                    fh.write('```json\n{"hooks": [{"args": ["/h/destructive-git-guard.py"], "timeout": 60}]}\n```\n')
+                with open(os.path.join(root, 'docs', 'old.md'), 'w') as fh:
+                    fh.write('prose\n\n```%s\n%s\n```\n' % (tag, bad))
+                problems = snippet_problems(collect_documented_snippets(root), worst)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(os.path.join('docs', 'old.md'), problems[0])
+
+    def test_non_json_fences_mentioning_the_guard_are_not_hook_snippets(self):
+        worst = guard.WORST_CASE_SEGMENT_SECONDS
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, 'hooks'))
+            with open(os.path.join(root, 'hooks', 'hooks.json'), 'w') as fh:
+                fh.write('{"hooks": {}}')
+            with open(os.path.join(root, 'README.md'), 'w') as fh:
+                fh.write('```json\n{"hooks": [{"args": ["/h/destructive-git-guard.py"], "timeout": 60}]}\n```\n'
+                         '```bash\ncp hooks/destructive-git-guard.py ~/.claude/hooks/\n```\n'
+                         '```text\nthe destructive-git-guard.py hook\n```\n')
+            self.assertEqual(snippet_problems(collect_documented_snippets(root), worst), [])
+
+    def test_a_jsonc_block_with_a_leading_comment_fails_loudly_rather_than_being_skipped(self):
+        text = '```jsonc\n// settings\n{"hooks": [{"args": ["/h/destructive-git-guard.py"], "timeout": 10}]}\n```\n'
+        with self.assertRaises(AssertionError):
+            extract_hook_snippets(text, 'x.md')
+
+    def test_a_guard_registered_as_a_later_arg_is_still_checked(self):
+        worst = guard.WORST_CASE_SEGMENT_SECONDS
+        later = [('x.md', {'hooks': [{'args': ['-u', '/h/destructive-git-guard.py'], 'timeout': 10}]})]
+        problems = snippet_problems(later, worst)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('timeout 10', problems[0])
 
     def test_snippets_are_found_under_docs_and_unparseable_ones_fail_loudly(self):
         worst = guard.WORST_CASE_SEGMENT_SECONDS
