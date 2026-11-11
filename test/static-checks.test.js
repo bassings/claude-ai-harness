@@ -201,7 +201,7 @@ const LEAK_PATTERNS = [
 // The literal placeholder an install instruction is SUPPOSED to contain.
 // Stripped before matching rather than exempting the whole /Users/ clause: a
 // file allowed to say "/Users/YOUR_USERNAME" must still be caught if it says
-// "/Users/scott.b". An exemption that turns a clause off entirely is the
+// "/Users/some-operator". An exemption that turns a clause off entirely is the
 // difference between a documented placeholder and a real leak going unnoticed.
 const PLACEHOLDER_RE = /\/Users\/YOUR_USERNAME/g
 
@@ -261,33 +261,78 @@ function exemptionFor(rel) {
   return EXEMPTIONS.find((e) => e.paths.some((p) => (p.endsWith('/') ? rel.startsWith(p) : rel === p)))
 }
 
-function trackedFiles() {
-  const out = spawnSync('git', ['-C', ROOT, 'ls-files', '-z'], { encoding: 'utf8', env: sanitizedGitEnv() })
+function trackedFiles(root = ROOT) {
+  const out = spawnSync('git', ['-C', root, 'ls-files', '-z'], { encoding: 'utf8', env: sanitizedGitEnv() })
   assert.equal(out.status, 0, `git ls-files failed: ${out.stderr}`)
   const files = out.stdout.split('\0').filter(Boolean)
   // A guard that scans nothing passes. This is the "absence reads as success"
-  // shape the harness exists to catch, so the floor is asserted explicitly.
-  assert.ok(files.length > 50, `expected the repo to track more than 50 files, got ${files.length} -- a scan of nothing passes trivially`)
+  // shape the harness exists to catch, so the floor is asserted explicitly for
+  // the real repository (a temp fixture repo is deliberately tiny).
+  if (root === ROOT) assert.ok(files.length > 50, `expected the repo to track more than 50 files, got ${files.length} -- a scan of nothing passes trivially`)
   return files
 }
 
-test('static: NO tracked file leaks an absolute /Users/, /Volumes/ or /home/<name> path or a private target repo name, outside the explicitly recorded EXEMPTIONS (AC-ARCH-9, inverted round-two review M1)', () => {
+// The leak scan as a function of a repository root, so it can be pointed at a
+// throwaway repo (AC-QA-24) as well as this one. Returns what it scanned and
+// every violation rather than asserting, so a caller can assert on either.
+function scanTrackedForLeaks(root) {
+  const violations = []
   let scanned = 0
-  for (const rel of trackedFiles()) {
-    const abs = path.join(ROOT, rel)
+  for (const rel of trackedFiles(root)) {
+    const abs = path.join(root, rel)
     if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) continue
     const raw = fs.readFileSync(abs)
-    // Skip binaries: a NUL byte in the first 4KB is the usual heuristic.
-    if (raw.subarray(0, 4096).includes(0)) continue
+    // Binaries are read too (AC-QA-24): a NUL byte used to mean "skip", which
+    // let a tracked binary carry an absolute home path unseen. UTF-8 decoding
+    // of binary data keeps every ASCII byte, so the path patterns still match.
     const ex = exemptionFor(rel) || { skip: [], placeholder: false }
     const text = ex.placeholder ? raw.toString('utf8').replace(PLACEHOLDER_RE, '/Users/') : raw.toString('utf8')
     scanned += 1
     for (const { key, name, re } of LEAK_PATTERNS) {
       if (ex.skip.includes(key)) continue
-      assert.ok(!re.test(text), `${rel} hardcodes ${name}. If that is deliberate, add it to EXEMPTIONS with a reason; do not widen the pattern.`)
+      if (re.test(text)) violations.push({ rel, name })
     }
   }
+  return { scanned, violations }
+}
+
+test('static: NO tracked file leaks an absolute /Users/, /Volumes/ or /home/<name> path or a private target repo name, outside the explicitly recorded EXEMPTIONS (AC-ARCH-9, inverted round-two review M1)', () => {
+  const { scanned, violations } = scanTrackedForLeaks(ROOT)
+  for (const { rel, name } of violations) {
+    assert.fail(`${rel} hardcodes ${name}. If that is deliberate, add it to EXEMPTIONS with a reason; do not widen the pattern.`)
+  }
   assert.ok(scanned > 50, `only ${scanned} files were actually scanned`)
+})
+
+// AC-QA-24: the scan must read tracked binaries, not skip them. The fixture
+// lives in a temp git repo at a path outside the test/ blanket exemption, and
+// the home path is built at run time so no tracked file contains it.
+test('static: the leak scan reads tracked binary files, failing one that holds an absolute home path and passing the same binary without it (AC-QA-24)', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'leakscan-bin-'))
+  try {
+    const git = (args) => {
+      const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8', env: sanitizedGitEnv() })
+      assert.equal(r.status, 0, `git ${args.join(' ')} failed: ${r.stderr}`)
+    }
+    git(['init', '-q'])
+    const syntheticHome = ['', 'Users', 'some-operator'].join('/')
+    const nul = Buffer.from([0, 1, 2, 0])
+    fs.mkdirSync(path.join(dir, 'assets'))
+    fs.writeFileSync(path.join(dir, 'assets', 'leaky.bin'), Buffer.concat([nul, Buffer.from(`${syntheticHome}/project\n`), nul]))
+    git(['add', 'assets/leaky.bin'])
+    const leaky = scanTrackedForLeaks(dir)
+    assert.ok(
+      leaky.violations.some((v) => v.rel === 'assets/leaky.bin' && /\/Users\//.test(v.name)),
+      `a tracked binary containing an absolute home path must fail the scan, got ${JSON.stringify(leaky)}`,
+    )
+
+    fs.writeFileSync(path.join(dir, 'assets', 'leaky.bin'), Buffer.concat([nul, Buffer.from('no path here\n'), nul]))
+    const clean = scanTrackedForLeaks(dir)
+    assert.deepEqual(clean.violations, [], 'the same binary without a path must pass the scan')
+    assert.equal(clean.scanned, 1, 'the clean binary must have been scanned, not skipped, or a pass proves nothing')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('static: every EXEMPTIONS entry names a real tracked path, waives only known pattern keys, and gives a reason -- so a stale or blanket exemption cannot quietly hide a whole directory', () => {
