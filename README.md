@@ -52,10 +52,15 @@ Then run the workflows namespaced:
 
 ### Manual copy (per-user, unnamespaced)
 
-The installer accepts a fresh `~/.claude` (empty, or holding only
-`settings.json` and `projects/`) and an existing install. Into any other
-non-empty directory it refuses, writes nothing, and prints the one command that
-proceeds anyway. Before it replaces a file that differs, it copies the old
+The installer accepts an empty directory, a directory holding `settings.json`
+or `projects/` (a fresh `~/.claude`), and an existing install (`AGENT-HARNESS.md`,
+`workflows/` or `skills/`). It refuses, writes nothing, and prints the one
+command that proceeds anyway, for any other non-empty directory and for any
+directory holding a typical home-directory entry (`.zshrc`, `.bashrc`,
+`.bash_profile`, `.profile`, `Documents`, `Desktop`, `Library` or `Downloads`),
+whatever markers it also holds. It also removes any `*.harness-tmp.<pid>` file
+an interrupted install left in the directories it publishes into, naming each.
+Before it replaces a file that differs, it copies the old
 version under `~/.claude/.harness-backups/<UTC timestamp>/` and prints that
 path; the newest 10 backup directories are kept. It warns, naming which, when
 the checkout is not on the default branch or has uncommitted changes to tracked

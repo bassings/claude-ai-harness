@@ -194,6 +194,11 @@ fi
 # Claude home: settings.json or projects/ (what Claude Code itself creates
 # before any harness is installed), or the harness's own files. Anything else
 # is refused, and the refusal prints the one command that proceeds.
+#
+# One thing outranks every marker: a typical user-home entry (a shell rc file,
+# Documents, Desktop, Library, Downloads) means this is somebody's home
+# directory, not a Claude home, however many markers it also holds. A plain
+# ~/projects is common, so a marker alone proves nothing.
 shquote() {
   _s=$1
   _out=
@@ -211,15 +216,23 @@ shquote() {
   printf "'%s'" "$_out"
 }
 
+refuse_destination() {
+  echo "install: $DEST does not look like a Claude install: $1. Refusing." >&2
+  echo "         If this really is where the harness should go, run:" >&2
+  echo "HARNESS_INSTALL_REQUIRE_MARKER=0 CLAUDE_HOME=$(shquote "$DEST") $(shquote "$REPO/bin/install.sh")" >&2
+  exit 2
+}
+
 if [ "$CHECK_ONLY" -eq 0 ] && [ "${HARNESS_INSTALL_REQUIRE_MARKER:-1}" = "1" ]; then
   if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
+    for _entry in .zshrc .bashrc .bash_profile .profile Documents Desktop Library Downloads; do
+      if [ -e "$DEST/$_entry" ] || [ -L "$DEST/$_entry" ]; then
+        refuse_destination "it holds $_entry, which belongs to a user's home directory"
+      fi
+    done
     if [ ! -e "$DEST/AGENT-HARNESS.md" ] && [ ! -d "$DEST/workflows" ] && [ ! -d "$DEST/skills" ] \
       && [ ! -e "$DEST/settings.json" ] && [ ! -d "$DEST/projects" ]; then
-      echo "install: $DEST is not empty and does not look like a Claude install" >&2
-      echo "         (no settings.json, projects/, AGENT-HARNESS.md, workflows/ or skills/). Refusing." >&2
-      echo "         If this really is where the harness should go, run:" >&2
-      echo "HARNESS_INSTALL_REQUIRE_MARKER=0 CLAUDE_HOME=$(shquote "$DEST") $(shquote "$REPO/bin/install.sh")" >&2
-      exit 2
+      refuse_destination "it holds none of settings.json, projects/, AGENT-HARNESS.md, workflows/ or skills/"
     fi
   fi
 fi
@@ -247,9 +260,33 @@ fi
 KEEP_BACKUPS=10
 BK_ROOT="$DEST/.harness-backups"
 BK_DIR=""
+installed=0
+tmp=""
+
+# The one way an install fails part-way: say what was done, that the result is
+# a mix, and the two ways out.
+fail_install() {
+  echo "install: $1" >&2
+  echo "install: INCOMPLETE: $installed file(s) updated before this failure, so $DEST holds a mix of old and new files." >&2
+  echo "         To finish: fix the cause above and re-run this installer." >&2
+  if [ -n "$BK_DIR" ]; then
+    echo "         To undo: copy the files back from $BK_DIR (same relative paths)." >&2
+  else
+    echo "         No file was backed up in this run, so there is nothing to restore." >&2
+  fi
+  exit 1
+}
+
+# Timestamp-named directories are the only entries retention counts or deletes.
+is_backup_name() {
+  case "$1" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z*) return 0 ;;
+  esac
+  return 1
+}
 
 make_backup_dir() {
-  mkdir -p "$BK_ROOT" || { echo "install: cannot create $BK_ROOT; nothing overwritten." >&2; exit 1; }
+  mkdir -p "$BK_ROOT" || fail_install "cannot create $BK_ROOT; nothing was overwritten by this step."
   _ts=$(date -u +%Y%m%dT%H%M%SZ)
   _cand=$_ts
   _n=0
@@ -258,8 +295,7 @@ make_backup_dir() {
   # first one's directory.
   while ! mkdir "$BK_ROOT/$_cand" 2>/dev/null; do
     if [ ! -e "$BK_ROOT/$_cand" ]; then
-      echo "install: cannot create a backup directory under $BK_ROOT; nothing overwritten." >&2
-      exit 1
+      fail_install "cannot create a backup directory under $BK_ROOT; nothing was overwritten by this step."
     fi
     _n=$((_n + 1))
     _cand="$_ts-$_n"
@@ -268,7 +304,28 @@ make_backup_dir() {
   echo "install: previous versions of overwritten files are backed up in $BK_DIR"
 }
 
-installed=0
+# An interrupted earlier install (a kill, which no trap can catch) leaves
+# <file>.harness-tmp.<pid> beside its destination. Remove those, only in the
+# directories this install publishes into and only with exactly that suffix,
+# and name each one.
+_seen="|"
+for rel in $FILES; do
+  _d="$DEST/$(dirname -- "$rel")"
+  case "$_seen" in *"|$_d|"*) continue ;; esac
+  _seen="$_seen$_d|"
+  [ -d "$_d" ] || continue
+  for _stale in "$_d"/*.harness-tmp.[0-9]*; do
+    [ -f "$_stale" ] || continue
+    rm -f "$_stale"
+    echo "install: removed leftover temp file from an interrupted install: $_stale" >&2
+  done
+done
+
+# A signal between the temp write and the rename must not leave the temp file.
+trap 'if [ -n "$tmp" ]; then rm -f "$tmp"; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 for rel in $FILES; do
   src="$REPO/$rel"
   dst="$DEST/$rel"
@@ -287,31 +344,33 @@ for rel in $FILES; do
     mkdir -p "$(dirname -- "$BK_DIR/$rel")" \
       && cp -p "$dst" "$BK_DIR/$rel" \
       && cmp -s "$dst" "$BK_DIR/$rel" \
-      || { echo "install: could not back up $rel; left it unchanged." >&2; exit 1; }
+      || fail_install "could not back up $rel; it was left unchanged."
   fi
   # Written beside the destination (same filesystem, so the rename is atomic)
   # under a name no loader matches, then renamed over it: a kill at any point
   # leaves the old file whole.
   tmp="$dst.harness-tmp.$$"
   cp "$src" "$tmp" && cmp -s "$src" "$tmp" \
-    || { rm -f "$tmp"; echo "install: could not write $rel; left it unchanged." >&2; exit 1; }
+    || fail_install "could not write $rel; it was left unchanged."
   mv -f "$tmp" "$dst" \
-    || { rm -f "$tmp"; echo "install: could not replace $rel; left it unchanged." >&2; exit 1; }
+    || fail_install "could not replace $rel; it was left unchanged."
+  tmp=""
   echo "updated: $rel"
   installed=$((installed + 1))
 done
 
 if [ -n "$BK_DIR" ]; then
-  _excess=$(( $(ls -1 "$BK_ROOT" | wc -l) - KEEP_BACKUPS ))
+  _count=0
+  for _name in $(ls -1 "$BK_ROOT"); do
+    if is_backup_name "$_name"; then _count=$((_count + 1)); fi
+  done
+  _excess=$((_count - KEEP_BACKUPS))
   for _name in $(ls -1 "$BK_ROOT"); do
     [ "$_excess" -gt 0 ] || break
-    case "$_name" in
-      [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z*)
-        [ "$BK_ROOT/$_name" != "$BK_DIR" ] || continue
-        rm -rf "$BK_ROOT/$_name"
-        _excess=$((_excess - 1))
-        ;;
-    esac
+    is_backup_name "$_name" || continue
+    [ "$BK_ROOT/$_name" != "$BK_DIR" ] || continue
+    rm -rf "$BK_ROOT/$_name"
+    _excess=$((_excess - 1))
   done
 fi
 
