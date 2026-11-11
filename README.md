@@ -383,13 +383,15 @@ conductor pieces make that state unrepresentable:
   not (see `docs/plan-guard-reasons-mutation-proofs.md`).
 
 Installing as a plugin wires the hook automatically. For manual installs,
-copy the hook and add to `~/.claude/settings.json`:
+copy the hook and add to `~/.claude/settings.json`, substituting your own
+home directory for the placeholder (`args` is not tilde-expanded, see the
+destructive git guard section below):
 
 ```json
 {
   "hooks": {
     "Stop": [{ "hooks": [{ "type": "command", "command": "python3",
-      "args": ["~/.claude/hooks/plan-guard-stop.py"], "timeout": 10 }] }]
+      "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/plan-guard-stop.py"], "timeout": 10 }] }]
   }
 }
 ```
@@ -622,7 +624,7 @@ exits 2. Substitute your own home directory below.
   "hooks": {
     "PreToolUse": [{ "matcher": "Bash", "hooks": [
       { "type": "command", "command": "python3",
-        "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/destructive-git-guard.py"], "timeout": 10 },
+        "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/destructive-git-guard.py"], "timeout": 60 },
       { "type": "command", "command": "python3",
         "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/git-snapshot.py"], "timeout": 10 }
     ] }]

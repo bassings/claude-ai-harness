@@ -17,11 +17,14 @@ Run: python3 -m unittest discover -s hooks -p 'test_*.py'
 import importlib.util
 import json
 import os
+import re
+import tempfile
 import unittest
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
 GUARD_PATH = os.path.join(HOOKS_DIR, 'destructive-git-guard.py')
 HOOKS_JSON_PATH = os.path.join(HOOKS_DIR, 'hooks.json')
+REPO_ROOT = os.path.dirname(HOOKS_DIR)
 
 _spec = importlib.util.spec_from_file_location('destructive_git_guard_timeout_check', GUARD_PATH)
 guard = importlib.util.module_from_spec(_spec)
@@ -43,6 +46,87 @@ def find_hook_entry_by_script(hooks_json, script_basename):
                 if args and os.path.basename(args[0]) == script_basename:
                     return entry
     return None
+
+
+GUARD_SCRIPT = 'destructive-git-guard.py'
+HOOKS_JSON_ORIGIN = 'hooks/hooks.json'
+
+# A fenced json block, at any indentation of the fence.
+_FENCE_RE = re.compile(r'^[ \t]*```json[ \t]*\n(.*?)^[ \t]*```', re.DOTALL | re.MULTILINE)
+
+
+def hook_entries(snippet):
+    """Every dict anywhere in a parsed snippet that carries `args`."""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if 'args' in node:
+                found.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(snippet)
+    return found
+
+
+def extract_hook_snippets(text, origin):
+    """Parse every fenced json block in `text` that names the guard or carries
+    `args`, returning [(origin, parsed)]. A matching block that does not parse
+    RAISES rather than being skipped: a snippet this test cannot read is a
+    snippet it cannot vouch for."""
+    snippets = []
+    for match in _FENCE_RE.finditer(text):
+        body = match.group(1)
+        if GUARD_SCRIPT not in body and '"args"' not in body:
+            continue
+        try:
+            snippets.append((origin, json.loads(body)))
+        except ValueError as exc:
+            raise AssertionError('%s has a hook snippet that is not valid JSON: %s' % (origin, exc))
+    return snippets
+
+
+def collect_documented_snippets(repo_root):
+    """Hook snippets from README.md, every .md file under docs/ (recursively)
+    and hooks/hooks.json, so moving a snippet between them cannot hide it."""
+    sources = [os.path.join(repo_root, 'README.md')]
+    for dirpath, _dirs, files in os.walk(os.path.join(repo_root, 'docs')):
+        sources.extend(os.path.join(dirpath, f) for f in sorted(files) if f.endswith('.md'))
+    snippets = []
+    for path in sources:
+        with open(path, encoding='utf-8') as fh:
+            snippets.extend(extract_hook_snippets(fh.read(), os.path.relpath(path, repo_root)))
+    with open(os.path.join(repo_root, 'hooks', 'hooks.json'), encoding='utf-8') as fh:
+        snippets.append((HOOKS_JSON_ORIGIN, json.load(fh)))
+    return snippets
+
+
+def snippet_problems(snippets, worst_case_seconds):
+    """Problems across `snippets`: no DOCUMENTED guard snippet (hooks.json
+    always names the guard, so it cannot count toward this or the check would
+    be vacuous), a guard timeout absent or not strictly above the worst case,
+    or `~` in any args."""
+    problems = []
+    guard_seen = 0
+    for origin, snippet in snippets:
+        for entry in hook_entries(snippet):
+            args = entry['args']
+            for arg in args:
+                if '~' in arg:
+                    problems.append('%s: args contains "~" (%r); a tilde is not expanded in args, so the hook exits 2 and refuses every Bash call' % (origin, arg))
+            if args and os.path.basename(args[0]) == GUARD_SCRIPT:
+                if origin != HOOKS_JSON_ORIGIN:
+                    guard_seen += 1
+                timeout = entry.get('timeout')
+                if not isinstance(timeout, (int, float)) or timeout <= worst_case_seconds:
+                    problems.append('%s: %s registered with timeout %r, not strictly greater than its worst case of %ss' % (origin, GUARD_SCRIPT, timeout, worst_case_seconds))
+    if guard_seen == 0:
+        problems.append('no hook snippet naming %s found in README.md, docs/ or hooks/hooks.json' % GUARD_SCRIPT)
+    return problems
 
 
 class TestHookTimeoutBudget(unittest.TestCase):
@@ -76,6 +160,41 @@ class TestHookTimeoutBudget(unittest.TestCase):
         self.assertIsNotNone(stop_hook, 'hooks.json has no entry registering plan-guard-stop.py')
         self.assertEqual(snapshot.get('timeout'), 10)
         self.assertEqual(stop_hook.get('timeout'), 10)
+
+    def test_every_documented_hook_snippet_is_within_budget_and_free_of_tilde_args(self):
+        problems = snippet_problems(collect_documented_snippets(REPO_ROOT), guard.WORST_CASE_SEGMENT_SECONDS)
+        self.assertEqual(problems, [])
+
+    def test_snippet_check_flags_a_low_guard_timeout_a_tilde_and_a_missing_guard(self):
+        worst = guard.WORST_CASE_SEGMENT_SECONDS
+        low = [('x.md', {'hooks': [{'args': ['/h/destructive-git-guard.py'], 'timeout': worst}]})]
+        self.assertEqual(len(snippet_problems(low, worst)), 1)
+        tilde = [('x.md', {'hooks': [{'args': ['~/.claude/hooks/destructive-git-guard.py'], 'timeout': worst + 1}]})]
+        self.assertEqual(len(snippet_problems(tilde, worst)), 1)
+        absent = [('x.md', {'hooks': [{'args': ['/h/git-snapshot.py'], 'timeout': 10}]})]
+        self.assertEqual(len(snippet_problems(absent, worst)), 1)
+        manifest_only = [(HOOKS_JSON_ORIGIN, {'hooks': [{'args': ['/p/destructive-git-guard.py'], 'timeout': worst + 1}]})]
+        self.assertEqual(len(snippet_problems(manifest_only, worst)), 1)
+
+    def test_snippets_are_found_under_docs_and_unparseable_ones_fail_loudly(self):
+        worst = guard.WORST_CASE_SEGMENT_SECONDS
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, 'docs', 'nested'))
+            os.makedirs(os.path.join(root, 'hooks'))
+            with open(os.path.join(root, 'README.md'), 'w') as fh:
+                fh.write('no snippet here\n')
+            with open(os.path.join(root, 'hooks', 'hooks.json'), 'w') as fh:
+                fh.write('{"hooks": {}}')
+            nested = os.path.join('docs', 'nested', 'a.md')
+            with open(os.path.join(root, nested), 'w') as fh:
+                fh.write('```json\n{"hooks": [{"args": ["/h/destructive-git-guard.py"], "timeout": %d}]}\n```\n' % (worst + 1))
+            found = collect_documented_snippets(root)
+            self.assertIn(nested, [origin for origin, _ in found])
+            self.assertEqual(snippet_problems(found, worst), [])
+            with open(os.path.join(root, 'docs', 'broken.md'), 'w') as fh:
+                fh.write('```json\n{"args": ["/h/destructive-git-guard.py",]}\n```\n')
+            with self.assertRaises(AssertionError):
+                collect_documented_snippets(root)
 
 
 if __name__ == '__main__':
