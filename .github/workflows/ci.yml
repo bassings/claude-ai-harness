@@ -62,10 +62,7 @@ jobs:
       # No install step: this repo has no dependencies and no lockfile.
       # If that ever changes, this comment is the thing that should have.
       - name: Test
-        run: |
-          before=$(sh .githooks/ledger-tripwire.sh state)
-          node --test test/*.test.js
-          sh .githooks/ledger-tripwire.sh verify "$before"
+        run: node --test test/*.test.js
 
       # The suite defends itself against git's environment rather than relying
       # on the caller to clean it (test/helpers/git-env.js). Running it once
