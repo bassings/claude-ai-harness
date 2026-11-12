@@ -2029,6 +2029,7 @@ test('T11 L3: the start-up sweep removes only a stale run.XXXXXX directory this 
   const link = path.join(parent, 'run.LINK11')
   const linkTarget = freshDir('link-target-')
   fs.writeFileSync(path.join(linkTarget, 'kept'), 'kept\n')
+  backdate(linkTarget, 48)
   fs.symlinkSync(linkTarget, link)
   backdate(link, 48)
   const repo = makeTempRepo()
