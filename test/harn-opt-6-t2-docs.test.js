@@ -102,7 +102,7 @@ test('L1: both relay instructions tell the conductor to replace home-directory p
 test('L1: review-cycle returns ledger_write_error redacted, as its log line already does', async () => {
   // Round 2 L4: a macOS home path and a /home path (this operator's home sits under one) must both be redacted.
   const CANARY = '/Users/canary-user/secret/ledger.jsonl'
-  const CANARY_HOME = '/Volumes/Storage/home/canary-user/secret/ledger.jsonl'
+  const CANARY_HOME = '/mnt/volume/home/canary-user/secret/ledger.jsonl'
   const COVERAGE = { examined: 'x', verified_by: 'y', could_not_check: 'z' }
   const TIP = { head_sha_measured: 'abcdef1234567890', head_tree_measured: '1111111111111111111111111111111111111111' }
   const CLEAN = { verdict: 'CLEAN', coverage: COVERAGE, findings: [], ...TIP }
