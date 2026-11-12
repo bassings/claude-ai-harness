@@ -214,8 +214,13 @@ STAGED_SOURCE=""        # what the staged copy must still equal for it to be del
 STAGED_WORKFLOW_DIR=""  # set only when this run created .claude/workflows
 STALE_TMPDIR=""
 CLAUDE_PID=""
-RUNNER_TMP=""           # the runner-owned mode-700 directory every temp file lives in
-SWEEP_PENDING=0         # set once at start-up: clear what a SIGKILLed run left in RUNNER_TMP
+RUNNER_PARENT=""        # the runner-owned mode-700 directory that holds one run.XXXXXX directory per invocation
+RUNNER_TMP=""           # THIS invocation's own directory: every per-run file lives in it, and nothing else does
+SWEEP_PENDING=0         # set once at start-up: remove stale run directories left by killed runs
+# A run directory older than this is a dead run's. It is 24 hours because one
+# invocation lasts at most (configured repos) x (the 21-minute session timeout
+# plus its grace), so a live sibling's directory is far younger than this.
+STALE_RUN_MINUTES=1440
 RUN_COMPLETE=0          # set only when the normal end is reached
 SCRATCH_REPORT=""       # where the session writes its report (inside RUNNER_TMP); the runner moves it
 SCRATCH_SIDECAR=""      # the same for the proposal-targets sidecar
@@ -232,17 +237,22 @@ EXIT_REASON=""          # why the run ended abnormally, when the runner knows
 # every repo's iteration all come through here, and it holds every rm in this
 # script. The staged copy goes only if it is still byte-identical to its
 # source, so a file the repo ships, or one replaced during the run, is kept.
-# The one-off start-up sweep clears only the contents of RUNNER_TMP, a
-# directory only this runner writes to, never anything outside it.
+# Every invocation owns one directory of its own (RUNNER_TMP), so no file name
+# is shared between runs, and the final call ("final", from the exit path)
+# removes it once the outputs have been placed and the plan marker restored.
+# The one-off start-up sweep removes only STALE per-run directories: a real
+# directory (not a link, which find does not follow), named like the runner's
+# own mktemp pattern, owned by this user, older than STALE_RUN_MINUTES, and
+# never this run's. A sibling's fresh directory is therefore never touched.
 cleanup_run() {
   if [ "$SWEEP_PENDING" = 1 ]; then
     SWEEP_PENDING=0
-    for leftover in "$RUNNER_TMP"/* "$RUNNER_TMP"/.[!.]*; do
-      if [ -e "$leftover" ] || [ -L "$leftover" ]; then
-        echo "REMOVED-LEFTOVER-TMP ${leftover##*/}" >> "$LOG"
-        rm -rf "$leftover"
+    while IFS= read -r stale; do
+      if [ -n "$stale" ] && [ "$stale" != "$RUNNER_TMP" ]; then
+        echo "REMOVED-STALE-RUN-DIR ${stale##*/}" >> "$LOG"
+        rm -rf "$stale"
       fi
-    done
+    done < <(find "$RUNNER_PARENT" -mindepth 1 -maxdepth 1 -type d -name 'run.??????' -user "$(id -u)" -mmin +"$STALE_RUN_MINUTES" 2>/dev/null)
   fi
   # The plan-guard Stop hook may re-claim a dormant plan for the headless
   # session and rewrite .claude/active-plan. The marker is put back only if it
@@ -252,11 +262,23 @@ cleanup_run() {
   if [ -n "$PLAN_MARKER" ]; then
     if [ ! -L "$PLAN_MARKER" ] && [ -f "$PLAN_MARKER" ] && grep -qxF "conductor: $SESSION_ID" "$PLAN_MARKER" 2>/dev/null; then
       if [ "$PLAN_HAD" = 1 ]; then
-        cat "$PLAN_SNAPSHOT" > "$PLAN_MARKER"
+        # Never truncate the live marker: the snapshot is copied to a temp file
+        # beside it, compared, and renamed over it, so a missing snapshot or a
+        # failed write leaves the marker as it was, and says so.
+        restore_tmp="$(mktemp "${PLAN_MARKER%/*}/.optimise-active-plan.XXXXXX" 2>/dev/null)"
+        if [ -r "$PLAN_SNAPSHOT" ] && [ -n "$restore_tmp" ] && cat "$PLAN_SNAPSHOT" > "$restore_tmp" && cmp -s "$PLAN_SNAPSHOT" "$restore_tmp" && mv -f "$restore_tmp" "$PLAN_MARKER"; then
+          echo "RESTORED-ACTIVE-PLAN $PLAN_LABEL" >> "$LOG"
+        else
+          if [ -n "$restore_tmp" ]; then
+            rm -f "$restore_tmp"
+          fi
+          echo "RESTORE-FAILED-ACTIVE-PLAN $PLAN_LABEL" >> "$LOG"
+          note_fail "$PLAN_LABEL" "could not restore .claude/active-plan"
+        fi
       else
         rm -f "$PLAN_MARKER"
+        echo "RESTORED-ACTIVE-PLAN $PLAN_LABEL" >> "$LOG"
       fi
-      echo "RESTORED-ACTIVE-PLAN $PLAN_LABEL" >> "$LOG"
     fi
     rm -f "$PLAN_SNAPSHOT"
   fi
@@ -295,6 +317,12 @@ cleanup_run() {
   STAGED_MARKER=""
   STAGED_SOURCE=""
   STAGED_WORKFLOW_DIR=""
+  if [ "${1:-}" = final ] && [ -n "$RUNNER_PARENT" ] && [ "${RUNNER_TMP%/*}" = "$RUNNER_PARENT" ]; then
+    case "${RUNNER_TMP##*/}" in
+      run.??????) rm -rf "$RUNNER_TMP" ;;
+    esac
+    RUNNER_TMP=""
+  fi
   return 0
 }
 
@@ -389,8 +417,9 @@ copy_new() {
 
 # One line, overwritten each run: UTC timestamp, verdict, labels, reasons.
 write_last_result() {
-  mkdir -p "$(dirname "$LAST_RESULT")"
-  printf '%s %s labels="%s" reasons="%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" > "$LAST_RESULT"
+  if ! { mkdir -p "$(dirname "$LAST_RESULT")" && printf '%s %s labels="%s" reasons="%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" > "$LAST_RESULT"; } 2>/dev/null; then
+    echo "LAST-RESULT-WRITE-FAILED" >> "$LOG"
+  fi
 }
 
 # Raises one operating-system notification for the whole run. The text goes to
@@ -433,7 +462,7 @@ on_signal() {
 # last.
 on_exit() {
   local status=$?
-  cleanup_run
+  cleanup_run final
   if [ "$RUN_COMPLETE" -eq 0 ]; then
     local reason="${EXIT_REASON:-aborted before completion (exit status $status)}"
     echo "RESULT FAIL - reason=\"$reason\"" >> "$LOG"
@@ -618,14 +647,30 @@ LIB_SCRIPT="$SCRIPT_DIR/../workflows/lib/install-consistency.mjs"
 
 echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) weekly optimise-cycle starting version=$SCRIPT_VERSION ===" >> "$LOG"
 
-# T11: every temp file goes in one subdirectory only this runner writes to,
-# mode 700, so anything found in it is provably the runner's own. That is what
-# makes the one-off sweep of a SIGKILLed run's leftovers safe: it clears this
-# directory's contents and nothing outside it. A path that is a symlink or not
-# owned by this user is refused rather than used.
-RUNNER_TMP="$WORK_DIR/optimise-weekly-runner"
-if [ -L "$RUNNER_TMP" ] || ! mkdir -p "$RUNNER_TMP" 2>/dev/null || ! chmod 700 "$RUNNER_TMP" 2>/dev/null || [ ! -O "$RUNNER_TMP" ]; then
+# The outcome file says RUNNING from the first moment, so a run that dies
+# without reporting (a SIGKILL, a full disk) leaves RUNNING, not last week's
+# result.
+write_last_result RUNNING "" ""
+
+# T11: all of a run's temp files live in a directory of its own, made with
+# mktemp -d inside one parent that only this runner writes to (mode 700). Two
+# invocations, or an invocation and a test, therefore never share a file name.
+# The parent is created first and only then checked -- not a link, owned by this
+# user, and its physical path exactly the physical WORK_DIR plus the runner
+# name -- and only then chmodded, so a link planted in the window is never
+# followed. Anything else is refused rather than used.
+RUNNER_PARENT="$WORK_DIR/optimise-weekly-runner"
+WORK_REAL="$(cd -P "$WORK_DIR" 2>/dev/null && pwd -P)"
+mkdir -p "$RUNNER_PARENT" 2>/dev/null
+PARENT_REAL="$(cd -P "$RUNNER_PARENT" 2>/dev/null && pwd -P)"
+if [ -L "$RUNNER_PARENT" ] || [ ! -d "$RUNNER_PARENT" ] || [ ! -O "$RUNNER_PARENT" ] || [ -z "$WORK_REAL" ] || [ "$PARENT_REAL" != "$WORK_REAL/optimise-weekly-runner" ]; then
   EXIT_REASON="runner temp directory is not a directory this user owns"
+  exit 1
+fi
+chmod 700 "$RUNNER_PARENT"
+RUNNER_TMP="$(mktemp -d "$RUNNER_PARENT/run.XXXXXX" 2>/dev/null)"
+if [ -z "$RUNNER_TMP" ]; then
+  EXIT_REASON="could not create this run's temp directory"
   exit 1
 fi
 SWEEP_PENDING=1

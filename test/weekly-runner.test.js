@@ -287,7 +287,7 @@ function runWeeklyScript(repos, opts = {}) {
     OPTIMISE_WEEKLY_LOG: log,
     HOME: opts.home || ISOLATED_HOME,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: opts.stalenessRemote || NO_STALENESS_REMOTE,
-    TMPDIR: process.env.TMPDIR || RUN_TMPDIR,
+    TMPDIR: freshDir('tmpdir-'),
     OSA_RECORD: `${log}.notify`,
     OSA_EXIT: String(opts.notifierExit || 0),
     ...(opts.env || {}),
@@ -752,7 +752,7 @@ test('weekly runner (subtraction round, item 9): the default repo list is read f
     OPTIMISE_WEEKLY_LOG: log,
     HOME: fakeHome,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
-    TMPDIR: process.env.TMPDIR || RUN_TMPDIR,
+    TMPDIR: freshDir('tmpdir-'),
   }
   delete env.OPTIMISE_WEEKLY_REPOS
   delete env.CLAUDE_HOME
@@ -774,7 +774,7 @@ test('weekly runner (subtraction round, item 9): no $HOME/.claude/optimise-weekl
     OPTIMISE_WEEKLY_LOG: log,
     HOME: fakeHome,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
-    TMPDIR: process.env.TMPDIR || RUN_TMPDIR,
+    TMPDIR: freshDir('tmpdir-'),
   }
   delete env.OPTIMISE_WEEKLY_REPOS
   delete env.CLAUDE_HOME
@@ -1447,7 +1447,7 @@ function runWithEnvUnset(configBody) {
     HOME: home,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
     OSA_RECORD: `${log}.notify`,
-    TMPDIR: process.env.TMPDIR || RUN_TMPDIR,
+    TMPDIR: freshDir('tmpdir-'),
   }
   delete env.OPTIMISE_WEEKLY_REPOS
   delete env.CLAUDE_HOME
@@ -1643,13 +1643,19 @@ function startRunner(repo, { home, claudeHome, tmpdir, extraPath }) {
   return { child, log, done, notifyCalls: () => readNotifyCalls(`${log}.notify`) }
 }
 
-// The runner keeps its own temp files in one subdirectory of TMPDIR (L3).
+// The runner keeps its temp files under one parent directory of TMPDIR, and
+// each invocation owns one run.XXXXXX directory inside it (T11 round 3).
 const RUNNER_DIR = 'optimise-weekly-runner'
+const RUN_DIR_RE = /^run\.[A-Za-z0-9]{6}$/
+
+function runDirs(dir) {
+  const parent = path.join(dir, RUNNER_DIR)
+  if (!fs.existsSync(parent)) return []
+  return fs.readdirSync(parent).filter((n) => RUN_DIR_RE.test(n)).map((n) => path.join(parent, n))
+}
 
 function transcripts(dir) {
-  const inner = path.join(dir, RUNNER_DIR)
-  if (!fs.existsSync(inner)) return []
-  return fs.readdirSync(inner).filter((n) => n.startsWith('optimise-weekly-transcript.'))
+  return runDirs(dir).flatMap((d) => fs.readdirSync(d).filter((n) => n.startsWith('optimise-weekly-transcript.')))
 }
 
 function killIfAlive(pidFile) {
@@ -1677,6 +1683,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
       run.child.kill(sig)
       await Promise.race([run.done, new Promise((_, rej) => setTimeout(() => rej(new Error('runner did not exit after the signal')), 20000))])
       assert.deepEqual(transcripts(tmp), [], 'the transcript temp file must be gone')
+      assert.deepEqual(runDirs(tmp), [], 'the run\'s own directory must be gone')
       assert.equal(fs.existsSync(stagedPath(repo)), false, 'the staged workflow must be gone')
       assert.equal(fs.existsSync(path.join(repo, '.claude', 'workflows')), false, 'and the directory the run created')
       let alive = true
@@ -1788,7 +1795,7 @@ test('T11 AC-SEC-10: the transcript temp file lives under CLAUDE_HOME when TMPDI
   const claudeHome = freshDir('claudehome-')
   const lister = freshDir('ls-stub-')
   fs.writeFileSync(path.join(lister, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
-ls "$CLAUDE_HOME/optimise-weekly-runner" > .home-listing
+ls "$(dirname "$REPORT_OUT")" > .home-listing
 cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0
@@ -1815,7 +1822,7 @@ test('T11 AC-DATA-14: the runner has exactly one cleanup function, every rm sits
   const handler = exitTrap.l.match(/^trap '?(\w+)'? EXIT/)[1]
   const handlerStart = lines.findIndex((l) => l.startsWith(`${handler}() {`))
   const handlerEnd = lines.findIndex((l, i) => i > handlerStart && l === '}')
-  assert.ok(handler === name || lines.slice(handlerStart, handlerEnd).some((l) => l.trim() === name), 'the EXIT trap runs the cleanup function')
+  assert.ok(handler === name || lines.slice(handlerStart, handlerEnd).some((l) => l.trim() === name || l.trim() === `${name} final`), 'the EXIT trap runs the cleanup function')
   for (const sigName of ['TERM', 'INT']) {
     assert.ok(code.some(({ l }) => /^trap /.test(l) && l.includes(sigName)), `a trap for ${sigName}`)
   }
@@ -1839,7 +1846,7 @@ test('T11 AC-DATA-14: the staleness check\'s clone directory is gone after a run
 function listingClaude() {
   const dir = freshDir('listing-stub-')
   fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
-ls "\${TMPDIR:-$CLAUDE_HOME}/optimise-weekly-runner" > .runner-listing
+ls "$(dirname "$REPORT_OUT")" > .runner-listing
 mkdir -p .claude
 cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
@@ -1940,12 +1947,13 @@ esac
 
 // L3 ------------------------------------------------------------------------
 
-test('T11 L3: the runner\'s temp files live in a runner-owned mode-700 subdirectory', () => {
+test('T11 L3: the runner\'s temp files live in a runner-owned mode-700 parent, in a mode-700 directory of their own per run', () => {
   const repo = makeTempRepo()
   const tmp = freshDir('tmp-')
   const modeProbe = freshDir('mode-stub-')
   fs.writeFileSync(path.join(modeProbe, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
-ls -ld "$TMPDIR/optimise-weekly-runner" > .runner-mode
+ls -ld "$(dirname "$REPORT_OUT")" > .runner-mode
+ls -ld "$(dirname "$(dirname "$REPORT_OUT")")" > .parent-mode
 mkdir -p .claude
 cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
@@ -1953,10 +1961,17 @@ exit 0
 `, { mode: 0o755 })
   const res = runWeeklyScript([repo], { extraPath: modeProbe, env: { TMPDIR: tmp } })
   assert.equal(res.status, 0, res.logContents)
-  assert.match(fs.readFileSync(path.join(repo, '.runner-mode'), 'utf8'), /^drwx------/, 'mode 700')
+  assert.match(fs.readFileSync(path.join(repo, '.runner-mode'), 'utf8'), /^drwx------/, 'the per-run directory is mode 700')
+  assert.match(fs.readFileSync(path.join(repo, '.parent-mode'), 'utf8'), /^drwx------/, 'the parent is mode 700')
 })
 
-test('T11 L3: after a SIGKILL the next run removes the transcript left in the runner directory and names it in the log, while an unrelated same-named file outside it survives', async () => {
+function backdate(p, hours) {
+  const t = new Date(Date.now() - hours * 3600 * 1000)
+  if (fs.lstatSync(p).isSymbolicLink()) fs.lutimesSync(p, t, t)
+  else fs.utimesSync(p, t, t)
+}
+
+test('T11 L3: after a SIGKILL, a run directory left behind is removed by a later run once it is older than the threshold, and is named in the log; an unrelated same-named file outside survives', async () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
   const tmp = freshDir('tmp-')
@@ -1970,15 +1985,80 @@ test('T11 L3: after a SIGKILL the next run removes the transcript left in the ru
     await waitFor(() => fs.existsSync(path.join(repo, '.ready')), 'claude to start')
     run.child.kill('SIGKILL')
     await run.done
-    leftover = transcripts(tmp)
-    assert.equal(leftover.length, 1, 'guard against vacuity: SIGKILL leaves the transcript behind')
+    leftover = runDirs(tmp)
+    assert.equal(leftover.length, 1, 'guard against vacuity: SIGKILL leaves the run directory (and its transcript) behind')
+    assert.equal(transcripts(tmp).length, 1)
   } finally {
     killIfAlive(pidFile)
   }
+  const fresh = runWeeklyScript([repo], { home, claudeHome, extraPath: witnessingClaudeStub('pass'), env: { TMPDIR: tmp } })
+  assert.equal(fs.existsSync(leftover[0]), true, 'a directory this fresh may belong to a live sibling, so it must survive')
+  assert.ok(!/REMOVED-STALE-RUN-DIR/.test(fresh.logContents), fresh.logContents)
+  backdate(leftover[0], 48)
   const res = runWeeklyScript([repo], { home, claudeHome, extraPath: witnessingClaudeStub('pass'), env: { TMPDIR: tmp } })
-  assert.deepEqual(transcripts(tmp), [], 'the leftover transcript must be gone')
-  assert.match(res.logContents, new RegExp(`^REMOVED-LEFTOVER-TMP ${escapeRegExp(leftover[0])}$`, 'm'), res.logContents)
+  assert.equal(fs.existsSync(leftover[0]), false, 'the stale directory must be gone')
+  assert.match(res.logContents, new RegExp(`^REMOVED-STALE-RUN-DIR ${escapeRegExp(path.basename(leftover[0]))}$`, 'm'), res.logContents)
   assert.equal(fs.readFileSync(decoy, 'utf8'), 'not ours\n', 'a same-named file outside the runner directory is never touched')
+})
+
+test('T11 L3: the start-up sweep removes only a stale run.XXXXXX directory this user owns -- never a fresh sibling, a 23-hour-old one, a differently named directory, a file, a symlink (or its target), or anything a stale directory links to', () => {
+  const tmp = freshDir('tmp-')
+  const outside = freshDir('outside-')
+  fs.writeFileSync(path.join(outside, 'sentinel'), 'outside\n')
+  const parent = path.join(tmp, RUNNER_DIR)
+  fs.mkdirSync(parent, { mode: 0o700 })
+  const mk = (name, hours, fill) => {
+    const d = path.join(parent, name)
+    fs.mkdirSync(d)
+    if (fill) fill(d)
+    backdate(d, hours)
+    return d
+  }
+  const stale = mk('run.STALE1', 25, (d) => {
+    fs.writeFileSync(path.join(d, 'report.md'), 'x\n')
+    fs.symlinkSync(path.join(outside, 'sentinel'), path.join(d, 'link-out'))
+  })
+  const edge = mk('run.EDGE23', 23, (d) => fs.writeFileSync(path.join(d, 'report.md'), 'edge\n'))
+  const sibling = mk('run.FRESH1', 0, (d) => fs.writeFileSync(path.join(d, 'report.md'), 'sibling\n'))
+  const other = mk('other.OLD111', 48, (d) => fs.writeFileSync(path.join(d, 'f'), 'other\n'))
+  const short = mk('run.ABCDE', 48)
+  const long = mk('run.ABCDEFG', 48)
+  const file = path.join(parent, 'run.FILE11')
+  fs.writeFileSync(file, 'a file\n')
+  backdate(file, 48)
+  const link = path.join(parent, 'run.LINK11')
+  const linkTarget = freshDir('link-target-')
+  fs.writeFileSync(path.join(linkTarget, 'kept'), 'kept\n')
+  fs.symlinkSync(linkTarget, link)
+  backdate(link, 48)
+  const repo = makeTempRepo()
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(WRITE_VALID), env: { TMPDIR: tmp } })
+  assert.equal(res.status, 0, res.logContents)
+  assert.equal(fs.existsSync(stale), false, 'the stale directory is removed')
+  assert.equal(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8'), 'outside\n', 'a link inside a stale directory is not followed')
+  for (const keep of [edge, sibling, other, short, long, file]) assert.equal(fs.existsSync(keep), true, `${keep} must survive`)
+  assert.equal(fs.readFileSync(path.join(sibling, 'report.md'), 'utf8'), 'sibling\n', 'a concurrent sibling\'s files are untouched')
+  assert.equal(fs.lstatSync(link).isSymbolicLink(), true, 'a symlink named like a run directory is left alone')
+  assert.equal(fs.readFileSync(path.join(linkTarget, 'kept'), 'utf8'), 'kept\n', 'and so is its target')
+  assert.deepEqual(res.logContents.match(/^REMOVED-STALE-RUN-DIR .*$/gm), ['REMOVED-STALE-RUN-DIR run.STALE1'])
+})
+
+test('T11 round 3: a symlink where the runner parent should be is refused before anything is changed, and its target is not chmodded or swept', () => {
+  const repo = makeTempRepo()
+  const tmp = freshDir('tmp-')
+  const target = freshDir('parent-target-')
+  fs.chmodSync(target, 0o755)
+  fs.writeFileSync(path.join(target, 'sentinel'), 'kept\n')
+  const stale = path.join(target, 'run.STALE1')
+  fs.mkdirSync(stale)
+  backdate(stale, 48)
+  fs.symlinkSync(target, path.join(tmp, RUNNER_DIR))
+  const res = runWeeklyScript([repo], { extraPath: argvRecordingClaude(), env: { TMPDIR: tmp } })
+  assert.notEqual(res.status, 0)
+  assert.match(res.logContents, /^RESULT FAIL - reason="runner temp directory is not a directory this user owns/m, res.logContents)
+  assert.equal(fs.statSync(target).mode & 0o777, 0o755, 'the link target must not be chmodded')
+  assert.equal(fs.existsSync(stale), true, 'and nothing under it may be swept')
+  assert.equal(fs.existsSync(path.join(repo, '.claude-argv')), false)
 })
 
 // L6 ------------------------------------------------------------------------
@@ -2006,9 +2086,15 @@ test('T11 L6: a leftover that is byte-identical to its marker but tracked by git
 // sidecar to scratch paths in the runner-owned directory, and the runner (the
 // trusted side) validates and moves them into place after the session ends.
 
-function scratchPaths(tmp) {
-  const dir = path.join(fs.realpathSync(tmp), RUNNER_DIR)
-  return { report: path.join(dir, 'report.md'), sidecar: path.join(dir, 'proposal-targets.json') }
+// The per-run scratch paths, read from the prompt the runner gave claude.
+function scratchFromPrompt(prompt, tmp) {
+  const report = prompt.match(/"report_path": "([^"]*)"/)[1]
+  const sidecar = prompt.match(/"proposal_targets_path": "([^"]*)"/)[1]
+  const dir = path.dirname(report)
+  assert.equal(path.dirname(sidecar), dir, 'both files live in the same per-run directory')
+  assert.equal(path.dirname(dir), path.join(fs.realpathSync(tmp), RUNNER_DIR), 'the directory is directly under the runner parent')
+  assert.match(path.basename(dir), RUN_DIR_RE, 'and is named like the runner\'s own mktemp pattern')
+  return { report, sidecar, dir }
 }
 
 // A claude that only knows the scratch paths it is told in its prompt (it
@@ -2039,9 +2125,7 @@ test('T11 R2: the prompt names scratch output paths in the runner directory, and
   const tmp = freshDir('tmp-')
   runWeeklyScript([repo], { extraPath: argvRecordingClaude(), env: { TMPDIR: tmp } })
   const argv = capturedArgv(repo)
-  const { report, sidecar } = scratchPaths(tmp)
-  assert.ok(argv[1].includes(`"report_path": "${report}"`), argv[1])
-  assert.ok(argv[1].includes(`"proposal_targets_path": "${sidecar}"`), argv[1])
+  const { report, sidecar } = scratchFromPrompt(argv[1], tmp)
   const allowed = flagValues(argv, '--allowedTools')
   assert.deepEqual(allowed.filter((e) => /^(Edit|Write)\(/.test(e)).sort(), [`Edit(/${report})`, `Edit(/${sidecar})`].sort())
   assert.ok(!allowed.some((e) => /^(Edit|Write)\(/.test(e) && e.includes('.claude')), 'no write rule may name a .claude/ path: the session cannot write there')
@@ -2099,9 +2183,7 @@ test('T11 R2: a report and sidecar written to the scratch paths are moved into .
   assert.match(res.logContents, resultLineRegex('PASS', label(repo)))
   assert.equal(fs.readFileSync(path.join(repo, REPORT_REL), 'utf8'), VALID_REPORT)
   assert.equal(fs.readFileSync(path.join(repo, FINAL_SIDECAR_REL), 'utf8'), '{"targets":[]}\n')
-  const { report, sidecar } = scratchPaths(tmp)
-  assert.equal(fs.existsSync(report), false)
-  assert.equal(fs.existsSync(sidecar), false)
+  assert.deepEqual(runDirs(tmp), [], 'the run\'s own directory, and with it the scratch files, is gone')
   assert.deepEqual(fs.readdirSync(path.join(repo, '.claude')).filter((n) => n.startsWith('.optimise-output')), [], 'no temp file left beside the report')
 })
 
@@ -2233,4 +2315,111 @@ test('T11 R2: a report just under the size cap that is one enormous line is judg
   assert.notEqual(res.status, null, 'the runner must finish well inside the test timeout, not hang in the heading check')
   assert.match(res.logContents, resultLineRegex('FAIL', label(repo)))
   assert.match(res.logContents, /does not start with a markdown heading/)
+})
+
+
+// --- T11 round 3: no state shared between runs ------------------------------
+
+test('T11 round 3: two runs sharing one TMPDIR get different per-run directories, and no fixed file name is shared', () => {
+  const tmp = freshDir('tmp-')
+  const a = makeTempRepo()
+  const b = makeTempRepo()
+  runWeeklyScript([a], { extraPath: argvRecordingClaude(), env: { TMPDIR: tmp } })
+  runWeeklyScript([b], { extraPath: argvRecordingClaude(), env: { TMPDIR: tmp } })
+  const pa = scratchFromPrompt(capturedArgv(a)[1], tmp)
+  const pb = scratchFromPrompt(capturedArgv(b)[1], tmp)
+  assert.notEqual(pa.dir, pb.dir)
+  assert.notEqual(pa.report, pb.report)
+  assert.notEqual(pa.sidecar, pb.sidecar)
+  assert.deepEqual(runDirs(tmp), [], 'each run removed its own directory')
+})
+
+test('T11 round 3: two overlapping runs on one TMPDIR each keep their own report, targets and plan marker, and each repo\'s active-plan ends byte-identical to its start', async () => {
+  const tmp = freshDir('tmp-')
+  const a = makeTempRepo()
+  const b = makeTempRepo()
+  const planA = 'plan.md\nconductor: dead-conductor-A\n'
+  const planB = 'plan.md\nconductor: dead-conductor-B\n'
+  withMarker(a, planA)
+  withMarker(b, planB)
+  const body = (tag) => `# Report ${tag}\n\n## Section\n${tag}\n`
+  const stub = (tag, wait) => scratchClaude(`${REWRITE_AS_HOOK}
+printf '${body(tag).replace(/\n/g, '\\n')}' > "$REPORT_OUT"
+printf '{"targets":["${tag}"]}\\n' > "$SIDECAR_OUT"
+${wait ? 'echo $$ > .claude-pid\n: > .ready\nwhile [ ! -f .go ]; do sleep 0.2; done' : ''}`)
+  const run = startRunner(a, { home: freshHome(), claudeHome: freshDir('claudehome-'), tmpdir: tmp, extraPath: stub('A', true) })
+  const pidFile = path.join(a, '.claude-pid')
+  try {
+    await waitFor(() => fs.existsSync(path.join(a, '.ready')), 'run A to be in flight')
+    assert.equal(runDirs(tmp).length, 1, 'guard against vacuity: A\'s directory exists while B runs')
+    const resB = runWeeklyScript([b], { extraPath: stub('B', false), env: { TMPDIR: tmp } })
+    assert.equal(resB.status, 0, resB.logContents)
+    assert.ok(!/REMOVED-STALE-RUN-DIR/.test(resB.logContents), 'B must not sweep A\'s live directory')
+    assert.equal(runDirs(tmp).length, 1, 'A\'s directory survives B\'s whole run')
+    fs.writeFileSync(path.join(a, '.go'), '')
+    await Promise.race([run.done, new Promise((_, rej) => setTimeout(() => rej(new Error('run A did not finish')), 30000))])
+  } finally {
+    killIfAlive(pidFile)
+  }
+  assert.equal(fs.readFileSync(path.join(a, REPORT_REL), 'utf8'), body('A'), 'A reports its own report')
+  assert.equal(fs.readFileSync(path.join(b, REPORT_REL), 'utf8'), body('B'), 'B reports its own report')
+  assert.equal(fs.readFileSync(path.join(a, FINAL_SIDECAR_REL), 'utf8'), '{"targets":["A"]}\n')
+  assert.equal(fs.readFileSync(path.join(b, FINAL_SIDECAR_REL), 'utf8'), '{"targets":["B"]}\n')
+  assert.equal(fs.readFileSync(path.join(a, '.claude', 'active-plan'), 'utf8'), planA)
+  assert.equal(fs.readFileSync(path.join(b, '.claude', 'active-plan'), 'utf8'), planB)
+  assert.deepEqual(runDirs(tmp), [])
+})
+
+// F2 ----------------------------------------------------------------------------
+
+test('T11 round 3 (F2): if the plan snapshot is gone when the marker must be restored, the marker is left as it is (never truncated), RESTORE-FAILED is logged, and the run FAILs', () => {
+  const repo = makeTempRepo()
+  withMarker(repo, DORMANT_PLAN)
+  const stub = scratchClaude(`${REWRITE_AS_HOOK}\nrm -f "$(dirname "$REPORT_OUT")/active-plan.snapshot"\n${WRITE_VALID}`)
+  const res = runWeeklyScript([repo], { extraPath: stub })
+  const marker = fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8')
+  assert.match(marker, /^\/abs\/plan\.md\nconductor: [0-9a-f-]{36}\n$/, `the marker must keep the bytes it had, not be emptied:\n${JSON.stringify(marker)}`)
+  assert.match(res.logContents, new RegExp(`^RESTORE-FAILED-ACTIVE-PLAN ${escapeRegExp(label(repo))}$`, 'm'), res.logContents)
+  assert.ok(!/^RESTORED-ACTIVE-PLAN/m.test(res.logContents), 'it must not claim a restore that did not happen')
+  assert.notEqual(res.status, 0)
+  assert.equal(res.notifyCalls.length, 1)
+})
+
+// F6 ----------------------------------------------------------------------------
+
+test('T11 round 3 (F6): with no marker before the run, another conductor\'s marker that appears during it is left alone and nothing is logged as restored', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(`printf 'plan.md\\nconductor: a-real-live-conductor\\n' > .claude/active-plan\n${WRITE_VALID}`) })
+  assert.equal(fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8'), 'plan.md\nconductor: a-real-live-conductor\n')
+  assert.ok(!/RESTORED-ACTIVE-PLAN/.test(res.logContents), res.logContents)
+})
+
+// F5 ----------------------------------------------------------------------------
+
+test('T11 round 3 (F5): the last-result file says RUNNING as soon as a run starts, so a run that is SIGKILLed leaves RUNNING and not last week\'s PASS', async () => {
+  const repo = makeTempRepo()
+  const home = freshHome()
+  const lastResult = path.join(home, LAST_RESULT_REL)
+  fs.mkdirSync(path.dirname(lastResult), { recursive: true })
+  fs.writeFileSync(lastResult, '2026-01-01T00:00:00Z PASS labels="earlier" reasons=""\n')
+  const run = startRunner(repo, { home, claudeHome: freshDir('claudehome-'), tmpdir: freshDir('tmp-'), extraPath: hangingClaude() })
+  const pidFile = path.join(repo, '.claude-pid')
+  try {
+    await waitFor(() => fs.existsSync(path.join(repo, '.ready')), 'claude to start')
+    run.child.kill('SIGKILL')
+    await run.done
+  } finally {
+    killIfAlive(pidFile)
+  }
+  assert.match(fs.readFileSync(lastResult, 'utf8'), /^\S+ RUNNING /, 'an operator must be able to see that the last run never finished')
+})
+
+test('T11 round 3 (F5): a failed write of the last-result file is logged as LAST-RESULT-WRITE-FAILED', () => {
+  const repo = makeTempRepo()
+  setMarker(repo, 'pass')
+  const home = freshHome()
+  fs.mkdirSync(path.join(home, LAST_RESULT_REL), { recursive: true })
+  const res = runWeeklyScript([repo], { home })
+  assert.match(res.logContents, /^LAST-RESULT-WRITE-FAILED$/m, res.logContents)
 })

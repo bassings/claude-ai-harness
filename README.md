@@ -1392,8 +1392,8 @@ recorded in `docs/release-checklist.md` when it has been done.
 
 **The session never writes under `.claude/`.** Measured on a real headless
 run (Claude Code 2.1.322, `dontAsk`): every write into `.claude/` is refused
-whatever the allow rule. So the runner names two scratch files in its own
-mode-700 directory and passes them to the workflow as `report_path` and
+whatever the allow rule. So the runner names two scratch files in a
+directory of this one run's own (below) and passes them to the workflow as `report_path` and
 `proposal_targets_path`; the session may `Edit` those two files and nothing
 else, and writes no other file. After the session ends the runner, not the
 session, moves each into place (`.claude/optimise-cycle-report.md` in the
@@ -1429,12 +1429,30 @@ PASS or FAIL, labels, reasons) that stays until the next run overwrites it. A
 notifier that fails leaves `NOTIFY-FAILED <exit code>` in the run log. The
 transcript temp file and the staged `optimise-cycle.js` are removed on exit
 and on SIGTERM or SIGINT, and a run that is stopped that way records FAIL and
-notifies like any other FAIL. Temp files live in a mode-700 directory only the
-runner writes to (`optimise-weekly-runner` under `$TMPDIR`, or under
-`~/.claude` when that is unset). After a SIGKILL the next run clears that
-directory's contents, logging `REMOVED-LEFTOVER-TMP <name>`, and recognises
-its staged copy by a marker, removes it if git does not track it, and logs
-`REMOVED-LEFTOVER-STAGED <label>`.
+notifies like any other FAIL. Each invocation makes a directory of its own,
+`run.XXXXXX` (from `mktemp -d`), inside a mode-700 parent that only the runner
+writes to (`optimise-weekly-runner` under `$TMPDIR`, or under `~/.claude` when
+that is unset), and every per-run file (transcript, scratch report and sidecar,
+plan-marker snapshot, staleness clone) lives in it, so overlapping runs, or a
+run overlapping a test, never share a file name. The run removes its own
+directory on exit, after the outputs are placed and the plan marker restored.
+The parent is checked after it is created (not a link, owned by this user, its
+physical path as expected) and only then chmodded. At start-up a run removes
+only stale `run.XXXXXX` directories: real directories (links are not followed)
+owned by this user and older than 24 hours, which is longer than any run can
+last (the 21-minute session timeout per repo), logging
+`REMOVED-STALE-RUN-DIR <name>`. A sibling's fresh directory is never touched.
+There is no lock. After a SIGKILL the dead run's directory therefore stays for
+up to 24 hours, and its plan-marker snapshot is not used to restore a marker
+that carries the dead session's id (the conductor's own six-hour staleness rule
+re-claims it). The next run also recognises a killed run's staged copy by a
+marker, removes it if git does not track it, and logs
+`REMOVED-LEFTOVER-STAGED <label>`. The outcome file reads `RUNNING` from the
+moment a run starts, so a run that dies without reporting leaves `RUNNING`,
+not last week's result, and a failed write of it is logged as
+`LAST-RESULT-WRITE-FAILED`. If the plan marker cannot be restored (the
+snapshot is missing or the write fails) it is left exactly as it was,
+`RESTORE-FAILED-ACTIVE-PLAN <label>` is logged and the repo FAILs.
 
 **Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
 and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
