@@ -406,10 +406,14 @@ test('weekly runner: one repo passing and one failing -- overall exit non-zero, 
 
 test('weekly runner: a directory that is not a git repo is skipped, not failed, and the stub is never invoked for it (witnessed, not just asserted by name)', () => {
   const notARepo = fs.mkdtempSync(path.join(RUN_TMPDIR, 'not-a-repo-'))
-  const { status, logContents } = runWeeklyScript([notARepo])
+  const passRepo = makeTempRepo()
+  setMarker(passRepo, 'pass')
+  // A passing repo beside it, because a run in which EVERY path is skipped is
+  // itself a FAIL (T11 escalation, finding 5, tested below).
+  const { status, logContents } = runWeeklyScript([notARepo, passRepo])
   assert.equal(status, 0, logContents)
   assert.match(logContents, new RegExp(`SKIP ${escapeRegExp(label(notARepo))} \\(not a git repo\\)`), logContents)
-  assert.ok(!logContents.includes('RESULT'), 'a skipped, non-git directory must never produce a PASS/FAIL verdict line')
+  assert.ok(!new RegExp(`RESULT \\S+ ${escapeRegExp(label(notARepo))}`).test(logContents), 'a skipped, non-git directory must never produce a PASS/FAIL verdict line')
   assert.ok(!fs.existsSync(path.join(notARepo, WITNESS_REL)), 'witness: the stub must genuinely never have run for a skipped directory')
 })
 
@@ -1237,20 +1241,20 @@ function stagedWasSeen(repo) {
 test('weekly runner: stages the global workflow script into the repo so the run never has to copy it itself', () => {
   const repo = makeTempRepo()
   const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
-  withGlobalWorkflow(home, '// global optimise-cycle script\n')
+  withGlobalWorkflow(home, '// global optimise-cycle script, report_path\n')
   const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
   assert.match(res.logContents, resultLineRegex('PASS', label(repo)))
   assert.equal(stagedWasSeen(repo), true,
     'the script must actually be present WHILE the run happens; asserting only on the log would pass against a runner that logged "staged" and staged nothing')
   assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'),
-    '// global optimise-cycle script\n',
+    '// global optimise-cycle script, report_path\n',
     'and it must be the global script, not an empty placeholder')
 })
 
 test('weekly runner: removes the script it staged, leaving the repo exactly as it found it', () => {
   const repo = makeTempRepo()
   const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
-  withGlobalWorkflow(home, '// global optimise-cycle script\n')
+  withGlobalWorkflow(home, '// global optimise-cycle script, report_path\n')
   runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
   assert.equal(stagedWasSeen(repo), true,
     'guard against vacuity: prove it WAS there, or "it is gone" means nothing')
@@ -1263,7 +1267,7 @@ test('weekly runner: removes the script it staged, leaving the repo exactly as i
 test('weekly runner: cleans up the staged script even when the run FAILS', () => {
   const repo = makeTempRepo()
   const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
-  withGlobalWorkflow(home, '// global optimise-cycle script\n')
+  withGlobalWorkflow(home, '// global optimise-cycle script, report_path\n')
   const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('fail') })
   assert.match(res.logContents, resultLineRegex('FAIL', label(repo)))
   assert.equal(stagedWasSeen(repo), true, 'guard against vacuity, as above')
@@ -1277,7 +1281,7 @@ test("weekly runner: a repo that ships its OWN workflow script keeps it, untouch
   fs.mkdirSync(path.dirname(own), { recursive: true })
   fs.writeFileSync(own, '// THIS REPO SHIPS ITS OWN TUNED COPY\n')
   const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
-  withGlobalWorkflow(home, '// global optimise-cycle script\n')
+  withGlobalWorkflow(home, '// global optimise-cycle script, report_path\n')
   const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
   assert.equal(fs.readFileSync(own, 'utf8'), '// THIS REPO SHIPS ITS OWN TUNED COPY\n',
     'staging must never overwrite a repo that deliberately ships its own copy')
@@ -1553,7 +1557,12 @@ test('T11 AC-SEC-8: the allowlist names no bare tool that would grant everything
   }
 })
 
-const HELPER_ENTRY = /^Bash\(node (\/|~\/)[^ *]*\/workflows\/lib\/optimise-(read|report-ignore)\.mjs:\*\)$/
+// optimise-read.mjs only reads files (Read already can), so its arguments stay
+// free. optimise-report-ignore.mjs writes <root>/.git/info/exclude and runs git
+// with its cwd at <root>, so its root is pinned to the analysed repo (T11
+// escalation, finding 1): the plain spelling, the double-quoted spelling, and
+// the command substitution the workflow tells the agent to use.
+const HELPER_ENTRY = /^Bash\(node ((?:\/|~\/)[^ *]*)\/workflows\/lib\/(?:optimise-read\.mjs:\*|optimise-report-ignore\.mjs (?:\/[^ *"]+|"\/[^*"]+"|"\$\(git rev-parse --show-toplevel\)") \*)\)$/
 
 test('T11 AC-SEC-8: no Bash(node...) entry may run arbitrary code -- each names one helper script path, never bare node, node -e or a repo-local copy', () => {
   const repo = makeTempRepo()
@@ -1562,23 +1571,27 @@ test('T11 AC-SEC-8: no Bash(node...) entry may run arbitrary code -- each names 
   const nodeEntries = allowed.filter((e) => /^Bash\(node/.test(e))
   assert.ok(nodeEntries.length > 0, 'the optimiser runs two node helpers, so some node entry must exist')
   for (const entry of nodeEntries) {
-    assert.match(entry, HELPER_ENTRY, `a node entry must name one helper script path: ${entry}`)
-    assert.ok(!entry.includes(repo), `a repo-local copy of a helper must never be allowed to run: ${entry}`)
+    const m = entry.match(HELPER_ENTRY)
+    assert.ok(m, `a node entry must name one helper script path: ${entry}`)
+    assert.ok(!m[1].startsWith(repo), `a repo-local copy of a helper must never be allowed to run: ${entry}`)
   }
   assert.ok(!allowed.some((e) => /^Bash\(node:/.test(e) || e === 'Bash(node *)'), 'no bare node entry')
 })
 
-test('T11 AC-SEC-8: the node entries name exactly the two helpers the optimiser workflow runs, under CLAUDE_HOME', () => {
+test('T11 AC-SEC-8: the node entries name exactly the two helpers the optimiser workflow runs, under CLAUDE_HOME, and the report-ignore helper only at the analysed repo root', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
   runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
   const allowed = flagValues(capturedArgv(repo), '--allowedTools')
+  const ignore = `node ${claudeHome}/workflows/lib/optimise-report-ignore.mjs`
   assert.deepEqual(
     allowed.filter((e) => /^Bash\(node/.test(e)).sort(),
     [
       `Bash(node ${claudeHome}/workflows/lib/optimise-read.mjs:*)`,
-      `Bash(node ${claudeHome}/workflows/lib/optimise-report-ignore.mjs:*)`,
-    ],
+      `Bash(${ignore} "$(git rev-parse --show-toplevel)" *)`,
+      `Bash(${ignore} "${repo}" *)`,
+      `Bash(${ignore} ${repo} *)`,
+    ].sort(),
   )
 })
 
@@ -1668,7 +1681,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
   test(`T11 AC-OPS-4: after ${sig} mid-run no transcript temp file and no staged workflow remain, claude is stopped, and the outcome is recorded as FAIL and notified (M1)`, async () => {
     const repo = makeTempRepo()
     const claudeHome = freshDir('claudehome-')
-    withGlobalWorkflow(claudeHome, '// global v1\n')
+    withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
     const tmp = freshDir('tmp-')
     const home = freshHome()
     const lastResult = path.join(home, LAST_RESULT_REL)
@@ -1730,7 +1743,7 @@ test('T11 AC-OPS-4: an abnormal end the runner has no handler for (SIGHUP) still
 test('T11 AC-OPS-4: a claude that is SIGKILLed mid-run (the shape of the timeout\'s second-stage kill; the timeout itself is not exercised, since TIMEOUT_S has no test seam) leaves no transcript temp file and no staged workflow, and the repo FAILs', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1\n')
+  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
   const tmp = freshDir('tmp-')
   const killed = freshDir('killed-stub-')
   fs.writeFileSync(path.join(killed, 'claude'), '#!/bin/sh\nif [ -f .claude/workflows/optimise-cycle.js ]; then : > .staged-seen; fi\nkill -KILL $$\n', { mode: 0o755 })
@@ -1744,7 +1757,7 @@ test('T11 AC-OPS-4: a claude that is SIGKILLed mid-run (the shape of the timeout
 test('T11 AC-OPS-4: after SIGKILL the next run deletes the staged copy it left, logs REMOVED-LEFTOVER-STAGED <label>, never calls it the repo\'s own, and re-stages from the global copy', async () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1\n')
+  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
   const home = freshHome()
   const run = startRunner(repo, { home, claudeHome, tmpdir: freshDir('tmp-'), extraPath: hangingClaude() })
   const pidFile = path.join(repo, '.claude-pid')
@@ -1756,11 +1769,11 @@ test('T11 AC-OPS-4: after SIGKILL the next run deletes the staged copy it left, 
     killIfAlive(pidFile)
   }
   assert.equal(fs.existsSync(stagedPath(repo)), true, 'guard against vacuity: SIGKILL cannot be trapped, so the copy is left behind')
-  withGlobalWorkflow(claudeHome, '// global v2\n')
+  withGlobalWorkflow(claudeHome, '// global v2 report_path\n')
   const res = runWeeklyScript([repo], { home, claudeHome, extraPath: witnessingClaudeStub('pass') })
   assert.match(res.logContents, new RegExp(`^REMOVED-LEFTOVER-STAGED ${escapeRegExp(label(repo))}$`, 'm'), res.logContents)
   assert.ok(!/repo ships its own/.test(res.logContents), `a leftover must never be logged as the repo's own:\n${res.logContents}`)
-  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'), '// global v2\n', 're-staged from the CURRENT global copy')
+  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'), '// global v2 report_path\n', 're-staged from the CURRENT global copy')
   assert.equal(fs.existsSync(stagedPath(repo)), false, 'and removed again at the end of this run')
   assert.match(res.logContents, resultLineRegex('PASS', label(repo)))
 })
@@ -1768,7 +1781,7 @@ test('T11 AC-OPS-4: after SIGKILL the next run deletes the staged copy it left, 
 test('T11 AC-DATA-14: a staged file that is no longer byte-identical to the global source (replaced during the run) is kept, with nothing else left beside it', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1\n')
+  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
   const replacer = freshDir('replace-stub-')
   fs.writeFileSync(path.join(replacer, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
 printf '// REPLACED DURING THE RUN\\n' > .claude/workflows/optimise-cycle.js
@@ -1859,7 +1872,7 @@ test('T11 M3: with two repos, the first repo\'s transcript, staged copy, marker 
   const a = makeTempRepo()
   const b = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1\n')
+  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
   const tmp = freshDir('tmp-')
   const res = runWeeklyScript([a, b], { claudeHome, extraPath: listingClaude(), env: { TMPDIR: tmp } })
   assert.equal(res.status, 0, res.logContents)
@@ -1873,7 +1886,7 @@ test('T11 M3: a repo that fails on its start time still has its staged copy remo
   const a = makeTempRepo()
   const b = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1\n')
+  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
   const dateDir = freshDir('bad-date-')
   fs.writeFileSync(path.join(dateDir, 'date'), '#!/bin/sh\nif [ "$1" = "+%s" ]; then\n  echo ""\nelse\n  exec /bin/date "$@"\nfi\n', { mode: 0o755 })
   runWeeklyScript([a, b], { claudeHome, extraPath: dateDir })
@@ -1899,7 +1912,7 @@ function symlinkCase(name, build) {
   test(`T11 L2: a dangling symlink at ${name} is refused: nothing is created at its target, and the repo FAILs with a reason`, () => {
     const repo = makeTempRepo()
     const claudeHome = freshDir('claudehome-')
-    withGlobalWorkflow(claudeHome, '// global v1\n')
+    withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
     const target = danglingTarget()
     build(repo, target)
     const res = runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
@@ -1929,7 +1942,7 @@ symlinkCase('.claude', (repo, target) => {
 test('T11 L7: a workflow file that appears between the existence check and the copy is never overwritten, and is kept', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1\n')
+  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
   // A mkdir shim that, once the staging directory exists, drops a repo-owned
   // file into it: the file appears AFTER the runner decided there was none.
   const shim = freshDir('mkdir-shim-')
@@ -2067,7 +2080,7 @@ test('T11 round 3: a symlink where the runner parent should be is refused before
 test('T11 L6: a leftover that is byte-identical to its marker but tracked by git is never deleted', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v2\n')
+  withGlobalWorkflow(claudeHome, '// global v2 report_path\n')
   const dir = path.dirname(stagedPath(repo))
   fs.mkdirSync(dir, { recursive: true })
   fs.writeFileSync(stagedPath(repo), '// committed by a developer\n')
@@ -2132,15 +2145,16 @@ test('T11 R2: the prompt names scratch output paths in the runner directory, and
   assert.ok(!allowed.some((e) => /^(Edit|Write)\(/.test(e) && e.includes('.claude')), 'no write rule may name a .claude/ path: the session cannot write there')
 })
 
-test('T11 R2: the git -C entries use the spelling the CLI honours (a space and *, not :*), and the git -c escapes are denied for the -C form too', () => {
+test('T11 R2: the git -C entries use the spelling the CLI honours (a space and *, not :*), name only the analysed repo root (T11 escalation, finding 1), and the git -c escapes are denied for the -C form too', () => {
   const repo = makeTempRepo()
   runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
   const argv = capturedArgv(repo)
   const allowed = flagValues(argv, '--allowedTools')
-  for (const want of ['Bash(git -C * log *)', 'Bash(git -C * rev-parse *)', 'Bash(git log:*)', 'Bash(git rev-parse:*)']) {
+  for (const want of [`Bash(git -C ${repo} log *)`, `Bash(git -C "${repo}" log *)`, `Bash(git -C ${repo} rev-parse *)`, `Bash(git -C "${repo}" rev-parse *)`, 'Bash(git log:*)', 'Bash(git rev-parse:*)']) {
     assert.ok(allowed.includes(want), `missing ${want}`)
   }
-  assert.ok(!allowed.some((e) => /^Bash\(git -C \* \S+:\*\)$/.test(e)), 'a * mixed with the trailing :* syntax never matches')
+  assert.ok(!allowed.some((e) => /^Bash\(git -C \* /.test(e)), 'git -C must never be allowed at a wildcard path: a planted repo elsewhere could carry a config git executes')
+  assert.ok(!allowed.some((e) => /^Bash\(git -C .*:\*\)$/.test(e)), 'a * mixed with the trailing :* syntax never matches')
   const denied = flagValues(argv, '--disallowedTools')
   for (const want of ['Bash(git -c:*)', 'Bash(git -C * -c *)']) {
     assert.ok(denied.includes(want), `a deny must stay for ${want}: a wildcard before the rest of the command also approves inserted options`)
@@ -2424,3 +2438,163 @@ test('T11 round 3 (F5): a failed write of the last-result file is logged as LAST
   const res = runWeeklyScript([repo], { home })
   assert.match(res.logContents, /^LAST-RESULT-WRITE-FAILED$/m, res.logContents)
 })
+
+// --- T11 escalation round ----------------------------------------------------
+
+// Finding 1: no allowed command may name another host. `gh run list -R
+// host/owner/repo` and `gh repo view host/owner/repo` were measured reaching
+// an arbitrary host (GH_DEBUG=api), so the network-capable gh forms are denied
+// on every gh command and gh repo view, which the workflow never runs, is gone.
+// `gh * -*R*` catches -R inside a short-flag cluster (`-aR host/o/r`).
+const GH_HOST_DENIES = [
+  'Bash(gh * -R*)', 'Bash(gh * -*R*)', 'Bash(gh * --repo*)', 'Bash(gh * --hostname*)',
+  'Bash(gh -R*)', 'Bash(gh --repo*)', 'Bash(gh --hostname*)',
+  'Bash(GH_HOST=*)', 'Bash(GH_REPO=*)',
+]
+
+test('T11 escalation (finding 1): no gh entry can name another host -- gh repo view is gone, only gh run list and gh run view remain, and -R, --repo and --hostname are denied on any gh command', () => {
+  const repo = makeTempRepo()
+  runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
+  const argv = capturedArgv(repo)
+  const allowed = flagValues(argv, '--allowedTools')
+  assert.deepEqual(allowed.filter((e) => /^Bash\(gh\b/.test(e)).sort(), ['Bash(gh run list:*)', 'Bash(gh run view:*)'])
+  assert.ok(!allowed.some((e) => /gh repo/.test(e)), `gh repo view must not be allowed:\n${allowed.join('\n')}`)
+  const denied = flagValues(argv, '--disallowedTools')
+  for (const want of GH_HOST_DENIES) {
+    assert.ok(denied.includes(want), `missing deny ${want}:\n${denied.join('\n')}`)
+  }
+})
+
+test('T11 escalation (finding 1): for a linked worktree the git -C and report-ignore rules name both the worktree and the main checkout the workflow resolves, and nothing else', () => {
+  const main = makeTempRepo()
+  fs.writeFileSync(path.join(main, 'f'), 'x\n')
+  sh('git add f', main)
+  sh('git commit -q -m init', main)
+  const wt = path.join(freshDir('wt-'), 'tree')
+  sh(`git worktree add -q ${JSON.stringify(wt)}`, main)
+  const claudeHome = freshDir('claudehome-')
+  runWeeklyScript([wt], { claudeHome, extraPath: argvRecordingClaude() })
+  const allowed = flagValues(capturedArgv(wt), '--allowedTools')
+  const gitLog = allowed.filter((e) => /^Bash\(git -C .* log \*\)$/.test(e)).sort()
+  assert.deepEqual(gitLog, [`Bash(git -C "${main}" log *)`, `Bash(git -C "${wt}" log *)`, `Bash(git -C ${main} log *)`, `Bash(git -C ${wt} log *)`].sort())
+  const ignore = `node ${claudeHome}/workflows/lib/optimise-report-ignore.mjs`
+  const ignoreRules = allowed.filter((e) => e.startsWith(`Bash(${ignore} `)).sort()
+  assert.deepEqual(ignoreRules, [
+    `Bash(${ignore} "$(git rev-parse --show-toplevel)" *)`,
+    `Bash(${ignore} "${main}" *)`, `Bash(${ignore} "${wt}" *)`,
+    `Bash(${ignore} ${main} *)`, `Bash(${ignore} ${wt} *)`,
+  ].sort())
+})
+
+test('T11 escalation (finding 1): a repo whose path a permission rule cannot name gets no git -C or report-ignore rule at all, never a wildcard, and the log says so', () => {
+  const dir = path.join(freshDir('spaced-'), 'a b')
+  fs.mkdirSync(dir)
+  execFileSync('git', ['init', '-q', dir])
+  const res = runWeeklyScript([dir], { extraPath: argvRecordingClaude() })
+  const allowed = flagValues(capturedArgv(dir), '--allowedTools')
+  assert.ok(allowed.length > 0, 'guard against vacuity: claude ran with an allowlist')
+  assert.ok(!allowed.some((e) => /^Bash\(git -C /.test(e) || /optimise-report-ignore/.test(e)), `no rooted rule may be added:\n${allowed.join('\n')}`)
+  assert.match(res.logContents, /^NO-ROOTED-RULES a b \(the repo path holds characters a permission rule cannot name\)$/m, res.logContents)
+})
+
+// Finding 3: the staged copy is compared with the bytes actually staged (the
+// marker), not with the global file, which may change during the run.
+test('T11 escalation (finding 3): a global workflow rewritten mid-run does not orphan the staged copy -- it is removed with its marker, and the next run stages afresh rather than calling it the repo\'s own', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  const globalFile = path.join(withGlobalWorkflow(claudeHome, '// global v1 report_path\n'), 'optimise-cycle.js')
+  const rewriter = freshDir('rewrite-global-stub-')
+  fs.writeFileSync(path.join(rewriter, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
+if [ -f .claude/workflows/optimise-cycle.js ]; then : > .staged-seen; fi
+printf '// global v2 report_path\\n' > ${JSON.stringify(globalFile)}
+cat > "$REPORT_OUT" <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF
+exit 0
+`, { mode: 0o755 })
+  const first = runWeeklyScript([repo], { claudeHome, extraPath: rewriter })
+  assert.equal(fs.existsSync(path.join(repo, '.staged-seen')), true, 'guard against vacuity: the copy was staged during the run')
+  assert.equal(fs.readFileSync(globalFile, 'utf8'), '// global v2 report_path\n', 'guard against vacuity: the global file really changed mid-run')
+  assert.equal(fs.existsSync(stagedPath(repo)), false, `the staged copy must not be left behind:\n${first.logContents}`)
+  assert.equal(fs.existsSync(path.join(repo, '.claude', 'workflows')), false, 'nor its marker or the directory the run created')
+  const second = runWeeklyScript([repo], { claudeHome, extraPath: witnessingClaudeStub('pass') })
+  assert.ok(!/repo ships its own/.test(second.logContents), `the next run must not treat the runner's own copy as the repo's:\n${second.logContents}`)
+  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'), '// global v2 report_path\n', 'and it stages the current global copy')
+})
+
+// Finding 4: a SIGKILL leftover is deleted only while it still matches its
+// marker byte for byte. A developer's edit to it makes it theirs.
+test('T11 escalation (finding 4): an untracked leftover that no longer matches its marker (a developer edited it) is never deleted, is called the repo\'s own, and no REMOVED-LEFTOVER-STAGED is logged', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// global v2 report_path\n')
+  const dir = path.dirname(stagedPath(repo))
+  fs.mkdirSync(dir, { recursive: true })
+  const marker = path.join(dir, '.optimise-cycle.js.staged')
+  fs.writeFileSync(marker, '// global v1 report_path\n')
+  fs.writeFileSync(stagedPath(repo), '// edited by a developer\n')
+  assert.equal(fs.existsSync(marker), true, 'guard against vacuity: the marker exists before the run')
+  const res = runWeeklyScript([repo], { claudeHome, extraPath: witnessingClaudeStub('pass') })
+  assert.equal(fs.readFileSync(stagedPath(repo), 'utf8'), '// edited by a developer\n', `the developer's edit must survive:\n${res.logContents}`)
+  assert.ok(!/REMOVED-LEFTOVER-STAGED/.test(res.logContents), res.logContents)
+  assert.match(res.logContents, /repo ships its own optimise-cycle\.js/)
+})
+
+// Finding 5: a run that checks nothing is not a PASS.
+test('T11 escalation (finding 5): a run in which every configured path is skipped (none is a git repo) FAILs "no repos checked (all skipped)", exits non-zero, notifies once and records FAIL', () => {
+  const a = freshDir('plain-a-')
+  const b = freshDir('plain-b-')
+  const home = freshHome()
+  const res = runWeeklyScript([a, b], { home })
+  assert.match(res.logContents, new RegExp(`SKIP ${escapeRegExp(label(a))} \\(not a git repo\\)`), 'guard against vacuity: both were skipped')
+  assert.match(res.logContents, /^RESULT FAIL - reason="no repos checked \(all skipped\)"$/m, res.logContents)
+  assert.notEqual(res.status, 0, res.logContents)
+  assert.equal(res.notifyCalls.length, 1, JSON.stringify(res.notifyCalls))
+  assert.match(res.notifyCalls[0].join('\n'), /no repos checked \(all skipped\)/)
+  assert.match(fs.readFileSync(path.join(home, LAST_RESULT_REL), 'utf8'), /^\S+ FAIL .*no repos checked \(all skipped\)/)
+})
+
+test('T11 escalation (finding 5): an empty repo list still reports only "no repos configured", not a second all-skipped FAIL', () => {
+  const res = runWeeklyScript([], { rawRepos: '' })
+  assert.match(res.logContents, NO_REPOS_LINE, res.logContents)
+  assert.ok(!/all skipped/.test(res.logContents), res.logContents)
+})
+
+// Finding 6: the runner passes report_path, which an older installed workflow
+// does not accept; such a run would FAIL every repo with "report file missing".
+test('T11 escalation (finding 6): an installed optimise-cycle.js that predates report_path FAILs the run with a reason naming the mismatch and bin/install.sh, before any claude runs or anything is staged', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, '// an optimise-cycle.js from before the scratch output paths\n')
+  const home = freshHome()
+  const res = runWeeklyScript([repo], { home, claudeHome, extraPath: argvRecordingClaude() })
+  assert.match(res.logContents, /^RESULT FAIL - reason="installed optimise-cycle\.js predates report_path; run bin\/install\.sh"$/m, res.logContents)
+  assert.notEqual(res.status, 0)
+  assert.equal(res.notifyCalls.length, 1, JSON.stringify(res.notifyCalls))
+  assert.match(res.notifyCalls[0].join('\n'), /predates report_path; run bin\/install\.sh/)
+  assert.match(fs.readFileSync(path.join(home, LAST_RESULT_REL), 'utf8'), / FAIL /)
+  assert.equal(fs.existsSync(path.join(repo, '.claude-argv')), false, 'claude must never have run')
+  assert.equal(fs.existsSync(path.join(repo, '.claude', 'workflows')), false, 'nothing may be staged')
+})
+
+test('T11 escalation (finding 6): an installed optimise-cycle.js that supports report_path runs normally', () => {
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8'))
+  const res = runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
+  assert.equal(res.status, 0, res.logContents)
+  assert.ok(!/predates report_path/.test(res.logContents), res.logContents)
+})
+
+// Finding 7: a timeout names itself.
+for (const [code, reason] of [[124, 'timed out after 1260s'], [137, 'killed after timeout grace']]) {
+  test(`T11 escalation (finding 7): claude ending with exit ${code} FAILs with the reason "${reason}"`, () => {
+    const repo = makeTempRepo()
+    const stub = freshDir(`exit-${code}-stub-`)
+    fs.writeFileSync(path.join(stub, 'claude'), `#!/bin/sh\nexit ${code}\n`, { mode: 0o755 })
+    const res = runWeeklyScript([repo], { extraPath: stub })
+    const line = extractResultLine(res.logContents, 'FAIL', label(repo))
+    assert.ok(line.includes(`reason="${reason}`), line)
+    assert.ok(!line.includes(`claude exited ${code}`), `the bare exit code names no cause:\n${line}`)
+    assert.match(res.notifyCalls[0].join('\n'), new RegExp(escapeRegExp(reason)))
+  })
+}

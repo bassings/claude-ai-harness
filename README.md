@@ -1384,6 +1384,24 @@ explicit refusal of `Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`,
 `Bash(wget:*)`, plus `git -c` in its `-C` form. The hooks are **not**
 disabled: the destructive-command guard and the snapshot hook stay active for
 the unattended session.
+
+**No allowed command may send data to a host the session chooses.** `Read`,
+`Grep` and `Glob` can read any file this user can read, so the boundary is
+egress, not readability. `gh repo view` is not on the list (the workflow never
+runs it, and with a `HOST/OWNER/REPO` argument it sends a request to any
+host), and `-R`, `--repo` and `--hostname` are denied on every `gh` command,
+in their attached and separate forms and inside a short-flag cluster
+(`Bash(gh * -R*)`, `Bash(gh * -*R*)`, `Bash(gh * --repo*)`,
+`Bash(gh * --hostname*)` and the same at the front of the command), as are the
+`GH_HOST=` and `GH_REPO=` prefixes. `gh run list` and `gh run view` therefore
+reach only the host the analysed repo's own remote names. `git -C` and the
+`optimise-report-ignore.mjs` helper (which writes `<root>/.git/info/exclude`
+and runs git there) are allowed only with `<root>` naming the analysed repo
+itself, never a wildcard path, because git run in a directory someone planted
+reads that directory's config, which can name a program git executes. A repo
+whose path a rule cannot name exactly gets no such rule, and the log says
+`NO-ROOTED-RULES <label>`. These are deny and prefix rules; whether the CLI
+matches every spelling is for a real headless run to show.
 `test/static-checks.test.js` pins the deny tokens and the allowlist flags in
 the script text, and `test/weekly-runner.test.js` captures the real argument
 list. The allowlist has not been exercised by a real headless run from this
@@ -1422,7 +1440,8 @@ hook still writes `refs/harness-snapshots/*` in every analysed repo on each
 weekly run; nothing here prevents that.
 
 **A FAIL is announced, and cleanup is the runner's job.** When any repo's
-verdict is FAIL, or no repos are configured, the run raises one macOS
+verdict is FAIL, no repos are configured, or every configured path is skipped
+(`no repos checked (all skipped)`), the run raises one macOS
 notification naming the failing repo labels and the first reason, and writes
 one line to `~/.claude/logs/optimise-cycle-weekly.last-result` (UTC timestamp,
 PASS or FAIL, labels, reasons) that stays until the next run overwrites it. A
@@ -1459,8 +1478,15 @@ and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
 repo's `bin/`** after merging any change to them. Unlike the top-level
 workflow scripts above, copying these genuinely does deploy them: launchd
 spawns a fresh shell process per run, which reads the file at exec, so there
-is no snapshot and no restart step. The `diff -q` pair is therefore a
-sufficient check here, not merely a necessary one:
+is no snapshot and no restart step. **The runner also requires the matching
+`workflows/optimise-cycle.js`**: it passes the workflow arguments
+(`report_path`, `proposal_targets_path`) that an older installed workflow does
+not accept, so updating the runner without the workflow makes every repo
+FAIL. Run `bin/install.sh` (which installs `workflows/`) and confirm with
+`bin/install.sh --check`, as well as the copy commands below; a run that finds an installed `optimise-cycle.js`
+without `report_path` stops with `installed optimise-cycle.js predates
+report_path; run bin/install.sh`. The `diff -q` pair below confirms the `bin/`
+copies only, so it is necessary but not sufficient on its own:
 
 ```bash
 cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh

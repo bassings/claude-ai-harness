@@ -146,7 +146,7 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # was indistinguishable in the log from one that had it. Bump this whenever
 # this script's behaviour changes materially; test/static-checks.test.js
 # pins that it has moved past the pre-staleness-check value.
-SCRIPT_VERSION="2026-11-12.1"
+SCRIPT_VERSION="2026-11-12.2"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REDACT_SCRIPT="$SCRIPT_DIR/redact-transcript.mjs"
@@ -344,48 +344,97 @@ cleanup_run() {
 #     itself; that is deliberately NOT allowed here, since a repo's own
 #     script is code the run did not install. A plugin-only install (no
 #     $CLAUDE_HOME mirror) therefore FAILS loudly, and is notified.
-#   - git log and git rev-parse (with -C <root>, which the workflow uses):
-#     the workflow's git lane. The -C forms are spelled `git -C * log *`,
-#     because the CLI never matches a * mixed with the trailing :* syntax. A
-#     wildcard before the rest of the command also approves inserted options
-#     such as -c, so `-c` is denied for that form too (see the invocation). cat, head, ls, wc and date were dropped
+#     optimise-read.mjs only reads files (it imports fs, path, crypto and url,
+#     and never writes or spawns), so it reaches nothing Read cannot, and its
+#     arguments stay free. optimise-report-ignore.mjs writes
+#     <root>/.git/info/exclude and runs git with its cwd at <root>, so it is
+#     allowed only with <root> naming the analysed repo (rooted_rules, below).
+#   - git log and git rev-parse: the plain forms run in the analysed repo
+#     (the session's cwd). The -C forms the git lane uses name the analysed
+#     repo's own root, never a wildcard path, because git run in a directory
+#     an attacker planted (a committed bare-repo layout) reads that
+#     directory's config, which can name a program git executes. They are
+#     spelled `git -C <root> log *`, because the CLI never matches a * mixed
+#     with the trailing :* syntax. A wildcard after the subcommand also
+#     approves inserted options, so -c, --output and --ext-diff are denied
+#     (see the invocation). cat, head, ls, wc and date were dropped
 #     because Read, Grep and Glob cover reading, and each of those commands
 #     takes any path. status, show, diff, ls-files and check-ignore were
 #     dropped as unused by the agent (the helper runs check-ignore itself);
 #     remote was dropped because `git remote set-url` writes config.
-#   - gh run list, gh run view, gh repo view: read-only queries.
+#   - gh run list and gh run view, from the analysed repo's own directory.
+#     gh repo view is not listed: the workflow never runs it, and with a
+#     HOST/OWNER/REPO argument it sends a request to any host. -R, --repo and
+#     --hostname, which do the same on any gh command, are denied (see the
+#     invocation), as are the GH_HOST and GH_REPO environment prefixes.
 #   - openssl rand -hex 16, exactly: the per-run containment nonce. Any other
 #     openssl rand would allow `-out <file>`.
 # What this list does NOT prevent, stated plainly: Read, Grep and Glob can
 # read any file this user can read, so the boundary against exfiltration is
-# that no network tool is allowed (WebFetch, curl and wget are refused), not
-# that nothing sensitive is readable. The two node helpers take arbitrary
-# arguments; optimise-report-ignore.mjs appends a path to the .git/info/
-# exclude of whatever root it is given. git log accepts options such as
-# --output=<file> and --ext-diff that write a file or run a configured
-# program; a prefix rule cannot see inside the arguments, so the deny entries
-# below are best effort and not a guarantee. Shell chaining and command
-# substitution inside an allowed command are judged by the CLI's own parser,
-# not by this script. Agent and Workflow start further sessions whose
-# permissions are the CLI's to inherit; this script has not verified how.
-# The list was written from the workflow's text and has not been exercised by
-# a real headless run in this repository's tests.
+# that no allowed command can send data to a host of the session's choosing:
+# WebFetch, curl and wget are refused, and gh may reach only the host the
+# analysed repo's own remote names. That boundary rests on the deny entries
+# below matching every spelling of -R, --repo and --hostname; a prefix rule
+# cannot see inside the arguments, so the deny entries are best effort and
+# not a guarantee. Shell chaining and command substitution inside an allowed
+# command are judged by the CLI's own parser, not by this script. Agent and
+# Workflow start further sessions whose permissions are the CLI's to
+# inherit; this script has not verified how. The list was written from the
+# workflow's text and has not been exercised by a real headless run in this
+# repository's tests.
 ALLOWED_TOOLS=(
   "Skill" "Workflow" "Agent" "Read" "Grep" "Glob"
-  "Bash(git log:*)" "Bash(git -C * log *)" "Bash(git rev-parse:*)" "Bash(git -C * rev-parse *)"
-  "Bash(gh run list:*)" "Bash(gh run view:*)" "Bash(gh repo view:*)"
+  "Bash(git log:*)" "Bash(git rev-parse:*)"
+  "Bash(gh run list:*)" "Bash(gh run view:*)"
   "Bash(node $CLAUDE_HOME/workflows/lib/optimise-read.mjs:*)"
-  "Bash(node $CLAUDE_HOME/workflows/lib/optimise-report-ignore.mjs:*)"
   "Bash(openssl rand -hex 16)"
 )
+IGNORE_HELPERS=("$CLAUDE_HOME/workflows/lib/optimise-report-ignore.mjs")
 # The workflow tells the agent the global mirror is ~/.claude/workflows/lib;
 # when that is where CLAUDE_HOME points, the tilde spelling is allowed too.
 if [ "$CLAUDE_HOME" = "$HOME/.claude" ]; then
-  ALLOWED_TOOLS+=(
-    "Bash(node ~/.claude/workflows/lib/optimise-read.mjs:*)"
-    "Bash(node ~/.claude/workflows/lib/optimise-report-ignore.mjs:*)"
-  )
+  ALLOWED_TOOLS+=("Bash(node ~/.claude/workflows/lib/optimise-read.mjs:*)")
+  IGNORE_HELPERS+=("~/.claude/workflows/lib/optimise-report-ignore.mjs")
 fi
+
+# The rules that name one analysed repo's own root, rebuilt for each repo into
+# REPO_ALLOWED. The roots are the two the workflow resolves (the toplevel, and
+# for a linked worktree the main checkout), each in its plain and its
+# double-quoted spelling, since which one the CLI compares is not known here.
+# A root that a rule cannot name exactly (anything but plain path characters)
+# gets no rule at all, never a wildcard: that repo's git lane and report-ignore
+# step are then refused, and the log says so.
+REPO_ALLOWED=()
+rooted_rules() {
+  local repo="$1" label="$2" root helper accepted=0 skipped=0 seen=""
+  REPO_ALLOWED=()
+  for root in "$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" \
+    "$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"; do
+    if [ -z "$root" ] || [ "$root" = "." ] || [ "$root" = "$seen" ]; then
+      continue
+    fi
+    seen="$root"
+    if ! printf '%s' "$root" | grep -Eq '^/[A-Za-z0-9_/.-]+$'; then
+      skipped=1
+      continue
+    fi
+    accepted=1
+    REPO_ALLOWED+=("Bash(git -C $root log *)" "Bash(git -C \"$root\" log *)" "Bash(git -C $root rev-parse *)" "Bash(git -C \"$root\" rev-parse *)")
+    for helper in "${IGNORE_HELPERS[@]}"; do
+      REPO_ALLOWED+=("Bash(node $helper $root *)" "Bash(node $helper \"$root\" *)")
+    done
+  done
+  if [ "$accepted" = 1 ]; then
+    # The spelling the workflow gives for the report root; it resolves in the
+    # session's cwd, which is the analysed repo.
+    for helper in "${IGNORE_HELPERS[@]}"; do
+      REPO_ALLOWED+=("Bash(node $helper \"\$(git rev-parse --show-toplevel)\" *)")
+    done
+  fi
+  if [ "$skipped" = 1 ]; then
+    echo "NO-ROOTED-RULES $label (the repo path holds characters a permission rule cannot name)" >> "$LOG"
+  fi
+}
 
 # What the run reports about its own outcome. note_fail is the only place a
 # failure is recorded, so the exit status, the notification and the
@@ -552,9 +601,14 @@ verdict_repo() {
   local reasons=()
   local mtime first_line
 
-  if [ "$claude_exit" -ne 0 ]; then
-    reasons+=("claude exited $claude_exit")
-  fi
+  # 124 and 137 are what `timeout` itself exits with when it stops claude:
+  # 124 after the polite signal, 137 after the -k grace period's hard kill.
+  case "$claude_exit" in
+    0) ;;
+    124) reasons+=("timed out after ${TIMEOUT_S}s") ;;
+    137) reasons+=("killed after timeout grace") ;;
+    *) reasons+=("claude exited $claude_exit") ;;
+  esac
 
   if [ -n "$OUTPUT_PROBLEM" ]; then
     reasons+=("$OUTPUT_PROBLEM")
@@ -792,6 +846,17 @@ if [ ${#REPOS[@]} -eq 0 ]; then
   note_fail "-" "no repos configured"
 fi
 
+# The runner passes report_path and proposal_targets_path, which an installed
+# optimise-cycle.js older than this runner does not accept; every repo would
+# then FAIL with "report file missing", which names the symptom and not the
+# cause. Such a run stops here, before anything is staged or any session runs.
+# A plugin-only install has no global copy and is not checked.
+if [ -f "$CLAUDE_HOME/workflows/optimise-cycle.js" ] && ! grep -q 'report_path' "$CLAUDE_HOME/workflows/optimise-cycle.js"; then
+  echo 'RESULT FAIL - reason="installed optimise-cycle.js predates report_path; run bin/install.sh"' >> "$LOG"
+  note_fail "-" "installed optimise-cycle.js predates report_path; run bin/install.sh"
+  REPOS=()
+fi
+
 # Group 8: bash 3.2's `set -u` treats "${REPOS[@]}" on a genuinely empty
 # array as an unbound-variable error; the ${arr[@]+"${arr[@]}"} idiom below
 # expands to nothing (not an error) when REPOS is empty.
@@ -886,8 +951,10 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     # Each file is created exclusively (copy_new), so one that appears after
     # the checks above is never overwritten, and each is recorded for cleanup
     # only once this run has really created it, so a file that is not ours is
-    # never deleted.
-    STAGED_SOURCE="$global_workflow"
+    # never deleted. The copy is compared at cleanup with the marker, the bytes
+    # actually staged, never with the global file, which may change during the
+    # run and would then leave our own copy behind as if the repo shipped it.
+    STAGED_SOURCE="$staged_marker"
     if [ ! -d "$repo/.claude/workflows" ]; then
       STAGED_WORKFLOW_DIR="$repo/.claude/workflows"
     fi
@@ -966,13 +1033,14 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # cleanup_run knows to put the saved bytes back. The snapshot hook still
   # writes refs/harness-snapshots/* in each analysed repo; nothing here
   # prevents that.
+  rooted_rules "$repo" "$repo_label"
   TRANSCRIPT_FILE="$(mktemp "$RUNNER_TMP/optimise-weekly-transcript.XXXXXX")"
   timeout -k 60 "$TIMEOUT_S" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90, \"report_path\": \"$SCRATCH_REPORT_PATH\", \"proposal_targets_path\": \"$SCRATCH_SIDECAR_PATH\"}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
-    --allowedTools "${ALLOWED_TOOLS[@]}" \
+    --allowedTools "${ALLOWED_TOOLS[@]}" ${REPO_ALLOWED[@]+"${REPO_ALLOWED[@]}"} \
     --permission-mode dontAsk \
     --setting-sources user \
     --session-id "$SESSION_ID" \
-    --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" "Bash(git -c:*)" "Bash(git -C * -c *)" "Bash(git * --output*)" "Bash(git * --ext-diff*)" \
+    --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" "Bash(git -c:*)" "Bash(git -C * -c *)" "Bash(git * --output*)" "Bash(git * --ext-diff*)" "Bash(gh * -R*)" "Bash(gh * -*R*)" "Bash(gh * --repo*)" "Bash(gh * --hostname*)" "Bash(gh -R*)" "Bash(gh --repo*)" "Bash(gh --hostname*)" "Bash(GH_HOST=*)" "Bash(GH_REPO=*)" \
     > "$TRANSCRIPT_FILE" 2>&1 &
   # Backgrounded and waited on, so a SIGTERM or SIGINT to this script is
   # handled at once (on_signal) rather than after claude finishes.
@@ -1023,6 +1091,14 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     note_fail "$repo_label" "$VERDICT_FIRST" "$VERDICT_ALL"
   fi
 done
+
+# A run whose every configured path was skipped checked nothing, which is not a
+# PASS: if git stopped resolving under launchd, or refused every repo, the job
+# would otherwise be green every week while analysing nothing.
+if [ -z "$PASS_LABELS" ] && [ -z "$FAIL_LABELS" ]; then
+  echo 'RESULT FAIL - reason="no repos checked (all skipped)"' >> "$LOG"
+  note_fail "-" "no repos checked (all skipped)"
+fi
 echo "=== done $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG"
 
 # T11: the outcome is reported by on_exit, which runs on every way out of this
