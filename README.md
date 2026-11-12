@@ -549,8 +549,8 @@ past it.
   newline, so the line after a comment is still checked. A pathspec the
   shell builds at run time (`$X`, `${X}`, `$(...)`, backticks, `{a,b}`) on
   `git checkout`/`git restore` is whole-tree scope, so a dirty tracked file
-  anywhere refuses it. A refusal names the class that fired (`comment
-  continuation`, `backslash continuation`, `dynamic pathspec`, `zsh -c`) and
+  anywhere refuses it. An operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis at the end of a line, or beside another one, no longer hides the next command: the tokeniser read such a run as one token, so the text is spaced around them first. A refusal names the class that fired (`comment
+  continuation`, `backslash continuation`, `dynamic pathspec`, `adjacent operators`, `zsh -c`) and
   prints the override. `bash -c`/`sh -c`/`zsh -c`/
   `bash -lc SCRIPT`, and the `nohup`, `sudo` (including `sudo -u <user>`),
   `timeout <n>`, `xargs`, `env` (including `env -i`), `command` and `exec`
@@ -627,7 +627,6 @@ measured, none is guarded, and none is planned to be.
 | Repository retargeting through a wrapper | `env GIT_DIR=<other>/.git git clean -fd` | The clean/stash fail-closed rule reads the env prefix on the segment itself, and `env` hides it one level down. The other repository's untracked files or stash entries go, unmeasured. |
 | Repository retargeting already in the environment | `export GIT_DIR=...` in the shell that launched the session, then `git clean -fd` | The guard scrubs `GIT_*` from its own measuring call, which is what stops a leaked variable making it read the wrong repo -- but the real command still obeys the variable, so the two look at different repositories. Measured with a clean cwd and untracked work in the target: ALLOWED, and the real run deleted it. |
 | A run-time pathspec on a command other than `checkout`/`restore` | `git clean -fd "$X"`, `git clean -fd -- $(cat list)` | `git checkout` and `git restore` read a pathspec containing `$`, a backtick, `$(...)` or `{...}` as whole-tree scope (class `dynamic pathspec`), so a dirty tracked file anywhere refuses them. `git clean` does not: its dry run measures the pathspec as literal text, which matches nothing, so untracked files go unmeasured. |
-| A line that ends in an operator | `echo a &&` then a newline then `git reset --hard`; the same with a trailing `;`, `\|` or `&`, and `(cd x)` then a newline | The tokeniser reads the operator and the newline after it as one token, so the two lines are never split and the second is never matched. Measured ALLOWED on the pre-T5 guard and still ALLOWED. Found while closing the comment class; not part of it. |
 | An apostrophe inside a double-quoted string | `git commit -m "don't" && echo $(git reset --hard)` | Substitution extraction flips into single-quote mode at the apostrophe, so every `$(...)` and backtick after it on the line is never looked at. |
 | `-n` where it is not a flag | `git clean -f -e -n`, `git clean -f -- -n` | Any `-n` token anywhere reads as `--dry-run`, so the invocation is treated as harmless and never measured. Measured: `git clean -f -e -n` was ALLOWED and the real run deleted every untracked file in the tree. |
 | Nesting past `MAX_UNWRAP_DEPTH` | six or more stacked `bash -c` / `$(...)` layers | Past the bound everything fails OPEN, the clean and stash rules included, so these two lose their fail-closed posture exactly where an adversary would put them. |

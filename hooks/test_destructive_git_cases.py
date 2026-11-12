@@ -926,7 +926,7 @@ class TestSubprocessCallsPerSegment(unittest.TestCase):
         self.assertGreater(observed_max, 0, 'sanity: the counter must observe the guard starting git at least once across the corpus')
 
 
-PARSING_CLASSES = ('comment continuation', 'backslash continuation', 'dynamic pathspec', 'zsh -c')
+PARSING_CLASSES = ('comment continuation', 'backslash continuation', 'dynamic pathspec', 'zsh -c', 'adjacent operators')
 
 # What a refusal must TELL the agent to do, not only what it found (AC-OPS-8). Asserted against the real process's stderr.
 REFUSAL_INSTRUCTION_FRAGMENTS = (

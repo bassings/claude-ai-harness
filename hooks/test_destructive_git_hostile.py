@@ -477,6 +477,8 @@ class TestParsingWorkGrowsLinearly(unittest.TestCase):
             'comment on every line': lambda n: rep('', 'echo a # c\n', 'git status', n),
             'mid-word hash': lambda n: rep('', 'echo a#b;', 'git status', n),
             'a long run of continuations': lambda n: rep('git status ', '\\\n', '--short', n),
+            'operator then newline': lambda n: rep('', 'echo a &&\n', 'git status', n),
+            'parentheses beside operators': lambda n: rep('', '(a);(b)&&', 'git status', n),
             'quoted run': lambda n: rep("git commit -m '", 'a b ', "'", n),
             'many substitutions': lambda n: rep('', 'echo $(true);', 'git status', n),
             'one deep substitution': lambda n: '$(echo ' * ((n - 16) // 8) + 'x' + ')' * ((n - 16) // 8),

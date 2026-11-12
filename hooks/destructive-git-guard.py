@@ -180,6 +180,11 @@ in order:
      names, so a dirty tracked file anywhere refuses the command, with the
      class `dynamic pathspec` named. A substitution is restored into the
      token it was written in, not dropped.
+ 12. The same pass puts spaces around an unquoted newline, `;`, `(` and `)`,
+     and `|&` is a control operator: the tokeniser reads a run of adjacent
+     punctuation (`&&` then a newline, `)` then `&&`) as one token that is no
+     control operator, so the commands either side were never split. The
+     refusal names the class `adjacent operators`.
 
 A `cd <path>` segment updates the effective directory used by every later
 segment in the same command, so `cd <dir> && git ...` is scoped against
@@ -227,7 +232,7 @@ import sys
 
 ESCAPE_VAR = 'HARNESS_ALLOW_DESTRUCTIVE_GIT'
 
-CONTROL_OPERATORS = ('&&', '||', ';', '|', '&', '\n')
+CONTROL_OPERATORS = ('&&', '||', ';', '|', '|&', '&', '\n')
 
 # '\n' added to the punctuation set (default is '();<>|&') so a bare newline
 # becomes its own token instead of being swallowed as ordinary whitespace or
@@ -356,6 +361,7 @@ COMMENT_CLASS = 'comment continuation'
 CONTINUATION_CLASS = 'backslash continuation'
 DYNAMIC_PATHSPEC_CLASS = 'dynamic pathspec'
 ZSH_CLASS = 'zsh -c'
+ADJACENT_OPERATORS_CLASS = 'adjacent operators'
 
 # One sentence per class that is attached to a refusal AFTER the fact (the
 # dynamic pathspec class has its own refusal text, REFUSAL_DYNAMIC). It
@@ -370,6 +376,11 @@ CLASS_NOTES = {
         "a backslash-newline continuation was joined into one line before "
         "matching, as the shell does"),
     ZSH_CLASS: "the body of a `zsh -c` was checked as its own command",
+    ADJACENT_OPERATORS_CLASS: (
+        "an operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis is followed "
+        "by a newline or sits directly beside another one; the tokeniser reads "
+        "such a run as a single token, so it is split into separate operators "
+        "before matching"),
 }
 
 # Prefix wrappers whose ENTIRE effect (for this guard's purposes) is "strip
@@ -558,9 +569,12 @@ def normalise_shell_text(command):
     i = 0
     word_start = True
     first_hash = -1
+    after_op = False  # the last significant character was an unquoted ; & | ( )
     while i < n:
         ch = command[i]
         mode = stack[-1] if stack else 'code'
+        was_op = after_op
+        after_op = False
         if mode == 'sq':
             out.append(ch)
             if ch == "'":
@@ -571,6 +585,7 @@ def normalise_shell_text(command):
         if ch == '\\' and i + 1 < n:
             if command[i + 1] == '\n':
                 classes.add(CONTINUATION_CLASS)
+                after_op = was_op
                 i += 2
                 continue
             out.append(ch)
@@ -623,6 +638,7 @@ def normalise_shell_text(command):
                 # newline would otherwise leave `;` and the newline adjacent,
                 # and the tokeniser reads that pair as one token.
                 out.append(' ')
+                after_op = was_op
                 eol = command.find('\n', i)
                 i = n if eol == -1 else eol
                 continue
@@ -630,7 +646,12 @@ def normalise_shell_text(command):
             i += 1
             continue
         if ch == '\n':
-            out.append(ch)
+            # Spaces on both sides: the tokeniser reads a run of adjacent
+            # punctuation (`&&` then a newline) as ONE token that is no
+            # control operator, so the newline stopped separating commands.
+            if was_op:
+                classes.add(ADJACENT_OPERATORS_CLASS)
+            out.append(' \n ')
             i += 1
             word_start = True
             if heredocs:
@@ -654,7 +675,7 @@ def normalise_shell_text(command):
                 i = marker.end()
                 word_start = False
                 continue
-        if ch in ';&|()<> \t':
+        if ch in ';&|()<> \t\r':
             if isinstance(mode, int):
                 if ch == '(':
                     stack[-1] = mode + 1
@@ -666,7 +687,23 @@ def normalise_shell_text(command):
                         word_start = False
                         continue
                     stack[-1] = mode - 1
-            out.append(ch)
+            if ch in ';()':
+                # Spaced for the same reason as a newline: `)&&`, `&&(`, `);`
+                # and `;(` are each one token to the tokeniser otherwise.
+                prev = command[i - 1] if i else ''
+                if (ch in '()' and prev in ';&|') or (ch == ';' and prev in '()'):
+                    classes.add(ADJACENT_OPERATORS_CLASS)
+                out.append(' ' + ch + ' ')
+                after_op = True
+            else:
+                prev = command[i - 1] if i else ''
+                if (ch == '&' and prev in ')|') or (ch == '|' and prev == ')'):
+                    classes.add(ADJACENT_OPERATORS_CLASS)
+                out.append(ch)
+                if ch in '&|':
+                    after_op = True
+                elif ch in ' \t\r':
+                    after_op = was_op
             i += 1
             word_start = True
             continue
@@ -821,9 +858,10 @@ def split_segments(command):
     # it during the whitespace-skip that runs BEFORE punctuation_chars is
     # ever consulted, so a newline never reaches the lexer as a token no
     # matter what punctuation_chars says. Removing it from `whitespace`
-    # (leaving space/tab there) is what makes it surface as its own token
+    # (leaving space, tab and carriage return there, so a CRLF line ending
+    # does not glue `\r` onto the last word) is what makes it surface as its own token
     # via PUNCTUATION_CHARS below, instead of being silently swallowed.
-    lexer.whitespace = ' \t'
+    lexer.whitespace = ' \t\r'
     # Comments are removed by normalise_shell_text(), which knows a `#` only
     # starts one at the beginning of a word. shlex treats a `#` anywhere
     # outside quotes as a comment and reads on to the end of the line,
@@ -846,7 +884,7 @@ def split_segments(command):
             continue  # e.g. a trailing `;`, or two operators in a row
         before = separators[index]
         after = separators[index + 1] if index + 1 < len(separators) else None
-        out.append((segment, before == '|' or after == '|'))
+        out.append((segment, before in ('|', '|&') or after in ('|', '|&')))
     return out
 
 
