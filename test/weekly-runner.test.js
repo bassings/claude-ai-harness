@@ -1241,20 +1241,20 @@ function stagedWasSeen(repo) {
 test('weekly runner: stages the global workflow script into the repo so the run never has to copy it itself', () => {
   const repo = makeTempRepo()
   const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
-  withGlobalWorkflow(home, '// global optimise-cycle script, report_path\n')
+  withGlobalWorkflow(home, '// global optimise-cycle script\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
   assert.match(res.logContents, resultLineRegex('PASS', label(repo)))
   assert.equal(stagedWasSeen(repo), true,
     'the script must actually be present WHILE the run happens; asserting only on the log would pass against a runner that logged "staged" and staged nothing')
   assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'),
-    '// global optimise-cycle script, report_path\n',
+    '// global optimise-cycle script\nconst WEEKLY_RUNNER_CONTRACT = 1\n',
     'and it must be the global script, not an empty placeholder')
 })
 
 test('weekly runner: removes the script it staged, leaving the repo exactly as it found it', () => {
   const repo = makeTempRepo()
   const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
-  withGlobalWorkflow(home, '// global optimise-cycle script, report_path\n')
+  withGlobalWorkflow(home, '// global optimise-cycle script\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
   assert.equal(stagedWasSeen(repo), true,
     'guard against vacuity: prove it WAS there, or "it is gone" means nothing')
@@ -1267,7 +1267,7 @@ test('weekly runner: removes the script it staged, leaving the repo exactly as i
 test('weekly runner: cleans up the staged script even when the run FAILS', () => {
   const repo = makeTempRepo()
   const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
-  withGlobalWorkflow(home, '// global optimise-cycle script, report_path\n')
+  withGlobalWorkflow(home, '// global optimise-cycle script\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('fail') })
   assert.match(res.logContents, resultLineRegex('FAIL', label(repo)))
   assert.equal(stagedWasSeen(repo), true, 'guard against vacuity, as above')
@@ -1281,7 +1281,7 @@ test("weekly runner: a repo that ships its OWN workflow script keeps it, untouch
   fs.mkdirSync(path.dirname(own), { recursive: true })
   fs.writeFileSync(own, '// THIS REPO SHIPS ITS OWN TUNED COPY\n')
   const home = fs.mkdtempSync(path.join(RUN_TMPDIR, 'claudehome-'))
-  withGlobalWorkflow(home, '// global optimise-cycle script, report_path\n')
+  withGlobalWorkflow(home, '// global optimise-cycle script\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const res = runWeeklyScript([repo], { claudeHome: home, extraPath: witnessingClaudeStub('pass') })
   assert.equal(fs.readFileSync(own, 'utf8'), '// THIS REPO SHIPS ITS OWN TUNED COPY\n',
     'staging must never overwrite a repo that deliberately ships its own copy')
@@ -1702,7 +1702,7 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
   test(`T11 AC-OPS-4: after ${sig} mid-run no transcript temp file and no staged workflow remain, claude is stopped, and the outcome is recorded as FAIL and notified (M1)`, async () => {
     const repo = makeTempRepo()
     const claudeHome = freshDir('claudehome-')
-    withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
+    withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
     const tmp = freshDir('tmp-')
     const home = freshHome()
     const lastResult = path.join(home, LAST_RESULT_REL)
@@ -1764,7 +1764,7 @@ test('T11 AC-OPS-4: an abnormal end the runner has no handler for (SIGHUP) still
 test('T11 AC-OPS-4: a claude that is SIGKILLed mid-run (the shape of the timeout\'s second-stage kill; the timeout itself is not exercised, since TIMEOUT_S has no test seam) leaves no transcript temp file and no staged workflow, and the repo FAILs', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const tmp = freshDir('tmp-')
   const killed = freshDir('killed-stub-')
   fs.writeFileSync(path.join(killed, 'claude'), '#!/bin/sh\nif [ -f .claude/workflows/optimise-cycle.js ]; then : > .staged-seen; fi\nkill -KILL $$\n', { mode: 0o755 })
@@ -1778,7 +1778,7 @@ test('T11 AC-OPS-4: a claude that is SIGKILLed mid-run (the shape of the timeout
 test('T11 AC-OPS-4: after SIGKILL the next run deletes the staged copy it left, logs REMOVED-LEFTOVER-STAGED <label>, never calls it the repo\'s own, and re-stages from the global copy', async () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const home = freshHome()
   const run = startRunner(repo, { home, claudeHome, tmpdir: freshDir('tmp-'), extraPath: hangingClaude() })
   const pidFile = path.join(repo, '.claude-pid')
@@ -1790,11 +1790,11 @@ test('T11 AC-OPS-4: after SIGKILL the next run deletes the staged copy it left, 
     killIfAlive(pidFile)
   }
   assert.equal(fs.existsSync(stagedPath(repo)), true, 'guard against vacuity: SIGKILL cannot be trapped, so the copy is left behind')
-  withGlobalWorkflow(claudeHome, '// global v2 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v2\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const res = runWeeklyScript([repo], { home, claudeHome, extraPath: witnessingClaudeStub('pass') })
   assert.match(res.logContents, new RegExp(`^REMOVED-LEFTOVER-STAGED ${escapeRegExp(label(repo))}$`, 'm'), res.logContents)
   assert.ok(!/repo ships its own/.test(res.logContents), `a leftover must never be logged as the repo's own:\n${res.logContents}`)
-  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'), '// global v2 report_path\n', 're-staged from the CURRENT global copy')
+  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'), '// global v2\nconst WEEKLY_RUNNER_CONTRACT = 1\n', 're-staged from the CURRENT global copy')
   assert.equal(fs.existsSync(stagedPath(repo)), false, 'and removed again at the end of this run')
   assert.match(res.logContents, resultLineRegex('PASS', label(repo)))
 })
@@ -1802,7 +1802,7 @@ test('T11 AC-OPS-4: after SIGKILL the next run deletes the staged copy it left, 
 test('T11 AC-DATA-14: a staged file that is no longer byte-identical to the global source (replaced during the run) is kept, with nothing else left beside it', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const replacer = freshDir('replace-stub-')
   fs.writeFileSync(path.join(replacer, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
 printf '// REPLACED DURING THE RUN\\n' > .claude/workflows/optimise-cycle.js
@@ -1893,7 +1893,7 @@ test('T11 M3: with two repos, the first repo\'s transcript, staged copy, marker 
   const a = makeTempRepo()
   const b = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const tmp = freshDir('tmp-')
   const res = runWeeklyScript([a, b], { claudeHome, extraPath: listingClaude(), env: { TMPDIR: tmp } })
   assert.equal(res.status, 0, res.logContents)
@@ -1907,7 +1907,7 @@ test('T11 M3: a repo that fails on its start time still has its staged copy remo
   const a = makeTempRepo()
   const b = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const dateDir = freshDir('bad-date-')
   fs.writeFileSync(path.join(dateDir, 'date'), '#!/bin/sh\nif [ "$1" = "+%s" ]; then\n  echo ""\nelse\n  exec /bin/date "$@"\nfi\n', { mode: 0o755 })
   runWeeklyScript([a, b], { claudeHome, extraPath: dateDir })
@@ -1933,7 +1933,7 @@ function symlinkCase(name, build) {
   test(`T11 L2: a dangling symlink at ${name} is refused: nothing is created at its target, and the repo FAILs with a reason`, () => {
     const repo = makeTempRepo()
     const claudeHome = freshDir('claudehome-')
-    withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
+    withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
     const target = danglingTarget()
     build(repo, target)
     const res = runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
@@ -1963,7 +1963,7 @@ symlinkCase('.claude', (repo, target) => {
 test('T11 L7: a workflow file that appears between the existence check and the copy is never overwritten, and is kept', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v1 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   // A mkdir shim that, once the staging directory exists, drops a repo-owned
   // file into it: the file appears AFTER the runner decided there was none.
   const shim = freshDir('mkdir-shim-')
@@ -2101,7 +2101,7 @@ test('T11 round 3: a symlink where the runner parent should be is refused before
 test('T11 L6: a leftover that is byte-identical to its marker but tracked by git is never deleted', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v2 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v2\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const dir = path.dirname(stagedPath(repo))
   fs.mkdirSync(dir, { recursive: true })
   fs.writeFileSync(stagedPath(repo), '// committed by a developer\n')
@@ -2522,23 +2522,23 @@ test('T11 escalation (finding 1): a repo whose path a permission rule cannot nam
 test('T11 escalation (finding 3): a global workflow rewritten mid-run does not orphan the staged copy -- it is removed with its marker, and the next run stages afresh rather than calling it the repo\'s own', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  const globalFile = path.join(withGlobalWorkflow(claudeHome, '// global v1 report_path\n'), 'optimise-cycle.js')
+  const globalFile = path.join(withGlobalWorkflow(claudeHome, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n'), 'optimise-cycle.js')
   const rewriter = freshDir('rewrite-global-stub-')
   fs.writeFileSync(path.join(rewriter, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
 if [ -f .claude/workflows/optimise-cycle.js ]; then : > .staged-seen; fi
-printf '// global v2 report_path\\n' > ${JSON.stringify(globalFile)}
+printf '// global v2\\nconst WEEKLY_RUNNER_CONTRACT = 1\\n' > ${JSON.stringify(globalFile)}
 cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0
 `, { mode: 0o755 })
   const first = runWeeklyScript([repo], { claudeHome, extraPath: rewriter })
   assert.equal(fs.existsSync(path.join(repo, '.staged-seen')), true, 'guard against vacuity: the copy was staged during the run')
-  assert.equal(fs.readFileSync(globalFile, 'utf8'), '// global v2 report_path\n', 'guard against vacuity: the global file really changed mid-run')
+  assert.equal(fs.readFileSync(globalFile, 'utf8'), '// global v2\nconst WEEKLY_RUNNER_CONTRACT = 1\n', 'guard against vacuity: the global file really changed mid-run')
   assert.equal(fs.existsSync(stagedPath(repo)), false, `the staged copy must not be left behind:\n${first.logContents}`)
   assert.equal(fs.existsSync(path.join(repo, '.claude', 'workflows')), false, 'nor its marker or the directory the run created')
   const second = runWeeklyScript([repo], { claudeHome, extraPath: witnessingClaudeStub('pass') })
   assert.ok(!/repo ships its own/.test(second.logContents), `the next run must not treat the runner's own copy as the repo's:\n${second.logContents}`)
-  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'), '// global v2 report_path\n', 'and it stages the current global copy')
+  assert.equal(fs.readFileSync(path.join(repo, WITNESS_STAGED), 'utf8'), '// global v2\nconst WEEKLY_RUNNER_CONTRACT = 1\n', 'and it stages the current global copy')
 })
 
 // Finding 4: a SIGKILL leftover is deleted only while it still matches its
@@ -2546,11 +2546,11 @@ exit 0
 test('T11 escalation (finding 4): an untracked leftover that no longer matches its marker (a developer edited it) is never deleted, is called the repo\'s own, and no REMOVED-LEFTOVER-STAGED is logged', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// global v2 report_path\n')
+  withGlobalWorkflow(claudeHome, '// global v2\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   const dir = path.dirname(stagedPath(repo))
   fs.mkdirSync(dir, { recursive: true })
   const marker = path.join(dir, '.optimise-cycle.js.staged')
-  fs.writeFileSync(marker, '// global v1 report_path\n')
+  fs.writeFileSync(marker, '// global v1\nconst WEEKLY_RUNNER_CONTRACT = 1\n')
   fs.writeFileSync(stagedPath(repo), '// edited by a developer\n')
   assert.equal(fs.existsSync(marker), true, 'guard against vacuity: the marker exists before the run')
   const res = runWeeklyScript([repo], { claudeHome, extraPath: witnessingClaudeStub('pass') })
@@ -2581,10 +2581,19 @@ test('T11 escalation (finding 5): an empty repo list still reports only "no repo
 
 // Finding 6: the runner passes report_path, which an older installed workflow
 // does not accept; such a run would FAIL every repo with "report file missing".
-test('T11 escalation (finding 6): an installed optimise-cycle.js that predates report_path FAILs the run with a reason naming the mismatch and bin/install.sh, before any claude runs or anything is staged', () => {
+// Round 4 M3: the fixture is main's real optimise-cycle.js from before this
+// change, not a synthetic string. That file already contains the word
+// report_path (as a return-value key), so a check that greps for the word
+// passes it; only the explicit contract constant tells the two apart.
+const PRE_T11_WORKFLOW = path.join(__dirname, 'fixtures', 'optimise-cycle.main-before-t11.js.txt')
+
+test('T11 escalation (finding 6, round 4 M3): the real pre-change optimise-cycle.js from main FAILs the run with a reason naming the mismatch and bin/install.sh, before any claude runs or anything is staged', () => {
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
-  withGlobalWorkflow(claudeHome, '// an optimise-cycle.js from before the scratch output paths\n')
+  const old = fs.readFileSync(PRE_T11_WORKFLOW, 'utf8')
+  assert.ok(old.length > 10000 && old.includes('report_path'), 'guard against vacuity: the fixture is the real file, and it does contain the word report_path')
+  assert.ok(!old.includes('WEEKLY_RUNNER_CONTRACT'), 'and it carries no contract constant')
+  withGlobalWorkflow(claudeHome, old)
   const home = freshHome()
   const res = runWeeklyScript([repo], { home, claudeHome, extraPath: argvRecordingClaude() })
   assert.match(res.logContents, /^RESULT FAIL - reason="installed optimise-cycle\.js predates report_path; run bin\/install\.sh"$/m, res.logContents)
@@ -2603,6 +2612,70 @@ test('T11 escalation (finding 6): an installed optimise-cycle.js that supports r
   const res = runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
   assert.equal(res.status, 0, res.logContents)
   assert.ok(!/predates report_path/.test(res.logContents), res.logContents)
+})
+
+test('T11 escalation (round 4 M3): the contract the runner requires is the one this repo\'s optimise-cycle.js declares, so the two cannot drift apart unnoticed', () => {
+  const runner = fs.readFileSync(SCRIPT_PATH, 'utf8').match(/^REQUIRED_WORKFLOW_CONTRACT=(\d+)$/m)
+  const workflow = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8').match(/^const WEEKLY_RUNNER_CONTRACT = (\d+)$/m)
+  assert.ok(runner && workflow, 'both sides declare the contract')
+  assert.equal(runner[1], workflow[1])
+})
+
+// Round 4, item 2: the scope step runs `git remote get-url origin`, which a
+// real headless probe showed refused under the allowlist. It is allowed in
+// exactly that spelling: no wildcard, so no other remote subcommand
+// (set-url writes config) and no other remote name.
+test('T11 escalation (round 4): `git remote get-url origin` is allowed exactly, and no other git remote form is', () => {
+  const repo = makeTempRepo()
+  runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
+  const allowed = flagValues(capturedArgv(repo), '--allowedTools')
+  assert.deepEqual(allowed.filter((e) => /\bremote\b/.test(e)), ['Bash(git remote get-url origin)'])
+})
+
+// Round 4, item 3 (L1): the plain `git log` and `git rev-parse` rules run
+// wherever the session's cwd is, so git must never adopt a committed bare-repo
+// layout as a repository there. The session is launched with
+// safe.bareRepository=explicit through GIT_CONFIG_COUNT, extending any count
+// the caller already set rather than overwriting it.
+function gitEnvRecordingClaude() {
+  const dir = freshDir('gitenv-stub-')
+  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
+env | grep '^GIT_CONFIG_' | sort > .claude-gitenv
+mkdir -p planted
+git init -q --bare planted/bare
+( cd planted/bare && git rev-parse --git-dir ) > .bare-out 2>&1
+echo "exit=$?" >> .bare-out
+cat > "$REPORT_OUT" <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF
+exit 0
+`, { mode: 0o755 })
+  return dir
+}
+
+test('T11 escalation (round 4 L1): the session is launched with safe.bareRepository=explicit, so git run inside a planted bare-repo directory refuses it', () => {
+  const repo = makeTempRepo()
+  const res = runWeeklyScript([repo], { extraPath: gitEnvRecordingClaude(), unsetEnv: ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'] })
+  assert.equal(res.status, 0, res.logContents)
+  const env = fs.readFileSync(path.join(repo, '.claude-gitenv'), 'utf8').split('\n').filter(Boolean)
+  assert.deepEqual(env, ['GIT_CONFIG_COUNT=1', 'GIT_CONFIG_KEY_0=safe.bareRepository', 'GIT_CONFIG_VALUE_0=explicit'])
+  const bare = fs.readFileSync(path.join(repo, '.bare-out'), 'utf8')
+  assert.match(bare, /cannot use bare repository/, `git inside the planted bare repo must refuse it:\n${bare}`)
+  assert.match(bare, /exit=[1-9]/, bare)
+})
+
+test('T11 escalation (round 4 L1): a GIT_CONFIG_COUNT the caller already set is extended, never overwritten', () => {
+  const repo = makeTempRepo()
+  const res = runWeeklyScript([repo], {
+    extraPath: gitEnvRecordingClaude(),
+    env: { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.abbrev', GIT_CONFIG_VALUE_0: '12' },
+  })
+  assert.equal(res.status, 0, res.logContents)
+  const env = fs.readFileSync(path.join(repo, '.claude-gitenv'), 'utf8').split('\n').filter(Boolean)
+  assert.deepEqual(env, [
+    'GIT_CONFIG_COUNT=2',
+    'GIT_CONFIG_KEY_0=core.abbrev', 'GIT_CONFIG_KEY_1=safe.bareRepository',
+    'GIT_CONFIG_VALUE_0=12', 'GIT_CONFIG_VALUE_1=explicit',
+  ])
 })
 
 // Finding 7: a timeout names itself.

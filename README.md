@@ -1484,7 +1484,8 @@ is no snapshot and no restart step. **The runner also requires the matching
 not accept, so updating the runner without the workflow makes every repo
 FAIL. Run `bin/install.sh` (which installs `workflows/`) and confirm with
 `bin/install.sh --check`, as well as the copy commands below; a run that finds an installed `optimise-cycle.js`
-without `report_path` stops with `installed optimise-cycle.js predates
+whose `WEEKLY_RUNNER_CONTRACT` constant is missing or lower than the runner's
+`REQUIRED_WORKFLOW_CONTRACT` stops with `installed optimise-cycle.js predates
 report_path; run bin/install.sh`. The `diff -q` pair below confirms the `bin/`
 copies only, so it is necessary but not sufficient on its own:
 

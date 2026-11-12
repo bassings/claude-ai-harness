@@ -146,7 +146,7 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # was indistinguishable in the log from one that had it. Bump this whenever
 # this script's behaviour changes materially; test/static-checks.test.js
 # pins that it has moved past the pre-staleness-check value.
-SCRIPT_VERSION="2026-11-12.2"
+SCRIPT_VERSION="2026-11-13.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REDACT_SCRIPT="$SCRIPT_DIR/redact-transcript.mjs"
@@ -360,8 +360,14 @@ cleanup_run() {
 #     (see the invocation). cat, head, ls, wc and date were dropped
 #     because Read, Grep and Glob cover reading, and each of those commands
 #     takes any path. status, show, diff, ls-files and check-ignore were
-#     dropped as unused by the agent (the helper runs check-ignore itself);
-#     remote was dropped because `git remote set-url` writes config.
+#     dropped as unused by the agent (the helper runs check-ignore itself).
+#     `git remote get-url origin`, which the scope step runs for a report
+#     label, is allowed in exactly that spelling and no other: it prints the
+#     configured URL and contacts nothing, while a wildcard would also admit
+#     `git remote set-url`, which writes config. The plain git rules follow
+#     the session's cwd, so the session is launched with
+#     safe.bareRepository=explicit (see the invocation): git then refuses to
+#     treat a committed bare-repo layout as a repository wherever it runs.
 #   - gh run list and gh run view, from the analysed repo's own directory.
 #     gh repo view is not listed: the workflow never runs it, and with a
 #     HOST/OWNER/REPO argument it sends a request to any host. -R, --repo and
@@ -384,7 +390,7 @@ cleanup_run() {
 # repository's tests.
 ALLOWED_TOOLS=(
   "Skill" "Workflow" "Agent" "Read" "Grep" "Glob"
-  "Bash(git log:*)" "Bash(git rev-parse:*)"
+  "Bash(git log:*)" "Bash(git rev-parse:*)" "Bash(git remote get-url origin)"
   "Bash(gh run list:*)" "Bash(gh run view:*)"
   "Bash(node $CLAUDE_HOME/workflows/lib/optimise-read.mjs:*)"
   "Bash(openssl rand -hex 16)"
@@ -848,8 +854,13 @@ fi
 # optimise-cycle.js older than this runner does not accept; every repo would
 # then FAIL with "report file missing", which names the symptom and not the
 # cause. Such a run stops here, before anything is staged or any session runs.
-# A plugin-only install has no global copy and is not checked.
-if [ -f "$CLAUDE_HOME/workflows/optimise-cycle.js" ] && ! grep -q 'report_path' "$CLAUDE_HOME/workflows/optimise-cycle.js"; then
+# A plugin-only install has no global copy and is not checked. The check reads
+# the workflow's explicit WEEKLY_RUNNER_CONTRACT constant, not a word in it:
+# the copy on main before this change already contained "report_path" (as a
+# return-value key), so a grep for the word let exactly the old file through.
+REQUIRED_WORKFLOW_CONTRACT=1
+installed_contract="$(sed -n 's/^const WEEKLY_RUNNER_CONTRACT = \([0-9][0-9]*\)$/\1/p' "$CLAUDE_HOME/workflows/optimise-cycle.js" 2>/dev/null | head -n1)"
+if [ -f "$CLAUDE_HOME/workflows/optimise-cycle.js" ] && { [ -z "$installed_contract" ] || [ "$installed_contract" -lt "$REQUIRED_WORKFLOW_CONTRACT" ]; }; then
   echo 'RESULT FAIL - reason="installed optimise-cycle.js predates report_path; run bin/install.sh"' >> "$LOG"
   note_fail "-" "installed optimise-cycle.js predates report_path; run bin/install.sh"
   REPOS=()
@@ -1032,8 +1043,14 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # writes refs/harness-snapshots/* in each analysed repo; nothing here
   # prevents that.
   rooted_rules "$repo" "$repo_label"
+  # safe.bareRepository=explicit for the session's git, appended after any
+  # GIT_CONFIG_* entries the caller already passes rather than replacing them.
+  git_cfg_n="${GIT_CONFIG_COUNT:-0}"
+  case "$git_cfg_n" in
+    ''|*[!0-9]*) git_cfg_n=0 ;;
+  esac
   TRANSCRIPT_FILE="$(mktemp "$RUNNER_TMP/optimise-weekly-transcript.XXXXXX")"
-  timeout -k 60 "$TIMEOUT_S" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90, \"report_path\": \"$SCRATCH_REPORT_PATH\", \"proposal_targets_path\": \"$SCRATCH_SIDECAR_PATH\"}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
+  timeout -k 60 "$TIMEOUT_S" env "GIT_CONFIG_COUNT=$((git_cfg_n + 1))" "GIT_CONFIG_KEY_$git_cfg_n=safe.bareRepository" "GIT_CONFIG_VALUE_$git_cfg_n=explicit" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90, \"report_path\": \"$SCRATCH_REPORT_PATH\", \"proposal_targets_path\": \"$SCRATCH_SIDECAR_PATH\"}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
     --allowedTools "${ALLOWED_TOOLS[@]}" ${REPO_ALLOWED[@]+"${REPO_ALLOWED[@]}"} \
     --permission-mode dontAsk \
     --setting-sources user \

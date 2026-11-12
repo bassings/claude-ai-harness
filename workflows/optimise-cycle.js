@@ -23,6 +23,13 @@ const requestedWindow = typeof opts.window === 'number' && opts.window > 0 ? opt
 // nothing here changes. A path that is given must be a plain absolute path
 // with no `..`, `.` or `.claude` segment and only path-safe characters; a bad
 // one stops the run before any agent step rather than being silently ignored.
+//
+// The weekly runner (bin/optimise-cycle-weekly.sh) reads this constant from the
+// installed copy before it stages anything, and refuses to run against a copy
+// whose contract is lower than its own REQUIRED_WORKFLOW_CONTRACT. Raise both
+// together whenever the runner starts relying on a new argument or behaviour
+// here. 1: report_path, proposal_targets_path, and no command substitution.
+const WEEKLY_RUNNER_CONTRACT = 1
 const OUTPUT_PATH_RE = /^\/[A-Za-z0-9_\/.-]+$/
 const outputPathOk = (p) => typeof p === 'string' && OUTPUT_PATH_RE.test(p) && p.split('/').every((seg) => seg !== '..' && seg !== '.' && seg !== '.claude')
 const reportOut = opts.report_path == null ? null : opts.report_path
