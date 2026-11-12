@@ -652,7 +652,8 @@ class TestRefusalQuotesTheCommandAsWritten(unittest.TestCase):
         reason = guard.evaluate('echo x | xargs git clean -fd', self._root)
         self.assertIsNotNone(reason, 'an xargs-fed clean over an untracked file must still be refused')
         self.assertNotIn('git clean -fd', reason, 'the refusal prints no form of the command (its own advice names `git clean -n`); got: %s' % reason)
-        self.assertIn('exactly as first typed', reason)
+        self.assertIn('immediately before the git command that was refused', reason)
+        self.assertNotIn('exactly as first typed', reason)
 
     def test_xargs_unwrapping_appends_no_token_of_its_own(self):
         self.assertEqual(
@@ -933,9 +934,13 @@ REFUSAL_INSTRUCTION_FRAGMENTS = (
     'copy the file to a scratch path first',
     '`git stash`',
     'opt in explicitly',
-    'HARNESS_ALLOW_DESTRUCTIVE_GIT=1 set in front of it',
-    'exactly as first typed',
+    'immediately before the git command that was refused',
+    'not to the whole line',
+    'switches this guard off for everything in that session',
 )
+
+# The part of that every one of the four refusal templates carries (the clean and stash refusals give their own safe alternative).
+REFUSAL_OVERRIDE_FRAGMENTS = REFUSAL_INSTRUCTION_FRAGMENTS[2:]
 
 
 def run_guard_process(command, cwd):
@@ -993,6 +998,68 @@ class TestParsingClassRefusals(unittest.TestCase):
             subprocess.run(['rm', '-rf', tmp])
 
 
+class TestOverrideInstructionWorksAsPrinted(unittest.TestCase):
+    """The refusal says to put HARNESS_ALLOW_DESTRUCTIVE_GIT=1 immediately before the git command that was refused, and that
+    it applies to that one command, not the whole line. This follows the instruction as printed for multi-segment commands
+    and requires the guard to honour it, and requires the variable at the very front of such a line to still be refused,
+    so the scoping the sentence describes is pinned in both directions."""
+
+    # (command, the git call inside it that the refusal is about)
+    MULTI_SEGMENT = (
+        ('git status && git reset --hard', 'git reset --hard'),
+        ('f=tracked.txt; git checkout -- $f', 'git checkout -- $f'),
+        ('echo a # note\ngit checkout -- tracked.txt', 'git checkout -- tracked.txt'),
+        ('echo $(git reset --hard)', 'git reset --hard'),
+        ('for f in tracked.txt; do git checkout -- "$f"; done', 'git checkout -- "$f"'),
+        ('while read f; do git restore "$f"; done < l', 'git restore "$f"'),
+        ('cd . && git checkout -- .', 'git checkout -- .'),
+        ("zsh -c 'git reset --hard'", 'git reset --hard'),
+    )
+    VAR = 'HARNESS_ALLOW_DESTRUCTIVE_GIT=1 '
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        run_git(['init', '-q', '-b', 'master'], self.root)
+        write_file(self.root, 'tracked.txt', 'c\n')
+        run_git(['add', '--', 'tracked.txt'], self.root)
+        run_git(['commit', '-q', '-m', 'seed'], self.root)
+        write_file(self.root, 'tracked.txt', 'dirty\n')
+        self._saved = os.environ.pop(guard.ESCAPE_VAR, None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ[guard.ESCAPE_VAR] = self._saved
+        subprocess.run(['rm', '-rf', self.root])
+
+    def test_every_multi_segment_command_is_refused_to_begin_with(self):
+        for command, _call in self.MULTI_SEGMENT:
+            with self.subTest(command=command):
+                self.assertIsNotNone(guard.evaluate(command, self.root))
+
+    def test_the_variable_directly_before_the_refused_git_call_is_honoured(self):
+        for command, call in self.MULTI_SEGMENT:
+            with self.subTest(command=command):
+                placed = command.replace(call, self.VAR + call, 1)
+                self.assertNotEqual(placed, command)
+                self.assertIsNone(guard.evaluate(placed, self.root),
+                                  'the printed instruction did not get through for %r' % (placed,))
+
+    def test_the_variable_at_the_front_of_a_multi_segment_line_is_not_enough(self):
+        # A `bash -c`/`zsh -c` line is one segment, and the variable on it covers the body, so it is left out here.
+        for command, _call in self.MULTI_SEGMENT:
+            if command.startswith('zsh -c'):
+                continue
+            with self.subTest(command=command):
+                self.assertIsNotNone(guard.evaluate(self.VAR + command, self.root),
+                                     'the variable in front of the whole line must not disarm a later segment')
+
+    def test_the_refusal_names_that_position_and_not_the_whole_line(self):
+        reason = guard.evaluate('git status && git reset --hard', self.root)
+        self.assertIn('immediately before the git command that was refused', reason)
+        self.assertIn('not to the whole line', reason)
+        self.assertNotIn('exactly as first typed', reason)
+
+
 class TestClassNotesDoNotClaimCausation(unittest.TestCase):
     """AC-OPS-8 says a refusal names the class that FIRED. The guard reads the whole command text, and does not re-run the
     match without each construct, so a comment, a continuation or an adjacent operator is reported as something the
@@ -1035,15 +1102,16 @@ class TestClassNotesDoNotClaimCausation(unittest.TestCase):
                 self.assertNotIn('git checkout', stderr)
                 self.assertNotIn('git restore', stderr)
                 self.assertIn('HARNESS_ALLOW_DESTRUCTIVE_GIT', stderr)
-                self.assertIn('exactly as first typed', stderr)
+                self.assertIn('immediately before the git command that was refused', stderr)
 
     def test_every_refusal_template_has_the_same_instruction_and_no_command_slot(self):
         for name in ('REFUSAL', 'REFUSAL_DYNAMIC', 'REFUSAL_CLEAN', 'REFUSAL_STASH'):
             template = getattr(guard, name)
             with self.subTest(template=name):
                 self.assertNotIn('{cmd}', template, 'a refusal must not have a slot for the refused command')
-                self.assertIn('re-run the original command exactly as first typed', template)
-                self.assertIn('{var}=1 set in front of it', template)
+                for fragment in REFUSAL_OVERRIDE_FRAGMENTS:
+                    self.assertIn(fragment, template)
+                self.assertNotIn('exactly as first typed', template, 'a variable in front of a whole line is not honoured')
 
     def test_a_class_note_appears_once_however_deeply_the_refusal_is_nested(self):
         self.assertEqual(self._stderr("zsh -c \"zsh -c 'git reset --hard'\" # y").count('[class: zsh -c'), 1)
@@ -1056,6 +1124,9 @@ class TestClassNotesDoNotClaimCausation(unittest.TestCase):
         stderr = self._stderr('git checkout "$f"')
         self.assertIn('class: dynamic pathspec', stderr)
         self.assertIn('A branch or path here is built when the command runs', stderr)
+        self.assertIn('@{...}', stderr)
+        self.assertIn('`@{-1}`', stderr)
+        self.assertIn('git switch -', stderr)
         for fragment in REFUSAL_INSTRUCTION_FRAGMENTS:
             self.assertIn(fragment, stderr)
 

@@ -1511,13 +1511,26 @@ def stash_would_lose_entries(cwd, target):
     return ref in entries
 
 
+# The override instruction every refusal carries. It prints no command text.
+# The inline form is scoped to ONE segment (escape_hatch_active_for_segment),
+# so it has to sit directly before the refused git call: in front of a whole
+# multi-segment line it covers only the first segment, and in front of `for`
+# it is a syntax error.
+OVERRIDE_INSTRUCTION = (
+    "put {var}=1 immediately before the git command that was refused; it "
+    "applies to that one command, not to the whole line, so in a loop, a "
+    "multi-line command or a `$(...)` it goes on the git call inside it. "
+    "Exporting {var}=1 for the session also works, but it switches this "
+    "guard off for everything in that session."
+)
+
 REFUSAL = (
     "destructive-git-guard: refused this command -- it would discard "
     "uncommitted work (`git status` shows a tracked, uncommitted change in "
     "scope). Safe alternatives: copy the file to a scratch path first, or "
     "`git stash` before retrying. If this revert is deliberate, opt in "
-    "explicitly: re-run the original command exactly as first typed with "
-    "{var}=1 set in front of it, or exported for the session. If work is already lost another way, hooks/git-snapshot.py "
+    "explicitly: " + OVERRIDE_INSTRUCTION + " If work is already lost "
+    "another way, hooks/git-snapshot.py "
     "may have a recoverable copy -- list them with: git for-each-ref "
     "--format='%(refname) %(creatordate:iso-strict) %(contents:subject)' "
     "refs/harness-snapshots/"
@@ -1529,15 +1542,17 @@ REFUSAL = (
 REFUSAL_DYNAMIC = (
     "destructive-git-guard: refused this command -- class: dynamic pathspec. A "
     "branch or path here is built when the command runs (a variable, a "
-    "`$(...)` or backtick substitution, a `{{a,b}}` brace expansion or a "
-    "`~`), so this guard cannot tell whether it names a branch, which "
+    "`$(...)` or backtick substitution, a `{{a,b}}` brace expansion, a "
+    "`~`, or `@{{...}}`, which is git's own ref syntax (`@{{-1}}`, `@{{u}}`, "
+    "`HEAD@{{1}}`) but is also a brace expansion), so this guard cannot tell "
+    "whether it names a branch, which "
     "discards nothing, or a file, which it would revert. It treats the whole "
     "tree as in scope, and `git status` shows a tracked, uncommitted change "
     "that could be discarded. Safe "
-    "alternatives: name the paths literally, copy the file to a scratch path "
+    "alternatives: to switch branches use `git switch -` or a literal "
+    "branch name, name the paths literally, copy the file to a scratch path "
     "first, or `git stash` before retrying. If this revert is deliberate, opt "
-    "in explicitly: re-run the original command exactly as first typed with "
-    "{var}=1 set in front of it, or exported for the session. If work is "
+    "in explicitly: " + OVERRIDE_INSTRUCTION + " If work is "
     "already lost another way, "
     "hooks/git-snapshot.py may have a recoverable copy -- list them with: git "
     "for-each-ref --format='%(refname) %(creatordate:iso-strict) "
@@ -1560,9 +1575,7 @@ REFUSAL_CLEAN = (
     "which this guard cannot measure), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: run `git clean "
     "-n` yourself first and inspect the list. If this cleanup is "
-    "deliberate, opt in explicitly: re-run the original command exactly as "
-    "first typed with {var}=1 set in front of it, or exported for the "
-    "session."
+    "deliberate, opt in explicitly: " + OVERRIDE_INSTRUCTION
 )
 
 REFUSAL_STASH = (
@@ -1576,8 +1589,7 @@ REFUSAL_STASH = (
     "cannot measure), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: `git stash list` "
     "to inspect the stash entries first. If this is deliberate, opt in "
-    "explicitly: re-run the original command exactly as first typed with "
-    "{var}=1 set in front of it, or exported for the session."
+    "explicitly: " + OVERRIDE_INSTRUCTION
 )
 
 # K1 review round 2/3: this refusal fires BEFORE any tokenising, so there is

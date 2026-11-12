@@ -5723,9 +5723,7 @@
         }
       ],
       "expect": "block",
-      "note": "HARN-AUDIT-1 T5 AC-SEC-1: continuation inside git checkout -- .",
-      "class": "backslash continuation",
-      "bare": "git checkout -- ."
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: continuation inside git checkout -- . (Round 4 L2: blocked even without joining the continuation, so this row is a regression pin and carries no class tag; the row below blocks only when the continuation is joined.)"
     },
     {
       "command": "git checkout -- \\\ntracked.txt",
@@ -9779,6 +9777,96 @@
       ],
       "expect": "block",
       "note": "HARN-AUDIT-1 T5 fix round 3 L2: the same with a path; the shell would hand git `tracked.txt\\r`, the guard reads `tracked.txt`. Stricter reading, pinned."
+    },
+    {
+      "command": "git checkout -\\\n- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 4 L2: blocks only when the continuation is joined. Unjoined this is `git checkout -` (the previous branch) then a line that is not git.",
+      "class": "backslash continuation",
+      "bare": "git checkout -- ."
+    },
+    {
+      "command": "cd sub |& true; git checkout -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 4 L1: `|&` makes the `cd` run in its own subshell, so the guard measures the dirty outer tree, not the clean nested repo. Without the `|&` handling the guard moves into `sub` and allows it."
+    },
+    {
+      "command": "cd sub | true; git checkout -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 4 L1: the `|` control for the row above."
     }
   ]
 }

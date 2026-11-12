@@ -555,7 +555,9 @@ past it.
   branch or a file IS refused on a dirty tree, and so is any `@{...}`: that
   is a documented over-block, because a file reverted by mistake is lost and
   a refusal costs one retry with the override
-  (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, set inline in front of the command).
+  (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, put immediately before the git command
+  that was refused). For a branch switch, `git switch -` or a literal branch
+  name is not refused.
   These commands, which a guard that read `@{...}` as git's ref syntax would
   have let through, are refused while a tracked file is dirty:
   `git checkout @{-1}`, `git checkout @{u}`, `git checkout HEAD@{1}`,
@@ -565,9 +567,13 @@ past it.
   lone `@{1}` is a file name in a pathspec position, so the text alone does
   not say which one it is. An operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis at the end of a line, or beside another one, no longer hides the next command: the tokeniser read such a run as one token, so the text is spaced around them first. A refusal does not print the refused command: a hint rebuilt from the
   guard's own tokens once turned an inert single-quoted `$(...)` into a live
-  one. It says to re-run the original command exactly as first typed with
-  `HARNESS_ALLOW_DESTRUCTIVE_GIT=1` set in front of it (or exported for the
-  session), and says which parsing class applied. A
+  one. It says to put `HARNESS_ALLOW_DESTRUCTIVE_GIT=1` immediately before
+  the git command that was refused: the inline form applies to that one
+  command, not the whole line, so in a loop, a multi-line command or a
+  `$(...)` it goes on the git call inside it, and in front of `git status &&
+  git reset --hard` it would not cover the reset. Exporting it for the session
+  also works but switches the guard off for everything in that session. The
+  refusal also says which parsing class applied. A
   `zsh -c` refusal names `zsh -c` as the class that fired, because its body is
   only checked at all as zsh is unwrapped. A `dynamic pathspec` refusal has
   its own text. For `comment continuation`, `backslash continuation` and
@@ -654,7 +660,7 @@ measured, none is guarded, and none is planned to be.
 | A run-time pathspec on a command other than `checkout`/`restore` | `git clean -fd "$X"`, `git clean -fd -- "$X"`, `git clean -fd ${X}` | `git checkout` and `git restore` read a pathspec containing `$`, a backtick, `$(...)`, `{...}` or a leading `~` as whole-tree scope (class `dynamic pathspec`), so a dirty tracked file anywhere refuses them. `git clean` does not for a variable or a brace: its dry run measures the pathspec as literal text, which matches nothing, so untracked files go unmeasured. A `$(...)` or backtick substitution IS handled: it is dropped from the dry run, which widens it to everything the other arguments select, so `git clean -fd -- $(cat list)` is refused. Not detected. |
 | An apostrophe inside a double-quoted string | `git commit -m "don't" && echo $(git reset --hard)` | Substitution extraction flips into single-quote mode at the apostrophe, so every `$(...)` and backtick after it on the line is never looked at. |
 | `-n` where it is not a flag | `git clean -f -e -n`, `git clean -f -- -n` | Any `-n` token anywhere reads as `--dry-run`, so the invocation is treated as harmless and never measured. Measured: `git clean -f -e -n` was ALLOWED and the real run deleted every untracked file in the tree. |
-| Nesting past `MAX_UNWRAP_DEPTH` | six or more stacked `bash -c` / `$(...)` layers | Past the bound everything fails OPEN, the clean and stash rules included, so these two lose their fail-closed posture exactly where an adversary would put them. |
+| Nesting past `MAX_UNWRAP_DEPTH` | six or more stacked `bash -c` / `$(...)` layers | Past the bound everything fails OPEN, with no notice, the clean and stash rules included, so these two lose their fail-closed posture exactly where an adversary would put them. |
 | `git stash store` | `C=$(git stash create) && git stash store "$C" && git stash drop` | `store` is treated as a non-push, so the entry it adds is not counted and the following drop is allowed. The working tree survives, so this one costs a dangling commit rather than live work. |
 | `eval` | `eval 'git reset --hard'` | Never unwrapped at all. |
 | A substitution as the binary path | `$(which git) checkout -- file` | The guard cannot resolve what the substitution prints, so it never recognises the invocation as `git`. |
@@ -670,7 +676,9 @@ measured, none is guarded, and none is planned to be.
 | A script fed to a shell on its standard input | `echo 'git reset --hard' \| zsh`, `zsh <<< 'git reset --hard'` | Nothing on the command line names the script, so it is never matched. |
 | A command built at run time or defined elsewhere | `f() { git reset --hard; }; f`, `G=git; $G reset --hard`, `zsh -c "$(echo git reset --hard)"` | The destructive text is never a literal token in a position the guard reads. |
 | A here-document fed to a shell | `bash <<'EOF'` ... `EOF` | Heredoc bodies are blanked uniformly before matching, which is right for the inert case (`cat <<EOF`) and wrong for this one. |
-| Input the tokeniser cannot parse | an unbalanced quote | Fails open by design; the guard only ever refuses a shape it positively identifies. |
+| Input the tokeniser cannot parse | an unbalanced quote, ANSI-C quoting such as `echo $'it\'s'; git reset --hard`, a trailing lone backslash | The command is allowed with no notice: nothing raised, so the "NOT checked" message that a guard exception produces is not sent either, and neither the user nor Claude is told the command was never read. The guard only ever refuses a shape it positively identifies. Not detected. |
+| A `cd` on the left of a background operator | `cd <clean directory> & git reset --hard`, and the same with `&\|` or `&!` | The guard moves its dirty check into the clean directory, but the shell runs the next command in the original one, so the dirty tree is reset. `\|` and `\|&` are handled (the `cd` runs in its own subshell); `&`, `&\|` and `&!` are not. The `&` form is the same on main. Not detected. |
+| Heredoc delimiters spelled `<<\EOF`, `<<"E-F"` or `<<E.F` | `cat <<\EOF`, a line with an apostrophe, `EOF`, then `git checkout -- file` | The delimiter pattern reads only plain words, so these markers are misread, the apostrophe in the body opens a quote, and the text is unparseable and fails open. bash and zsh both revert the file. Not detected. |
 | The oversize shortcut's `git` test | 65,536+ characters containing `g''it` but not `git` | Over the parsing cap, a command with no literal `git` substring is allowed unparsed. Quote removal defeats the substring test. |
 
 Writing or quoting a guarded command as inert TEXT -- inside a here-document
