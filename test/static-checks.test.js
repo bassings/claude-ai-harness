@@ -1114,7 +1114,7 @@ test('static: README.md documents the launchd rollback for com.local.optimise-cy
 // closes that coverage gap mechanically, so a future edit cannot silently
 // drop either control without a red test naming exactly which token
 // vanished.
-test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh contains every required --disallowedTools deny token and the --settings disableAllHooks blob (subtraction round item 3) -- deleting either previously shipped the suite green, since every test drives a stub `claude`, never the real flags', () => {
+test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh contains every required --disallowedTools deny token and the allowlist flags, and no longer disables hooks (subtraction round item 3, reversed by T11 AC-SEC-8) -- deleting any previously shipped the suite green, since every test drives a stub `claude`, never the real flags', () => {
   const script = readAll('bin', 'optimise-cycle-weekly.sh')
   const lines = script.split('\n')
   // Scoped to the ACTUAL invocation block, not the whole file: a whole-file
@@ -1146,10 +1146,11 @@ test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh con
   for (const token of requiredDenyTokens) {
     assert.ok(callSite.includes(token), `the claude -p call site must deny ${token}`)
   }
-  assert.ok(
-    callSite.includes('--settings \'{"disableAllHooks": true}\''),
-    'the claude -p call site must pass --settings \'{"disableAllHooks": true}\''
-  )
+  assert.ok(callSite.includes('--allowedTools'), 'the claude -p call site must pass --allowedTools')
+  assert.ok(callSite.includes('--permission-mode dontAsk'), 'the claude -p call site must refuse unlisted tools with --permission-mode dontAsk')
+  assert.ok(callSite.includes('--session-id "$SESSION_ID"'), 'the claude -p call site must pass --session-id, which is how the plan marker is recognised and restored')
+  assert.ok(callSite.includes('--setting-sources user'), 'the claude -p call site must load user settings only, so a repo cannot widen the allowlist')
+  assert.ok(!callSite.includes('--settings'), 'the claude -p call site must not override settings: the guard and snapshot hooks stay on')
 })
 
 test('static: bin/com.local.optimise-cycle-weekly.plist is tracked in the repo and is a valid plist containing no real account path (it is a template -- every path is a /Users/YOUR_USERNAME placeholder, since this repo is public)', () => {

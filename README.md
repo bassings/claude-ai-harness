@@ -1407,54 +1407,137 @@ anchored to that specific message, not a bare grep for the ceiling
 variable's name, which used to false-positive on any transcript merely
 mentioning it (this README does, right here).
 
-**Permission constraints on the unattended job -- defence in depth, not a
-boundary.** `claude -p` runs here with `--disallowedTools` denying the
-destructive and outward-facing operations this read-only job never needs:
-`Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`, `Bash(git commit:*)`,
-`Bash(git reset:*)`, `Bash(gh pr merge:*)`, `Bash(gh pr create:*)`,
-`Bash(gh issue create:*)`, `Bash(gh release create:*)`,
-`Bash(gh workflow run:*)`, `Bash(curl:*)`, `Bash(wget:*)`, alongside
-`--settings '{"disableAllHooks": true}'` (see the plan-guard note below).
-Both are real: verified empirically, end to end, against a throwaway repo
-with both flags applied, a well-formed report was still produced (exit 0),
-and every one of the listed tools genuinely refused when invoked directly.
-**They are not a sandbox, and nothing here claims they are one.** The same
-real run showed `Write`, `Edit`, `mv` and `python3 -c` all succeed under
-this exact flag set -- `--disallowedTools` denies only its literal
-enumerated targets, and `--settings` **merges** with (does not replace)
-the global `defaultMode: auto`, so a tool not on the list is still
-reachable. The actual containment for this job is the prompt's own
-read-only instruction plus the fact that the verdict never trusts what the
-model says (PASS/FAIL above); these flags are real, additional defence in
-depth behind that, not a second, independent boundary. `--permission-mode
-plan` was considered and rejected: plan mode would prevent the optimiser
-writing the report this script's own verdict depends on, silently trading
-a permission problem for a job that runs and produces nothing.
-`test/static-checks.test.js` pins the exact deny tokens and the
-`disableAllHooks` blob in the script text, so neither can be quietly
-dropped -- deleting either previously left the whole weekly-runner test
-suite green, since every test there drives a stub `claude`, never the real
-flags.
+**Permission constraints on the unattended job -- an explicit allowlist, with
+the hooks left on.** `claude -p` runs here with `--allowedTools` naming every
+tool the optimiser needs (read-only git and gh queries, the two node helpers
+the workflow invokes, and `Edit` on exactly two scratch files, below) and
+`--permission-mode dontAsk`, which refuses every tool not on the list rather
+than prompting or auto-approving it, and `--setting-sources user`, so only the
+user's own settings load and an analysed repo's committed or local settings
+cannot widen the list or add hooks (the guard, snapshot and plan-guard hooks
+are registered at user level, so they stay). `--setting-sources user` also
+loads the operator's own `permissions.allow` rules from
+`~/.claude/settings.json`, and any such rule joins the unattended allowlist,
+so the list above is the boundary only when the operator has no user-level
+allow rules. Agents defined inside an analysed repo (`.claude/agents/`) are not
+loaded under `--setting-sources user`, and a built-in subagent started by the
+session was refused both a write outside the repo and an unlisted Bash
+command; agents the operator has installed at user level do load, and are
+trusted as the operator's own. `--disallowedTools` stays as a second,
+explicit refusal of `Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`,
+`Bash(git commit:*)`, `Bash(git reset:*)`, `Bash(gh pr merge:*)`,
+`Bash(gh pr create:*)`, `Bash(gh issue create:*)`,
+`Bash(gh release create:*)`, `Bash(gh workflow run:*)`, `Bash(curl:*)` and
+`Bash(wget:*)`, plus `git -c` in its `-C` form. The hooks are **not**
+disabled: the destructive-command guard and the snapshot hook stay active for
+the unattended session.
 
-**The plan-guard Stop hook is the one measured mutation source, and
-`disableAllHooks` genuinely stops it.** Measured 2026-08-16: the
-globally-installed conductor plan-guard Stop hook touched
-`.claude/active-plan` in both delivery repos during the real run, as a
-side effect of the background workflow the optimiser launches -- nothing
-this script does, but a mutation of the analysed repo all the same.
-`--settings '{"disableAllHooks": true}'` stops that hook firing for this
-one invocation (verified empirically: `.claude/active-plan`'s mtime was
-unchanged after a real run against a repo with the identical hook wired
-and an open-task plan active). There is no postcondition checking this
-after the fact any more (see the subtraction-round note above for why).
+**No allowed command may send data to a host the session chooses.** `Read`,
+`Grep` and `Glob` can read any file this user can read, so the boundary is
+egress, not readability. `gh repo view` is not on the list (the workflow never
+runs it, and with a `HOST/OWNER/REPO` argument it sends a request to any
+host), and `-R`, `--repo` and `--hostname` are denied on every `gh` command,
+in their attached and separate forms and inside a short-flag cluster
+(`Bash(gh * -R*)`, `Bash(gh * -*R*)`, `Bash(gh * --repo*)`,
+`Bash(gh * --hostname*)` and the same at the front of the command), as are the
+`GH_HOST=` and `GH_REPO=` prefixes. `gh run list` and `gh run view` therefore
+reach only the host the analysed repo's own remote names. `git -C` and the
+`optimise-report-ignore.mjs` helper (which writes `<root>/.git/info/exclude`
+and runs git there) are allowed only with `<root>` naming the analysed repo
+itself, never a wildcard path, because git run in a directory someone planted
+reads that directory's config, which can name a program git executes. A repo
+whose path a rule cannot name exactly gets no such rule, and the log says
+`NO-ROOTED-RULES <label>`. These are deny and prefix rules; whether the CLI
+matches every spelling is for a real headless run to show.
+`test/static-checks.test.js` pins the deny tokens and the allowlist flags in
+the script text, and `test/weekly-runner.test.js` captures the real argument
+list. The test suite still drives a stub `claude`. Real headless probes
+under the runner's flags were run by hand during review: the `gh`
+host-naming forms were refused, `git remote get-url origin` was allowed and
+`git remote set-url` refused, and `safe.bareRepository` reached the session's
+git. The full real weekly run is recorded in `docs/release-checklist.md` when
+it happens.
+
+**The session never writes under `.claude/`.** Measured on a real headless
+run (Claude Code 2.1.322, `dontAsk`): every write into `.claude/` is refused
+whatever the allow rule. So the runner names two scratch files in a
+directory of this one run's own (below) and passes them to the workflow as `report_path` and
+`proposal_targets_path`; the session may `Edit` those two files and nothing
+else, and writes no other file. After the session ends the runner, not the
+session, moves each into place (`.claude/optimise-cycle-report.md` in the
+repo, and the sidecar under the main checkout the optimiser resolved). It
+accepts a file only if it is a regular file (not a symlink), non-empty and
+under a size cap, and moves it through a fresh temp file and a rename, so
+nothing is written through a symlink. A file that is present and refused makes
+the repo FAIL with the reason; one that is absent is reported by the verdict
+as a missing or stale report. The scratch path must be a plain absolute path
+with no `.claude` segment, so with `$TMPDIR` unset and `~/.claude` as the
+fallback the run stops with a FAIL (launchd always sets `$TMPDIR`).
+
+**The plan-guard Stop hook rewrites a dormant plan marker, and the runner puts
+it back.** Measured: the hook rewrote a dormant `.claude/active-plan` (a stale
+conductor line) to an absolute plan path with `conductor: <the headless
+session id>`. Each run is given `--session-id <uuid>`, the runner saves the
+marker's bytes first, and afterwards restores them byte for byte only if the
+marker now carries that uuid, so a real conductor's concurrent change is never
+overwritten (a marker that did not exist before and now carries the uuid is
+removed). `RESTORED-ACTIVE-PLAN <label>` is logged when that happens, and the
+restore runs from the same cleanup path, so a signal still restores. A
+SIGKILL skips it. This does not stop the hook from blocking the headless
+session's own stop while plan tasks are open, and the real conductor is
+treated as a bystander for the length of the run. Separately, the snapshot
+hook still writes `refs/harness-snapshots/*` in every analysed repo on each
+weekly run; nothing here prevents that.
+
+**A FAIL is announced, and cleanup is the runner's job.** When any repo's
+verdict is FAIL, no repos are configured, or every configured path is skipped
+(`no repos checked (all skipped)`), the run raises one macOS
+notification naming the failing repo labels and the first reason, and writes
+one line to `~/.claude/logs/optimise-cycle-weekly.last-result` (UTC timestamp,
+PASS or FAIL, labels, reasons) that stays until the next run overwrites it. A
+notifier that fails leaves `NOTIFY-FAILED <exit code>` in the run log. The
+transcript temp file and the staged `optimise-cycle.js` are removed on exit
+and on SIGTERM or SIGINT, and a run that is stopped that way records FAIL and
+notifies like any other FAIL. Each invocation makes a directory of its own,
+`run.XXXXXX` (from `mktemp -d`), inside a mode-700 parent that only the runner
+writes to (`optimise-weekly-runner` under `$TMPDIR`, or under `~/.claude` when
+that is unset), and every per-run file (transcript, scratch report and sidecar,
+plan-marker snapshot, staleness clone) lives in it, so overlapping runs, or a
+run overlapping a test, never share a file name. The run removes its own
+directory on exit, after the outputs are placed and the plan marker restored.
+The parent is checked after it is created (not a link, owned by this user, its
+physical path as expected) and only then chmodded. At start-up a run removes
+only stale `run.XXXXXX` directories: real directories (links are not followed)
+owned by this user and older than 24 hours, which is longer than any run can
+last (the 21-minute session timeout per repo), logging
+`REMOVED-STALE-RUN-DIR <name>`. A sibling's fresh directory is never touched.
+There is no lock. After a SIGKILL the dead run's directory therefore stays for
+up to 24 hours, and its plan-marker snapshot is not used to restore a marker
+that carries the dead session's id (the conductor's own six-hour staleness rule
+re-claims it). The next run also recognises a killed run's staged copy by a
+marker, removes it if git does not track it, and logs
+`REMOVED-LEFTOVER-STAGED <label>`. The outcome file reads `RUNNING` from the
+moment a run starts, so a run that dies without reporting leaves `RUNNING`,
+not last week's result, and a failed write of it is logged as
+`LAST-RESULT-WRITE-FAILED`. If the plan marker cannot be restored (the
+snapshot is missing or the write fails) it is left exactly as it was,
+`RESTORE-FAILED-ACTIVE-PLAN <label>` is logged and the repo FAILs.
 
 **Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
 and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
 repo's `bin/`** after merging any change to them. Unlike the top-level
 workflow scripts above, copying these genuinely does deploy them: launchd
 spawns a fresh shell process per run, which reads the file at exec, so there
-is no snapshot and no restart step. The `diff -q` pair is therefore a
-sufficient check here, not merely a necessary one:
+is no snapshot and no restart step. **The runner also requires the matching
+`workflows/optimise-cycle.js`**: it passes the workflow arguments
+(`report_path`, `proposal_targets_path`) that an older installed workflow does
+not accept, so updating the runner without the workflow makes every repo
+FAIL. Run `bin/install.sh` (which installs `workflows/`) and confirm with
+`bin/install.sh --check`, as well as the copy commands below; a run that finds an installed `optimise-cycle.js`
+whose `WEEKLY_RUNNER_CONTRACT` constant is missing or lower than the runner's
+`REQUIRED_WORKFLOW_CONTRACT` stops with `installed optimise-cycle.js predates
+report_path; run bin/install.sh`. The `diff -q` pair below confirms the `bin/`
+copies only, so it is necessary but not sufficient on its own:
 
 ```bash
 cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
@@ -1523,6 +1606,13 @@ rm ~/Library/LaunchAgents/com.local.optimise-cycle-weekly.plist
 ```
 
 To reinstate it later, re-run the two-line `sed`/`bootstrap` install above.
+
+If the job was ever killed with SIGKILL before the rollback, also delete
+`.claude/workflows/.optimise-cycle.js.staged` in each configured repo, and
+`.claude/workflows/optimise-cycle.js` there if it is byte-identical to that
+marker and untracked. The pre-T11 runner knows nothing of the marker and reads
+any existing workflow file as the repo's own, so a stale copy would otherwise
+stay pinned and override later global updates with no log line.
 
 **This rollback has been executed, not merely documented** (2026-08-18, per
 CLAUDE.md §11: a documented rollback nobody has run is an assumption). The
