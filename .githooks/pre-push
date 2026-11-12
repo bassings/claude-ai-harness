@@ -49,6 +49,12 @@ fi
 echo "pre-push: running the test suite (${_count} files)"
 node --test test/*.test.js
 
+# The test files that run the ledger writer must also pass in a shell that exports HARNESS_LEDGER_READONLY
+# (the writer refuses every write then). Mirrors the same step in .github/workflows/ci.yml; it replaced a test
+# that spawned `node --test` from inside the suite. test/harn-opt-6-r2-env.test.js pins that both list these files.
+echo "pre-push: running the ledger writer's test files with HARNESS_LEDGER_READONLY exported"
+HARNESS_LEDGER_READONLY=1 node --test test/harn-opt-6-t1.test.js test/harn-opt-6-gap.test.js test/review-cycle-finding-ids.test.js test/ledger-append.test.js test/sigkill-orphan.test.js
+
 # The Python hooks suite. Added 2026-09-05 after an adversarial pass found that
 # hooks/plan-guard-stop.py -- the no-stall guard -- could be broken outright with
 # this gate still reporting success: no file under test/ mentions it, so the Node
