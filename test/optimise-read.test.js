@@ -1040,54 +1040,64 @@ test('optimise-read CLI: `node optimise-read.mjs ledger <rootA> <rootB>` combine
   assert.equal(perRepoSum, out.n, 'with no window truncation, perRepo\'s summed counts must equal n exactly -- no starvation, no divergence')
 })
 
-// Round-4 review L8 (AC-QA-20): the AC states a 0.5s wall-clock bound over
-// a 2000-record ledger, but the ONLY thing enforcing it was a structural
-// guard (test/optimise-static.test.js: the per-record loops contain no fs
-// call) -- real, but it proves an O(1)-per-record SHAPE, not a wall-clock
-// NUMBER; an algorithmic regression that stayed fs-free but went quadratic
-// in record count would pass every existing check. This is the timing
-// assertion itself, generous (2s, not 0.5s) so it cannot flake under
-// parallel suite load the way a tight bound would -- both lenses measured
-// one to two orders of magnitude inside 0.5s (3.9-6.6ms via the exported
-// functions, 43-50ms via the real CLI), so 2s leaves ample headroom while
-// still catching a genuine quadratic-blowup regression.
-test('optimise-read CLI: aggregating a real 2000-record ledger through the CLI stays well under a generous 2s wall-clock ceiling, three consecutive runs (L8, AC-QA-20)', () => {
+// Round-4 review L8 (AC-QA-20) asked for a guard against an algorithmic regression that stays free of fs calls (which
+// test/optimise-static.test.js already pins) but goes quadratic in record count. The first version timed the CLI against
+// a wall-clock ceiling (2s, then the median of three runs under 500ms); it failed on loaded and shallow-clone runners at
+// 855ms and 2512ms (HARN-AUDIT-1 T1, AC-QA-1). The property is now a deterministic work count over the WHOLE command: the
+// real CLI (`ledger <repo>`: parse, window, sort, every aggregator, the sidecar and label steps) runs as a child with a
+// preload that adds the length of the array to a counter each time an Array.prototype method that walks or copies an array
+// is called (includes, indexOf, find, filter, concat, slice, iteration and the rest). That is the work an accumulator
+// built on those methods costs, so a linear pass costs about the same per record at 500 and at 2000 records (ratio 1) and a
+// per-record call to one of them on a growing array (a find or includes over an accumulator) multiplies the ratio by the
+// size factor (4). It sees only those Array.prototype calls: a hand-written indexed loop (`for (let i = 0; ...)`) over a
+// growing array, or a scan of a Map, Set or object, adds nothing to the count and is NOT caught. The fixture's distinct keys (spec,
+// plan, finding id, AC id) grow with n, because an accumulator keyed on a few values stays small however many records
+// there are and would hide the very quadratic this is for.
+const ledgerRecord = (i) => ({
+  schema_version: 2, run_id: `r${i}`, ts: `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+  repo: 'demo', kind: 'review_cycle', outcome: 'done', spec: `specs/${i}.md`, plan_key: `specs/${i}.md`,
+  lenses_run: ['lens-security', 'lens-qa'], lenses_skipped: [],
+  findings: [{ id: `f${i}`, lens: 'lens-qa', severity: 'Low', ac_id: `AC-QA-${i + 1}`, disposition: 'open' }],
+  ac_verdicts: [{ ac_id: `AC-QA-${i + 1}`, verdict: i % 7 === 0 ? 'FAIL' : 'PASS' }],
+  write_ok: true, write_error: null,
+})
+
+const ARRAY_WORK_PRELOAD = `
+const counted = ['includes', 'indexOf', 'lastIndexOf', 'find', 'findIndex', 'findLast', 'findLastIndex', 'some', 'every', 'filter', 'map', 'forEach', 'reduce', 'reduceRight', 'flatMap', 'flat', 'concat', 'slice', 'splice', 'join', 'at']
+let total = 0
+for (const name of counted) {
+  const original = Array.prototype[name]
+  Array.prototype[name] = function (...args) { total += this.length; return original.apply(this, args) }
+}
+const iterator = Array.prototype[Symbol.iterator]
+Array.prototype[Symbol.iterator] = function () { total += this.length; return iterator.call(this) }
+Array.prototype.values = Array.prototype[Symbol.iterator]
+process.on('exit', () => require('node:fs').writeFileSync(process.env.ARRAY_WORK_LOG, String(total)))
+`
+
+function arrayWorkPerRecord(n) {
   const repo = makeTempRepo()
   const ledgerPath = path.join(repo, LEDGER_REL)
   fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
-  const lines = []
-  for (let i = 0; i < 2000; i++) {
-    lines.push(JSON.stringify({
-      schema_version: 2, run_id: `r${i}`, ts: `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
-      repo: 'demo', kind: 'review_cycle', outcome: 'done', spec: `specs/${i % 20}.md`, plan_key: `specs/${i % 20}.md`,
-      lenses_run: ['lens-security', 'lens-qa'], lenses_skipped: [],
-      findings: [{ id: `f${i}`, lens: 'lens-qa', severity: 'Low', ac_id: `AC-QA-${(i % 5) + 1}`, disposition: 'open' }],
-      ac_verdicts: [{ ac_id: `AC-QA-${(i % 5) + 1}`, verdict: i % 7 === 0 ? 'FAIL' : 'PASS' }],
-      write_ok: true, write_error: null,
-    }))
-  }
-  fs.writeFileSync(ledgerPath, lines.join('\n') + '\n')
-  const elapsedMs = []
-  for (let run = 0; run < 3; run++) {
-    const before = Date.now()
-    const res = spawnSync('node', [MODULE_PATH, 'ledger', repo], { encoding: 'utf8' })
-    elapsedMs.push(Date.now() - before)
-    assert.equal(res.status, 0, res.stderr)
-    const out = JSON.parse(res.stdout.trim())
-    assert.equal(out.n, 2000, 'sanity: the real fixture must actually reach aggregation, not be windowed/skipped away')
-  }
-  // Round-7 review F13: AC-QA-20 states the bound as 0.5s ("current
-  // measured: 0.05s"), but this test enforced 2s -- a round-4 L8 anti-
-  // flake relaxation that, measured at the pinned tip, left roughly 40x
-  // headroom rather than the AC's own ~10x. Tightened to the AC's actual
-  // number (still ~10x headroom over the ~45ms baseline measured in
-  // round-7's own review), asserted against the MEDIAN of the three runs
-  // rather than each individually, so one slow-scheduled run on a loaded
-  // CI box cannot flake the whole guard while a genuine quadratic
-  // regression (which would move every run, not just one) still trips it.
-  const sorted = [...elapsedMs].sort((a, b) => a - b)
-  const median = sorted[1]
-  assert.ok(median < 500, `expected the median of 3 runs under 500ms (AC-QA-20's own stated bound), got ${elapsedMs.join(', ')}ms (median ${median}ms)`)
+  fs.writeFileSync(ledgerPath, Array.from({ length: n }, (_, i) => JSON.stringify(ledgerRecord(i))).join('\n') + '\n')
+  const preloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'array-work-'))
+  trackTempDir(preloadDir)
+  const preload = path.join(preloadDir, 'array-work.cjs')
+  const log = path.join(preloadDir, 'work.txt')
+  fs.writeFileSync(preload, ARRAY_WORK_PRELOAD)
+  const res = spawnSync(process.execPath, ['--require', preload, MODULE_PATH, 'ledger', repo], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, env: { ...process.env, ARRAY_WORK_LOG: log } }) // with every AC id distinct the report outgrows the 1MB default
+  assert.equal(res.status, 0, res.stderr)
+  const out = JSON.parse(res.stdout.trim())
+  assert.equal(out.n, n, 'the fixture must actually reach aggregation, not be windowed or skipped away')
+  assert.equal(out.rework.acVerdicts.length, n, 'every record carries its own AC id, so the keyed accumulators grow with n')
+  return Number(fs.readFileSync(log, 'utf8')) / n
+}
+
+test('optimise-read CLI: the whole ledger command does a bounded amount of Array.prototype work per record however many records there are (L8, AC-QA-20, counted, not timed)', () => {
+  const small = arrayWorkPerRecord(500)
+  const large = arrayWorkPerRecord(2000)
+  assert.ok(small > 5, `sanity: the counter must observe the command walking arrays, saw ${small.toFixed(1)} per record`)
+  assert.ok(large / small < 2, `array work per record grew ${(large / small).toFixed(2)}x for 4x the records (${small.toFixed(1)} -> ${large.toFixed(1)}); a linear pass keeps it near 1, a per-record Array.prototype scan of a growing array near 4`)
 })
 
 test('optimise-read CLI: `node optimise-read.mjs ids` reads a batch of proposal targets from stdin and returns a stable id per target, in order', () => {

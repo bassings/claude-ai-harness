@@ -1914,7 +1914,7 @@ test('static harn-fix-2 AC-QA-19: every GUARDED shape is refused, and every shap
   function runHook(command, dir) {
     return spawnSync('python3', [HOOK_PATH], {
       input: JSON.stringify({ tool_name: 'Bash', tool_input: { command }, cwd: dir }),
-      encoding: 'utf8', env: sge(), timeout: 10000,
+      encoding: 'utf8', env: sge(), timeout: 60000,
     })
   }
 

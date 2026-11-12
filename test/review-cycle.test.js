@@ -1156,26 +1156,45 @@ test('review-cycle.js: 51 globs in one key aborts naming the key (item 1, per-ke
   )
 })
 
-// Timing proof (DoD requirement): the pathological glob measured at 5060ms in
-// the security review (7 occurrences of "**", 21 chars) must now be REJECTED
-// by the bound check, not compiled -- so rejection must take microseconds,
-// not seconds. Asserted generously (under 100ms, two orders of magnitude
-// below the smallest pathological measurement in the review) to stay robust
-// under CI jitter while still proving the pathological path is never reached.
-test('review-cycle.js: the pathological glob from the security review measurement (7x "**", 5060ms to compile) is rejected in under 100ms, never compiled (item 1, timing proof)', async () => {
+// Proof that the pathological glob is rejected by the bound check and never compiled (HARN-AUDIT-1 T1, AC-QA-1). The glob
+// measured at 5060ms to compile in the security review (7 occurrences of "**", 21 chars). This used to assert the rejection
+// took under 100ms, which a loaded runner could break; what matters is that no regular expression is built from it, so
+// every `new RegExp` of an anchored pattern containing ".*" (what globToRe builds from "**") is counted. The workflow
+// script runs in this realm, so wrapping the global constructor sees it. The control run, with a valid glob, proves the
+// counter does see a compile; the pathological run must count none.
+async function compiledGlobCount(glob) {
+  const Real = globalThis.RegExp
+  let compiled = 0
+  globalThis.RegExp = new Proxy(Real, {
+    construct(target, args, newTarget) {
+      if (typeof args[0] === 'string' && args[0].startsWith('^') && args[0].endsWith('$') && args[0].includes('.*')) compiled += 1
+      return Reflect.construct(target, args, newTarget)
+    },
+  })
+  try {
+    await runWorkflow(WF, {
+      args: {},
+      agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: [glob] } } }),
+    }).catch((err) => {
+      assert.match(err.message, /HarnessTriggersShapeInvalid/, 'the only acceptable failure is the shape rejection')
+    })
+  } finally {
+    globalThis.RegExp = Real
+  }
+  return compiled
+}
+
+test('review-cycle.js: the pathological glob from the security review measurement (7x "**", 5060ms to compile) is rejected by the bound check and never compiled (item 1, counted, not timed)', async () => {
+  assert.ok((await compiledGlobCount('**/*.js')) > 0, 'sanity: the counter must observe a valid glob being compiled, or the zero below proves nothing')
   const glob = '**a**a**a**a**a**a**b'
-  const start = process.hrtime.bigint()
+  const started = process.hrtime.bigint()
   await assert.rejects(
-    () =>
-      runWorkflow(WF, {
-        args: {},
-        agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: [glob] } } }),
-      }),
+    () => runWorkflow(WF, { args: {}, agent: baseAgent({ 'scope:diff': { ...SCOPE_OK, harness_triggers_file_exists: true, custom_rules: { data: [glob] } } }) }),
     /HarnessTriggersShapeInvalid/
   )
-  const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6
-  console.log(`    (pathological glob rejected in ${elapsedMs.toFixed(3)}ms)`)
-  assert.ok(elapsedMs < 100, `expected rejection in well under 100ms (bound check, not regex compile), got ${elapsedMs.toFixed(3)}ms`)
+  assert.equal(await compiledGlobCount(glob), 0, 'the pathological glob must be rejected before any regular expression is built from it')
+  // Informational only (no threshold, nothing asserted on it): how long the rejection took, as the old test printed.
+  process.stderr.write(`    (pathological glob rejected in ${(Number(process.hrtime.bigint() - started) / 1e6).toFixed(3)}ms)\n`)
 })
 
 // Item 2 [MEDIUM]: `?` was unescaped -- globToRe('?') threw a SyntaxError

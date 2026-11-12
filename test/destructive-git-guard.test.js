@@ -31,7 +31,7 @@ function runHook(payload, extraEnv = {}) {
     input: JSON.stringify(payload),
     encoding: 'utf8',
     env: sanitizedGitEnv(extraEnv),
-    timeout: 10000,
+    timeout: 60000,
   })
 }
 
@@ -703,7 +703,7 @@ test('destructive-git-guard: a leaked GIT_DIR/GIT_WORK_TREE pointed at a second,
     // the hook's OWN stripping logic. This constructs the leaked-GIT_DIR
     // environment directly, exactly as a real leaked variable would arrive.
     env: { ...process.env, GIT_DIR: path.join(cleanDir, '.git'), GIT_WORK_TREE: cleanDir },
-    timeout: 10000,
+    timeout: 60000,
   })
   assert.equal(res.status, 2, `expected exit 2 (the hook must strip GIT_DIR/GIT_WORK_TREE before its own status check), got ${res.status}; stderr: ${res.stderr}`)
 })

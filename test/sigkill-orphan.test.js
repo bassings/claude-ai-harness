@@ -67,7 +67,7 @@ test('AC-DATA-9: a process SIGKILLed after writing the start record, before it c
   // referenced by the test process, for the rest of the suite run. Killed
   // in a finally now, so a failing assertion here fails FAST, not slow.
   const POLL_INTERVAL_MS = 15
-  const POLL_TIMEOUT_MS = 10000
+  const POLL_TIMEOUT_MS = 30000
   const pollDeadline = Date.now() + POLL_TIMEOUT_MS
   let beforeKillLines = readLedgerLines(repo)
   try {

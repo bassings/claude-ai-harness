@@ -210,13 +210,31 @@ test('ledger-append: the path resolves via git rev-parse --git-common-dir, never
   assert.equal(lines.length, 1)
 })
 
+// Diagnosis of the CI flake (8 failures on main, 11 to 13 October 2026, always "49 !== 50" or similar): the writer of that
+// date rewrote .git/info/exclude with a truncating in-place write and then ran `git check-ignore`, so a writer that read
+// the file while a sibling had it truncated got "not ignored" and refused with write_ok:false and exit 0. This test then
+// counted lines and never looked at write_ok, so the refusal surfaced only as a missing line, and only when the runner was
+// slow enough for the writers to collide. The production race was fixed on 13 October by writing the exclude file through
+// a temp file and a rename (b1595bc, HARN-OPT-5 T6), and the per-writer write_ok assertion below is what keeps a
+// recurrence loud and named rather than a bare count.
+//
+// The overlap does not rest on the runner's scheduling: every writer is spawned in one synchronous loop, before any of
+// them can exit, and each is held for 500ms between its fstat and its write by the writer's own test-only window
+// (LEDGER_APPEND_TEST_RACE_WINDOW_MS, the one the short-write race test uses), so most appends overlap whether the machine
+// is fast or loaded. Measured on an unloaded machine, at most 40 of the 50 were inside the 500ms window at once, not all 50
+// (node start-up is staggered across the spawn loop), which is why the deterministic preload test below, and not this one,
+// carries the atomicity guarantee. That overlap is what makes a torn or interleaved write observable here (AC-DATA-16).
+//
+// This guard is probabilistic, and one green run is not proof of atomicity. Against a writer that splits its one write into
+// two, it failed in 5 of 5 runs on one machine and 7 of 8 on another, about one miss in eight. The deterministic guard for
+// "one append is one write() of the whole line" is the preload-counting test below ("exactly one write() of the whole line").
 test('ledger-append: 50 concurrent writers all land, each parses as JSON, each run_id appears exactly once (AC-DATA-3)', async () => {
   const repo = makeTempRepo()
   const N = 50
   const runs = Array.from({ length: N }, (_, i) =>
     new Promise((resolve, reject) => {
       const { spawn } = require('node:child_process')
-      const child = spawn('node', [APPEND_SCRIPT], { cwd: repo })
+      const child = spawn('node', [APPEND_SCRIPT], { cwd: repo, env: { ...process.env, LEDGER_APPEND_TEST_RACE_WINDOW_MS: '500' } })
       child.stdin.end(JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: `writer-${i}` }))
       let stderr = ''
       let stdout = ''
@@ -238,6 +256,319 @@ test('ledger-append: 50 concurrent writers all land, each parses as JSON, each r
   const parsed = lines.map((l) => JSON.parse(l))
   const runIds = new Set(parsed.map((e) => e.run_id))
   assert.equal(runIds.size, N, 'every run_id must be unique and present exactly once')
+})
+
+// The 50-writer test above catches a split write only when the interleaving happens to land: measured by mutation, it
+// failed in 5 of 5 runs here and 7 of 8 on the conductor's run, so one green run is not proof of atomicity. This test is
+// the deterministic one (HARN-AUDIT-1 T1, AC-DATA-16). The writer runs with a preload that records each Buffer passed to
+// fs.writeSync, and one append must be exactly one write, holding the whole line and its newline. A mutation that splits
+// the write in two fails here every time, however the processes are scheduled.
+test('ledger-append: one append is exactly one write() of the whole line, counted by a preload, not left to chance (AC-DATA-3, AC-DATA-16)', () => {
+  const { spawnSync } = require('node:child_process')
+  const repo = makeTempRepo()
+  const log = path.join(repo, '..', `write-log-${process.pid}-${Date.now()}.jsonl`)
+  trackTempDir(log)
+  // The preload is written into a temp directory here, not shipped as a file: it records every fs.writeSync of a Buffer to
+  // WRITE_LOG as one JSON line holding the byte length and whether it ends in a newline. Strings are not recorded: the
+  // writer's temp-file write for the git exclude file passes a string.
+  const preloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'count-writes-'))
+  trackTempDir(preloadDir)
+  const preload = path.join(preloadDir, 'count-writes.cjs')
+  fs.writeFileSync(preload, [
+    "const fs = require('node:fs')",
+    'const original = fs.writeSync',
+    'let recording = false',
+    'fs.writeSync = function writeSync(fd, data, ...rest) {',
+    '  if (!recording && process.env.WRITE_LOG && Buffer.isBuffer(data)) {',
+    '    recording = true // appendFileSync below calls fs.writeSync itself',
+    '    try {',
+    "      fs.appendFileSync(process.env.WRITE_LOG, JSON.stringify({ length: data.length, endsWithNewline: data[data.length - 1] === 0x0a }) + '\\n')",
+    '    } finally {',
+    '      recording = false',
+    '    }',
+    '  }',
+    '  return original.call(this, fd, data, ...rest)',
+    '}',
+    '',
+  ].join('\n'))
+  for (let i = 0; i < 2; i++) { // the second append runs against a non-empty ledger, the path that reads the last byte first
+    fs.rmSync(log, { force: true })
+    const res = spawnSync(process.execPath, ['--require', preload, APPEND_SCRIPT], {
+      cwd: repo,
+      encoding: 'utf8',
+      input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: `single-write-${i}` }),
+      env: { ...process.env, WRITE_LOG: log },
+    })
+    assert.equal(JSON.parse(res.stdout.trim().split('\n').pop()).write_ok, true, res.stderr)
+    const writes = fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    assert.equal(writes.length, 1, `append ${i} made ${writes.length} write() calls of a Buffer, expected exactly one: ${JSON.stringify(writes)}`)
+    assert.equal(writes[0].endsWithNewline, true, 'the one write must carry the line and its terminating newline')
+    const lines = readLedgerLines(repo)
+    assert.equal(lines.length, i + 1)
+    assert.equal(writes[0].length, Buffer.byteLength(lines[i], 'utf8') + 1, 'the one write must be the whole line plus its newline')
+  }
+})
+
+// A slow git must not be reported as "the ledger is not ignored" (HARN-AUDIT-1 T1). On a loaded machine `git check-ignore`
+// once took longer than the writer's 10s timeout, the timed-out child has no exit status, and the writer treated it as
+// "not ignored" and refused with a message blaming a negation pattern, dropping a real row. A `git` shim on PATH misbehaves
+// in `check-ignore` as its per-call script says, and answers EVERY `check-ignore` call itself: script[n-1] is the behaviour
+// of the n-th call (counted in a file), and a call beyond the script exits 97, so an unexpected extra call surfaces as a
+// "failed (exit 97)" refusal rather than passing silently. No real `git check-ignore` runs under any shim, so no real git
+// runs under a test-chosen timeout: on a loaded machine real check-ignore has taken over 10 seconds, and any bound a test
+// picks for it can be exceeded. Other subcommands (the spawned writer's own rev-parse and remote calls, which carry no
+// timeout) pass through to the real git. The answers are the ones real git gives for the two call shapes the writer makes,
+// pinned byte for byte against real git by the faithfulness test below:
+//   ignored    `-q`: exit 0, no output. `-v -z --stdin`: exit 0 and the record `.git/info/exclude\0<line>\0<pattern>\0<path>\0`,
+//              the line being the last one in .git/info/exclude that lists the ledger (exit 99 if none does, so a test that
+//              scripts "ignored" for a repo whose exclude does not list it fails loudly).
+//   unignored  exit 1, no output (git's "no pattern matches").
+//   sleep      outlives any bound (`exec sleep` replaces the shim so no grandchild holds the pipes open after the kill).
+//   kill       killed by SIGKILL, so the child has a signal and no exit status, with no timeout needing to elapse.
+//   exit128    exit 128 (git's own failure status, as for a corrupt index).
+// The tests call the exported ensureGitignored() in this process with the timeout passed as an argument, so the shipped
+// writer needs no environment variable. A test that scripts no `sleep` passes no bound and runs under the shipped default.
+function fakeGitShim(script) {
+  const { execFileSync } = require('node:child_process')
+  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-git-shim-'))
+  trackTempDir(dir)
+  const counter = path.join(dir, 'check-ignore-calls')
+  const act = {
+    sleep: 'exec sleep 30',
+    kill: 'kill -9 $$',
+    exit128: 'exit 128',
+    unignored: 'cat >/dev/null; exit 1',
+    ignored: [
+      'if [ "$2" = -q ]; then exit 0; fi',
+      'cat >/dev/null',
+      `l=$(grep -n -x -F -e '${LEDGER_REL}' .git/info/exclude | tail -n 1 | cut -d: -f1)`,
+      'if [ -z "$l" ]; then exit 99; fi',
+      `printf '.git/info/exclude\\0%s\\0%s\\0%s\\0' "$l" '${LEDGER_REL}' '${LEDGER_REL}'`,
+      'exit 0',
+    ].join('; '),
+  }
+  const cases = script.map((b, i) => {
+    if (!act[b]) throw new Error(`fakeGitShim: unknown behaviour ${b}`)
+    return `  ${i + 1}) ${act[b]} ;;\n`
+  }).join('')
+  fs.writeFileSync(path.join(dir, 'git'),
+    `#!/bin/sh\nif [ "$1" != check-ignore ]; then exec "${real}" "$@"; fi\n` +
+    `n=$(cat "${counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${counter}"\n` +
+    `case $n in\n${cases}  *) exit 97 ;;\nesac\n`,
+    { mode: 0o755 })
+  return { dir, calls: () => Number(fs.existsSync(counter) ? fs.readFileSync(counter, 'utf8') : 0) }
+}
+
+// The bound for the tests that script a `sleep`. It bounds only the shim, never real git: every call under it is the shim
+// doing its own few milliseconds of work (bump the counter, then answer, kill itself, or exec sleep) before it misbehaves
+// or answers, and a `sleep` call always outlives it. It must exceed that work under load, or a `kill` call would be
+// reported as a timeout and a counter bump could be cut off; measured well under it with one busy process per core.
+const SHIM_TIMEOUT_MS = 1000
+
+// The shim's canned answers are what real git prints, byte for byte, for both call shapes and both verdicts. Real git
+// runs here with no timeout, so it cannot flake on a loaded machine.
+test('ledger-append: the fake git shim answers check-ignore exactly as real git does for an ignored and a not-ignored ledger (HARN-AUDIT-1 T1)', () => {
+  const env = require('./helpers/temp-repo.js').sanitizedGitEnv()
+  const calls = [['check-ignore', '-v', '-z', '--stdin'], ['check-ignore', '-q', LEDGER_REL]]
+  const run = (bin, repo, args) => {
+    const r = spawnSync(bin, args, { cwd: repo, env, encoding: 'utf8', input: args.includes('--stdin') ? LEDGER_REL + '\0' : '' })
+    return { status: r.status, signal: r.signal, stdout: r.stdout }
+  }
+  const ignoredRepo = makeTempRepo()
+  fs.mkdirSync(path.join(ignoredRepo, '.git', 'info'), { recursive: true })
+  fs.appendFileSync(path.join(ignoredRepo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
+  for (const [repo, verdict, status] of [[ignoredRepo, 'ignored', 0], [makeTempRepo(), 'unignored', 1]]) {
+    const shim = fakeGitShim(calls.map(() => verdict))
+    for (const args of calls) {
+      const expected = run('git', repo, args)
+      assert.equal(expected.status, status, `sanity: real git ${args.join(' ')} must exit ${status} for this repo`)
+      assert.deepEqual(run(path.join(shim.dir, 'git'), repo, args), expected, `the shim's "${verdict}" answer to ${args.join(' ')} differs from real git's`)
+    }
+    assert.equal(shim.calls(), calls.length)
+  }
+})
+
+// Runs the writer's own ensureGitignored(repo, timeoutMs) in this process with the shim first on PATH, capturing what it
+// writes to stdout and stderr. The timeout goes in as an argument; the shipped default is GIT_CALL_TIMEOUT_MS, pinned elsewhere.
+async function ensureGitignoredThroughSlowGit(shim, repo, timeoutMs) {
+  const { ensureGitignored } = await import(APPEND_MODULE_URL)
+  const savedPath = process.env.PATH
+  const realOut = process.stdout.write
+  const realErr = process.stderr.write
+  const out = []
+  const err = []
+  process.env.PATH = `${shim.dir}${path.delimiter}${savedPath}`
+  process.stdout.write = (chunk) => { out.push(String(chunk)); return true }
+  process.stderr.write = (chunk) => { err.push(String(chunk)); return true }
+  try {
+    return { verdict: ensureGitignored(repo, timeoutMs), stdout: out.join(''), stderr: err.join('') }
+  } finally {
+    process.stdout.write = realOut
+    process.stderr.write = realErr
+    process.env.PATH = savedPath
+  }
+}
+
+// Here the retry ends in git's exit 1 (the ledger is not yet ignored), which the writer reads as an answer; the writer then
+// adds the exclude line and the verifying call finds the ledger ignored.
+test('ledger-append: an interrupted git check-ignore is retried, the retry answers "not ignored", the check then succeeds, and the retry is reported on stderr only (HARN-AUDIT-1 T1)', async () => {
+  const repo = makeTempRepo()
+  const shim = fakeGitShim(['kill', 'unignored', 'ignored'])
+  const r = await ensureGitignoredThroughSlowGit(shim, repo)
+  assert.equal(r.verdict, true, 'a single interrupted git must not drop the row')
+  assert.equal(shim.calls(), 3, 'the killed classifying call, its one retry, then the verifying call')
+  assert.equal(r.stderr, 'ledger-append: git check-ignore was killed by SIGKILL, retry succeeded\n', 'a recovered interruption leaves one stderr line')
+  assert.equal(r.stdout, '', 'stdout carries the single JSON result line and nothing else')
+})
+
+// The commonest real recovery: the path is already ignored, so the retry returns normally (exit 0) rather than by git's
+// exit 1. The stderr line must be left on this path too, or a loaded machine leaves no trace of the retry.
+test('ledger-append: a timed-out check-ignore whose retry returns normally (path already ignored) leaves the stderr line and no stdout (HARN-AUDIT-1 T1)', async () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.git', 'info'), { recursive: true })
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
+  const shim = fakeGitShim(['sleep', 'ignored'])
+  const r = await ensureGitignoredThroughSlowGit(shim, repo, SHIM_TIMEOUT_MS)
+  assert.equal(r.verdict, true)
+  assert.equal(shim.calls(), 2, 'the first check-ignore timed out and the one retry answered')
+  assert.equal(r.stderr, `ledger-append: git check-ignore timed out after ${SHIM_TIMEOUT_MS}ms, retry succeeded\n`)
+  assert.equal(r.stdout, '')
+})
+
+// Same recovery through the whole writer, with a git that is killed by a signal instead of timing out (no wait needed):
+// the row is written, stdout is exactly one JSON line, and stderr carries the signal wording.
+test('ledger-append: a check-ignore killed by a signal and retried successfully writes the row, keeps stdout to one JSON line, and says it was killed (HARN-AUDIT-1 T1)', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.git', 'info'), { recursive: true })
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), LEDGER_REL + '\n')
+  const shim = fakeGitShim(['kill', 'ignored'])
+  const res = spawnSync(process.execPath, [APPEND_SCRIPT], {
+    cwd: repo,
+    encoding: 'utf8',
+    input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'killed-git' }),
+    env: { ...require('./helpers/temp-repo.js').sanitizedGitEnv(), PATH: `${shim.dir}${path.delimiter}${process.env.PATH}` },
+  })
+  assert.equal(res.stdout.trim().split('\n').length, 1, 'stdout is one line')
+  assert.equal(JSON.parse(res.stdout).write_ok, true)
+  assert.match(res.stderr, /^ledger-append: git check-ignore was killed by SIGKILL, retry succeeded$/m)
+  assert.equal(shim.calls(), 2)
+  assert.equal(readLedgerLines(repo).length, 1)
+})
+
+// A second interruption is refused with wording that names the real cause: a timeout points at a slow git, a signal kill
+// points at something killing git, and the operator must not be sent to the wrong one. Both causes, both call sites (the
+// classifying call, then the verifying call after the exclude line is written). The shim answers every call, so the bound
+// in the timeout cases bounds only the shim.
+const TIMED_OUT_WORDING = /timed out after \d+ms/
+const KILLED_WORDING = /was killed by SIGKILL/
+const interruptedCases = [
+  { site: 'classifying', cause: 'timeout', script: ['sleep', 'sleep'], timeoutMs: SHIM_TIMEOUT_MS },
+  { site: 'classifying', cause: 'signal', script: ['kill', 'kill'] },
+  { site: 'verifying', cause: 'timeout', script: ['unignored', 'sleep', 'sleep'], timeoutMs: SHIM_TIMEOUT_MS },
+  { site: 'verifying', cause: 'signal', script: ['unignored', 'kill', 'kill'] },
+]
+for (const c of interruptedCases) {
+  test(`ledger-append: a ${c.site} git check-ignore interrupted twice by ${c.cause === 'timeout' ? 'a timeout' : 'a signal'} is refused with the ${c.cause === 'timeout' ? 'timed-out' : 'killed-by-signal'} wording only, never the negation message (HARN-AUDIT-1 T1)`, async () => {
+    const repo = makeTempRepo()
+    const shim = fakeGitShim(c.script)
+    const r = await ensureGitignoredThroughSlowGit(shim, repo, c.timeoutMs)
+    assert.equal(typeof r.verdict, 'string', 'a named refusal, not plain false')
+    assert.match(r.verdict, /retried once/i)
+    assert.doesNotMatch(r.verdict, /not actually gitignored|negation/i, 'an interrupted git is not a negation pattern')
+    if (c.cause === 'timeout') {
+      assert.match(r.verdict, TIMED_OUT_WORDING)
+      assert.doesNotMatch(r.verdict, /killed/i, 'a timeout must not be reported as a kill')
+    } else {
+      assert.match(r.verdict, KILLED_WORDING)
+      assert.doesNotMatch(r.verdict, /timed out/i, 'a signal kill must not be reported as a timeout')
+    }
+    assert.equal(shim.calls(), c.script.length, 'exactly one retry of the interrupted call')
+    assert.equal(r.stderr, '', 'the retry line is for a recovered interruption only')
+    if (c.site === 'classifying') {
+      assert.equal(fs.existsSync(path.join(repo, '.git', 'info', 'exclude')) && fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8').includes(LEDGER_REL), false, 'fail closed: no exclude line is written when the ignore check could not be completed')
+    }
+  })
+}
+
+// Two different interruptions: the refusal names the cause of the second (the retry's), which is the one the writer
+// last saw. No retry recovered, so stderr stays empty.
+for (const [first, second] of [['timeout', 'signal'], ['signal', 'timeout']]) {
+  const behaviour = { timeout: 'sleep', signal: 'kill' }
+  test(`ledger-append: a check-ignore interrupted by a ${first} and then by a ${second} is refused naming the ${second} only (HARN-AUDIT-1 T1)`, async () => {
+    const repo = makeTempRepo()
+    const shim = fakeGitShim([behaviour[first], behaviour[second]])
+    const r = await ensureGitignoredThroughSlowGit(shim, repo, SHIM_TIMEOUT_MS)
+    assert.equal(typeof r.verdict, 'string', 'a named refusal, not plain false')
+    assert.match(r.verdict, /retried once/i)
+    if (second === 'timeout') {
+      assert.match(r.verdict, new RegExp(`timed out after ${SHIM_TIMEOUT_MS}ms`))
+      assert.doesNotMatch(r.verdict, /killed/i, 'the first cause (a kill) must not be the one named')
+    } else {
+      assert.match(r.verdict, KILLED_WORDING)
+      assert.doesNotMatch(r.verdict, /timed out/i, 'the first cause (a timeout) must not be the one named')
+    }
+    assert.equal(shim.calls(), 2, 'exactly one retry')
+    assert.equal(r.stderr, '', 'no retry recovered, so no retry line')
+  })
+}
+
+// An interruption whose retry then fails outright (exit 128) is not a recovery: the refusal names the exit 128, no
+// "retry succeeded" line is written, and nothing is written to the exclude file or the ledger.
+test('ledger-append: a check-ignore interrupted once whose retry exits 128 refuses naming exit 128, leaves no retry-succeeded line, and writes nothing (HARN-AUDIT-1 T1)', () => {
+  const repo = makeTempRepo()
+  const exclude = path.join(repo, '.git', 'info', 'exclude')
+  const excludeBefore = fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null
+  const shim = fakeGitShim(['kill', 'exit128'])
+  const res = spawnSync(process.execPath, [APPEND_SCRIPT], {
+    cwd: repo,
+    encoding: 'utf8',
+    input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'killed-then-128' }),
+    env: { ...require('./helpers/temp-repo.js').sanitizedGitEnv(), PATH: `${shim.dir}${path.delimiter}${process.env.PATH}` },
+  })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /git check-ignore failed \(exit 128\)/)
+  assert.doesNotMatch(out.write_error, /killed|retried once/i, 'the interruption was recovered from; the failure is the exit 128')
+  assert.doesNotMatch(res.stderr, /retry succeeded/, 'a retry that failed is not reported as a success')
+  assert.equal(shim.calls(), 2, 'the killed call and its one retry')
+  assert.equal(fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : null, excludeBefore, 'the exclude file is untouched')
+  assert.equal(readLedgerLines(repo).length, 0, 'fail closed: nothing is written')
+})
+
+// A git that fails outright (exit 128 for a corrupt index, ENOENT for a missing binary) is not a negation pattern either.
+// Both check-ignore calls are covered, end to end through the writer, and neither names a path (AC-SEC-13).
+for (const [label, script] of [['classifying', ['exit128']], ['verifying', ['unignored', 'exit128']]]) {
+  test(`ledger-append: a ${label} git check-ignore that exits 128 refuses with a message naming the failure, never the negation message, and writes nothing (HARN-AUDIT-1 T1)`, () => {
+    const repo = makeTempRepo()
+    const shim = fakeGitShim(script)
+    const res = spawnSync(process.execPath, [APPEND_SCRIPT], {
+      cwd: repo,
+      encoding: 'utf8',
+      input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done', task: 'git-128' }),
+      env: { ...require('./helpers/temp-repo.js').sanitizedGitEnv(), PATH: `${shim.dir}${path.delimiter}${process.env.PATH}` },
+    })
+    const out = JSON.parse(res.stdout.trim().split('\n').pop())
+    assert.equal(out.write_ok, false)
+    assert.match(out.write_error, /git check-ignore failed \(exit 128\)/)
+    assert.match(out.write_error, /refusing to write/)
+    assert.doesNotMatch(out.write_error, /not actually gitignored|negation/i, 'a git failure is not a negation pattern')
+    assert.equal(out.write_error.includes(repo), false, 'the refusal names no path')
+    assert.equal(readLedgerLines(repo).length, 0, 'fail closed: nothing is written')
+  })
+}
+
+test('ledger-append: a genuine negation pattern still refuses with the negation message, not the timeout one (HARN-AUDIT-1 T1)', () => {
+  const { spawnSync } = require('node:child_process')
+  const repo = makeTempRepo()
+  fs.writeFileSync(path.join(repo, '.gitignore'), '!' + LEDGER_REL + '\n')
+  sh('git add .gitignore && git commit -q -m negate', repo)
+  const res = spawnSync(process.execPath, [APPEND_SCRIPT], { cwd: repo, encoding: 'utf8', input: JSON.stringify({ schema_version: 1, kind: 'tdd_task', outcome: 'done' }), env: require('./helpers/temp-repo.js').sanitizedGitEnv() })
+  const out = JSON.parse(res.stdout.trim().split('\n').pop())
+  assert.equal(out.write_ok, false)
+  assert.match(out.write_error, /not actually gitignored/)
+  assert.doesNotMatch(out.write_error, /timed out/i)
+  assert.equal(readLedgerLines(repo).length, 0)
 })
 
 test('ledger-append: seeding 100 known lines then writing once leaves the first 100 byte-identical, exactly one added (AC-DATA-2)', () => {
@@ -3725,18 +4056,43 @@ test('ledger-append module: a declared integer field REFUSES a non-integer numbe
 // canonicalPlanKey and passed while never reaching the regex at all, which is
 // the seam problem: a function reachable only through a path that bypasses it
 // is a function nothing is testing.
-test('ledger-append module: stripTrailingSeparators is linear on the input that made the old regex quadratic', async () => {
-  const { stripTrailingSeparators } = await import(APPEND_MODULE_URL)
-  const time = (n) => {
-    const s = '/'.repeat(n) + 'x'          // separators THEN a non-separator
-    const t = process.hrtime.bigint()
-    for (let i = 0; i < 50; i += 1) stripTrailingSeparators(s)
-    return Number(process.hrtime.bigint() - t) / 1e6
+//
+// The property is pinned by a deterministic count, not a clock (AC-QA-1). The first version compared wall-clock time at
+// two input sizes; on a loaded two-core runner the small run rounded to its 0.01ms floor and the ratio came out at 67x
+// against a limit of 30 (CI run 40598215039), and the same failure reached test/harn-opt-6-r2-env.test.js through its
+// nested run. The quadratic cost lived in the regex engine retrying from every position, so what matters is that no
+// regular expression is evaluated at all. Every entry point a regex-based strip reaches (RegExp.prototype exec and test,
+// plus the Symbol.match, matchAll, replace, search and split protocol methods) is counted while the helper runs on the
+// input that was quadratic, and the count must be zero. The loop that replaced the regex is linear by construction.
+// Everything is synchronous, and node:test runs the tests of one file one at a time, so no other test sees the patches.
+function countRegexEvaluations(fn) {
+  const keys = ['exec', 'test', Symbol.match, Symbol.matchAll, Symbol.replace, Symbol.search, Symbol.split]
+  const originals = keys.map((key) => [key, Object.getOwnPropertyDescriptor(RegExp.prototype, key)])
+  let count = 0
+  for (const [key, descriptor] of originals) {
+    Object.defineProperty(RegExp.prototype, key, { ...descriptor, value: function (...args) { count += 1; return descriptor.value.apply(this, args) } })
   }
-  time(2000)
-  const small = Math.max(time(2000), 0.01)
-  const large = Math.max(time(20000), 0.01)
-  assert.ok(large / small < 30, `10x the input cost ${(large / small).toFixed(0)}x the time (${small.toFixed(2)}ms -> ${large.toFixed(2)}ms); the old regex was ~190x`)
+  try {
+    fn()
+  } finally {
+    for (const [key, descriptor] of originals) Object.defineProperty(RegExp.prototype, key, descriptor)
+  }
+  return count
+}
+
+// Two properties are guarded. "No regular expression is evaluated" is counted below. Linear cost is guarded by the size of
+// the input: about a million characters finish in milliseconds in a single pass, while any super-linear implementation, with
+// or without a regex, needs minutes and is stopped by the hang deadline. That is a hang deadline and not a timing assertion:
+// a slow machine lengthens a linear run by a small factor and cannot approach it.
+test('ledger-append module: stripTrailingSeparators handles a million-character run of separators within the hang deadline, evaluates no regular expression, and still strips it correctly', async () => {
+  const { stripTrailingSeparators } = await import(APPEND_MODULE_URL)
+  const hostile = '/'.repeat(500000) + 'x' + '\\/'.repeat(250000) // 500000 separators, a non-separator, then 500000 more of both kinds
+  let stripped
+  const evaluations = hangDeadline(() => countRegexEvaluations(() => { stripped = stripTrailingSeparators(hostile) }))
+  assert.equal(evaluations, 0, 'stripTrailingSeparators must not evaluate a regular expression: the one it replaced was quadratic on a long run of separators')
+  assert.equal(stripped, '/'.repeat(500000) + 'x', 'and it still strips every trailing separator, of both kinds, from the hostile input')
+  // The counter really sees a regex-based strip, so the zero above is not a patch that never took effect.
+  assert.ok(countRegexEvaluations(() => 'a//'.replace(/[\\/]+$/, '')) > 0, 'sanity: the counter must observe a regex-based strip, or the zero above proves nothing')
 })
 
 test('ledger-append module: stripTrailingSeparators strips what the regex stripped, and nothing else', async () => {
@@ -3921,77 +4277,98 @@ test('ledger-append (AC-SEC-2): a rejected ac_id is still quarantined into ac_id
   assert.equal(entry.invalid_ac_ids_dropped, 1)
 })
 
-test('ledger-append (AC-SEC-4): the pattern is linear -- 1024 adversarial characters evaluate well under 10ms with no super-linear growth', async () => {
+// A hang deadline, not a timing assertion: runs fn under the vm watchdog, which interrupts synchronous execution (a
+// catastrophically backtracking regular expression included, which node:test's own timeout cannot, since it fires from the
+// event loop the regex is blocking). A slow machine only lengthens a run that is still finishing; it throws only for a hang.
+const HANG_DEADLINE_MS = 5000
+function hangDeadline(fn) {
+  try {
+    return require('node:vm').runInNewContext('fn()', { fn }, { timeout: HANG_DEADLINE_MS })
+  } catch (e) {
+    if (e && e.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw new Error(`hang deadline of ${HANG_DEADLINE_MS}ms exceeded: the code under test did not finish, which a linear implementation does in milliseconds`)
+    throw e
+  }
+}
+
+// HARN-AUDIT-1 T1 (AC-QA-1): the two timing tests that stood here (1024 characters under 10ms, and a growth ratio between
+// lengths) are replaced by a property of the pattern itself, which does not depend on a clock. A regular expression can
+// only backtrack super-linearly if some repetition is unbounded: with every quantifier bounded ({m,n} or ?), the work per
+// match is capped by a constant fixed by the pattern, whatever the input length. So the pattern must carry no `*`, no `+`
+// and no `{n,}`, and no repeatable group may contain any quantifier, bounded or not. The shape this guards against is a nested
+// quantifier over an optional separator, such as ^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$, which the planning cycle
+// measured doubling per added character.
+// Returns what makes a regular expression's work per match super-linear in the input: every unbounded quantifier (`*`, `+`,
+// `{n,}`, reported as written), and every REPEATABLE group (one whose own quantifier allows more than one pass: `*`, `+`,
+// `{m,n}` with n > 1) that contains a quantifier of any kind, bounded or not, reported as 'nested-repeat'. The second is the
+// case a bounded quantifier does not make safe: (?:[A-Za-z0-9]{1,40}[-/ ]?){0,40} has no unbounded quantifier and still
+// splits a run of letters in exponentially many ways. A group quantified `?` or {0,1} runs at most once, so it stays legal.
+function unboundedQuantifiers(source) {
+  const bare = source.replace(/\\./g, 'E').replace(/\[(?:\\.|[^\]\\])*\]/g, 'C') // escapes and character classes hold no quantifier
+  const found = []
+  const quantifierAt = (i) => {
+    const m = /^(?:[*+?]|\{\d+(?:,\d*)?\})/.exec(bare.slice(i))
+    if (!m) return null
+    const text = m[0]
+    const braces = /^\{(\d+)(?:(,)(\d*))?\}$/.exec(text)
+    const repeatable = braces ? (braces[2] ? braces[3] === '' || Number(braces[3]) > 1 : Number(braces[1]) > 1) : text !== '?'
+    const unbounded = text === '*' || text === '+' || (braces && braces[2] && braces[3] === '')
+    return { text, repeatable, unbounded, length: text.length + (bare[i + text.length] === '?' ? 1 : 0) } // a trailing ? is laziness
+  }
+  const stack = [false] // per open group: does it contain a quantifier
+  for (let i = 0; i < bare.length; i++) {
+    if (bare[i] === '(') {
+      const prefix = /^\(\?(?::|=|!|<=|<!|<[^>]*>)/.exec(bare.slice(i))
+      if (prefix) i += prefix[0].length - 1
+      stack.push(false)
+    } else if (bare[i] === ')') {
+      const hadQuantifier = stack.pop()
+      const q = quantifierAt(i + 1)
+      if (hadQuantifier && q && q.repeatable) found.push('nested-repeat')
+      if (hadQuantifier || q) stack[stack.length - 1] = true
+    } else {
+      const q = quantifierAt(i)
+      if (!q) continue
+      stack[stack.length - 1] = true
+      if (q.unbounded) found.push(q.text)
+      i += q.length - 1
+    }
+  }
+  return found
+}
+
+test('ledger-append (AC-SEC-4): the AC id pattern has no unbounded quantifier, so its work per match is capped whatever the input length', async () => {
   const re = await acIdPattern()
-  // The shape the planning cycle measured as dangerous, kept here as the
-  // reason this test exists: ^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$ took
-  // 0.51ms at 20 characters, 7.91ms at 24 and 31.67ms at 26 -- doubling per
-  // added character. A nested quantifier over an optional separator is how
-  // this fix could have shipped a denial of service.
-  const timings = []
-  for (const n of [16, 24, 32, 64, 128, 256, 512, 1024]) {
-    const hostile = 'A-'.repeat(Math.ceil(n / 2)).slice(0, n)
-    const t0 = process.hrtime.bigint()
-    for (let i = 0; i < 200; i++) re.test(hostile)
-    timings.push({ n, ms: Number(process.hrtime.bigint() - t0) / 1e6 / 200 })
-  }
-  for (const { n, ms } of timings) {
-    assert.ok(ms < 10, `${n} characters took ${ms.toFixed(3)}ms, over the 10ms bound`)
-  }
-  const worst = Math.max(...timings.map((t) => t.ms))
-  assert.ok(worst < 10, `worst case ${worst.toFixed(3)}ms`)
+  assert.deepEqual(unboundedQuantifiers(re.source), [], `the pattern ${re.source} has an unbounded quantifier`)
+  // The detector sees the shapes it exists to catch, so an empty result above is not a detector that finds nothing.
+  assert.ok(unboundedQuantifiers('^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$').length >= 3)
+  assert.deepEqual(unboundedQuantifiers('^[a-z]{1,40}\\+[ /]?$'), [], 'a bounded quantifier, an escaped plus and a class are not unbounded')
+  assert.deepEqual(unboundedQuantifiers('^[+*]{1,4}x{2,}$'), ['{2,}'], 'a plus inside a class is not counted, an open-ended repeat is')
+  // A bounded quantifier does not make a repeated group safe: this one has no unbounded quantifier and is still exponential.
+  assert.deepEqual(unboundedQuantifiers('^(?:[A-Za-z0-9]{1,40}[-/ ]?){0,40}$'), ['nested-repeat'], 'a repeatable group holding bounded quantifiers is nested')
+  assert.deepEqual(unboundedQuantifiers('^(?:(?:a{1,3})?b){2,5}$'), ['nested-repeat'], 'a quantifier two groups down still counts')
+  assert.deepEqual(unboundedQuantifiers('^(?:(?<p>[a-z]{1,40})(?<s>[ /]))?AC$'), [], 'a group that runs at most once may hold a bounded quantifier')
+  assert.deepEqual(unboundedQuantifiers('^(?:a|b){1,3}$'), [], 'a repeated group with no quantifier inside is not nested')
 })
 
-// M6 (round 2 review): the test above cannot actually catch a nested-
-// quantifier regression. Its hostile input, 'A-'.repeat(n/2), is a CLEAN
-// match for `([A-Za-z0-9]+[-/ ]?)*` at every prefix -- each "A-" chunk is
-// consumed unambiguously (one or more alphanumerics, then exactly the
-// optional separator), so there is nothing for the engine to backtrack
-// over. Measured directly (round-2 report): applying QA's mutation
-// (AC_ID_PATTERN_STR replaced with the nested shape
-// `^([A-Za-z0-9]+[-/ ]?)*AC-[A-Z0-9]+-[0-9]+$` the comment above already
-// names) left the existing test green.
-//
-// Catastrophic backtracking needs AMBIGUITY: a run of characters that could
-// be split among repetitions of the outer group in many different ways, with
-// no terminating match to short-circuit the search. A long run of the SAME
-// character with no separator at all (or with a would-be-separator that
-// never lines up with a real boundary), followed by something that breaks
-// the match, is exactly that shape.
-test('ledger-append (AC-SEC-4, M6 round 3): the pattern stays linear against inputs AMBIGUOUS for a nested/optional-separator quantifier, with a growth bound between lengths, not just the original test\'s unambiguous hostile shape', async () => {
+test('ledger-append (AC-SEC-4, M6 round 3): inputs ambiguous for a nested or optional-separator quantifier, and inputs of very different lengths, are all refused, and a real id still matches', async () => {
   const re = await acIdPattern()
+  // Checked first, and fatally: against a pattern with a nested quantifier the hostile inputs below would not fail, they
+  // would run for longer than anyone waits, so they are only run once the shape check has passed.
+  assert.deepEqual(unboundedQuantifiers(re.source), [], 'refusing to run hostile inputs against a pattern with an unbounded quantifier')
   const shapes = [
     (n) => 'A'.repeat(n) + '!',
     (n) => 'a1'.repeat(Math.ceil(n / 2)).slice(0, n) + '!',
     (n) => 'A '.repeat(Math.ceil(n / 2)).slice(0, n) + 'x',
+    (n) => 'A-'.repeat(Math.ceil(n / 2)).slice(0, n),
   ]
-  const lengths = [16, 20, 22, 24, 26, 28]
-  for (const shape of shapes) {
-    const timings = []
-    for (const n of lengths) {
-      const hostile = shape(n)
-      const t0 = process.hrtime.bigint()
-      re.test(hostile)
-      const ms = Number(process.hrtime.bigint() - t0) / 1e6
-      timings.push({ n, ms })
-      assert.ok(ms < 10, `${JSON.stringify(hostile)} (length ${n}) took ${ms.toFixed(3)}ms, over the 10ms bound`)
+  hangDeadline(() => {
+    for (const shape of shapes) {
+      for (const n of [16, 26, 256, 1024, 100000]) {
+        assert.equal(re.test(shape(n)), false, `${JSON.stringify(shape(n).slice(0, 40))} (length ${n}) must not match`)
+      }
     }
-    // A growth bound, not just the absolute one above: a genuinely linear
-    // (or low-polynomial) pattern's time barely moves as length grows a
-    // handful of characters at a time. A catastrophic nested quantifier
-    // multiplies by roughly 4x for every two added characters at exactly
-    // these lengths (measured on the mutation named above). Only compared
-    // once a timing clears a noise floor, so sub-millisecond jitter on the
-    // real (fast) pattern can never itself fail this assertion -- the real
-    // pattern's timings at these lengths never approach the floor at all.
-    for (let i = 1; i < timings.length; i++) {
-      const prev = timings[i - 1]
-      const curr = timings[i]
-      if (curr.ms < 0.5) continue
-      const ratio = curr.ms / Math.max(prev.ms, 0.001)
-      assert.ok(ratio < 3, `growth from ${prev.n} to ${curr.n} characters (input ${JSON.stringify(shape(curr.n))}) was ${ratio.toFixed(1)}x (${prev.ms.toFixed(3)}ms -> ${curr.ms.toFixed(3)}ms) -- looks super-linear`)
-    }
-  }
+  })
+  assert.equal(re.test('AC-SEC-4'), true)
 })
 
 // --- specs/harn-ledger-validators.md D3 -----------------------------------

@@ -266,7 +266,7 @@ function runWeeklyScript(repos, opts = {}) {
   } else {
     env.OPTIMISE_WEEKLY_REPOS = repos.join('\n')
   }
-  const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 20000, env })
+  const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 60000, env })
   const logContents = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
   return { ...res, log, logContents }
 }
@@ -718,7 +718,7 @@ test('weekly runner (subtraction round, item 9): the default repo list is read f
   }
   delete env.OPTIMISE_WEEKLY_REPOS
   delete env.CLAUDE_HOME
-  const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 20000, env })
+  const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 60000, env })
   const logContents = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
   assert.equal(res.status, 0, logContents)
   assert.match(logContents, resultLineRegex('PASS', label(repo)), logContents)
@@ -739,7 +739,7 @@ test('weekly runner (subtraction round, item 9): no $HOME/.claude/optimise-weekl
   }
   delete env.OPTIMISE_WEEKLY_REPOS
   delete env.CLAUDE_HOME
-  const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 20000, env })
+  const res = spawnSync(SCRIPT_PATH, [], { encoding: 'utf8', timeout: 60000, env })
   const logContents = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''
   assert.equal(res.status, 0, logContents)
   assert.ok(!logContents.includes('RESULT'), 'no config file must produce no verdict lines')
