@@ -1059,7 +1059,7 @@ test("T6 round 3 M2: the sidecar is written under the roster's first repo root, 
   const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
   assert.ok(prompt.includes(`"${ALPHA}" ".claude/optimise-proposal-targets.json"`), `the ensure-ignored check for the sidecar names roster root 1:\n${prompt.slice(0, 2500)}`)
   assert.ok(prompt.includes(`${ALPHA}/.claude/optimise-proposal-targets.json`), 'the write target is the sidecar path under roster root 1')
-  assert.ok(prompt.includes('"$(git rev-parse --show-toplevel)" ".claude/optimise-cycle-report.md"'), 'the report still goes to the current repo')
+  assert.ok(prompt.includes('"<toplevel>" ".claude/optimise-cycle-report.md"'), 'the report still goes to the current repo')
 })
 
 test('T6 round 3 L1: a ledger label that is a roster root path is redacted in the escaped-defect header, not printed (AC-SEC-10)', async () => {

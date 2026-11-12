@@ -1562,7 +1562,29 @@ test('T11 AC-SEC-8: the allowlist names no bare tool that would grant everything
 // with its cwd at <root>, so its root is pinned to the analysed repo (T11
 // escalation, finding 1): the plain spelling, the double-quoted spelling, and
 // the command substitution the workflow tells the agent to use.
-const HELPER_ENTRY = /^Bash\(node ((?:\/|~\/)[^ *]*)\/workflows\/lib\/(?:optimise-read\.mjs:\*|optimise-report-ignore\.mjs (?:\/[^ *"]+|"\/[^*"]+"|"\$\(git rev-parse --show-toplevel\)") \*)\)$/
+const HELPER_ENTRY = /^Bash\(node ((?:\/|~\/)[^ *]*)\/workflows\/lib\/(?:optimise-read\.mjs:\*|optimise-report-ignore\.mjs (?:\/[^ *"]+|"\/[^*"]+") \*)\)$/
+
+// A real headless run (Claude Code, dontAsk) printed `Ignoring --allowedTools
+// rule "*)": Wildcard tool name "*)" is not supported in allow rules` for each
+// rule holding a literal "$(git rev-parse --show-toplevel)": the CLI splits the
+// rule at the inner parenthesis and discards it, and the command it meant to
+// allow was refused. So no rule may carry a command substitution of either form.
+test('T11 escalation (real probe): no allow rule the runner passes contains a $( or backtick command substitution, which the CLI cannot parse in a rule', () => {
+  const main = makeTempRepo()
+  fs.writeFileSync(path.join(main, 'f'), 'x\n')
+  sh('git add f', main)
+  sh('git commit -q -m init', main)
+  const wt = path.join(freshDir('wt-'), 'tree')
+  sh(`git worktree add -q ${JSON.stringify(wt)}`, main)
+  for (const [repo, home] of [[makeTempRepo(), undefined], [wt, freshDir('claudehome-')]]) {
+    runWeeklyScript([repo], { claudeHome: home, extraPath: argvRecordingClaude() })
+    const allowed = flagValues(capturedArgv(repo), '--allowedTools')
+    assert.ok(allowed.some((e) => /optimise-report-ignore/.test(e)), 'guard against vacuity: the rooted helper rules are present')
+    for (const entry of allowed) {
+      assert.ok(!entry.includes('$(') && !entry.includes('`'), `a rule holding a command substitution is discarded by the CLI: ${entry}`)
+    }
+  }
+})
 
 test('T11 AC-SEC-8: no Bash(node...) entry may run arbitrary code -- each names one helper script path, never bare node, node -e or a repo-local copy', () => {
   const repo = makeTempRepo()
@@ -1588,7 +1610,6 @@ test('T11 AC-SEC-8: the node entries name exactly the two helpers the optimiser 
     allowed.filter((e) => /^Bash\(node/.test(e)).sort(),
     [
       `Bash(node ${claudeHome}/workflows/lib/optimise-read.mjs:*)`,
-      `Bash(${ignore} "$(git rev-parse --show-toplevel)" *)`,
       `Bash(${ignore} "${repo}" *)`,
       `Bash(${ignore} ${repo} *)`,
     ].sort(),
@@ -2480,7 +2501,6 @@ test('T11 escalation (finding 1): for a linked worktree the git -C and report-ig
   const ignore = `node ${claudeHome}/workflows/lib/optimise-report-ignore.mjs`
   const ignoreRules = allowed.filter((e) => e.startsWith(`Bash(${ignore} `)).sort()
   assert.deepEqual(ignoreRules, [
-    `Bash(${ignore} "$(git rev-parse --show-toplevel)" *)`,
     `Bash(${ignore} "${main}" *)`, `Bash(${ignore} "${wt}" *)`,
     `Bash(${ignore} ${main} *)`, `Bash(${ignore} ${wt} *)`,
   ].sort())

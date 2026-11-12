@@ -406,7 +406,7 @@ fi
 # step are then refused, and the log says so.
 REPO_ALLOWED=()
 rooted_rules() {
-  local repo="$1" label="$2" root helper accepted=0 skipped=0 seen=""
+  local repo="$1" label="$2" root helper skipped=0 seen=""
   REPO_ALLOWED=()
   for root in "$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" \
     "$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"; do
@@ -418,19 +418,17 @@ rooted_rules() {
       skipped=1
       continue
     fi
-    accepted=1
     REPO_ALLOWED+=("Bash(git -C $root log *)" "Bash(git -C \"$root\" log *)" "Bash(git -C $root rev-parse *)" "Bash(git -C \"$root\" rev-parse *)")
     for helper in "${IGNORE_HELPERS[@]}"; do
       REPO_ALLOWED+=("Bash(node $helper $root *)" "Bash(node $helper \"$root\" *)")
     done
   done
-  if [ "$accepted" = 1 ]; then
-    # The spelling the workflow gives for the report root; it resolves in the
-    # session's cwd, which is the analysed repo.
-    for helper in "${IGNORE_HELPERS[@]}"; do
-      REPO_ALLOWED+=("Bash(node $helper \"\$(git rev-parse --show-toplevel)\" *)")
-    done
-  fi
+  # No rule may hold a command substitution: a real headless run printed
+  # `Ignoring --allowedTools rule "*)": Wildcard tool name "*)" is not supported
+  # in allow rules` for a rule holding "$(git rev-parse --show-toplevel)" (the
+  # CLI splits it at the inner parenthesis and discards it). The workflow
+  # therefore has the session run git rev-parse --show-toplevel on its own and
+  # pass the path as a quoted literal, which the rules above name.
   if [ "$skipped" = 1 ]; then
     echo "NO-ROOTED-RULES $label (the repo path holds characters a permission rule cannot name)" >> "$LOG"
   fi

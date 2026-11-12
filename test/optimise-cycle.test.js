@@ -2177,9 +2177,52 @@ test('optimise-cycle (T11): given report_path and proposal_targets_path, the wri
   assert.ok(prompt.includes('to "/scratch/runner/targets.json"'), prompt)
   assert.ok(!prompt.includes('to the file ".claude/optimise-cycle-report.md"'), 'no instruction to write the default report path')
   assert.ok(!prompt.includes('"/repo/.claude/optimise-proposal-targets.json" (create'), 'no instruction to write the default sidecar path')
-  assert.ok(prompt.includes('"$(git rev-parse --show-toplevel)" ".claude/optimise-cycle-report.md"'), 'the report is still ignored at its final location')
+  assert.ok(prompt.includes('"<toplevel>" ".claude/optimise-cycle-report.md"'), 'the report is still ignored at its final location')
   assert.ok(prompt.includes('"/repo" ".claude/optimise-proposal-targets.json"'), 'the sidecar is still ignored at its final location')
   assert.equal(result.report_path, '/scratch/runner/report.md')
+})
+
+// T11 escalation (real headless probe): the weekly runner's permission rules
+// cannot name a command substitution (the CLI discards any rule holding
+// "$(git rev-parse --show-toplevel)"), so no command the workflow tells the
+// session to run may contain one; the agent runs the inner command on its own
+// and passes its output as a double-quoted literal.
+for (const [why, args] of [['default arguments', {}], ['the weekly runner\'s output paths', { report_path: '/scratch/runner/report.md', proposal_targets_path: '/scratch/runner/targets.json' }]]) {
+  test(`optimise-cycle (T11 escalation): with ${why}, no agent prompt asks for a $( command substitution`, async () => {
+    const { calls } = await runWorkflow(WORKFLOW, { args, agent: baseResponses() })
+    assert.ok(calls.length >= 5, 'guard against vacuity: the run reached its agent steps')
+    assert.ok(calls.some((c) => c.opts.label === 'report:write'), 'guard against vacuity: the report:write step ran')
+    for (const c of calls) {
+      assert.ok(!c.prompt.includes('$('), `${c.opts.label} asks for a command substitution:\n${c.prompt.slice(Math.max(0, c.prompt.indexOf('$(') - 200), c.prompt.indexOf('$(') + 200)}`)
+    }
+  })
+}
+
+test('optimise-cycle (T11 escalation): report:write runs git rev-parse --show-toplevel on its own first, passes that absolute path to the helper as a double-quoted literal, and still writes nothing unless the helper says ignored', async () => {
+  const { calls } = await runWorkflow(WORKFLOW, { args: { report_path: '/scratch/runner/report.md' }, agent: baseResponses() })
+  const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
+  const first = prompt.indexOf('`git rev-parse --show-toplevel` on its own')
+  const helper = prompt.indexOf('`node <path-to-optimise-report-ignore.mjs> "<toplevel>" ".claude/optimise-cycle-report.md"`')
+  assert.ok(first >= 0, `the agent must run rev-parse on its own:\n${prompt.slice(0, 1500)}`)
+  assert.ok(helper > first, 'and only then the helper, with <toplevel> as its first argument')
+  assert.match(prompt, /<toplevel> written out as that literal absolute path/, 'the placeholder is filled with the literal path, never a substitution')
+  assert.match(prompt, /If ignored is NOT true: do NOT write the report at all/, 'fail closed: no write unless ignored')
+})
+
+test('optimise-cycle (T11 escalation): the CI lane no longer offers gh --repo, which the weekly runner denies; gh runs from inside each repo root', async () => {
+  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  const prompt = calls.find((c) => c.opts.label === 'lane:ci').prompt
+  const prohibition = 'never pass `-R` or `--repo`'
+  assert.equal(prompt.split(prohibition).length, 2, 'it says so explicitly, once, so the agent does not reach for them')
+  const rest = prompt.replace(prohibition, '')
+  assert.ok(!/--repo\b|\s-R\b|`-R`/.test(rest), `nowhere else may the CI lane suggest -R or --repo:\n${rest.slice(0, 1200)}`)
+  assert.match(prompt, /from inside its root/, 'gh runs from inside the repo root')
+})
+
+test('optimise-cycle (T11 escalation, static): SKILL.md asks for no $( command substitution either', () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
+  assert.ok(skill.length > 1000, 'guard against vacuity: the skill was read')
+  assert.ok(!skill.includes('$('), 'SKILL.md must not instruct a command substitution')
 })
 
 test('optimise-cycle (T11): overriding only the report leaves the sidecar instruction at its default', async () => {
