@@ -534,11 +534,11 @@ const parseBeforeObj = (x, tempPrefixes) => {
     tempPrefixes.some((pre) => f.startsWith(pre))
   return fileOk && typeof v.rollup === 'string' && /^[0-9a-f]{64}$/.test(v.rollup) ? v : null
 }
-const CHANGE_KINDS = ['added', 'changed', 'removed']
+const CHANGE_KINDS = new Set(['added', 'changed', 'removed'])
 const parseDiffObj = (x) => {
   const v = parseObj(x)
   const ok = v && Array.isArray(v.changes) && typeof v.before_rollup === 'string' &&
-    v.changes.every((c) => c && typeof c === 'object' && typeof c.path === 'string' && CHANGE_KINDS.includes(c.change) && typeof c.shadows_installed_workflow === 'boolean')
+    v.changes.every((c) => c && typeof c === 'object' && typeof c.path === 'string' && CHANGE_KINDS.has(c.change) && typeof c.shadows_installed_workflow === 'boolean')
   return ok ? v : null
 }
 // Reads budget.spent() defensively: null (never 0) when budget is absent or

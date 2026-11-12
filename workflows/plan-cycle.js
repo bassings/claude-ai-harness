@@ -692,7 +692,7 @@ const reportOk = synthesis && typeof synthesis.summary === 'string' && synthesis
 // HARN-OPT-5 T8: a write-back that could not be checked, or failed its check, is aborted -- never blocked, never done.
 // T8 review round 1 F4: an id outside the AC pattern would have reached the verify command's shell argument; the run
 // is aborted (the check is treated as malformed) rather than trusting what the agent typed.
-const survivingIdsOk = synthesis && Array.isArray(synthesis.surviving_ids) && synthesis.surviving_ids.every((id) => typeof id === 'string' && /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/.test(id))
+const survivingIdsOk = synthesis && Array.isArray(synthesis.surviving_ids) && synthesis.surviving_ids.every((id) => typeof id === 'string' && /^AC-[A-Z][A-Z0-9]{0,15}-\d{1,6}$/.test(id))
 const writeback = survivingIdsOk ? parseWritebackCheck(synthesis && synthesis.writeback_check, specBefore, synthesis.surviving_ids) : null
 const writebackOk = Boolean(writeback && writeback.ok)
 const outcome = !reportOk || !writebackOk ? 'aborted' : lensReports.some(r => r.verdict === 'BLOCKED') ? 'blocked' : 'done'

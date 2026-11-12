@@ -33,7 +33,7 @@ import { createHash } from 'node:crypto'
 const SNAP_PREFIX = 'harn-specwb-'
 // T8 review round 2 H1: a lens prefix may carry a digit (AC-A11Y-<n>), the same blindness static-checks M5 recorded.
 const AC_LINE = /^- \*\*(AC-[A-Z][A-Z0-9]*-\d+):\*\*(.*)$/
-const AC_ID = /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/
+const AC_ID = /^AC-[A-Z][A-Z0-9]{0,15}-\d{1,6}$/
 const ACCEPTANCE = '## Acceptance criteria'
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
