@@ -2081,6 +2081,16 @@ test('T11 R2: a runner temp directory path the optimiser would refuse (a .claude
   assert.equal(fs.existsSync(path.join(repo, '.claude-argv')), false, 'claude must never have run')
 })
 
+test('T11 R2: a runner temp directory path with a character the optimiser would refuse (a space) stops the run with a FAIL, before any claude', () => {
+  const repo = makeTempRepo()
+  const tmp = path.join(freshDir('space-'), 'a b')
+  fs.mkdirSync(tmp)
+  const res = runWeeklyScript([repo], { extraPath: argvRecordingClaude(), env: { TMPDIR: tmp } })
+  assert.notEqual(res.status, 0)
+  assert.match(res.logContents, /^RESULT FAIL - reason="runner temp directory path cannot be given to the optimiser/m, res.logContents)
+  assert.equal(fs.existsSync(path.join(repo, '.claude-argv')), false, 'claude must never have run')
+})
+
 test('T11 R2: a report and sidecar written to the scratch paths are moved into .claude/, and the scratch files are gone', () => {
   const repo = makeTempRepo()
   const tmp = freshDir('tmp-')
