@@ -217,6 +217,15 @@ CLAUDE_PID=""
 RUNNER_TMP=""           # the runner-owned mode-700 directory every temp file lives in
 SWEEP_PENDING=0         # set once at start-up: clear what a SIGKILLed run left in RUNNER_TMP
 RUN_COMPLETE=0          # set only when the normal end is reached
+SCRATCH_REPORT=""       # where the session writes its report (inside RUNNER_TMP); the runner moves it
+SCRATCH_SIDECAR=""      # the same for the proposal-targets sidecar
+MOVE_TMP=""             # a temp file beside the final path while a move is in flight
+PLAN_MARKER=""          # <repo>/.claude/active-plan, while a run may have it rewritten
+PLAN_SNAPSHOT=""        # its bytes from before the run
+PLAN_HAD=0              # 1 if the marker existed before the run
+PLAN_LABEL=""
+SESSION_ID=""           # this run's --session-id, which the plan-guard hook writes into a marker it claims
+OUTPUT_PROBLEM=""       # why a scratch output was rejected, for the verdict
 EXIT_REASON=""          # why the run ended abnormally, when the runner knows
 
 # The one cleanup function: the exit trap, the signal handlers and the end of
@@ -235,6 +244,31 @@ cleanup_run() {
       fi
     done
   fi
+  # The plan-guard Stop hook may re-claim a dormant plan for the headless
+  # session and rewrite .claude/active-plan. The marker is put back only if it
+  # now carries THIS run's session id, so a real conductor's concurrent change
+  # is never clobbered; a marker that did not exist before, and now carries
+  # this session's id, is removed.
+  if [ -n "$PLAN_MARKER" ]; then
+    if [ ! -L "$PLAN_MARKER" ] && [ -f "$PLAN_MARKER" ] && grep -qxF "conductor: $SESSION_ID" "$PLAN_MARKER" 2>/dev/null; then
+      if [ "$PLAN_HAD" = 1 ]; then
+        cat "$PLAN_SNAPSHOT" > "$PLAN_MARKER"
+      else
+        rm -f "$PLAN_MARKER"
+      fi
+      echo "RESTORED-ACTIVE-PLAN $PLAN_LABEL" >> "$LOG"
+    fi
+    rm -f "$PLAN_SNAPSHOT"
+  fi
+  if [ -n "$MOVE_TMP" ]; then
+    rm -f "$MOVE_TMP"
+  fi
+  if [ -n "$SCRATCH_REPORT" ]; then
+    rm -rf "$SCRATCH_REPORT"
+  fi
+  if [ -n "$SCRATCH_SIDECAR" ]; then
+    rm -rf "$SCRATCH_SIDECAR"
+  fi
   if [ -n "$TRANSCRIPT_FILE" ]; then
     rm -f "$TRANSCRIPT_FILE"
   fi
@@ -250,6 +284,11 @@ cleanup_run() {
   if [ -n "$STAGED_WORKFLOW_DIR" ]; then
     rmdir "$STAGED_WORKFLOW_DIR" 2>/dev/null
   fi
+  PLAN_MARKER=""
+  PLAN_SNAPSHOT=""
+  MOVE_TMP=""
+  SCRATCH_REPORT=""
+  SCRATCH_SIDECAR=""
   TRANSCRIPT_FILE=""
   STALE_TMPDIR=""
   STAGED_WORKFLOW=""
@@ -262,7 +301,13 @@ cleanup_run() {
 # The tools the unattended optimiser may use, and nothing else (the run passes
 # --permission-mode dontAsk). Every entry is here because workflows/
 # optimise-cycle.js instructs it:
-#   - Write and Edit: the report and its sidecar, nothing else.
+#   - Edit, on the two scratch files the session writes its report and
+#     sidecar to, and nothing else (the entries are added once the runner
+#     directory exists, below). Measured for real: in dontAsk mode every
+#     write into .claude/ is refused whatever the rule, so the session never
+#     writes there; the runner moves the files into place afterwards. There
+#     is no Write entry, because the CLI matches only Edit rules to file
+#     writes (Edit rules cover every file-editing tool).
 #   - node: only the two helper scripts the workflow runs (optimise-read.mjs
 #     and optimise-report-ignore.mjs), by absolute path under $CLAUDE_HOME. A
 #     bare node entry would allow `node -e <anything>`, which is arbitrary
@@ -272,7 +317,10 @@ cleanup_run() {
 #     script is code the run did not install. A plugin-only install (no
 #     $CLAUDE_HOME mirror) therefore FAILS loudly, and is notified.
 #   - git log and git rev-parse (with -C <root>, which the workflow uses):
-#     the workflow's git lane. cat, head, ls, wc and date were dropped
+#     the workflow's git lane. The -C forms are spelled `git -C * log *`,
+#     because the CLI never matches a * mixed with the trailing :* syntax. A
+#     wildcard before the rest of the command also approves inserted options
+#     such as -c, so `-c` is denied for that form too (see the invocation). cat, head, ls, wc and date were dropped
 #     because Read, Grep and Glob cover reading, and each of those commands
 #     takes any path. status, show, diff, ls-files and check-ignore were
 #     dropped as unused by the agent (the helper runs check-ignore itself);
@@ -296,9 +344,7 @@ cleanup_run() {
 # a real headless run in this repository's tests.
 ALLOWED_TOOLS=(
   "Skill" "Workflow" "Agent" "Read" "Grep" "Glob"
-  "Write($REPORT_REL)" "Edit($REPORT_REL)"
-  "Write(.claude/optimise-proposal-targets.json)" "Edit(.claude/optimise-proposal-targets.json)"
-  "Bash(git log:*)" "Bash(git -C * log:*)" "Bash(git rev-parse:*)" "Bash(git -C * rev-parse:*)"
+  "Bash(git log:*)" "Bash(git -C * log *)" "Bash(git rev-parse:*)" "Bash(git -C * rev-parse *)"
   "Bash(gh run list:*)" "Bash(gh run view:*)" "Bash(gh repo view:*)"
   "Bash(node $CLAUDE_HOME/workflows/lib/optimise-read.mjs:*)"
   "Bash(node $CLAUDE_HOME/workflows/lib/optimise-report-ignore.mjs:*)"
@@ -412,6 +458,57 @@ trap on_exit EXIT
 trap 'on_signal 15 143' TERM
 trap 'on_signal 2 130' INT
 
+# The CLI spells an absolute path in a permission rule with a doubled leading
+# slash (a single slash means relative to the project root), so the rule for
+# /a/b is Edit(//a/b). Kept in one place so a real probe can change it once.
+edit_rule() {
+  printf 'Edit(/%s)' "$1"
+}
+
+# Moves a file the session wrote to a scratch path into the repo, after the
+# session has ended. The session is not trusted: the file is accepted only if
+# it is a regular file (not a symlink), non-empty and no larger than $3 bytes,
+# and it lands through a fresh exclusive temp file beside the destination and a
+# rename, which replaces a symlink at the destination instead of following it.
+# A file that is simply absent is left for the verdict to report; one that is
+# present and refused is recorded in OUTPUT_PROBLEM. $4 names it in the reason.
+place_output() {
+  local src="$1" dest="$2" cap="$3" what="$4" size destdir problem=""
+  if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+    return 0
+  fi
+  if [ -L "$src" ]; then
+    problem="$what rejected: the scratch file is a symlink"
+  elif [ ! -f "$src" ]; then
+    problem="$what rejected: the scratch path is not a regular file"
+  else
+    size=$(wc -c < "$src" | tr -d ' ')
+    if [ "$size" -eq 0 ]; then
+      problem="$what rejected: the scratch file is empty"
+    elif [ "$size" -gt "$cap" ]; then
+      problem="$what rejected: the scratch file is larger than $cap bytes"
+    fi
+  fi
+  destdir="$(dirname "$dest")"
+  if [ -z "$problem" ]; then
+    if [ -L "$destdir" ] || [ -d "$dest" ]; then
+      problem="$what rejected: the destination is a symlinked directory or a directory"
+    elif ! mkdir -p "$destdir" 2>/dev/null; then
+      problem="$what rejected: could not create the destination directory"
+    fi
+  fi
+  if [ -z "$problem" ]; then
+    MOVE_TMP="$(mktemp "$destdir/.optimise-output.XXXXXX" 2>/dev/null)"
+    if [ -n "$MOVE_TMP" ] && cat "$src" > "$MOVE_TMP" && mv -f "$MOVE_TMP" "$dest"; then
+      MOVE_TMP=""
+      return 0
+    fi
+    problem="$what rejected: could not move it into place"
+  fi
+  OUTPUT_PROBLEM="${OUTPUT_PROBLEM:+$OUTPUT_PROBLEM; }$problem"
+  return 1
+}
+
 # Per-repo verdict, decided entirely from the report artefact, claude's exit
 # code, and this script's own observations of the repo -- never from what
 # claude said. Echoes one RESULT line and returns 0 for PASS, 1 for FAIL.
@@ -428,6 +525,10 @@ verdict_repo() {
 
   if [ "$claude_exit" -ne 0 ]; then
     reasons+=("claude exited $claude_exit")
+  fi
+
+  if [ -n "$OUTPUT_PROBLEM" ]; then
+    reasons+=("$OUTPUT_PROBLEM")
   fi
 
   # Subtraction round: anchored to the CLI's own message (captured below,
@@ -472,7 +573,9 @@ verdict_repo() {
     if [ ! -s "$report_path" ]; then
       reasons+=("report file is empty")
     else
-      first_line=$(grep -m1 -v '^[[:space:]]*$' "$report_path" 2>/dev/null || true)
+      # Only the first 4 KiB is looked at: bash 3.2 pattern matching on a
+      # multi-megabyte line is quadratic, and a report may be one.
+      first_line=$(grep -m1 -v '^[[:space:]]*$' "$report_path" 2>/dev/null | head -c 4096)
       # Group 8: strip a leading UTF-8 BOM before checking for a heading --
       # a BOM-prefixed "# Heading" is still a heading.
       first_line="${first_line#$'\xef\xbb\xbf'}"
@@ -527,6 +630,19 @@ if [ -L "$RUNNER_TMP" ] || ! mkdir -p "$RUNNER_TMP" 2>/dev/null || ! chmod 700 "
 fi
 SWEEP_PENDING=1
 cleanup_run
+
+# The session writes its report and sidecar here, and the optimiser takes the
+# paths as arguments, so they must be plain absolute paths with no `.claude`
+# segment. The physical path is used, so a symlinked TMPDIR (macOS /var) cannot
+# make the permission rule and the path the session uses disagree.
+RUNNER_REAL="$(cd -P "$RUNNER_TMP" 2>/dev/null && pwd -P)"
+SCRATCH_REPORT_PATH="$RUNNER_REAL/report.md"
+SCRATCH_SIDECAR_PATH="$RUNNER_REAL/proposal-targets.json"
+if ! printf '%s' "$RUNNER_REAL" | grep -Eq '^/[A-Za-z0-9_/.-]+$' || printf '%s' "$RUNNER_REAL" | grep -Eq '(^|/)(\.claude|\.\.|\.)(/|$)'; then
+  EXIT_REASON="runner temp directory path cannot be given to the optimiser (plain characters only, no .claude segment)"
+  exit 1
+fi
+ALLOWED_TOOLS+=("$(edit_rule "$SCRATCH_REPORT_PATH")" "$(edit_rule "$SCRATCH_SIDECAR_PATH")")
 
 log_staleness() {
   echo "STALENESS $1 $2" >> "$LOG"
@@ -748,7 +864,38 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     continue
   fi
 
-  # Headless, read-only run. The optimiser writes its own report file; we
+  SESSION_ID="$( (uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null) | tr 'A-Z' 'a-z')"
+  if ! [[ "$SESSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    echo "RESULT FAIL $repo_label reason=\"could not mint a session id\"" >> "$LOG"
+    note_fail "$repo_label" "could not mint a session id"
+    cleanup_run
+    continue
+  fi
+
+  # The plan-guard Stop hook can re-claim a dormant plan for this headless
+  # session and rewrite .claude/active-plan (measured: it writes
+  # `conductor: <session id>`). The marker's bytes are saved here, and
+  # cleanup_run puts them back if the marker carries this run's session id.
+  PLAN_LABEL="$repo_label"
+  PLAN_HAD=0
+  PLAN_SNAPSHOT="$RUNNER_TMP/active-plan.snapshot"
+  if [ -f "$repo/.claude/active-plan" ] && [ ! -L "$repo/.claude/active-plan" ]; then
+    if cp "$repo/.claude/active-plan" "$PLAN_SNAPSHOT"; then
+      PLAN_HAD=1
+      PLAN_MARKER="$repo/.claude/active-plan"
+    else
+      echo "could not snapshot .claude/active-plan; it will not be restored" >> "$LOG"
+    fi
+  elif [ ! -e "$repo/.claude/active-plan" ] && [ ! -L "$repo/.claude/active-plan" ]; then
+    PLAN_MARKER="$repo/.claude/active-plan"
+  fi
+  SCRATCH_REPORT="$SCRATCH_REPORT_PATH"
+  SCRATCH_SIDECAR="$SCRATCH_SIDECAR_PATH"
+  OUTPUT_PROBLEM=""
+
+  # Headless, read-only run. The optimiser writes its report and sidecar to
+  # the scratch paths above, never under .claude/ (the session cannot write
+  # there); this script moves them into place afterwards. We
   # capture the transcript as diagnostic context only -- verdict_repo above
   # is what actually decides PASS/FAIL.
   #
@@ -757,8 +904,8 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # working tree, so nothing here switches them off. The permission model is
   # an explicit allowlist: --allowedTools names every tool the optimiser
   # needs, and --permission-mode dontAsk refuses everything else instead of
-  # prompting (nobody is there to answer) or auto-approving it. Write and
-  # Edit are scoped to the one report file. --disallowedTools stays as a
+  # prompting (nobody is there to answer) or auto-approving it. Edit is
+  # scoped to the two scratch files. --disallowedTools stays as a
   # second, explicit refusal of the destructive and outward-facing commands
   # (a deny rule wins over an allow rule); --permission-mode plan was
   # considered and rejected, since plan mode would block the optimiser
@@ -769,15 +916,18 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # level, so they stay.
   #
   # The plan-guard Stop hook can still rewrite .claude/active-plan in a repo
-  # with a conducted plan open (the 2026-08-16 measurement above); that is
-  # the cost of leaving the guard on, and docs/release-checklist.md records
-  # the real-run check of it.
+  # with a dormant plan (the 2026-08-16 measurement above); --session-id
+  # gives this run an id the hook then writes into the marker, which is how
+  # cleanup_run knows to put the saved bytes back. The snapshot hook still
+  # writes refs/harness-snapshots/* in each analysed repo; nothing here
+  # prevents that.
   TRANSCRIPT_FILE="$(mktemp "$RUNNER_TMP/optimise-weekly-transcript.XXXXXX")"
-  timeout -k 60 "$TIMEOUT_S" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
+  timeout -k 60 "$TIMEOUT_S" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90, \"report_path\": \"$SCRATCH_REPORT_PATH\", \"proposal_targets_path\": \"$SCRATCH_SIDECAR_PATH\"}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
     --allowedTools "${ALLOWED_TOOLS[@]}" \
     --permission-mode dontAsk \
     --setting-sources user \
-    --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" "Bash(git -c:*)" "Bash(git * --output*)" "Bash(git * --ext-diff*)" \
+    --session-id "$SESSION_ID" \
+    --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" "Bash(git -c:*)" "Bash(git -C * -c *)" "Bash(git * --output*)" "Bash(git * --ext-diff*)" \
     > "$TRANSCRIPT_FILE" 2>&1 &
   # Backgrounded and waited on, so a SIGTERM or SIGINT to this script is
   # handled at once (on_signal) rather than after claude finishes.
@@ -809,6 +959,15 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   else
     echo "[transcript omitted: redaction step failed or is unavailable -- see bin/redact-transcript.mjs]" >> "$LOG"
   fi
+
+  # The sidecar belongs under the root the optimiser resolved, which for a
+  # linked worktree is the main checkout (the parent of the common git dir).
+  sidecar_root="$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"
+  if [ ! -d "$sidecar_root" ]; then
+    sidecar_root="$repo"
+  fi
+  place_output "$SCRATCH_REPORT" "$repo/$REPORT_REL" 5242880 report
+  place_output "$SCRATCH_SIDECAR" "$sidecar_root/.claude/optimise-proposal-targets.json" 1048576 sidecar
   cleanup_run
 
   echo "exit=$claude_exit $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"

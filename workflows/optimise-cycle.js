@@ -16,6 +16,19 @@ opts = opts || {}
 const requestedRepos = Array.isArray(opts.repos) && opts.repos.length ? opts.repos : ['.']
 const requestedWindow = typeof opts.window === 'number' && opts.window > 0 ? opts.window : 2000
 
+// Optional output paths, for a caller whose session may not write under
+// .claude/ (the unattended weekly runner): when given, the report and the
+// proposal-targets sidecar are written to these absolute paths instead of the
+// default .claude/ locations, and the caller moves them into place. Absent,
+// nothing here changes. A path that is given must be a plain absolute path
+// with no `..`, `.` or `.claude` segment and only path-safe characters; a bad
+// one stops the run before any agent step rather than being silently ignored.
+const OUTPUT_PATH_RE = /^\/[A-Za-z0-9_\/.-]+$/
+const outputPathOk = (p) => typeof p === 'string' && OUTPUT_PATH_RE.test(p) && p.split('/').every((seg) => seg !== '..' && seg !== '.' && seg !== '.claude')
+const reportOut = opts.report_path == null ? null : opts.report_path
+const sidecarOut = opts.proposal_targets_path == null ? null : opts.proposal_targets_path
+const badOutputPaths = [['report_path', reportOut], ['proposal_targets_path', sidecarOut]].filter(([, v]) => v !== null && !outputPathOk(v)).map(([k]) => k)
+
 // AC-SIMP-10 / AC-QA-17: below this many usable ledger records, the
 // optimiser reports insufficient data and emits zero LEDGER-CITED
 // ("harness-side") proposals -- mirrors workflows/lib/optimise-read.mjs's
@@ -205,6 +218,15 @@ function hasReinstatementEvidence(p) {
 // AC-SEC-9 -- but the SAME "exactly one funnel point" discipline applies to
 // its one allowed write, the report file).
 async function run() {
+
+if (badOutputPaths.length) {
+  return {
+    resolved: [],
+    unresolved: [],
+    report: `Refusing to proceed: ${badOutputPaths.join(' and ')} must be a plain absolute path with no "..", "." or ".claude" segment.`,
+    __outcome: 'aborted',
+  }
+}
 
 // ---- Phase 1: scope ----
 phase('Scope')
@@ -1016,6 +1038,12 @@ const reportMarkdown = buildReport({
   flatten: flat,
 })
 
+const reportWriteTarget = reportOut
+  ? `"${reportOut}" (an absolute path; its directory already exists, so create no directory; overwrite the file if it already exists)`
+  : `"${REPORT_RELATIVE_PATH}" at the CURRENT repo's root (create the .claude/ directory first if it does not exist; overwrite the file if it already exists)`
+const sidecarWriteTarget = sidecarOut
+  ? `"${sidecarOut}" (an absolute path; its directory already exists, so create no directory; overwrite it if it exists)`
+  : `"${roots[0]}/${PROPOSAL_TARGETS_RELATIVE_PATH}" (create its .claude/ directory first if needed; overwrite it if it exists)`
 const reportWrite = await agent(
   `Before writing anything, ensure the report path is gitignored -- mirroring ledger-append.mjs's own discipline ` +
   `(the SAME protection the ledger already has, which the report previously lacked despite documentation claiming ` +
@@ -1030,10 +1058,9 @@ const reportWrite = await agent(
   `looks there first; the invoking repo need not be on the roster at all), exactly: \`node <path-to-optimise-report-ignore.mjs> ` +
   `"${roots[0]}" "${PROPOSAL_TARGETS_RELATIVE_PATH}"\`. If ITS ignored is not true, do NOT write the ` +
   `sidecar (still write the report) and say so in error.\n` +
-  `Only once ignored is true, write EXACTLY the content below, verbatim, to the file "${REPORT_RELATIVE_PATH}" at ` +
-  `the CURRENT repo's root (create the .claude/ directory first if it does not exist; overwrite the file if it ` +
-  `already exists). Once the sidecar path is ignored, also write EXACTLY the second data block below, verbatim, to ` +
-  `"${roots[0]}/${PROPOSAL_TARGETS_RELATIVE_PATH}" (create its .claude/ directory first if needed; overwrite it if it exists). Apart from that sidecar, the report is the only file you may create or modify in this step. Do NOT run \`git add\`, ` +
+  `Only once ignored is true, write EXACTLY the content below, verbatim, to the file ${reportWriteTarget}. ` +
+  `Once the sidecar path is ignored, also write EXACTLY the second data block below, verbatim, to ` +
+  `${sidecarWriteTarget}. Apart from that sidecar, the report is the only file you may create or modify in this step. Do NOT run \`git add\`, ` +
   `\`git commit\`, \`git push\`, any \`gh\` command with \`-X POST/PATCH/PUT/DELETE\`, or any other command that ` +
   `changes repo or remote state.\n\n` +
   wrapAsData(dataNonce, 'report-content-to-write-verbatim', reportMarkdown) +
@@ -1067,7 +1094,7 @@ return {
   // (rather than parsing the markdown) saw none of it.
   wall_clock: ledgerAgg ? ledgerAgg.wallClock : null,
   per_repo: ledgerAgg ? ledgerAgg.perRepo : [],
-  report_path: REPORT_RELATIVE_PATH,
+  report_path: reportOut || REPORT_RELATIVE_PATH,
   report_written: !!(reportWrite && reportWrite.written),
   report_write_error: reportWriteError,
   proposal_ids_computed: proposalIdsComputed,

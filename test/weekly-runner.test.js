@@ -137,7 +137,13 @@ const CHATTY_SUCCESS_LINE = 'Report written to .claude/optimise-cycle-report.md 
 // Anchored to the CLI's real message, taken verbatim from the real
 // 2026-08-16 log line quoted in specs/harn-opt-2.md conductor log tick 40.
 const CEILING_LINE = 'Background tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.'
-const STUB_CLAUDE = `#!/bin/sh
+// T11 round 2: the session may not write under .claude/, so the runner names
+// scratch paths in the prompt (report_path / proposal_targets_path) and moves
+// the files into place itself. Stubs write where the prompt says.
+const SCRATCH_SNIPPET = `REPORT_OUT=$(printf '%s' "$2" | sed -n 's/.*"report_path": "\\([^"]*\\)".*/\\1/p')
+[ -n "$REPORT_OUT" ] || REPORT_OUT=${REPORT_REL}
+`
+const STUB_CLAUDE = `#!/bin/sh\n${SCRATCH_SNIPPET}
 : > ${JSON.stringify(WITNESS_REL)}
 marker=""
 if [ -f .optimise-weekly-test-marker ]; then
@@ -146,25 +152,25 @@ fi
 case "$marker" in
   pass)
     mkdir -p .claude
-    cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+    cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
     echo "stub: some chatter the verdict must not depend on"
     exit 0
     ;;
   silent-pass)
     mkdir -p .claude
-    cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+    cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
     exit 0
     ;;
   empty)
     mkdir -p .claude
-    : > ${JSON.stringify(REPORT_REL)}
+    : > "$REPORT_OUT"
     exit 0
     ;;
   fail-with-report)
     mkdir -p .claude
-    cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+    cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
     exit 3
     ;;
@@ -178,17 +184,17 @@ ${VALID_REPORT}REPORTEOF
     ;;
   error-text)
     mkdir -p .claude
-    printf 'Traceback (most recent call last):\\nRuntimeError: something went wrong\\n' > ${JSON.stringify(REPORT_REL)}
+    printf 'Traceback (most recent call last):\\nRuntimeError: something went wrong\\n' > "$REPORT_OUT"
     exit 0
     ;;
   heading-no-sections)
     mkdir -p .claude
-    printf '# Delivery optimiser report\\n\\nSome prose with no section heading at all.\\n' > ${JSON.stringify(REPORT_REL)}
+    printf '# Delivery optimiser report\\n\\nSome prose with no section heading at all.\\n' > "$REPORT_OUT"
     exit 0
     ;;
   bom)
     mkdir -p .claude
-    printf '\\357\\273\\277# Delivery optimiser report\\n\\n## Sample completeness\\nn=3, clean.\\n' > ${JSON.stringify(REPORT_REL)}
+    printf '\\357\\273\\277# Delivery optimiser report\\n\\n## Sample completeness\\nn=3, clean.\\n' > "$REPORT_OUT"
     exit 0
     ;;
   ceiling-hit)
@@ -197,7 +203,7 @@ ${VALID_REPORT}REPORTEOF
     ;;
   mentions-ceiling-var-only)
     mkdir -p .claude
-    cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+    cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
     echo "See CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in the README for details."
     exit 0
@@ -281,6 +287,7 @@ function runWeeklyScript(repos, opts = {}) {
     OPTIMISE_WEEKLY_LOG: log,
     HOME: opts.home || ISOLATED_HOME,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: opts.stalenessRemote || NO_STALENESS_REMOTE,
+    TMPDIR: process.env.TMPDIR || RUN_TMPDIR,
     OSA_RECORD: `${log}.notify`,
     OSA_EXIT: String(opts.notifierExit || 0),
     ...(opts.env || {}),
@@ -567,7 +574,7 @@ test('weekly runner (Group 7): the model\'s transcript is redacted before landin
   const repo = makeTempRepo()
   const echoDir = fs.mkdtempSync(path.join(RUN_TMPDIR, 'echo-claude-'))
   trackTempDir(echoDir)
-  const shim = `#!/bin/sh\necho "Report written to ${repo}/${REPORT_REL} -- 1 ranked proposal."\nmkdir -p .claude\ncat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'\n${VALID_REPORT}REPORTEOF\nexit 0\n`
+  const shim = `#!/bin/sh\n${SCRATCH_SNIPPET}\necho "Report written to ${repo}/${REPORT_REL} -- 1 ranked proposal."\nmkdir -p .claude\ncat > "$REPORT_OUT" <<'REPORTEOF'\n${VALID_REPORT}REPORTEOF\nexit 0\n`
   fs.writeFileSync(path.join(echoDir, 'claude'), shim, { mode: 0o755 })
   const { status, logContents } = runWeeklyScript([repo], { extraPath: echoDir })
   assert.equal(status, 0, logContents)
@@ -598,7 +605,7 @@ test('weekly runner (subtraction round, item 4): a backtick-wrapped absolute pat
   // between the opening backtick and the path -- the one shape
   // ABSOLUTE_PATH_RE's old prefix class (start-of-string, whitespace,
   // quote or paren) could not anchor on at all.
-  const shim = `#!/bin/sh\necho "\\\`${homeLikeRoot}/${REPORT_REL}\\\` -- 3 ranked proposals."\nmkdir -p .claude\ncat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'\n${VALID_REPORT}REPORTEOF\nexit 0\n`
+  const shim = `#!/bin/sh\n${SCRATCH_SNIPPET}\necho "\\\`${homeLikeRoot}/${REPORT_REL}\\\` -- 3 ranked proposals."\nmkdir -p .claude\ncat > "$REPORT_OUT" <<'REPORTEOF'\n${VALID_REPORT}REPORTEOF\nexit 0\n`
   fs.writeFileSync(path.join(echoDir, 'claude'), shim, { mode: 0o755 })
   const { status, logContents } = runWeeklyScript([homeLikeRoot], { extraPath: echoDir })
   assert.equal(status, 0, logContents)
@@ -620,7 +627,7 @@ test('weekly runner (subtraction round, item 5): when the redaction step fails, 
   const echoDir = fs.mkdtempSync(path.join(RUN_TMPDIR, 'redact-fail-'))
   trackTempDir(echoDir)
   const RAW_MARKER = 'RAW-TRANSCRIPT-MARKER-should-never-reach-the-log'
-  const shim = `#!/bin/sh\necho ${JSON.stringify(RAW_MARKER)}\nmkdir -p .claude\ncat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'\n${VALID_REPORT}REPORTEOF\nexit 0\n`
+  const shim = `#!/bin/sh\n${SCRATCH_SNIPPET}\necho ${JSON.stringify(RAW_MARKER)}\nmkdir -p .claude\ncat > "$REPORT_OUT" <<'REPORTEOF'\n${VALID_REPORT}REPORTEOF\nexit 0\n`
   fs.writeFileSync(path.join(echoDir, 'claude'), shim, { mode: 0o755 })
   // Stands in for "the redaction step is unavailable or errors": `node`
   // always exits 1, so `node "$REDACT_SCRIPT" ... && ...` in the script
@@ -745,6 +752,7 @@ test('weekly runner (subtraction round, item 9): the default repo list is read f
     OPTIMISE_WEEKLY_LOG: log,
     HOME: fakeHome,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
+    TMPDIR: process.env.TMPDIR || RUN_TMPDIR,
   }
   delete env.OPTIMISE_WEEKLY_REPOS
   delete env.CLAUDE_HOME
@@ -766,6 +774,7 @@ test('weekly runner (subtraction round, item 9): no $HOME/.claude/optimise-weekl
     OPTIMISE_WEEKLY_LOG: log,
     HOME: fakeHome,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
+    TMPDIR: process.env.TMPDIR || RUN_TMPDIR,
   }
   delete env.OPTIMISE_WEEKLY_REPOS
   delete env.CLAUDE_HOME
@@ -1209,12 +1218,12 @@ function withGlobalWorkflow(home, body) {
 const WITNESS_STAGED = '.optimise-weekly-staged-seen'
 function witnessingClaudeStub(outcome) {
   const dir = fs.mkdtempSync(path.join(RUN_TMPDIR, 'witness-stub-'))
-  const body = `#!/bin/sh
+  const body = `#!/bin/sh\n${SCRATCH_SNIPPET}
 if [ -f .claude/workflows/optimise-cycle.js ]; then
   cat .claude/workflows/optimise-cycle.js > ${JSON.stringify(WITNESS_STAGED)}
 fi
 ${outcome === 'fail' ? 'exit 1' : `mkdir -p .claude
-cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0`}
 `
@@ -1438,6 +1447,7 @@ function runWithEnvUnset(configBody) {
     HOME: home,
     OPTIMISE_WEEKLY_STALENESS_REMOTE: NO_STALENESS_REMOTE,
     OSA_RECORD: `${log}.notify`,
+    TMPDIR: process.env.TMPDIR || RUN_TMPDIR,
   }
   delete env.OPTIMISE_WEEKLY_REPOS
   delete env.CLAUDE_HOME
@@ -1487,11 +1497,11 @@ test('T11 AC-OPS-6: the first log line of every run carries a SCRIPT_VERSION new
 
 function argvRecordingClaude() {
   const dir = freshDir('argv-stub-')
-  const body = `#!/bin/sh
+  const body = `#!/bin/sh\n${SCRATCH_SNIPPET}
 : > .claude-argv
 for a in "$@"; do printf '%s\\n' "$a" >> .claude-argv; done
 mkdir -p .claude
-cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0
 `
@@ -1527,18 +1537,14 @@ test('T11 AC-SEC-8: the claude invocation passes an explicit --allowedTools list
   assert.ok(settings === null || !settings.join('').includes('disableAllHooks'))
 })
 
-test('T11 AC-SEC-8: the allowlist names no bare tool that would grant everything, and scopes writes to the report file', () => {
+test('T11 AC-SEC-8: the allowlist names no bare tool that would grant everything and has no Write entry (scratch-path Edit rules are pinned in the R2 tests)', () => {
   const repo = makeTempRepo()
   runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
   const allowed = flagValues(capturedArgv(repo), '--allowedTools')
   for (const bare of ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', '*']) {
     assert.ok(!allowed.includes(bare), `a bare ${bare} entry would grant the whole tool:\n${allowed.join('\n')}`)
   }
-  for (const entry of allowed.filter((e) => /^(Write|Edit)\(/.test(e))) {
-    const target = entry.replace(/^(Write|Edit)\(|\)$/g, '')
-    assert.ok(['.claude/optimise-cycle-report.md', '.claude/optimise-proposal-targets.json'].includes(target), `writes are allowed to the report and its sidecar only: ${entry}`)
-  }
-  assert.ok(allowed.some((e) => e.startsWith('Write(')), 'the report must be writable or the run can never PASS')
+  assert.ok(!allowed.some((e) => /^Write\(/.test(e)), 'Write(...) is never matched by the CLI: only Edit rules cover file-editing tools')
   for (const entry of allowed.filter((e) => /^Bash\(/.test(e))) {
     assert.ok(!/^Bash\((rm|sudo|curl|wget|git push|git commit|git reset)\b/.test(entry), `a denied command must not be allowed: ${entry}`)
     for (const reader of ['cat', 'head', 'tail', 'ls', 'wc', 'date', 'echo', 'printf']) {
@@ -1757,9 +1763,9 @@ test('T11 AC-DATA-14: a staged file that is no longer byte-identical to the glob
   const claudeHome = freshDir('claudehome-')
   withGlobalWorkflow(claudeHome, '// global v1\n')
   const replacer = freshDir('replace-stub-')
-  fs.writeFileSync(path.join(replacer, 'claude'), `#!/bin/sh
+  fs.writeFileSync(path.join(replacer, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
 printf '// REPLACED DURING THE RUN\\n' > .claude/workflows/optimise-cycle.js
-cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0
 `, { mode: 0o755 })
@@ -1781,9 +1787,9 @@ test('T11 AC-SEC-10: the transcript temp file lives under CLAUDE_HOME when TMPDI
   const repo = makeTempRepo()
   const claudeHome = freshDir('claudehome-')
   const lister = freshDir('ls-stub-')
-  fs.writeFileSync(path.join(lister, 'claude'), `#!/bin/sh
+  fs.writeFileSync(path.join(lister, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
 ls "$CLAUDE_HOME/optimise-weekly-runner" > .home-listing
-cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0
 `, { mode: 0o755 })
@@ -1832,10 +1838,10 @@ test('T11 AC-DATA-14: the staleness check\'s clone directory is gone after a run
 // the EXIT trap cleans the same state whether or not the in-loop call runs.
 function listingClaude() {
   const dir = freshDir('listing-stub-')
-  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh
+  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
 ls "\${TMPDIR:-$CLAUDE_HOME}/optimise-weekly-runner" > .runner-listing
 mkdir -p .claude
-cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0
 `, { mode: 0o755 })
@@ -1938,10 +1944,10 @@ test('T11 L3: the runner\'s temp files live in a runner-owned mode-700 subdirect
   const repo = makeTempRepo()
   const tmp = freshDir('tmp-')
   const modeProbe = freshDir('mode-stub-')
-  fs.writeFileSync(path.join(modeProbe, 'claude'), `#!/bin/sh
+  fs.writeFileSync(path.join(modeProbe, 'claude'), `#!/bin/sh\n${SCRATCH_SNIPPET}
 ls -ld "$TMPDIR/optimise-weekly-runner" > .runner-mode
 mkdir -p .claude
-cat > ${JSON.stringify(REPORT_REL)} <<'REPORTEOF'
+cat > "$REPORT_OUT" <<'REPORTEOF'
 ${VALID_REPORT}REPORTEOF
 exit 0
 `, { mode: 0o755 })
@@ -1991,4 +1997,230 @@ test('T11 L6: a leftover that is byte-identical to its marker but tracked by git
   assert.equal(fs.readFileSync(stagedPath(repo), 'utf8'), '// committed by a developer\n', `the tracked file must survive:\n${res.logContents}`)
   assert.ok(!/REMOVED-LEFTOVER-STAGED/.test(res.logContents), res.logContents)
   assert.match(res.logContents, /repo ships its own optimise-cycle\.js/)
+})
+
+// --- T11 fix round 2: the session never writes under .claude/ ---------------
+//
+// Measured for real (Claude Code 2.1.322, dontAsk): every write into .claude/
+// is refused whatever the allow rule. So the session writes its report and
+// sidecar to scratch paths in the runner-owned directory, and the runner (the
+// trusted side) validates and moves them into place after the session ends.
+
+function scratchPaths(tmp) {
+  const dir = path.join(fs.realpathSync(tmp), RUNNER_DIR)
+  return { report: path.join(dir, 'report.md'), sidecar: path.join(dir, 'proposal-targets.json') }
+}
+
+// A claude that only knows the scratch paths it is told in its prompt (it
+// exits 3 if it is not told any), reads its --session-id, then runs `action`.
+function scratchClaude(action) {
+  const dir = freshDir('scratch-stub-')
+  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh
+REPORT_OUT=$(printf '%s' "$2" | sed -n 's/.*"report_path": "\\([^"]*\\)".*/\\1/p')
+SIDECAR_OUT=$(printf '%s' "$2" | sed -n 's/.*"proposal_targets_path": "\\([^"]*\\)".*/\\1/p')
+[ -n "$REPORT_OUT" ] || exit 3
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--session-id" ]; then SESSION_ID="$a"; fi
+  prev="$a"
+done
+${action}
+`, { mode: 0o755 })
+  return dir
+}
+
+const WRITE_VALID = `cat > "$REPORT_OUT" <<'REPORTEOF'
+${VALID_REPORT}REPORTEOF`
+const WRITE_SIDECAR = `printf '{"targets":[]}\\n' > "$SIDECAR_OUT"`
+const FINAL_SIDECAR_REL = path.join('.claude', 'optimise-proposal-targets.json')
+
+test('T11 R2: the prompt names scratch output paths in the runner directory, and the allowlist lets the session Edit exactly those two (absolute, double-slash spelling) and Write nothing', () => {
+  const repo = makeTempRepo()
+  const tmp = freshDir('tmp-')
+  runWeeklyScript([repo], { extraPath: argvRecordingClaude(), env: { TMPDIR: tmp } })
+  const argv = capturedArgv(repo)
+  const { report, sidecar } = scratchPaths(tmp)
+  assert.ok(argv[1].includes(`"report_path": "${report}"`), argv[1])
+  assert.ok(argv[1].includes(`"proposal_targets_path": "${sidecar}"`), argv[1])
+  const allowed = flagValues(argv, '--allowedTools')
+  assert.deepEqual(allowed.filter((e) => /^(Edit|Write)\(/.test(e)).sort(), [`Edit(/${report})`, `Edit(/${sidecar})`].sort())
+  assert.ok(!allowed.some((e) => /^(Edit|Write)\(/.test(e) && e.includes('.claude')), 'no write rule may name a .claude/ path: the session cannot write there')
+})
+
+test('T11 R2: the git -C entries use the spelling the CLI honours (a space and *, not :*), and the git -c escapes are denied for the -C form too', () => {
+  const repo = makeTempRepo()
+  runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
+  const argv = capturedArgv(repo)
+  const allowed = flagValues(argv, '--allowedTools')
+  for (const want of ['Bash(git -C * log *)', 'Bash(git -C * rev-parse *)', 'Bash(git log:*)', 'Bash(git rev-parse:*)']) {
+    assert.ok(allowed.includes(want), `missing ${want}`)
+  }
+  assert.ok(!allowed.some((e) => /^Bash\(git -C \* \S+:\*\)$/.test(e)), 'a * mixed with the trailing :* syntax never matches')
+  const denied = flagValues(argv, '--disallowedTools')
+  for (const want of ['Bash(git -c:*)', 'Bash(git -C * -c *)']) {
+    assert.ok(denied.includes(want), `a deny must stay for ${want}: a wildcard before the rest of the command also approves inserted options`)
+  }
+})
+
+test('T11 R2: each run is given a fresh session id (a UUID) with --session-id', () => {
+  const repo = makeTempRepo()
+  runWeeklyScript([repo], { extraPath: argvRecordingClaude() })
+  const id = flagValues(capturedArgv(repo), '--session-id')
+  assert.equal(id.length, 1)
+  assert.match(id[0], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+})
+
+test('T11 R2: a runner temp directory path the optimiser would refuse (a .claude segment) stops the run with a FAIL and a notification, before any claude', () => {
+  const repo = makeTempRepo()
+  const tmp = path.join(freshDir('dotclaude-'), '.claude', 'tmp')
+  fs.mkdirSync(tmp, { recursive: true })
+  const res = runWeeklyScript([repo], { extraPath: argvRecordingClaude(), env: { TMPDIR: tmp } })
+  assert.notEqual(res.status, 0)
+  assert.match(res.logContents, /^RESULT FAIL - reason="runner temp directory path cannot be given to the optimiser/m, res.logContents)
+  assert.equal(res.notifyCalls.length, 1)
+  assert.equal(fs.existsSync(path.join(repo, '.claude-argv')), false, 'claude must never have run')
+})
+
+test('T11 R2: a report and sidecar written to the scratch paths are moved into .claude/, and the scratch files are gone', () => {
+  const repo = makeTempRepo()
+  const tmp = freshDir('tmp-')
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(`${WRITE_VALID}\n${WRITE_SIDECAR}`), env: { TMPDIR: tmp } })
+  assert.equal(res.status, 0, res.logContents)
+  assert.match(res.logContents, resultLineRegex('PASS', label(repo)))
+  assert.equal(fs.readFileSync(path.join(repo, REPORT_REL), 'utf8'), VALID_REPORT)
+  assert.equal(fs.readFileSync(path.join(repo, FINAL_SIDECAR_REL), 'utf8'), '{"targets":[]}\n')
+  const { report, sidecar } = scratchPaths(tmp)
+  assert.equal(fs.existsSync(report), false)
+  assert.equal(fs.existsSync(sidecar), false)
+  assert.deepEqual(fs.readdirSync(path.join(repo, '.claude')).filter((n) => n.startsWith('.optimise-output')), [], 'no temp file left beside the report')
+})
+
+test('T11 R2: a sidecar is optional, and with none written the report still passes', () => {
+  const repo = makeTempRepo()
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(WRITE_VALID) })
+  assert.equal(res.status, 0, res.logContents)
+  assert.equal(fs.existsSync(path.join(repo, FINAL_SIDECAR_REL)), false)
+})
+
+test('T11 R2: for a linked worktree the report lands in the worktree and the sidecar in the main checkout, where the optimiser reads it', () => {
+  const main = makeTempRepo()
+  fs.writeFileSync(path.join(main, 'f'), 'x\n')
+  sh('git add f', main)
+  sh('git commit -q -m init', main)
+  const wt = path.join(freshDir('wt-'), 'tree')
+  sh(`git worktree add -q ${JSON.stringify(wt)}`, main)
+  const res = runWeeklyScript([wt], { extraPath: scratchClaude(`${WRITE_VALID}\n${WRITE_SIDECAR}`) })
+  assert.equal(res.status, 0, res.logContents)
+  assert.equal(fs.existsSync(path.join(wt, REPORT_REL)), true)
+  assert.equal(fs.existsSync(path.join(main, FINAL_SIDECAR_REL)), true, 'the sidecar belongs under the roster root the workflow resolves')
+  assert.equal(fs.existsSync(path.join(wt, FINAL_SIDECAR_REL)), false)
+})
+
+function rejection(name, action, reasonRe, finalPath = REPORT_REL) {
+  test(`T11 R2: ${name} is rejected -- the repo FAILs with a reason and nothing reaches .claude/`, () => {
+    const repo = makeTempRepo()
+    const secret = path.join(freshDir('secret-'), 'secret.txt')
+    fs.writeFileSync(secret, '# SECRET\n\n## must never be copied\n')
+    const res = runWeeklyScript([repo], { extraPath: scratchClaude(action.replace('$SECRET', secret)) })
+    assert.match(res.logContents, resultLineRegex('FAIL', label(repo)), res.logContents)
+    assert.match(res.logContents, reasonRe, res.logContents)
+    assert.equal(fs.existsSync(path.join(repo, finalPath)), false, 'a rejected file must not be moved')
+    assert.notEqual(res.status, 0)
+  })
+}
+
+rejection('a report that is a symlink', 'ln -s "$SECRET" "$REPORT_OUT"', /report rejected: .*symlink/)
+rejection('an empty report', ': > "$REPORT_OUT"', /report rejected: .*empty/)
+rejection('a report that is not a regular file', 'mkdir "$REPORT_OUT"', /report rejected: .*not a regular file/)
+rejection('an oversize report', `head -c 5300000 /dev/zero | tr '\\0' 'a' > "$REPORT_OUT"`, /report rejected: .*larger than/)
+rejection('a sidecar that is a symlink', `${WRITE_VALID}\nln -s "$SECRET" "$SIDECAR_OUT"`, /sidecar rejected: .*symlink/, FINAL_SIDECAR_REL)
+
+test('T11 R2: the move never writes through a symlink that sits where the final report goes', () => {
+  const repo = makeTempRepo()
+  const target = path.join(freshDir('link-target-'), 'created-through-the-link')
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.symlinkSync(target, path.join(repo, REPORT_REL))
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(WRITE_VALID) })
+  assert.equal(fs.existsSync(target), false, 'nothing may be created at the link target')
+  assert.equal(fs.lstatSync(path.join(repo, REPORT_REL)).isSymbolicLink(), false, 'the link itself is replaced')
+  assert.equal(fs.readFileSync(path.join(repo, REPORT_REL), 'utf8'), VALID_REPORT)
+  assert.equal(res.status, 0, res.logContents)
+})
+
+// The plan marker -----------------------------------------------------------
+
+const DORMANT_PLAN = 'plan.md\nconductor: dead-conductor\n'
+const REWRITE_AS_HOOK = 'printf "/abs/plan.md\\nconductor: %s\\n" "$SESSION_ID" > .claude/active-plan'
+
+function withMarker(repo, body) {
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'active-plan'), body)
+}
+
+test('T11 R2: a dormant plan marker the plan-guard hook re-claims for this session is restored byte for byte, and the restore is logged', () => {
+  const repo = makeTempRepo()
+  withMarker(repo, DORMANT_PLAN)
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(`${REWRITE_AS_HOOK}\n${WRITE_VALID}`) })
+  assert.equal(res.status, 0, res.logContents)
+  assert.equal(fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8'), DORMANT_PLAN)
+  assert.match(res.logContents, new RegExp(`^RESTORED-ACTIVE-PLAN ${escapeRegExp(label(repo))}$`, 'm'), res.logContents)
+})
+
+test('T11 R2: a marker changed to some OTHER conductor (a real one, working concurrently) is left alone', () => {
+  const repo = makeTempRepo()
+  withMarker(repo, DORMANT_PLAN)
+  const changed = 'plan.md\\nconductor: a-real-live-conductor\\n'
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(`printf '${changed}' > .claude/active-plan\n${WRITE_VALID}`) })
+  assert.equal(fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8'), 'plan.md\nconductor: a-real-live-conductor\n')
+  assert.ok(!/RESTORED-ACTIVE-PLAN/.test(res.logContents), res.logContents)
+})
+
+test('T11 R2: a marker nothing touched is left alone and nothing is logged', () => {
+  const repo = makeTempRepo()
+  withMarker(repo, DORMANT_PLAN)
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(WRITE_VALID) })
+  assert.equal(fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8'), DORMANT_PLAN)
+  assert.ok(!/RESTORED-ACTIVE-PLAN/.test(res.logContents))
+})
+
+test('T11 R2: with no marker before the run, a marker carrying this session\'s id is removed after it', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(`${REWRITE_AS_HOOK}\n${WRITE_VALID}`) })
+  assert.equal(fs.existsSync(path.join(repo, '.claude', 'active-plan')), false)
+  assert.match(res.logContents, /^RESTORED-ACTIVE-PLAN /m)
+})
+
+test('T11 R2: a signal mid-run still restores the marker, because the restore is part of the one cleanup path', async () => {
+  const repo = makeTempRepo()
+  withMarker(repo, DORMANT_PLAN)
+  const hanging = scratchClaude(`${REWRITE_AS_HOOK}\necho $$ > .claude-pid\n: > .ready\nexec sleep 30`)
+  const run = startRunner(repo, { home: freshHome(), claudeHome: freshDir('claudehome-'), tmpdir: freshDir('tmp-'), extraPath: hanging })
+  const pidFile = path.join(repo, '.claude-pid')
+  try {
+    await waitFor(() => fs.existsSync(path.join(repo, '.ready')), 'claude to start')
+    assert.notEqual(fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8'), DORMANT_PLAN, 'guard against vacuity: the stub did rewrite it')
+    run.child.kill('SIGTERM')
+    await Promise.race([run.done, new Promise((_, rej) => setTimeout(() => rej(new Error('runner did not exit')), 20000))])
+    assert.equal(fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8'), DORMANT_PLAN)
+  } finally {
+    killIfAlive(pidFile)
+  }
+})
+
+test('T11 R2: a directory sitting where the final report goes is refused, not moved into', () => {
+  const repo = makeTempRepo()
+  fs.mkdirSync(path.join(repo, REPORT_REL), { recursive: true })
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(WRITE_VALID) })
+  assert.match(res.logContents, /report rejected: .*destination/, res.logContents)
+  assert.deepEqual(fs.readdirSync(path.join(repo, REPORT_REL)), [], 'nothing may be moved into the directory')
+  assert.notEqual(res.status, 0)
+})
+
+test('T11 R2: a report just under the size cap that is one enormous line is judged quickly (bash 3.2 pattern matching on a multi-megabyte string is quadratic), and FAILs for having no heading', () => {
+  const repo = makeTempRepo()
+  const res = runWeeklyScript([repo], { extraPath: scratchClaude(`head -c 4900000 /dev/zero | tr '\\0' 'a' > "$REPORT_OUT"`) })
+  assert.notEqual(res.status, null, 'the runner must finish well inside the test timeout, not hang in the heading check')
+  assert.match(res.logContents, resultLineRegex('FAIL', label(repo)))
+  assert.match(res.logContents, /does not start with a markdown heading/)
 })

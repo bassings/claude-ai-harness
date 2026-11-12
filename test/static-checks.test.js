@@ -1022,6 +1022,7 @@ test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh con
   }
   assert.ok(callSite.includes('--allowedTools'), 'the claude -p call site must pass --allowedTools')
   assert.ok(callSite.includes('--permission-mode dontAsk'), 'the claude -p call site must refuse unlisted tools with --permission-mode dontAsk')
+  assert.ok(callSite.includes('--session-id "$SESSION_ID"'), 'the claude -p call site must pass --session-id, which is how the plan marker is recognised and restored')
   assert.ok(callSite.includes('--setting-sources user'), 'the claude -p call site must load user settings only, so a repo cannot widen the allowlist')
   assert.ok(!callSite.includes('--settings'), 'the claude -p call site must not override settings: the guard and snapshot hooks stay on')
 })

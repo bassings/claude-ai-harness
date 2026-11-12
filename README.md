@@ -1370,8 +1370,8 @@ mentioning it (this README does, right here).
 
 **Permission constraints on the unattended job -- an explicit allowlist, with
 the hooks left on.** `claude -p` runs here with `--allowedTools` naming every
-tool the optimiser needs (read-only git and gh queries, the node helpers the
-workflow invokes, and `Write`/`Edit` scoped to the one report file) and
+tool the optimiser needs (read-only git and gh queries, the two node helpers
+the workflow invokes, and `Edit` on exactly two scratch files, below) and
 `--permission-mode dontAsk`, which refuses every tool not on the list rather
 than prompting or auto-approving it, and `--setting-sources user`, so only the
 user's own settings load and an analysed repo's committed or local settings
@@ -1381,19 +1381,45 @@ explicit refusal of `Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`,
 `Bash(git commit:*)`, `Bash(git reset:*)`, `Bash(gh pr merge:*)`,
 `Bash(gh pr create:*)`, `Bash(gh issue create:*)`,
 `Bash(gh release create:*)`, `Bash(gh workflow run:*)`, `Bash(curl:*)` and
-`Bash(wget:*)`. The hooks are **not** disabled: the destructive-command guard
-and the snapshot hook stay active for the unattended session.
+`Bash(wget:*)`, plus `git -c` in its `-C` form. The hooks are **not**
+disabled: the destructive-command guard and the snapshot hook stay active for
+the unattended session.
 `test/static-checks.test.js` pins the deny tokens and the allowlist flags in
 the script text, and `test/weekly-runner.test.js` captures the real argument
 list. The allowlist has not been exercised by a real headless run from this
 repository's tests (every test drives a stub `claude`); the real-run check is
 recorded in `docs/release-checklist.md` when it has been done.
 
-**The plan-guard Stop hook is the one measured mutation source.** Measured
-2026-08-16: the globally-installed conductor plan-guard Stop hook rewrote
-`.claude/active-plan` in both delivery repos during the real run, as a side
-effect of the background workflow the optimiser launches. With the hooks left
-on, a repo that has a conducted plan open can still see that happen.
+**The session never writes under `.claude/`.** Measured on a real headless
+run (Claude Code 2.1.322, `dontAsk`): every write into `.claude/` is refused
+whatever the allow rule. So the runner names two scratch files in its own
+mode-700 directory and passes them to the workflow as `report_path` and
+`proposal_targets_path`; the session may `Edit` those two files and nothing
+else, and writes no other file. After the session ends the runner, not the
+session, moves each into place (`.claude/optimise-cycle-report.md` in the
+repo, and the sidecar under the main checkout the optimiser resolved). It
+accepts a file only if it is a regular file (not a symlink), non-empty and
+under a size cap, and moves it through a fresh temp file and a rename, so
+nothing is written through a symlink. A file that is present and refused makes
+the repo FAIL with the reason; one that is absent is reported by the verdict
+as a missing or stale report. The scratch path must be a plain absolute path
+with no `.claude` segment, so with `$TMPDIR` unset and `~/.claude` as the
+fallback the run stops with a FAIL (launchd always sets `$TMPDIR`).
+
+**The plan-guard Stop hook rewrites a dormant plan marker, and the runner puts
+it back.** Measured: the hook rewrote a dormant `.claude/active-plan` (a stale
+conductor line) to an absolute plan path with `conductor: <the headless
+session id>`. Each run is given `--session-id <uuid>`, the runner saves the
+marker's bytes first, and afterwards restores them byte for byte only if the
+marker now carries that uuid, so a real conductor's concurrent change is never
+overwritten (a marker that did not exist before and now carries the uuid is
+removed). `RESTORED-ACTIVE-PLAN <label>` is logged when that happens, and the
+restore runs from the same cleanup path, so a signal still restores. A
+SIGKILL skips it. This does not stop the hook from blocking the headless
+session's own stop while plan tasks are open, and the real conductor is
+treated as a bystander for the length of the run. Separately, the snapshot
+hook still writes `refs/harness-snapshots/*` in every analysed repo on each
+weekly run; nothing here prevents that.
 
 **A FAIL is announced, and cleanup is the runner's job.** When any repo's
 verdict is FAIL, or no repos are configured, the run raises one macOS
