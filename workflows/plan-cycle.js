@@ -750,7 +750,10 @@ const parseSpecSnapshot = (x) => {
 // T8 review round 2 M1: the surviving ids travel in a file beside the snapshot, at a path this script composes from the
 // validated snapshot path (no agent-typed text reaches the verify command), and verify echoes the ids it checked.
 const survivingIdsFile = (before) => `${before.file.slice(0, before.file.lastIndexOf('/'))}/surviving.json`
-const sameIdSet = (a, b) => Array.isArray(a) && Array.isArray(b) && JSON.stringify([...new Set(a)].sort()) === JSON.stringify([...new Set(b)].sort())
+// Elements of `a` come from a parsed JSON line and are not guaranteed to be strings, so the comparator coerces with String()
+// exactly as the default Array#sort does, and orders by UTF-16 code units (never localeCompare).
+const byDefaultOrder = (x, y) => { const s = String(x), t = String(y); return s < t ? -1 : s > t ? 1 : 0 }
+const sameIdSet = (a, b) => Array.isArray(a) && Array.isArray(b) && JSON.stringify([...new Set(a)].sort(byDefaultOrder)) === JSON.stringify([...new Set(b)].sort(byDefaultOrder))
 // The check must be about THIS snapshot (sha256 tie), carry a boolean ok and an array of problems, and have checked
 // exactly the ids the agent returned as surviving_ids (round 2 M1: otherwise a dropped criterion could pass if the
 // agent handed verify the ids it actually wrote rather than the ids it was given).
@@ -819,7 +822,7 @@ if (startRunId) terminalEntry.run_id = startRunId
 // by the write_ok:false consumer below. budget_spent needs no such retry: it
 // is an existing field and null is already accepted by every installed writer.
 let terminalWrite = await writeLedger(terminalEntry)
-const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.\[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
+const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
 if (refusedKey && !['kind', 'outcome', 'run_id', 'finding_entries'].includes(refusedKey) && Object.hasOwn(terminalEntry, refusedKey)) {
   log(`Terminal ledger write refused ${refusedKey} (installed writer predates it); retrying once without it: ${redactLogText(String(terminalWrite.write_error))}`)
   const { [refusedKey]: _refused, ...retryEntry } = terminalEntry

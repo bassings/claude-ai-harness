@@ -1200,7 +1200,7 @@ const scratchBase = scope && typeof scope.scratch_root === 'string' ? scope.scra
 // Round 1 L2 (AC-SEC-11, AC-QA-26): an absolute plain path is not enough, a working tree
 // qualifies. The base must also sit under a known temp prefix, or under the TMPDIR the
 // scope step passed through (a bare "/" or a relative value never widens the list).
-const plainAbsolute = (x) => /^\/[A-Za-z0-9._+@\/-]+$/.test(x) && !x.split('/').includes('..') && !x.split('/').includes('.claude')
+const plainAbsolute = (x) => /^\/[A-Za-z0-9._+@/-]+$/.test(x) && !x.split('/').includes('..') && !x.split('/').includes('.claude')
 const scopeTmpdir = scope && typeof scope.tmpdir === 'string' ? scope.tmpdir.replace(/\/+$/, '') : ''
 const tempPrefixes = ['/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/'].concat(scopeTmpdir && plainAbsolute(scopeTmpdir) ? [`${scopeTmpdir}/`] : [])
 const scratchUsable = plainAbsolute(scratchBase) && tempPrefixes.some((pre) => scratchBase.startsWith(pre))
@@ -2018,7 +2018,7 @@ if (startRunId && PAYLOAD_RUN_ID_RE.test(startRunId)) terminalEntry.run_id = sta
 // by the write_ok:false consumer below. budget_spent needs no such retry: it
 // is an existing field and null is already accepted by every installed writer.
 let terminalWrite = await writeLedger(terminalEntry)
-const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.\[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
+const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
 if (refusedKey && !['kind', 'outcome', 'run_id', 'finding_entries'].includes(refusedKey) && Object.hasOwn(terminalEntry, refusedKey)) {
   log(`Terminal ledger write refused ${refusedKey} (installed writer predates it); retrying once without it: ${redactLogText(String(terminalWrite.write_error))}`)
   const { [refusedKey]: _refused, ...retryEntry } = terminalEntry

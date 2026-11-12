@@ -183,7 +183,7 @@ function readIds(idsFile) {
   let ids
   try { ids = JSON.parse(raw) } catch { fail('the surviving-ids file is not JSON') }
   if (!Array.isArray(ids) || !ids.every((x) => typeof x === 'string' && AC_ID.test(x))) fail('the surviving-ids file must be a JSON array of AC ids')
-  return [...new Set(ids)].sort()
+  return [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 }
 
 function verify(specPathGiven, snapFile, idsFile) {
