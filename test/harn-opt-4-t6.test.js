@@ -588,7 +588,9 @@ test('T6 scope: no install-consistency check in optimise-cycle.js, no new workfl
   const src = fs.readFileSync(WORKFLOW, 'utf8')
   assert.ok(!/install[-_ ]consistency|allow_inconsistent_install|checkInstall/i.test(src), 'T6 declined the install-consistency check')
   const argNames = [...new Set([...src.matchAll(/\bopts\.([A-Za-z_]+)/g)].map((m) => m[1]))].sort()
-  assert.deepEqual(argNames, ['repos', 'window'], 'no new workflow argument')
+  // T11 (owner-approved): report_path and proposal_targets_path let the
+  // unattended weekly runner write its outputs outside .claude/.
+  assert.deepEqual(argNames, ['proposal_targets_path', 'report_path', 'repos', 'window'], 'no new workflow argument beyond the two T11 output paths')
   const readerSrc = fs.readFileSync(MODULE_PATH, 'utf8')
   assert.ok(!/child_process|execSync|execFileSync|spawnSync|\bspawn\(/.test(readerSrc), 'reader functions run no subprocess')
 })
