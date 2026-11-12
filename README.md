@@ -542,7 +542,16 @@ past it.
   substitution are extracted (nesting depth-counted, and never one sitting
   inside single quotes, which bash never expands) and independently
   re-evaluated the same way, so `echo $(git reset --hard)` is caught while
-  `echo '$(git reset --hard)'` stays inert text. `bash -c`/`sh -c`/
+  `echo '$(git reset --hard)'` stays inert text. Before any of that the text
+  is read as the shell reads it: a backslash-newline outside single quotes
+  joins the two lines, and a `#` comment (which starts only at the beginning
+  of a word, never in the middle of one or inside quotes) ends at its own
+  newline, so the line after a comment is still checked. A pathspec the
+  shell builds at run time (`$X`, `${X}`, `$(...)`, backticks, `{a,b}`) on
+  `git checkout`/`git restore` is whole-tree scope, so a dirty tracked file
+  anywhere refuses it. A refusal names the class that fired (`comment
+  continuation`, `backslash continuation`, `dynamic pathspec`, `zsh -c`) and
+  prints the override. `bash -c`/`sh -c`/`zsh -c`/
   `bash -lc SCRIPT`, and the `nohup`, `sudo` (including `sudo -u <user>`),
   `timeout <n>`, `xargs`, `env` (including `env -i`), `command` and `exec`
   prefix wrappers, are unwrapped and their inner command fed back through
@@ -617,14 +626,18 @@ measured, none is guarded, and none is planned to be.
 |---|---|---|
 | Repository retargeting through a wrapper | `env GIT_DIR=<other>/.git git clean -fd` | The clean/stash fail-closed rule reads the env prefix on the segment itself, and `env` hides it one level down. The other repository's untracked files or stash entries go, unmeasured. |
 | Repository retargeting already in the environment | `export GIT_DIR=...` in the shell that launched the session, then `git clean -fd` | The guard scrubs `GIT_*` from its own measuring call, which is what stops a leaked variable making it read the wrong repo -- but the real command still obeys the variable, so the two look at different repositories. Measured with a clean cwd and untracked work in the target: ALLOWED, and the real run deleted it. |
-| A pathspec that is not a literal token | `git checkout -- $(cat list)`, `git checkout -- "$FILES"` | The substitution or variable is not a path this guard can resolve, and it is dropped rather than read as "unknown", so the scope narrows to nothing and a dirty file is reverted. |
+| A run-time pathspec on a command other than `checkout`/`restore` | `git clean -fd "$X"`, `git clean -fd -- $(cat list)` | `git checkout` and `git restore` read a pathspec containing `$`, a backtick, `$(...)` or `{...}` as whole-tree scope (class `dynamic pathspec`), so a dirty tracked file anywhere refuses them. `git clean` does not: its dry run measures the pathspec as literal text, which matches nothing, so untracked files go unmeasured. |
+| A line that ends in an operator | `echo a &&` then a newline then `git reset --hard`; the same with a trailing `;`, `\|` or `&`, and `(cd x)` then a newline | The tokeniser reads the operator and the newline after it as one token, so the two lines are never split and the second is never matched. Measured ALLOWED on the pre-T5 guard and still ALLOWED. Found while closing the comment class; not part of it. |
 | An apostrophe inside a double-quoted string | `git commit -m "don't" && echo $(git reset --hard)` | Substitution extraction flips into single-quote mode at the apostrophe, so every `$(...)` and backtick after it on the line is never looked at. |
 | `-n` where it is not a flag | `git clean -f -e -n`, `git clean -f -- -n` | Any `-n` token anywhere reads as `--dry-run`, so the invocation is treated as harmless and never measured. Measured: `git clean -f -e -n` was ALLOWED and the real run deleted every untracked file in the tree. |
 | Nesting past `MAX_UNWRAP_DEPTH` | six or more stacked `bash -c` / `$(...)` layers | Past the bound everything fails OPEN, the clean and stash rules included, so these two lose their fail-closed posture exactly where an adversary would put them. |
 | `git stash store` | `C=$(git stash create) && git stash store "$C" && git stash drop` | `store` is treated as a non-push, so the entry it adds is not counted and the following drop is allowed. The working tree survives, so this one costs a dangling commit rather than live work. |
 | `eval` | `eval 'git reset --hard'` | Never unwrapped at all. |
 | A substitution as the binary path | `$(which git) checkout -- file` | The guard cannot resolve what the substitution prints, so it never recognises the invocation as `git`. |
-| Shell and wrapper flags not modelled | `sh -ec`, `bash -xc`, `timeout -k 5 5`, `xargs -I {}` | The wrapper is not recognised, so the inner command is never reached. |
+| Shell and wrapper flags not modelled | `sh -ec`, `bash -xc`, `zsh -fc`, `zsh -ic`, `zsh -l -c`, `zsh --no-rcs -c`, `timeout -k 5 5`, `xargs -I {}` | The wrapper is not recognised, so the inner command is never reached. Only `-c` and `-lc` are read, for `bash`, `sh` and `zsh`. |
+| Shells other than `bash`, `sh` and `zsh` | `dash -c`, `ksh -c`, `fish -c`, `busybox sh -c`, `env -S '...'` | Not unwrapped, so the inner command is never reached. |
+| A script fed to a shell on its standard input | `echo 'git reset --hard' \| zsh`, `zsh <<< 'git reset --hard'` | Nothing on the command line names the script, so it is never matched. |
+| A command built at run time or defined elsewhere | `f() { git reset --hard; }; f`, `G=git; $G reset --hard`, `zsh -c "$(echo git reset --hard)"` | The destructive text is never a literal token in a position the guard reads. |
 | A here-document fed to a shell | `bash <<'EOF'` ... `EOF` | Heredoc bodies are blanked uniformly before matching, which is right for the inert case (`cat <<EOF`) and wrong for this one. |
 | Input the tokeniser cannot parse | an unbalanced quote | Fails open by design; the guard only ever refuses a shape it positively identifies. |
 | The oversize shortcut's `git` test | 65,536+ characters containing `g''it` but not `git` | Over the parsing cap, a command with no literal `git` substring is allowed unparsed. Quote removal defeats the substring test. |

@@ -25,6 +25,7 @@ Run: python3 -m unittest discover -s hooks -p 'test_*.py'
 """
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -876,6 +877,18 @@ class TestHookProcessContract(unittest.TestCase):
                   % (len(durations), max(durations), statistics.median(durations)), file=sys.stderr)
 
 
+def count_segments(command):
+    """How many segments the guard sees in `command`: split after the same normalisation the guard applies first, since
+    comments, continuations and here-document bodies change where the segments are. 0 when the text cannot be tokenised."""
+    text, _classes = guard.normalise_shell_text(command)
+    text = guard.strip_heredoc_bodies(text)
+    text, _bodies = guard.extract_command_substitutions(text)
+    try:
+        return len(guard.split_segments(text))
+    except ValueError:
+        return 0
+
+
 class TestSubprocessCallsPerSegment(unittest.TestCase):
     """HARN-AUDIT-1 T1: what the per-invocation 1000ms assertion protected, as a count. The guard's cost is the git
     subprocesses it starts, and its own budget is MAX_SUBPROCESS_CALLS_PER_SEGMENT per segment (the constant
@@ -901,7 +914,7 @@ class TestSubprocessCallsPerSegment(unittest.TestCase):
                     guard.evaluate(case['command'], root)
                 finally:
                     guard.subprocess.run = real_run
-                segments = max(1, len(guard.split_segments(case['command'])))
+                segments = max(1, count_segments(case['command']))
                 observed_max = max(observed_max, len(calls))
                 with self.subTest(command=case['command']):
                     self.assertLessEqual(
@@ -911,6 +924,126 @@ class TestSubprocessCallsPerSegment(unittest.TestCase):
         finally:
             subprocess.run(['rm', '-rf', tmp])
         self.assertGreater(observed_max, 0, 'sanity: the counter must observe the guard starting git at least once across the corpus')
+
+
+PARSING_CLASSES = ('comment continuation', 'backslash continuation', 'dynamic pathspec', 'zsh -c')
+
+# What a refusal must TELL the agent to do, not only what it found (AC-OPS-8). Asserted against the real process's stderr.
+REFUSAL_INSTRUCTION_FRAGMENTS = (
+    'copy the file to a scratch path first',
+    '`git stash`',
+    'opt in explicitly',
+    'HARNESS_ALLOW_DESTRUCTIVE_GIT=1 set inline',
+)
+
+
+def run_guard_process(command, cwd):
+    payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': cwd,
+                          'hook_event_name': 'PreToolUse'})
+    return subprocess.run([sys.executable, GUARD_PATH], input=payload, capture_output=True, text=True,
+                          env=clean_env(), timeout=HANG_DEADLINE_SECONDS)
+
+
+class TestParsingClassRefusals(unittest.TestCase):
+    """HARN-AUDIT-1 T5 (AC-OPS-8, AC-QA-10): each BLOCK case the corpus tags with a `class` is a refusal that names that
+    class, prints the instruction to opt in, and has the bare destructive form as a control in the same fixture."""
+
+    def _tagged(self):
+        return [c for c in CASES if 'class' in c]
+
+    def test_every_class_has_a_block_case_and_every_tag_is_a_known_class(self):
+        tagged = self._tagged()
+        for case in tagged:
+            self.assertIn(case['class'], PARSING_CLASSES, 'unknown class tag on %r' % (case['command'],))
+            self.assertEqual(case['expect'], 'block', '%r carries a class tag but is not a BLOCK case' % (case['command'],))
+        for name in PARSING_CLASSES:
+            self.assertTrue([c for c in tagged if c['class'] == name], 'no BLOCK case is tagged with the class %r' % (name,))
+
+    def test_every_tagged_case_has_the_bare_destructive_form_as_a_control_in_the_same_fixture(self):
+        controls = [c for c in CASES if c.get('control')]
+        self.assertTrue(controls, 'the corpus has no control cases')
+        for control in controls:
+            self.assertEqual(control['expect'], 'block', 'a control is the bare form, which must block: %r' % (control['command'],))
+        for case in self._tagged():
+            with self.subTest(command=case['command']):
+                self.assertTrue([c for c in controls if c['setup'] == case['setup']],
+                                'no bare-form control shares the fixture of %r' % (case['command'],))
+
+    def test_each_new_refusal_names_its_class_and_prints_the_instruction(self):
+        tmp = tempfile.mkdtemp(prefix='destructive-git-cases-classes-')
+        try:
+            for case in self._tagged():
+                with self.subTest(command=case['command'], cls=case['class']):
+                    root = tempfile.mkdtemp(dir=tmp)
+                    apply_setup(root, case['setup'], DECLARED_SETUP_OPS)
+                    result = run_guard_process(case['command'], root)
+                    self.assertEqual(result.returncode, 2, 'expected a refusal, stderr: %s' % result.stderr)
+                    self.assertIn(case['class'], result.stderr,
+                                  'the refusal must name the class that fired (%r): %s' % (case['class'], result.stderr))
+                    for fragment in REFUSAL_INSTRUCTION_FRAGMENTS:
+                        self.assertIn(fragment, result.stderr,
+                                      'the refusal must carry the instruction clause %r: %s' % (fragment, result.stderr))
+        finally:
+            subprocess.run(['rm', '-rf', tmp])
+
+
+class TestNoCaseReachesTheFailOpenExceptBranch(unittest.TestCase):
+    """HARN-AUDIT-1 T5 (AC-SEC-2): `main()` answers 0 (allow) from a broad `except Exception` when evaluate() raises, so a
+    new parsing path that throws on a real case turns a BLOCK into a silent allow and nothing else notices. evaluate() is
+    wrapped to record anything it raises; every case is driven through the real main() and the record must stay empty."""
+
+    def _drive(self, command, cwd, raised):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': cwd})
+        real_evaluate = guard.evaluate
+
+        def recording(cmd, where):
+            try:
+                return real_evaluate(cmd, where)
+            except Exception as exc:
+                raised.append((cmd, repr(exc)))
+                raise
+        old_in, old_err = sys.stdin, sys.stderr
+        sys.stdin, sys.stderr = io.StringIO(payload), io.StringIO()
+        guard.evaluate = recording
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                guard.main()
+            return ctx.exception.code
+        finally:
+            guard.evaluate = real_evaluate
+            sys.stdin, sys.stderr = old_in, old_err
+
+    def test_the_recorder_sees_an_evaluate_that_raises(self):
+        # Without this the test below could pass with the recorder wired to nothing.
+        real_split = guard.split_segments
+
+        def boom(command):
+            raise RuntimeError('injected')
+        guard.split_segments = boom
+        raised = []
+        try:
+            code = self._drive('git status', tempfile.gettempdir(), raised)
+        finally:
+            guard.split_segments = real_split
+        self.assertIn(code, (0, None), 'main() fails open on an exception, which is the behaviour being watched')
+        self.assertEqual(len(raised), 1, 'the recorder must see the exception main() swallows')
+
+    def test_no_corpus_case_makes_evaluate_raise_and_each_gets_its_expected_exit(self):
+        tmp = tempfile.mkdtemp(prefix='destructive-git-cases-nofailopen-')
+        raised = []
+        try:
+            for case in CASES:
+                root = tempfile.mkdtemp(dir=tmp)
+                apply_setup(root, case['setup'], DECLARED_SETUP_OPS)
+                code = self._drive(case['command'], root, raised)
+                with self.subTest(command=case['command']):
+                    if case['expect'] == 'block':
+                        self.assertEqual(code, 2, 'wrong exit for %r (%s)' % (case['command'], case.get('note')))
+                    else:
+                        self.assertIn(code, (0, None), 'wrong exit for %r (%s)' % (case['command'], case.get('note')))
+        finally:
+            subprocess.run(['rm', '-rf', tmp])
+        self.assertEqual(raised, [], 'evaluate() raised on corpus cases, which main() turns into a silent allow: %r' % raised)
 
 
 if __name__ == '__main__':
