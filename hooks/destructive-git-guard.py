@@ -170,7 +170,10 @@ in order:
      quotes, joining the lines, and drop a `#` comment, which starts only at
      the beginning of a word outside quotes and ends at its own newline.
      The tokeniser's comment handling is off, because it read a `#` in the
-     middle of a word as a comment and swallowed the newline after one. The
+     middle of a word as a comment and swallowed the newline after one. A
+     comment inside backticks ends at the closing backtick, a `#` inside
+     `${...}` and after a bare carriage return starts none (all checked
+     against real bash and zsh). The
      refusal names the class (`comment continuation`, `backslash
      continuation`) when the command contains one; a refusal from inside a
      `zsh -c` body names `zsh -c`.
@@ -179,7 +182,11 @@ in order:
      for `git checkout` and `git restore`: the guard cannot tell which file it
      names, so a dirty tracked file anywhere refuses the command, with the
      class `dynamic pathspec` named. A substitution is restored into the
-     token it was written in, not dropped.
+     token it was written in, not dropped. An unquoted leading `~` counts.
+     A `@{...}` suffix is git's own ref syntax and does not, and the operand
+     of `--detach`, `-t`/`--track` (checkout) and `--source`/`-s` (restore)
+     is a ref, never a pathspec. A bare run-time word (`git checkout "$f"`)
+     may be either, so it is refused on a dirty tree.
  12. The same pass puts spaces around an unquoted newline, `;`, `(` and `)`,
      and `|&` is a control operator: the tokeniser reads a run of adjacent
      punctuation (`&&` then a newline, `)` then `&&`) as one token that is no
@@ -563,7 +570,7 @@ def normalise_shell_text(command):
     input: an unbalanced quote just leaves the rest of the text as it came."""
     out = []
     classes = set()
-    stack = []  # 'sq', 'dq', 'bt' (backticks), or an int (paren depth inside `$(`)
+    stack = []  # 'sq', 'dq', 'bt' (backticks), 'br' (inside `${`), or an int (paren depth inside `$(`)
     heredocs = []
     n = len(command)
     i = 0
@@ -630,17 +637,39 @@ def normalise_shell_text(command):
             i += 2
             word_start = True
             continue
+        if ch == '$' and command.startswith('${', i):
+            # A parameter expansion: a `#` anywhere inside it is literal text
+            # (`${X:-a #b}`), checked against bash and zsh.
+            out.append('${')
+            stack.append('br')
+            i += 2
+            word_start = False
+            continue
+        if ch == '}' and mode == 'br':
+            stack.pop()
+            out.append(ch)
+            i += 1
+            word_start = False
+            continue
         if ch == '#':
             if first_hash < 0:
                 first_hash = i
-            if word_start:
+            if word_start and mode != 'br':
                 # Replaced by a space, not removed: `a;# note` followed by a
                 # newline would otherwise leave `;` and the newline adjacent,
                 # and the tokeniser reads that pair as one token.
                 out.append(' ')
                 after_op = was_op
-                eol = command.find('\n', i)
-                i = n if eol == -1 else eol
+                if mode == 'bt':
+                    # Inside backticks the shell finds the closing backtick
+                    # before it parses a comment, so the comment ends there.
+                    end = i
+                    while end < n and command[end] not in '\n`':
+                        end += 1
+                    i = end
+                else:
+                    eol = command.find('\n', i)
+                    i = n if eol == -1 else eol
                 continue
             out.append(ch)
             i += 1
@@ -661,6 +690,13 @@ def normalise_shell_text(command):
                     out.append(command[i:])
                     break
                 i = resume
+            continue
+        if ch == '\r' and not command.startswith('\r\n', i):
+            # A carriage return not ending a CRLF is an ordinary character in
+            # a shell, so a `#` after it starts no comment.
+            out.append(ch)
+            i += 1
+            word_start = False
             continue
         if ch == '<' and command.startswith('<<', i):
             if command.startswith('<<<', i):
@@ -1087,12 +1123,27 @@ def normalize_rest(rest):
     return expand_bundled_short_flags(rest)
 
 
+# git's own revision syntax `<ref>@{<n>}` / `@{-1}` / `@{upstream}`: the braces
+# are part of a ref name, not a shell brace expansion.
+REFLOG_SUFFIX_RE = re.compile(r'@\{[^{}$`]*\}')
+
+# `git checkout` flags whose operand is a branch or commit, never a pathspec.
+CHECKOUT_REF_OPERAND_FLAGS = ('--detach', '-d', '-t', '--track')
+
+# `git restore` flags whose separate operand is a ref, never a pathspec.
+RESTORE_REF_OPERAND_FLAGS = ('--source', '-s')
+
+
 def is_dynamic_pathspec(token):
     """True if `token` is a path the shell builds at run time, which this
     guard cannot resolve: a variable (`$X`, `${X}`), a command substitution
     (`$(...)` or backticks, restored into the token by
-    take_substitution_placeholders) or a brace expansion (`{a,b}`)."""
-    return '$' in token or '`' in token or '{' in token
+    take_substitution_placeholders), a brace expansion (`{a,b}`) or an
+    unquoted leading `~`. A `@{...}` suffix is git's own ref syntax and does
+    not count. (Quoting is gone by now, so a quoted `'~'` is read as dynamic
+    too: the stricter reading.)"""
+    stripped = REFLOG_SUFFIX_RE.sub('', token)
+    return '$' in stripped or '`' in stripped or '{' in stripped or stripped.startswith('~')
 
 
 def has_pathspec_from_file(rest):
@@ -1239,6 +1290,8 @@ def destructive_scope(subcmd, rest, cwd, git_config=None, unknown_trailing=False
             return ('tree', None)
         if '-b' in rest or '-B' in rest or '--orphan' in rest:
             return None  # branch creation, not a restore
+        if any(flag in rest for flag in CHECKOUT_REF_OPERAND_FLAGS):
+            return None  # its operand is a branch or commit and it takes no pathspec
         non_flags = [t for t in rest if not t.startswith('-')]
         if not non_flags:
             return None
@@ -1274,7 +1327,15 @@ def destructive_scope(subcmd, rest, cwd, git_config=None, unknown_trailing=False
         if '--' in rest:
             paths = rest[rest.index('--') + 1:]
         else:
-            paths = [t for t in rest if not t.startswith('-')]
+            paths = []
+            operand_of_source = False
+            for t in rest:
+                if operand_of_source:
+                    operand_of_source = False
+                elif t in RESTORE_REF_OPERAND_FLAGS:
+                    operand_of_source = True
+                elif not t.startswith('-'):
+                    paths.append(t)
         if any(is_dynamic_pathspec(p) for p in paths):
             return ('dynamic_tree', None)
         return ('paths', paths) if paths else None
@@ -1452,11 +1513,13 @@ REFUSAL = (
 # names its class, says why the whole tree was measured, and carries the same
 # instruction and recovery clauses as REFUSAL.
 REFUSAL_DYNAMIC = (
-    "destructive-git-guard: refused `{cmd}` -- class: dynamic pathspec. A path "
-    "here is built when the command runs (a variable, a `$(...)` or backtick "
-    "substitution, or a `{{a,b}}` brace expansion), so this guard cannot tell "
-    "which file it names and treats the whole tree as in scope, and `git "
-    "status` shows a tracked, uncommitted change that it could discard. Safe "
+    "destructive-git-guard: refused `{cmd}` -- class: dynamic pathspec. A "
+    "branch or path here is built when the command runs (a variable, a "
+    "`$(...)` or backtick substitution, a `{{a,b}}` brace expansion or a "
+    "`~`), so this guard cannot tell whether it names a branch, which "
+    "discards nothing, or a file, which it would revert. It treats the whole "
+    "tree as in scope, and `git status` shows a tracked, uncommitted change "
+    "that could be discarded. Safe "
     "alternatives: name the paths literally, copy the file to a scratch path "
     "first, or `git stash` before retrying. If this revert is deliberate, opt "
     "in explicitly: re-run with {var}=1 set inline (`{var}=1 {cmd}`) or "
@@ -1527,16 +1590,29 @@ REFUSAL_OVERSIZE = (
 )
 
 
+# Classes whose presence in a refusal means the refusal depended on them: a
+# `zsh -c` body is only checked at all because zsh is unwrapped. The other
+# classes are read off the command text as a whole, and the guard does not
+# re-run the match without them, so they are reported as constructs the
+# command also uses and never as the cause.
+CAUSAL_CLASSES = frozenset({ZSH_CLASS})
+
+
 def annotate_refusal(reason, classes):
-    """`reason` with one sentence per parsing class in `classes` appended, or
-    `reason` unchanged when there are none. The class is named whenever the
-    construct is present in the refused command, which is also true of a
-    command that would have been refused without it: the note says what the
-    guard did, not that the refusal depended on it."""
+    """`reason` with the parsing classes in `classes` appended, or `reason`
+    unchanged when there are none. A causal class is named as the class that
+    fired. The rest are listed as "also uses", because the same command
+    would often be refused without them (`git reset --hard # note`)."""
     if not reason or not classes:
         return reason
-    notes = ' '.join('[class: %s -- %s.]' % (name, CLASS_NOTES[name]) for name in sorted(classes))
-    return reason + ' ' + notes
+    notes = ['[class: %s -- %s.]' % (name, CLASS_NOTES[name])
+             for name in sorted(classes) if name in CAUSAL_CLASSES]
+    others = sorted(name for name in classes if name not in CAUSAL_CLASSES)
+    if others:
+        notes.append('[This command also uses: %s. It was read as the shell reads it; the refusal above '
+                     'does not necessarily depend on this.]'
+                     % '; '.join('%s (%s)' % (name, CLASS_NOTES[name]) for name in others))
+    return reason + ' ' + ' '.join(notes)
 
 
 def classify_cd(tokens):
@@ -1910,7 +1986,12 @@ def main():
         cwd = os.getcwd()
     try:
         reason = evaluate(command, cwd)
-    except Exception:
+    except Exception as exc:
+        # Left as a trace and nothing more: one line naming the exception
+        # class, with no command text, so a parsing regression is visible
+        # instead of silent. The verdict is unchanged (below).
+        print('destructive-git-guard: internal error (%s); this command was NOT checked'
+              % type(exc).__name__, file=sys.stderr)
         # AC-SEC-4: whatever pathological input reaches this point, the
         # hook contract stays exit 0 or 2, NEVER 1, and stderr never carries
         # a Python traceback. An exception here is a bug in this module's

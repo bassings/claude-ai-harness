@@ -959,15 +959,20 @@ class TestParsingClassRefusals(unittest.TestCase):
         for name in PARSING_CLASSES:
             self.assertTrue([c for c in tagged if c['class'] == name], 'no BLOCK case is tagged with the class %r' % (name,))
 
-    def test_every_tagged_case_has_the_bare_destructive_form_as_a_control_in_the_same_fixture(self):
+    def test_every_tagged_case_names_its_bare_destructive_form_and_that_control_exists_in_its_fixture(self):
         controls = [c for c in CASES if c.get('control')]
         self.assertTrue(controls, 'the corpus has no control cases')
         for control in controls:
             self.assertEqual(control['expect'], 'block', 'a control is the bare form, which must block: %r' % (control['command'],))
+            self.assertNotIn('class', control, 'a control is the bare form, so it carries no parsing class: %r' % (control['command'],))
         for case in self._tagged():
             with self.subTest(command=case['command']):
-                self.assertTrue([c for c in controls if c['setup'] == case['setup']],
-                                'no bare-form control shares the fixture of %r' % (case['command'],))
+                bare = case.get('bare')
+                self.assertTrue(bare, 'a tagged case must name its bare destructive form in `bare`')
+                self.assertIn(bare.split()[1], case['command'].replace('\\\n', ''),
+                              "the bare form %r is not a form of this case's own command" % (bare,))
+                self.assertTrue([c for c in controls if c['command'] == bare and c['setup'] == case['setup']],
+                                'no control row has the command %r in the fixture of %r' % (bare, case['command']))
 
     def test_each_new_refusal_names_its_class_and_prints_the_instruction(self):
         tmp = tempfile.mkdtemp(prefix='destructive-git-cases-classes-')
@@ -985,6 +990,42 @@ class TestParsingClassRefusals(unittest.TestCase):
                                       'the refusal must carry the instruction clause %r: %s' % (fragment, result.stderr))
         finally:
             subprocess.run(['rm', '-rf', tmp])
+
+
+class TestClassNotesDoNotClaimCausation(unittest.TestCase):
+    """AC-OPS-8 says a refusal names the class that FIRED. The guard reads the whole command text, and does not re-run the
+    match without each construct, so a comment, a continuation or an adjacent operator is reported as something the
+    command also uses, never as the cause. `zsh -c` is causal: its body is only checked because zsh is unwrapped."""
+
+    def _stderr(self, command):
+        root = tempfile.mkdtemp()
+        try:
+            run_git(['init', '-q', '-b', 'master'], root)
+            write_file(root, 'tracked.txt', 'c\n')
+            run_git(['add', '--', 'tracked.txt'], root)
+            run_git(['commit', '-q', '-m', 'seed'], root)
+            write_file(root, 'tracked.txt', 'dirty\n')
+            result = run_guard_process(command, root)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            return result.stderr
+        finally:
+            subprocess.run(['rm', '-rf', root])
+
+    def test_a_refusal_that_never_needed_the_comment_does_not_say_the_comment_fired(self):
+        stderr = self._stderr('git reset --hard # revert')
+        self.assertNotIn('[class: comment continuation', stderr)
+        self.assertIn('also uses: comment continuation', stderr)
+        self.assertIn('does not necessarily depend', stderr)
+
+    def test_zsh_is_reported_as_the_class_that_fired(self):
+        self.assertIn('[class: zsh -c', self._stderr("zsh -c 'git reset --hard'"))
+
+    def test_a_dynamic_pathspec_refusal_says_a_branch_or_path(self):
+        stderr = self._stderr('git checkout "$f"')
+        self.assertIn('class: dynamic pathspec', stderr)
+        self.assertIn('A branch or path here is built when the command runs', stderr)
+        for fragment in REFUSAL_INSTRUCTION_FRAGMENTS:
+            self.assertIn(fragment, stderr)
 
 
 class TestNoCaseReachesTheFailOpenExceptBranch(unittest.TestCase):
@@ -1012,6 +1053,29 @@ class TestNoCaseReachesTheFailOpenExceptBranch(unittest.TestCase):
         finally:
             guard.evaluate = real_evaluate
             sys.stdin, sys.stderr = old_in, old_err
+
+    def test_a_parser_exception_still_allows_but_leaves_a_trace_without_the_command(self):
+        real_split = guard.split_segments
+
+        def boom(command):
+            raise KeyError('secret-looking-text')
+        guard.split_segments = boom
+        old_in, old_err = sys.stdin, sys.stderr
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git reset --hard'}, 'cwd': tempfile.gettempdir()})
+        sys.stdin, sys.stderr = io.StringIO(payload), io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                guard.main()
+            trace = sys.stderr.getvalue()
+        finally:
+            guard.split_segments = real_split
+            sys.stdin, sys.stderr = old_in, old_err
+        self.assertIn(ctx.exception.code, (0, None), 'the fail-open verdict is unchanged')
+        self.assertEqual(len(trace.strip().splitlines()), 1, 'exactly one line: %r' % trace)
+        self.assertIn('KeyError', trace)
+        self.assertIn('NOT checked', trace)
+        self.assertNotIn('git reset', trace, 'the trace must not carry command text')
+        self.assertNotIn('secret-looking-text', trace, 'the trace must not carry the exception message')
 
     def test_the_recorder_sees_an_evaluate_that_raises(self):
         # Without this the test below could pass with the recorder wired to nothing.

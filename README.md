@@ -549,7 +549,13 @@ past it.
   newline, so the line after a comment is still checked. A pathspec the
   shell builds at run time (`$X`, `${X}`, `$(...)`, backticks, `{a,b}`) on
   `git checkout`/`git restore` is whole-tree scope, so a dirty tracked file
-  anywhere refuses it. An operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis at the end of a line, or beside another one, no longer hides the next command: the tokeniser read such a run as one token, so the text is spaced around them first. A refusal names the class that fired (`comment
+  anywhere refuses it. A `@{...}` suffix (`HEAD@{1}`, `@{-1}`) is git's own
+  ref syntax, and the operand of `--detach`, `-t`/`--track` and
+  `--source`/`-s` is a ref, so those are not refused. A bare run-time word
+  with nothing to say whether it is a branch or a file (`git checkout
+  "$BRANCH"`, `git checkout ${BRANCH:-master}`) IS refused on a dirty tree:
+  a documented over-block, because a file reverted by mistake is lost and a
+  refusal costs one retry with the override. An operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis at the end of a line, or beside another one, no longer hides the next command: the tokeniser read such a run as one token, so the text is spaced around them first. A refusal names the class that fired (`comment
   continuation`, `backslash continuation`, `dynamic pathspec`, `adjacent operators`, `zsh -c`) and
   prints the override. `bash -c`/`sh -c`/`zsh -c`/
   `bash -lc SCRIPT`, and the `nohup`, `sudo` (including `sudo -u <user>`),
@@ -633,6 +639,9 @@ measured, none is guarded, and none is planned to be.
 | `git stash store` | `C=$(git stash create) && git stash store "$C" && git stash drop` | `store` is treated as a non-push, so the entry it adds is not counted and the following drop is allowed. The working tree survives, so this one costs a dangling commit rather than live work. |
 | `eval` | `eval 'git reset --hard'` | Never unwrapped at all. |
 | A substitution as the binary path | `$(which git) checkout -- file` | The guard cannot resolve what the substitution prints, so it never recognises the invocation as `git`. |
+| Process substitution | `echo >(git reset --hard)`, `cat <(git reset --hard)` | The body of `<(...)` and `>(...)` is never extracted, so it is never matched. |
+| ANSI-C quoting | `echo $'a\'b'; git reset --hard` | The `\'` inside `$'...'` is read as closing a single quote, so the rest of the line is treated as quoted. |
+| A heredoc marker the shell does not read as one | `echo "a <<EOF"`, `echo a <<<EOF`, `echo $((1<<2))`, each followed by a newline, `git reset --hard`, a newline and `EOF` | The here-document stage matches `<<WORD` anywhere in the text, so the lines after such a marker are blanked as if they were a body. Found while checking the comment class; not fixed by it. |
 | Shell and wrapper flags not modelled | `sh -ec`, `bash -xc`, `zsh -fc`, `zsh -ic`, `zsh -l -c`, `zsh --no-rcs -c`, `timeout -k 5 5`, `xargs -I {}` | The wrapper is not recognised, so the inner command is never reached. Only `-c` and `-lc` are read, for `bash`, `sh` and `zsh`. |
 | Shells other than `bash`, `sh` and `zsh` | `dash -c`, `ksh -c`, `fish -c`, `busybox sh -c`, `env -S '...'` | Not unwrapped, so the inner command is never reached. |
 | A script fed to a shell on its standard input | `echo 'git reset --hard' \| zsh`, `zsh <<< 'git reset --hard'` | Nothing on the command line names the script, so it is never matched. |
