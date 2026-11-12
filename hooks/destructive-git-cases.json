@@ -8498,8 +8498,10 @@
           "content": "dirty\n"
         }
       ],
-      "expect": "allow",
-      "note": "HARN-AUDIT-1 T5 fix round 1 M2: the previous branch. A branch or ref switch discards nothing, and git refuses it itself if it would overwrite."
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: the previous branch, refused again (documented over-block, owner decision). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
     },
     {
       "command": "git checkout HEAD@{1}",
@@ -8524,8 +8526,10 @@
           "content": "dirty\n"
         }
       ],
-      "expect": "allow",
-      "note": "HARN-AUDIT-1 T5 fix round 1 M2: a reflog ref. A branch or ref switch discards nothing, and git refuses it itself if it would overwrite."
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: a reflog ref, refused again (documented over-block, owner decision). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
     },
     {
       "command": "git checkout master@{1}",
@@ -8550,8 +8554,10 @@
           "content": "dirty\n"
         }
       ],
-      "expect": "allow",
-      "note": "HARN-AUDIT-1 T5 fix round 1 M2: a branch reflog ref. A branch or ref switch discards nothing, and git refuses it itself if it would overwrite."
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: a branch reflog ref, refused again (documented over-block, owner decision). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
     },
     {
       "command": "git checkout -q @{-1}",
@@ -8576,8 +8582,10 @@
           "content": "dirty\n"
         }
       ],
-      "expect": "allow",
-      "note": "HARN-AUDIT-1 T5 fix round 1 M2: the previous branch, quiet. A branch or ref switch discards nothing, and git refuses it itself if it would overwrite."
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: the previous branch, quiet, refused again (documented over-block, owner decision). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
     },
     {
       "command": "git checkout --detach \"$SHA\"",
@@ -9085,6 +9093,476 @@
       ],
       "expect": "allow",
       "note": "HARN-AUDIT-1 T5 fix round 1 L3: nothing to lose in a clean tree"
+    },
+    {
+      "command": "git checkout -- @{a,b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{a,b} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- @{a..b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{a..b} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- @{1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{1} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- HEAD@{1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: HEAD@{1} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- @{-1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{-1} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- @{u}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{u} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{a,b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{a,b} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{a..b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{a..b} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{1} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{-1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{-1} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{u}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{u} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git restore @{a,b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: restore with a brace list. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git restore -- @{u}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: restore with @{u} after --. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git checkout -",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 2: `git checkout -` is the previous branch and has no run-time word, so it still works on a dirty tree."
+    },
+    {
+      "command": "git checkout --detach @{-1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 2: the operand of --detach is a ref whatever it contains, and git refuses a switch that would overwrite."
+    },
+    {
+      "command": "git checkout -t @{u}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 2: the operand of -t is a ref."
+    },
+    {
+      "command": "echo \"$(echo a # )\"\n)\"; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2 L7: a `#` inside a $( ) inside double quotes. Checked 2026-11-12: zsh -c ran the marker command after it, bash -c rejected the text as a syntax error. The stricter reading wins.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
     }
   ]
 }

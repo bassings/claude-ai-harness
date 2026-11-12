@@ -173,25 +173,28 @@ in order:
      middle of a word as a comment and swallowed the newline after one. A
      comment inside backticks ends at the closing backtick, a `#` inside
      `${...}` and after a bare carriage return starts none (all checked
-     against real bash and zsh). The
-     refusal names the class (`comment continuation`, `backslash
-     continuation`) when the command contains one; a refusal from inside a
-     `zsh -c` body names `zsh -c`.
+     against real bash and zsh). A refusal
+     lists `comment continuation` and `backslash continuation` as
+     constructs the command also uses, once, at the end, and does not claim
+     the refusal depended on them (the match is not re-run without each); a
+     refusal from inside a `zsh -c` body names `zsh -c` as the class that
+     fired.
  11. A pathspec the shell builds at run time (`$X`, `${X}`, a `$(...)` or
      backtick substitution, a `{a,b}` brace expansion) is whole-tree scope
      for `git checkout` and `git restore`: the guard cannot tell which file it
      names, so a dirty tracked file anywhere refuses the command, with the
      class `dynamic pathspec` named. A substitution is restored into the
-     token it was written in, not dropped. An unquoted leading `~` counts.
-     A `@{...}` suffix is git's own ref syntax and does not, and the operand
-     of `--detach`, `-t`/`--track` (checkout) and `--source`/`-s` (restore)
-     is a ref, never a pathspec. A bare run-time word (`git checkout "$f"`)
-     may be either, so it is refused on a dirty tree.
+     token it was written in, not dropped. An unquoted leading `~` counts,
+     and so does any `@{...}` (`HEAD@{1}`, `@{-1}`, `@{u}`, `@{a,b}`): the
+     text is a brace expansion as often as it is a ref. The operand of
+     `--detach`, `-t`/`--track` (checkout) and `--source`/`-s` (restore) is a
+     ref, never a pathspec. A bare run-time word (`git checkout "$f"`) may be
+     either, so it is refused on a dirty tree.
  12. The same pass puts spaces around an unquoted newline, `;`, `(` and `)`,
      and `|&` is a control operator: the tokeniser reads a run of adjacent
      punctuation (`&&` then a newline, `)` then `&&`) as one token that is no
      control operator, so the commands either side were never split. The
-     refusal names the class `adjacent operators`.
+     refusal lists `adjacent operators` the same way.
 
 A `cd <path>` segment updates the effective directory used by every later
 segment in the same command, so `cd <dir> && git ...` is scoped against
@@ -1123,10 +1126,6 @@ def normalize_rest(rest):
     return expand_bundled_short_flags(rest)
 
 
-# git's own revision syntax `<ref>@{<n>}` / `@{-1}` / `@{upstream}`: the braces
-# are part of a ref name, not a shell brace expansion.
-REFLOG_SUFFIX_RE = re.compile(r'@\{[^{}$`]*\}')
-
 # `git checkout` flags whose operand is a branch or commit, never a pathspec.
 CHECKOUT_REF_OPERAND_FLAGS = ('--detach', '-d', '-t', '--track')
 
@@ -1139,11 +1138,13 @@ def is_dynamic_pathspec(token):
     guard cannot resolve: a variable (`$X`, `${X}`), a command substitution
     (`$(...)` or backticks, restored into the token by
     take_substitution_placeholders), a brace expansion (`{a,b}`) or an
-    unquoted leading `~`. A `@{...}` suffix is git's own ref syntax and does
-    not count. (Quoting is gone by now, so a quoted `'~'` is read as dynamic
-    too: the stricter reading.)"""
-    stripped = REFLOG_SUFFIX_RE.sub('', token)
-    return '$' in stripped or '`' in stripped or '{' in stripped or stripped.startswith('~')
+    unquoted leading `~`. There is no exception for git's own `@{...}` ref
+    syntax (`HEAD@{1}`, `@{-1}`, `@{u}`): it is the same text as a brace
+    expansion (`@{a,b}` is two files), and in a pathspec position a lone
+    `@{1}` is a file name, so a token containing a brace is refused where a
+    pathspec could be destructive. (Quoting is gone by now, so a quoted
+    `'~'` is read as dynamic too: the stricter reading.)"""
+    return '$' in token or '`' in token or '{' in token or token.startswith('~')
 
 
 def has_pathspec_from_file(rest):
@@ -1615,6 +1616,24 @@ def annotate_refusal(reason, classes):
     return reason + ' ' + ' '.join(notes)
 
 
+def display_command(tokens):
+    """`tokens` as one command line for a refusal's override hint. Shell
+    quoting is gone by the time the guard sees a token, so it is put back
+    where leaving it out would change the command: a token with a `$` or a
+    backtick is double-quoted (the expansion survives, word splitting does
+    not), a brace or tilde word is left bare (quotes would switch the
+    expansion off), and anything else gets shell quoting."""
+    parts = []
+    for tok in tokens:
+        if '{' in tok or tok.startswith('~'):
+            parts.append(tok)
+        elif '$' in tok or '`' in tok:
+            parts.append('"' + tok.replace('\\', '\\\\').replace('"', '\\"') + '"')
+        else:
+            parts.append(shlex.quote(tok))
+    return ' '.join(parts)
+
+
 def classify_cd(tokens):
     """If `tokens` (already redirect/env/keyword-stripped) is a `cd`
     invocation, return ('static', path) when the target is a literal
@@ -1765,8 +1784,9 @@ def evaluate(command, cwd):
     """Return a refusal message, or None to allow `command`."""
     if os.environ.get(ESCAPE_VAR) == '1':
         return None
-    state = {'cwd': cwd, 'cwd_known': True, 'shared': {'stash_created': False}}
-    return evaluate_command_text(command, state, 0)
+    state = {'cwd': cwd, 'cwd_known': True, 'shared': {'stash_created': False, 'classes': set()}}
+    reason = evaluate_command_text(command, state, 0)
+    return annotate_refusal(reason, state['shared']['classes'])
 
 
 def evaluate_command_text(command, state, depth):
@@ -1847,10 +1867,12 @@ def evaluate_command_text(command, state, depth):
             reason = evaluate_command_text(
                 substitutions[index], child_context(segment_state), depth + 1)
             if reason:
-                return annotate_refusal(reason, classes)
+                segment_state['shared']['classes'].update(classes)
+                return reason
         reason = evaluate_segment(tokens, segment_state, depth)
         if reason:
-            return annotate_refusal(reason, classes)
+            segment_state['shared']['classes'].update(classes)
+            return reason
         for _ in range(closed):
             if len(contexts) > 1:
                 contexts.pop()  # popped AFTER the segment, which is inside it
@@ -1886,8 +1908,8 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
         if depth >= MAX_UNWRAP_DEPTH:
             return None  # bounded; fail open past the bound
         reason = evaluate_command_text(script, child_context(state), depth + 1)
-        if os.path.basename(head[0]) == 'zsh':
-            return annotate_refusal(reason, {ZSH_CLASS})
+        if reason and os.path.basename(head[0]) == 'zsh':
+            state['shared']['classes'].add(ZSH_CLASS)
         return reason
 
     unwrapped = strip_prefix_wrapper(head)
@@ -1912,7 +1934,7 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
             if subcmd in ('clean', 'stash'):
                 scope = destructive_scope(subcmd, rest, None, git_config, unknown_trailing)
                 if scope is not None:
-                    display_cmd = ' '.join(head)
+                    display_cmd = display_command(head)
                     template = REFUSAL_CLEAN if scope[0] == 'clean' else REFUSAL_STASH
                     return template.format(cmd=display_cmd, var=ESCAPE_VAR)
         return None
@@ -1937,7 +1959,7 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
     if scope is None:
         return None
 
-    display_cmd = ' '.join(head)
+    display_cmd = display_command(head)
     kind = scope[0]
     if kind == 'clean':
         # `retargeted` short-circuits the measurement rather than colouring
@@ -1955,6 +1977,26 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
     if risky:
         return template.format(cmd=display_cmd, var=ESCAPE_VAR)
     return None
+
+
+def report_internal_error(exc):
+    """Say, on the channels Claude Code shows, that this command was NOT
+    checked because the guard itself raised. Claude Code documents that stderr
+    from a hook that exits 0 is never shown to Claude or in the transcript
+    (debug log only), so the report is JSON on stdout: `systemMessage` is
+    shown to the user, and a PreToolUse `additionalContext` is passed to
+    Claude next to the tool result. The exception CLASS only: no command
+    text and no exception message. It carries no `permissionDecision`, so the
+    verdict is still the allow the exit code gives. One line on stderr is
+    kept for the debug log."""
+    name = type(exc).__name__
+    notice = ('destructive-git-guard: internal error (%s); this command was NOT checked and was allowed. '
+              'This is a bug in the guard.' % name)
+    print(notice, file=sys.stderr)
+    print(json.dumps({
+        'systemMessage': notice,
+        'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': notice},
+    }))
 
 
 def main():
@@ -1990,8 +2032,7 @@ def main():
         # Left as a trace and nothing more: one line naming the exception
         # class, with no command text, so a parsing regression is visible
         # instead of silent. The verdict is unchanged (below).
-        print('destructive-git-guard: internal error (%s); this command was NOT checked'
-              % type(exc).__name__, file=sys.stderr)
+        report_internal_error(exc)
         # AC-SEC-4: whatever pathological input reaches this point, the
         # hook contract stays exit 0 or 2, NEVER 1, and stderr never carries
         # a Python traceback. An exception here is a bug in this module's

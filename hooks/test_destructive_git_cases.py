@@ -1017,6 +1017,14 @@ class TestClassNotesDoNotClaimCausation(unittest.TestCase):
         self.assertIn('also uses: comment continuation', stderr)
         self.assertIn('does not necessarily depend', stderr)
 
+    def test_the_override_hint_keeps_the_quoting_of_a_run_time_word(self):
+        stderr = self._stderr('git checkout -- "$F" "my file"')
+        self.assertIn('`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- "$F" \'my file\'`', stderr)
+
+    def test_a_class_note_appears_once_however_deeply_the_refusal_is_nested(self):
+        self.assertEqual(self._stderr("zsh -c \"zsh -c 'git reset --hard'\" # y").count('[class: zsh -c'), 1)
+        self.assertEqual(self._stderr("bash -c 'echo a # x\ngit reset --hard' # y").count('also uses'), 1)
+
     def test_zsh_is_reported_as_the_class_that_fired(self):
         self.assertIn('[class: zsh -c', self._stderr("zsh -c 'git reset --hard'"))
 
@@ -1043,8 +1051,8 @@ class TestNoCaseReachesTheFailOpenExceptBranch(unittest.TestCase):
             except Exception as exc:
                 raised.append((cmd, repr(exc)))
                 raise
-        old_in, old_err = sys.stdin, sys.stderr
-        sys.stdin, sys.stderr = io.StringIO(payload), io.StringIO()
+        old_in, old_out, old_err = sys.stdin, sys.stdout, sys.stderr
+        sys.stdin, sys.stdout, sys.stderr = io.StringIO(payload), io.StringIO(), io.StringIO()
         guard.evaluate = recording
         try:
             with self.assertRaises(SystemExit) as ctx:
@@ -1052,30 +1060,49 @@ class TestNoCaseReachesTheFailOpenExceptBranch(unittest.TestCase):
             return ctx.exception.code
         finally:
             guard.evaluate = real_evaluate
-            sys.stdin, sys.stderr = old_in, old_err
+            sys.stdin, sys.stdout, sys.stderr = old_in, old_out, old_err
 
-    def test_a_parser_exception_still_allows_but_leaves_a_trace_without_the_command(self):
+    def _run_main(self, command):
+        old_in, old_out, old_err = sys.stdin, sys.stdout, sys.stderr
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': tempfile.gettempdir()})
+        sys.stdin, sys.stdout, sys.stderr = io.StringIO(payload), io.StringIO(), io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                guard.main()
+            return ctx.exception.code, sys.stdout.getvalue(), sys.stderr.getvalue()
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = old_in, old_out, old_err
+
+    def test_a_parser_exception_still_allows_and_says_so_where_claude_code_shows_it(self):
+        # Claude Code documents that stderr from a hook that exits 0 is never shown to Claude or in the transcript (only in
+        # the debug log), while a `systemMessage` in the JSON on stdout is "shown to the user" and a PreToolUse
+        # `additionalContext` is passed to Claude next to the tool result. The verdict stays allow (exit 0): an
+        # unparseable command already fails open, and an exception here is a bug in the guard, not evidence of danger.
         real_split = guard.split_segments
 
         def boom(command):
             raise KeyError('secret-looking-text')
         guard.split_segments = boom
-        old_in, old_err = sys.stdin, sys.stderr
-        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git reset --hard'}, 'cwd': tempfile.gettempdir()})
-        sys.stdin, sys.stderr = io.StringIO(payload), io.StringIO()
         try:
-            with self.assertRaises(SystemExit) as ctx:
-                guard.main()
-            trace = sys.stderr.getvalue()
+            code, out, err = self._run_main('git reset --hard')
         finally:
             guard.split_segments = real_split
-            sys.stdin, sys.stderr = old_in, old_err
-        self.assertIn(ctx.exception.code, (0, None), 'the fail-open verdict is unchanged')
-        self.assertEqual(len(trace.strip().splitlines()), 1, 'exactly one line: %r' % trace)
-        self.assertIn('KeyError', trace)
-        self.assertIn('NOT checked', trace)
-        self.assertNotIn('git reset', trace, 'the trace must not carry command text')
-        self.assertNotIn('secret-looking-text', trace, 'the trace must not carry the exception message')
+        self.assertIn(code, (0, None), 'the fail-open verdict is unchanged')
+        message = json.loads(out)
+        self.assertIn('KeyError', message['systemMessage'])
+        self.assertIn('NOT checked', message['systemMessage'])
+        self.assertEqual(message['hookSpecificOutput']['hookEventName'], 'PreToolUse')
+        self.assertIn('KeyError', message['hookSpecificOutput']['additionalContext'])
+        self.assertNotIn('permissionDecision', message['hookSpecificOutput'], 'it must not decide for Claude Code')
+        for text in (out, err):
+            self.assertNotIn('git reset', text, 'no command text on any channel')
+            self.assertNotIn('secret-looking-text', text, 'no exception message on any channel')
+        self.assertEqual(len(err.strip().splitlines()), 1, 'one line for the debug log: %r' % err)
+
+    def test_an_ordinary_allow_prints_nothing_on_stdout(self):
+        code, out, err = self._run_main('git status')
+        self.assertIn(code, (0, None))
+        self.assertEqual((out, err), ('', ''))
 
     def test_the_recorder_sees_an_evaluate_that_raises(self):
         # Without this the test below could pass with the recorder wired to nothing.

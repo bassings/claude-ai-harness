@@ -549,15 +549,30 @@ past it.
   newline, so the line after a comment is still checked. A pathspec the
   shell builds at run time (`$X`, `${X}`, `$(...)`, backticks, `{a,b}`) on
   `git checkout`/`git restore` is whole-tree scope, so a dirty tracked file
-  anywhere refuses it. A `@{...}` suffix (`HEAD@{1}`, `@{-1}`) is git's own
-  ref syntax, and the operand of `--detach`, `-t`/`--track` and
-  `--source`/`-s` is a ref, so those are not refused. A bare run-time word
-  with nothing to say whether it is a branch or a file (`git checkout
-  "$BRANCH"`, `git checkout ${BRANCH:-master}`) IS refused on a dirty tree:
-  a documented over-block, because a file reverted by mistake is lost and a
-  refusal costs one retry with the override. An operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis at the end of a line, or beside another one, no longer hides the next command: the tokeniser read such a run as one token, so the text is spaced around them first. A refusal names the class that fired (`comment
-  continuation`, `backslash continuation`, `dynamic pathspec`, `adjacent operators`, `zsh -c`) and
-  prints the override. `bash -c`/`sh -c`/`zsh -c`/
+  anywhere refuses it. The operand of `--detach`, `-t`/`--track` and
+  `--source`/`-s` is a ref, so those are not refused, and `git checkout -`
+  is not either. A bare run-time word with nothing to say whether it is a
+  branch or a file IS refused on a dirty tree, and so is any `@{...}`: that
+  is a documented over-block, because a file reverted by mistake is lost and
+  a refusal costs one retry with the override
+  (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, set inline in front of the command).
+  These commands, which a guard that read `@{...}` as git's ref syntax would
+  have let through, are refused while a tracked file is dirty:
+  `git checkout @{-1}`, `git checkout @{u}`, `git checkout HEAD@{1}`,
+  `git checkout master@{1}`, `git checkout "$BRANCH"` and
+  `git checkout ${BRANCH:-master}`. The reason is that `@{a,b}` is a brace
+  expansion that names two files (bash and zsh both print `@a @b`), and a
+  lone `@{1}` is a file name in a pathspec position, so the text alone does
+  not say which one it is. An operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis at the end of a line, or beside another one, no longer hides the next command: the tokeniser read such a run as one token, so the text is spaced around them first. A refusal prints the override, and says which parsing class applied. A
+  `zsh -c` refusal names `zsh -c` as the class that fired, because its body is
+  only checked at all as zsh is unwrapped. A `dynamic pathspec` refusal has
+  its own text. For `comment continuation`, `backslash continuation` and
+  `adjacent operators` the refusal lists them as constructs the command also
+  uses, once at the end, and does not claim the refusal depended on them: the
+  guard does not re-run the match without each one. If the guard itself
+  raises, the command is still allowed (as for any shape it cannot parse),
+  and a `systemMessage` and an `additionalContext` on stdout say it was NOT
+  checked, naming only the exception class. `bash -c`/`sh -c`/`zsh -c`/
   `bash -lc SCRIPT`, and the `nohup`, `sudo` (including `sudo -u <user>`),
   `timeout <n>`, `xargs`, `env` (including `env -i`), `command` and `exec`
   prefix wrappers, are unwrapped and their inner command fed back through
@@ -632,7 +647,7 @@ measured, none is guarded, and none is planned to be.
 |---|---|---|
 | Repository retargeting through a wrapper | `env GIT_DIR=<other>/.git git clean -fd` | The clean/stash fail-closed rule reads the env prefix on the segment itself, and `env` hides it one level down. The other repository's untracked files or stash entries go, unmeasured. |
 | Repository retargeting already in the environment | `export GIT_DIR=...` in the shell that launched the session, then `git clean -fd` | The guard scrubs `GIT_*` from its own measuring call, which is what stops a leaked variable making it read the wrong repo -- but the real command still obeys the variable, so the two look at different repositories. Measured with a clean cwd and untracked work in the target: ALLOWED, and the real run deleted it. |
-| A run-time pathspec on a command other than `checkout`/`restore` | `git clean -fd "$X"`, `git clean -fd -- $(cat list)` | `git checkout` and `git restore` read a pathspec containing `$`, a backtick, `$(...)` or `{...}` as whole-tree scope (class `dynamic pathspec`), so a dirty tracked file anywhere refuses them. `git clean` does not: its dry run measures the pathspec as literal text, which matches nothing, so untracked files go unmeasured. |
+| A run-time pathspec on a command other than `checkout`/`restore` | `git clean -fd "$X"`, `git clean -fd -- "$X"`, `git clean -fd ${X}` | `git checkout` and `git restore` read a pathspec containing `$`, a backtick, `$(...)`, `{...}` or a leading `~` as whole-tree scope (class `dynamic pathspec`), so a dirty tracked file anywhere refuses them. `git clean` does not for a variable or a brace: its dry run measures the pathspec as literal text, which matches nothing, so untracked files go unmeasured. A `$(...)` or backtick substitution IS handled: it is dropped from the dry run, which widens it to everything the other arguments select, so `git clean -fd -- $(cat list)` is refused. |
 | An apostrophe inside a double-quoted string | `git commit -m "don't" && echo $(git reset --hard)` | Substitution extraction flips into single-quote mode at the apostrophe, so every `$(...)` and backtick after it on the line is never looked at. |
 | `-n` where it is not a flag | `git clean -f -e -n`, `git clean -f -- -n` | Any `-n` token anywhere reads as `--dry-run`, so the invocation is treated as harmless and never measured. Measured: `git clean -f -e -n` was ALLOWED and the real run deleted every untracked file in the tree. |
 | Nesting past `MAX_UNWRAP_DEPTH` | six or more stacked `bash -c` / `$(...)` layers | Past the bound everything fails OPEN, the clean and stash rules included, so these two lose their fail-closed posture exactly where an adversary would put them. |
