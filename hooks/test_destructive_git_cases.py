@@ -648,11 +648,11 @@ class TestRefusalQuotesTheCommandAsWritten(unittest.TestCase):
     def tearDown(self):
         subprocess.run(['rm', '-rf', self._root])
 
-    def test_an_xargs_wrapped_clean_is_quoted_without_a_synthetic_pathspec(self):
+    def test_an_xargs_wrapped_clean_is_refused_without_printing_the_command(self):
         reason = guard.evaluate('echo x | xargs git clean -fd', self._root)
         self.assertIsNotNone(reason, 'an xargs-fed clean over an untracked file must still be refused')
-        self.assertIn('`git clean -fd`', reason,
-                      'the refusal must quote the command as written; got: %s' % reason)
+        self.assertNotIn('git clean -fd', reason, 'the refusal prints no form of the command (its own advice names `git clean -n`); got: %s' % reason)
+        self.assertIn('exactly as first typed', reason)
 
     def test_xargs_unwrapping_appends_no_token_of_its_own(self):
         self.assertEqual(
@@ -933,7 +933,8 @@ REFUSAL_INSTRUCTION_FRAGMENTS = (
     'copy the file to a scratch path first',
     '`git stash`',
     'opt in explicitly',
-    'HARNESS_ALLOW_DESTRUCTIVE_GIT=1 set inline',
+    'HARNESS_ALLOW_DESTRUCTIVE_GIT=1 set in front of it',
+    'exactly as first typed',
 )
 
 
@@ -1017,9 +1018,32 @@ class TestClassNotesDoNotClaimCausation(unittest.TestCase):
         self.assertIn('also uses: comment continuation', stderr)
         self.assertIn('does not necessarily depend', stderr)
 
-    def test_the_override_hint_keeps_the_quoting_of_a_run_time_word(self):
-        stderr = self._stderr('git checkout -- "$F" "my file"')
-        self.assertIn('`HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- "$F" \'my file\'`', stderr)
+    def test_the_refusal_prints_no_form_of_the_refused_command(self):
+        # A hint rebuilt from the guard's own tokens turned an inert single-quoted literal into an executing one
+        # (`'$(touch PWNED)'` came back as `"$(touch PWNED)"`), so the refusal now says to re-run the ORIGINAL command
+        # with the override in front of it and prints nothing of the command at all.
+        for command, secret in (("git checkout -- '$(touch PWNED)'", '$(touch PWNED)'),
+                                ("git checkout -- 'price$1.txt'", 'price$1.txt'),
+                                ("git restore '{tracked.txt,x}'", '{tracked.txt,x}'),
+                                ('git checkout -- "$F" "my file"', 'my file'),
+                                ('git reset --hard', 'git reset'),
+                                ('git checkout -- tracked.txt', 'tracked.txt'),
+                                ('git restore tracked.txt', 'tracked.txt')):
+            with self.subTest(command=command):
+                stderr = self._stderr(command)
+                self.assertNotIn(secret, stderr)
+                self.assertNotIn('git checkout', stderr)
+                self.assertNotIn('git restore', stderr)
+                self.assertIn('HARNESS_ALLOW_DESTRUCTIVE_GIT', stderr)
+                self.assertIn('exactly as first typed', stderr)
+
+    def test_every_refusal_template_has_the_same_instruction_and_no_command_slot(self):
+        for name in ('REFUSAL', 'REFUSAL_DYNAMIC', 'REFUSAL_CLEAN', 'REFUSAL_STASH'):
+            template = getattr(guard, name)
+            with self.subTest(template=name):
+                self.assertNotIn('{cmd}', template, 'a refusal must not have a slot for the refused command')
+                self.assertIn('re-run the original command exactly as first typed', template)
+                self.assertIn('{var}=1 set in front of it', template)
 
     def test_a_class_note_appears_once_however_deeply_the_refusal_is_nested(self):
         self.assertEqual(self._stderr("zsh -c \"zsh -c 'git reset --hard'\" # y").count('[class: zsh -c'), 1)

@@ -9563,6 +9563,222 @@
       "note": "HARN-AUDIT-1 T5 fix round 2 L7: a `#` inside a $( ) inside double quotes. Checked 2026-11-12: zsh -c ran the marker command after it, bash -c rejected the text as a syntax error. The stricter reading wins.",
       "class": "comment continuation",
       "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &| git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: zsh's &| (background and disown) is a control operator. Checked 2026-11-13 with the agent shell (zsh 5.9): `echo a &| echo b` printed a then b, so the second command runs; bash rejects the line.",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a&|git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: &| with no spaces. Checked 2026-11-13 with the agent shell (zsh 5.9): `echo a &| echo b` printed a then b, so the second command runs; bash rejects the line.",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &! git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: &!, the synonym of &|, with spaces (already blocked before this round: pinned).",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a&!git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: &! with no spaces. Checked 2026-11-13 with the agent shell (zsh 5.9): `echo a &| echo b` printed a then b, so the second command runs; bash rejects the line.",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &| git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: a harmless command after &| is still allowed."
+    },
+    {
+      "command": "echo a &! git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: a harmless command after &! is still allowed."
+    },
+    {
+      "command": "git reset --hard\r\n",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 L2: a carriage return before the newline. Checked 2026-11-13: bash and zsh pass `--hard\\r` to git, which exits 129 and reverts nothing. The guard blocks it anyway, the stricter reading; pinned so the CR in the tokeniser's whitespace cannot be dropped unnoticed."
+    },
+    {
+      "command": "git checkout -- tracked.txt\r\n",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 L2: the same with a path; the shell would hand git `tracked.txt\\r`, the guard reads `tracked.txt`. Stricter reading, pinned."
     }
   ]
 }

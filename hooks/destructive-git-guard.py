@@ -714,6 +714,17 @@ def normalise_shell_text(command):
                 i = marker.end()
                 word_start = False
                 continue
+        if ch == '&' and command[i + 1:i + 2] in ('|', '!') and (i == 0 or command[i - 1] not in '&>|'):
+            # zsh's `&|` and `&!` background a command and disown it: a plain
+            # `&` as far as splitting commands goes. Left alone, `&|` is one
+            # punctuation token that is no control operator, and `&!git` is
+            # an `&` and a word `!git`.
+            classes.add(ADJACENT_OPERATORS_CLASS)
+            out.append(' & ')
+            i += 2
+            word_start = True
+            after_op = True
+            continue
         if ch in ';&|()<> \t\r':
             if isinstance(mode, int):
                 if ch == '(':
@@ -898,7 +909,9 @@ def split_segments(command):
     # ever consulted, so a newline never reaches the lexer as a token no
     # matter what punctuation_chars says. Removing it from `whitespace`
     # (leaving space, tab and carriage return there, so a CRLF line ending
-    # does not glue `\r` onto the last word) is what makes it surface as its own token
+    # does not glue `\r` onto the last word; kept on purpose although a shell
+    # would hand git `--hard\r`, because the stricter reading is the safe one
+    # and hooks/test_destructive_git_cases.py pins it) is what makes it surface as its own token
     # via PUNCTUATION_CHARS below, instead of being silently swallowed.
     lexer.whitespace = ' \t\r'
     # Comments are removed by normalise_shell_text(), which knows a `#` only
@@ -1499,12 +1512,12 @@ def stash_would_lose_entries(cwd, target):
 
 
 REFUSAL = (
-    "destructive-git-guard: refused `{cmd}` -- it would discard uncommitted "
-    "work (`git status` shows a tracked, uncommitted change in scope). Safe "
-    "alternatives: copy the file to a scratch path first, or `git stash` "
-    "before retrying. If this revert is deliberate, opt in explicitly: "
-    "re-run with {var}=1 set inline (`{var}=1 {cmd}`) or exported for the "
-    "session. If work is already lost another way, hooks/git-snapshot.py "
+    "destructive-git-guard: refused this command -- it would discard "
+    "uncommitted work (`git status` shows a tracked, uncommitted change in "
+    "scope). Safe alternatives: copy the file to a scratch path first, or "
+    "`git stash` before retrying. If this revert is deliberate, opt in "
+    "explicitly: re-run the original command exactly as first typed with "
+    "{var}=1 set in front of it, or exported for the session. If work is already lost another way, hooks/git-snapshot.py "
     "may have a recoverable copy -- list them with: git for-each-ref "
     "--format='%(refname) %(creatordate:iso-strict) %(contents:subject)' "
     "refs/harness-snapshots/"
@@ -1514,7 +1527,7 @@ REFUSAL = (
 # names its class, says why the whole tree was measured, and carries the same
 # instruction and recovery clauses as REFUSAL.
 REFUSAL_DYNAMIC = (
-    "destructive-git-guard: refused `{cmd}` -- class: dynamic pathspec. A "
+    "destructive-git-guard: refused this command -- class: dynamic pathspec. A "
     "branch or path here is built when the command runs (a variable, a "
     "`$(...)` or backtick substitution, a `{{a,b}}` brace expansion or a "
     "`~`), so this guard cannot tell whether it names a branch, which "
@@ -1523,8 +1536,9 @@ REFUSAL_DYNAMIC = (
     "that could be discarded. Safe "
     "alternatives: name the paths literally, copy the file to a scratch path "
     "first, or `git stash` before retrying. If this revert is deliberate, opt "
-    "in explicitly: re-run with {var}=1 set inline (`{var}=1 {cmd}`) or "
-    "exported for the session. If work is already lost another way, "
+    "in explicitly: re-run the original command exactly as first typed with "
+    "{var}=1 set in front of it, or exported for the session. If work is "
+    "already lost another way, "
     "hooks/git-snapshot.py may have a recoverable copy -- list them with: git "
     "for-each-ref --format='%(refname) %(creatordate:iso-strict) "
     "%(contents:subject)' refs/harness-snapshots/"
@@ -1538,7 +1552,7 @@ REFUSAL_DYNAMIC = (
 # reach the same refusal for the same underlying reason: this rule could not
 # confirm the command is safe.
 REFUSAL_CLEAN = (
-    "destructive-git-guard: refused `{cmd}` -- either a real dry run of the "
+    "destructive-git-guard: refused this command -- either a real dry run of the "
     "same flags and pathspecs shows untracked or ignored files would be "
     "removed, or that could not be verified (the directory could not be "
     "resolved, the check itself failed or timed out, or the command selects "
@@ -1546,12 +1560,13 @@ REFUSAL_CLEAN = (
     "which this guard cannot measure), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: run `git clean "
     "-n` yourself first and inspect the list. If this cleanup is "
-    "deliberate, opt in explicitly: re-run with {var}=1 set inline "
-    "(`{var}=1 {cmd}`) or exported for the session."
+    "deliberate, opt in explicitly: re-run the original command exactly as "
+    "first typed with {var}=1 set in front of it, or exported for the "
+    "session."
 )
 
 REFUSAL_STASH = (
-    "destructive-git-guard: refused `{cmd}` -- either the stash list is "
+    "destructive-git-guard: refused this command -- either the stash list is "
     "non-empty (or an earlier `git stash` in this same command would make "
     "it so), or that could not be verified (the directory could not be "
     "resolved, the check itself failed or timed out, the stash "
@@ -1561,14 +1576,13 @@ REFUSAL_STASH = (
     "cannot measure), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: `git stash list` "
     "to inspect the stash entries first. If this is deliberate, opt in "
-    "explicitly: re-run with {var}=1 set inline (`{var}=1 {cmd}`) or "
-    "exported for the session."
+    "explicitly: re-run the original command exactly as first typed with "
+    "{var}=1 set in front of it, or exported for the session."
 )
 
-# K1 review round 2/3: no `{cmd}` slot -- this refusal fires BEFORE any
-# tokenising, so there is no parsed `head` to display, and printing the
-# full over-cap text back would itself be wasteful. Shows a bounded prefix
-# instead. Only the process-environment escape hatch (exported for the
+# K1 review round 2/3: this refusal fires BEFORE any tokenising, so there is
+# no parsed `head`, and printing the full over-cap text back would itself be
+# wasteful. Shows a bounded prefix instead. Only the process-environment escape hatch (exported for the
 # session) can apply here: the inline, segment-scoped form needs the
 # command tokenised to find it, which is exactly the step this refusal
 # skips. Only ever raised for an over-cap command that DOES contain the
@@ -1614,24 +1628,6 @@ def annotate_refusal(reason, classes):
                      'does not necessarily depend on this.]'
                      % '; '.join('%s (%s)' % (name, CLASS_NOTES[name]) for name in others))
     return reason + ' ' + ' '.join(notes)
-
-
-def display_command(tokens):
-    """`tokens` as one command line for a refusal's override hint. Shell
-    quoting is gone by the time the guard sees a token, so it is put back
-    where leaving it out would change the command: a token with a `$` or a
-    backtick is double-quoted (the expansion survives, word splitting does
-    not), a brace or tilde word is left bare (quotes would switch the
-    expansion off), and anything else gets shell quoting."""
-    parts = []
-    for tok in tokens:
-        if '{' in tok or tok.startswith('~'):
-            parts.append(tok)
-        elif '$' in tok or '`' in tok:
-            parts.append('"' + tok.replace('\\', '\\\\').replace('"', '\\"') + '"')
-        else:
-            parts.append(shlex.quote(tok))
-    return ' '.join(parts)
 
 
 def classify_cd(tokens):
@@ -1934,9 +1930,8 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
             if subcmd in ('clean', 'stash'):
                 scope = destructive_scope(subcmd, rest, None, git_config, unknown_trailing)
                 if scope is not None:
-                    display_cmd = display_command(head)
                     template = REFUSAL_CLEAN if scope[0] == 'clean' else REFUSAL_STASH
-                    return template.format(cmd=display_cmd, var=ESCAPE_VAR)
+                    return template.format(var=ESCAPE_VAR)
         return None
 
     parsed = parse_git_invocation(head, state['cwd'])
@@ -1959,7 +1954,6 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
     if scope is None:
         return None
 
-    display_cmd = display_command(head)
     kind = scope[0]
     if kind == 'clean':
         # `retargeted` short-circuits the measurement rather than colouring
@@ -1975,7 +1969,7 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
         risky = has_uncommitted_change(segment_cwd, scope)
         template = REFUSAL_DYNAMIC if kind == 'dynamic_tree' else REFUSAL
     if risky:
-        return template.format(cmd=display_cmd, var=ESCAPE_VAR)
+        return template.format(var=ESCAPE_VAR)
     return None
 
 
@@ -2029,9 +2023,12 @@ def main():
     try:
         reason = evaluate(command, cwd)
     except Exception as exc:
-        # Left as a trace and nothing more: one line naming the exception
-        # class, with no command text, so a parsing regression is visible
-        # instead of silent. The verdict is unchanged (below).
+        # The verdict stays allow (below), but it is no longer silent:
+        # report_internal_error() puts the exception CLASS, never the command
+        # or the message, in a systemMessage and an additionalContext on
+        # stdout (the channels Claude Code shows for an exit 0 hook) and one
+        # line on stderr (debug log only). Do not remove the stdout JSON as
+        # redundant: stderr alone is never shown.
         report_internal_error(exc)
         # AC-SEC-4: whatever pathological input reaches this point, the
         # hook contract stays exit 0 or 2, NEVER 1, and stderr never carries
