@@ -2621,6 +2621,35 @@ test('T11 escalation (round 4 M3): the contract the runner requires is the one t
   assert.equal(runner[1], workflow[1])
 })
 
+// Round 5 M3: the "lower than required" comparison itself, not only a copy with
+// no constant. REQUIRED is read from the runner so the tests follow it when it
+// is raised; today REQUIRED-1 is 0, which the check must treat as lower.
+function requiredContract() {
+  return Number(fs.readFileSync(SCRIPT_PATH, 'utf8').match(/^REQUIRED_WORKFLOW_CONTRACT=(\d+)$/m)[1])
+}
+
+test('T11 escalation (round 5 M3): an installed optimise-cycle.js declaring a contract one below the required value FAILs "predates report_path" and never invokes claude', () => {
+  const required = requiredContract()
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, `// an older contract\nconst WEEKLY_RUNNER_CONTRACT = ${required - 1}\n`)
+  const res = runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
+  assert.match(res.logContents, /^RESULT FAIL - reason="installed optimise-cycle\.js predates report_path; run bin\/install\.sh"$/m, res.logContents)
+  assert.notEqual(res.status, 0)
+  assert.equal(fs.existsSync(path.join(repo, '.claude-argv')), false, 'claude must never have run')
+})
+
+test('T11 escalation (round 5 M3): an installed optimise-cycle.js declaring a contract one above the required value proceeds to the session', () => {
+  const required = requiredContract()
+  const repo = makeTempRepo()
+  const claudeHome = freshDir('claudehome-')
+  withGlobalWorkflow(claudeHome, `// a newer contract\nconst WEEKLY_RUNNER_CONTRACT = ${required + 1}\n`)
+  const res = runWeeklyScript([repo], { claudeHome, extraPath: argvRecordingClaude() })
+  assert.equal(res.status, 0, res.logContents)
+  assert.ok(!/predates report_path/.test(res.logContents), res.logContents)
+  assert.equal(fs.existsSync(path.join(repo, '.claude-argv')), true, 'claude ran')
+})
+
 // Round 4, item 2: the scope step runs `git remote get-url origin`, which a
 // real headless probe showed refused under the allowlist. It is allowed in
 // exactly that spelling: no wildcard, so no other remote subcommand
@@ -2661,6 +2690,23 @@ test('T11 escalation (round 4 L1): the session is launched with safe.bareReposit
   const bare = fs.readFileSync(path.join(repo, '.bare-out'), 'utf8')
   assert.match(bare, /cannot use bare repository/, `git inside the planted bare repo must refuse it:\n${bare}`)
   assert.match(bare, /exit=[1-9]/, bare)
+})
+
+// Round 5: a caller's GIT_CONFIG_COUNT that is not plain digits. Measured: git
+// itself refuses such a count (both `abc` and `0k` were tried), so the
+// runner's own repo check fails first and the run FAILs as all-skipped without
+// ever launching a session. The launch line's non-numeric fallback is therefore
+// not reachable through the runner; this pins what does happen instead.
+test('T11 escalation (round 5): a caller GIT_CONFIG_COUNT git rejects (abc) stops the run loudly before any session, never launching one with a broken git', () => {
+  const repo = makeTempRepo()
+  const res = runWeeklyScript([repo], {
+    extraPath: gitEnvRecordingClaude(),
+    env: { GIT_CONFIG_COUNT: 'abc' },
+    unsetEnv: ['GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'],
+  })
+  assert.match(res.logContents, /^RESULT FAIL - reason="no repos checked \(all skipped\)"$/m, res.logContents)
+  assert.notEqual(res.status, 0)
+  assert.equal(fs.existsSync(path.join(repo, '.claude-gitenv')), false, 'no session was launched')
 })
 
 test('T11 escalation (round 4 L1): a GIT_CONFIG_COUNT the caller already set is extended, never overwritten', () => {

@@ -383,11 +383,21 @@ cleanup_run() {
 # below matching every spelling of -R, --repo and --hostname; a prefix rule
 # cannot see inside the arguments, so the deny entries are best effort and
 # not a guarantee. Shell chaining and command substitution inside an allowed
-# command are judged by the CLI's own parser, not by this script. Agent and
-# Workflow start further sessions whose permissions are the CLI's to
-# inherit; this script has not verified how. The list was written from the
-# workflow's text and has not been exercised by a real headless run in this
-# repository's tests.
+# command are judged by the CLI's own parser, not by this script.
+# --setting-sources user also loads the operator's own permissions.allow rules
+# from ~/.claude/settings.json, and any such rule joins this allowlist for the
+# unattended session, so this list is the boundary only when the operator has
+# no user-level allow rules. Agent and Workflow start further sessions. Real
+# headless probes under these flags, run by hand during review, found that
+# agents defined inside an analysed repo (.claude/agents/) are not loaded, and
+# that a built-in subagent the session started was refused both a write
+# outside the repo and an unlisted Bash command. Agents the operator has
+# installed at user level do load, and are trusted as the operator's own.
+# The test suite still drives a stub claude. The same hand-run probes found
+# the gh host-naming forms refused, `git remote get-url origin` allowed and
+# `git remote set-url` refused, and safe.bareRepository reaching the
+# session's git; the full real weekly run is recorded in the release
+# checklist when it happens.
 ALLOWED_TOOLS=(
   "Skill" "Workflow" "Agent" "Read" "Grep" "Glob"
   "Bash(git log:*)" "Bash(git rev-parse:*)" "Bash(git remote get-url origin)"

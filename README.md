@@ -1376,7 +1376,15 @@ the workflow invokes, and `Edit` on exactly two scratch files, below) and
 than prompting or auto-approving it, and `--setting-sources user`, so only the
 user's own settings load and an analysed repo's committed or local settings
 cannot widen the list or add hooks (the guard, snapshot and plan-guard hooks
-are registered at user level, so they stay). `--disallowedTools` stays as a second,
+are registered at user level, so they stay). `--setting-sources user` also
+loads the operator's own `permissions.allow` rules from
+`~/.claude/settings.json`, and any such rule joins the unattended allowlist,
+so the list above is the boundary only when the operator has no user-level
+allow rules. Agents defined inside an analysed repo (`.claude/agents/`) are not
+loaded under `--setting-sources user`, and a built-in subagent started by the
+session was refused both a write outside the repo and an unlisted Bash
+command; agents the operator has installed at user level do load, and are
+trusted as the operator's own. `--disallowedTools` stays as a second,
 explicit refusal of `Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`,
 `Bash(git commit:*)`, `Bash(git reset:*)`, `Bash(gh pr merge:*)`,
 `Bash(gh pr create:*)`, `Bash(gh issue create:*)`,
@@ -1404,9 +1412,12 @@ whose path a rule cannot name exactly gets no such rule, and the log says
 matches every spelling is for a real headless run to show.
 `test/static-checks.test.js` pins the deny tokens and the allowlist flags in
 the script text, and `test/weekly-runner.test.js` captures the real argument
-list. The allowlist has not been exercised by a real headless run from this
-repository's tests (every test drives a stub `claude`); the real-run check is
-recorded in `docs/release-checklist.md` when it has been done.
+list. The test suite still drives a stub `claude`. Real headless probes
+under the runner's flags were run by hand during review: the `gh`
+host-naming forms were refused, `git remote get-url origin` was allowed and
+`git remote set-url` refused, and `safe.bareRepository` reached the session's
+git. The full real weekly run is recorded in `docs/release-checklist.md` when
+it happens.
 
 **The session never writes under `.claude/`.** Measured on a real headless
 run (Claude Code 2.1.322, `dontAsk`): every write into `.claude/` is refused
