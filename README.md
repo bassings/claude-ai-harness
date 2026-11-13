@@ -556,7 +556,8 @@ past it.
   is a documented over-block, because a file reverted by mistake is lost and
   a refusal costs one retry with the override
   (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, put immediately before the git command
-  that was refused). For a branch switch, `git switch -` or a literal branch
+  that was refused, or before the wrapper if it runs through `env`, `xargs`,
+  `command`, `nohup`, `exec` or `timeout`). For a branch switch, `git switch -` or a literal branch
   name is not refused.
   These commands, which a guard that read `@{...}` as git's ref syntax would
   have let through, are refused while a tracked file is dirty:
@@ -568,11 +569,17 @@ past it.
   not say which one it is. An operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis at the end of a line, or beside another one, no longer hides the next command: the tokeniser read such a run as one token, so the text is spaced around them first. A refusal does not print the refused command: a hint rebuilt from the
   guard's own tokens once turned an inert single-quoted `$(...)` into a live
   one. It says to put `HARNESS_ALLOW_DESTRUCTIVE_GIT=1` immediately before
-  the git command that was refused: the inline form applies to that one
-  command, not the whole line, so in a loop, a multi-line command or a
-  `$(...)` it goes on the git call inside it, and in front of `git status &&
-  git reset --hard` it would not cover the reset. Exporting it for the session
-  also works but switches the guard off for everything in that session. The
+  the git command that was refused, or immediately before the wrapper when
+  the git call runs through `env`, `xargs`, `command`, `nohup`, `exec` or
+  `timeout` (the shell cannot run it between the wrapper and git, and `env`
+  refuses it there). The inline form applies to that one command, not the
+  whole line: a line with more than one refused git command needs it on each,
+  inside a `$(...)`, a loop or an `if` it goes on the git call there, and in
+  front of `git status && git reset --hard` it would not cover the reset. In
+  a loop or `if`, start the git call on its own line or after `;` or `&&`,
+  not directly after `do` or `then` (see the known-gaps row). Exporting it
+  for the session also works but switches the guard off for everything in
+  that session. The
   refusal also says which parsing class applied. A
   `zsh -c` refusal names `zsh -c` as the class that fired, because its body is
   only checked at all as zsh is unwrapped. A `dynamic pathspec` refusal has
@@ -677,6 +684,7 @@ measured, none is guarded, and none is planned to be.
 | A command built at run time or defined elsewhere | `f() { git reset --hard; }; f`, `G=git; $G reset --hard`, `zsh -c "$(echo git reset --hard)"` | The destructive text is never a literal token in a position the guard reads. |
 | A here-document fed to a shell | `bash <<'EOF'` ... `EOF` | Heredoc bodies are blanked uniformly before matching, which is right for the inert case (`cat <<EOF`) and wrong for this one. |
 | Input the tokeniser cannot parse | an unbalanced quote, ANSI-C quoting such as `echo $'it\'s'; git reset --hard`, a trailing lone backslash | The command is allowed with no notice: nothing raised, so the "NOT checked" message that a guard exception produces is not sent either, and neither the user nor Claude is told the command was never read. The guard only ever refuses a shape it positively identifies. Not detected. |
+| An assignment directly after a shell keyword | `for x in f; do FOO=1 git reset --hard; done`, and the same after `then`, `else`, `elif ...; then`, `{`, `!`, `time`, and `do` of a `while` or `until` loop | The keyword is stripped before the assignment, so the guard sees `FOO=1` as the command and never reads the git call after it. Any variable name does it, `HARNESS_ALLOW_DESTRUCTIVE_GIT` included, so there the override is neither needed nor checked. The same lines without the assignment are refused; `(`, `&&`, `;` and a newline before the assignment are refused too. Present on main. Not detected. |
 | A `cd` on the left of a background operator | `cd <clean directory> & git reset --hard`, and the same with `&\|` or `&!` | The guard moves its dirty check into the clean directory, but the shell runs the next command in the original one, so the dirty tree is reset. `\|` and `\|&` are handled (the `cd` runs in its own subshell); `&`, `&\|` and `&!` are not. The `&` form is the same on main. Not detected. |
 | Heredoc delimiters spelled `<<\EOF`, `<<"E-F"` or `<<E.F` | `cat <<\EOF`, a line with an apostrophe, `EOF`, then `git checkout -- file` | The delimiter pattern reads only plain words, so these markers are misread, the apostrophe in the body opens a quote, and the text is unparseable and fails open. bash and zsh both revert the file. Not detected. |
 | The oversize shortcut's `git` test | 65,536+ characters containing `g''it` but not `git` | Over the parsing cap, a command with no literal `git` substring is allowed unparsed. Quote removal defeats the substring test. |

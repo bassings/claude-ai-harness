@@ -935,7 +935,10 @@ REFUSAL_INSTRUCTION_FRAGMENTS = (
     '`git stash`',
     'opt in explicitly',
     'immediately before the git command that was refused',
+    'immediately before the wrapper',
     'not to the whole line',
+    'needs it on each',
+    'not directly after `do` or `then`',
     'switches this guard off for everything in that session',
 )
 
@@ -1010,8 +1013,13 @@ class TestOverrideInstructionWorksAsPrinted(unittest.TestCase):
         ('f=tracked.txt; git checkout -- $f', 'git checkout -- $f'),
         ('echo a # note\ngit checkout -- tracked.txt', 'git checkout -- tracked.txt'),
         ('echo $(git reset --hard)', 'git reset --hard'),
-        ('for f in tracked.txt; do git checkout -- "$f"; done', 'git checkout -- "$f"'),
-        ('while read f; do git restore "$f"; done < l', 'git restore "$f"'),
+        # Loops and `if`: the git call must start its own line or follow `;` or `&&`. Directly after `do` or `then` an
+        # assignment of ANY name hides the git call from the guard (a known gap, see KNOWN_GAP rows), so the override there
+        # would prove nothing; the control in the test below catches that.
+        ('for f in tracked.txt; do\n  git checkout -- "$f"\ndone', 'git checkout -- "$f"'),
+        ('for f in tracked.txt; do true; git checkout -- "$f"; done', 'git checkout -- "$f"'),
+        ('while read f; do\n  git restore "$f"\ndone < l', 'git restore "$f"'),
+        ('if true; then\n  git reset --hard\nfi', 'git reset --hard'),
         ('cd . && git checkout -- .', 'git checkout -- .'),
         ("zsh -c 'git reset --hard'", 'git reset --hard'),
     )
@@ -1041,8 +1049,45 @@ class TestOverrideInstructionWorksAsPrinted(unittest.TestCase):
             with self.subTest(command=command):
                 placed = command.replace(call, self.VAR + call, 1)
                 self.assertNotEqual(placed, command)
+                unrelated = command.replace(call, 'FOO=1 ' + call, 1)
+                self.assertIsNotNone(guard.evaluate(unrelated, self.root),
+                                     'control: an unrelated assignment in the override\'s place must still be refused, or '
+                                     'an allow below proves nothing about the override: %r' % (unrelated,))
                 self.assertIsNone(guard.evaluate(placed, self.root),
                                   'the printed instruction did not get through for %r' % (placed,))
+
+    # (wrapper, a refused command through it). The printed placement is before the wrapper.
+    WRAPPED = (
+        ('env git reset --hard', 'env'),
+        ('echo x | xargs git clean -fd', 'xargs'),
+        ('command git reset --hard', 'command'),
+        ('nohup git reset --hard', 'nohup'),
+        ('timeout 5 git reset --hard', 'timeout'),
+        ('exec git reset --hard', 'exec'),
+    )
+
+    def test_the_variable_before_a_wrapper_is_honoured(self):
+        write_file(self.root, 'scratch-untracked.txt', 'unsaved\n')  # so `git clean` has something to remove
+        for command, wrapper in self.WRAPPED:
+            with self.subTest(command=command):
+                self.assertIsNotNone(guard.evaluate(command, self.root), 'control: refused without the variable')
+                placed = command.replace(wrapper, self.VAR + wrapper, 1)
+                self.assertIsNone(guard.evaluate(placed, self.root),
+                                  'the printed instruction did not get through for %r' % (placed,))
+
+    def test_between_a_wrapper_and_the_git_call_is_pinned_as_it_is_today(self):
+        # Not an endorsed placement: the shell cannot run these lines (`xargs VAR=1 git ...` tries to execute `VAR=1`), and
+        # the refusal does not tell anyone to write them. This pins today's verdict so a change to it is visible: `env`
+        # reads the assignment as its own and refuses, the other wrappers hide the assignment and the guard allows.
+        write_file(self.root, 'scratch-untracked.txt', 'unsaved\n')
+        for command, wrapper in self.WRAPPED:
+            with self.subTest(command=command):
+                between = command.replace(wrapper + ' ', wrapper + ' ' + self.VAR, 1)
+                verdict = guard.evaluate(between, self.root)
+                if wrapper == 'env':
+                    self.assertIsNotNone(verdict, between)
+                else:
+                    self.assertIsNone(verdict, between)
 
     def test_the_variable_at_the_front_of_a_multi_segment_line_is_not_enough(self):
         # A `bash -c`/`zsh -c` line is one segment, and the variable on it covers the body, so it is left out here.
@@ -1058,6 +1103,22 @@ class TestOverrideInstructionWorksAsPrinted(unittest.TestCase):
         self.assertIn('immediately before the git command that was refused', reason)
         self.assertIn('not to the whole line', reason)
         self.assertNotIn('exactly as first typed', reason)
+
+
+class TestKnownGapRowsStayVisible(unittest.TestCase):
+    """Rows whose note starts with `KNOWN GAP` record a documented, measured bypass as its current verdict (allow), so closing
+    it later is a visible change to the corpus rather than a silent one. README's known-gaps table lists each as Not detected."""
+
+    def test_known_gap_rows_exist_expect_allow_and_point_at_the_readme(self):
+        rows = [c for c in CASES if c.get('note', '').startswith('KNOWN GAP')]
+        self.assertTrue(rows, 'no KNOWN GAP rows')
+        for row in rows:
+            with self.subTest(command=row['command']):
+                self.assertEqual(row['expect'], 'allow', 'a KNOWN GAP row pins today\'s allow')
+                self.assertIn('see README', row['note'])
+        with open(os.path.join(HOOKS_DIR, '..', 'README.md')) as fh:
+            readme = fh.read()
+        self.assertIn('An assignment directly after a shell keyword', readme)
 
 
 class TestClassNotesDoNotClaimCausation(unittest.TestCase):

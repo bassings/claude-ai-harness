@@ -1513,15 +1513,25 @@ def stash_would_lose_entries(cwd, target):
 
 # The override instruction every refusal carries. It prints no command text.
 # The inline form is scoped to ONE segment (escape_hatch_active_for_segment),
-# so it has to sit directly before the refused git call: in front of a whole
-# multi-segment line it covers only the first segment, and in front of `for`
-# it is a syntax error.
+# so it has to sit directly before the refused git call, or before the
+# wrapper (`env`, `xargs`, `command`, `nohup`, `exec`, `timeout`) that runs
+# it: in front of a whole multi-segment line it covers only the first
+# segment, and in front of `for` it is a syntax error. Behind a wrapper the
+# shell cannot run `xargs VAR=1 git ...`, and `env VAR=1 git ...` is read as
+# env's own assignment and refused. Directly after `do` or `then` an
+# assignment of any name hides the git call from the guard (a known gap,
+# listed in README), so the loop advice below avoids that spot.
 OVERRIDE_INSTRUCTION = (
-    "put {var}=1 immediately before the git command that was refused; it "
-    "applies to that one command, not to the whole line, so in a loop, a "
-    "multi-line command or a `$(...)` it goes on the git call inside it. "
-    "Exporting {var}=1 for the session also works, but it switches this "
-    "guard off for everything in that session."
+    "put {var}=1 immediately before the git command that was refused or, "
+    "when that git call runs through a wrapper such as `env`, `xargs`, "
+    "`command`, `nohup`, `exec` or `timeout`, immediately before the "
+    "wrapper. It applies to that one command, not to the whole line, so a "
+    "line with more than one refused git command needs it on each, and "
+    "inside a `$(...)`, a loop or an `if` it goes on the git call there; in "
+    "a loop or `if`, start that git call on its own line or after `;` or "
+    "`&&`, not directly after `do` or `then`. Exporting {var}=1 for the "
+    "session also works, but it switches this guard off for everything in "
+    "that session."
 )
 
 REFUSAL = (

@@ -9867,6 +9867,240 @@
       ],
       "expect": "block",
       "note": "HARN-AUDIT-1 T5 fix round 4 L1: the `|` control for the row above."
+    },
+    {
+      "command": "for x in f; do FOO=1 git reset --hard; done",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `do`."
+    },
+    {
+      "command": "while true; do FOO=1 git reset --hard; done",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `do` in a while loop."
+    },
+    {
+      "command": "until false; do FOO=1 git reset --hard; done",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `do` in an until loop."
+    },
+    {
+      "command": "if true; then FOO=1 git reset --hard; fi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `then`."
+    },
+    {
+      "command": "if false; then true; else FOO=1 git reset --hard; fi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `else`."
+    },
+    {
+      "command": "if false; then true; elif true; then FOO=1 git reset --hard; fi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `then` of an `elif`."
+    },
+    {
+      "command": "{ FOO=1 git reset --hard; }",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `{`."
+    },
+    {
+      "command": "! FOO=1 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `!`."
+    },
+    {
+      "command": "time FOO=1 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `time`."
     }
   ]
 }
