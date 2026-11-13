@@ -5282,6 +5282,4825 @@
       ],
       "expect": "allow",
       "note": "AC-QA-2 twin (round 5, H3): the pipeline shape with an empty outer stash"
+    },
+    {
+      "command": "git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 control: the bare form in the same fixture as every new BLOCK case",
+      "control": true
+    },
+    {
+      "command": "git checkout -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 control: the bare form in the same fixture as every new BLOCK case",
+      "control": true
+    },
+    {
+      "command": "git checkout -- tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 control: the bare form in the same fixture as every new BLOCK case",
+      "control": true
+    },
+    {
+      "command": "git restore tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 control: the bare form in the same fixture as every new BLOCK case",
+      "control": true
+    },
+    {
+      "command": "echo hi # note\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-QA-10: trailing comment, then the destructive line",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a#b; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-QA-10: mid-word # is not a comment",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a#b\ngit checkout -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: mid-word # on the preceding line",
+      "class": "comment continuation",
+      "bare": "git checkout -- ."
+    },
+    {
+      "command": "git status # look\ngit checkout -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: trailing comment on the preceding line",
+      "class": "comment continuation",
+      "bare": "git checkout -- ."
+    },
+    {
+      "command": "echo hi # note\n  git restore tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: comment, then an indented restore",
+      "class": "comment continuation",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "echo hi;# note\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a comment with no space after the semicolon (blocked before T5 as well: pins that removing the comment leaves the semicolon and the newline as separate tokens)",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo hi >#x\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a # after a redirect operator is a comment",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo hi # <<EOF\ngit reset --hard\nEOF\n",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a heredoc marker inside a comment is not a heredoc, so the next line runs",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo hi # it's a note\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: an apostrophe inside a comment opens no quote",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "cat <<'EOF'\ndon't\nEOF\necho hi # note\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a heredoc body with an apostrophe must not stop the comment after it being read as one",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "git reset \\\n--hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-QA-10: continuation between words",
+      "class": "backslash continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "git checkout \\\n-- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: continuation inside git checkout -- . (Round 4 L2: blocked even without joining the continuation, so this row is a regression pin and carries no class tag; the row below blocks only when the continuation is joined.)"
+    },
+    {
+      "command": "git checkout -- \\\ntracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: continuation before the pathspec",
+      "class": "backslash continuation",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git reset --ha\\\nrd",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: continuation in the middle of a word joins the word",
+      "class": "backslash continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "cat <<'EOF'\ndon't\nEOF\ngit reset \\\n--hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a continuation after a heredoc whose body has an apostrophe",
+      "class": "backslash continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "git reset \\\n  --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: continuation followed by indentation",
+      "class": "backslash continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "git checkout -- $(ls)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: bare substitution pathspec",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- \"$(ls)\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: quoted substitution pathspec",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- \"$X\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: quoted variable pathspec",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- $X",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: bare variable pathspec",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- ${X}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: braced variable pathspec",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- `ls`",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: backtick substitution pathspec",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "for f in a; do git checkout -- \"$f\"; done",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: for loop",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "while read f; do git restore \"$f\"; done < l",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: while loop",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git restore {a,b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: brace expansion",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git restore \"$f\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: restore with a variable",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git restore $(git ls-files -m)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: restore with a substitution",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git checkout HEAD \"$f\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: ref then a variable pathspec",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout \"$f\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: bare checkout of a variable is read as a pathspec, failing closed",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- other.txt $X",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: one clean literal path and one variable: the variable could be the dirty file",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "bash -c 'git restore \"$f\"'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a variable pathspec inside bash -c",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git -C . checkout -- \"$f\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a variable pathspec after -C",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "zsh -c 'git checkout -- .'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 AC-SEC-1: zsh -c",
+      "class": "zsh -c",
+      "bare": "git checkout -- ."
+    },
+    {
+      "command": "zsh -c 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: zsh -c reset",
+      "class": "zsh -c",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "/bin/zsh -lc 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: absolute zsh path with -lc",
+      "class": "zsh -c",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "nohup zsh -c 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a prefix wrapper in front of zsh -c",
+      "class": "zsh -c",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "zsh -c \"bash -c 'git reset --hard'\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: zsh around bash",
+      "class": "zsh -c",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "git clean -fd $(echo x)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "scratch.txt",
+          "content": "unsaved\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: a substitution pathspec must not narrow git clean's dry run to a literal path (blocked before T5 too: pins the restore-into-token change)"
+    },
+    {
+      "command": "git clean -fd $(echo x)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: the same command with nothing untracked to remove"
+    },
+    {
+      "command": "git commit -m \"fix #12\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 AC-QA-11: # inside double quotes"
+    },
+    {
+      "command": "git commit -m 'fix #12'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 AC-QA-11: # inside single quotes"
+    },
+    {
+      "command": "echo a#b",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 AC-QA-11: mid-word # in a non-destructive command"
+    },
+    {
+      "command": "echo a#b\ngit status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: mid-word # then a safe command"
+    },
+    {
+      "command": "git log $REF",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 AC-QA-11: a variable in a non-pathspec position"
+    },
+    {
+      "command": "git log \"$REF\" --oneline",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: a quoted variable in a non-pathspec position"
+    },
+    {
+      "command": "git status \\\n--short",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 AC-QA-11: continuation of a safe command"
+    },
+    {
+      "command": "zsh -c 'git status'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 AC-QA-11: zsh -c of a safe command"
+    },
+    {
+      "command": "echo hi # git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 AC-QA-11: the destructive spelling only after a real comment"
+    },
+    {
+      "command": "echo hi # $(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: a substitution inside a comment is text"
+    },
+    {
+      "command": "echo hi # note\ngit status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: a comment, then a safe command"
+    },
+    {
+      "command": "echo \"# not a comment\" && git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: # inside quotes starts no comment"
+    },
+    {
+      "command": "git checkout -b \"feat-$X\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: branch creation with a variable is not a restore"
+    },
+    {
+      "command": "git commit -m \"built $(date)\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: a substitution inside a commit message"
+    },
+    {
+      "command": "git commit -F - <<'EOF'\nfix: don't # x\nEOF\n",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: a heredoc body with an apostrophe and a hash"
+    },
+    {
+      "command": "git checkout -- \"$X\" # git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5: the pathspec is dynamic even with a trailing comment",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- \"$X\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: dynamic pathspec in a clean tree has nothing to lose"
+    },
+    {
+      "command": "zsh -c 'git checkout -- .'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: zsh -c in a clean tree has nothing to lose"
+    },
+    {
+      "command": "echo hi # note\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: comment continuation in a clean tree has nothing to lose"
+    },
+    {
+      "command": "echo hi # note\nHARNESS_ALLOW_DESTRUCTIVE_GIT=1 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: the documented inline override on the line after a comment"
+    },
+    {
+      "command": "HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git reset \\\n--hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: the documented inline override on a continued line"
+    },
+    {
+      "command": "HARNESS_ALLOW_DESTRUCTIVE_GIT=1 git checkout -- \"$X\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: the documented inline override covers a dynamic pathspec"
+    },
+    {
+      "command": "HARNESS_ALLOW_DESTRUCTIVE_GIT=1 zsh -c 'git reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5: the documented inline override covers zsh -c"
+    },
+    {
+      "command": "echo a\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up control: a plain newline-separated pair, which must keep blocking",
+      "control": true
+    },
+    {
+      "command": "echo a &&\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a line ending in &&, then the destructive line",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a ||\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a line ending in ||, then the destructive line",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a ;\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a line ending in ;, then the destructive line",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a |\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a line ending in |, then the destructive line",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a |&\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a line ending in |&, then the destructive line",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a line ending in &, then the destructive line",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a;\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: semicolon with no space before it",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "(cd sub)\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a closing parenthesis then a newline",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a |\ngit checkout -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a pipe at the end of a line, then checkout -- .",
+      "class": "adjacent operators",
+      "bare": "git checkout -- ."
+    },
+    {
+      "command": "echo a &&  \t\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: spaces and a tab between the operator and the newline",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &&\r\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: CRLF line ending after the operator",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a;\r\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: CRLF line ending after a semicolon",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &&\n\n\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: several newlines after the operator",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a && # note\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a comment between the operator and the newline",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &&\\\n\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a backslash-newline continuation then a newline",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a \\\n&&\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: the operator on a continued line",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "bash -c 'echo a &&\ngit reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: inside bash -c",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "zsh -c 'echo a &&\ngit reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: inside zsh -c",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo $(echo a &&\ngit reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: inside $( )",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo \"$(echo a;\ngit reset --hard)\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: inside a double-quoted $( )",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "(echo a);git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: a semicolon straight after a closing parenthesis",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a;(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: an opening parenthesis straight after a semicolon",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a&&(git reset --hard)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: an opening parenthesis straight after &&",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "(echo a)&&git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: && straight after a closing parenthesis",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a|&git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 follow-up: |& with the command straight after it",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &&\ngit status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: a safe command after an operator and a newline"
+    },
+    {
+      "command": "echo a |\ncat",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: a pipe at the end of a line, then a safe command"
+    },
+    {
+      "command": "(cd sub)\ngit status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: a subshell then a safe command"
+    },
+    {
+      "command": "echo a;(git status)",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: a safe command in a subshell"
+    },
+    {
+      "command": "echo \"a &&\ngit reset --hard\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: an operator and a newline inside double quotes are a literal string"
+    },
+    {
+      "command": "echo 'a ;\ngit reset --hard'",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: an operator and a newline inside single quotes are a literal string"
+    },
+    {
+      "command": "cat <<'EOF'\na &&\ngit reset --hard\nEOF\n",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: a heredoc body containing the shape is inert text"
+    },
+    {
+      "command": "echo a &&\ngit reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: nothing to lose in a clean tree"
+    },
+    {
+      "command": "echo a &&\nHARNESS_ALLOW_DESTRUCTIVE_GIT=1 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 follow-up: the documented inline override on the line after an operator"
+    },
+    {
+      "command": "echo `#c`; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M1: # straight after an opening backtick Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the command after the closing backtick, because the shell finds the closing backtick before it parses a comment.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo ` #c`; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M1: # after a space inside backticks Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the command after the closing backtick.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo \"`#c`\"; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M1: a backtick comment inside double quotes Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the command after the closing backtick.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a\r#; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L1: a bare carriage return is an ordinary character, so # after it starts no comment Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the marker.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo ${X:-a #b}; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L2: # after whitespace inside ${...} is literal Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the marker.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo ${X:-#b}; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L2: # at the start of a ${...} word is literal Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the marker.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo ${X:-a\n#b}; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L2: # at the start of a line inside ${...} is literal Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the marker.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo ${X:-${Y:-a #b}}; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L2: nested ${...} Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the marker.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo ${X:-$(echo a #b\n)}; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L2: a real comment inside $( ) inside ${...} ends at its newline Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both ran the marker.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a\r\n# git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L1: CRLF then a real comment line is a comment Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: both treat the line as a comment; the marker did not run."
+    },
+    {
+      "command": "true;#; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1: # after a semicolon is a comment Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: neither ran the marker."
+    },
+    {
+      "command": "true &#; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1: # after & is a comment Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: neither ran the marker."
+    },
+    {
+      "command": "(true)#; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1: # after a closing parenthesis is a comment Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: neither ran the marker."
+    },
+    {
+      "command": "true\t#; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1: # after a tab is a comment Checked 2026-11-12 with real bash -c and zsh -c, touching a marker file: neither ran the marker."
+    },
+    {
+      "command": "echo a\f#; git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1: a form feed is an ordinary character, so # after it is literal (nothing destructive here)"
+    },
+    {
+      "command": "echo ${#X}; git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1: ${#X} is a length, not a comment"
+    },
+    {
+      "command": "echo hi # ${X:-a} git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1: a real comment containing ${ is text"
+    },
+    {
+      "command": "git checkout @{-1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: the previous branch, refused again (documented over-block, owner decision). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout HEAD@{1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: a reflog ref, refused again (documented over-block, owner decision). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout master@{1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: a branch reflog ref, refused again (documented over-block, owner decision). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -q @{-1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: the previous branch, quiet, refused again (documented over-block, owner decision). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout --detach \"$SHA\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: --detach takes a commit. A branch or ref switch discards nothing, and git refuses it itself if it would overwrite."
+    },
+    {
+      "command": "git checkout -t origin/$B",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: -t takes a branch. A branch or ref switch discards nothing, and git refuses it itself if it would overwrite."
+    },
+    {
+      "command": "git restore --source HEAD@{1} other.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: the argument of --source is a ref and other.txt is clean"
+    },
+    {
+      "command": "git restore --source \"$REF\" other.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: the argument of --source is a ref, whatever it holds, and other.txt is clean"
+    },
+    {
+      "command": "git restore -s \"$REF\" other.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: the argument of -s is a ref and other.txt is clean"
+    },
+    {
+      "command": "git restore --source=HEAD@{1} other.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: --source=<ref> and a clean path"
+    },
+    {
+      "command": "git checkout \"$f\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: a bare run-time word may be a path or a branch; data loss outranks convenience, so it stays refused",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout \"$BRANCH\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: a bare variable may be a path; refused (documented over-block)",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout ${BRANCH:-master}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: a bare parameter expansion may be a path; refused (documented over-block)",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout --detach -- \"$f\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: a pathspec after -- is still measured whatever came before it",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -t origin/x -- \"$f\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: a pathspec after -- is still measured after -t",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -b new -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: -b does not make a pathspec after -- safe"
+    },
+    {
+      "command": "git restore --source HEAD@{1} tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: the ref is excluded but the path is dirty"
+    },
+    {
+      "command": "git restore --source \"$REF\" tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: the ref is excluded but the path is dirty"
+    },
+    {
+      "command": "git restore --source HEAD \"$f\"",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 M2: a pathspec after the --source argument is still dynamic",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git checkout -- ~/x",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L3: an unquoted ~ expands to a path the guard cannot read",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git restore ~/x",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L3: restore with a tilde path",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git checkout -- ~+/tracked.txt",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L3: ~+ expands to the working directory, so this reverts tracked.txt",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- ~/x",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 1 L3: nothing to lose in a clean tree"
+    },
+    {
+      "command": "git checkout -- @{a,b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{a,b} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- @{a..b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{a..b} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- @{1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{1} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- HEAD@{1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: HEAD@{1} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- @{-1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{-1} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout -- @{u}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{u} after --, a pathspec position. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{a,b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{a,b} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{a..b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{a..b} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{1} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{-1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{-1} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git checkout @{u}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: @{u} as a bare word, a ref position that is also a possible path (documented over-block). The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git checkout -- tracked.txt"
+    },
+    {
+      "command": "git restore @{a,b}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: restore with a brace list. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git restore -- @{u}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2: restore with @{u} after --. The guard reads any @{...} as a run-time word: a brace list or sequence (@{a,b}, @{a..b}) expands to files (checked 2026-11-12: bash and zsh both print `@a @b`), and a single item (@{1}, @{-1}, @{u}, HEAD@{1}) is git's ref syntax in a ref position but a file name in a pathspec position, which the guard cannot tell apart.",
+      "class": "dynamic pathspec",
+      "bare": "git restore tracked.txt"
+    },
+    {
+      "command": "git checkout -",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 2: `git checkout -` is the previous branch and has no run-time word, so it still works on a dirty tree."
+    },
+    {
+      "command": "git checkout --detach @{-1}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 2: the operand of --detach is a ref whatever it contains, and git refuses a switch that would overwrite."
+    },
+    {
+      "command": "git checkout -t @{u}",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 2: the operand of -t is a ref."
+    },
+    {
+      "command": "echo \"$(echo a # )\"\n)\"; git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 2 L7: a `#` inside a $( ) inside double quotes. Checked 2026-11-12: zsh -c ran the marker command after it, bash -c rejected the text as a syntax error. The stricter reading wins.",
+      "class": "comment continuation",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &| git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: zsh's &| (background and disown) is a control operator. Checked 2026-11-13 with the agent shell (zsh 5.9): `echo a &| echo b` printed a then b, so the second command runs; bash rejects the line.",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a&|git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: &| with no spaces. Checked 2026-11-13 with the agent shell (zsh 5.9): `echo a &| echo b` printed a then b, so the second command runs; bash rejects the line.",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &! git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: &!, the synonym of &|, with spaces (already blocked before this round: pinned).",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a&!git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: &! with no spaces. Checked 2026-11-13 with the agent shell (zsh 5.9): `echo a &| echo b` printed a then b, so the second command runs; bash rejects the line.",
+      "class": "adjacent operators",
+      "bare": "git reset --hard"
+    },
+    {
+      "command": "echo a &| git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: a harmless command after &| is still allowed."
+    },
+    {
+      "command": "echo a &! git status",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "HARN-AUDIT-1 T5 fix round 3 M2: a harmless command after &! is still allowed."
+    },
+    {
+      "command": "git reset --hard\r\n",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 L2: a carriage return before the newline. Checked 2026-11-13: bash and zsh pass `--hard\\r` to git, which exits 129 and reverts nothing. The guard blocks it anyway, the stricter reading; pinned so the CR in the tokeniser's whitespace cannot be dropped unnoticed."
+    },
+    {
+      "command": "git checkout -- tracked.txt\r\n",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 3 L2: the same with a path; the shell would hand git `tracked.txt\\r`, the guard reads `tracked.txt`. Stricter reading, pinned."
+    },
+    {
+      "command": "git checkout -\\\n- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 4 L2: blocks only when the continuation is joined. Unjoined this is `git checkout -` (the previous branch) then a line that is not git.",
+      "class": "backslash continuation",
+      "bare": "git checkout -- ."
+    },
+    {
+      "command": "cd sub |& true; git checkout -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 4 L1: `|&` makes the `cd` run in its own subshell, so the guard measures the dirty outer tree, not the clean nested repo. Without the `|&` handling the guard moves into `sub` and allows it."
+    },
+    {
+      "command": "cd sub | true; git checkout -- .",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        },
+        {
+          "op": "nested_repo",
+          "path": "sub",
+          "dirty": false
+        }
+      ],
+      "expect": "block",
+      "note": "HARN-AUDIT-1 T5 fix round 4 L1: the `|` control for the row above."
+    },
+    {
+      "command": "for x in f; do FOO=1 git reset --hard; done",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `do`."
+    },
+    {
+      "command": "while true; do FOO=1 git reset --hard; done",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `do` in a while loop."
+    },
+    {
+      "command": "until false; do FOO=1 git reset --hard; done",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `do` in an until loop."
+    },
+    {
+      "command": "if true; then FOO=1 git reset --hard; fi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `then`."
+    },
+    {
+      "command": "if false; then true; else FOO=1 git reset --hard; fi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `else`."
+    },
+    {
+      "command": "if false; then true; elif true; then FOO=1 git reset --hard; fi",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `then` of an `elif`."
+    },
+    {
+      "command": "{ FOO=1 git reset --hard; }",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `{`."
+    },
+    {
+      "command": "! FOO=1 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `!`."
+    },
+    {
+      "command": "time FOO=1 git reset --hard",
+      "setup": [
+        {
+          "op": "init",
+          "branch": "master"
+        },
+        {
+          "op": "commit",
+          "path": "tracked.txt",
+          "content": "committed\n"
+        },
+        {
+          "op": "commit",
+          "path": "other.txt",
+          "content": "other\n"
+        },
+        {
+          "op": "write",
+          "path": "tracked.txt",
+          "content": "dirty\n"
+        }
+      ],
+      "expect": "allow",
+      "note": "KNOWN GAP, see README (an assignment directly after a shell keyword hides the git call, whatever the variable is called; present on main, measured 2026-11-13): after `time`."
     }
   ]
 }

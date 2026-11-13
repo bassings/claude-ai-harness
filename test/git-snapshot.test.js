@@ -727,7 +727,8 @@ test('git-snapshot AC-ARCH-2: the detector\'s refusal text and exit code are unc
   const payload = bashPayload(dir, 'git checkout -- README.md')
   const detectorRes = spawnSync('python3', [detectorPath], { input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv(), timeout: 60000 })
   assert.equal(detectorRes.status, 2)
-  assert.match(detectorRes.stderr, /README\.md/)
+  assert.match(detectorRes.stderr, /uncommitted/i)
+  assert.doesNotMatch(detectorRes.stderr, /README\.md/, 'the refusal prints no form of the refused command')
 })
 
 // ---------------------------------------------------------------------
