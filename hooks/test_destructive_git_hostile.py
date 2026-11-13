@@ -192,6 +192,19 @@ class TestHostileCommandsInProcess(unittest.TestCase):
 
     def test_every_hostile_command_exits_0_or_2_never_crashes(self):
         cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-')
+        # HARN-AUDIT-1 T5 (AC-SEC-2): main() answers 0 from a broad `except Exception` when evaluate() raises, which would
+        # satisfy the exit-code assertion below while hiding a parsing path that throws. evaluate() is wrapped to record
+        # what it raises, and the record must stay empty.
+        raised = []
+        real_evaluate = guard.evaluate
+
+        def recording(command, where):
+            try:
+                return real_evaluate(command, where)
+            except Exception as exc:
+                raised.append((command[:80], repr(exc)))
+                raise
+        guard.evaluate = recording
         try:
             subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd,
                             capture_output=True, timeout=HANG_DEADLINE_SECONDS)
@@ -204,7 +217,9 @@ class TestHostileCommandsInProcess(unittest.TestCase):
                     self.assertNotIn(TRACEBACK_MARKER, stderr,
                                       'hostile command #%d produced a traceback on stderr: %r...' % (index, command[:80]))
         finally:
+            guard.evaluate = real_evaluate
             subprocess.run(['rm', '-rf', cwd])
+        self.assertEqual(raised, [], 'evaluate() raised on hostile input, which main() turns into a silent allow: %r' % raised[:5])
 
 
 class TestHostileCommandsAsRealProcesses(unittest.TestCase):
@@ -374,7 +389,7 @@ class TestOversizeCommandIsNeverParsed(unittest.TestCase):
     extract_command_substitutions, not split_segments, not the shlex tokeniser, and it starts no git subprocess. Each stage is
     wrapped to count its calls while evaluate() decides the command in this process. No clock is read."""
 
-    STAGES = ['strip_heredoc_bodies', 'extract_command_substitutions', 'split_segments']
+    STAGES = ['normalise_shell_text', 'strip_heredoc_bodies', 'extract_command_substitutions', 'split_segments']
 
     def _calls_while_evaluating(self, command, cwd):
         calls = {name: 0 for name in self.STAGES + ['shlex.shlex', 'subprocess.run']}
@@ -427,6 +442,93 @@ class TestOversizeCommandIsNeverParsed(unittest.TestCase):
             _, calls = self._calls_while_evaluating('git status', cwd)
             for name in self.STAGES + ['shlex.shlex']:
                 self.assertGreater(calls[name], 0, 'sanity: the counter must observe %s on a command that is parsed' % name)
+        finally:
+            subprocess.run(['rm', '-rf', cwd])
+
+
+class TestParsingWorkGrowsLinearly(unittest.TestCase):
+    """HARN-AUDIT-1 T5 (the cost bound carried from T1's review). T1 replaced the wall-clock assertions with call counts,
+    which cannot see super-linear work INSIDE one call, and a PreToolUse hook that times out lets the command run. This
+    measures the work itself, deterministically: evaluate() is run for each hostile shape at two sizes, 32768 and 65536
+    characters (the cap itself), under a trace that counts every executed line of Python in the guard and in shlex, and the
+    count per character at the larger size must stay within MAX_PER_CHAR_GROWTH of the count per character at the smaller.
+    No clock is read, so load cannot move it, and there is no retry to hide anything behind.
+
+    What it cannot see: time spent inside one C call (a regex scan, str.find, a list copy), which executes no Python
+    lines. Those are bounded by the length cap rather than by this test, and the scanner's own C-level searches are
+    arranged to be linear (see skip_heredoc_bodies)."""
+
+    SMALL = 32768
+    BIG = guard.MAX_COMMAND_LENGTH_CHARS
+    # Work per character may grow by this factor between the two sizes. Exactly linear work holds it at 1.0 (fixed start-up
+    # work makes it fall slightly), doubling the input of quadratic work doubles it, so 1.25 separates the two with room for
+    # lines that run once per thousand characters.
+    MAX_PER_CHAR_GROWTH = 1.25
+
+    @staticmethod
+    def _repeat(prefix, unit, suffix, size):
+        return prefix + unit * max(1, (size - len(prefix) - len(suffix)) // len(unit)) + suffix
+
+    def _shapes(self):
+        rep = self._repeat
+        return {
+            'one long token': lambda n: rep('git reset --hard ', 'A', '', n),
+            'many segments': lambda n: rep('', 'git status;', '', n),
+            'comment on every line': lambda n: rep('', 'echo a # c\n', 'git status', n),
+            'mid-word hash': lambda n: rep('', 'echo a#b;', 'git status', n),
+            'a long run of continuations': lambda n: rep('git status ', '\\\n', '--short', n),
+            'operator then newline': lambda n: rep('', 'echo a &&\n', 'git status', n),
+            'parentheses beside operators': lambda n: rep('', '(a);(b)&&', 'git status', n),
+            'parameter expansions with hashes': lambda n: rep('', 'echo ${X:-a #b};', 'git status', n),
+            'backtick comments': lambda n: rep('', 'echo `#c`;', 'git status', n),
+            'bare carriage returns before hashes': lambda n: rep('', 'echo a\r#;', 'git status', n),
+            'quoted run': lambda n: rep("git commit -m '", 'a b ', "'", n),
+            'many substitutions': lambda n: rep('', 'echo $(true);', 'git status', n),
+            'one deep substitution': lambda n: '$(echo ' * ((n - 16) // 8) + 'x' + ')' * ((n - 16) // 8),
+            'heredoc with a long body': lambda n: rep("cat <<'EOF'\n", 'text git\n', 'EOF\ngit status', n),
+            'unterminated heredoc markers': lambda n: rep('', '<<A\n', '', n),
+            'distinct unterminated markers': lambda n: ''.join('<<H%d\n' % i for i in range(n // 9)),
+            'dynamic pathspecs': lambda n: rep('git checkout -- ', '"$X" ', '', n),
+            'nested parens': lambda n: '( ' * ((n - 16) // 4) + 'git status' + ' )' * ((n - 16) // 4),
+        }
+
+    def _steps(self, command, cwd):
+        files = {GUARD_PATH, getattr(shlex, '__file__', None)}
+        steps = [0]
+
+        def local(frame, event, arg):
+            if event == 'line':
+                steps[0] += 1
+            return local
+
+        def global_trace(frame, event, arg):
+            return local if frame.f_code.co_filename in files else None
+        sys.settrace(global_trace)
+        try:
+            guard.evaluate(command, cwd)
+        finally:
+            sys.settrace(None)
+        return steps[0]
+
+    def test_work_at_the_cap_is_within_a_linear_factor_of_work_at_half_the_cap(self):
+        cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-linear-')
+        try:
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=HANG_DEADLINE_SECONDS)
+            for name, build in self._shapes().items():
+                small, big = build(self.SMALL), build(self.BIG)
+                self.assertLessEqual(len(big), guard.MAX_COMMAND_LENGTH_CHARS, '%s: the big input must not be over the cap' % name)
+                self.assertGreater(len(big), 1.5 * len(small), '%s: the two sizes must really differ' % name)
+                with self.subTest(shape=name):
+                    work_small = self._steps(small, cwd)
+                    work_big = self._steps(big, cwd)
+                    self.assertGreater(work_small, 100, 'the counter must see the guard parse the input (%d steps)' % work_small)
+                    per_char_small = work_small / len(small)
+                    per_char_big = work_big / len(big)
+                    self.assertLessEqual(
+                        per_char_big, self.MAX_PER_CHAR_GROWTH * per_char_small,
+                        '%s: %d steps at %d characters but %d at %d, so the work per character grew from %.3f to %.3f; '
+                        'linear work keeps it flat and quadratic work doubles it'
+                        % (name, work_small, len(small), work_big, len(big), per_char_small, per_char_big))
         finally:
             subprocess.run(['rm', '-rf', cwd])
 
