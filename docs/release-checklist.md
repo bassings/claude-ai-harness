@@ -151,12 +151,94 @@ for itself.
 Under AC-PROD-3 the README may present only the routes marked "yes" here as
 verified.
 
-## 5. Still to record
+## 5. The weekly runner under its allowlist (T11)
+
+Recorded 2026-11-13, Claude Code 2.1.322, after `bin/install.sh` and
+`bin/install.sh --check` matched the checkout at `main` `0a5c6d6`. Installed
+`~/.claude/bin/optimise-cycle-weekly.sh` is `SCRIPT_VERSION` `2026-11-13.1`,
+sha256 `9360dd12ae74f6bebc24eed43e91d7055d67974c2abc9a28bdc964bd0988e688`;
+installed `~/.claude/workflows/optimise-cycle.js` is sha256
+`e67e67068c30f33d0b0da155a63d574db16cf215ab552653c325835eb221d657`.
+
+### Headless permission probes, by hand, in throwaway repositories
+
+Each probe ran `claude -p` with the runner's `--allowedTools`,
+`--disallowedTools`, `--permission-mode dontAsk` and `--setting-sources user`.
+
+| Probe | Result |
+|---|---|
+| `gh run list` and `gh run view` with `-R`, `-Rvalue`, `--repo`, `--repo=`, `-aR`, a leading `-R`, `--hostname`, and the `GH_HOST=` and `GH_REPO=` prefixes | all refused, including from a subagent |
+| `gh repo view <host>/<owner>/<repo>`, `env GH_HOST=... gh run list` | refused |
+| `git -C <another directory> log`, `git -C <root> -c key=value log`, `git log --output=<path>`, `node -e 1`, the report-ignore helper pointed at another directory | refused |
+| `cd sub && git log -1`, a redirect to a path outside the repository | refused |
+| A helper call whose argument contains `$(...)` | refused; the CLI also discards any allow rule containing `$(...)` |
+| `gh run list --limit 5 --json ...`, `gh run view 1 --json jobs`, `git -C <root> log ...`, `git rev-parse --show-toplevel`, the two-step report-ignore sequence, `optimise-read.mjs` with piped input | allowed |
+| `git remote get-url origin` / `git remote set-url origin ...` | allowed / refused |
+| `git remote`, `git remote -v`, `date +%s`, though unlisted | allowed: the CLI treats them as read-only |
+| `git rev-parse` and `git log` inside a planted bare repository, with the launch environment | git refuses: `cannot use bare repository` |
+| Agents defined in the analysed repository's `.claude/agents/` | not loaded; a built-in subagent was refused a Write outside the repository and an unlisted Bash command |
+| An agent started by the Workflow tool, and one started by the Agent tool: `git log`, `git rev-parse`, `optimise-read.mjs ledger`, `gh run list`, Read | allowed in both |
+| The same two agents asked to Write `report.md` at the allowed scratch path | **refused in both**, by a CLI rule and not by the path: `Subagents should return findings as text, not write report files.` |
+
+AC-SEC-9 also asks for `git checkout -- .` refused by the guard and
+`.claude/active-plan` unchanged in a scratch repository with the hooks
+installed. The marker half is covered by the real run below. The guard half
+was **not probed** under the runner's flags.
+
+### The first real weekly run through launchd
+
+`launchctl kickstart` of `com.local.optimise-cycle-weekly`, three configured
+repositories, started 2026-11-13T12:10:03Z, finished 12:46:59Z.
+
+| Check | Result |
+|---|---|
+| First log line carries the version | yes: `version=2026-11-13.1` |
+| Install staleness check | `STALENESS ok`, 36 published files, no drift |
+| Verdict logged | `RESULT PASS` for all three; last-result `PASS` with the three labels |
+| Staged `.claude/workflows/optimise-cycle.js` removed from each repository afterwards | yes |
+| `.claude/active-plan` of the two repositories that had one | byte-for-byte as before; the log carries `RESTORED-ACTIVE-PLAN` for one of them |
+| An uncommitted tracked change in one analysed repository | still present, untouched |
+| Per-run temporary directory | removed |
+
+**The three `PASS` verdicts are not evidence that the optimiser worked.**
+Each session's own closing text, kept in the log, says its report is
+incomplete:
+
+| Repository | What the session reported |
+|---|---|
+| first | the workflow's report write did not land and the session wrote the file from the returned text; the CI aggregation step did not run; the escaped-defect figure was not measured |
+| second | `Ranked proposals: 0`, with "the session's permission mode denied the shell tool, so the ledger reader, `gh` and `git` never ran"; the report shows 0 ledger records against a 78-line ledger |
+| third | 0 ledger records where the previous week's report showed 467; the report write did not land and the session wrote the file itself; only the CI section is real |
+
+So, under the allowlist, the run is contained and tidy and the optimiser's
+output is hollow, and the runner scores a hollow report `PASS`. The runner
+before T11 produced full reports with the hooks off and permissions bypassed.
+AC-OPS-6's "one real run has logged `RESULT PASS`" is met only in the letter
+and is **not recorded as met**. Two causes are measured and one is not:
+
+- Measured: a subagent's Write of the report is refused by the CLI whatever
+  the allow rules say, so `report_path` as a subagent write cannot work.
+- Measured: the runner's verdict checks the report's shape and not its
+  content (plan task T31).
+- Not measured: why one session was refused the shell tool outright while the
+  probe's Workflow and Agent subagents were allowed the same commands.
+
+### The FAIL notification (AC-OPS-1)
+
+Two forced failures through launchd on 2026-11-13 (11:55:15Z and 11:57:33Z),
+made by pointing the job at a repository path that does not exist. Both
+logged `RESULT FAIL ... reason="configured repo path does not exist"`, wrote
+the last-result line, and logged no `NOTIFY-FAILED`. **Nobody was looking at
+the screen**, so whether the notification appeared is not recorded.
+
+## 6. Still to record
 
 - One run of each workflow by `scriptPath` from a session started in a scratch
   repository (section 3), including `/plan-cycle` against a copy of the
   starter spec (AC-PROD-4, after T14).
-- One headless run under the weekly runner's exact flags in a scratch
-  repository with the hooks installed (AC-SEC-9, T11).
+- The weekly runner (section 5): a real run whose reports are complete, the
+  cause of the outright shell refusal, `git checkout -- .` refused by the
+  guard under the runner's flags (AC-SEC-9), and the FAIL notification seen
+  by a person (AC-OPS-1).
 - A static `import` and a dynamic `import()` in a workflow script (section 1).
 - The plugin and first-install routes (section 4).
