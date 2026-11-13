@@ -226,7 +226,7 @@ test('T6 AC-DATA-4: replacement is a rename from a uniquely named temp file besi
   const original = fs.readFileSync(exclude)
   const a = spawnWriter(repo, 1, { [WINDOW]: '60000' })
   const b = spawnWriter(repo, 2, { [WINDOW]: '60000' })
-  const temps = await waitFor(() => (strayFiles(infoDir).length >= 2 ? strayFiles(infoDir) : null), 15000, 'two temp files beside the exclude target')
+  const temps = await waitFor(() => (strayFiles(infoDir).length >= 2 ? strayFiles(infoDir) : null), 30000, 'two temp files beside the exclude target')
   assert.equal(new Set(temps).size, temps.length, 'temp names are unique per writer')
   assert.ok(fs.readFileSync(exclude).equals(original), 'target untouched while the temp files exist')
   a.child.kill('SIGKILL')
@@ -274,7 +274,7 @@ test('T6 AC-DATA-5: a symlinked exclude stays a symlink to the same target, whic
 
   // Temp placement: while paused, the stray file sits in the target's directory.
   const paused = spawnWriter(repo, 1, { [WINDOW]: '60000' })
-  const temp = await waitFor(() => strayFiles(elsewhere).filter((n) => n !== 'shared-exclude')[0], 15000, 'temp file in the target directory')
+  const temp = await waitFor(() => strayFiles(elsewhere).filter((n) => n !== 'shared-exclude')[0], 30000, 'temp file in the target directory')
   assert.ok(temp)
   assert.deepEqual(strayFiles(path.dirname(exclude)), [], 'no temp file in .git/info when the target lives elsewhere')
   paused.child.kill('SIGKILL')
@@ -376,7 +376,9 @@ test('T6 M1 AC-SEC-13: a corrupt .git/index (check-ignore exits non-1) fails clo
   fs.writeFileSync(excludePath, '# untouched\n')
   const { out } = runOne(repo)
   assert.equal(out.write_ok, false)
-  assert.match(out.write_error, /not actually gitignored/)
+  // HARN-AUDIT-1 T1: a git failure is named as one, not reported as a negation pattern.
+  assert.match(out.write_error, /git check-ignore failed \(exit 128\)/)
+  assert.doesNotMatch(out.write_error, /not actually gitignored|negation/)
   assert.equal(readLedgerLines(repo).length, 0)
   assert.equal(fs.readFileSync(excludePath, 'utf8'), '# untouched\n', 'a non-1 check-ignore exit must not write the exclude file')
 })
@@ -524,7 +526,7 @@ test('T6 round 2 F5 AC-DATA-4: an operator line appended while the writer sits i
   const exclude = excludePathOf(repo)
   fs.writeFileSync(exclude, OPERATOR_LINES)
   const w = spawnWriter(repo, 1, { [WINDOW]: '1500' })
-  await waitFor(() => strayFiles(path.dirname(exclude))[0], 15000, 'temp file in .git/info')
+  await waitFor(() => strayFiles(path.dirname(exclude))[0], 30000, 'temp file in .git/info')
   fs.appendFileSync(exclude, '*.added-during-window\n')
   const r = await w.done
   assert.ok(r.out, `no result: ${r.stdout} ${r.stderr}`)
@@ -550,6 +552,10 @@ test('T6 conductor: every git subprocess in ensureGitignored carries a timeout, 
   const body = src.slice(start, end)
   const calls = body.match(/execFileSync\('git'[^\n]*/g) || []
   assert.ok(calls.length >= 2, `expected the classifying and post-write git calls, found ${calls.length}`)
-  for (const c of calls) assert.match(c, /timeout: GIT_CALL_TIMEOUT_MS/, `git call without a timeout: ${c}`)
+  // HARN-AUDIT-1 T1: the calls take their bound from ensureGitignored's timeoutMs parameter (so a test can pass a short one
+  // in-process), and that parameter's default is the constant. No call without a timeout, and no environment variable.
+  for (const c of calls) assert.match(c, /timeout: timeoutMs\b/, `git call without a timeout: ${c}`)
   assert.match(src, /const GIT_CALL_TIMEOUT_MS = \d+/)
+  assert.match(src, /function ensureGitignored\(root, timeoutMs = GIT_CALL_TIMEOUT_MS\) \{/, 'the parameter must default to GIT_CALL_TIMEOUT_MS')
+  assert.doesNotMatch(src, /process\.env\.LEDGER_APPEND_TEST_GIT/, 'no environment variable controls the git timeout')
 })

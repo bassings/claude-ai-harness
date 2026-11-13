@@ -207,17 +207,88 @@ test('T7 normaliser: instance names merge into one row through the ci command, m
   assert.equal(kept.n, 2)
 })
 
-test('T7 normaliser: a 10,000-character name of repeated " - Update #1" normalises in under 50 ms, and so does a hostile digit run (AC-SEC-12)', () => {
+// A hang deadline, not a timing assertion: runs fn under the vm watchdog, which interrupts synchronous execution (a
+// catastrophically backtracking regular expression included, which node:test's own timeout cannot, since it fires from the
+// event loop the regex is blocking). A slow machine only lengthens a run that is still finishing; it throws only for a hang.
+const HANG_DEADLINE_MS = 5000
+function hangDeadline(fn) {
+  try {
+    return require('node:vm').runInNewContext('fn()', { fn }, { timeout: HANG_DEADLINE_MS })
+  } catch (e) {
+    if (e && e.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw new Error(`hang deadline of ${HANG_DEADLINE_MS}ms exceeded: the code under test did not finish, which a linear implementation does in milliseconds`)
+    throw e
+  }
+}
+
+// Same detector as test/ledger-append.test.js (kept as a copy: no shared helper file is added for it).
+// Returns what makes a regular expression's work per match super-linear in the input: every unbounded quantifier (`*`, `+`,
+// `{n,}`, reported as written), and every REPEATABLE group (one whose own quantifier allows more than one pass: `*`, `+`,
+// `{m,n}` with n > 1) that contains a quantifier of any kind, bounded or not, reported as 'nested-repeat'. The second is the
+// case a bounded quantifier does not make safe: (?:[A-Za-z0-9]{1,40}[-/ ]?){0,40} has no unbounded quantifier and still
+// splits a run of letters in exponentially many ways. A group quantified `?` or {0,1} runs at most once, so it stays legal.
+function unboundedQuantifiers(source) {
+  const bare = source.replace(/\\./g, 'E').replace(/\[(?:\\.|[^\]\\])*\]/g, 'C') // escapes and character classes hold no quantifier
+  const found = []
+  const quantifierAt = (i) => {
+    const m = /^(?:[*+?]|\{\d+(?:,\d*)?\})/.exec(bare.slice(i))
+    if (!m) return null
+    const text = m[0]
+    const braces = /^\{(\d+)(?:(,)(\d*))?\}$/.exec(text)
+    const repeatable = braces ? (braces[2] ? braces[3] === '' || Number(braces[3]) > 1 : Number(braces[1]) > 1) : text !== '?'
+    const unbounded = text === '*' || text === '+' || (braces && braces[2] && braces[3] === '')
+    return { text, repeatable, unbounded, length: text.length + (bare[i + text.length] === '?' ? 1 : 0) } // a trailing ? is laziness
+  }
+  const stack = [false] // per open group: does it contain a quantifier
+  for (let i = 0; i < bare.length; i++) {
+    if (bare[i] === '(') {
+      const prefix = /^\(\?(?::|=|!|<=|<!|<[^>]*>)/.exec(bare.slice(i))
+      if (prefix) i += prefix[0].length - 1
+      stack.push(false)
+    } else if (bare[i] === ')') {
+      const hadQuantifier = stack.pop()
+      const q = quantifierAt(i + 1)
+      if (hadQuantifier && q && q.repeatable) found.push('nested-repeat')
+      if (hadQuantifier || q) stack[stack.length - 1] = true
+    } else {
+      const q = quantifierAt(i)
+      if (!q) continue
+      stack[stack.length - 1] = true
+      if (q.unbounded) found.push(q.text)
+      i += q.length - 1
+    }
+  }
+  return found
+}
+
+// HARN-AUDIT-1 T1 (AC-QA-1): this used to time normaliseJobName on hostile 10,000-character names against a 50ms bound. The
+// property is now pinned without a clock, in two parts. The results on those hostile inputs are exact (a wrong result on
+// them would be a behaviour bug, whatever the speed). And the regex literal carries no unbounded quantifier (no `*`, `+` or
+// `{n,}`; each repetition is `{1,10}` or a fixed alternation), so the work at each of the n start positions is capped by a
+// constant and the whole is linear in the name length, with nothing for a hostile name to make super-linear. The next test
+// pins the anchoring and the absence of a quantified group on the same function.
+test('T7 normaliser: hostile 10,000-character names normalise exactly, and the regex has no unbounded quantifier, so its cost is linear in the name (AC-SEC-12, counted, not timed)', () => {
   const n = reader.normaliseJobName
   assert.equal(typeof n, 'function')
-  n('warm up - Update #1')
-  for (const hostile of [' - Update #1'.repeat(Math.ceil(10000 / 12)).slice(0, 10000), 'x - Update #' + '9'.repeat(10000), ' on PR #'.repeat(1250), '#'.repeat(10000)]) {
-    const t0 = process.hrtime.bigint()
-    const res = n(hostile)
-    const ms = Number(process.hrtime.bigint() - t0) / 1e6
-    assert.equal(typeof res, 'string')
-    assert.ok(ms < 50, `${ms} ms for a ${hostile.length}-char name`)
-  }
+  hangDeadline(() => {
+    const unit = ' - Update #1'
+    assert.equal(n(unit.repeat(833)), unit.repeat(832), 'only the trailing suffix is stripped from a name of repeated suffixes')
+    const digits = 'x - Update #' + '9'.repeat(10000)
+    assert.equal(n(digits), digits, 'a digit run beyond the cap of 10 is not a suffix')
+    const onPr = ' on PR #'.repeat(1250)
+    assert.equal(n(onPr), onPr)
+    const hashes = '#'.repeat(10000)
+    assert.equal(n(hashes), hashes)
+  })
+
+  const src = fs.readFileSync(MODULE_PATH, 'utf8')
+  const body = /function normaliseJobName[\s\S]*?\n}\n/.exec(src)[0]
+  const literals = body.match(/\/(?:\\.|[^/\\\n])+\/(?=[gimsuy]*[,)])/g) || []
+  assert.equal(literals.length, 1, `normaliseJobName must hold exactly one regex literal, found ${literals.length}`)
+  assert.deepEqual(unboundedQuantifiers(literals[0]), [], `the regex ${literals[0]} has an unbounded quantifier or a repeated group holding a quantifier`)
+  // The detector sees what it exists to catch.
+  assert.ok(unboundedQuantifiers('/( - Update)+ #\\d+$/').length >= 2)
+  assert.deepEqual(unboundedQuantifiers('(?:[A-Za-z0-9]{1,40}[-/ ]?){0,40}'), ['nested-repeat'], 'a repeated group holding bounded quantifiers is nested')
+  assert.deepEqual(unboundedQuantifiers('(?: on PR| - Update) #\\d{1,10}$'), [], 'the shipped shape: a one-pass group and a bounded digit run')
 })
 
 test('T7 normaliser: the source regex is anchored at the end and carries no nested quantifier (AC-SEC-12)', () => {

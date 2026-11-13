@@ -149,7 +149,7 @@ in order:
      of what surrounds it, and `echo '$(git reset --hard)'` must stay inert
      text (AC-QA-4). The masked-out span is replaced by a single space so
      the surrounding text still tokenises.
-  9. Unwrap `bash -c`/`sh -c`/`bash -lc SCRIPT` (matched by binary
+  9. Unwrap `bash -c`/`sh -c`/`zsh -c`/`bash -lc SCRIPT` (matched by binary
      basename) and the `nohup`, `sudo` (including `sudo -u <user>`),
      `timeout <n>`, `xargs`, `env` (including `env -i`, `env VAR=val`,
      `env -u NAME`), `command` and `exec` prefix wrappers, feeding the
@@ -165,6 +165,36 @@ in order:
      appends one synthetic `.` pathspec token standing in for the
      arguments it would append from its stdin at run time (unknowable
      statically) -- see strip_xargs_wrapper()'s own comment.
+ 10. Before stages 7 and 8, read the text as the shell does
+     (normalise_shell_text): remove each backslash-newline outside single
+     quotes, joining the lines, and drop a `#` comment, which starts only at
+     the beginning of a word outside quotes and ends at its own newline.
+     The tokeniser's comment handling is off, because it read a `#` in the
+     middle of a word as a comment and swallowed the newline after one. A
+     comment inside backticks ends at the closing backtick, a `#` inside
+     `${...}` and after a bare carriage return starts none (all checked
+     against real bash and zsh). A refusal
+     lists `comment continuation` and `backslash continuation` as
+     constructs the command also uses, once, at the end, and does not claim
+     the refusal depended on them (the match is not re-run without each); a
+     refusal from inside a `zsh -c` body names `zsh -c` as the class that
+     fired.
+ 11. A pathspec the shell builds at run time (`$X`, `${X}`, a `$(...)` or
+     backtick substitution, a `{a,b}` brace expansion) is whole-tree scope
+     for `git checkout` and `git restore`: the guard cannot tell which file it
+     names, so a dirty tracked file anywhere refuses the command, with the
+     class `dynamic pathspec` named. A substitution is restored into the
+     token it was written in, not dropped. An unquoted leading `~` counts,
+     and so does any `@{...}` (`HEAD@{1}`, `@{-1}`, `@{u}`, `@{a,b}`): the
+     text is a brace expansion as often as it is a ref. The operand of
+     `--detach`, `-t`/`--track` (checkout) and `--source`/`-s` (restore) is a
+     ref, never a pathspec. A bare run-time word (`git checkout "$f"`) may be
+     either, so it is refused on a dirty tree.
+ 12. The same pass puts spaces around an unquoted newline, `;`, `(` and `)`,
+     and `|&` is a control operator: the tokeniser reads a run of adjacent
+     punctuation (`&&` then a newline, `)` then `&&`) as one token that is no
+     control operator, so the commands either side were never split. The
+     refusal lists `adjacent operators` the same way.
 
 A `cd <path>` segment updates the effective directory used by every later
 segment in the same command, so `cd <dir> && git ...` is scoped against
@@ -212,7 +242,7 @@ import sys
 
 ESCAPE_VAR = 'HARNESS_ALLOW_DESTRUCTIVE_GIT'
 
-CONTROL_OPERATORS = ('&&', '||', ';', '|', '&', '\n')
+CONTROL_OPERATORS = ('&&', '||', ';', '|', '|&', '&', '\n')
 
 # '\n' added to the punctuation set (default is '();<>|&') so a bare newline
 # becomes its own token instead of being swallowed as ordinary whitespace or
@@ -327,10 +357,41 @@ WORST_CASE_SEGMENT_SECONDS = MAX_SUBPROCESS_CALLS_PER_SEGMENT * SUBPROCESS_TIMEO
 # just for being long.
 MAX_COMMAND_LENGTH_CHARS = 65536
 
-# `bash -c SCRIPT` / `sh -c SCRIPT` / `bash -lc SCRIPT`: matched by binary
-# basename (wrapper_shell_c()) so `/bin/bash -c ...` is still recognised.
-SHELL_C_BASENAMES = ('bash', 'sh')
+# `bash -c SCRIPT` / `sh -c SCRIPT` / `zsh -c SCRIPT` / `bash -lc SCRIPT`:
+# matched by binary basename (wrapper_shell_c()) so `/bin/bash -c ...` is
+# still recognised.
+SHELL_C_BASENAMES = ('bash', 'sh', 'zsh')
 SHELL_C_FLAGS = ('-c', '-lc')
+
+# The parsing classes a refusal can name (every refusal this guard raises
+# because of one of them says so, with the override it already prints): a
+# `#` comment before a later line, a backslash-newline continuation, a
+# pathspec built at run time, and a `zsh -c` body.
+COMMENT_CLASS = 'comment continuation'
+CONTINUATION_CLASS = 'backslash continuation'
+DYNAMIC_PATHSPEC_CLASS = 'dynamic pathspec'
+ZSH_CLASS = 'zsh -c'
+ADJACENT_OPERATORS_CLASS = 'adjacent operators'
+
+# One sentence per class that is attached to a refusal AFTER the fact (the
+# dynamic pathspec class has its own refusal text, REFUSAL_DYNAMIC). It
+# names the class and says what the guard did, so an over-block can be told
+# from a real block without reading source.
+CLASS_NOTES = {
+    COMMENT_CLASS: (
+        "this command contains a `#`; a comment starts only at the beginning "
+        "of a word and ends at its own newline, so the text after it was "
+        "still checked"),
+    CONTINUATION_CLASS: (
+        "a backslash-newline continuation was joined into one line before "
+        "matching, as the shell does"),
+    ZSH_CLASS: "the body of a `zsh -c` was checked as its own command",
+    ADJACENT_OPERATORS_CLASS: (
+        "an operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis is followed "
+        "by a newline or sits directly beside another one; the tokeniser reads "
+        "such a run as a single token, so it is split into separate operators "
+        "before matching"),
+}
 
 # Prefix wrappers whose ENTIRE effect (for this guard's purposes) is "strip
 # my own name and run what follows" -- no flags of their own worth modelling.
@@ -414,7 +475,7 @@ HEREDOC_START_RE = re.compile(r'<<-?\s*([\'"]?)(\w+)\1')
 # (round 4, M4). Word characters only, so shlex tokenises it as one ordinary
 # word wherever it lands, quoted or not. A command whose own literal text
 # contains this exact string, with an index a real substitution also used,
-# would have it stripped -- accepted, for an accident guard, over a
+# would have it replaced by that substitution's text -- accepted, for an accident guard, over a
 # nondeterministic nonce that would make the same input parse differently
 # from run to run.
 SUBSTITUTION_PLACEHOLDER_FMT = '__harness_subst_%d__'
@@ -462,6 +523,246 @@ def strip_heredoc_bodies(command):
         out.append(command[closing.start():closing.end()])
         i = closing.end()
     return ''.join(out)
+
+
+def skip_heredoc_bodies(command, i, delimiters, out):
+    """Copy the bodies of the here-documents opened on the line that just
+    ended (`i` is the index of the first body line) into `out` verbatim,
+    through each closing delimiter line, and return the index after the last
+    one. Returns -1 when a closing line cannot be found: the caller then
+    stops interpreting the rest of the text (an unterminated heredoc runs to
+    the end of the input in a shell, so it is inert) rather than searching
+    again for each later marker, which would cost quadratic time."""
+    n = len(command)
+    for delim in delimiters:
+        pos = i
+        while True:
+            if pos >= n:
+                return -1
+            eol = command.find('\n', pos)
+            end = n if eol == -1 else eol
+            if command[pos:end].strip(' \t') == delim:
+                break
+            if eol == -1:
+                return -1
+            pos = eol + 1
+        out.append(command[i:end])
+        if end < n:
+            out.append('\n')
+            i = end + 1
+        else:
+            i = n
+    return i
+
+
+def normalise_shell_text(command):
+    """Prepare `command` for the tokeniser the way the shell reads it, in one
+    linear pass that tracks quoting: a backslash-newline outside single
+    quotes is removed, joining the two lines (inside single quotes it is
+    literal text and stays), and a `#` that begins a word outside quotes
+    starts a comment that runs to, but not through, the end of its line. The
+    tokeniser's own comment handling is switched off (split_segments), because
+    it treats a `#` in the middle of a word as a comment and swallows the
+    newline after one, which hid every later line from the matcher.
+
+    Quote state is a stack, so a `$(...)` opened inside double quotes has its
+    own quoting, and a here-document body is copied through unread (it is
+    inert text, and an apostrophe in it must not open a quote). Returns
+    (text, classes): the classes (COMMENT_CLASS, CONTINUATION_CLASS) the
+    refusal names if one is raised for this text. Never raises on malformed
+    input: an unbalanced quote just leaves the rest of the text as it came."""
+    out = []
+    classes = set()
+    stack = []  # 'sq', 'dq', 'bt' (backticks), 'br' (inside `${`), or an int (paren depth inside `$(`)
+    heredocs = []
+    n = len(command)
+    i = 0
+    word_start = True
+    first_hash = -1
+    after_op = False  # the last significant character was an unquoted ; & | ( )
+    while i < n:
+        ch = command[i]
+        mode = stack[-1] if stack else 'code'
+        was_op = after_op
+        after_op = False
+        if mode == 'sq':
+            out.append(ch)
+            if ch == "'":
+                stack.pop()
+                word_start = False
+            i += 1
+            continue
+        if ch == '\\' and i + 1 < n:
+            if command[i + 1] == '\n':
+                classes.add(CONTINUATION_CLASS)
+                after_op = was_op
+                i += 2
+                continue
+            out.append(ch)
+            out.append(command[i + 1])
+            i += 2
+            word_start = False
+            continue
+        if mode == 'dq':
+            if ch == '"':
+                stack.pop()
+                word_start = False
+            elif ch == '`':
+                stack.append('bt')
+            elif ch == '$' and command.startswith('$(', i):
+                out.append('$(')
+                stack.append(0)
+                i += 2
+                word_start = True
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "'" or ch == '"':
+            stack.append('sq' if ch == "'" else 'dq')
+            out.append(ch)
+            i += 1
+            word_start = False
+            continue
+        if ch == '`':
+            if mode == 'bt':
+                stack.pop()
+                word_start = False
+            else:
+                stack.append('bt')
+                word_start = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '$' and command.startswith('$(', i):
+            out.append('$(')
+            stack.append(0)
+            i += 2
+            word_start = True
+            continue
+        if ch == '$' and command.startswith('${', i):
+            # A parameter expansion: a `#` anywhere inside it is literal text
+            # (`${X:-a #b}`), checked against bash and zsh.
+            out.append('${')
+            stack.append('br')
+            i += 2
+            word_start = False
+            continue
+        if ch == '}' and mode == 'br':
+            stack.pop()
+            out.append(ch)
+            i += 1
+            word_start = False
+            continue
+        if ch == '#':
+            if first_hash < 0:
+                first_hash = i
+            if word_start and mode != 'br':
+                # Replaced by a space, not removed: `a;# note` followed by a
+                # newline would otherwise leave `;` and the newline adjacent,
+                # and the tokeniser reads that pair as one token.
+                out.append(' ')
+                after_op = was_op
+                if mode == 'bt':
+                    # Inside backticks the shell finds the closing backtick
+                    # before it parses a comment, so the comment ends there.
+                    end = i
+                    while end < n and command[end] not in '\n`':
+                        end += 1
+                    i = end
+                else:
+                    eol = command.find('\n', i)
+                    i = n if eol == -1 else eol
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '\n':
+            # Spaces on both sides: the tokeniser reads a run of adjacent
+            # punctuation (`&&` then a newline) as ONE token that is no
+            # control operator, so the newline stopped separating commands.
+            if was_op:
+                classes.add(ADJACENT_OPERATORS_CLASS)
+            out.append(' \n ')
+            i += 1
+            word_start = True
+            if heredocs:
+                resume = skip_heredoc_bodies(command, i, heredocs, out)
+                heredocs = []
+                if resume < 0:
+                    out.append(command[i:])
+                    break
+                i = resume
+            continue
+        if ch == '\r' and not command.startswith('\r\n', i):
+            # A carriage return not ending a CRLF is an ordinary character in
+            # a shell, so a `#` after it starts no comment.
+            out.append(ch)
+            i += 1
+            word_start = False
+            continue
+        if ch == '<' and command.startswith('<<', i):
+            if command.startswith('<<<', i):
+                out.append('<<<')
+                i += 3
+                word_start = False
+                continue
+            marker = HEREDOC_START_RE.match(command, i)
+            if marker:
+                heredocs.append(marker.group(2))
+                out.append(command[i:marker.end()])
+                i = marker.end()
+                word_start = False
+                continue
+        if ch == '&' and command[i + 1:i + 2] in ('|', '!') and (i == 0 or command[i - 1] not in '&>|'):
+            # zsh's `&|` and `&!` background a command and disown it: a plain
+            # `&` as far as splitting commands goes. Left alone, `&|` is one
+            # punctuation token that is no control operator, and `&!git` is
+            # an `&` and a word `!git`.
+            classes.add(ADJACENT_OPERATORS_CLASS)
+            out.append(' & ')
+            i += 2
+            word_start = True
+            after_op = True
+            continue
+        if ch in ';&|()<> \t\r':
+            if isinstance(mode, int):
+                if ch == '(':
+                    stack[-1] = mode + 1
+                elif ch == ')':
+                    if mode == 0:
+                        stack.pop()
+                        out.append(ch)
+                        i += 1
+                        word_start = False
+                        continue
+                    stack[-1] = mode - 1
+            if ch in ';()':
+                # Spaced for the same reason as a newline: `)&&`, `&&(`, `);`
+                # and `;(` are each one token to the tokeniser otherwise.
+                prev = command[i - 1] if i else ''
+                if (ch in '()' and prev in ';&|') or (ch == ';' and prev in '()'):
+                    classes.add(ADJACENT_OPERATORS_CLASS)
+                out.append(' ' + ch + ' ')
+                after_op = True
+            else:
+                prev = command[i - 1] if i else ''
+                if (ch == '&' and prev in ')|') or (ch == '|' and prev == ')'):
+                    classes.add(ADJACENT_OPERATORS_CLASS)
+                out.append(ch)
+                if ch in '&|':
+                    after_op = True
+                elif ch in ' \t\r':
+                    after_op = was_op
+            i += 1
+            word_start = True
+            continue
+        out.append(ch)
+        i += 1
+        word_start = False
+    if first_hash >= 0:
+        classes.add(COMMENT_CLASS)
+    return ''.join(out), classes
 
 
 def extract_command_substitutions(text):
@@ -529,31 +830,32 @@ def extract_command_substitutions(text):
     return ''.join(out), bodies
 
 
-def take_substitution_placeholders(tokens, substitution_count):
-    """Split `tokens` into (tokens_without_placeholders, [indices]) -- the
-    substitution indices written in this segment, in the order they appear.
-    A placeholder may sit INSIDE a larger token (`git commit -m "built
-    $(date)"` tokenises as one word), so it is removed by substring, and a
-    token left empty by that removal is dropped entirely. An index past
-    `substitution_count` is not one this evaluation produced, so that token
+def take_substitution_placeholders(tokens, substitutions):
+    """Split `tokens` into (tokens_with_substitutions_restored, [indices]) --
+    the substitution indices written in this segment, in the order they
+    appear. A placeholder may sit INSIDE a larger token (`git commit -m "built
+    $(date)"` tokenises as one word), so it is replaced by substring with
+    `$(body)` as written. It is replaced, not removed: a pathspec built from
+    a substitution has to stay visible as one (is_dynamic_pathspec), and the
+    refusal quotes the command as the agent wrote it. An index past
+    `len(substitutions)` is not one this evaluation produced, so that token
     is left exactly as written."""
     out = []
     indices = []
     for tok in tokens:
         matches = [m for m in SUBSTITUTION_PLACEHOLDER_RE.finditer(tok)
-                   if int(m.group(1)) < substitution_count]
+                   if int(m.group(1)) < len(substitutions)]
         if not matches:
             out.append(tok)
             continue
         indices.extend(int(m.group(1)) for m in matches)
-        stripped = ''
+        restored = ''
         last = 0
         for m in matches:
-            stripped += tok[last:m.start()]
+            restored += tok[last:m.start()] + '$(' + substitutions[int(m.group(1))] + ')'
             last = m.end()
-        stripped += tok[last:]
-        if stripped:
-            out.append(stripped)
+        restored += tok[last:]
+        out.append(restored)
     return out, indices
 
 
@@ -606,9 +908,17 @@ def split_segments(command):
     # it during the whitespace-skip that runs BEFORE punctuation_chars is
     # ever consulted, so a newline never reaches the lexer as a token no
     # matter what punctuation_chars says. Removing it from `whitespace`
-    # (leaving space/tab there) is what makes it surface as its own token
+    # (leaving space, tab and carriage return there, so a CRLF line ending
+    # does not glue `\r` onto the last word; kept on purpose although a shell
+    # would hand git `--hard\r`, because the stricter reading is the safe one
+    # and hooks/test_destructive_git_cases.py pins it) is what makes it surface as its own token
     # via PUNCTUATION_CHARS below, instead of being silently swallowed.
-    lexer.whitespace = ' \t'
+    lexer.whitespace = ' \t\r'
+    # Comments are removed by normalise_shell_text(), which knows a `#` only
+    # starts one at the beginning of a word. shlex treats a `#` anywhere
+    # outside quotes as a comment and reads on to the end of the line,
+    # swallowing the newline, so every later line was never seen.
+    lexer.commenters = ''
     tokens = list(lexer)
     segments = [[]]
     # separators[i] is the control operator that PRECEDES segments[i];
@@ -626,7 +936,7 @@ def split_segments(command):
             continue  # e.g. a trailing `;`, or two operators in a row
         before = separators[index]
         after = separators[index + 1] if index + 1 < len(separators) else None
-        out.append((segment, before == '|' or after == '|'))
+        out.append((segment, before in ('|', '|&') or after in ('|', '|&')))
     return out
 
 
@@ -829,6 +1139,27 @@ def normalize_rest(rest):
     return expand_bundled_short_flags(rest)
 
 
+# `git checkout` flags whose operand is a branch or commit, never a pathspec.
+CHECKOUT_REF_OPERAND_FLAGS = ('--detach', '-d', '-t', '--track')
+
+# `git restore` flags whose separate operand is a ref, never a pathspec.
+RESTORE_REF_OPERAND_FLAGS = ('--source', '-s')
+
+
+def is_dynamic_pathspec(token):
+    """True if `token` is a path the shell builds at run time, which this
+    guard cannot resolve: a variable (`$X`, `${X}`), a command substitution
+    (`$(...)` or backticks, restored into the token by
+    take_substitution_placeholders), a brace expansion (`{a,b}`) or an
+    unquoted leading `~`. There is no exception for git's own `@{...}` ref
+    syntax (`HEAD@{1}`, `@{-1}`, `@{u}`): it is the same text as a brace
+    expansion (`@{a,b}` is two files), and in a pathspec position a lone
+    `@{1}` is a file name, so a token containing a brace is refused where a
+    pathspec could be destructive. (Quoting is gone by now, so a quoted
+    `'~'` is read as dynamic too: the stricter reading.)"""
+    return '$' in token or '`' in token or '{' in token or token.startswith('~')
+
+
 def has_pathspec_from_file(rest):
     return any(t == '--pathspec-from-file' or t.startswith('--pathspec-from-file=') for t in rest)
 
@@ -889,13 +1220,19 @@ def clean_dry_run_args(rest):
     """`rest` with the reporting-only flags dropped, ready to follow `git
     clean -n`. Stops filtering at a `--` pathspec separator: a file
     genuinely named `-q` must still reach the dry run as a pathspec, exactly
-    as it would reach the real invocation."""
+    as it would reach the real invocation.
+
+    A token carrying a command substitution is dropped, as it was before
+    substitutions were restored into tokens: its value is unknown, so the dry
+    run is widened to everything the other arguments select, never narrowed
+    to a literal path named after the substitution's own text."""
     if '--' in rest:
         sep = rest.index('--')
         head, tail = rest[:sep], rest[sep:]
     else:
         head, tail = rest, []
-    return [t for t in head if t not in CLEAN_REPORTING_ONLY_FLAGS] + tail
+    kept = [t for t in head if t not in CLEAN_REPORTING_ONLY_FLAGS]
+    return [t for t in kept + tail if '$(' not in t]
 
 
 def stash_is_push(rest_n):
@@ -953,6 +1290,8 @@ def destructive_scope(subcmd, rest, cwd, git_config=None, unknown_trailing=False
             return ('tree', None)
         if '--' in rest:
             paths = rest[rest.index('--') + 1:]
+            if any(is_dynamic_pathspec(p) for p in paths):
+                return ('dynamic_tree', None)
             return ('paths', paths) if paths else None
         if rest == ['.']:
             return ('paths', ['.'])
@@ -965,9 +1304,15 @@ def destructive_scope(subcmd, rest, cwd, git_config=None, unknown_trailing=False
             return ('tree', None)
         if '-b' in rest or '-B' in rest or '--orphan' in rest:
             return None  # branch creation, not a restore
+        if any(flag in rest for flag in CHECKOUT_REF_OPERAND_FLAGS):
+            return None  # its operand is a branch or commit and it takes no pathspec
         non_flags = [t for t in rest if not t.startswith('-')]
         if not non_flags:
             return None
+        if any(is_dynamic_pathspec(t) for t in non_flags):
+            # Whether a run-time word is a ref or a path is unknowable here, and
+            # git reads whatever it is as a pathspec when it is not a ref.
+            return ('dynamic_tree', None)
         first, remainder = non_flags[0], non_flags[1:]
         if resolve_as_ref(cwd, first):
             # `<ref> <path>...`: git treats everything after a leading ref
@@ -996,7 +1341,17 @@ def destructive_scope(subcmd, rest, cwd, git_config=None, unknown_trailing=False
         if '--' in rest:
             paths = rest[rest.index('--') + 1:]
         else:
-            paths = [t for t in rest if not t.startswith('-')]
+            paths = []
+            operand_of_source = False
+            for t in rest:
+                if operand_of_source:
+                    operand_of_source = False
+                elif t in RESTORE_REF_OPERAND_FLAGS:
+                    operand_of_source = True
+                elif not t.startswith('-'):
+                    paths.append(t)
+        if any(is_dynamic_pathspec(p) for p in paths):
+            return ('dynamic_tree', None)
         return ('paths', paths) if paths else None
 
     if subcmd == 'reset':
@@ -1156,16 +1511,62 @@ def stash_would_lose_entries(cwd, target):
     return ref in entries
 
 
+# The override instruction every refusal carries. It prints no command text.
+# The inline form is scoped to ONE segment (escape_hatch_active_for_segment),
+# so it has to sit directly before the refused git call, or before the
+# wrapper (`env`, `xargs`, `command`, `nohup`, `exec`, `timeout`) that runs
+# it: in front of a whole multi-segment line it covers only the first
+# segment, and in front of `for` it is a syntax error. Behind a wrapper the
+# shell cannot run `xargs VAR=1 git ...`, and `env VAR=1 git ...` is read as
+# env's own assignment and refused. Directly after `do` or `then` an
+# assignment of any name hides the git call from the guard (a known gap,
+# listed in README), so the loop advice below avoids that spot.
+OVERRIDE_INSTRUCTION = (
+    "put {var}=1 immediately before the git command that was refused or, "
+    "when that git call runs through a wrapper such as `env`, `xargs`, "
+    "`command`, `nohup`, `exec` or `timeout`, immediately before the "
+    "wrapper. It applies to that one command, not to the whole line, so a "
+    "line with more than one refused git command needs it on each, and "
+    "inside a `$(...)`, a loop or an `if` it goes on the git call there; in "
+    "a loop or `if`, start that git call on its own line or after `;` or "
+    "`&&`, not directly after `do` or `then`. Exporting {var}=1 for the "
+    "session also works, but it switches this guard off for everything in "
+    "that session."
+)
+
 REFUSAL = (
-    "destructive-git-guard: refused `{cmd}` -- it would discard uncommitted "
-    "work (`git status` shows a tracked, uncommitted change in scope). Safe "
-    "alternatives: copy the file to a scratch path first, or `git stash` "
-    "before retrying. If this revert is deliberate, opt in explicitly: "
-    "re-run with {var}=1 set inline (`{var}=1 {cmd}`) or exported for the "
-    "session. If work is already lost another way, hooks/git-snapshot.py "
+    "destructive-git-guard: refused this command -- it would discard "
+    "uncommitted work (`git status` shows a tracked, uncommitted change in "
+    "scope). Safe alternatives: copy the file to a scratch path first, or "
+    "`git stash` before retrying. If this revert is deliberate, opt in "
+    "explicitly: " + OVERRIDE_INSTRUCTION + " If work is already lost "
+    "another way, hooks/git-snapshot.py "
     "may have a recoverable copy -- list them with: git for-each-ref "
     "--format='%(refname) %(creatordate:iso-strict) %(contents:subject)' "
     "refs/harness-snapshots/"
+)
+
+# The refusal for a pathspec this guard cannot read (is_dynamic_pathspec): it
+# names its class, says why the whole tree was measured, and carries the same
+# instruction and recovery clauses as REFUSAL.
+REFUSAL_DYNAMIC = (
+    "destructive-git-guard: refused this command -- class: dynamic pathspec. A "
+    "branch or path here is built when the command runs (a variable, a "
+    "`$(...)` or backtick substitution, a `{{a,b}}` brace expansion, a "
+    "`~`, or `@{{...}}`, which is git's own ref syntax (`@{{-1}}`, `@{{u}}`, "
+    "`HEAD@{{1}}`) but is also a brace expansion), so this guard cannot tell "
+    "whether it names a branch, which "
+    "discards nothing, or a file, which it would revert. It treats the whole "
+    "tree as in scope, and `git status` shows a tracked, uncommitted change "
+    "that could be discarded. Safe "
+    "alternatives: to switch branches use `git switch -` or a literal "
+    "branch name, name the paths literally, copy the file to a scratch path "
+    "first, or `git stash` before retrying. If this revert is deliberate, opt "
+    "in explicitly: " + OVERRIDE_INSTRUCTION + " If work is "
+    "already lost another way, "
+    "hooks/git-snapshot.py may have a recoverable copy -- list them with: git "
+    "for-each-ref --format='%(refname) %(creatordate:iso-strict) "
+    "%(contents:subject)' refs/harness-snapshots/"
 )
 
 # AC-OPS-11: each new rule names its OWN reason -- never the "tracked,
@@ -1176,7 +1577,7 @@ REFUSAL = (
 # reach the same refusal for the same underlying reason: this rule could not
 # confirm the command is safe.
 REFUSAL_CLEAN = (
-    "destructive-git-guard: refused `{cmd}` -- either a real dry run of the "
+    "destructive-git-guard: refused this command -- either a real dry run of the "
     "same flags and pathspecs shows untracked or ignored files would be "
     "removed, or that could not be verified (the directory could not be "
     "resolved, the check itself failed or timed out, or the command selects "
@@ -1184,12 +1585,11 @@ REFUSAL_CLEAN = (
     "which this guard cannot measure), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: run `git clean "
     "-n` yourself first and inspect the list. If this cleanup is "
-    "deliberate, opt in explicitly: re-run with {var}=1 set inline "
-    "(`{var}=1 {cmd}`) or exported for the session."
+    "deliberate, opt in explicitly: " + OVERRIDE_INSTRUCTION
 )
 
 REFUSAL_STASH = (
-    "destructive-git-guard: refused `{cmd}` -- either the stash list is "
+    "destructive-git-guard: refused this command -- either the stash list is "
     "non-empty (or an earlier `git stash` in this same command would make "
     "it so), or that could not be verified (the directory could not be "
     "resolved, the check itself failed or timed out, the stash "
@@ -1199,14 +1599,12 @@ REFUSAL_STASH = (
     "cannot measure), and this rule "
     "fails CLOSED rather than guessing. Safe alternative: `git stash list` "
     "to inspect the stash entries first. If this is deliberate, opt in "
-    "explicitly: re-run with {var}=1 set inline (`{var}=1 {cmd}`) or "
-    "exported for the session."
+    "explicitly: " + OVERRIDE_INSTRUCTION
 )
 
-# K1 review round 2/3: no `{cmd}` slot -- this refusal fires BEFORE any
-# tokenising, so there is no parsed `head` to display, and printing the
-# full over-cap text back would itself be wasteful. Shows a bounded prefix
-# instead. Only the process-environment escape hatch (exported for the
+# K1 review round 2/3: this refusal fires BEFORE any tokenising, so there is
+# no parsed `head`, and printing the full over-cap text back would itself be
+# wasteful. Shows a bounded prefix instead. Only the process-environment escape hatch (exported for the
 # session) can apply here: the inline, segment-scoped form needs the
 # command tokenised to find it, which is exactly the step this refusal
 # skips. Only ever raised for an over-cap command that DOES contain the
@@ -1227,6 +1625,31 @@ REFUSAL_OVERSIZE = (
     "{var}=1 for the session before retrying (the inline form cannot be "
     "recognised here, since this refusal happens before any parsing)."
 )
+
+
+# Classes whose presence in a refusal means the refusal depended on them: a
+# `zsh -c` body is only checked at all because zsh is unwrapped. The other
+# classes are read off the command text as a whole, and the guard does not
+# re-run the match without them, so they are reported as constructs the
+# command also uses and never as the cause.
+CAUSAL_CLASSES = frozenset({ZSH_CLASS})
+
+
+def annotate_refusal(reason, classes):
+    """`reason` with the parsing classes in `classes` appended, or `reason`
+    unchanged when there are none. A causal class is named as the class that
+    fired. The rest are listed as "also uses", because the same command
+    would often be refused without them (`git reset --hard # note`)."""
+    if not reason or not classes:
+        return reason
+    notes = ['[class: %s -- %s.]' % (name, CLASS_NOTES[name])
+             for name in sorted(classes) if name in CAUSAL_CLASSES]
+    others = sorted(name for name in classes if name not in CAUSAL_CLASSES)
+    if others:
+        notes.append('[This command also uses: %s. It was read as the shell reads it; the refusal above '
+                     'does not necessarily depend on this.]'
+                     % '; '.join('%s (%s)' % (name, CLASS_NOTES[name]) for name in others))
+    return reason + ' ' + ' '.join(notes)
 
 
 def classify_cd(tokens):
@@ -1379,8 +1802,9 @@ def evaluate(command, cwd):
     """Return a refusal message, or None to allow `command`."""
     if os.environ.get(ESCAPE_VAR) == '1':
         return None
-    state = {'cwd': cwd, 'cwd_known': True, 'shared': {'stash_created': False}}
-    return evaluate_command_text(command, state, 0)
+    state = {'cwd': cwd, 'cwd_known': True, 'shared': {'stash_created': False, 'classes': set()}}
+    reason = evaluate_command_text(command, state, 0)
+    return annotate_refusal(reason, state['shared']['classes'])
 
 
 def evaluate_command_text(command, state, depth):
@@ -1431,6 +1855,7 @@ def evaluate_command_text(command, state, depth):
             return None
         return REFUSAL_OVERSIZE.format(
             length=len(command), prefix=command[:80], cap=MAX_COMMAND_LENGTH_CHARS, var=ESCAPE_VAR)
+    command, classes = normalise_shell_text(command)
     command = strip_heredoc_bodies(command)
     command, substitutions = extract_command_substitutions(command)
     try:
@@ -1452,7 +1877,7 @@ def evaluate_command_text(command, state, depth):
         if is_pipeline_component:
             segment_state = child_context(segment_state)
         tokens, substitution_indices = take_substitution_placeholders(
-            tokens, len(substitutions))
+            tokens, substitutions)
         # A substitution runs in its own child process at the point ITS
         # segment runs: after every segment before it, so it sees their
         # `cd`, and before the segment it sits in.
@@ -1460,9 +1885,11 @@ def evaluate_command_text(command, state, depth):
             reason = evaluate_command_text(
                 substitutions[index], child_context(segment_state), depth + 1)
             if reason:
+                segment_state['shared']['classes'].update(classes)
                 return reason
         reason = evaluate_segment(tokens, segment_state, depth)
         if reason:
+            segment_state['shared']['classes'].update(classes)
             return reason
         for _ in range(closed):
             if len(contexts) > 1:
@@ -1498,7 +1925,10 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
     if script is not None:
         if depth >= MAX_UNWRAP_DEPTH:
             return None  # bounded; fail open past the bound
-        return evaluate_command_text(script, child_context(state), depth + 1)
+        reason = evaluate_command_text(script, child_context(state), depth + 1)
+        if reason and os.path.basename(head[0]) == 'zsh':
+            state['shared']['classes'].add(ZSH_CLASS)
+        return reason
 
     unwrapped = strip_prefix_wrapper(head)
     if unwrapped is not None:
@@ -1522,9 +1952,8 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
             if subcmd in ('clean', 'stash'):
                 scope = destructive_scope(subcmd, rest, None, git_config, unknown_trailing)
                 if scope is not None:
-                    display_cmd = ' '.join(head)
                     template = REFUSAL_CLEAN if scope[0] == 'clean' else REFUSAL_STASH
-                    return template.format(cmd=display_cmd, var=ESCAPE_VAR)
+                    return template.format(var=ESCAPE_VAR)
         return None
 
     parsed = parse_git_invocation(head, state['cwd'])
@@ -1547,7 +1976,6 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
     if scope is None:
         return None
 
-    display_cmd = ' '.join(head)
     kind = scope[0]
     if kind == 'clean':
         # `retargeted` short-circuits the measurement rather than colouring
@@ -1561,10 +1989,30 @@ def evaluate_segment(raw_tokens, state, depth, unknown_trailing=False):
         template = REFUSAL_STASH
     else:
         risky = has_uncommitted_change(segment_cwd, scope)
-        template = REFUSAL
+        template = REFUSAL_DYNAMIC if kind == 'dynamic_tree' else REFUSAL
     if risky:
-        return template.format(cmd=display_cmd, var=ESCAPE_VAR)
+        return template.format(var=ESCAPE_VAR)
     return None
+
+
+def report_internal_error(exc):
+    """Say, on the channels Claude Code shows, that this command was NOT
+    checked because the guard itself raised. Claude Code documents that stderr
+    from a hook that exits 0 is never shown to Claude or in the transcript
+    (debug log only), so the report is JSON on stdout: `systemMessage` is
+    shown to the user, and a PreToolUse `additionalContext` is passed to
+    Claude next to the tool result. The exception CLASS only: no command
+    text and no exception message. It carries no `permissionDecision`, so the
+    verdict is still the allow the exit code gives. One line on stderr is
+    kept for the debug log."""
+    name = type(exc).__name__
+    notice = ('destructive-git-guard: internal error (%s); this command was NOT checked and was allowed. '
+              'This is a bug in the guard.' % name)
+    print(notice, file=sys.stderr)
+    print(json.dumps({
+        'systemMessage': notice,
+        'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': notice},
+    }))
 
 
 def main():
@@ -1596,7 +2044,14 @@ def main():
         cwd = os.getcwd()
     try:
         reason = evaluate(command, cwd)
-    except Exception:
+    except Exception as exc:
+        # The verdict stays allow (below), but it is no longer silent:
+        # report_internal_error() puts the exception CLASS, never the command
+        # or the message, in a systemMessage and an additionalContext on
+        # stdout (the channels Claude Code shows for an exit 0 hook) and one
+        # line on stderr (debug log only). Do not remove the stdout JSON as
+        # redundant: stderr alone is never shown.
+        report_internal_error(exc)
         # AC-SEC-4: whatever pathological input reaches this point, the
         # hook contract stays exit 0 or 2, NEVER 1, and stderr never carries
         # a Python traceback. An exception here is a bug in this module's

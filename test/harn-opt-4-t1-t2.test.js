@@ -82,7 +82,7 @@ test('T2: 50 findings at the measured maximum size plus 96 ac_verdicts write fin
 
 test('T2: 400 findings with 400 distinct hostile lens strings still write a full envelope inside MAX_LINE_BYTES (AC-SEC-3)', async () => {
   const { MAX_LINE_BYTES, MAX_FINDINGS } = await import(APPEND_MODULE_URL)
-  const pathLens = '/Users/scott/very-private-project-dir'
+  const pathLens = '/Users/some-operator/very-private-project-dir'
   const tokenLens = 'ghp_' + 'Ab3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF3hJ6'
   assert.equal(tokenLens.length, 40)
   const labels = [pathLens, tokenLens, ...Array.from({ length: 398 }, (_, i) => `lens-${'abcdefghij'[i % 10]}${String.fromCharCode(97 + (Math.floor(i / 10) % 26))}${String.fromCharCode(97 + (Math.floor(i / 260) % 26))}${'klmnopqrst'[i % 10]}${i}`.replace(/[0-9]/g, (d) => 'abcdefghij'[d]))]

@@ -33,13 +33,10 @@ jobs:
       matrix:
         node: ['22', '26']
     steps:
+      # Default shallow checkout: the suite reads no repository history
+      # (historical files are vendored under test/fixtures/). Only the
+      # gitleaks job below needs full history.
       - uses: actions/checkout@v4
-        with:
-          # The suite resolves a historical commit by subject across
-          # --branches --remotes (test/static-checks.test.js). A shallow clone
-          # has no such commit and the guard fails for a reason unrelated to
-          # the change under test.
-          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -66,6 +63,14 @@ jobs:
       # If that ever changes, this comment is the thing that should have.
       - name: Test
         run: node --test test/*.test.js
+
+      # The writer refuses every write when HARNESS_LEDGER_READONLY is exported, as a review lens
+      # exports it, so the test files that run the writer must pass in that shell too. This used to be
+      # one test that spawned `node --test` on these files from inside the suite, which took 28 seconds
+      # on a runner and inherited every timing flake of the files it ran; it is a step of its own now.
+      # test/harn-opt-6-r2-env.test.js pins that this line, and the pre-push one, list exactly these files.
+      - name: Test the ledger writer's files with HARNESS_LEDGER_READONLY exported
+        run: HARNESS_LEDGER_READONLY=1 node --test test/harn-opt-6-t1.test.js test/harn-opt-6-gap.test.js test/review-cycle-finding-ids.test.js test/ledger-append.test.js test/sigkill-orphan.test.js
 
       # The suite defends itself against git's environment rather than relying
       # on the caller to clean it (test/helpers/git-env.js). Running it once

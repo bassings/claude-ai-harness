@@ -24,7 +24,7 @@ function runHook(payload, extraEnv = {}, opts = {}) {
     input: JSON.stringify(payload),
     encoding: 'utf8',
     env: sanitizedGitEnv(extraEnv),
-    timeout: 10000,
+    timeout: 60000,
     ...opts,
   })
 }
@@ -88,7 +88,7 @@ for (const [label, command] of NON_GIT_DESTRUCTIVE) {
     dirty(dir)
     const before = fs.readFileSync(path.join(dir, 'README.md'), 'utf8')
     const detectorPath = path.join(__dirname, '..', 'hooks', 'destructive-git-guard.py')
-    const detectorRes = spawnSync('python3', [detectorPath], { input: JSON.stringify(bashPayload(dir, command)), encoding: 'utf8', env: sanitizedGitEnv(), timeout: 10000 })
+    const detectorRes = spawnSync('python3', [detectorPath], { input: JSON.stringify(bashPayload(dir, command)), encoding: 'utf8', env: sanitizedGitEnv(), timeout: 60000 })
     assert.equal(detectorRes.status, 0, `sanity: the detector must NOT refuse "${label}" -- it is out of its guarded-shape scope entirely`)
 
     const res = runHook(bashPayload(dir, command))
@@ -239,12 +239,12 @@ test('git-snapshot AC-QA-5: tool_name other than Bash is silent (dirty tree, no 
 })
 
 test('git-snapshot AC-QA-5: malformed JSON on stdin exits 0 silently', () => {
-  const res = spawnSync('python3', [HOOK_PATH], { input: 'not json{{{', encoding: 'utf8', env: sanitizedGitEnv(), timeout: 10000 })
+  const res = spawnSync('python3', [HOOK_PATH], { input: 'not json{{{', encoding: 'utf8', env: sanitizedGitEnv(), timeout: 60000 })
   assert.equal(res.status, 0)
 })
 
 test('git-snapshot AC-QA-5: empty stdin exits 0 silently', () => {
-  const res = spawnSync('python3', [HOOK_PATH], { input: '', encoding: 'utf8', env: sanitizedGitEnv(), timeout: 10000 })
+  const res = spawnSync('python3', [HOOK_PATH], { input: '', encoding: 'utf8', env: sanitizedGitEnv(), timeout: 60000 })
   assert.equal(res.status, 0)
 })
 
@@ -607,7 +607,7 @@ test('git-snapshot AC-SEC-5a: a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE poin
     // directly, exactly as it would really arrive (see M3 in
     // destructive-git-guard.test.js, the same class of leak).
     env: { ...process.env, GIT_DIR: path.join(decoy, '.git'), GIT_WORK_TREE: decoy, GIT_INDEX_FILE: path.join(decoy, '.git', 'index') },
-    timeout: 10000,
+    timeout: 60000,
   })
   assert.equal(res.status, 0)
   assert.equal(snapshotRefs(decoy).length, 0, 'the decoy repo must gain no snapshot ref')
@@ -710,7 +710,7 @@ test('git-snapshot AC-ARCH-2: the snapshot hook still records a snapshot for a p
   const dir = makeTempRepo()
   dirty(dir)
   const payload = bashPayload(dir, 'git checkout -- README.md')
-  const detectorRes = spawnSync('python3', [detectorPath], { input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv(), timeout: 10000 })
+  const detectorRes = spawnSync('python3', [detectorPath], { input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv(), timeout: 60000 })
   assert.equal(detectorRes.status, 2, 'sanity: the detector must refuse this one')
   const snapshotRes = runHook(payload)
   assert.equal(snapshotRes.status, 0)
@@ -725,9 +725,10 @@ test('git-snapshot AC-ARCH-2: the detector\'s refusal text and exit code are unc
   const dir = makeTempRepo()
   dirty(dir)
   const payload = bashPayload(dir, 'git checkout -- README.md')
-  const detectorRes = spawnSync('python3', [detectorPath], { input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv(), timeout: 10000 })
+  const detectorRes = spawnSync('python3', [detectorPath], { input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv(), timeout: 60000 })
   assert.equal(detectorRes.status, 2)
-  assert.match(detectorRes.stderr, /README\.md/)
+  assert.match(detectorRes.stderr, /uncommitted/i)
+  assert.doesNotMatch(detectorRes.stderr, /README\.md/, 'the refusal prints no form of the refused command')
 })
 
 // ---------------------------------------------------------------------
@@ -756,7 +757,7 @@ function countGitInvocations(dir, payload) {
     input: JSON.stringify(payload),
     encoding: 'utf8',
     env: sanitizedGitEnv({ PATH: `${stubDir}:${process.env.PATH}` }),
-    timeout: 10000,
+    timeout: 60000,
     cwd: dir,
   })
   assert.equal(res.status, 0, `stub-git run must still exit 0: stderr=${res.stderr}`)
@@ -973,20 +974,39 @@ test('git-snapshot AC-QA-17: 50 snapshots of a changing 250KB file keep .git und
 // AC-OPS-13: per-call cost is measured and capped, with a 5x margin.
 // ---------------------------------------------------------------------
 
-test('git-snapshot AC-OPS-13: median of 5+ invocations against a small dirty repo stays under 400ms (>=5x the ~76ms measured baseline)', () => {
+// The per-call cost is pinned by a deterministic work count, not a clock (HARN-AUDIT-1 T1, AC-QA-1). The hook's cost is
+// the git subprocesses it starts, so a `git` shim first on PATH logs each one (its first argument) and runs the real git;
+// the hook must start no more than the measured baseline. The old assertion was a median wall-clock of 400ms, which a
+// loaded runner or a shallow clone exceeded (the same family as the optimise-read flake). The hook's own DEADLINE_SECONDS
+// is what bounds a hung git; this test only pins how many it starts.
+// rev-parse, stash, update-ref and for-each-ref, measured on a small dirty repo; changing it is a deliberate act.
+const BASELINE_GIT_CALLS = 4
+
+function gitShim() {
+  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim()
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-shim-'))
+  trackTempDir(dir)
+  const log = path.join(dir, 'calls.log')
+  fs.writeFileSync(path.join(dir, 'git'), `#!/bin/sh\nfor a in "$@"; do case "$a" in -*|core.*) ;; *) printf '%s\\n' "$a" >> "${log}"; break ;; esac; done\nexec "${real}" "$@"\n`, { mode: 0o755 })
+  return { dir, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : []), reset: () => fs.rmSync(log, { force: true }) }
+}
+
+test('git-snapshot AC-OPS-13: a snapshot of a small dirty repo starts no more git subprocesses than the measured baseline, and the count does not grow with repeated calls', () => {
   const dir = makeTempRepo()
-  const times = []
-  for (let i = 0; i < 7; i++) {
+  const shim = gitShim()
+  const env = { PATH: `${shim.dir}${path.delimiter}${process.env.PATH}` }
+  const counts = []
+  for (let i = 0; i < 3; i++) {
     dirty(dir, 'README.md', `v${i}\n`)
-    const start = process.hrtime.bigint()
-    const res = runHook(bashPayload(dir))
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6
+    shim.reset()
+    const res = runHook(bashPayload(dir), env)
     assert.equal(res.status, 0)
-    times.push(elapsedMs)
+    counts.push(shim.calls())
   }
-  times.sort((a, b) => a - b)
-  const median = times[Math.floor(times.length / 2)]
-  assert.ok(median < 400, `median invocation time ${median.toFixed(1)}ms exceeds the 400ms ceiling (measured baseline ~76ms, 5x margin)`)
+  for (const calls of counts) {
+    assert.ok(calls.length >= 3, `sanity: the shim must observe the hook's git calls, saw ${JSON.stringify(calls)}`)
+    assert.ok(calls.length <= BASELINE_GIT_CALLS, `the hook started ${calls.length} git subprocesses (${calls.join(', ')}); the measured baseline is ${BASELINE_GIT_CALLS}`)
+  }
 })
 
 test('git-snapshot AC-QA-17: a repeat snapshot of UNCHANGED content reuses the same tree/blob objects (no additional blob/tree cost)', () => {

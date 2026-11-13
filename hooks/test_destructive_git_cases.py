@@ -25,6 +25,7 @@ Run: python3 -m unittest discover -s hooks -p 'test_*.py'
 """
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -37,6 +38,10 @@ import unittest
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
 GUARD_PATH = os.path.join(HOOKS_DIR, 'destructive-git-guard.py')
+
+# HARN-AUDIT-1 T1: every subprocess here carries this deadline only so a hung child fails the test with a clear message instead
+# of freezing the suite. It is generous for a loaded two-core runner and asserts nothing about speed.
+HANG_DEADLINE_SECONDS = 60
 CORPUS_PATH = os.path.join(HOOKS_DIR, 'destructive-git-cases.json')
 
 _spec = importlib.util.spec_from_file_location('destructive_git_guard', GUARD_PATH)
@@ -81,7 +86,7 @@ def clean_env():
 def run_git(args, cwd):
     result = subprocess.run(
         ['git'] + args, cwd=cwd, env=clean_env(),
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=HANG_DEADLINE_SECONDS,
     )
     if result.returncode != 0:
         raise RuntimeError('fixture setup failed: git %s (in %s)\nstdout: %s\nstderr: %s'
@@ -643,11 +648,12 @@ class TestRefusalQuotesTheCommandAsWritten(unittest.TestCase):
     def tearDown(self):
         subprocess.run(['rm', '-rf', self._root])
 
-    def test_an_xargs_wrapped_clean_is_quoted_without_a_synthetic_pathspec(self):
+    def test_an_xargs_wrapped_clean_is_refused_without_printing_the_command(self):
         reason = guard.evaluate('echo x | xargs git clean -fd', self._root)
         self.assertIsNotNone(reason, 'an xargs-fed clean over an untracked file must still be refused')
-        self.assertIn('`git clean -fd`', reason,
-                      'the refusal must quote the command as written; got: %s' % reason)
+        self.assertNotIn('git clean -fd', reason, 'the refusal prints no form of the command (its own advice names `git clean -n`); got: %s' % reason)
+        self.assertIn('immediately before the git command that was refused', reason)
+        self.assertNotIn('exactly as first typed', reason)
 
     def test_xargs_unwrapping_appends_no_token_of_its_own(self):
         self.assertEqual(
@@ -813,7 +819,7 @@ class TestLeakedGitDirCannotMakeTheGuardReadAnotherRepo(unittest.TestCase):
         env.update(self._leaked)
         result = subprocess.run(
             [sys.executable, GUARD_PATH],
-            input=payload, capture_output=True, text=True, env=env, timeout=10,
+            input=payload, capture_output=True, text=True, env=env, timeout=HANG_DEADLINE_SECONDS,
         )
         self.assertEqual(
             result.returncode, 2,
@@ -823,14 +829,19 @@ class TestLeakedGitDirCannotMakeTheGuardReadAnotherRepo(unittest.TestCase):
 
 
 class TestHookProcessContract(unittest.TestCase):
-    """AC-QA-7 (timing) plus the exit-code contract, driven as REAL
-    subprocesses of the guard (the actual deployed hook path), not just
-    evaluate() -- proves main()'s JSON-in/exit-code-out dispatch agrees
-    with evaluate()'s own verdict for the same corpus, and measures the
-    real per-invocation wall time against the 57-98ms baseline measured
-    2026-09-19."""
+    """AC-QA-7 plus the exit-code contract, driven as REAL subprocesses of
+    the guard (the actual deployed hook path), not just evaluate() -- proves
+    main()'s JSON-in/exit-code-out dispatch agrees with evaluate()'s own
+    verdict for the same corpus.
 
-    def test_every_case_as_a_process_within_the_time_budget(self):
+    HARN-AUDIT-1 T1: the per-invocation 1000ms wall-clock assertion (and the
+    1.0s subprocess timeout that enforced it) is gone, because a loaded
+    runner could fail it with nothing wrong. AC-QA-7's cost property is
+    pinned as a count in TestSubprocessCallsPerSegment below; the timeout
+    here only bounds a hang. The per-invocation timing summary the old test
+    printed is kept as informational stderr output: it asserts nothing."""
+
+    def test_every_case_as_a_process_agrees_with_evaluate(self):
         durations = []
         tmp = tempfile.mkdtemp(prefix='destructive-git-cases-proc-')
         try:
@@ -847,15 +858,10 @@ class TestHookProcessContract(unittest.TestCase):
                 result = subprocess.run(
                     [sys.executable, GUARD_PATH],
                     input=payload, capture_output=True, text=True,
-                    env=clean_env(), timeout=1.0,
+                    env=clean_env(), timeout=HANG_DEADLINE_SECONDS,
                 )
-                elapsed_ms = (time.monotonic() - start) * 1000.0
-                durations.append(elapsed_ms)
+                durations.append((time.monotonic() - start) * 1000.0)
                 with self.subTest(command=case['command']):
-                    self.assertLess(
-                        elapsed_ms, 1000.0,
-                        '%r took %.1fms, over the 1000ms per-invocation budget (AC-QA-7)'
-                        % (case['command'], elapsed_ms))
                     self.assertIn(result.returncode, (0, 2),
                                   '%r exited %s, must be 0 or 2' % (case['command'], result.returncode))
                     expected_exit = 2 if case['expect'] == 'block' else 0
@@ -870,6 +876,421 @@ class TestHookProcessContract(unittest.TestCase):
         if durations:
             print('\ndestructive-git-cases timing: n=%d max=%.1fms median=%.1fms'
                   % (len(durations), max(durations), statistics.median(durations)), file=sys.stderr)
+
+
+def count_segments(command):
+    """How many segments the guard sees in `command`: split after the same normalisation the guard applies first, since
+    comments, continuations and here-document bodies change where the segments are. 0 when the text cannot be tokenised."""
+    text, _classes = guard.normalise_shell_text(command)
+    text = guard.strip_heredoc_bodies(text)
+    text, _bodies = guard.extract_command_substitutions(text)
+    try:
+        return len(guard.split_segments(text))
+    except ValueError:
+        return 0
+
+
+class TestSubprocessCallsPerSegment(unittest.TestCase):
+    """HARN-AUDIT-1 T1: what the per-invocation 1000ms assertion protected, as a count. The guard's cost is the git
+    subprocesses it starts, and its own budget is MAX_SUBPROCESS_CALLS_PER_SEGMENT per segment (the constant
+    hooks/test_hook_timeout_budget.py pins hooks.json's timeout against). Every case in the corpus is decided in this
+    process with subprocess.run wrapped to count, and the count must stay within that budget for the command's segments.
+    No clock is read."""
+
+    def test_every_case_starts_at_most_the_budgeted_subprocesses_per_segment(self):
+        real_run = guard.subprocess.run
+        tmp = tempfile.mkdtemp(prefix='destructive-git-cases-count-')
+        observed_max = 0
+        try:
+            for case in CASES:
+                root = tempfile.mkdtemp(dir=tmp)
+                apply_setup(root, case['setup'], DECLARED_SETUP_OPS)
+                calls = []
+
+                def counting(*args, **kwargs):
+                    calls.append(args[0] if args else None)
+                    return real_run(*args, **kwargs)
+                guard.subprocess.run = counting
+                try:
+                    guard.evaluate(case['command'], root)
+                finally:
+                    guard.subprocess.run = real_run
+                segments = max(1, count_segments(case['command']))
+                observed_max = max(observed_max, len(calls))
+                with self.subTest(command=case['command']):
+                    self.assertLessEqual(
+                        len(calls), guard.MAX_SUBPROCESS_CALLS_PER_SEGMENT * segments,
+                        '%r started %d subprocesses over %d segment(s), over the budget of %d per segment (AC-QA-7): %r'
+                        % (case['command'], len(calls), segments, guard.MAX_SUBPROCESS_CALLS_PER_SEGMENT, calls))
+        finally:
+            subprocess.run(['rm', '-rf', tmp])
+        self.assertGreater(observed_max, 0, 'sanity: the counter must observe the guard starting git at least once across the corpus')
+
+
+PARSING_CLASSES = ('comment continuation', 'backslash continuation', 'dynamic pathspec', 'zsh -c', 'adjacent operators')
+
+# What a refusal must TELL the agent to do, not only what it found (AC-OPS-8). Asserted against the real process's stderr.
+REFUSAL_INSTRUCTION_FRAGMENTS = (
+    'copy the file to a scratch path first',
+    '`git stash`',
+    'opt in explicitly',
+    'immediately before the git command that was refused',
+    'immediately before the wrapper',
+    'not to the whole line',
+    'needs it on each',
+    'not directly after `do` or `then`',
+    'switches this guard off for everything in that session',
+)
+
+# The part of that every one of the four refusal templates carries (the clean and stash refusals give their own safe alternative).
+REFUSAL_OVERRIDE_FRAGMENTS = REFUSAL_INSTRUCTION_FRAGMENTS[2:]
+
+
+def run_guard_process(command, cwd):
+    payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': cwd,
+                          'hook_event_name': 'PreToolUse'})
+    return subprocess.run([sys.executable, GUARD_PATH], input=payload, capture_output=True, text=True,
+                          env=clean_env(), timeout=HANG_DEADLINE_SECONDS)
+
+
+class TestParsingClassRefusals(unittest.TestCase):
+    """HARN-AUDIT-1 T5 (AC-OPS-8, AC-QA-10): each BLOCK case the corpus tags with a `class` is a refusal that names that
+    class, prints the instruction to opt in, and has the bare destructive form as a control in the same fixture."""
+
+    def _tagged(self):
+        return [c for c in CASES if 'class' in c]
+
+    def test_every_class_has_a_block_case_and_every_tag_is_a_known_class(self):
+        tagged = self._tagged()
+        for case in tagged:
+            self.assertIn(case['class'], PARSING_CLASSES, 'unknown class tag on %r' % (case['command'],))
+            self.assertEqual(case['expect'], 'block', '%r carries a class tag but is not a BLOCK case' % (case['command'],))
+        for name in PARSING_CLASSES:
+            self.assertTrue([c for c in tagged if c['class'] == name], 'no BLOCK case is tagged with the class %r' % (name,))
+
+    def test_every_tagged_case_names_its_bare_destructive_form_and_that_control_exists_in_its_fixture(self):
+        controls = [c for c in CASES if c.get('control')]
+        self.assertTrue(controls, 'the corpus has no control cases')
+        for control in controls:
+            self.assertEqual(control['expect'], 'block', 'a control is the bare form, which must block: %r' % (control['command'],))
+            self.assertNotIn('class', control, 'a control is the bare form, so it carries no parsing class: %r' % (control['command'],))
+        for case in self._tagged():
+            with self.subTest(command=case['command']):
+                bare = case.get('bare')
+                self.assertTrue(bare, 'a tagged case must name its bare destructive form in `bare`')
+                self.assertIn(bare.split()[1], case['command'].replace('\\\n', ''),
+                              "the bare form %r is not a form of this case's own command" % (bare,))
+                self.assertTrue([c for c in controls if c['command'] == bare and c['setup'] == case['setup']],
+                                'no control row has the command %r in the fixture of %r' % (bare, case['command']))
+
+    def test_each_new_refusal_names_its_class_and_prints_the_instruction(self):
+        tmp = tempfile.mkdtemp(prefix='destructive-git-cases-classes-')
+        try:
+            for case in self._tagged():
+                with self.subTest(command=case['command'], cls=case['class']):
+                    root = tempfile.mkdtemp(dir=tmp)
+                    apply_setup(root, case['setup'], DECLARED_SETUP_OPS)
+                    result = run_guard_process(case['command'], root)
+                    self.assertEqual(result.returncode, 2, 'expected a refusal, stderr: %s' % result.stderr)
+                    self.assertIn(case['class'], result.stderr,
+                                  'the refusal must name the class that fired (%r): %s' % (case['class'], result.stderr))
+                    for fragment in REFUSAL_INSTRUCTION_FRAGMENTS:
+                        self.assertIn(fragment, result.stderr,
+                                      'the refusal must carry the instruction clause %r: %s' % (fragment, result.stderr))
+        finally:
+            subprocess.run(['rm', '-rf', tmp])
+
+
+class TestOverrideInstructionWorksAsPrinted(unittest.TestCase):
+    """The refusal says to put HARNESS_ALLOW_DESTRUCTIVE_GIT=1 immediately before the git command that was refused, and that
+    it applies to that one command, not the whole line. This follows the instruction as printed for multi-segment commands
+    and requires the guard to honour it, and requires the variable at the very front of such a line to still be refused,
+    so the scoping the sentence describes is pinned in both directions."""
+
+    # (command, the git call inside it that the refusal is about)
+    MULTI_SEGMENT = (
+        ('git status && git reset --hard', 'git reset --hard'),
+        ('f=tracked.txt; git checkout -- $f', 'git checkout -- $f'),
+        ('echo a # note\ngit checkout -- tracked.txt', 'git checkout -- tracked.txt'),
+        ('echo $(git reset --hard)', 'git reset --hard'),
+        # Loops and `if`: the git call must start its own line or follow `;` or `&&`. Directly after `do` or `then` an
+        # assignment of ANY name hides the git call from the guard (a known gap, see KNOWN_GAP rows), so the override there
+        # would prove nothing; the control in the test below catches that.
+        ('for f in tracked.txt; do\n  git checkout -- "$f"\ndone', 'git checkout -- "$f"'),
+        ('for f in tracked.txt; do true; git checkout -- "$f"; done', 'git checkout -- "$f"'),
+        ('while read f; do\n  git restore "$f"\ndone < l', 'git restore "$f"'),
+        ('if true; then\n  git reset --hard\nfi', 'git reset --hard'),
+        ('cd . && git checkout -- .', 'git checkout -- .'),
+        ("zsh -c 'git reset --hard'", 'git reset --hard'),
+    )
+    VAR = 'HARNESS_ALLOW_DESTRUCTIVE_GIT=1 '
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        run_git(['init', '-q', '-b', 'master'], self.root)
+        write_file(self.root, 'tracked.txt', 'c\n')
+        run_git(['add', '--', 'tracked.txt'], self.root)
+        run_git(['commit', '-q', '-m', 'seed'], self.root)
+        write_file(self.root, 'tracked.txt', 'dirty\n')
+        self._saved = os.environ.pop(guard.ESCAPE_VAR, None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ[guard.ESCAPE_VAR] = self._saved
+        subprocess.run(['rm', '-rf', self.root])
+
+    def test_every_multi_segment_command_is_refused_to_begin_with(self):
+        for command, _call in self.MULTI_SEGMENT:
+            with self.subTest(command=command):
+                self.assertIsNotNone(guard.evaluate(command, self.root))
+
+    def test_the_variable_directly_before_the_refused_git_call_is_honoured(self):
+        for command, call in self.MULTI_SEGMENT:
+            with self.subTest(command=command):
+                placed = command.replace(call, self.VAR + call, 1)
+                self.assertNotEqual(placed, command)
+                unrelated = command.replace(call, 'FOO=1 ' + call, 1)
+                self.assertIsNotNone(guard.evaluate(unrelated, self.root),
+                                     'control: an unrelated assignment in the override\'s place must still be refused, or '
+                                     'an allow below proves nothing about the override: %r' % (unrelated,))
+                self.assertIsNone(guard.evaluate(placed, self.root),
+                                  'the printed instruction did not get through for %r' % (placed,))
+
+    # (wrapper, a refused command through it). The printed placement is before the wrapper.
+    WRAPPED = (
+        ('env git reset --hard', 'env'),
+        ('echo x | xargs git clean -fd', 'xargs'),
+        ('command git reset --hard', 'command'),
+        ('nohup git reset --hard', 'nohup'),
+        ('timeout 5 git reset --hard', 'timeout'),
+        ('exec git reset --hard', 'exec'),
+    )
+
+    def test_the_variable_before_a_wrapper_is_honoured(self):
+        write_file(self.root, 'scratch-untracked.txt', 'unsaved\n')  # so `git clean` has something to remove
+        for command, wrapper in self.WRAPPED:
+            with self.subTest(command=command):
+                self.assertIsNotNone(guard.evaluate(command, self.root), 'control: refused without the variable')
+                placed = command.replace(wrapper, self.VAR + wrapper, 1)
+                self.assertIsNone(guard.evaluate(placed, self.root),
+                                  'the printed instruction did not get through for %r' % (placed,))
+
+    def test_between_a_wrapper_and_the_git_call_is_pinned_as_it_is_today(self):
+        # Not an endorsed placement: the shell cannot run these lines (`xargs VAR=1 git ...` tries to execute `VAR=1`), and
+        # the refusal does not tell anyone to write them. This pins today's verdict so a change to it is visible: `env`
+        # reads the assignment as its own and refuses, the other wrappers hide the assignment and the guard allows.
+        write_file(self.root, 'scratch-untracked.txt', 'unsaved\n')
+        for command, wrapper in self.WRAPPED:
+            with self.subTest(command=command):
+                between = command.replace(wrapper + ' ', wrapper + ' ' + self.VAR, 1)
+                verdict = guard.evaluate(between, self.root)
+                if wrapper == 'env':
+                    self.assertIsNotNone(verdict, between)
+                else:
+                    self.assertIsNone(verdict, between)
+
+    def test_the_variable_at_the_front_of_a_multi_segment_line_is_not_enough(self):
+        # A `bash -c`/`zsh -c` line is one segment, and the variable on it covers the body, so it is left out here.
+        for command, _call in self.MULTI_SEGMENT:
+            if command.startswith('zsh -c'):
+                continue
+            with self.subTest(command=command):
+                self.assertIsNotNone(guard.evaluate(self.VAR + command, self.root),
+                                     'the variable in front of the whole line must not disarm a later segment')
+
+    def test_the_refusal_names_that_position_and_not_the_whole_line(self):
+        reason = guard.evaluate('git status && git reset --hard', self.root)
+        self.assertIn('immediately before the git command that was refused', reason)
+        self.assertIn('not to the whole line', reason)
+        self.assertNotIn('exactly as first typed', reason)
+
+
+class TestKnownGapRowsStayVisible(unittest.TestCase):
+    """Rows whose note starts with `KNOWN GAP` record a documented, measured bypass as its current verdict (allow), so closing
+    it later is a visible change to the corpus rather than a silent one. README's known-gaps table lists each as Not detected."""
+
+    def test_known_gap_rows_exist_expect_allow_and_point_at_the_readme(self):
+        rows = [c for c in CASES if c.get('note', '').startswith('KNOWN GAP')]
+        self.assertTrue(rows, 'no KNOWN GAP rows')
+        for row in rows:
+            with self.subTest(command=row['command']):
+                self.assertEqual(row['expect'], 'allow', 'a KNOWN GAP row pins today\'s allow')
+                self.assertIn('see README', row['note'])
+        with open(os.path.join(HOOKS_DIR, '..', 'README.md')) as fh:
+            readme = fh.read()
+        self.assertIn('An assignment directly after a shell keyword', readme)
+
+
+class TestClassNotesDoNotClaimCausation(unittest.TestCase):
+    """AC-OPS-8 says a refusal names the class that FIRED. The guard reads the whole command text, and does not re-run the
+    match without each construct, so a comment, a continuation or an adjacent operator is reported as something the
+    command also uses, never as the cause. `zsh -c` is causal: its body is only checked because zsh is unwrapped."""
+
+    def _stderr(self, command):
+        root = tempfile.mkdtemp()
+        try:
+            run_git(['init', '-q', '-b', 'master'], root)
+            write_file(root, 'tracked.txt', 'c\n')
+            run_git(['add', '--', 'tracked.txt'], root)
+            run_git(['commit', '-q', '-m', 'seed'], root)
+            write_file(root, 'tracked.txt', 'dirty\n')
+            result = run_guard_process(command, root)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            return result.stderr
+        finally:
+            subprocess.run(['rm', '-rf', root])
+
+    def test_a_refusal_that_never_needed_the_comment_does_not_say_the_comment_fired(self):
+        stderr = self._stderr('git reset --hard # revert')
+        self.assertNotIn('[class: comment continuation', stderr)
+        self.assertIn('also uses: comment continuation', stderr)
+        self.assertIn('does not necessarily depend', stderr)
+
+    def test_the_refusal_prints_no_form_of_the_refused_command(self):
+        # A hint rebuilt from the guard's own tokens turned an inert single-quoted literal into an executing one
+        # (`'$(touch PWNED)'` came back as `"$(touch PWNED)"`), so the refusal now says to re-run the ORIGINAL command
+        # with the override in front of it and prints nothing of the command at all.
+        for command, secret in (("git checkout -- '$(touch PWNED)'", '$(touch PWNED)'),
+                                ("git checkout -- 'price$1.txt'", 'price$1.txt'),
+                                ("git restore '{tracked.txt,x}'", '{tracked.txt,x}'),
+                                ('git checkout -- "$F" "my file"', 'my file'),
+                                ('git reset --hard', 'git reset'),
+                                ('git checkout -- tracked.txt', 'tracked.txt'),
+                                ('git restore tracked.txt', 'tracked.txt')):
+            with self.subTest(command=command):
+                stderr = self._stderr(command)
+                self.assertNotIn(secret, stderr)
+                self.assertNotIn('git checkout', stderr)
+                self.assertNotIn('git restore', stderr)
+                self.assertIn('HARNESS_ALLOW_DESTRUCTIVE_GIT', stderr)
+                self.assertIn('immediately before the git command that was refused', stderr)
+
+    def test_every_refusal_template_has_the_same_instruction_and_no_command_slot(self):
+        for name in ('REFUSAL', 'REFUSAL_DYNAMIC', 'REFUSAL_CLEAN', 'REFUSAL_STASH'):
+            template = getattr(guard, name)
+            with self.subTest(template=name):
+                self.assertNotIn('{cmd}', template, 'a refusal must not have a slot for the refused command')
+                for fragment in REFUSAL_OVERRIDE_FRAGMENTS:
+                    self.assertIn(fragment, template)
+                self.assertNotIn('exactly as first typed', template, 'a variable in front of a whole line is not honoured')
+
+    def test_a_class_note_appears_once_however_deeply_the_refusal_is_nested(self):
+        self.assertEqual(self._stderr("zsh -c \"zsh -c 'git reset --hard'\" # y").count('[class: zsh -c'), 1)
+        self.assertEqual(self._stderr("bash -c 'echo a # x\ngit reset --hard' # y").count('also uses'), 1)
+
+    def test_zsh_is_reported_as_the_class_that_fired(self):
+        self.assertIn('[class: zsh -c', self._stderr("zsh -c 'git reset --hard'"))
+
+    def test_a_dynamic_pathspec_refusal_says_a_branch_or_path(self):
+        stderr = self._stderr('git checkout "$f"')
+        self.assertIn('class: dynamic pathspec', stderr)
+        self.assertIn('A branch or path here is built when the command runs', stderr)
+        self.assertIn('@{...}', stderr)
+        self.assertIn('`@{-1}`', stderr)
+        self.assertIn('git switch -', stderr)
+        for fragment in REFUSAL_INSTRUCTION_FRAGMENTS:
+            self.assertIn(fragment, stderr)
+
+
+class TestNoCaseReachesTheFailOpenExceptBranch(unittest.TestCase):
+    """HARN-AUDIT-1 T5 (AC-SEC-2): `main()` answers 0 (allow) from a broad `except Exception` when evaluate() raises, so a
+    new parsing path that throws on a real case turns a BLOCK into a silent allow and nothing else notices. evaluate() is
+    wrapped to record anything it raises; every case is driven through the real main() and the record must stay empty."""
+
+    def _drive(self, command, cwd, raised):
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': cwd})
+        real_evaluate = guard.evaluate
+
+        def recording(cmd, where):
+            try:
+                return real_evaluate(cmd, where)
+            except Exception as exc:
+                raised.append((cmd, repr(exc)))
+                raise
+        old_in, old_out, old_err = sys.stdin, sys.stdout, sys.stderr
+        sys.stdin, sys.stdout, sys.stderr = io.StringIO(payload), io.StringIO(), io.StringIO()
+        guard.evaluate = recording
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                guard.main()
+            return ctx.exception.code
+        finally:
+            guard.evaluate = real_evaluate
+            sys.stdin, sys.stdout, sys.stderr = old_in, old_out, old_err
+
+    def _run_main(self, command):
+        old_in, old_out, old_err = sys.stdin, sys.stdout, sys.stderr
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': tempfile.gettempdir()})
+        sys.stdin, sys.stdout, sys.stderr = io.StringIO(payload), io.StringIO(), io.StringIO()
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                guard.main()
+            return ctx.exception.code, sys.stdout.getvalue(), sys.stderr.getvalue()
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = old_in, old_out, old_err
+
+    def test_a_parser_exception_still_allows_and_says_so_where_claude_code_shows_it(self):
+        # Claude Code documents that stderr from a hook that exits 0 is never shown to Claude or in the transcript (only in
+        # the debug log), while a `systemMessage` in the JSON on stdout is "shown to the user" and a PreToolUse
+        # `additionalContext` is passed to Claude next to the tool result. The verdict stays allow (exit 0): an
+        # unparseable command already fails open, and an exception here is a bug in the guard, not evidence of danger.
+        real_split = guard.split_segments
+
+        def boom(command):
+            raise KeyError('secret-looking-text')
+        guard.split_segments = boom
+        try:
+            code, out, err = self._run_main('git reset --hard')
+        finally:
+            guard.split_segments = real_split
+        self.assertIn(code, (0, None), 'the fail-open verdict is unchanged')
+        message = json.loads(out)
+        self.assertIn('KeyError', message['systemMessage'])
+        self.assertIn('NOT checked', message['systemMessage'])
+        self.assertEqual(message['hookSpecificOutput']['hookEventName'], 'PreToolUse')
+        self.assertIn('KeyError', message['hookSpecificOutput']['additionalContext'])
+        self.assertNotIn('permissionDecision', message['hookSpecificOutput'], 'it must not decide for Claude Code')
+        for text in (out, err):
+            self.assertNotIn('git reset', text, 'no command text on any channel')
+            self.assertNotIn('secret-looking-text', text, 'no exception message on any channel')
+        self.assertEqual(len(err.strip().splitlines()), 1, 'one line for the debug log: %r' % err)
+
+    def test_an_ordinary_allow_prints_nothing_on_stdout(self):
+        code, out, err = self._run_main('git status')
+        self.assertIn(code, (0, None))
+        self.assertEqual((out, err), ('', ''))
+
+    def test_the_recorder_sees_an_evaluate_that_raises(self):
+        # Without this the test below could pass with the recorder wired to nothing.
+        real_split = guard.split_segments
+
+        def boom(command):
+            raise RuntimeError('injected')
+        guard.split_segments = boom
+        raised = []
+        try:
+            code = self._drive('git status', tempfile.gettempdir(), raised)
+        finally:
+            guard.split_segments = real_split
+        self.assertIn(code, (0, None), 'main() fails open on an exception, which is the behaviour being watched')
+        self.assertEqual(len(raised), 1, 'the recorder must see the exception main() swallows')
+
+    def test_no_corpus_case_makes_evaluate_raise_and_each_gets_its_expected_exit(self):
+        tmp = tempfile.mkdtemp(prefix='destructive-git-cases-nofailopen-')
+        raised = []
+        try:
+            for case in CASES:
+                root = tempfile.mkdtemp(dir=tmp)
+                apply_setup(root, case['setup'], DECLARED_SETUP_OPS)
+                code = self._drive(case['command'], root, raised)
+                with self.subTest(command=case['command']):
+                    if case['expect'] == 'block':
+                        self.assertEqual(code, 2, 'wrong exit for %r (%s)' % (case['command'], case.get('note')))
+                    else:
+                        self.assertIn(code, (0, None), 'wrong exit for %r (%s)' % (case['command'], case.get('note')))
+        finally:
+            subprocess.run(['rm', '-rf', tmp])
+        self.assertEqual(raised, [], 'evaluate() raised on corpus cases, which main() turns into a silent allow: %r' % raised)
 
 
 if __name__ == '__main__':

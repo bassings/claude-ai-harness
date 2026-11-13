@@ -11,7 +11,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { createHash } = require('node:crypto')
-const { execFileSync, spawnSync } = require('node:child_process')
+const { spawnSync } = require('node:child_process')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { extractLedgerPayload } = require('./helpers/extract-ledger-payload.js')
 const { findingId: oracleId } = require('./helpers/finding-entries.js')
@@ -281,18 +281,11 @@ test('AC-QA-6: through the real writer, a confirmed prior records one fixed entr
 })
 
 // ---- AC-DATA-6a and AC-DATA-2 need the writer as it stood before this change ----
-const OLD_WRITER_COMMIT = '06049e4'
-let oldWriterPath = null
-try {
-  const dir = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'old-writer-'))
-  oldWriterPath = path.join(dir, 'ledger-append.mjs')
-  fs.writeFileSync(oldWriterPath, execFileSync('git', ['show', `${OLD_WRITER_COMMIT}:workflows/lib/ledger-append.mjs`], { cwd: ROOT, encoding: 'utf8', env: sanitizedGitEnv(), maxBuffer: 64 * 1024 * 1024 }))
-} catch {
-  oldWriterPath = null
-}
+// Vendored byte-for-byte from that commit (see test/fixtures/PROVENANCE.md), so it is always present.
+const oldWriterPath = path.join(__dirname, 'fixtures', 'writer-06049e4', 'lib', 'ledger-append.mjs')
 const runOldWriter = (repo, payload) => JSON.parse(spawnSync('node', [oldWriterPath], { cwd: repo, input: JSON.stringify(payload), encoding: 'utf8', env: sanitizedGitEnv() }).stdout.trim().split('\n').pop())
 
-test('AC-DATA-6a: the new payload fed to the writer at 06049e4 is refused by name and never lands a row with merged or missing findings', { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+test('AC-DATA-6a: the new payload fed to the writer at 06049e4 is refused by name and never lands a row with merged or missing findings', async () => {
   const { terminal } = await review({}, withFindings([lensFinding('first claim', 'a.js:1'), lensFinding('second claim', 'a.js:2')]))
   assert.equal(terminal.finding_entries.filter((e) => e.disposition === 'open').length, 2)
   const repo = makeTempRepo()
@@ -302,7 +295,7 @@ test('AC-DATA-6a: the new payload fed to the writer at 06049e4 is refused by nam
   assert.equal(readLedgerLines(repo).length, 0, 'no row lands')
 })
 
-test('AC-OPS-4: through the 06049e4 writer the terminal write ends write_ok false, is logged, and never retries without the findings key', { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+test('AC-OPS-4: through the 06049e4 writer the terminal write ends write_ok false, is logged, and never retries without the findings key', async () => {
   const repo = makeTempRepo()
   const { result, logs, calls } = await review({}, {
     ...withFindings([lensFinding('first claim', 'a.js:1')]),
@@ -466,7 +459,7 @@ GOLDEN['unconfirmed prior with a non-enum severity, a free-text ac_id and an unk
   }
 })()
 
-test('E (round 3): a confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens records a fixed row with null severity, ac_id and lens, and the same three counters as the 06049e4 writer', { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+test('E (round 3): a confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens records a fixed row with null severity, ac_id and lens, and the same three counters as the 06049e4 writer', async () => {
   const fixture = GOLDEN['confirmed prior with a non-enum severity, a free-text ac_id and an unknown lens']
   const { terminal } = await review(fixture.args, fixture.over)
   const oldRepo = makeTempRepo()
@@ -541,26 +534,57 @@ const LENS_START = SOURCE.indexOf('// HARN-OPT-6 (AC-SEC-2, AC-SEC-4): a lens-au
 const LENS_END = SOURCE.indexOf('function payloadSeverity(')
 assert.ok(LENS_START > 0 && LENS_END > LENS_START, 'could not locate the payload label block in review-cycle.js')
 const lensBlock = () => new Function(`${SOURCE.slice(LENS_START, LENS_END)}\nreturn { payloadLens, payloadDrops }`)()
-const timed = (fn) => { const t0 = process.hrtime.bigint(); const value = fn(); return { value, ms: Number(process.hrtime.bigint() - t0) / 1e6 } }
+// The bound is pinned by a count, not a clock (HARN-AUDIT-1 T1, AC-QA-1; the old assertions timed payloadLens under 500ms).
+// What made these inputs dangerous is the length of the string a backtracking regular expression is run over, so every
+// RegExp entry point (exec, test and the Symbol.match, matchAll, replace, search and split methods) records the length of
+// the string it is given while `fn` runs. The anchored shape test PAYLOAD_LENS_RE is excluded: it fails on the first
+// character that is not a lowercase letter, so it is linear whatever the length. Everything else must only ever see the
+// first 256 characters of a label. Synchronous, and node:test runs one test of a file at a time, so nothing else sees the
+// patches.
+const LENS_SHAPE_SOURCE = '^(lens|reviewer)-[a-z]+$'
+function measured(fn) {
+  const keys = ['exec', 'test', Symbol.match, Symbol.matchAll, Symbol.replace, Symbol.search, Symbol.split]
+  const originals = keys.map((key) => [key, Object.getOwnPropertyDescriptor(RegExp.prototype, key)])
+  let maxInput = 0
+  let calls = 0
+  for (const [key, descriptor] of originals) {
+    Object.defineProperty(RegExp.prototype, key, {
+      ...descriptor,
+      value: function (...args) {
+        if (this.source !== LENS_SHAPE_SOURCE) { calls += 1; maxInput = Math.max(maxInput, String(args[0]).length) }
+        return descriptor.value.apply(this, args)
+      },
+    })
+  }
+  let value
+  try {
+    value = fn()
+  } finally {
+    for (const [key, descriptor] of originals) Object.defineProperty(RegExp.prototype, key, descriptor)
+  }
+  return { value, maxInput, calls }
+}
 
 test('M3: a 100,000-character label of repeated separators resolves to its leading roster lens quickly (the label is bounded before any regex runs)', () => {
   const { payloadLens } = lensBlock()
   const label = 'lens-security' + ' + '.repeat(20000) + ', '.repeat(20000)
   assert.ok(label.length >= 100000)
-  const { value, ms } = timed(() => payloadLens(label))
+  const { value, maxInput, calls } = measured(() => payloadLens(label))
   assert.equal(value, 'lens-security')
-  assert.ok(ms < 500, `payloadLens took ${ms} ms`)
-  const sep = timed(() => payloadLens(' + '.repeat(33000) + ', '.repeat(33000)))
+  assert.ok(calls > 0, 'sanity: the counter must observe the label being matched, or the bound below proves nothing')
+  assert.ok(maxInput <= 256, `a regular expression was run over ${maxInput} characters of a ${label.length}-character label`)
+  const sep = measured(() => payloadLens(' + '.repeat(33000) + ', '.repeat(33000)))
   assert.equal(sep.value, null)
-  assert.ok(sep.ms < 500, `separator-only input took ${sep.ms} ms`)
+  assert.ok(sep.calls > 0 && sep.maxInput <= 256, `separator-only input: a regular expression was run over ${sep.maxInput} characters`)
 })
 
 test('M3: a 100,001-character whitespace label is bounded too (the " and " split backtracks quadratically on unbounded whitespace)', () => {
   const { payloadLens, payloadDrops } = lensBlock()
-  const { value, ms } = timed(() => payloadLens(' '.repeat(100001)))
+  const { value, maxInput, calls } = measured(() => payloadLens(' '.repeat(100001)))
   assert.equal(value, null)
   assert.equal(payloadDrops.finding_fields, 1)
-  assert.ok(ms < 500, `payloadLens took ${ms} ms`)
+  assert.ok(calls > 0, 'sanity: the counter must observe the label being matched, or the bound below proves nothing')
+  assert.ok(maxInput <= 256, `a regular expression was run over ${maxInput} characters of a 100001-character whitespace label`)
 })
 
 test('M3: only the first 256 characters of a label are read: a roster name starting past character 256 is never resolved, one ending exactly at 256 is', () => {
@@ -679,7 +703,7 @@ test('L2: a null or absent list is not a malformed one and is not counted', asyn
 })
 
 for (const [name, fixture] of Object.entries(GOLDEN)) {
-  test(`AC-DATA-2: golden row equivalence with the writer at 06049e4: ${name}`, { skip: !oldWriterPath && `git object ${OLD_WRITER_COMMIT} is not available` }, async () => {
+  test(`AC-DATA-2: golden row equivalence with the writer at 06049e4: ${name}`, async () => {
     const { terminal } = await review(fixture.args, fixture.over)
     const descriptors = fixture.descriptors()
     // The script nulls spec_bugs on a no-spec run and moves them to open; the fixtures here keep to what the

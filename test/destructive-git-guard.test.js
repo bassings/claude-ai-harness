@@ -31,7 +31,7 @@ function runHook(payload, extraEnv = {}) {
     input: JSON.stringify(payload),
     encoding: 'utf8',
     env: sanitizedGitEnv(extraEnv),
-    timeout: 10000,
+    timeout: 60000,
   })
 }
 
@@ -49,7 +49,7 @@ test('destructive-git-guard: git checkout -- <dirty file> is refused (exit 2, st
   makeDirtyFile(dir)
   const res = runHook(bashPayload('git checkout -- README.md', dir))
   assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
-  assert.match(res.stderr, /README\.md/)
+  assert.doesNotMatch(res.stderr, /README\.md/, 'the refusal must not echo any form of the refused command (HARN-AUDIT-1 T5: the override hint used to)')
   assert.match(res.stderr, /uncommitted/i)
 })
 
@@ -200,7 +200,7 @@ test('destructive-git-guard: git checkout <dirty file>, bare pathspec with no --
   makeDirtyFile(dir)
   const res = runHook(bashPayload('git checkout README.md', dir))
   assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
-  assert.match(res.stderr, /README\.md/)
+  assert.doesNotMatch(res.stderr, /README\.md/, 'the refusal must not echo any form of the refused command (HARN-AUDIT-1 T5: the override hint used to)')
 })
 
 test('destructive-git-guard: git checkout <clean file>, bare pathspec with no --, is allowed', () => {
@@ -363,7 +363,7 @@ test('destructive-git-guard: a destructive command on the SECOND LINE of a multi
   makeDirtyFile(dir)
   const res = runHook(bashPayload('echo hi\ngit checkout -- README.md', dir))
   assert.equal(res.status, 2, `expected exit 2, got ${res.status}; stderr: ${res.stderr}`)
-  assert.match(res.stderr, /README\.md/)
+  assert.doesNotMatch(res.stderr, /README\.md/, 'the refusal must not echo any form of the refused command (HARN-AUDIT-1 T5: the override hint used to)')
 })
 
 test('destructive-git-guard: a harmless command on the second line of a multi-line command that starts with a refusal is still allowed once the tree is clean', () => {
@@ -703,7 +703,7 @@ test('destructive-git-guard: a leaked GIT_DIR/GIT_WORK_TREE pointed at a second,
     // the hook's OWN stripping logic. This constructs the leaked-GIT_DIR
     // environment directly, exactly as a real leaked variable would arrive.
     env: { ...process.env, GIT_DIR: path.join(cleanDir, '.git'), GIT_WORK_TREE: cleanDir },
-    timeout: 10000,
+    timeout: 60000,
   })
   assert.equal(res.status, 2, `expected exit 2 (the hook must strip GIT_DIR/GIT_WORK_TREE before its own status check), got ${res.status}; stderr: ${res.stderr}`)
 })

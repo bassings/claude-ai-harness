@@ -34,7 +34,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 HOOKS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +44,10 @@ guard = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(guard)
 
 MIN_HOSTILE_COMMANDS = 1000
+
+# HARN-AUDIT-1 T1: every subprocess in this file carries this deadline only so a hung child fails the test with a clear
+# message instead of freezing the suite. It is generous for a loaded two-core runner and asserts nothing about speed.
+HANG_DEADLINE_SECONDS = 60
 
 BASE_COMMANDS = [
     'git reset --hard',
@@ -189,9 +192,22 @@ class TestHostileCommandsInProcess(unittest.TestCase):
 
     def test_every_hostile_command_exits_0_or_2_never_crashes(self):
         cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-')
+        # HARN-AUDIT-1 T5 (AC-SEC-2): main() answers 0 from a broad `except Exception` when evaluate() raises, which would
+        # satisfy the exit-code assertion below while hiding a parsing path that throws. evaluate() is wrapped to record
+        # what it raises, and the record must stay empty.
+        raised = []
+        real_evaluate = guard.evaluate
+
+        def recording(command, where):
+            try:
+                return real_evaluate(command, where)
+            except Exception as exc:
+                raised.append((command[:80], repr(exc)))
+                raise
+        guard.evaluate = recording
         try:
             subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd,
-                            capture_output=True, timeout=10)
+                            capture_output=True, timeout=HANG_DEADLINE_SECONDS)
             for index, command in enumerate(HOSTILE_COMMANDS):
                 with self.subTest(index=index, command=command[:80]):
                     code, stderr = self._drive_main(command, cwd)
@@ -201,7 +217,9 @@ class TestHostileCommandsInProcess(unittest.TestCase):
                     self.assertNotIn(TRACEBACK_MARKER, stderr,
                                       'hostile command #%d produced a traceback on stderr: %r...' % (index, command[:80]))
         finally:
+            guard.evaluate = real_evaluate
             subprocess.run(['rm', '-rf', cwd])
+        self.assertEqual(raised, [], 'evaluate() raised on hostile input, which main() turns into a silent allow: %r' % raised[:5])
 
 
 class TestHostileCommandsAsRealProcesses(unittest.TestCase):
@@ -218,7 +236,7 @@ class TestHostileCommandsAsRealProcesses(unittest.TestCase):
         cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-proc-')
         try:
             subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd,
-                            capture_output=True, timeout=10)
+                            capture_output=True, timeout=HANG_DEADLINE_SECONDS)
             for index, command in enumerate(self._sample()):
                 payload = json.dumps({
                     'tool_name': 'Bash',
@@ -229,7 +247,7 @@ class TestHostileCommandsAsRealProcesses(unittest.TestCase):
                 with self.subTest(index=index, command=command[:80]):
                     result = subprocess.run(
                         [sys.executable, GUARD_PATH], input=payload,
-                        capture_output=True, text=True, timeout=10,
+                        capture_output=True, text=True, timeout=HANG_DEADLINE_SECONDS,
                     )
                     self.assertIn(result.returncode, (0, 2),
                                   'process exited %s for %r...' % (result.returncode, command[:80]))
@@ -247,35 +265,28 @@ class TestHostileCommandsAsRealProcesses(unittest.TestCase):
         # this test's own subprocess.run() enforces, under any real
         # contention. This is a NAMED regression test for that exact
         # command, not just a member of the generated set: an explicit,
-        # tight, STATED budget (2000ms -- roughly 50x the ~36ms measured
-        # after the fix, and 5x tighter than the general 10s subprocess
-        # spawn timeout above), and the SPECIFIC expected outcome (refused,
+        # HARN-AUDIT-1 T1: the stated 2000ms budget is now a count (see
+        # TestOversizeCommandIsNeverParsed), and the SPECIFIC expected outcome (refused,
         # not merely "0 or 2"), naming the oversize reason.
-        WORST_CASE_BUDGET_MS = 2000
         oversize_command = HOSTILE_COMMANDS[4]
         self.assertGreater(len(oversize_command), guard.MAX_COMMAND_LENGTH_CHARS,
                             'sanity: HOSTILE_COMMANDS[4] must still be the over-cap command this test names')
         cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-worst-case-')
         try:
             subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd,
-                            capture_output=True, timeout=10)
+                            capture_output=True, timeout=HANG_DEADLINE_SECONDS)
             payload = json.dumps({
                 'tool_name': 'Bash',
                 'tool_input': {'command': oversize_command},
                 'cwd': cwd,
                 'hook_event_name': 'PreToolUse',
             })
-            start = time.monotonic()
+            # The cost bound is a count, not a clock: see TestOversizeCommandIsNeverParsed. Here the real process
+            # must refuse it, and the timeout below only bounds a hang.
             result = subprocess.run(
                 [sys.executable, GUARD_PATH], input=payload,
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=HANG_DEADLINE_SECONDS,
             )
-            elapsed_ms = (time.monotonic() - start) * 1000.0
-            self.assertLess(
-                elapsed_ms, WORST_CASE_BUDGET_MS,
-                'the 1 MiB command took %.1fms, over the explicit %sms worst-case budget '
-                '(PR #3 measured ~8-9s for this shape before MAX_COMMAND_LENGTH_CHARS existed)'
-                % (elapsed_ms, WORST_CASE_BUDGET_MS))
             self.assertEqual(
                 result.returncode, 2,
                 'an over-cap command must be REFUSED, not allowed -- it could still hide a real '
@@ -305,13 +316,11 @@ class TestOversizeGitSubstringDecision(unittest.TestCase):
             'cwd': cwd,
             'hook_event_name': 'PreToolUse',
         })
-        start = time.monotonic()
         result = subprocess.run(
             [sys.executable, GUARD_PATH], input=payload,
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_DEADLINE_SECONDS,
         )
-        elapsed_ms = (time.monotonic() - start) * 1000.0
-        return result, elapsed_ms
+        return result, None
 
     def test_a_70000_char_command_with_no_git_substring_is_allowed(self):
         # The exact shape measured against b9db050: over the cap, no `git`
@@ -323,17 +332,14 @@ class TestOversizeGitSubstringDecision(unittest.TestCase):
         self.assertNotIn('git', command, 'sanity: this command must contain no `git` substring at all')
         cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-oversize-no-git-')
         try:
-            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=10)
-            result, elapsed_ms = self._run(command, cwd)
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=HANG_DEADLINE_SECONDS)
+            result, _ = self._run(command, cwd)
             self.assertEqual(
                 result.returncode, 0,
                 'a large command with no `git` substring must be ALLOWED without being parsed -- '
                 'this hook runs on every Bash call, and refusing ordinary large writes (a heredoc, '
                 'generated test data) is exactly the noise that gets a guard disabled. '
                 'Got exit %s, stderr: %s' % (result.returncode, result.stderr))
-            self.assertLess(elapsed_ms, 2000,
-                             'the no-git allow path took %.1fms -- it must be a cheap linear scan, never a parse'
-                             % elapsed_ms)
         finally:
             subprocess.run(['rm', '-rf', cwd])
 
@@ -343,11 +349,10 @@ class TestOversizeGitSubstringDecision(unittest.TestCase):
         command = 'git reset --hard ' + ('A' * 1048576)
         cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-oversize-with-git-')
         try:
-            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=10)
-            result, elapsed_ms = self._run(command, cwd)
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=HANG_DEADLINE_SECONDS)
+            result, _ = self._run(command, cwd)
             self.assertEqual(result.returncode, 2,
                               'an over-cap command containing `git reset --hard` must still be refused')
-            self.assertLess(elapsed_ms, 2000, 'refusing an over-cap git command took %.1fms, over budget' % elapsed_ms)
         finally:
             subprocess.run(['rm', '-rf', cwd])
 
@@ -367,13 +372,178 @@ class TestOversizeGitSubstringDecision(unittest.TestCase):
         self.assertIn('git', command, 'sanity: the heredoc body must mention git')
         cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-oversize-heredoc-')
         try:
-            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=10)
-            result, elapsed_ms = self._run(command, cwd)
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=HANG_DEADLINE_SECONDS)
+            result, _ = self._run(command, cwd)
             self.assertEqual(
                 result.returncode, 2,
                 'an over-cap heredoc whose body mentions `git` is refused -- the accepted cost of '
                 'checking the raw text before heredoc stripping, not a bug')
-            self.assertLess(elapsed_ms, 2000, 'refusing an over-cap heredoc took %.1fms, over budget' % elapsed_ms)
+        finally:
+            subprocess.run(['rm', '-rf', cwd])
+
+
+class TestOversizeCommandIsNeverParsed(unittest.TestCase):
+    """HARN-AUDIT-1 T1: what the 2000ms budgets above protected, as a count. PR #3 measured split_segments() alone at about
+    8s on the 1 MiB command because shlex reads a token one character at a time, so the property is that a command over
+    MAX_COMMAND_LENGTH_CHARS never reaches any stage that scans it per character: not strip_heredoc_bodies, not
+    extract_command_substitutions, not split_segments, not the shlex tokeniser, and it starts no git subprocess. Each stage is
+    wrapped to count its calls while evaluate() decides the command in this process. No clock is read."""
+
+    STAGES = ['normalise_shell_text', 'strip_heredoc_bodies', 'extract_command_substitutions', 'split_segments']
+
+    def _calls_while_evaluating(self, command, cwd):
+        calls = {name: 0 for name in self.STAGES + ['shlex.shlex', 'subprocess.run']}
+        real = {name: getattr(guard, name) for name in self.STAGES}
+        real_shlex, real_run = guard.shlex.shlex, guard.subprocess.run
+
+        def counting(name, fn):
+            def wrapper(*args, **kwargs):
+                calls[name] += 1
+                return fn(*args, **kwargs)
+            return wrapper
+        try:
+            for name in self.STAGES:
+                setattr(guard, name, counting(name, real[name]))
+            guard.shlex.shlex = counting('shlex.shlex', real_shlex)
+            guard.subprocess.run = counting('subprocess.run', real_run)
+            verdict = guard.evaluate(command, cwd)
+        finally:
+            for name in self.STAGES:
+                setattr(guard, name, real[name])
+            guard.shlex.shlex = real_shlex
+            guard.subprocess.run = real_run
+        return verdict, calls
+
+    def test_an_over_cap_command_reaches_no_parsing_stage_and_starts_no_subprocess(self):
+        cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-never-parsed-')
+        try:
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=HANG_DEADLINE_SECONDS)
+            cases = [
+                ('the 1 MiB git reset --hard', HOSTILE_COMMANDS[4], True),
+                ('git reset --hard plus 1 MiB of padding', 'git reset --hard ' + ('A' * 1048576), True),
+                ('a heredoc body that mentions git', "cat <<'EOF' > f.txt\n" + 'please never run git reset --hard here\n' * 2000 + 'EOF\n', True),
+                ('a 70000-character write with no git', 'echo hi ' + ('x' * 70000), False),
+            ]
+            for label, command, refused in cases:
+                with self.subTest(label):
+                    self.assertGreater(len(command), guard.MAX_COMMAND_LENGTH_CHARS, 'sanity: over the cap')
+                    verdict, calls = self._calls_while_evaluating(command, cwd)
+                    self.assertEqual(verdict is not None, refused)
+                    self.assertEqual(calls, {name: 0 for name in calls},
+                                      'an over-cap command must be decided from its length and a `git` substring scan alone, '
+                                      'before any per-character stage or subprocess runs: %r' % calls)
+        finally:
+            subprocess.run(['rm', '-rf', cwd])
+
+    def test_the_counter_sees_every_stage_on_an_ordinary_command(self):
+        cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-counter-')
+        try:
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=HANG_DEADLINE_SECONDS)
+            _, calls = self._calls_while_evaluating('git status', cwd)
+            for name in self.STAGES + ['shlex.shlex']:
+                self.assertGreater(calls[name], 0, 'sanity: the counter must observe %s on a command that is parsed' % name)
+        finally:
+            subprocess.run(['rm', '-rf', cwd])
+
+
+class TestParsingWorkGrowsLinearly(unittest.TestCase):
+    """HARN-AUDIT-1 T5 (the cost bound carried from T1's review). T1 replaced the wall-clock assertions with call counts,
+    which cannot see super-linear work INSIDE one call, and a PreToolUse hook that times out lets the command run. This
+    measures the work itself, deterministically: evaluate() is run for each hostile shape at two sizes, 32768 and 65536
+    characters (the cap itself), under a trace that counts every executed line of Python in the guard and in shlex, and the
+    count per character at the larger size must stay within MAX_PER_CHAR_GROWTH of the count per character at the smaller.
+    No clock is read, so load cannot move it, and there is no retry to hide anything behind.
+
+    What it cannot see: time spent inside one C call (a regex scan, str.find, a list copy), which executes no Python
+    lines. Those are bounded by the length cap rather than by this test, and the scanner's own C-level searches are
+    arranged to be linear (see skip_heredoc_bodies)."""
+
+    SMALL = 32768
+    BIG = guard.MAX_COMMAND_LENGTH_CHARS
+    # Work per character may grow by this factor between the two sizes. Exactly linear work holds it at 1.0 (fixed start-up
+    # work makes it fall slightly), doubling the input of quadratic work doubles it, so 1.25 separates the two with room for
+    # lines that run once per thousand characters.
+    MAX_PER_CHAR_GROWTH = 1.25
+
+    @staticmethod
+    def _repeat(prefix, unit, suffix, size):
+        return prefix + unit * max(1, (size - len(prefix) - len(suffix)) // len(unit)) + suffix
+
+    def _shapes(self):
+        rep = self._repeat
+        return {
+            'one long token': lambda n: rep('git reset --hard ', 'A', '', n),
+            'many segments': lambda n: rep('', 'git status;', '', n),
+            'comment on every line': lambda n: rep('', 'echo a # c\n', 'git status', n),
+            'mid-word hash': lambda n: rep('', 'echo a#b;', 'git status', n),
+            'a long run of continuations': lambda n: rep('git status ', '\\\n', '--short', n),
+            'operator then newline': lambda n: rep('', 'echo a &&\n', 'git status', n),
+            'parentheses beside operators': lambda n: rep('', '(a);(b)&&', 'git status', n),
+            'parameter expansions with hashes': lambda n: rep('', 'echo ${X:-a #b};', 'git status', n),
+            'backtick comments': lambda n: rep('', 'echo `#c`;', 'git status', n),
+            'bare carriage returns before hashes': lambda n: rep('', 'echo a\r#;', 'git status', n),
+            'quoted run': lambda n: rep("git commit -m '", 'a b ', "'", n),
+            'many substitutions': lambda n: rep('', 'echo $(true);', 'git status', n),
+            'one deep substitution': lambda n: '$(echo ' * ((n - 16) // 8) + 'x' + ')' * ((n - 16) // 8),
+            'heredoc with a long body': lambda n: rep("cat <<'EOF'\n", 'text git\n', 'EOF\ngit status', n),
+            'unterminated heredoc markers': lambda n: rep('', '<<A\n', '', n),
+            'distinct unterminated markers': lambda n: ''.join('<<H%d\n' % i for i in range(n // 9)),
+            'dynamic pathspecs': lambda n: rep('git checkout -- ', '"$X" ', '', n),
+            'nested parens': lambda n: '( ' * ((n - 16) // 4) + 'git status' + ' )' * ((n - 16) // 4),
+        }
+
+    def _steps(self, command, cwd):
+        files = {GUARD_PATH, getattr(shlex, '__file__', None)}
+        steps = [0]
+
+        def local(frame, event, arg):
+            if event == 'line':
+                steps[0] += 1
+            return local
+
+        def global_trace(frame, event, arg):
+            return local if frame.f_code.co_filename in files else None
+        previous = sys.gettrace()
+        sys.settrace(global_trace)
+        try:
+            guard.evaluate(command, cwd)
+        finally:
+            sys.settrace(previous)
+        return steps[0]
+
+    def test_the_step_counter_restores_the_tracer_that_was_installed_before_it(self):
+        # A coverage run installs its own tracer. Clearing it to None would leave
+        # every later test in the process unmeasured.
+        def sentinel(frame, event, arg):
+            return None
+        original = sys.gettrace()
+        sys.settrace(sentinel)
+        try:
+            self._steps('git status', tempfile.gettempdir())
+            restored = sys.gettrace()
+        finally:
+            sys.settrace(original)
+        self.assertIs(restored, sentinel)
+
+    def test_work_at_the_cap_is_within_a_linear_factor_of_work_at_half_the_cap(self):
+        cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-linear-')
+        try:
+            subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=cwd, capture_output=True, timeout=HANG_DEADLINE_SECONDS)
+            for name, build in self._shapes().items():
+                small, big = build(self.SMALL), build(self.BIG)
+                self.assertLessEqual(len(big), guard.MAX_COMMAND_LENGTH_CHARS, '%s: the big input must not be over the cap' % name)
+                self.assertGreater(len(big), 1.5 * len(small), '%s: the two sizes must really differ' % name)
+                with self.subTest(shape=name):
+                    work_small = self._steps(small, cwd)
+                    work_big = self._steps(big, cwd)
+                    self.assertGreater(work_small, 100, 'the counter must see the guard parse the input (%d steps)' % work_small)
+                    per_char_small = work_small / len(small)
+                    per_char_big = work_big / len(big)
+                    self.assertLessEqual(
+                        per_char_big, self.MAX_PER_CHAR_GROWTH * per_char_small,
+                        '%s: %d steps at %d characters but %d at %d, so the work per character grew from %.3f to %.3f; '
+                        'linear work keeps it flat and quadratic work doubles it'
+                        % (name, work_small, len(small), work_big, len(big), per_char_small, per_char_big))
         finally:
             subprocess.run(['rm', '-rf', cwd])
 
@@ -385,7 +555,7 @@ class TestHostilePayloadShapes(unittest.TestCase):
     def _run_raw(self, stdin_text, cwd=None):
         result = subprocess.run(
             [sys.executable, GUARD_PATH], input=stdin_text,
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=HANG_DEADLINE_SECONDS,
             cwd=cwd,
         )
         return result
@@ -435,7 +605,7 @@ class TestHostilePayloadShapes(unittest.TestCase):
         os.makedirs(weird, exist_ok=True)
         try:
             subprocess.run(['git', 'init', '-q', '-b', 'master'], cwd=weird,
-                            capture_output=True, timeout=10)
+                            capture_output=True, timeout=HANG_DEADLINE_SECONDS)
             payload = json.dumps({
                 'tool_name': 'Bash',
                 'tool_input': {'command': 'git reset --hard'},
@@ -444,7 +614,7 @@ class TestHostilePayloadShapes(unittest.TestCase):
             })
             result = subprocess.run(
                 [sys.executable, GUARD_PATH], input=payload,
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=HANG_DEADLINE_SECONDS,
             )
             self.assertIn(result.returncode, (0, 2))
             self.assertNotIn(TRACEBACK_MARKER, result.stderr)

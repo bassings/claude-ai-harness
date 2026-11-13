@@ -45,3 +45,8 @@ coverage/
 # it, and ignoring it is what makes the mistake impossible rather than
 # discouraged.
 .claude/blocked-on-human
+
+# Python coverage data. A binary that embeds absolute paths from the machine
+# that produced it; the leak scan reads binaries and caught it tracked.
+.coverage
+.coverage.*

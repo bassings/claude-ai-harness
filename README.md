@@ -52,6 +52,35 @@ Then run the workflows namespaced:
 
 ### Manual copy (per-user, unnamespaced)
 
+The installer accepts an empty directory, a directory holding `settings.json`
+or `projects/` (a fresh `~/.claude`), and an existing install (`AGENT-HARNESS.md`,
+`workflows/` or `skills/`). It refuses, writes nothing, and prints the one
+command that proceeds anyway, for any other non-empty directory and for any
+directory holding a typical home-directory entry (`.zshrc`, `.bashrc`,
+`.bash_profile`, `.profile`, `.ssh`, `.config`, `Documents`, `Desktop`, `Library`
+or `Downloads`),
+whatever markers it also holds. Each file is written to a temporary name beside
+its destination and renamed into place, so a stopped install never leaves a
+half-written file at the destination. If an install is killed outright
+(`SIGKILL`), one `<file>.harness-tmp.<pid>` stray can remain beside the
+destination; it is never at the destination path, nothing loads it, and it is
+safe to delete by hand. The installer never deletes one, because it may belong
+to an install that is still running. A destination file that was a symlink is
+replaced by a regular file (the install says so, naming the link target), and its
+backup holds the target's bytes, not the link. A directory where a file should go
+stops the install. If an install stops part-way it says so ("INCOMPLETE"), how
+many files it had updated, and to re-run it or restore from the printed backup
+directory. That restores files the install overwrote; files it added are in its
+`updated:` lines and stay until you delete them by hand.
+Run one install at a time: two installs into the same destination at once can
+stop each other with INCOMPLETE, because each checks its backup against a file
+the other has just replaced. Nothing is lost; re-run the installer.
+Before it replaces a file that differs, it copies the old
+version under `~/.claude/.harness-backups/<UTC timestamp>/` and prints that
+path; the newest 10 backup directories are kept. It warns, naming which, when
+the checkout is not on the default branch or has uncommitted changes to tracked
+files, because that code goes live on your next session.
+
 ```bash
 git clone https://github.com/bassings/claude-ai-harness
 claude-ai-harness/bin/install.sh            # install, then verify
@@ -383,13 +412,15 @@ conductor pieces make that state unrepresentable:
   not (see `docs/plan-guard-reasons-mutation-proofs.md`).
 
 Installing as a plugin wires the hook automatically. For manual installs,
-copy the hook and add to `~/.claude/settings.json`:
+copy the hook and add to `~/.claude/settings.json`, substituting your own
+home directory for the placeholder (`args` is not tilde-expanded, see the
+destructive git guard section below):
 
 ```json
 {
   "hooks": {
     "Stop": [{ "hooks": [{ "type": "command", "command": "python3",
-      "args": ["~/.claude/hooks/plan-guard-stop.py"], "timeout": 10 }] }]
+      "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/plan-guard-stop.py"], "timeout": 10 }] }]
   }
 }
 ```
@@ -511,7 +542,54 @@ past it.
   substitution are extracted (nesting depth-counted, and never one sitting
   inside single quotes, which bash never expands) and independently
   re-evaluated the same way, so `echo $(git reset --hard)` is caught while
-  `echo '$(git reset --hard)'` stays inert text. `bash -c`/`sh -c`/
+  `echo '$(git reset --hard)'` stays inert text. Before any of that the text
+  is read as the shell reads it: a backslash-newline outside single quotes
+  joins the two lines, and a `#` comment (which starts only at the beginning
+  of a word, never in the middle of one or inside quotes) ends at its own
+  newline, so the line after a comment is still checked. A pathspec the
+  shell builds at run time (`$X`, `${X}`, `$(...)`, backticks, `{a,b}`) on
+  `git checkout`/`git restore` is whole-tree scope, so a dirty tracked file
+  anywhere refuses it. The operand of `--detach`, `-t`/`--track` and
+  `--source`/`-s` is a ref, so those are not refused, and `git checkout -`
+  is not either. A bare run-time word with nothing to say whether it is a
+  branch or a file IS refused on a dirty tree, and so is any `@{...}`: that
+  is a documented over-block, because a file reverted by mistake is lost and
+  a refusal costs one retry with the override
+  (`HARNESS_ALLOW_DESTRUCTIVE_GIT=1`, put immediately before the git command
+  that was refused, or before the wrapper if it runs through `env`, `xargs`,
+  `command`, `nohup`, `exec` or `timeout`). For a branch switch, `git switch -` or a literal branch
+  name is not refused.
+  These commands, which a guard that read `@{...}` as git's ref syntax would
+  have let through, are refused while a tracked file is dirty:
+  `git checkout @{-1}`, `git checkout @{u}`, `git checkout HEAD@{1}`,
+  `git checkout master@{1}`, `git checkout "$BRANCH"` and
+  `git checkout ${BRANCH:-master}`. The reason is that `@{a,b}` is a brace
+  expansion that names two files (bash and zsh both print `@a @b`), and a
+  lone `@{1}` is a file name in a pathspec position, so the text alone does
+  not say which one it is. An operator (`&&`, `||`, `;`, `|`, `&`) or parenthesis at the end of a line, or beside another one, no longer hides the next command: the tokeniser read such a run as one token, so the text is spaced around them first. A refusal does not print the refused command: a hint rebuilt from the
+  guard's own tokens once turned an inert single-quoted `$(...)` into a live
+  one. It says to put `HARNESS_ALLOW_DESTRUCTIVE_GIT=1` immediately before
+  the git command that was refused, or immediately before the wrapper when
+  the git call runs through `env`, `xargs`, `command`, `nohup`, `exec` or
+  `timeout` (the shell cannot run it between the wrapper and git, and `env`
+  refuses it there). The inline form applies to that one command, not the
+  whole line: a line with more than one refused git command needs it on each,
+  inside a `$(...)`, a loop or an `if` it goes on the git call there, and in
+  front of `git status && git reset --hard` it would not cover the reset. In
+  a loop or `if`, start the git call on its own line or after `;` or `&&`,
+  not directly after `do` or `then` (see the known-gaps row). Exporting it
+  for the session also works but switches the guard off for everything in
+  that session. The
+  refusal also says which parsing class applied. A
+  `zsh -c` refusal names `zsh -c` as the class that fired, because its body is
+  only checked at all as zsh is unwrapped. A `dynamic pathspec` refusal has
+  its own text. For `comment continuation`, `backslash continuation` and
+  `adjacent operators` the refusal lists them as constructs the command also
+  uses, once at the end, and does not claim the refusal depended on them: the
+  guard does not re-run the match without each one. If the guard itself
+  raises, the command is still allowed (as for any shape it cannot parse),
+  and a `systemMessage` and an `additionalContext` on stdout say it was NOT
+  checked, naming only the exception class. `bash -c`/`sh -c`/`zsh -c`/
   `bash -lc SCRIPT`, and the `nohup`, `sudo` (including `sudo -u <user>`),
   `timeout <n>`, `xargs`, `env` (including `env -i`), `command` and `exec`
   prefix wrappers, are unwrapped and their inner command fed back through
@@ -586,16 +664,29 @@ measured, none is guarded, and none is planned to be.
 |---|---|---|
 | Repository retargeting through a wrapper | `env GIT_DIR=<other>/.git git clean -fd` | The clean/stash fail-closed rule reads the env prefix on the segment itself, and `env` hides it one level down. The other repository's untracked files or stash entries go, unmeasured. |
 | Repository retargeting already in the environment | `export GIT_DIR=...` in the shell that launched the session, then `git clean -fd` | The guard scrubs `GIT_*` from its own measuring call, which is what stops a leaked variable making it read the wrong repo -- but the real command still obeys the variable, so the two look at different repositories. Measured with a clean cwd and untracked work in the target: ALLOWED, and the real run deleted it. |
-| A pathspec that is not a literal token | `git checkout -- $(cat list)`, `git checkout -- "$FILES"` | The substitution or variable is not a path this guard can resolve, and it is dropped rather than read as "unknown", so the scope narrows to nothing and a dirty file is reverted. |
+| A run-time pathspec on a command other than `checkout`/`restore` | `git clean -fd "$X"`, `git clean -fd -- "$X"`, `git clean -fd ${X}` | `git checkout` and `git restore` read a pathspec containing `$`, a backtick, `$(...)`, `{...}` or a leading `~` as whole-tree scope (class `dynamic pathspec`), so a dirty tracked file anywhere refuses them. `git clean` does not for a variable or a brace: its dry run measures the pathspec as literal text, which matches nothing, so untracked files go unmeasured. A `$(...)` or backtick substitution IS handled: it is dropped from the dry run, which widens it to everything the other arguments select, so `git clean -fd -- $(cat list)` is refused. Not detected. |
 | An apostrophe inside a double-quoted string | `git commit -m "don't" && echo $(git reset --hard)` | Substitution extraction flips into single-quote mode at the apostrophe, so every `$(...)` and backtick after it on the line is never looked at. |
 | `-n` where it is not a flag | `git clean -f -e -n`, `git clean -f -- -n` | Any `-n` token anywhere reads as `--dry-run`, so the invocation is treated as harmless and never measured. Measured: `git clean -f -e -n` was ALLOWED and the real run deleted every untracked file in the tree. |
-| Nesting past `MAX_UNWRAP_DEPTH` | six or more stacked `bash -c` / `$(...)` layers | Past the bound everything fails OPEN, the clean and stash rules included, so these two lose their fail-closed posture exactly where an adversary would put them. |
+| Nesting past `MAX_UNWRAP_DEPTH` | six or more stacked `bash -c` / `$(...)` layers | Past the bound everything fails OPEN, with no notice, the clean and stash rules included, so these two lose their fail-closed posture exactly where an adversary would put them. |
 | `git stash store` | `C=$(git stash create) && git stash store "$C" && git stash drop` | `store` is treated as a non-push, so the entry it adds is not counted and the following drop is allowed. The working tree survives, so this one costs a dangling commit rather than live work. |
 | `eval` | `eval 'git reset --hard'` | Never unwrapped at all. |
 | A substitution as the binary path | `$(which git) checkout -- file` | The guard cannot resolve what the substitution prints, so it never recognises the invocation as `git`. |
-| Shell and wrapper flags not modelled | `sh -ec`, `bash -xc`, `timeout -k 5 5`, `xargs -I {}` | The wrapper is not recognised, so the inner command is never reached. |
+| Process substitution | `echo >(git reset --hard)`, `cat <(git reset --hard)` | The body of `<(...)` and `>(...)` is never extracted, so it is never matched. |
+| ANSI-C quoting | `echo $'a\'b'; git reset --hard` | The `\'` inside `$'...'` is read as closing a single quote, so the rest of the line is treated as quoted. |
+| A heredoc marker the shell does not read as one | `echo "a <<EOF"`, `echo a <<<EOF`, `echo $((1<<2))`, each followed by a newline, `git reset --hard`, a newline and `EOF` | The here-document stage matches `<<WORD` anywhere in the text, so the lines after such a marker are blanked as if they were a body. Found while checking the comment class; not fixed by it. Not detected. |
+| A quoted parenthesis inside `$(...)` | `echo $(echo ')'); git checkout -- file` | The substitution extractor counts parentheses without reading quotes, so it ends the substitution at the quoted `)` and the rest of the line is treated as inside it. Measured: bash and zsh both revert the file, the guard does not refuse. Not detected. |
+| A trailing lone backslash | `git reset --hard \`, `git checkout -- file \` | The tokeniser rejects the dangling escape, and an unparseable command fails open (with no notice, because nothing raised). bash drops the backslash and runs the command. Not detected. |
+| Abbreviated long options | `git reset --har`, `git checkout --forc master` | Long flags are matched exactly. git accepts any unique prefix, and a prefix of `--hard` or `--force` reverts the tree. Not detected. |
+| Many destructive lines in one command | 65,535 characters of `git reset --hard` lines in a clean tree | Each line starts its own `git status`: 3,855 runs, about 35 seconds measured on one machine, and nothing caps the total. A slower machine could pass the 60-second hook timeout, and a timed-out hook lets the command run. Not detected. |
+| Shell and wrapper flags not modelled | `sh -ec`, `bash -xc`, `zsh -fc`, `zsh -ic`, `zsh -l -c`, `zsh --no-rcs -c`, `timeout -k 5 5`, `xargs -I {}` | The wrapper is not recognised, so the inner command is never reached. Only `-c` and `-lc` are read, for `bash`, `sh` and `zsh`. Not detected. |
+| Shells other than `bash`, `sh` and `zsh` | `dash -c`, `ksh -c`, `fish -c`, `busybox sh -c`, `env -S '...'` | Not unwrapped, so the inner command is never reached. |
+| A script fed to a shell on its standard input | `echo 'git reset --hard' \| zsh`, `zsh <<< 'git reset --hard'` | Nothing on the command line names the script, so it is never matched. |
+| A command built at run time or defined elsewhere | `f() { git reset --hard; }; f`, `G=git; $G reset --hard`, `zsh -c "$(echo git reset --hard)"` | The destructive text is never a literal token in a position the guard reads. |
 | A here-document fed to a shell | `bash <<'EOF'` ... `EOF` | Heredoc bodies are blanked uniformly before matching, which is right for the inert case (`cat <<EOF`) and wrong for this one. |
-| Input the tokeniser cannot parse | an unbalanced quote | Fails open by design; the guard only ever refuses a shape it positively identifies. |
+| Input the tokeniser cannot parse | an unbalanced quote, ANSI-C quoting such as `echo $'it\'s'; git reset --hard`, a trailing lone backslash | The command is allowed with no notice: nothing raised, so the "NOT checked" message that a guard exception produces is not sent either, and neither the user nor Claude is told the command was never read. The guard only ever refuses a shape it positively identifies. Not detected. |
+| An assignment directly after a shell keyword | `for x in f; do FOO=1 git reset --hard; done`, and the same after `then`, `else`, `elif ...; then`, `{`, `!`, `time`, and `do` of a `while` or `until` loop | The keyword is stripped before the assignment, so the guard sees `FOO=1` as the command and never reads the git call after it. Any variable name does it, `HARNESS_ALLOW_DESTRUCTIVE_GIT` included, so there the override is neither needed nor checked. The same lines without the assignment are refused; `(`, `&&`, `;` and a newline before the assignment are refused too. Present on main. Not detected. |
+| A `cd` on the left of a background operator | `cd <clean directory> & git reset --hard`, and the same with `&\|` or `&!` | The guard moves its dirty check into the clean directory, but the shell runs the next command in the original one, so the dirty tree is reset. `\|` and `\|&` are handled (the `cd` runs in its own subshell); `&`, `&\|` and `&!` are not. The `&` form is the same on main. Not detected. |
+| Heredoc delimiters spelled `<<\EOF`, `<<"E-F"` or `<<E.F` | `cat <<\EOF`, a line with an apostrophe, `EOF`, then `git checkout -- file` | The delimiter pattern reads only plain words, so these markers are misread, the apostrophe in the body opens a quote, and the text is unparseable and fails open. bash and zsh both revert the file. Not detected. |
 | The oversize shortcut's `git` test | 65,536+ characters containing `g''it` but not `git` | Over the parsing cap, a command with no literal `git` substring is allowed unparsed. Quote removal defeats the substring test. |
 
 Writing or quoting a guarded command as inert TEXT -- inside a here-document
@@ -622,13 +713,21 @@ exits 2. Substitute your own home directory below.
   "hooks": {
     "PreToolUse": [{ "matcher": "Bash", "hooks": [
       { "type": "command", "command": "python3",
-        "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/destructive-git-guard.py"], "timeout": 10 },
+        "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/destructive-git-guard.py"], "timeout": 60 },
       { "type": "command", "command": "python3",
         "args": ["/ABSOLUTE/PATH/TO/HOME/.claude/hooks/git-snapshot.py"], "timeout": 10 }
     ] }]
   }
 }
 ```
+
+**Already installed by hand from an earlier README?** Raise the guard's
+`timeout` in your `settings.json` to 60 (earlier copies of this snippet said
+10) and replace any `~` in `args` with an absolute path. A PreToolUse hook that
+times out does not block the command, it lets it run, so a 10 second timeout
+turns a slow git call into a silent allow of the command the guard exists to
+refuse; and `args` is not tilde-expanded, so a `~` path makes the hook exit 2
+and refuse every Bash call.
 
 **What is, and is not, protected before you rely on either mechanism:**
 the snapshot mechanism below does NOT cover untracked files, ignored files
@@ -1368,54 +1467,137 @@ anchored to that specific message, not a bare grep for the ceiling
 variable's name, which used to false-positive on any transcript merely
 mentioning it (this README does, right here).
 
-**Permission constraints on the unattended job -- defence in depth, not a
-boundary.** `claude -p` runs here with `--disallowedTools` denying the
-destructive and outward-facing operations this read-only job never needs:
-`Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`, `Bash(git commit:*)`,
-`Bash(git reset:*)`, `Bash(gh pr merge:*)`, `Bash(gh pr create:*)`,
-`Bash(gh issue create:*)`, `Bash(gh release create:*)`,
-`Bash(gh workflow run:*)`, `Bash(curl:*)`, `Bash(wget:*)`, alongside
-`--settings '{"disableAllHooks": true}'` (see the plan-guard note below).
-Both are real: verified empirically, end to end, against a throwaway repo
-with both flags applied, a well-formed report was still produced (exit 0),
-and every one of the listed tools genuinely refused when invoked directly.
-**They are not a sandbox, and nothing here claims they are one.** The same
-real run showed `Write`, `Edit`, `mv` and `python3 -c` all succeed under
-this exact flag set -- `--disallowedTools` denies only its literal
-enumerated targets, and `--settings` **merges** with (does not replace)
-the global `defaultMode: auto`, so a tool not on the list is still
-reachable. The actual containment for this job is the prompt's own
-read-only instruction plus the fact that the verdict never trusts what the
-model says (PASS/FAIL above); these flags are real, additional defence in
-depth behind that, not a second, independent boundary. `--permission-mode
-plan` was considered and rejected: plan mode would prevent the optimiser
-writing the report this script's own verdict depends on, silently trading
-a permission problem for a job that runs and produces nothing.
-`test/static-checks.test.js` pins the exact deny tokens and the
-`disableAllHooks` blob in the script text, so neither can be quietly
-dropped -- deleting either previously left the whole weekly-runner test
-suite green, since every test there drives a stub `claude`, never the real
-flags.
+**Permission constraints on the unattended job -- an explicit allowlist, with
+the hooks left on.** `claude -p` runs here with `--allowedTools` naming every
+tool the optimiser needs (read-only git and gh queries, the two node helpers
+the workflow invokes, and `Edit` on exactly two scratch files, below) and
+`--permission-mode dontAsk`, which refuses every tool not on the list rather
+than prompting or auto-approving it, and `--setting-sources user`, so only the
+user's own settings load and an analysed repo's committed or local settings
+cannot widen the list or add hooks (the guard, snapshot and plan-guard hooks
+are registered at user level, so they stay). `--setting-sources user` also
+loads the operator's own `permissions.allow` rules from
+`~/.claude/settings.json`, and any such rule joins the unattended allowlist,
+so the list above is the boundary only when the operator has no user-level
+allow rules. Agents defined inside an analysed repo (`.claude/agents/`) are not
+loaded under `--setting-sources user`, and a built-in subagent started by the
+session was refused both a write outside the repo and an unlisted Bash
+command; agents the operator has installed at user level do load, and are
+trusted as the operator's own. `--disallowedTools` stays as a second,
+explicit refusal of `Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`,
+`Bash(git commit:*)`, `Bash(git reset:*)`, `Bash(gh pr merge:*)`,
+`Bash(gh pr create:*)`, `Bash(gh issue create:*)`,
+`Bash(gh release create:*)`, `Bash(gh workflow run:*)`, `Bash(curl:*)` and
+`Bash(wget:*)`, plus `git -c` in its `-C` form. The hooks are **not**
+disabled: the destructive-command guard and the snapshot hook stay active for
+the unattended session.
 
-**The plan-guard Stop hook is the one measured mutation source, and
-`disableAllHooks` genuinely stops it.** Measured 2026-08-16: the
-globally-installed conductor plan-guard Stop hook touched
-`.claude/active-plan` in both delivery repos during the real run, as a
-side effect of the background workflow the optimiser launches -- nothing
-this script does, but a mutation of the analysed repo all the same.
-`--settings '{"disableAllHooks": true}'` stops that hook firing for this
-one invocation (verified empirically: `.claude/active-plan`'s mtime was
-unchanged after a real run against a repo with the identical hook wired
-and an open-task plan active). There is no postcondition checking this
-after the fact any more (see the subtraction-round note above for why).
+**No allowed command may send data to a host the session chooses.** `Read`,
+`Grep` and `Glob` can read any file this user can read, so the boundary is
+egress, not readability. `gh repo view` is not on the list (the workflow never
+runs it, and with a `HOST/OWNER/REPO` argument it sends a request to any
+host), and `-R`, `--repo` and `--hostname` are denied on every `gh` command,
+in their attached and separate forms and inside a short-flag cluster
+(`Bash(gh * -R*)`, `Bash(gh * -*R*)`, `Bash(gh * --repo*)`,
+`Bash(gh * --hostname*)` and the same at the front of the command), as are the
+`GH_HOST=` and `GH_REPO=` prefixes. `gh run list` and `gh run view` therefore
+reach only the host the analysed repo's own remote names. `git -C` and the
+`optimise-report-ignore.mjs` helper (which writes `<root>/.git/info/exclude`
+and runs git there) are allowed only with `<root>` naming the analysed repo
+itself, never a wildcard path, because git run in a directory someone planted
+reads that directory's config, which can name a program git executes. A repo
+whose path a rule cannot name exactly gets no such rule, and the log says
+`NO-ROOTED-RULES <label>`. These are deny and prefix rules; whether the CLI
+matches every spelling is for a real headless run to show.
+`test/static-checks.test.js` pins the deny tokens and the allowlist flags in
+the script text, and `test/weekly-runner.test.js` captures the real argument
+list. The test suite still drives a stub `claude`. Real headless probes
+under the runner's flags were run by hand during review: the `gh`
+host-naming forms were refused, `git remote get-url origin` was allowed and
+`git remote set-url` refused, and `safe.bareRepository` reached the session's
+git. The full real weekly run is recorded in `docs/release-checklist.md` when
+it happens.
+
+**The session never writes under `.claude/`.** Measured on a real headless
+run (Claude Code 2.1.322, `dontAsk`): every write into `.claude/` is refused
+whatever the allow rule. So the runner names two scratch files in a
+directory of this one run's own (below) and passes them to the workflow as `report_path` and
+`proposal_targets_path`; the session may `Edit` those two files and nothing
+else, and writes no other file. After the session ends the runner, not the
+session, moves each into place (`.claude/optimise-cycle-report.md` in the
+repo, and the sidecar under the main checkout the optimiser resolved). It
+accepts a file only if it is a regular file (not a symlink), non-empty and
+under a size cap, and moves it through a fresh temp file and a rename, so
+nothing is written through a symlink. A file that is present and refused makes
+the repo FAIL with the reason; one that is absent is reported by the verdict
+as a missing or stale report. The scratch path must be a plain absolute path
+with no `.claude` segment, so with `$TMPDIR` unset and `~/.claude` as the
+fallback the run stops with a FAIL (launchd always sets `$TMPDIR`).
+
+**The plan-guard Stop hook rewrites a dormant plan marker, and the runner puts
+it back.** Measured: the hook rewrote a dormant `.claude/active-plan` (a stale
+conductor line) to an absolute plan path with `conductor: <the headless
+session id>`. Each run is given `--session-id <uuid>`, the runner saves the
+marker's bytes first, and afterwards restores them byte for byte only if the
+marker now carries that uuid, so a real conductor's concurrent change is never
+overwritten (a marker that did not exist before and now carries the uuid is
+removed). `RESTORED-ACTIVE-PLAN <label>` is logged when that happens, and the
+restore runs from the same cleanup path, so a signal still restores. A
+SIGKILL skips it. This does not stop the hook from blocking the headless
+session's own stop while plan tasks are open, and the real conductor is
+treated as a bystander for the length of the run. Separately, the snapshot
+hook still writes `refs/harness-snapshots/*` in every analysed repo on each
+weekly run; nothing here prevents that.
+
+**A FAIL is announced, and cleanup is the runner's job.** When any repo's
+verdict is FAIL, no repos are configured, or every configured path is skipped
+(`no repos checked (all skipped)`), the run raises one macOS
+notification naming the failing repo labels and the first reason, and writes
+one line to `~/.claude/logs/optimise-cycle-weekly.last-result` (UTC timestamp,
+PASS or FAIL, labels, reasons) that stays until the next run overwrites it. A
+notifier that fails leaves `NOTIFY-FAILED <exit code>` in the run log. The
+transcript temp file and the staged `optimise-cycle.js` are removed on exit
+and on SIGTERM or SIGINT, and a run that is stopped that way records FAIL and
+notifies like any other FAIL. Each invocation makes a directory of its own,
+`run.XXXXXX` (from `mktemp -d`), inside a mode-700 parent that only the runner
+writes to (`optimise-weekly-runner` under `$TMPDIR`, or under `~/.claude` when
+that is unset), and every per-run file (transcript, scratch report and sidecar,
+plan-marker snapshot, staleness clone) lives in it, so overlapping runs, or a
+run overlapping a test, never share a file name. The run removes its own
+directory on exit, after the outputs are placed and the plan marker restored.
+The parent is checked after it is created (not a link, owned by this user, its
+physical path as expected) and only then chmodded. At start-up a run removes
+only stale `run.XXXXXX` directories: real directories (links are not followed)
+owned by this user and older than 24 hours, which is longer than any run can
+last (the 21-minute session timeout per repo), logging
+`REMOVED-STALE-RUN-DIR <name>`. A sibling's fresh directory is never touched.
+There is no lock. After a SIGKILL the dead run's directory therefore stays for
+up to 24 hours, and its plan-marker snapshot is not used to restore a marker
+that carries the dead session's id (the conductor's own six-hour staleness rule
+re-claims it). The next run also recognises a killed run's staged copy by a
+marker, removes it if git does not track it, and logs
+`REMOVED-LEFTOVER-STAGED <label>`. The outcome file reads `RUNNING` from the
+moment a run starts, so a run that dies without reporting leaves `RUNNING`,
+not last week's result, and a failed write of it is logged as
+`LAST-RESULT-WRITE-FAILED`. If the plan marker cannot be restored (the
+snapshot is missing or the write fails) it is left exactly as it was,
+`RESTORE-FAILED-ACTIVE-PLAN <label>` is logged and the repo FAILs.
 
 **Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
 and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
 repo's `bin/`** after merging any change to them. Unlike the top-level
 workflow scripts above, copying these genuinely does deploy them: launchd
 spawns a fresh shell process per run, which reads the file at exec, so there
-is no snapshot and no restart step. The `diff -q` pair is therefore a
-sufficient check here, not merely a necessary one:
+is no snapshot and no restart step. **The runner also requires the matching
+`workflows/optimise-cycle.js`**: it passes the workflow arguments
+(`report_path`, `proposal_targets_path`) that an older installed workflow does
+not accept, so updating the runner without the workflow makes every repo
+FAIL. Run `bin/install.sh` (which installs `workflows/`) and confirm with
+`bin/install.sh --check`, as well as the copy commands below; a run that finds an installed `optimise-cycle.js`
+whose `WEEKLY_RUNNER_CONTRACT` constant is missing or lower than the runner's
+`REQUIRED_WORKFLOW_CONTRACT` stops with `installed optimise-cycle.js predates
+report_path; run bin/install.sh`. The `diff -q` pair below confirms the `bin/`
+copies only, so it is necessary but not sufficient on its own:
 
 ```bash
 cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
@@ -1484,6 +1666,13 @@ rm ~/Library/LaunchAgents/com.local.optimise-cycle-weekly.plist
 ```
 
 To reinstate it later, re-run the two-line `sed`/`bootstrap` install above.
+
+If the job was ever killed with SIGKILL before the rollback, also delete
+`.claude/workflows/.optimise-cycle.js.staged` in each configured repo, and
+`.claude/workflows/optimise-cycle.js` there if it is byte-identical to that
+marker and untracked. The pre-T11 runner knows nothing of the marker and reads
+any existing workflow file as the repo's own, so a stale copy would otherwise
+stay pinned and override later global updates with no log line.
 
 **This rollback has been executed, not merely documented** (2026-08-18, per
 CLAUDE.md §11: a documented rollback nobody has run is an assumption). The

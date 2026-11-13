@@ -1335,9 +1335,9 @@ export function normaliseJobName(name) {
 // HARN-OPT-4 T7 (AC-SEC-11): a run id is interpolated into
 // `gh run view <id>` by the lane, so only an integer or an all-digit string
 // is ever accepted; anything else is ignored and never echoed.
-const RUN_ID_RE = /^[0-9]+$/
+const RUN_ID_RE = /^\d+$/
 const validRunId = (id) => (typeof id === 'number' ? Number.isSafeInteger(id) && id >= 0 : typeof id === 'string' && RUN_ID_RE.test(id))
-const FETCH_MODES = ['rate_limited', 'unauthenticated', 'other']
+const FETCH_MODES = new Set(['rate_limited', 'unauthenticated', 'other'])
 
 // CI waste (spec item 3): expects an array of {workflow, job, conclusion,
 // started_at, duration_s} already extracted by the agent step from `gh`
@@ -2040,7 +2040,7 @@ function runCiCommand(payload) {
     // and read as never failed, and the removal brake trusts that floor.
     if (seen.has(id)) continue
     seen.add(id)
-    poolRuns.push({ id, repo: run.repo, completed: run.status === 'completed', t: typeof run.started_at === 'string' ? Date.parse(run.started_at) : NaN })
+    poolRuns.push({ id, repo: run.repo, completed: run.status === 'completed', t: typeof run.started_at === 'string' ? Date.parse(run.started_at) : Number.NaN })
     // AC-OPS-10: an in-flight run has unsettled conclusions.
     if (run.status !== 'completed') {
       stats.notCompleted += 1
@@ -2048,14 +2048,14 @@ function runCiCommand(payload) {
     }
     // AC-OPS-11: a failed per-run fetch is counted by mode; an unknown mode is "other".
     if (run.fetch_error) {
-      stats.fetchFailures[FETCH_MODES.includes(run.fetch_error) ? run.fetch_error : 'other'] += 1
+      stats.fetchFailures[FETCH_MODES.has(run.fetch_error) ? run.fetch_error : 'other'] += 1
       partialWorkflows.add(`${run.repo}::${run.workflow}`)
       continue
     }
     // Round 1 L4 (AC-OPS-10): a digit-string attempt is read the way
     // validRunId reads ids, and any other present-but-unreadable attempt
     // fails closed as a re-run. Only an absent attempt, or a first one, is not.
-    const attemptN = typeof run.attempt === 'number' ? run.attempt : typeof run.attempt === 'string' && /^[0-9]+$/.test(run.attempt) ? Number(run.attempt) : null
+    const attemptN = typeof run.attempt === 'number' ? run.attempt : typeof run.attempt === 'string' && /^\d+$/.test(run.attempt) ? Number(run.attempt) : null
     // HARN-OPT-5 T7 (AC-DATA-16, AC-DATA-17, AC-SIMP-11): the re-run flag is
     // per job, joined to the run's attempt-1 jobs by run id plus RAW job name
     // (the run is one id; normalising first would let two distinct jobs share
@@ -2076,7 +2076,7 @@ function runCiCommand(payload) {
       stats.attempt1Unfetched += 1
       // T7 review round 1 F2 (AC-QA-24): a failed attempt-1 fetch is also counted by mode beside the per-run fetch
       // failures, so a token problem and a quota problem stay distinguishable on the stats line.
-      if (run.attempt1_fetch_error) stats.fetchFailures[FETCH_MODES.includes(run.attempt1_fetch_error) ? run.attempt1_fetch_error : 'other'] += 1
+      if (run.attempt1_fetch_error) stats.fetchFailures[FETCH_MODES.has(run.attempt1_fetch_error) ? run.attempt1_fetch_error : 'other'] += 1
     }
     const latestCounts = rawCounts(latestJobs)
     const a1Counts = a1WellFormed ? rawCounts(a1) : new Map()
@@ -2091,7 +2091,7 @@ function runCiCommand(payload) {
   // completed runs by started_at descending (id tie-break), deduplicated.
   const pool = []
   const inPool = new Set()
-  const add = (id) => { if (/^[0-9]+$/.test(id) && !inPool.has(id) && pool.length < CITATION_POOL_SIZE) { inPool.add(id); pool.push(id) } }
+  const add = (id) => { if (/^\d+$/.test(id) && !inPool.has(id) && pool.length < CITATION_POOL_SIZE) { inPool.add(id); pool.push(id) } }
   for (const row of Object.values(mapToObject(byJob))) for (const id of Array.isArray(row.failedRunIds) ? row.failedRunIds : []) add(String(id))
   const byRepo = new Map()
   for (const r of poolRuns) if (r.completed) (byRepo.get(r.repo) || byRepo.set(r.repo, []).get(r.repo)).push(r)
