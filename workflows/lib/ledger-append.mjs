@@ -1014,13 +1014,10 @@ export function degradeEntry(entry, redactRawField = (v) => v) {
         container[last] = null
         const bucket = last === 'ac_id' ? 'ac_id' : err.pathParts[0] === 'findings' && (last === 'lens' || last === 'severity') ? 'finding_field' : 'general'
         neutralisations.push({ pathParts: err.pathParts, bucket, kind: 'siblingField' })
-      } else if (err.pathParts.length === 1 && (last === 'blocked_reason' || last === 'model')) {
-        // HARN-OPT-4 T5 (AC-OPS-5): same treatment as round, below. A rejected
-        // reason is caller text; none of it is retained, only counted.
+      } else if (err.pathParts.length === 1 && (last === 'blocked_reason' || last === 'model' || last === 'round')) {
+        // HARN-OPT-4 T5 (AC-OPS-5): a rejected blocked_reason is caller text;
+        // none of it is retained, only counted.
         // HARN-OPT-5 T1 (AC-SEC-7): model rides the same branch, for the same reason.
-        container[last] = null
-        neutralisations.push({ pathParts: err.pathParts, bucket: 'general', kind: 'siblingField' })
-      } else if (err.pathParts.length === 1 && last === 'round') {
         // HARN-OPT-4 T4 (AC-QA-13): round is a bare counter. Nothing about a
         // rejected value is worth retaining, and the caller's free text (the
         // spec's "2; rm -rf" case) must not reach the durable line, so it is
@@ -1580,25 +1577,28 @@ function retryOnceIfInterrupted(run, timeoutMs) {
   const interrupted = (e) => !!e && (e.code === 'ETIMEDOUT' || (e.status == null && !!e.signal))
   try {
     return run()
-  } catch (first) {
-    if (!interrupted(first)) throw first
+  } catch (firstError) {
+    if (!interrupted(firstError)) throw firstError
     // The retry succeeded if it produced an answer: a normal return, or git's exit 1 (a thrown "not ignored" verdict).
-    const note = () => process.stderr.write(`ledger-append: git check-ignore ${causeOf(first)}, retry succeeded\n`)
+    const note = () => process.stderr.write(`ledger-append: git check-ignore ${causeOf(firstError)}, retry succeeded\n`)
     try {
       const value = run()
       note()
       return value
-    } catch (second) {
-      if (interrupted(second)) second.gitCheckInterruption = causeOf(second)
-      else if (second.status === 1) note()
-      throw second
+    } catch (secondError) {
+      if (interrupted(secondError)) secondError.gitCheckInterruption = causeOf(secondError)
+      else if (secondError.status === 1) note()
+      throw secondError
     }
   }
 }
 const gitCheckInterruptedRefusal = (e) => `the git ignore check ${e.gitCheckInterruption} and was retried once; refusing to write because the ledger could not be confirmed ignored`
 // Any other thrown git failure (exit 128 for a corrupt index, ENOENT for a missing binary) is not a verdict on the path
 // either. Names the failure class and never a path (AC-SEC-13).
-const gitCheckFailedRefusal = (e) => `git check-ignore failed (${e.status != null ? `exit ${e.status}` : e.code || 'no exit status'}) -- refusing to write because the ledger could not be confirmed ignored`
+const gitCheckFailedRefusal = (e) => {
+  const failure = e.status != null ? `exit ${e.status}` : e.code || 'no exit status'
+  return `git check-ignore failed (${failure}) -- refusing to write because the ledger could not be confirmed ignored`
+}
 
 // timeoutMs is a parameter, not an environment variable, so a test can drive the slow-git paths in-process without waiting
 // out the real bound; main() never passes it.
