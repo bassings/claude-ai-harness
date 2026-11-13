@@ -33,7 +33,7 @@ import { createHash } from 'node:crypto'
 const SNAP_PREFIX = 'harn-specwb-'
 // T8 review round 2 H1: a lens prefix may carry a digit (AC-A11Y-<n>), the same blindness static-checks M5 recorded.
 const AC_LINE = /^- \*\*(AC-[A-Z][A-Z0-9]*-\d+):\*\*(.*)$/
-const AC_ID = /^AC-[A-Z][A-Z0-9]{0,15}-[0-9]{1,6}$/
+const AC_ID = /^AC-[A-Z][A-Z0-9]{0,15}-\d{1,6}$/
 const ACCEPTANCE = '## Acceptance criteria'
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex')
@@ -183,7 +183,7 @@ function readIds(idsFile) {
   let ids
   try { ids = JSON.parse(raw) } catch { fail('the surviving-ids file is not JSON') }
   if (!Array.isArray(ids) || !ids.every((x) => typeof x === 'string' && AC_ID.test(x))) fail('the surviving-ids file must be a JSON array of AC ids')
-  return [...new Set(ids)].sort()
+  return [...new Set(ids)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 }
 
 function verify(specPathGiven, snapFile, idsFile) {

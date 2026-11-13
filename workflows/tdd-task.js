@@ -565,7 +565,7 @@ let terminalWrite = await writeLedger(terminalEntry)
 // HARN-OPT-5 T1 (AC-ARCH-4): this generic block replaces the key-specific
 // blocked_reason retry and is byte-identical across all three workflows.
 const firstTerminalWrite = terminalWrite
-const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.\[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
+const refusedKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
 if (refusedKey && !['kind', 'outcome', 'run_id', 'finding_entries'].includes(refusedKey) && Object.hasOwn(terminalEntry, refusedKey)) {
   log(`Terminal ledger write refused ${refusedKey} (installed writer predates it); retrying once without it: ${redactLogText(String(terminalWrite.write_error))}`)
   const { [refusedKey]: _refused, ...retryEntry } = terminalEntry
@@ -581,7 +581,7 @@ if (refusedKey && !['kind', 'outcome', 'run_id', 'finding_entries'].includes(ref
 const optionalKeysSent = ['model', 'blocked_reason'].filter(k => Object.hasOwn(terminalEntry, k))
 const strippedKeys = terminalWrite !== firstTerminalWrite && refusedKey ? [refusedKey] : []
 for (let extra = 1; strippedKeys.length > 0 && extra < optionalKeysSent.length; extra++) {
-  const nextKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.\[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
+  const nextKey = terminalWrite.write_ok ? null : (/(?:^|[^\w.[\]])([A-Za-z_]\w*): not an allowed property/.exec(String(terminalWrite.write_error)) || [])[1]
   if (!nextKey || !optionalKeysSent.includes(nextKey) || strippedKeys.includes(nextKey)) break
   strippedKeys.push(nextKey)
   log(`Terminal ledger write refused ${nextKey} as well (installed writer predates it); retrying without ${strippedKeys.join(', ')}: ${redactLogText(String(terminalWrite.write_error))}`)
