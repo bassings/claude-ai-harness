@@ -503,12 +503,27 @@ class TestParsingWorkGrowsLinearly(unittest.TestCase):
 
         def global_trace(frame, event, arg):
             return local if frame.f_code.co_filename in files else None
+        previous = sys.gettrace()
         sys.settrace(global_trace)
         try:
             guard.evaluate(command, cwd)
         finally:
-            sys.settrace(None)
+            sys.settrace(previous)
         return steps[0]
+
+    def test_the_step_counter_restores_the_tracer_that_was_installed_before_it(self):
+        # A coverage run installs its own tracer. Clearing it to None would leave
+        # every later test in the process unmeasured.
+        def sentinel(frame, event, arg):
+            return None
+        original = sys.gettrace()
+        sys.settrace(sentinel)
+        try:
+            self._steps('git status', tempfile.gettempdir())
+            restored = sys.gettrace()
+        finally:
+            sys.settrace(original)
+        self.assertIs(restored, sentinel)
 
     def test_work_at_the_cap_is_within_a_linear_factor_of_work_at_half_the_cap(self):
         cwd = tempfile.mkdtemp(prefix='destructive-git-hostile-linear-')
