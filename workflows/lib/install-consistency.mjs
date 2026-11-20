@@ -398,7 +398,7 @@ export const CONSUMER_SUBSET_PATTERNS = [
 // of the file that wires PreToolUse hooks is a real problem worth
 // reporting -- the same required-vs-optional split the two bin/ literals
 // above already establish, not a new shape.
-export const CONSUMER_OPTIONAL_PATTERNS = ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs', 'hooks/hooks.json']
+export const CONSUMER_OPTIONAL_PATTERNS = ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs', 'bin/sonar-rules-table.mjs', 'hooks/hooks.json']
 
 function escapeRegExpLiteral(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')

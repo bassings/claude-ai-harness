@@ -680,6 +680,7 @@ function publishedSubsetTree(overrides = {}) {
     'skills/conduct-plan/SKILL.md': 'conduct-plan skill\n',
     'bin/optimise-cycle-weekly.sh': 'weekly runner\n',
     'bin/redact-transcript.mjs': 'redact transcript\n',
+    'bin/sonar-rules-table.mjs': 'rules table generator\n',
     'bin/com.local.optimise-cycle-weekly.plist': 'NOT in the subset -- a per-operator TEMPLATE, deliberately excluded\n',
     'bin/setup-hooks.sh': 'NOT in the subset -- bin/ is not a directory-prefix pattern, only two literal files in it are\n',
     'test/some.test.js': 'NOT in the subset\n',
@@ -700,7 +701,7 @@ test('install-consistency: CONSUMER_SUBSET_PATTERNS is exported and matches the 
 
 test('install-consistency: CONSUMER_OPTIONAL_PATTERNS (HIGH-2, L-4) is exported and names exactly the two bin/ files README.md documents as separately synced, plus hooks/hooks.json (the plugin manifest, promoted from L-4), excluding the templated plist', async () => {
   const { CONSUMER_OPTIONAL_PATTERNS } = await loadModule()
-  assert.deepEqual([...CONSUMER_OPTIONAL_PATTERNS].sort(), ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs', 'hooks/hooks.json'].sort())
+  assert.deepEqual([...CONSUMER_OPTIONAL_PATTERNS].sort(), ['bin/optimise-cycle-weekly.sh', 'bin/redact-transcript.mjs', 'bin/sonar-rules-table.mjs', 'hooks/hooks.json'].sort())
 })
 
 test('install-consistency: isConsumerSubsetPath matches every pattern shape (literal, single-segment glob, directory prefix at any depth, and the HIGH-2 optional bin/ literals) and rejects a user-owned or deliberately-excluded file', async () => {
@@ -760,6 +761,7 @@ test('install-consistency: listConsumerSubsetFiles walks a real tree and returns
       'agents/reviewer-verification.md',
       'bin/optimise-cycle-weekly.sh',
       'bin/redact-transcript.mjs',
+      'bin/sonar-rules-table.mjs',
       'hooks/hooks.json',
       'skills/optimise-cycle/SKILL.md',
       'skills/conduct-plan/SKILL.md',
@@ -817,7 +819,7 @@ test('install-consistency: checkStaleness reports no drift when the install matc
   assert.deepEqual(result.missing, [])
   assert.equal(result.missing_count, 0)
   assert.deepEqual(result.drift, [])
-  assert.equal(result.published_files_checked, 13)
+  assert.equal(result.published_files_checked, 14)
   assert.deepEqual(result.unmatched_patterns, [])
   assert.equal(result.status, 'ok')
 })
@@ -1260,4 +1262,26 @@ test('install-consistency: CLI --check-staleness exits 0 with ok:false, status:"
   assert.equal(out.ok, false)
   assert.equal(out.status, 'could-not-check', 'status must be present on EVERY exit path, including a usage error, so a caller can dispatch on one field unconditionally')
   assert.match(out.error, /usage/i)
+})
+
+// HARN-RULES-1 AC-QA-17, AC-SIMP-10: the SonarQube rules-table generator
+// ships as an OPTIONAL consumer file: drift when an installed copy differs,
+// nothing when it is not installed.
+test('install-consistency (HARN-RULES-1): bin/sonar-rules-table.mjs is an optional consumer path; a differing installed copy is drift and an absent one is not', async () => {
+  const { isConsumerSubsetPath, isOptionalConsumerSubsetPath, checkStaleness } = await loadModule()
+  assert.equal(isConsumerSubsetPath('bin/sonar-rules-table.mjs'), true)
+  assert.equal(isOptionalConsumerSubsetPath('bin/sonar-rules-table.mjs'), true)
+  const published = publishedSubsetTree()
+  const drifted = checkStaleness(published, publishedSubsetTree({ 'bin/sonar-rules-table.mjs': 'a stale copy\n' }))
+  assert.deepEqual(drifted.drifted, ['bin/sonar-rules-table.mjs'])
+  assert.equal(drifted.status, 'drift')
+  const installDir = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
+  for (const rel of ['AGENT-HARNESS.md', 'agents/lens-security.md', 'agents/lens-qa.md', 'agents/reviewer-verification.md', 'workflows/plan-cycle.js', 'workflows/review-cycle.js', 'workflows/lib/install-consistency.mjs', 'workflows/lib/ledger-append.mjs', 'hooks/hooks.json', 'skills/optimise-cycle/SKILL.md', 'skills/conduct-plan/SKILL.md']) {
+    const dest = path.join(installDir, rel)
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.copyFileSync(path.join(published, rel), dest)
+  }
+  const absent = checkStaleness(published, installDir)
+  assert.deepEqual(absent.missing, [])
+  assert.equal(absent.status, 'ok')
 })
