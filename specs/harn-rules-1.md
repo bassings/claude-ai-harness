@@ -74,7 +74,7 @@ Two parts, deliberately separable:
 **Hand-written guidance survives a refresh (owner decision, 2026-11-21).** For
 a rule already in the table, the generator updates the counts and leaves the
 guidance text as it found it; a rule new to the table arrives with the
-analyser's own rule name until someone improves it. See AC-PROD-9.
+analyser's own rule name until someone improves it. See AC-PROD-11.
 
 **The four limits, measured 2026-11-21** against the three projects on the
 owner's SonarQube, and fixed as named constants (AC-SIMP-7):
@@ -180,7 +180,7 @@ path under `.claude/`; "the generator" means the new program under `bin/`.
 - **AC-PROD-6:** Measurement. On each run the generator records in the table's stamp, and prints to stdout, the window start and end, the analysed revision, the count of new-code issues in the window, how many of those were on rules the previous table already listed, and the total open count. Test: two runs against fixtures where the second window includes one listed and one unlisted rule give counts of 1 and 1, and no author field appears in the file or the output.
 - **AC-PROD-7:** Before the build starts, this spec records the baseline the change is judged against: the sibling repository's 4 of 11 post-merge scans with new issues, 12 issues in all, from 2026-11-13 to 2026-11-21, and this repository's 3 new issues across 3 merges on 2026-11-13. It names the comparison point, which is the next 10 feature merges in a repository using the table, states the do-nothing cost, and names the result that means the generator is not earning its keep: a share of post-merge scans with new issues no lower than the baseline, or new issues that land mostly on rules the table already listed.
 - **AC-PROD-8:** The conductor does not run the generator. Before the build starts, this spec's Proposed shape and Affected files are corrected to say a person runs it, and README.md tells that person when: after the analyser has finished analysing the merge. The built change matches.
-- **AC-PROD-9:** Hand-written guidance survives a refresh (owner decision 2026-11-21). When the table already holds a row for a rule the new run also selects, the generator writes that row's existing guidance text unchanged, after applying the same sanitising and length bounds as to any guidance (AC-SEC-5 to AC-SEC-8), and updates only its counts; a rule not previously in the table gets the analyser's rule name. A row whose rule the new run does not select is dropped. Test: a table whose row for one rule carries hand-written guidance is regenerated from fixtures in which that rule is still selected with different counts, a second rule is new and a third has left; the first row keeps its text with the new counts, the second carries the analyser's name, the third is gone. Mutation: make the generator always use the analyser's name and watch the test fail.
+- **AC-PROD-11:** Hand-written guidance survives a refresh (owner decision 2026-11-21). When the table already holds a row for a rule the new run also selects, the generator writes that row's existing guidance text unchanged, after applying the same sanitising and length bounds as to any guidance (AC-SEC-5 to AC-SEC-8), and updates only its counts; a rule not previously in the table gets the analyser's rule name. A row whose rule the new run does not select is dropped. Test: a table whose row for one rule carries hand-written guidance is regenerated from fixtures in which that rule is still selected with different counts, a second rule is new and a third has left; the first row keeps its text with the new counts, the second carries the analyser's name, the third is gone. Mutation: make the generator always use the analyser's name and watch the test fail.
 - **AC-PROD-9:** The generator exits zero after writing a table, whatever the issue counts. Test: a fixture with many new issues still exits zero. *(the no-reference searches are AC-QA-18 and AC-SEC-8)*
 
 ### Architecture (lens-architecture)
@@ -271,7 +271,7 @@ generator replaces the whole file.
 | Rules table plus generator, not table only, linters only or documentation only | owner, 2026-11-21 | accepted | A hand-kept list was the measured weakness |
 | One shared version for the owner's three repositories | owner, 2026-11-21 | accepted | The sibling repository's session asked to consume it |
 | Own small spec now, outside the stopped HARN-AUDIT-1 plan | owner, 2026-11-21 | accepted | Touches builder instructions, not the runner or the guard |
-| A refresh keeps hand-written guidance | owner, 2026-11-21 | accepted (AC-PROD-9) | The evidence credits hand-written guidance, and a refresh that discards it gives people a reason not to refresh |
+| A refresh keeps hand-written guidance | owner, 2026-11-21 | accepted (AC-PROD-11) | The evidence credits hand-written guidance, and a refresh that discards it gives people a reason not to refresh |
 | The four limits | conductor, measured 2026-11-21 | set from the analyser, table above | No lens had a measured basis; one defensible course, so taken without a question |
 | A second instruction site in `tdd-task` prompts | lens-simplicity veto | veto stands | Not a security, data-loss or accessibility item, so the veto holds; revisit if the measure shows the table earns its keep |
 
