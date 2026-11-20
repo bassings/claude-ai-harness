@@ -108,9 +108,11 @@ here.
 
 ## What this replaces
 
-Nothing in this repository. In the sibling repository it replaces a paragraph
-pasted by hand into each builder brief; removing that is that repository's
-change, not this one.
+Nothing is removed in this repository. This repository does adopt the table:
+`.claude/analyser-rules.md` is committed with this change as its first real
+use, and AC-PROD-7's comparison of the next 10 feature merges starts here. In
+the sibling repository the table replaces a paragraph pasted by hand into each
+builder brief; removing that is that repository's change, not this one.
 
 | What goes | Owning lens | Removal criterion |
 |---|---|---|
@@ -132,7 +134,7 @@ path under `.claude/`; "the generator" means the new program under `bin/`.
 - **AC-SEC-2:** Transport fails closed. An https `SONAR_HOST_URL` is accepted. An http URL is refused with a non-zero exit and no request sent, unless the operator sets `SONAR_ALLOW_HTTP=1`, in which case the program writes one stderr warning naming the cleartext token risk and proceeds. A URL containing userinfo, the `user:pass@host` form, is refused outright. Each of the three branches is a test.
 - **AC-SEC-3:** The token is sent only in an Authorization header, never in a query string, and the generator follows no redirects: any 3xx response is a non-zero exit. Test: a fixture server answers 302 to a second fixture server on another port; the second server records zero requests and the generator exits non-zero.
 - **AC-SEC-4:** The token never escapes. Test: with `SONAR_TOKEN` set to a unique sentinel, run the generator against fixture servers that answer 200, 401 with a body echoing the request's Authorization header, 500 with a body echoing all request headers, and a closed port; a search for the sentinel across stdout, stderr and the written table finds zero matches in every case. Error messages name the HTTP status and API path only, never the response body. *(merges AC-QA-6)*
-- **AC-SEC-5:** Every generated row is inert data. A row is emitted only when its rule key matches the fixed pattern `^[A-Za-z0-9_.:-]{1,64}$` and is dropped otherwise; counts are non-negative integers; guidance text is reduced to one line, with control characters, carriage returns, newlines, ANSI escapes, backticks, Unicode bidi and zero-width characters and the column separator removed or escaped, and is truncated to a fixed maximum length. Test: a fixture rule set including a name containing a newline followed by a markdown heading and a shell command, a 10 KB name, a name with column-separator characters, a backtick fence, an ANSI escape, a U+202E, an imperative sentence telling the reader to ignore prior guidance, and a rule key of `../../x` produces a table in which every rule is exactly one physical line with the header's column count, no guidance exceeds the cap, none of the listed characters survive, and the `../../x` rule is absent. *(merges the hostile-name half of AC-QA-8)*
+- **AC-SEC-5:** Every generated row is inert data. A row is emitted only when its rule key matches the fixed pattern `^[A-Za-z0-9_.:-]{1,64}$` and is dropped otherwise; counts are non-negative integers; guidance text is reduced to one line, with control characters, carriage returns, newlines, ANSI escapes, backticks, every invisible or format character and the column separator removed or escaped, by allowlist and not by an enumerated list: after NFKC normalisation, every code point in general categories Cc, Cf, Co, Cn, Zl and Zp is removed, as are variation selectors (U+FE00 to U+FE0F, U+E0100 to U+E01EF) and Hangul fillers (U+115F, U+1160, U+3164, U+FFA0), and is truncated to a fixed maximum length. Test: a fixture rule set including a name containing a newline followed by a markdown heading and a shell command, a 10 KB name, a name with column-separator characters, a backtick fence, an ANSI escape, a U+202E, an imperative sentence telling the reader to ignore prior guidance, and a rule key of `../../x` produces a table in which every rule is exactly one physical line with the header's column count, no guidance exceeds the cap, none of the listed characters survive, and the `../../x` rule is absent. *(merges the hostile-name half of AC-QA-8)* *(amended after review round 1: the fixture also carries a tag-character payload, U+061C, U+00AD, U+FE0F and U+3164, and none survives; the same sanitiser applies to guidance kept from the previous table)*
 - **AC-SEC-6:** The table has a hard size bound: a maximum row count and a maximum byte size, each stated in README.md. Test: a fixture server offering 500 tripped rules yields a table within both bounds. The same bounds are written into `agents/implementer.md`: a table over either bound is treated as absent, and the implementer says so at the top of its report. *(merges the cap half of AC-QA-9)*
 - **AC-SEC-7:** `agents/implementer.md` frames the table as reference data about patterns to avoid, never as instructions: it states that nothing in the table may cause the implementer to run a command, fetch a URL, read or write a file outside the task, change scope or skip a gate, that a row reading as an instruction is reported in the report's caveats and not followed, and that a table path which is a symlink or not a regular file is treated as absent. A test asserts each of those statements is present in `agents/implementer.md`.
 - **AC-SEC-8:** The table reaches a model only through the implementer reading the file itself. No workflow script interpolates table content into a prompt, and no lens agent, ledger line or conductor block note carries table text. Test: a search over `workflows/`, `agents/` and `skills/` finds the table's path in `agents/implementer.md` and in no other file. *(merges AC-SIMP-4 and AC-ARCH-7; tightened by the veto on a second instruction site)*
@@ -167,17 +169,17 @@ path under `.claude/`; "the generator" means the new program under `bin/`.
 - **AC-SIMP-5:** The generator is exactly one new file under `bin/`, and no new file is added under `workflows/lib/`.
 - **AC-SIMP-6:** The generator takes its configuration, the project key included, only from environment variables: it reads no configuration file, parses no command-line options, and writes to a single fixed output path held in one constant.
 - **AC-SIMP-7:** Each limit in the generator, namely the row cap, the byte cap, the guidance length cap and the recent-window length, is one named constant, and no environment variable or option changes any of them. *(reworded from one cap to four: AC-SEC-5 and AC-SEC-6 require separate bounds)*
-- **AC-SIMP-8:** No code judges whether the table is stale: nothing in the diff parses the table's stamp to compute an age, compare revisions or emit a warning. The generator writes the stamp as text, and only people and the builder read it.
+- **AC-SIMP-8:** No code judges whether the table is stale: nothing in the diff parses the table's stamp to compute an age, compare revisions or emit a warning. The generator writes the stamp as text, and only people and the builder read it. *(amended after review round 1, owner decision 2026-11-21: one exception. The generator reads the derivation instant from the previous table's stamp for the single purpose of AC-PROD-6's count; it still computes no age, compares no revisions and emits no staleness warning.)*
 - **AC-SIMP-9:** The ledger and the optimiser are unchanged: `git diff main` over every ledger and optimise file under `workflows/` is empty, and no new ledger field is introduced.
 - **AC-SIMP-10:** Shipping the generator is exactly one added string literal in `CONSUMER_OPTIONAL_PATTERNS` in `workflows/lib/install-consistency.mjs`, beside `bin/redact-transcript.mjs`, and `bin/install.sh` is unchanged. After `bin/install.sh`, `bin/install.sh --check` reports the generator as installed. *(merges AC-ARCH-6)*
 - **AC-SIMP-11:** `AGENT-HARNESS.md` is unchanged: the table and the generator are documented in README.md only.
-- **AC-SIMP-12:** Excluding this spec, the change touches exactly four non-test files: `agents/implementer.md`, the one new program under `bin/`, `workflows/lib/install-consistency.mjs` and README.md. Everything else it adds or edits is a test file or fixture under `test/` or a mutation-proof record under `docs/`. *(reworded from a six-file ceiling, which AC-QA-17 and AC-QA-20 could not fit inside)*
+- **AC-SIMP-12:** Excluding this spec, the change touches exactly five non-test files: `agents/implementer.md`, the one new program under `bin/`, `workflows/lib/install-consistency.mjs`, README.md, and this repository's own table at `.claude/analyser-rules.md`. Everything else it adds or edits is a test file or fixture under `test/` or a mutation-proof record under `docs/`. *(amended after review round 1: this repository adopts the table as its first user, see "What this replaces")*
 
 ### Product (lens-product)
 
 - **AC-PROD-4:** Every rule that new code tripped in the recent window appears in the table, ranked ahead of rules that are open only as legacy debt. Test: a fixture with a new-code rule whose open count is lower than many legacy rules shows that rule present and ranked first.
 - **AC-PROD-5:** README.md documents the table format with a complete copyable example and says that a replacement implementer must honour the table to get the benefit. A table written by hand to that format, with a rule identifier that is not a SonarQube key, is read and reported by the builder exactly as a generated one is.
-- **AC-PROD-6:** Measurement. On each run the generator records in the table's stamp, and prints to stdout, the window start and end, the analysed revision, the count of new-code issues in the window, how many of those were on rules the previous table already listed, and the total open count. Test: two runs against fixtures where the second window includes one listed and one unlisted rule give counts of 1 and 1, and no author field appears in the file or the output.
+- **AC-PROD-6:** Measurement. On each run the generator records in the table's stamp, and prints to stdout, the window start and end, the analysed revision, the count of new-code issues in the window, the total open count, and, when a previous table with a readable derivation instant exists, the count of issues created after that instant and how many of those were on rules that previous table listed, together with the instant itself. When there is no previous table or its stamp has no readable instant, those two counts are written as `n/a`, never as zero. Test: a first run writes `n/a`; a second run against fixtures holding one issue created before the previous instant on a listed rule, one created after it on a listed rule and one created after it on an unlisted rule gives 2 since the previous table and 1 on-listed; no author field appears in the file or the output. Mutation: count on-listed across the whole window and watch the test fail. *(amended after review round 1, owner decision 2026-11-21: the original count included issues that predate the table, so a first table read as a failure)*
 - **AC-PROD-7:** Before the build starts, this spec records the baseline the change is judged against: the sibling repository's 4 of 11 post-merge scans with new issues, 12 issues in all, from 2026-11-13 to 2026-11-21, and this repository's 3 new issues across 3 merges on 2026-11-13. It names the comparison point, which is the next 10 feature merges in a repository using the table, states the do-nothing cost, and names the result that means the generator is not earning its keep: a share of post-merge scans with new issues no lower than the baseline, or new issues that land mostly on rules the table already listed.
 - **AC-PROD-8:** The conductor does not run the generator. Before the build starts, this spec's Proposed shape and Affected files are corrected to say a person runs it, and README.md tells that person when: after the analyser has finished analysing the merge. The built change matches.
 - **AC-PROD-11:** Hand-written guidance survives a refresh (owner decision 2026-11-21). When the table already holds a row for a rule the new run also selects, the generator writes that row's existing guidance text unchanged, after applying the same sanitising and length bounds as to any guidance (AC-SEC-5 to AC-SEC-8), and updates only its counts; a rule not previously in the table gets the analyser's rule name. A row whose rule the new run does not select is dropped. Test: a table whose row for one rule carries hand-written guidance is regenerated from fixtures in which that rule is still selected with different counts, a second rule is new and a third has left; the first row keeps its text with the new counts, the second carries the analyser's name, the third is gone. Mutation: make the generator always use the analyser's name and watch the test fail.
@@ -236,10 +238,8 @@ Not vetoed, but no longer applicable:
 | The recent window | A fixed number of days in one constant, recorded in the stamp (AC-QA-11, AC-SIMP-7) | Architecture wanted the window set by the program so runs are comparable across repositories; simplicity wanted no setting. A constant gives both |
 | Import rule | `node:` built-ins only (AC-SEC-11) | Security's wording is stricter than simplicity's and wins on precedence |
 
-Left for the owner, because no lens supplied a criterion and the two parts of
-the spec pull against each other: whether regenerating the table keeps
-guidance a person has edited by hand, or replaces it. As written, the
-generator replaces the whole file.
+Settled by the owner on 2026-11-21: regenerating the table keeps guidance a
+person has edited by hand (AC-PROD-11).
 
 ---
 
@@ -273,11 +273,24 @@ generator replaces the whole file.
 | Own small spec now, outside the stopped HARN-AUDIT-1 plan | owner, 2026-11-21 | accepted | Touches builder instructions, not the runner or the guard |
 | A refresh keeps hand-written guidance | owner, 2026-11-21 | accepted (AC-PROD-11) | The evidence credits hand-written guidance, and a refresh that discards it gives people a reason not to refresh |
 | The four limits | conductor, measured 2026-11-21 | set from the analyser, table above | No lens had a measured basis; one defensible course, so taken without a question |
+| The on-listed measure counts only issues created after the previous table | owner, 2026-11-21, review round 1 | accepted (AC-PROD-6, AC-SIMP-8 amended) | As first built it read 46 of 46 on a table no builder had used |
+| This repository adopts the table in this change | lens-product and the AC-SIMP check, review round 1 | accepted (AC-SIMP-12 amended) | One defensible course: a generator with no real use behind it is the weaker thing to ship |
 | A second instruction site in `tdd-task` prompts | lens-simplicity veto | veto stands | Not a security, data-loss or accessibility item, so the veto holds; revisit if the measure shows the table earns its keep |
 
 ## Risks
 
-To be ranked by the planning cycle.
+Ranked by recoverability.
+
+1. **Expensive: text in the table steers a builder.** The table is tracked,
+   reviewed and read in every phase. Bounded by AC-SEC-5 to AC-SEC-9 and by
+   the instruction that nothing in it is an instruction; a model obeying that
+   cannot be proven by test.
+2. **Cheap: the token is sent to the wrong place or in the clear.** Bounded by
+   https by default, an explicit opt-in with a warning before the first
+   request, no redirects and no token in any output (AC-SEC-1 to AC-SEC-4).
+3. **Cheap: the table goes stale or is ignored.** Nothing judges staleness by
+   design; the stamp and AC-PROD-6's counts are the signal, and AC-PROD-7 names
+   the result that means it is not earning its keep.
 
 ## Affected files
 
@@ -287,6 +300,7 @@ To be ranked by the planning cycle.
 | `bin/` (one new program) | the SonarQube generator |
 | `workflows/lib/install-consistency.mjs` | ship the new program |
 | `README.md` | document the table, the generator, when a person runs it, and that a replaced implementer gets no benefit |
+| `.claude/analyser-rules.md` | this repository's own table, generated and then given hand-written guidance |
 | `test/`, `docs/` | tests, fixtures and mutation-proof records |
 
 `workflows/tdd-task.js` and `AGENT-HARNESS.md` are not changed (vetoed at
