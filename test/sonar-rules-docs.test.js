@@ -89,6 +89,21 @@ test('the table is not git-ignored, so a linked worktree receives it (AC-QA-14)'
   assert.equal(r.status, 1, `git check-ignore exit ${r.status}: the table path is ignored or git failed`)
 })
 
+test('a linked worktree made with git worktree add holds the committed table at its fixed path, with the main checkout\'s content, under this repository\'s own ignore rules (AC-QA-14)', () => {
+  const { makeTempRepo, sh, SUITE_TMPDIR } = require('./helpers/temp-repo.js')
+  const repo = makeTempRepo()
+  // This repository's own ignore rules apply, so a rule that began ignoring the table would show here.
+  fs.copyFileSync(path.join(ROOT, '.gitignore'), path.join(repo, '.gitignore'))
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, TABLE_REL), FIXTURE)
+  sh('git add -A && git commit -q -m "table"', repo)
+  const wt = path.join(fs.mkdtempSync(path.join(SUITE_TMPDIR, 'worktree-')), 'tree')
+  sh(`git worktree add -q -b table-worktree ${JSON.stringify(wt)}`, repo)
+  const there = path.join(wt, TABLE_REL)
+  assert.ok(fs.existsSync(there), 'the linked worktree has no file at the table path')
+  assert.equal(fs.readFileSync(there, 'utf8'), fs.readFileSync(path.join(repo, TABLE_REL), 'utf8'))
+})
+
 // ----------------------------------------------------- SonarQube stays out
 test('agents/implementer.md describes the table by its neutral columns only and names no SonarQube API, product or field (AC-ARCH-2)', () => {
   assert.ok(IMPLEMENTER.includes(TABLE_REL), 'the implementer does not name the table')
@@ -102,7 +117,7 @@ test('README names no SonarQube Web API path or SonarQube-only field name (AC-AR
 })
 
 // ------------------------------------------ the format, written down once
-const STAMP_RE = /^derived: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z revision: (?:[0-9a-f]{40}|unknown) analyser: \S+ window: \d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2} new-issues: \d+ on-listed: \d+ open-total: \d+ rules: \d+ of \d+(?: note: .*)?$/
+const STAMP_RE = /^derived: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z revision: (?:[0-9a-f]{40}|unknown) analyser: \S+ window: \d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2} new-issues: \d+ previous: (?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z|n\/a) since-previous: (?:\d+|n\/a) on-listed: (?:\d+|n\/a) open-total: \d+ rules: \d+ of (?:at least )?\d+(?: note: .*)?$/
 const fences = (text) => [...text.matchAll(/^```[^\n]*\n([\s\S]*?)^```/gm)].map((m) => m[1])
 const exampleBlock = () => fences(SECTION).find((b) => b.startsWith('# Analyser rules table'))
 
@@ -124,6 +139,13 @@ test('README documents the table format once, with a complete copyable example w
   for (const r of rows) assert.match(r, /^\| [A-Za-z0-9_.:-]{1,64} \| [^|]+ \| \d+ \| \d+ \|$/, `example row is not in the documented format: ${r}`)
   assert.ok(rows.some((r) => !/^\| [a-z]+:S\d+ \|/.test(r)), 'the example should show a rule identifier that is not an analyser key, as a hand-written table would')
   assert.ok(rows.length <= ROW_CAP && Buffer.byteLength(example) <= BYTE_CAP)
+})
+
+test('README describes the since-previous measure: the previous instant, n/a when there is none, and "at least" at the facet cap (AC-PROD-6, AC-OPS-6)', () => {
+  assert.match(SECTION, /previous table's? (?:derivation )?(?:instant|date and time)|instant of the previous table/i, 'the previous instant is not described')
+  assert.match(SECTION, /n\/a/, 'n/a is not described')
+  assert.match(SECTION, /at least/i, 'the capped total is not described')
+  assert.match(SECTION, /on-listed/, 'on-listed is not named')
 })
 
 test('README states the table bounds, the generator\'s environment variables and the stamp as the one derivation record (AC-SEC-6, AC-ARCH-3)', () => {

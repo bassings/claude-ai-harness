@@ -1741,11 +1741,11 @@ The table lives at `.claude/analyser-rules.md` and is tracked in git, not ignore
 
 ### Format
 
-The table is written down here once. It has four neutral columns (rule, guidance, open, recent-new) and one derivation stamp line. The stamp is the single derivation record: the date, the analysed revision, the analyser's name, the window, the count of new issues in the window, how many of those were on rules the previous table already listed, the total open count, and the rules kept out of the rules available. A table is bounded at 20 rows and 8,192 bytes; a builder treats a larger one as absent.
+The table is written down here once. It has four neutral columns (rule, guidance, open, recent-new) and one derivation stamp line. The stamp is the single derivation record: the date, the analysed revision, the analyser's name, the window, the count of new issues in the window, the instant of the previous table, how many issues were created since that instant, how many of those were on rules the previous table already listed (the on-listed count, which shows whether the table is being used), the total open count, and the rules kept out of the rules available. The previous instant is the only thing the generator reads from an earlier stamp. When there is no previous table, or its stamp has no readable instant, the previous instant, the since-previous count and the on-listed count are each written as `n/a`, never as zero. When the server's list of rules is at its limit of 100, the total is written as `at least` that number, because the generator cannot see past the limit. A table is bounded at 20 rows and 8,192 bytes; a builder treats a larger one as absent.
 
 ```
 # Analyser rules table
-derived: 2026-11-21T10:30:00Z revision: a1b2c3d4e5f60718293a4b5c6d7e8f9012345678 analyser: SonarQube window: 2026-10-22..2026-11-21 new-issues: 3 on-listed: 0 open-total: 19 rules: 3 of 3
+derived: 2026-11-21T10:30:00Z revision: a1b2c3d4e5f60718293a4b5c6d7e8f9012345678 analyser: SonarQube window: 2026-10-22..2026-11-21 new-issues: 3 previous: n/a since-previous: n/a on-listed: n/a open-total: 19 rules: 3 of 3
 
 | rule | guidance | open | recent-new |
 |---|---|---|---|

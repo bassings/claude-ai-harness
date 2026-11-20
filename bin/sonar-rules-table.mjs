@@ -20,6 +20,9 @@ const ROW_CAP = 20
 const WINDOW_DAYS = 30
 const GUIDANCE_CAP = 160
 const BYTE_CAP = 8192
+// A SonarQube rules facet holds at most this many values, so a facet with exactly
+// this many may have been cut and the number of rules is then only a lower bound.
+const FACET_CAP = 100
 const REQUEST_TIMEOUT_MS = 8000
 const RULE_KEY_RE = /^[A-Za-z0-9_.:-]{1,64}$/
 const PLACEHOLDER = 'Rule name unavailable from the analyser; see the rule key'
@@ -115,34 +118,48 @@ function facetCounts(body) {
   return out
 }
 
-// One physical line of inert text: no controls, escapes, bidi or zero-width
-// characters, backticks or column separators, and never over GUIDANCE_CAP.
+// One physical line of inert text, by allowlist (AC-SEC-5). After NFKC
+// normalisation every control, format, private-use, unassigned and line or
+// paragraph separator code point goes, with variation selectors, the Hangul
+// fillers, ANSI escapes, backticks and the column separator; whitespace is
+// collapsed and the length is capped. Format characters include the tag
+// characters that can spell a hidden sentence, so an enumerated list is not used.
 function sanitise(text) {
   const s = String(text)
+    .normalize('NFKC')
     .replace(/\u001b\[[0-9;?]*[ -\/]*[@-~]/g, '')
-    .replace(/[\u2028\u2029\u0000-\u001f\u007f-\u009f]/g, ' ')
-    .replace(/[​-‏‪-‮⁠-⁩﻿`]/g, '')
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, ' ')
+    .replace(/[\p{Cf}\p{Co}\p{Cn}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}\u115F\u1160\u3164\uFFA0`]/gu, '')
     .replace(/\|/g, '/')
     .replace(/\s+/g, ' ')
     .trim()
   return Array.from(s).slice(0, GUIDANCE_CAP).join('').trim()
 }
 
+// The previous table's rules and guidance, and its derivation instant. The
+// instant is the one thing read from the stamp, for the since-previous count
+// (AC-PROD-6, AC-SIMP-8); it is null unless it is a real UTC instant.
 function readPrevious(file) {
-  const prev = new Map()
+  const rules = new Map()
+  let instant = null
   let st
   try {
     st = fs.lstatSync(file)
   } catch {
-    return prev
+    return { rules, instant }
   }
-  if (!st.isFile() || st.size > BYTE_CAP) return prev
+  if (!st.isFile() || st.size > BYTE_CAP) return { rules, instant }
   for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    if (instant === null) {
+      const m = /^derived: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)(?: |$)/.exec(line)
+      const at = m ? new Date(m[1]) : null
+      if (at && !Number.isNaN(at.getTime()) && at.toISOString().replace(/\.000Z$/, 'Z') === m[1]) instant = m[1]
+    }
     if (!line.startsWith('|')) continue
     const c = line.split('|').slice(1, -1).map((x) => x.trim())
-    if (c.length === 4 && RULE_KEY_RE.test(c[0])) prev.set(c[0], sanitise(c[1]))
+    if (c.length === 4 && RULE_KEY_RE.test(c[0])) rules.set(c[0], sanitise(c[1]))
   }
-  return prev
+  return { rules, instant }
 }
 
 function render(stamp, rows) {
@@ -166,8 +183,29 @@ function checkTarget(root) {
   return { dir, file }
 }
 
+// A run killed between writing its temporary file and renaming it leaves that
+// file behind. Sweep those of this naming pattern whose process is gone; one
+// whose process is alive is another run still writing, and is left alone.
+function removeDeadTemporaries(dir, file) {
+  const base = path.basename(file).replace(/[.]/g, '\\.')
+  const pattern = new RegExp(`^\\.${base}\\.(\\d+)\\.tmp$`)
+  for (const name of fs.readdirSync(dir)) {
+    const m = pattern.exec(name)
+    if (!m || Number(m[1]) === process.pid) continue
+    let alive = true
+    try {
+      process.kill(Number(m[1]), 0)
+    } catch (e) {
+      alive = e.code !== 'ESRCH'
+    }
+    const p = path.join(dir, name)
+    if (!alive && fs.lstatSync(p).isFile()) fs.rmSync(p, { force: true })
+  }
+}
+
 function writeAtomically(dir, file, text) {
   fs.mkdirSync(dir, { recursive: true })
+  removeDeadTemporaries(dir, file)
   const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.tmp`)
   try {
     fs.writeFileSync(tmp, text, { flag: 'wx' })
@@ -216,16 +254,27 @@ async function main() {
   const rev = analyses?.analyses?.[0]?.revision
   const revision = typeof rev === 'string' && /^[0-9a-f]{40}$/.test(rev) ? rev : 'unknown'
 
-  const recentBody = await issueFacet(cfg, { createdAfter: since })
+  // Every date parameter is an explicit UTC instant: a bare date would be read
+  // in the server's own time zone.
+  const instantOf = (iso) => iso.replace(/Z$/, '+0000')
+  const recentBody = await issueFacet(cfg, { createdAfter: instantOf(`${since}T00:00:00Z`) })
   const openBody = await issueFacet(cfg, {})
   const recent = facetCounts(recentBody)
   const open = facetCounts(openBody)
   const newIssues = Number.isInteger(recentBody.total) ? recentBody.total : 0
   const openTotal = Number.isInteger(openBody.total) ? openBody.total : 0
 
-  const previous = readPrevious(file)
-  let onListed = 0
-  for (const [k, n] of recent) if (previous.has(k)) onListed += n
+  const { rules: previous, instant: previousInstant } = readPrevious(file)
+  // Issues created after the previous table: the only ones that can show
+  // whether the table was used. n/a, never zero, when there is nothing to compare with.
+  let sincePrevious = 'n/a'
+  let onListed = 'n/a'
+  if (previousInstant) {
+    const sinceBody = await issueFacet(cfg, { createdAfter: instantOf(previousInstant) })
+    sincePrevious = Number.isInteger(sinceBody.total) ? sinceBody.total : 0
+    onListed = 0
+    for (const [k, n] of facetCounts(sinceBody)) if (previous.has(k)) onListed += n
+  }
 
   // Recent-new first, then open count, then key: a rule new code just tripped
   // is never pushed out by an old backlog (AC-QA-9, AC-PROD-4).
@@ -246,7 +295,11 @@ async function main() {
     r.guidance = sanitise(found.mismatch ? r.key : found.name || '') || PLACEHOLDER
   }
 
-  const stampFor = (n) => `derived: ${cfg.now.toISOString().replace(/\.\d{3}Z$/, 'Z')} revision: ${revision} analyser: SonarQube window: ${since}..${end} new-issues: ${newIssues} on-listed: ${onListed} open-total: ${openTotal} rules: ${n} of ${all.length}` + (newIssues === 0 ? ' note: zero rules were tripped in the window' : '')
+  // With a rules facet at its cap the total may be higher than we can see.
+  // Every rule with a new issue also has an open one, so the open facet is the one that hits the cap first.
+  const capped = open.size >= FACET_CAP
+  const total = `${capped ? 'at least ' : ''}${all.length}`
+  const stampFor = (n) => `derived: ${cfg.now.toISOString().replace(/\.\d{3}Z$/, 'Z')} revision: ${revision} analyser: SonarQube window: ${since}..${end} new-issues: ${newIssues} previous: ${previousInstant || 'n/a'} since-previous: ${sincePrevious} on-listed: ${onListed} open-total: ${openTotal} rules: ${n} of ${total}` + (newIssues === 0 ? ' note: zero rules were tripped in the window' : '')
   let text = render(stampFor(rows.length), rows)
   while (Buffer.byteLength(text) > BYTE_CAP && rows.length > 0) {
     rows = rows.slice(0, -1)
@@ -260,7 +313,7 @@ async function main() {
   console.log(`wrote ${TABLE_REL}: ${rows.length} rules (window ${since}..${end}, analysed revision ${revision})`)
   if (revisionDenied) console.log('note: the token is not permitted to read the analysed revision; the revision is recorded as unknown')
   for (const n of notes) console.log(n)
-  if (head && revision !== head) console.log(`note: the server has not yet analysed the current head (server revision ${revision}, local head ${head})`)
+  if (head && revision !== 'unknown' && revision !== head) console.log(`note: the server has not yet analysed the current head (server revision ${revision}, local head ${head})`)
 }
 
 main().catch((e) => {
