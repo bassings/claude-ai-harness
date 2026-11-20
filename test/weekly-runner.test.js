@@ -882,6 +882,7 @@ function makePublishedRepo(overrides = {}) {
     'skills/conduct-plan/SKILL.md': 'conduct-plan skill\n',
     'bin/optimise-cycle-weekly.sh': 'weekly runner\n',
     'bin/redact-transcript.mjs': 'redact transcript\n',
+    'bin/sonar-rules-table.mjs': 'sonar rules table\n',
     ...overrides,
   }
   for (const [rel, content] of Object.entries(files)) {
@@ -920,6 +921,7 @@ function identicalInstallOf(publishedRepoDir) {
     'skills/conduct-plan/SKILL.md',
     'bin/optimise-cycle-weekly.sh',
     'bin/redact-transcript.mjs',
+    'bin/sonar-rules-table.mjs',
   ]) {
     files[rel] = fs.readFileSync(path.join(publishedRepoDir, rel), 'utf8')
   }

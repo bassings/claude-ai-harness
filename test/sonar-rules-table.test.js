@@ -93,7 +93,20 @@ async function startFake(cfg = {}) {
     }
     if (u.pathname.startsWith('/api/rules/')) return rules(u, q, json)
     const project = q.componentKeys || q.projects || q.project || q.component
-    if (cfg.project && project !== cfg.project) return json(404, { errors: [{ msg: 'unknown project' }] })
+    // Measured against a live 26.11 server on 2026-11-21: the measures lookup
+    // answers 404 for an unknown project and 200 for a real one.
+    if (u.pathname === '/api/measures/component') {
+      if (cfg.project && project !== cfg.project) return json(404, { errors: [{ msg: 'Component key not found' }] })
+      return json(200, { component: { key: project, measures: [{ metric: q.metricKeys || 'ncloc', value: '100' }] } })
+    }
+    // liveLike models the same server for a token that may run analyses and
+    // read issues but not browse extras: the analyses lookup is 403 and an
+    // issue search for a project that does not exist is 200 with total 0.
+    if (cfg.analysesStatus && u.pathname === '/api/project_analyses/search') return json(cfg.analysesStatus, { errors: [{ msg: 'Insufficient privileges' }] })
+    if (cfg.liveLike) {
+      if (u.pathname === '/api/project_analyses/search') return json(403, { errors: [{ msg: 'Insufficient privileges' }] })
+      if (u.pathname === '/api/issues/search' && project !== cfg.liveLike) return json(200, { total: 0, p: 1, ps: 1, issues: [], facets: [{ property: 'rules', values: [] }] })
+    } else if (cfg.project && project !== cfg.project) return json(404, { errors: [{ msg: 'unknown project' }] })
     if (u.pathname === '/api/project_analyses/search') return json(200, { analyses: [{ date: '2026-11-20T22:00:00+0000', revision: cfg.revision || REVISION }] })
     if (u.pathname === '/api/issues/search') {
       let list = cfg.issues || []
@@ -284,7 +297,8 @@ test('generator: more rules than the row cap keeps exactly the cap, within the b
 })
 
 test('generator: request count does not grow with open issues and never reaches past the first 10,000 results (AC-ARCH-8)', async () => {
-  const MAX_REQUESTS = 40
+  // 20 rule lookups (the row cap) + 1 existence check + 1 analyses lookup + 2 issue queries.
+  const MAX_REQUESTS = 24
   const counts = []
   for (const [rules, perRule] of [[30, 10], [300, 67]]) {
     const issues = []
@@ -565,14 +579,120 @@ test('generator: every unhappy server path exits non-zero in bounded time with o
       const r = await run({ cwd: repo, env: envFor(url), timeout: 15000 })
       assert.notEqual(r.code, 0, `${c.name}: expected non-zero`)
       assert.notEqual(r.signal, 'SIGKILL', `${c.name}: the generator must give up on its own inside 15 seconds`)
-      assert.equal(r.stderr.trim().split('\n').length, 1, `${c.name}: exactly one stderr line, got ${JSON.stringify(r.stderr)}`)
-      assert.match(r.stderr, c.expect, c.name)
+      // envFor sets SONAR_ALLOW_HTTP=1, so the cleartext warning (AC-SEC-2)
+      // precedes the error: exactly those two lines, in that order.
+      const lines = r.stderr.trim().split('\n')
+      assert.equal(lines.length, 2, `${c.name}: exactly the warning then the error, got ${JSON.stringify(r.stderr)}`)
+      assert.match(lines[0], /cleartext/i, `${c.name}: the first stderr line is the cleartext warning`)
+      assert.match(lines[1], c.expect, c.name)
       assert.equal(sha(tablePath(repo)), before, `${c.name}: table changed`)
       assert.deepEqual(fs.readdirSync(path.join(repo, '.claude')), [path.basename(TABLE_REL)], `${c.name}: stray file in .claude`)
     } finally {
       if (fake) await fake.close()
     }
   }
+})
+
+// ===================================== HARN-RULES-1 part 2: live-run defects
+// Found by a live run against SonarQube 26.11 on 2026-11-21 with a token that
+// may run analyses and read issues but cannot read the analysed revision.
+const LIVE = { project: 'proj', liveLike: 'proj', issues: happyIssues() }
+
+test('generator: a 401 or 403 on the analyses lookup is not fatal, the revision is unknown and one stdout note says the token may not read it (live defect 1)', async () => {
+  for (const cfg of [LIVE, { issues: happyIssues(), analysesStatus: 401 }, { issues: happyIssues(), analysesStatus: 403 }]) {
+    const repo = makeTempRepo()
+    const fake = await startFake(cfg)
+    try {
+      const r = await run({ cwd: repo, env: envFor(fake.url) })
+      assert.equal(r.code, 0, `expected exit 0, stderr: ${r.stderr}`)
+      assert.match(read(tablePath(repo)), / revision: unknown /)
+      const notes = r.stdout.split('\n').filter((l) => /not permitted to read the analysed revision/i.test(l))
+      assert.equal(notes.length, 1, `exactly one note on stdout, got ${JSON.stringify(r.stdout)}`)
+      assert.ok(!r.stderr.includes('project_analyses'), 'the tolerated failure is not an error')
+    } finally {
+      await fake.close()
+    }
+  }
+})
+
+test('generator: any other failure on the analyses lookup stays fatal, names the status and path, and writes nothing (live defect 1)', async () => {
+  for (const analysesStatus of [404, 500]) {
+    const repo = makeTempRepo()
+    const fake = await startFake({ issues: happyIssues(), analysesStatus })
+    try {
+      const r = await run({ cwd: repo, env: envFor(fake.url) })
+      assert.notEqual(r.code, 0, `${analysesStatus}: expected non-zero`)
+      assert.match(r.stderr, new RegExp(`${analysesStatus}`))
+      assert.match(r.stderr, /\/api\/project_analyses\/search|not found/)
+      assert.ok(!fs.existsSync(tablePath(repo)))
+    } finally {
+      await fake.close()
+    }
+  }
+})
+
+test('generator: the project is proved to exist before any issue query, and an unknown key fails naming it with an empty issue answer and no table (live defect 2)', async () => {
+  const real = makeTempRepo()
+  let fake = await startFake(LIVE)
+  try {
+    assert.equal((await run({ cwd: real, env: envFor(fake.url) })).code, 0)
+    const at = fake.requests.findIndex((q) => q.path === '/api/measures/component')
+    assert.ok(at >= 0, 'no existence request was sent')
+    assert.equal(fake.requests[at].query.component, 'proj')
+    assert.equal(fake.requests[at].query.metricKeys, 'ncloc')
+    const firstIssue = fake.requests.findIndex((q) => q.path === '/api/issues/search')
+    assert.ok(firstIssue > at, 'the existence check must precede every issue query')
+  } finally {
+    await fake.close()
+  }
+  const repo = makeTempRepo()
+  seedTable(repo, PREV_HEADER)
+  const before = sha(tablePath(repo))
+  fake = await startFake(LIVE)
+  try {
+    const r = await run({ cwd: repo, env: envFor(fake.url, { SONAR_PROJECT_KEY: 'no-such-project' }) })
+    assert.notEqual(r.code, 0)
+    const lines = r.stderr.trim().split('\n')
+    assert.match(lines[lines.length - 1], /project key "no-such-project" was not found/)
+    assert.equal(fake.requests.filter((q) => q.path === '/api/issues/search').length, 0, 'no issue query for an unknown project')
+    assert.equal(sha(tablePath(repo)), before, 'an unknown project must not replace the table with an empty one')
+  } finally {
+    await fake.close()
+  }
+})
+
+test('generator: the cleartext warning is on stderr before the first request is answered, not after a successful run (AC-SEC-2, live defect 3)', async () => {
+  const fake = await startFake({ hang: true })
+  const repo = makeTempRepo()
+  const child = spawn(process.execPath, [GEN], { cwd: repo, env: envFor(fake.url), stdio: ['ignore', 'pipe', 'pipe'] })
+  let stderr = ''
+  child.stderr.on('data', (d) => (stderr += d))
+  try {
+    const t0 = Date.now()
+    while (fake.requests.length === 0 && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 25))
+    assert.ok(fake.requests.length > 0, 'the generator never sent a request')
+    await new Promise((r) => setTimeout(r, 150))
+    assert.match(stderr, /cleartext/i, 'the token was sent before any warning was written')
+  } finally {
+    child.kill('SIGKILL')
+    await fake.close()
+  }
+})
+
+test('generator: a failing run without the opt-in prints exactly one stderr line, with no warning (AC-SEC-2)', async () => {
+  const repo = makeTempRepo()
+  const url = (await closedPortUrl()).replace('http:', 'https:')
+  const r = await run({ cwd: repo, env: envFor(url, { SONAR_ALLOW_HTTP: undefined }), timeout: 15000 })
+  assert.notEqual(r.code, 0)
+  assert.equal(r.stderr.trim().split('\n').length, 1, JSON.stringify(r.stderr))
+  assert.ok(!/cleartext/i.test(r.stderr))
+})
+
+test('static: the rule lookup comment records that it was verified against 26.11 on 2026-11-21 and no longer says UNVERIFIED', () => {
+  mustExist()
+  const src = read(GEN)
+  assert.ok(!/UNVERIFIED/.test(src))
+  assert.match(src, /verified[^\n]*26\.11[^\n]*2026-11-21|verified[^\n]*2026-11-21[^\n]*26\.11/i)
 })
 
 test('generator: a symlinked table path or a symlinked .claude directory is refused and nothing outside the repository is written (AC-SEC-10)', async () => {

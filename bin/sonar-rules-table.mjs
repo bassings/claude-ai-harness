@@ -47,7 +47,7 @@ function configure() {
   let warning = null
   if (url.protocol === 'http:') {
     if (process.env.SONAR_ALLOW_HTTP !== '1') throw new Fail('SONAR_HOST_URL is http; set SONAR_ALLOW_HTTP=1 to send the token in cleartext')
-    // Held back and printed only on success, so a failed run is one stderr line.
+    // Written to stderr before the first request, so before the token is sent.
     warning = 'warning: SONAR_ALLOW_HTTP=1, the token is sent in cleartext over http'
   } else if (url.protocol !== 'https:') {
     throw new Fail('SONAR_HOST_URL must be https')
@@ -89,8 +89,9 @@ async function get(cfg, apiPath, params) {
 const issueFacet = (cfg, extra) => get(cfg, '/api/issues/search', { componentKeys: cfg.project, resolved: 'false', facets: 'rules', ps: '1', ...extra })
 
 // The one place a rule's own name is looked up. /api/rules/show?key= is the
-// documented single-rule lookup, but it is UNVERIFIED against a live server
-// here; the caller trusts a name only when the returned key equals the one asked.
+// single-rule lookup, verified against SonarQube 26.11 on 2026-11-21: it returns
+// the rule with its exact key and name, and 404 for an unknown key. The caller
+// still trusts a name only when the returned key equals the one asked.
 async function lookupRuleName(cfg, key) {
   let body
   try {
@@ -187,16 +188,31 @@ function localHead(root) {
 
 async function main() {
   const cfg = configure()
+  if (cfg.warning) console.error(cfg.warning)
   const root = fs.realpathSync(process.cwd())
   const { dir, file } = checkTarget(root)
 
   const end = cfg.now.toISOString().slice(0, 10)
   const since = new Date(Date.parse(end) - WINDOW_DAYS * DAY_MS).toISOString().slice(0, 10)
 
-  const analyses = await get(cfg, '/api/project_analyses/search', { project: cfg.project, ps: '1' }).catch((e) => {
+  // An issue search answers 200 with total 0 for a project that does not exist,
+  // so existence is proved first with a lookup that answers 404 for an unknown
+  // key (measured against SonarQube 26.11 on 2026-11-21).
+  const notFound = (e) => {
     if (e.status === 404) throw new Fail(`${e.message}: project key "${cfg.project}" was not found`)
     throw e
-  })
+  }
+  await get(cfg, '/api/measures/component', { component: cfg.project, metricKeys: 'ncloc' }).catch(notFound)
+
+  // A token that may not read the analysed revision still gets a table.
+  let analyses = null
+  let revisionDenied = false
+  try {
+    analyses = await get(cfg, '/api/project_analyses/search', { project: cfg.project, ps: '1' })
+  } catch (e) {
+    if (e.status === 401 || e.status === 403) revisionDenied = true
+    else notFound(e)
+  }
   const rev = analyses?.analyses?.[0]?.revision
   const revision = typeof rev === 'string' && /^[0-9a-f]{40}$/.test(rev) ? rev : 'unknown'
 
@@ -242,9 +258,9 @@ async function main() {
   const head = localHead(root)
   console.log(stampFor(rows.length))
   console.log(`wrote ${TABLE_REL}: ${rows.length} rules (window ${since}..${end}, analysed revision ${revision})`)
+  if (revisionDenied) console.log('note: the token is not permitted to read the analysed revision; the revision is recorded as unknown')
   for (const n of notes) console.log(n)
   if (head && revision !== head) console.log(`note: the server has not yet analysed the current head (server revision ${revision}, local head ${head})`)
-  if (cfg.warning) console.error(cfg.warning)
 }
 
 main().catch((e) => {
