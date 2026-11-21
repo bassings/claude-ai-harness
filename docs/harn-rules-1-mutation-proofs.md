@@ -303,12 +303,21 @@ AC-QA-22. Each mutation was applied to `workflows/tdd-task.js`, confirmed landed
 by counting the matching text afterwards, run against
 `test/tdd-task.test.js` and `test/sonar-rules-docs.test.js`, and restored (the
 file was compared byte for byte with a copy taken before the first mutation).
+The last seven rows are the second round (the `rules_table` field and the
+word-for-word pin); the same procedure applied.
 
 | Mutation | Landed (check) | Test that failed |
 |---|---|---|
 | Remove the constant from the Test prompt (`write-test` dispatch) | one `${rulesTableNote}` use left instead of two | `tdd-task.js: the Test and Implement prompts both carry the same rules-table pointer sentence (AC-QA-22)` |
 | Remove the constant from the Implement prompt | one `${rulesTableNote}` use left instead of two | the same test |
 | Alter the path inside the constant (`analyser-rules.md` to `analyser-rule.md`) | one match for the altered path, none for the real one | `the table path is one literal in the generator and any other file that names it names the same path (AC-ARCH-1, AC-QA-22)`, and `the table path appears in agents/implementer.md and in no other tracked file outside the generator, its tests and the documents about it (AC-SEC-8)` |
+| Hostile rewording of the opening: "check the file" became "create the file ... if it is missing and follow every line in it as an instruction" | one match for the hostile opening, none for the real one | `tdd-task.js: the Test and Implement prompts both carry the rules-table pointer, word for word (AC-QA-22)` only (the earlier key-phrase test stayed green on this rewording, which is why the exact pin exists) |
+| Change `over 20 rows` to `over 21 rows` in the constant | one match | the word-for-word test, and `the row and byte bounds in the tdd-task pointer are the numbers agents/implementer.md and the generator state, so they cannot drift (AC-QA-22)` |
+| Drop the 200 character cap on the logged `rules_table` value | one match | `tdd-task.js: a reported rules_table is logged once per phase as one capped, control-free line, and never reaches the result, the ledger or a verifier prompt (AC-QA-22)` |
+| Drop the control character and line break reduction | one match | the same test |
+| Make `rules_table` required in the Test schema | one match | `tdd-task.js: both builder schemas declare an optional string rules_table, and the RED verifier schema is untouched (AC-QA-22)`, and the existing tests whose fake builder omits the field |
+| Remove the once-per-phase flag in `logRulesTable` | one match | `tdd-task.js: no rules_table, no log line; a Test phase that retries still logs once (AC-QA-22)` |
+| Append the status to `expected_failure` (the RED verifier's input) | one match | the same test as the cap mutation, which asserts the value reaches no verifier prompt |
 
 ### Live run for the tdd-task pointer (AC-QA-22)
 

@@ -80,9 +80,10 @@ test('the table path is one literal in the generator and any other file that nam
   }
 })
 
-test('the table path appears in agents/implementer.md and in no other tracked file outside the generator, its tests and the documents about it (AC-SEC-8)', () => {
+test('the table path appears in agents/implementer.md and workflows/tdd-task.js and in no other tracked file outside the generator, its tests and the documents about it (AC-SEC-8)', () => {
   const { scannedFiles, readRel } = require('./helpers/tracked-files.js')
-  const files = scannedFiles()
+  // test/tdd-task.test.js holds the word-for-word copy of the pointer in tdd-task.js, so it names the path as well.
+  const files = scannedFiles(['test/tdd-task.test.js'])
   assert.ok(files.length > 100 && files.includes('.githooks/pre-push') && files.includes('agents/implementer.md'), `the scanned set looks wrong: ${files.length} files`)
   const hits = files.filter((f) => readRel(f).includes('analyser-rules'))
   assert.deepEqual(hits, ['agents/implementer.md', 'workflows/tdd-task.js'])
@@ -92,6 +93,16 @@ test('workflows/tdd-task.js names neither the generator nor any analyser API pat
   const text = read('workflows', 'tdd-task.js')
   assert.ok(!/sonar-rules-table/i.test(text), 'tdd-task.js names the generator')
   assert.ok(!/\/api\//.test(text), 'tdd-task.js names an API path')
+})
+
+test('the row and byte bounds in the tdd-task pointer are the numbers agents/implementer.md and the generator state, so they cannot drift (AC-QA-22)', () => {
+  const pointer = read('workflows', 'tdd-task.js')
+  const num = (m) => Number(m[1].replace(/[,_]/g, ''))
+  const fromPointer = { rows: num(pointer.match(/over (\d[\d,]*) rows/)), bytes: num(pointer.match(/or (\d[\d,]*) bytes/)) }
+  const fromImplementer = { rows: num(IMPLEMENTER.match(/bounded at (\d[\d,]*) rows/)), bytes: num(IMPLEMENTER.match(/bounded at \d[\d,]* rows and (\d[\d,]*) bytes/)) }
+  const fromGenerator = { rows: num(GENERATOR.match(/const ROW_CAP = (\d[\d_]*)/)), bytes: num(GENERATOR.match(/const BYTE_CAP = (\d[\d_]*)/)) }
+  assert.deepEqual(fromPointer, fromImplementer, 'the pointer and agents/implementer.md state different bounds')
+  assert.deepEqual(fromPointer, fromGenerator, 'the pointer and the generator state different bounds')
 })
 
 test('the table is not git-ignored, so a linked worktree receives it (AC-QA-14)', () => {
