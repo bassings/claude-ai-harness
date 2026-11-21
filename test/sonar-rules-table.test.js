@@ -717,13 +717,30 @@ test('generator: a rules facet cut at its cap makes the total a lower bound whic
   // 150 rules whose only issue was created in the window and has been fixed: the open facet is empty.
   const fixed = []
   for (let i = 0; i < 150; i++) fixed.push(...mk(`js:X${String(i).padStart(3, '0')}`, 1, '2026-11-15T00:00:00+0000', { status: 'FIXED' }))
+  // One more rule with a key over the 64-character limit, ranked inside the first 100 values: the generator
+  // rejects it, so only the number of values the server sent shows that the facet was cut.
+  fixed.push(...mk(`js:${'L'.repeat(80)}`, 2, '2026-11-15T00:00:00+0000', { status: 'FIXED' }))
   const repo = makeTempRepo()
   let fake = await startFake({ issues: fixed, names: {} })
   try {
     const r = await run({ cwd: repo, env: envFor(fake.url) })
     assert.equal(r.code, 0, r.stderr)
-    assert.match(read(tablePath(repo)), /open-total: 0 rules: 20 of at least 100\b/)
-    assert.match(r.stdout, /20 of at least 100\b/)
+    // 99 usable rules out of 100 values sent: a lower bound, not an exact count.
+    assert.match(read(tablePath(repo)), /open-total: 0 rules: 20 of at least 99\b/)
+    assert.match(r.stdout, /20 of at least 99\b/)
+  } finally {
+    await fake.close()
+  }
+  // The same for the open facet: 150 old open rules, none new, plus one rejected key.
+  const legacy = []
+  for (let i = 0; i < 150; i++) legacy.push(...mk(`js:Y${String(i).padStart(3, '0')}`, 1, '2026-01-01T00:00:00+0000'))
+  legacy.push(...mk(`js:${'L'.repeat(80)}`, 2, '2026-01-01T00:00:00+0000'))
+  const old = makeTempRepo()
+  fake = await startFake({ issues: legacy, names: {} })
+  try {
+    const r = await run({ cwd: old, env: envFor(fake.url) })
+    assert.equal(r.code, 0, r.stderr)
+    assert.match(read(tablePath(old)), /new-issues: 0 .* rules: 20 of at least 99\b/)
   } finally {
     await fake.close()
   }
@@ -734,7 +751,7 @@ test('generator: a rules facet cut at its cap makes the total a lower bound whic
   try {
     const r = await run({ cwd: prev, env: envFor(fake.url) })
     assert.equal(r.code, 0, r.stderr)
-    assert.match(read(tablePath(prev)), /since-previous: 150 on-listed: at least 2 /)
+    assert.match(read(tablePath(prev)), /since-previous: 152 on-listed: at least 2 /)
     assert.match(r.stdout, /on-listed: at least 2 /)
   } finally {
     await fake.close()

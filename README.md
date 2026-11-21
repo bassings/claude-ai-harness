@@ -1596,7 +1596,7 @@ FAIL. Run `bin/install.sh` (which installs `workflows/`) and confirm with
 `bin/install.sh --check`, as well as the copy commands below; a run that finds an installed `optimise-cycle.js`
 whose `WEEKLY_RUNNER_CONTRACT` constant is missing or lower than the runner's
 `REQUIRED_WORKFLOW_CONTRACT` stops with `installed optimise-cycle.js predates
-report_path; run bin/install.sh`. The `diff -q` lines below confirms the `bin/`
+report_path; run bin/install.sh`. The `diff -q` lines below confirm the `bin/`
 copies only, so it is necessary but not sufficient on its own:
 
 ```bash

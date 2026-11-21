@@ -204,7 +204,7 @@ the fixtures used; a fixture with controls that are not whitespace (bell, NUL,
 DEL) was added and the row below is the second run. Two lines of code that no
 test could fail were removed instead of tested: the skip of the previous
 table's header and separator rows, which changed nothing, because neither row
-can be unreadable. Rows run `test/sonar-rules-table.test.js` except H13 to H15,
+can be unreadable. Rows F1 to F3 (a last fix: the cap checks counted the rules kept rather than the values the server sent, so a cut facet holding one rejected key looked complete) each use a 100-value facet with one over-long key. Rows run `test/sonar-rules-table.test.js` except H13 to H15,
 which run `test/sonar-rules-docs.test.js`.
 
 | # | Criterion | Edit | Landed on | Failing test (name abridged) |
@@ -237,6 +237,9 @@ which run `test/sonar-rules-docs.test.js`.
 | H15 | AC-OPS-6, README: on-listed is a floor | Reword | README.md:1746 | README says on-listed is a lower bound when the since-previous list is cut at its limit |
 | H16 | L11, the request uses the path constant | Write the path out in the request | generator:101 | static: the issues path is one constant, declared before its first use, and the request uses it |
 | H17 | L12, the helper exports only what tests use | Export one more name | test/helpers/tracked-files.js:52 | static: the tracked-files helper exports only what tests use |
+| F1 | AC-OPS-6, the new-issue facet's cap counts the values the server sent, rejected ones included | Test the filtered size of the new-issue facet instead | generator:354 | generator: a rules facet cut at its cap makes the total a lower bound whichever facet is cut, and on-listed a lower bound when the since-previous facet is cut |
+| F2 | AC-OPS-6, the open facet's cap counts the values sent | Test the filtered size of the open facet instead | generator:354 | generator: a rules facet cut at its cap makes the total a lower bound whichever facet is cut, and on-listed a lower bound when the since-previous facet is cut |
+| F3 | AC-OPS-6, the on-listed floor counts the values sent | Test the filtered size of the since-previous facet instead | generator:327 | generator: a rules facet cut at its cap makes the total a lower bound whichever facet is cut, and on-listed a lower bound when the since-previous facet is cut |
 
 ## Live implementer runs (AC-OPS-1, and the builder halves of AC-QA-15 and AC-PROD-5)
 

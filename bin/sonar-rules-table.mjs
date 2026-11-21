@@ -139,7 +139,9 @@ function facetCounts(body, tally) {
     if (typeof v?.val === 'string' && RULE_KEY_RE.test(v.val) && Number.isInteger(v.count) && v.count >= 0) out.set(v.val, v.count)
     else tally.rejected++ // counted, never quoted: the rejected text is what the checks refuse
   }
-  return out
+  // `sent` is how many values the server sent, rejected ones included: the cap
+  // is the server's, so it is tested against this and not against the rules kept.
+  return { rules: out, sent: facet.values.length }
 }
 
 // One physical line of inert text, by allowlist (AC-SEC-5). After NFKC
@@ -305,8 +307,8 @@ async function main() {
   const recentBody = await createdFacet(cfg, instantOf(`${since}T00:00:00Z`))
   const openBody = await openFacet(cfg)
   const tally = { rejected: 0 }
-  const recent = facetCounts(recentBody, tally)
-  const open = facetCounts(openBody, tally)
+  const { rules: recent, sent: recentSent } = facetCounts(recentBody, tally)
+  const { rules: open, sent: openSent } = facetCounts(openBody, tally)
   const newIssues = totalOf(recentBody)
   const openTotal = totalOf(openBody)
 
@@ -318,11 +320,11 @@ async function main() {
   if (previousInstant) {
     const sinceBody = await createdFacet(cfg, instantOf(previousInstant))
     sincePrevious = totalOf(sinceBody)
-    const sinceRules = facetCounts(sinceBody, tally)
+    const { rules: sinceRules, sent: sinceSent } = facetCounts(sinceBody, tally)
     let listed = 0
     for (const [k, n] of sinceRules) if (previous.has(k)) listed += n
     // A listed rule outside the facet's first values is not seen, so at the cap the count is a floor.
-    onListed = sinceRules.size >= FACET_CAP ? `at least ${listed}` : listed
+    onListed = sinceSent >= FACET_CAP ? `at least ${listed}` : listed
   }
 
   // Recent-new first, then open count, then key: a rule new code just tripped
@@ -349,7 +351,7 @@ async function main() {
   // With either rules facet at its cap the total may be higher than we can see.
   // A rule whose only issue in the window has since been fixed is in the recent
   // facet and not in the open one, so both are checked.
-  const capped = open.size >= FACET_CAP || recent.size >= FACET_CAP
+  const capped = openSent >= FACET_CAP || recentSent >= FACET_CAP
   const total = `${capped ? 'at least ' : ''}${all.length}`
   const stampFor = (n) => `derived: ${cfg.now.toISOString().replace(/\.\d{3}Z$/, 'Z')} revision: ${revision} analyser: SonarQube window: ${since}..${end} new-issues: ${newIssues} previous: ${previousInstant || 'n/a'} since-previous: ${sincePrevious} on-listed: ${onListed} open-total: ${openTotal} rules: ${n} of ${total}` + (newIssues === 0 ? ' note: zero rules were tripped in the window' : '')
   let text = render(stampFor(rows.length), rows)
