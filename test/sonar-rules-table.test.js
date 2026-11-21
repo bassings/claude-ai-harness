@@ -85,6 +85,12 @@ async function startFake(cfg = {}) {
     const q = Object.fromEntries(u.searchParams)
     requests.push({ path: u.pathname, query: q, rawUrl: req.url, headers: req.headers })
     if (cfg.hang) return
+    // cfg.stallBodyOn is the 1-based request that gets its headers and half a
+    // body, then nothing: the connection stays open and the body never ends.
+    if (cfg.stallBodyOn === requests.length) {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      return res.write('{"total":')
+    }
     if (cfg.redirectTo) {
       res.writeHead(302, { location: cfg.redirectTo })
       return res.end()
@@ -1297,6 +1303,67 @@ test('generator: the project is proved to exist before any issue query, and an u
     assert.match(lines[lines.length - 1], /project key "no-such-project" was not found/)
     assert.equal(fake.requests.filter((q) => q.path === '/api/issues/search').length, 0, 'no issue query for an unknown project')
     assert.equal(sha(tablePath(repo)), before, 'an unknown project must not replace the table with an empty one')
+  } finally {
+    await fake.close()
+  }
+})
+
+test('generator: a server that sends headers then stalls the body is a timeout naming the API path, on the first request and on a later one; an invalid JSON body is still invalid JSON (older fault 1)', async () => {
+  const cases = [
+    { name: 'first request', cfg: { stallBodyOn: 1, issues: happyIssues() }, expect: /^sonar-rules-table: request timed out on \/api\/\S+$/ },
+    { name: 'third request', cfg: { stallBodyOn: 3, issues: happyIssues() }, expect: /^sonar-rules-table: request timed out on \/api\/\S+$/ },
+    { name: 'invalid JSON', cfg: { rawBody: '<html>nope</html>' }, expect: /^sonar-rules-table: response was not valid JSON on \/api\/\S+$/ },
+  ]
+  for (const c of cases) {
+    const repo = makeTempRepo()
+    seedTable(repo, PREV_HEADER)
+    const before = sha(tablePath(repo))
+    const fake = await startFake(c.cfg)
+    try {
+      const r = await run({ cwd: repo, env: envFor(fake.url), timeout: 25000 })
+      assert.equal(r.code, 1, `${c.name}: exit code`)
+      assert.notEqual(r.signal, 'SIGKILL', `${c.name}: the generator must give up on its own`)
+      const lines = r.stderr.trim().split('\n')
+      assert.equal(lines.length, 2, `${c.name}: the warning then one error line, got ${JSON.stringify(r.stderr)}`)
+      assert.match(lines[1], c.expect, c.name)
+      if (c.cfg.stallBodyOn) assert.equal(lines[1].split(' on ')[1], fake.requests[c.cfg.stallBodyOn - 1].path, `${c.name}: the path named is the stalled request's`)
+      if (c.cfg.stallBodyOn > 1) assert.ok(fake.requests.length >= c.cfg.stallBodyOn, `${c.name}: the stall must come on a later request`)
+      assert.equal(r.stdout, '', `${c.name}: nothing on stdout`)
+      assert.equal(sha(tablePath(repo)), before, `${c.name}: table changed`)
+      assert.deepEqual(fs.readdirSync(path.join(repo, '.claude')), [path.basename(TABLE_REL)], `${c.name}: stray file in .claude`)
+    } finally {
+      await fake.close()
+    }
+  }
+})
+
+test('generator: an unexpected error prints its name only when the name is up to 32 letters, otherwise a generic line (older fault 2)', async () => {
+  const cases = [
+    { name: 'a normal class name', value: 'TypeError', line: 'unexpected TypeError' },
+    { name: 'the longest allowed name', value: 'A'.repeat(32), line: `unexpected ${'A'.repeat(32)}` },
+    { name: 'the token sentinel', value: `Error ${TOKEN}`, line: 'unexpected error' },
+    { name: 'a 40 character name', value: 'A'.repeat(40), line: 'unexpected error' },
+    { name: 'a name with a space', value: 'Bad Name', line: 'unexpected error' },
+    { name: 'a name with a newline', value: 'Bad\nName', line: 'unexpected error' },
+    { name: 'a name with a digit', value: 'Error2', line: 'unexpected error' },
+    { name: 'an empty name', value: '', line: 'unexpected error' },
+    { name: 'a number', value: 42, line: 'unexpected error' },
+    { name: 'an object', value: { text: 'Evil' }, line: 'unexpected error' },
+  ]
+  const fake = await startFake({ issues: happyIssues() })
+  try {
+    for (const c of cases) {
+      const repo = makeTempRepo()
+      seedTable(repo, SEED)
+      const before = sha(tablePath(repo))
+      const r = await run({ cwd: repo, env: hooked(fake.url, { HOOK_RENAME_THROW: 'named', HOOK_ERROR_NAME_JSON: JSON.stringify(c.value) }) })
+      assert.equal(r.code, 1, `${c.name}: exit code`)
+      const lines = r.stderr.trim().split('\n')
+      assert.equal(lines.length, 2, `${c.name}: the warning then one error line, got ${JSON.stringify(r.stderr)}`)
+      assert.equal(lines[1], `sonar-rules-table: ${c.line}`, c.name)
+      assert.ok(!r.stderr.includes('FREE-TEXT-SENTINEL') && !r.stderr.includes(TOKEN) && !r.stderr.includes('Evil'), `${c.name}: outside text was echoed`)
+      assert.equal(sha(tablePath(repo)), before, `${c.name}: table changed`)
+    }
   } finally {
     await fake.close()
   }

@@ -393,3 +393,17 @@ row keeps its name and the edit is the same change to the same logic.
 | B2 | AC-SEC-6 | Trim from the top of the ranking | generator:421 | generator: 20 rules with 160-character multibyte names stay within the byte cap... |
 | TLA | exit code | Exit code 0 on failure in the new top-level `catch` | generator:488 | generator: every unhappy server path exits non-zero in bounded time with one stderr line... |
 | X1 | trailing slash | `trimTrailingSlashes` returns its input unchanged (the replacement for the backtracking pattern) | generator:45 | all 86 tests in the file fail (every request URL gains a double slash) |
+
+## After HARN-RULES-1: two older faults
+
+Each edit was applied to `bin/sonar-rules-table.mjs`, the diff against a saved
+copy was read to confirm it landed on the intended line, the named test was run
+and seen to fail, and the file was then restored and compared byte for byte
+(`cmp`) with the saved copy. The two stalled-body rows share one test, which
+checks the first request, a later (third) request and a genuinely invalid body.
+
+| # | Fault | Edit | Landed on | Failing test (name abridged) |
+|---|---|---|---|---|
+| O1 | Error name echoed | Remove the name pattern check (`safeName` returns `e?.name \|\| 'error'`) | generator:`safeName` | generator: an unexpected error prints its name only when the name is up to 32 letters... (the token sentinel case printed `unexpected Error not-a-real-token-sentinel`) |
+| O2 | Stalled body | A stalled body reports invalid JSON again (drop the `TimeoutError` branch in `readBody`) | generator:`readBody` | generator: a server that sends headers then stalls the body is a timeout naming the API path... (first request: got `response was not valid JSON on /api/measures/component`) |
+| O3 | Invalid JSON | An invalid JSON body reports a timeout (the `JSON.parse` catch throws the timeout line) | generator:`get` | the same test (invalid JSON case: got `request timed out on /api/measures/component`) |

@@ -89,9 +89,22 @@ async function get(cfg, apiPath, params) {
     e.status = res.status
     throw e
   }
+  const text = await readBody(res, apiPath)
   try {
-    return JSON.parse(await res.text())
+    return JSON.parse(text)
   } catch {
+    throw new Fail(`response was not valid JSON on ${apiPath}`)
+  }
+}
+
+// The timeout covers the body as well as the headers, so a server that sends
+// headers and then stalls ends the read with a TimeoutError. Any other failure
+// to read the body keeps the invalid JSON line it has always had.
+async function readBody(res, apiPath) {
+  try {
+    return await res.text()
+  } catch (e) {
+    if (e?.name === 'TimeoutError') throw new Fail(`request timed out on ${apiPath}`)
     throw new Fail(`response was not valid JSON on ${apiPath}`)
   }
 }
@@ -463,6 +476,12 @@ async function main() {
   report({ stampFacts, rows, since, end, revision, unknownCause, notes, tally, previous, head: localHead(root) })
 }
 
+// An error's name is free text too: it is printed only when it is a plain
+// class-name-shaped word, otherwise the line says "error".
+function safeName(e) {
+  return typeof e?.name === 'string' && /^[A-Za-z]{1,32}$/.test(e.name) ? e.name : 'error'
+}
+
 // What a person sees for a failure that is not the generator's own. A local
 // file error names its system call, its code and the path relative to the
 // repository root, all fixed-shape fields. The error's free-text message is
@@ -471,7 +490,7 @@ async function main() {
 function describe(e) {
   if (e instanceof Fail) return e.message
   const code = typeof e?.code === 'string' && /^[A-Z][A-Z0-9_]{1,31}$/.test(e.code) ? e.code : null
-  if (!code) return `unexpected ${e?.name || 'error'}`
+  if (!code) return `unexpected ${safeName(e)}`
   const call = typeof e.syscall === 'string' && /^[a-z_]{2,24}$/.test(e.syscall) ? e.syscall : 'operation'
   let where = ''
   if (typeof e.path === 'string' && repoRoot) {

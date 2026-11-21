@@ -23,7 +23,7 @@ const GENERATOR_AND_ITS_TESTS = [
 ]
 const GENERATOR_FIXTURE_DIR = 'test/fixtures/sonar-rules/'
 // Documents that describe the change.
-const RECORDS = ['README.md', 'specs/harn-rules-1.md', 'docs/harn-rules-1-mutation-proofs.md']
+const RECORDS = ['README.md', 'specs/harn-rules-1.md', 'specs/harn-rules-2.md', 'docs/harn-rules-1-mutation-proofs.md']
 // The one install pattern literal (workflows/lib/install-consistency.mjs, whose
 // single mention is asserted on its own) and the tests that pin it.
 const INSTALL_PATTERN_FILES = ['workflows/lib/install-consistency.mjs', 'test/install-consistency.test.js', 'test/weekly-runner.test.js']
