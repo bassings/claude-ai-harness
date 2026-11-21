@@ -4,6 +4,10 @@
 //   HOOK_PARTIAL_WRITE=1     write half of the content, announce it on fd 2 with
 //                            HOOK-PARTIAL-WRITE, then stall so a test can kill
 //                            the process partway through a write.
+//   HOOK_RENAME_THROW=plain|coded
+//                            make the rename onto the table throw: plain is an Error
+//                            with no code, coded one with a code, syscall and path.
+//                            Both carry a free-text message holding a sentinel.
 //   HOOK_RENAME_DELAY_MS=n   stall n ms before renaming onto the table, so two
 //                            runs started together are both between write and
 //                            rename at once.
@@ -22,6 +26,14 @@ if (process.env.HOOK_PARTIAL_WRITE === '1') {
     fs.writeSync(2, 'HOOK-PARTIAL-WRITE\n')
     sleep(60000)
     return write.apply(this, arguments)
+  }
+}
+if (process.env.HOOK_RENAME_THROW) {
+  fs.renameSync = function (from, to) {
+    if (!names(to)) return rename.apply(this, arguments)
+    const e = new Error(`FREE-TEXT-SENTINEL ${to}`)
+    if (process.env.HOOK_RENAME_THROW === 'coded') Object.assign(e, { code: 'ENOSPC', syscall: 'rename', path: String(to) })
+    throw e
   }
 }
 if (process.env.HOOK_RENAME_DELAY_MS) {

@@ -39,7 +39,7 @@ All rows run `test/sonar-rules-table.test.js` except N21, N22 and N23, which run
 
 | # | Criterion | Edit | Landed on | Failing test (name abridged) |
 |---|---|---|---|---|
-| P1 | AC-QA-2 | Drop `resolved: 'false'` from the one issue-query helper | generator:92 | generator: every issue request asks for unresolved issues only and the resolved fixtures are not counted |
+| P1 | AC-QA-2 (superseded in round 2 by rows Q1 to Q4, once the query was split) | Drop `resolved: 'false'` from the one issue-query helper | generator:92 | generator: every issue request asks for unresolved issues only and the resolved fixtures are not counted |
 | P5 | AC-SEC-2, userinfo refusal | Replace the userinfo condition with `false` | generator:49 | generator: http is refused without SONAR_ALLOW_HTTP=1, allowed with a cleartext warning, and userinfo in the address is refused outright |
 | P6 | AC-SEC-2, http refusal | Replace the missing-opt-in condition with `false` | generator:52 | generator: http is refused without SONAR_ALLOW_HTTP=1, allowed with a cleartext warning, and userinfo in the address is refused outright |
 | P2 | AC-SEC-3, redirect refusal | `redirect: 'manual'` to `'follow'` | generator:70 | generator: a redirect is a failure and the redirect target receives no request |
@@ -89,14 +89,104 @@ All rows run `test/sonar-rules-table.test.js` except N21, N22 and N23, which run
 
 ### Mutants that survive, and why
 
-- **Byte cap (AC-SEC-6).** Replacing `> BYTE_CAP` with `> BYTE_CAP * 100` leaves
-  every test green, and no test can fail it: a row is at most about 260 bytes (a
-  64-character key, 160 characters of guidance and two counts), so 20 rows and
-  the stamp come to about 5.5 KB, under the 8,192-byte cap. The size loop is a
-  guard the other two caps make unreachable. It is left in place and is not
-  claimed as tested.
 - **Temporary-file naming pattern (AC-QA-10).** The test leaves a file named
   `.analyser-rules.md.bak` beside a dead run's file and asserts it survives. It
   was not mutated: broadening the pattern still leaves the file alone, because a
   non-numeric process id is treated as alive. Two guards cover one case.
 
+### Correction: the byte cap is reachable
+
+Round 1 said the 8,192-byte loop was unreachable, counting one byte per
+character. That was wrong: guidance is capped at 160 code points, and a CJK
+character is three bytes and an emoji four, so a row can reach about 650 bytes
+and 20 such rows come to about 13 KB. With 160-character multibyte names the
+loop trims to 15 rows. Rows B1 and B2 below prove the new test
+(`20 rules with 160-character multibyte names stay within the byte cap...`)
+fails when the loop is disabled and when it trims from the wrong end.
+
+## Fix round 2: proofs for the repaired and new guards
+
+Same method as round 1 (one anchor line, one occurrence of the old text, the
+file and line printed, only the named test run, original text written back and
+its hash compared; identical in every row). Rows T1 to T6 plant a reference in
+`.githooks/pre-push`, which the old directory lists did not scan, and in a
+second place they missed (`bin/install.sh`, or `workflows/lib/` for the API
+path), so each of the three guards is shown failing on a file the old list did
+not cover. Rows D11 and G1 repaired guards that did not hold: the first matched
+a sentence elsewhere in the file, and the second could not see an ignore rule
+once the table was tracked (`git check-ignore` skips tracked files unless given
+`--no-index`); both survived on first run, and the rows are the second run.
+The rows from D1 on give each of the previously unrecorded tests a mutation of
+its own subject (the README or implementer text, or the generator), not of a
+shared helper. Rows run `test/sonar-rules-table.test.js` for Q to L4 and K,
+and `test/sonar-rules-docs.test.js` for T5, T6, R, D and G.
+
+| # | Criterion | Edit | Landed on | Failing test (name abridged) |
+|---|---|---|---|---|
+| Q1 | AC-QA-2 | Drop `resolved: 'false'` from the open query | generator:100 | generator: the open query counts unresolved issues only, the two creation-date queries count created issues whether or not since fixed and leave out false positives and accepted ones, by an explicit status list |
+| Q2 | AC-QA-2 | Drop the explicit status list from the creation-date queries | generator:101 | generator: the open query counts unresolved issues only, the two creation-date queries count created issues whether or not since fixed and leave out false positives and accepted ones, by an explicit status list |
+| Q3 | AC-QA-2 | Add `FALSE_POSITIVE` to the status list | generator:98 | generator: the open query counts unresolved issues only, the two creation-date queries count created issues whether or not since fixed and leave out false positives and accepted ones, by an explicit status list |
+| Q4 | AC-PROD-4 / AC-QA-2 | Also send `resolved=false` on the creation-date queries, so a fixed issue stops counting as new | generator:101 | generator: a rule whose only window issue has since been fixed, with no open issue, is present with open 0 and recent-new 1 and keeps its hand-written guidance |
+| B1 | AC-SEC-6, byte cap (multibyte) | `> BYTE_CAP` to `> BYTE_CAP * 100` | generator:340 | generator: 20 rules with 160-character multibyte names stay within the byte cap, the rows are the top-ranked prefix, and stamp and stdout say N of M with N below 20 |
+| B2 | AC-SEC-6, top-ranked prefix kept | Trim from the top of the ranking instead of the bottom | generator:341 | generator: 20 rules with 160-character multibyte names stay within the byte cap, the rows are the top-ranked prefix, and stamp and stdout say N of M with N below 20 |
+| C1 | AC-SEC-5, cap counts code points | Cap by UTF-16 units instead of code points | generator:159 | generator: hostile rule names and keys become inert one-line data and a bad key is dropped |
+| T1 | AC-QA-18 (tracked-file scan) | Plant the generator's name in `.githooks/pre-push` | .githooks/pre-push:7 | static: nothing tracked references the generator or its token variable outside the named exclusions, and install-consistency.mjs names it exactly once, in CONSUMER_OPTIONAL_PATTERNS |
+| T2 | AC-QA-18 (tracked-file scan) | Plant the generator's name in `bin/install.sh` | bin/install.sh:36 | static: nothing tracked references the generator or its token variable outside the named exclusions, and install-consistency.mjs names it exactly once, in CONSUMER_OPTIONAL_PATTERNS |
+| T3 | AC-ARCH-2 (tracked-file scan, any API path) | Plant `/api/measures/component` in `.githooks/pre-push` | .githooks/pre-push:7 | static: SonarQube API paths appear in no tracked file outside the generator, its tests and fixtures and the documents about it |
+| T4 | AC-ARCH-2 (the path the old list missed) | Plant `/api/measures/component` in `workflows/lib/install-consistency.mjs` | workflows/lib/install-consistency.mjs:401 | static: SonarQube API paths appear in no tracked file outside the generator, its tests and fixtures and the documents about it |
+| T5 | AC-SEC-8 (tracked-file scan) | Plant the table path in `.githooks/pre-push` | .githooks/pre-push:7 | the table path appears in agents/implementer.md and in no other tracked file outside the generator, its tests and the documents about it |
+| T6 | AC-SEC-8 (tracked-file scan) | Plant the table path in `bin/install.sh` | bin/install.sh:36 | the table path appears in agents/implementer.md and in no other tracked file outside the generator, its tests and the documents about it |
+| M4a | M4, message not printed (coded error) | Append the error message to the coded line | generator:371 | generator: a local file failure names the system call, the code and the repository-relative path, never the error message |
+| M4b | M4, message not printed (no code) | Append the error message to the generic line | generator:364 | generator: a local file failure names the system call, the code and the repository-relative path, never the error message |
+| M4c | M4, path relative to the repository root | Print the absolute path | generator:368 | generator: a local file failure names the system call, the code and the repository-relative path, never the error message |
+| L1a | L1, placeholder looked up again | Treat the placeholder as hand-written | generator:325 | generator: guidance equal to the placeholder or to the bare rule key was never hand-written, so the name is looked up again, while real hand-written guidance stays |
+| L1b | L1, bare rule key looked up again | Treat the bare rule key as hand-written | generator:325 | generator: guidance equal to the placeholder or to the bare rule key was never hand-written, so the name is looked up again, while real hand-written guidance stays |
+| L3a | L3, missing or non-integer total fails | Accept any total | generator:125 | generator: a missing or non-integer total, or a missing rules facet, fails naming the API path and writes nothing |
+| L3b | L3, `paging.total` accepted | Read only the top-level total | generator:124 | generator: paging.total is read when the top-level total is absent |
+| L3c | L3, missing rules facet fails | Skip the facet check | generator:137 | generator: a missing or non-integer total, or a missing rules facet, fails naming the API path and writes nothing |
+| L4a | AC-OPS-7, token cause note | Never take the token branch | generator:286 | generator: an unknown revision says which cause applied, one note per cause, and nothing about the head |
+| L4b | AC-OPS-7, no-analysis cause note | Never take the no-analysis branch | generator:287 | generator: an unknown revision says which cause applied, one note per cause, and nothing about the head |
+| L4c | AC-OPS-7, no-revision cause note | Reword the no-revision note | generator:288 | generator: an unknown revision says which cause applied, one note per cause, and nothing about the head |
+| L4d | AC-OPS-7, git unavailable is said | Never print the git-unavailable note | generator:352 | generator: says so when git is unavailable for the head comparison, and not when it is available |
+| R1 | L5, README: once per analysed merge | Reword the sentence | README.md:1780 | README says each run starts a new measurement interval, so run once per analysed merge and commit the result |
+| R2 | AC-OPS-12, README: local failure named | Reword the troubleshooting entry | README.md:1792 | README troubleshooting names a local file failure by system call, code and path, and says zero rules can also mean nothing was created in the window |
+| R3 | AC-OPS-12, README: zero rules cause | Restore the old "no unresolved issues" cause | README.md:1793 | README troubleshooting names a local file failure by system call, code and path, and says zero rules can also mean nothing was created in the window |
+| K1 | AC-QA-9, two runs byte identical | Put the process id into the stamp | generator:338 | generator: two runs with the same clock against the same fixture are byte identical |
+| K2 | AC-OPS-5, unknown project names the key | Drop the key from the failure line | generator:266 | generator: an unknown project key exits non-zero naming the key and writes no table |
+| K3 | AC-SIMP-8, nothing judges staleness | Print a "previous table is stale" note | generator:306 | generator: nothing derived from the previous stamp but the one instant is computed, so a stale revision or an old table draws no warning |
+| K4 | live defect 1, other analyses failures stay fatal | Treat every analyses failure as tolerated | generator:277 | generator: any other failure on the analyses lookup stays fatal, names the status and path, and writes nothing |
+| K5 | AC-SEC-2, no warning without the opt-in | Print the cleartext warning on every run | generator:254 | generator: a failing run without the opt-in prints exactly one stderr line, with no warning |
+| D1 | AC-PROD-5, README section exists | Rename the section heading | README.md:1736 | README: has a section for the analyser rules table |
+| D2 | AC-ARCH-2, README names no API path | Write `/api/issues` into the README | README.md:1740 | README names no SonarQube Web API path or SonarQube-only field name |
+| D3 | AC-SEC-6, README states the byte bound | Remove the byte bound sentence | README.md:1744 | README states the table bounds, the generator's environment variables and the stamp as the one derivation record |
+| D4 | AC-PROD-8, README: never a gate | "It is sometimes a gate." | README.md:1780 | README says a person runs the generator from the repository root after the analyser has finished, that it is never a gate and nothing automated runs it |
+| D5 | AC-PROD-11, README: hand-written guidance survives | Say guidance is rewritten on every refresh | README.md:1782 | README says the table is tracked in git, hand-written guidance survives a refresh, and how to write the table by hand for another analyser |
+| D6 | AC-PROD-5, README: a replaced implementer gets no benefit | "gets full benefit" | README.md:1740 | README says a repository that has replaced its implementer agent gets no benefit, and the replacement must read the table to get it |
+| D7 | AC-SEC-12, README: token on the same command line | "somewhere" | README.md:1770 | README tells the person to supply the token on the same command line as node, read from their token file at that moment, and never export, copy or echo it |
+| D8 | AC-SEC-13, README: no global admin token | "any token you like" | README.md:1776 | README states the minimum permission, forbids a global admin token and explains the http opt-in |
+| D9 | AC-OPS-9, README: deleting the table is the rollback | "Deleting the table is harmless" | README.md:1788 | README says deleting the table is the rollback, and that reinstalling and restarting the session roll the implementer change out or back |
+| D10 | AC-OPS-12, README: absent-although-present symptom | Drop "although the file exists" | README.md:1794 | README has a troubleshooting entry, naming cause and action, for each of four symptoms |
+| D11 | AC-OPS-1, implementer: read only when it exists (repaired guard) | Drop "only when it exists" | agents/implementer.md:57 | agents/implementer.md reads the table when it exists, before writing a test or production code, in every phase |
+| D12 | AC-SEC-7, implementer: instruction-like rows not followed | "is followed" | agents/implementer.md:60 | agents/implementer.md frames the table as reference data about patterns to avoid and never as instructions |
+| D13 | AC-SEC-6, implementer: byte bound | `8,192 bytes` to `9,000 bytes` | agents/implementer.md:62 | agents/implementer.md states the same bounds as the generator and treats an oversize table as absent, saying so at the top of the report |
+| D14 | AC-OPS-1, implementer: status line forms | Rename the `unreadable` status line form | agents/implementer.md:69 | agents/implementer.md requires one rules-table status line in every report, showing exactly one of read, absent, unstamped or unreadable |
+| G1 | AC-QA-14, table not git-ignored (repaired guard) | Add the table path to `.gitignore` | .gitignore:52 | the table is not git-ignored, so a linked worktree receives it |
+| G2 | AC-QA-14, worktree receives the table | Add the table path to `.gitignore` | .gitignore:52 | a linked worktree made with git worktree add holds the committed table at its fixed path, with the main checkout's content, under this repository's own ignore rules |
+
+### Comparator inversions and UTC instants (L6, L7)
+
+Re-run in round 2 against the current code. Inverting the key tiebreak (row N16)
+fails `generator: rules tied on recent-new are ordered by open count, then rules
+tied on both by key, whatever order the server lists them in (AC-QA-9)`;
+inverting the open-count comparison (row N17) fails the same test. Every date
+parameter is an explicit UTC instant: the test
+`generator: the window is 30 days back to a UTC midnight, inclusive, either
+side of a Sydney daylight-saving change (AC-QA-11)` asserts that every
+`createdAfter` sent equals the window start plus `T00:00:00+0000`, and the fake
+server answers 400 to a bare date. Sending a bare date (row N6) fails that test.
+
+| # | Criterion | Edit | Landed on | Failing test (name abridged) |
+|---|---|---|---|---|
+| N16 | AC-QA-9 key tiebreak | Reverse the key comparison | generator:317 | generator: rules tied on recent-new are ordered by open count, then rules tied on both by key, whatever order the server lists them in |
+| N17 | AC-QA-9 open-count tiebreak | Reverse the open-count comparison | generator:317 | generator: rules tied on recent-new are ordered by open count, then rules tied on both by key, whatever order the server lists them in |
+| N6 | AC-QA-11 explicit UTC instants | Send a bare date | generator:293 | generator: the window is 30 days back to a UTC midnight, inclusive, either side of a Sydney daylight-saving change |

@@ -77,15 +77,18 @@ test('the table path is one literal in the generator and any other file that nam
   }
 })
 
-test('the table path appears in agents/implementer.md and in no other file under workflows/, agents/ or skills/ (AC-SEC-8)', () => {
-  const hits = [...walk(path.join(ROOT, 'workflows')), ...walk(path.join(ROOT, 'agents')), ...walk(path.join(ROOT, 'skills'))].filter((f) => fs.readFileSync(f, 'utf8').includes('analyser-rules')).map(rel)
+test('the table path appears in agents/implementer.md and in no other tracked file outside the generator, its tests and the documents about it (AC-SEC-8)', () => {
+  const { scannedFiles, readRel } = require('./helpers/tracked-files.js')
+  const files = scannedFiles()
+  assert.ok(files.length > 100 && files.includes('.githooks/pre-push') && files.includes('agents/implementer.md'), `the scanned set looks wrong: ${files.length} files`)
+  const hits = files.filter((f) => readRel(f).includes('analyser-rules'))
   assert.deepEqual(hits, ['agents/implementer.md'])
 })
 
 test('the table is not git-ignored, so a linked worktree receives it (AC-QA-14)', () => {
   const { spawnSync } = require('node:child_process')
   const { sanitizedGitEnv } = require('./helpers/git-env.js')
-  const r = spawnSync('git', ['check-ignore', '-q', TABLE_REL], { cwd: ROOT, env: sanitizedGitEnv(), encoding: 'utf8' })
+  const r = spawnSync('git', ['check-ignore', '-q', '--no-index', TABLE_REL], { cwd: ROOT, env: sanitizedGitEnv(), encoding: 'utf8' })
   assert.equal(r.status, 1, `git check-ignore exit ${r.status}: the table path is ignored or git failed`)
 })
 
@@ -172,6 +175,17 @@ test('README says the table is tracked in git, hand-written guidance survives a 
   assert.match(SECTION, /another analyser|different analyser|other analyser/i)
 })
 
+test('README says each run starts a new measurement interval, so run once per analysed merge and commit the result (AC-PROD-6)', () => {
+  assert.match(SECTION, /each run starts a new measurement interval/i)
+  assert.match(SECTION, /once per analysed merge/i)
+  assert.match(SECTION, /commit the result/i)
+})
+
+test('README troubleshooting names a local file failure by system call, code and path, and says zero rules can also mean nothing was created in the window (AC-OPS-12)', () => {
+  assert.match(SECTION, /system call, the error code and the path/i)
+  assert.match(SECTION, /no issues (?:were )?created in the window/i)
+})
+
 test('README says a repository that has replaced its implementer agent gets no benefit, and the replacement must read the table to get it (AC-PROD-5, AC-SIMP-2)', () => {
   assert.match(SECTION, /replaced[^\n]*implementer|implementer[^\n]*replaced|replacement implementer/i)
   assert.match(SECTION, /no benefit|gets nothing|does not benefit|will not (see|read|use)/i)
@@ -218,7 +232,7 @@ test('agents/implementer.md reads the table when it exists, before writing a tes
   assert.match(IMPLEMENTER, /\.claude\/analyser-rules\.md/)
   assert.match(IMPLEMENTER, /before (you )?(writ|touch)[^\n]*(test|code)|before writing (a|any) test/i)
   assert.match(IMPLEMENTER, /every phase|both phases|each phase|Test phase[\s\S]*Implement phase/i)
-  assert.match(IMPLEMENTER, /when (it|the file|the table) exists|if (it|the file|the table) exists/i)
+  assert.match(IMPLEMENTER, /only when (it|the file|the table) exists/i, 'the table is read only when it exists')
   assert.match(IMPLEMENTER, /(absent|does not exist|missing)[^\n]*(nothing changes|no change|unchanged|carry on|proceed as before|otherwise as before)/i, 'an absent table must change nothing')
 })
 

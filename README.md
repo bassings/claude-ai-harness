@@ -1773,11 +1773,11 @@ A person runs it from the repository root, after the analyser has finished analy
 SONAR_TOKEN="$(cat path/to/your-token-file)" SONAR_HOST_URL=https://sonar.example.invalid SONAR_PROJECT_KEY=my-project node bin/sonar-rules-table.mjs
 ```
 
-Never export the token into a shell session, never write or copy it into another file and never echo it. Use a token with Browse permission on the one project it reads, not a global admin token. Plain http needs `SONAR_ALLOW_HTTP=1` and sends the token in cleartext. A token that may not read the analysed revision still works: the revision is recorded as unknown and the run says so.
+Never export the token into a shell session, never write or copy it into another file and never echo it. Use a token with Browse permission on the one project it reads, not a global admin token. Plain http needs `SONAR_ALLOW_HTTP=1` and sends the token in cleartext. A token that may not read the analysed revision still works: the revision is recorded as unknown and the run says which cause applied: the token may not read it, the server returned no analysis, or the analysis carries no revision.
 
 What it does: it asks the server for the rules new code tripped in the last 30 days and for the largest open rules, chooses up to 20 rows with recent-new rules first and then by open count, looks up each new rule's own name for the guidance, and replaces the table atomically. It exits zero after writing, whatever the counts, and non-zero without writing when anything is wrong. Its summary says the rules kept out of the rules available, so a cut is never silent.
 
-It is never a gate. Nothing automated runs it: not the conductor, not CI, not a hook. It writes no ledger line, and a person decides when to run it and commits the result.
+It is never a gate. Nothing automated runs it: not the conductor, not CI, not a hook. It writes no ledger line, and a person decides when to run it and commits the result. Each run starts a new measurement interval (the previous instant in the stamp is the previous run), so run it once per analysed merge and commit the result; casual reruns leave short, empty intervals that say nothing about whether the table is used.
 
 Hand-written guidance survives a refresh. For a rule already in the table the generator updates the counts and leaves the guidance text as it found it; a rule new to the table arrives with the analyser's own rule name until someone improves it, and a rule the run no longer selects is dropped.
 
@@ -1789,8 +1789,8 @@ Deleting the table is the rollback: with no file, the builder carries on as befo
 
 ### Troubleshooting
 
-- The generator exits non-zero. Cause: a missing environment variable, an http address without the opt-in, a rejected token, a project key the server does not know, a timeout or a redirect. Action: read the one stderr line, which names the condition and the request that failed, and fix that; the existing table is left untouched.
-- The table says zero rules. Cause: the project has no unresolved issues in the window, or the wrong project key was read. Action: check `SONAR_PROJECT_KEY` and that the analyser has finished analysing the merge, then run it again.
+- The generator exits non-zero. Cause: a missing environment variable, an http address without the opt-in, a rejected token, a project key the server does not know, a timeout, a redirect, or an answer whose shape the generator does not recognise. Action: read the one stderr line, which names the condition and the request that failed, and fix that; the existing table is left untouched. A failure on the local side, such as a read-only `.claude` directory or a full disk, is named by the system call, the error code and the path relative to the repository root, for example `open failed (EACCES) on .claude/...`; the error's own text is never printed.
+- The table says zero rules. Cause: no issues were created in the window (issues since fixed still count, false positives and accepted ones do not), or the wrong project key was read. Action: check `SONAR_PROJECT_KEY` and that the analyser has finished analysing the merge, then run it again.
 - The builder reports absent although the file exists. Cause: the file is not at `.claude/analyser-rules.md` exactly, is a symlink, is over a bound, or is not committed so the worktree lacks it. Action: check the path and that the file is tracked in git.
 - The builder's report carries no rules-table line at all. Cause: the installed implementer is a replacement, or older than this change. Action: reinstall with `bin/install.sh`, restart the Claude Code session, and check the installed `implementer.md` names the table.
 

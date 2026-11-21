@@ -87,9 +87,18 @@ async function get(cfg, apiPath, params) {
   }
 }
 
-// Every issue query asks for unresolved issues only (AC-QA-2). One facet per
-// query, ps=1: the request count never depends on the number of issues.
-const issueFacet = (cfg, extra) => get(cfg, '/api/issues/search', { componentKeys: cfg.project, resolved: 'false', facets: 'rules', ps: '1', ...extra })
+// One facet per query, ps=1: the request count never depends on the number of
+// issues (AC-ARCH-8). The open query asks for unresolved issues only. The two
+// creation-date queries count issues by when they were created whether or not
+// since fixed, so a clean-up does not erase the rule it cleaned up, and leave
+// out only false positives and accepted issues, by an explicit status list that
+// never relies on the server's default (AC-QA-2). Verified against SonarQube
+// 26.11 on 2026-11-21: issueStatuses with createdAfter is accepted, and sending
+// resolved as well is not needed.
+const CREATED_STATUSES = 'OPEN,CONFIRMED,FIXED'
+const issueFacet = (cfg, extra) => get(cfg, '/api/issues/search', { componentKeys: cfg.project, facets: 'rules', ps: '1', ...extra })
+const openFacet = (cfg) => issueFacet(cfg, { resolved: 'false' })
+const createdFacet = (cfg, instant) => issueFacet(cfg, { issueStatuses: CREATED_STATUSES, createdAfter: instant })
 
 // The one place a rule's own name is looked up. /api/rules/show?key= is the
 // single-rule lookup, verified against SonarQube 26.11 on 2026-11-21: it returns
@@ -109,10 +118,24 @@ async function lookupRuleName(cfg, key) {
 }
 
 // ------------------------------------------------------------------ data
+// The top-level total, or paging.total when it is absent (the server returns
+// both; the top-level one is deprecated).
+function totalOf(body) {
+  const total = body?.total !== undefined ? body.total : body?.paging?.total
+  if (!Number.isInteger(total) || total < 0) throw new Fail(`the response has no usable total on ${ISSUES_PATH}`)
+  return total
+}
+
+const ISSUES_PATH = '/api/issues/search'
+
+// A changed response shape is a failure that names the API path, never a
+// silent zero: a run that would have written an empty table for that reason
+// writes nothing.
 function facetCounts(body) {
   const out = new Map()
-  const values = body?.facets?.find((f) => f.property === 'rules')?.values
-  for (const v of Array.isArray(values) ? values : []) {
+  const facet = Array.isArray(body?.facets) ? body.facets.find((f) => f?.property === 'rules') : undefined
+  if (!facet || !Array.isArray(facet.values)) throw new Fail(`the response has no rules facet on ${ISSUES_PATH}`)
+  for (const v of facet.values) {
     if (typeof v?.val === 'string' && RULE_KEY_RE.test(v.val) && Number.isInteger(v.count) && v.count >= 0) out.set(v.val, v.count)
   }
   return out
@@ -224,10 +247,13 @@ function localHead(root) {
   }
 }
 
+let repoRoot = null
+
 async function main() {
   const cfg = configure()
   if (cfg.warning) console.error(cfg.warning)
   const root = fs.realpathSync(process.cwd())
+  repoRoot = root
   const { dir, file } = checkTarget(root)
 
   const end = cfg.now.toISOString().slice(0, 10)
@@ -251,18 +277,26 @@ async function main() {
     if (e.status === 401 || e.status === 403) revisionDenied = true
     else notFound(e)
   }
-  const rev = analyses?.analyses?.[0]?.revision
+  const latest = analyses?.analyses?.[0]
+  const rev = latest?.revision
   const revision = typeof rev === 'string' && /^[0-9a-f]{40}$/.test(rev) ? rev : 'unknown'
+  // When the revision is unknown, say which cause applied (AC-OPS-7).
+  let unknownCause = null
+  if (revision === 'unknown') {
+    if (revisionDenied) unknownCause = 'the token is not permitted to read the analysed revision'
+    else if (!latest) unknownCause = 'the server returned no analysis for the project'
+    else unknownCause = 'the latest analysis carries no usable revision'
+  }
 
   // Every date parameter is an explicit UTC instant: a bare date would be read
   // in the server's own time zone.
   const instantOf = (iso) => iso.replace(/Z$/, '+0000')
-  const recentBody = await issueFacet(cfg, { createdAfter: instantOf(`${since}T00:00:00Z`) })
-  const openBody = await issueFacet(cfg, {})
+  const recentBody = await createdFacet(cfg, instantOf(`${since}T00:00:00Z`))
+  const openBody = await openFacet(cfg)
   const recent = facetCounts(recentBody)
   const open = facetCounts(openBody)
-  const newIssues = Number.isInteger(recentBody.total) ? recentBody.total : 0
-  const openTotal = Number.isInteger(openBody.total) ? openBody.total : 0
+  const newIssues = totalOf(recentBody)
+  const openTotal = totalOf(openBody)
 
   const { rules: previous, instant: previousInstant } = readPrevious(file)
   // Issues created after the previous table: the only ones that can show
@@ -270,8 +304,8 @@ async function main() {
   let sincePrevious = 'n/a'
   let onListed = 'n/a'
   if (previousInstant) {
-    const sinceBody = await issueFacet(cfg, { createdAfter: instantOf(previousInstant) })
-    sincePrevious = Number.isInteger(sinceBody.total) ? sinceBody.total : 0
+    const sinceBody = await createdFacet(cfg, instantOf(previousInstant))
+    sincePrevious = totalOf(sinceBody)
     onListed = 0
     for (const [k, n] of facetCounts(sinceBody)) if (previous.has(k)) onListed += n
   }
@@ -286,7 +320,9 @@ async function main() {
   const notes = []
   for (const r of rows) {
     const kept = previous.get(r.key)
-    if (kept) {
+    // A placeholder or the bare rule key is what an earlier failed lookup left
+    // behind, not hand-written guidance, so the name is looked up again.
+    if (kept && kept !== PLACEHOLDER && kept !== r.key) {
       r.guidance = kept
       continue
     }
@@ -311,12 +347,31 @@ async function main() {
   const head = localHead(root)
   console.log(stampFor(rows.length))
   console.log(`wrote ${TABLE_REL}: ${rows.length} rules (window ${since}..${end}, analysed revision ${revision})`)
-  if (revisionDenied) console.log('note: the token is not permitted to read the analysed revision; the revision is recorded as unknown')
+  if (unknownCause) console.log(`note: ${unknownCause}; the revision is recorded as unknown`)
   for (const n of notes) console.log(n)
+  if (!head && revision !== 'unknown') console.log('note: git is not available for the head comparison, so the server revision was not compared with the local head')
   if (head && revision !== 'unknown' && revision !== head) console.log(`note: the server has not yet analysed the current head (server revision ${revision}, local head ${head})`)
 }
 
+// What a person sees for a failure that is not the generator's own. A local
+// file error names its system call, its code and the path relative to the
+// repository root, all fixed-shape fields. The error's free-text message is
+// never printed, because nothing guarantees what it holds (AC-SEC-4). An error
+// with no code keeps the generic line.
+function describe(e) {
+  if (e instanceof Fail) return e.message
+  const code = typeof e?.code === 'string' && /^[A-Z][A-Z0-9_]{1,31}$/.test(e.code) ? e.code : null
+  if (!code) return `unexpected ${e?.name || 'error'}`
+  const call = typeof e.syscall === 'string' && /^[a-z_]{2,24}$/.test(e.syscall) ? e.syscall : 'operation'
+  let where = ''
+  if (typeof e.path === 'string' && repoRoot) {
+    const rel = path.relative(repoRoot, e.path)
+    where = ` on ${rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : '<outside the repository>'}`
+  }
+  return `${call} failed (${code})${where}`
+}
+
 main().catch((e) => {
-  console.error(e instanceof Fail ? `sonar-rules-table: ${e.message}` : `sonar-rules-table: unexpected ${e?.name || 'error'}`)
+  console.error(`sonar-rules-table: ${describe(e)}`)
   process.exitCode = 1
 })
