@@ -109,6 +109,55 @@ rely on; this measurement only shows the channel can work. Not measured:
 whether a bare `Bash` deny overrides an operator's user-level allow rule (the
 owner has none to test against).
 
+### Measured at real size, and what it changed (2026-11-22)
+
+The collector's `ledger.json` for this repository is 213,651 characters on one
+line. A no-shell headless session asked to read it and hand it to a workflow
+read only the first 40,743 characters and, correctly, reported that it could
+not pass the object; the session cost about US$1.09. So the hand-off this spec
+first assumed, the session passing the whole collected result as arguments,
+does not work at real size.
+
+A read-only map of `workflows/optimise-cycle.js` then showed where the size
+sits and how each part is used:
+
+- `neverFailingAcs` (129 KB, 388 rows) is iterated by script code and rendered
+  one line per row into the report, with no gate on it; 336 of the 388 rows
+  render as "insufficient data".
+- `rework.acVerdicts` (60 KB) reaches only the synthesis prompt; no script
+  code reads it.
+- Everything the gates, the tables and the id annotations compute on comes to
+  about 21 KB.
+- The collector read the ledger with the reader's default window of 2,000
+  records. The weekly runner has always passed 90, which gives 58 KB, 90
+  records and 100 criteria rows. Changing what the optimiser measures is out
+  of scope, so the collector's window is a defect and goes back to 90.
+- The proposal identifier decides the previously-rejected and
+  previously-adopted annotations and which report section a proposal lands
+  in, so computing it after the session returns would move part of report
+  assembly into the runner.
+- The collector's git result lacks two fields the workflow's schema requires
+  (`root_index`, `window_note`), nothing collects the plan labels the drafter
+  is shown, the workflow discards a good git figure when the ledger lane
+  failed (against AC-PROD-3), and the report prints no CI run count (which
+  AC-QA-2 needs).
+
+**Owner decisions, 2026-11-22.**
+
+1. **A bounded digest.** The collector also writes one digest per repository,
+   sized near what was measured to pass intact (about 28 KB here with git and
+   CI): every figure the gates and tables use, and for the never-failing table
+   only the rows that carry a verdict or a taint reason, plus a count of the
+   insufficient-data rows. The report's never-failing section lists those rows
+   and the count. The full lane files stay in the per-run directory and the
+   runner checks the report's figures against them.
+2. **Identifiers are computed inside the workflow**, by a second
+   implementation of the hash in the script, held to the existing one by a
+   parity test. This reverses the decision of 2026-11-21, which was taken
+   before the annotation lookup had been traced, and overturns the simplicity
+   veto on a second copy: the alternative splits report assembly across two
+   programs.
+
 ## Shapes considered
 
 **A. The runner collects, the workflow analyses.** The runner runs the three
@@ -214,7 +263,7 @@ Shape chosen at planning: **C**. The runner's collector is the only collection p
 - **AC-SIMP-1:** No new dependency. The change adds no package manifest or lockfile entry. Collection invokes only git, gh, node and timeout, all of which the runner already uses.
 - **AC-SIMP-2:** No new operator-facing configuration. `bin/optimise-cycle-weekly.sh`, `workflows/optimise-cycle.js` and the collector read no environment variable, settings key or config file that main does not already read. Collector timeouts and limits are named constants in code.
 - **AC-SIMP-4:** The proposal gates and report assembly exist once. `isAlwaysOnSecurityRemoval`, `hasReinstatementEvidence`, `isUnmeasuredSegmentMotivated`, `isWeakCiEvidenceRemoval`, `malformedTargetReason` and `buildReport` are each defined in exactly one file across `workflows/` and `bin/`, and that file is `workflows/optimise-cycle.js`. No new program applies gates or assembles a report. *(merges AC-ARCH-3)*
-- **AC-SIMP-5:** The workflow gains one new argument for the collected data, the path of the collected-data directory, and at most one more for the runner-minted nonce that AC-SEC-5 requires. `report_path` and `proposal_targets_path` are removed together with `OUTPUT_PATH_RE` and `outputPathOk`.
+- **AC-SIMP-5:** The workflow gains one new argument for the collected data, the path of the collected-data directory, and at most one more for the runner-minted nonce that AC-SEC-5 requires. `report_path` and `proposal_targets_path` are removed together with `OUTPUT_PATH_RE` and `outputPathOk`. *(amended 2026-11-22 on the owner's decision: the one new argument carries the digest itself, not a path, because a workflow script cannot read files and the session can pass a document of the digest's size intact; the second is the runner's nonce.)*
 - **AC-SIMP-6:** The verdict stays two-valued. Every RESULT line the runner writes is either `RESULT PASS` or `RESULT FAIL`, and the last-result file holds only PASS, FAIL or RUNNING. A lane that could not run for a reason outside the runner's control, such as gh being unauthenticated, is a FAIL whose reason names the lane and the mode.
 - **AC-SIMP-7:** The completeness verdict uses only the collected JSON files the runner wrote for that run and the report text. No completeness-summary subcommand, file or schema is added to `optimise-read.mjs` or anywhere else.
 - **AC-SIMP-8:** At most one new non-test source file is added, the collector. The change adds no new agent definition, skill or workflow file.
@@ -312,7 +361,10 @@ Vetoes simplicity raised that do not stand, because security outranks them:
 | Redesign: the runner collects, the session only analyses, the runner writes the report | owner, 2026-11-14 | accepted | Patching the allowlist had gone four review rounds; the measured failure was the session's need to act |
 | This work before any further rules-table work | owner, 2026-11-21 | accepted | The weekly job has produced nothing since 2026-11-08 |
 | Shape C over shape B | lens-simplicity veto; owner, 2026-11-21 | C | B puts the proposal gates and report assembly in a second place; the measured transit was verbatim and the figure checks cover a changed count. Accepted cost: an altered sentence in a proposal's prose would not be detected |
-| Proposal identifiers computed by the runner after the session returns | owner, 2026-11-21 | accepted | Keeps the session shell-free with one hashing implementation |
+| Proposal identifiers computed by the runner after the session returns | owner, 2026-11-21 | **reversed 2026-11-22** | Taken before the annotation lookup was traced |
+| Proposal identifiers computed inside the workflow, with a parity test against the existing implementation | owner, 2026-11-22 | accepted (AC-SIMP-4 holds; the simplicity veto on a second hash is overturned) | The identifier decides annotations and section placement; computing it later would split report assembly |
+| The collected data reaches the workflow as a bounded digest | owner, 2026-11-22 | accepted | The full ledger result is 214 KB and a session could read only a fifth of it; the never-failing section becomes the informative rows plus a count |
+| The collector's ledger window is 90 records, as the runner has always passed | conductor | restored | Changing what the optimiser measures is out of scope; one defensible course |
 | A third verdict state | lens-simplicity veto | PASS or FAIL only | A lane that could not run for an outside reason writes an honest report and scores FAIL |
 
 ## Risks
@@ -347,13 +399,15 @@ Ranked by recoverability.
 ## Tasks
 
 - [x] T1: the collector, one node module under `workflows/lib/` that gathers ledger, git and CI data for one repository into JSON files in a directory it is given, with fixed command forms, per-command timeouts, distinct ledger states and repo isolation; shipped by install (AC-ARCH-1, AC-ARCH-5, AC-ARCH-7, AC-SEC-7 to AC-SEC-12, AC-QA-1, AC-QA-6 to AC-QA-9, AC-QA-16, AC-QA-17, AC-QA-19, AC-QA-20, AC-OPS-4, AC-SIMP-1, AC-SIMP-8) — state: merged #40 (`6e067c8`)
-- [ ] T2: `optimise-cycle.js` takes the collected-data directory and the runner's nonce, skips its lanes when given them, drops the `report:write` step for both entry points, and returns the report, the sidecar and each lane's status as one structured result (AC-ARCH-2, AC-ARCH-8, AC-ARCH-9, AC-ARCH-11, AC-SEC-5, AC-SEC-6, AC-SEC-17, AC-QA-2, AC-QA-10, AC-SIMP-4, AC-SIMP-5) — state: queued (needs: T1)
+- [ ] T1b: the collector's hand-off, before T2 can be designed against it: the ledger window is 90 records as the runner has always passed (an option on the module, no new operator setting); the collector writes one bounded `digest.json` per repository beside the three lane files, holding every figure the workflow's gates and tables read, the never-failing rows that carry a verdict or a taint reason with a count of the rest, capped sizes for the per-plan and outcomes parts, short lines, and each lane's status and run counts; the git result carries the two fields the workflow's schema requires; the plan labels the drafter is shown are collected; and the six sites the T1 clean-up found with no test that fails when they are broken are pinned (AC-QA-1, AC-QA-19, AC-ARCH-1, AC-SEC-6, AC-SEC-11, AC-SEC-12) — state: queued
+- [ ] T2: `optimise-cycle.js` takes the digest and the runner's nonce as arguments, skips its lanes and its scope agent when given them, computes proposal identifiers itself by a hash held to the reader's by a parity test, keeps a good git figure when the ledger lane failed, prints the CI run count, drops the `report:write` step for both entry points, and returns the report, the sidecar and each lane's status as one structured result (AC-ARCH-2, AC-ARCH-8, AC-ARCH-9, AC-ARCH-11, AC-SEC-5, AC-SEC-6, AC-SEC-17, AC-QA-2, AC-QA-10, AC-SIMP-4, AC-SIMP-5, AC-PROD-3) — state: queued (needs: T1b)
 - [ ] T3: the runner collects, launches a session with no shell and no write, parses the structured result, checks every measured figure, computes proposal identifiers, makes the outputs ignored, writes the report and sidecar, and scores on content with a two-valued verdict; the removed grants, plumbing and tests go (AC-SEC-1, AC-SEC-2, AC-SEC-4, AC-SEC-13 to AC-SEC-16, AC-SEC-18, AC-QA-3 to AC-QA-5, AC-QA-11 to AC-QA-13, AC-QA-15, AC-QA-18, AC-QA-21, AC-QA-25, AC-ARCH-6, AC-ARCH-10, AC-ARCH-12, AC-PROD-1, AC-PROD-3, AC-PROD-4, AC-OPS-1, AC-OPS-6, AC-OPS-7, AC-OPS-9, AC-OPS-11, AC-OPS-12, AC-SIMP-2, AC-SIMP-6, AC-SIMP-7) — state: queued (needs: T1, T2)
 - [ ] T4: the attended `/optimise-cycle` uses the collector and writes its report from the structured result; README, skill and runbook entries for every new FAIL reason (AC-PROD-5, AC-PROD-8, AC-OPS-16, AC-SEC-18) — state: queued (needs: T2)
 - [ ] T5: real proof on the owner's machine: the headless probe under the runner's exact flags, one real launchd run cross-checked by hand against independent counts, one deliberately hollowed run that FAILs, timing, the rollback run once, all recorded in `docs/release-checklist.md`; the owner decides whether to switch the job back on (AC-SEC-3, AC-QA-22 to AC-QA-24, AC-OPS-14, AC-OPS-15, AC-SIMP-14) — state: queued (needs: T3, T4)
 
 ## Conductor log
 
+- **Tick 5 (2026-11-22):** real-size transit measured and failed (214 KB ledger result; the session read a fifth and said so). A planning agent mapped the workflow's use of every collected field (sizes and line references in the conductor's notes; summary above). Owner decided: a bounded digest, and identifiers computed inside the workflow. The collector's window goes back to 90 records. **T1b added** ahead of T2. Next: build T1b, then repeat the transit measurement five times with this repository's real digest in and a report from the real `buildReport` out, before T2 is built on it.
 - **Tick 4 (2026-11-22):** T1's eight analyser issues cleared in #41 (`8fccd11`), behaviour-identical, no test edited, by a builder briefed to search its own changed lines against each row of the rules table rather than report compliance. **Per-merge record, entry 5: 0 new, 0 on listed rules**; 134 open, coverage 97.0%; the collector keeps one issue, left on purpose with a comment. The builder ran fourteen mutations against the changed functions: eight caught, **six sites have no test that fails when broken** (the ENOENT and ELOOP branches at the guarded open, its final catch, the sidecar malformed-JSON catch, one log-token branch, one detail string), recorded as gaps in the proofs file. **T3 must pin them**, since it tests the same error paths through the runner. Next: measure the transit of real-size collected data (about 200 KB for this repository) into a workflow before T2 is designed around it.
 - **Tick 3 (2026-11-22):** **T1 merged** as `6e067c8` (#40). Fix round 3 (`c2a41c2`) restored the reader's command-line behaviour, which the conductor's own conflicting brief had changed, made unrecognised repository layouts report could-not-read, and hardened the read-funnel scan; the conductor compared the reader's output with the pre-change reader for a normal checkout, a linked worktree and a two-root call: byte-identical. CI then failed both test jobs: one new fixture committed without a git identity, which a CI runner lacks and the owner's machine has. Fixed in the test; the whole Node suite was run locally with no global git identity (2474 of 2474) before pushing again; CI green. Installed. Post-merge scan: coverage 97.1%, 141 open. **Per-merge record, entry 4: 8 issues created by T1, 6 of them on rules the table listed** (nested template literals twice, a nested ternary, optional chaining twice, await in a loop), although every builder reported the table as read and one reported using no nested ternaries. The table did not prevent repeats on a sizeable build. Two more are on a rule a sibling repository trips and this table did not list (an unexplained empty catch). A small clean-up PR follows before T2. Builder stalled three times waiting on background work it had started; nudged each time. Harness note for later: the local gate and CI differ on global git identity, and a builder's self-report of compliance with the rules table is not evidence.
 - **Tick 2 (2026-11-21):** T1 fix round 2 committed (`9584083`): guarded reads for every repository file, a 20-minute CI budget, hard timeouts, one ledger-root resolver, fixed-vocabulary failure text; 26 more mutations recorded, one survivor stated (the grace timer cannot be pinned without a process that survives SIGKILL). Gate 2457 Node, 136 Python. Real collector run on this repository: ledger, git and CI all ran, 100 runs fetched, none failed. Spec amended for the four gaps the reviews found (AC-SEC-11, AC-OPS-4, AC-QA-6, AC-QA-7). Next: a targeted check of the round's diff, then the T1 PR.
