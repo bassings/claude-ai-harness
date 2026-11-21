@@ -1628,11 +1628,13 @@ export function repoFileStatus(root, rel, maxBytes) {
       if (!dir.isDirectory()) return { status: 'not_regular', kind: 'other' }
     }
     const st = fs.lstatSync(path.join(root, rel))
-    const kind = st.isFile() ? 'file' : st.isDirectory() ? 'directory' : 'other'
+    let kind = 'other'
+    if (st.isFile()) kind = 'file'
+    else if (st.isDirectory()) kind = 'directory'
     if (kind !== 'file') return { status: 'not_regular', kind }
     return st.size > maxBytes ? { status: 'too_large', kind, size: st.size } : { status: 'ok', kind, size: st.size }
   } catch (e) {
-    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'unreadable' }
+    return e?.code === 'ENOENT' ? { status: 'absent' } : { status: 'unreadable' }
   }
 }
 
@@ -1644,7 +1646,8 @@ export function readRepoFile(root, rel, maxBytes) {
   try {
     fd = fs.openSync(path.join(root, rel), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
   } catch (e) {
-    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: e && e.code === 'ELOOP' ? 'not_regular' : 'unreadable' }
+    if (e?.code === 'ENOENT') return { status: 'absent' }
+    return { status: e?.code === 'ELOOP' ? 'not_regular' : 'unreadable' }
   }
   try {
     const st = fs.fstatSync(fd)
@@ -1658,7 +1661,9 @@ export function readRepoFile(root, rel, maxBytes) {
       offset += n
     }
     return { status: 'ok', text: buf.subarray(0, offset).toString('utf8') }
-  } catch (e) {
+  } catch {
+    // Any failure while reading the open descriptor is reported as the fixed
+    // 'unreadable' status; the error is dropped because its message can carry a path.
     return { status: 'unreadable' }
   } finally {
     fs.closeSync(fd)
@@ -2019,7 +2024,7 @@ function readProposalTargetsSidecar(roots) {
         return
       }
       parsed = JSON.parse(file.text)
-    } catch (e) {
+    } catch {
       // Malformed JSON. The message is never echoed (it can carry the path).
       if (i === 0) firstFailure = 'proposal-target sidecar unreadable or not valid JSON'
       return

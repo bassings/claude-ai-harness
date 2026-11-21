@@ -102,3 +102,37 @@ and throws; the first test named is the one the row proves.
 | S5 | AC-SEC-11 (round 3 item 3) | `fs.readSync(...)` added | the same test |
 | S6 | AC-SEC-11 (round 3 item 3) | `fs.copyFileSync(...)` added | the same test |
 | S7 | AC-SEC-11 (round 3 item 3) | `fs.readlinkSync(...)` added | the same test |
+
+## After the post-merge clean-up
+
+The clean-up (nested template literals and ternary, optional chaining, ignored
+exceptions, a comment at the sequential await) changed no behaviour: the three
+test files `test/harn-runner-2-t1.test.js`, `test/optimise-read.test.js` and
+the rules-table generator's test file passed unedited (359 tests) before any mutation.
+Same method as above (applied, confirmed to have landed on a code line, test run,
+restored byte-identical, checked by comparing against the original text). Run
+against `test/harn-runner-2-t1.test.js`. C19, C9 and D3 and D2 are recorded rows
+re-run; L1, E1, K1 and A1 are new edits on the functions the clean-up touched.
+
+| id | function touched | the edit | named test that failed |
+|---|---|---|---|
+| C19 | `readerJson` (collector) | reader called under the `git log` timeout key | "AC-OPS-4: a reader that overruns its own timeout ..." |
+| C9 | `logLine` (collector) | log line prefix `COLLECT` to `COLLECTED` | "AC-QA-1: K ledger lines, R gh runs and F fix commits ..."; "AC-QA-7: a gh run list that hangs ..." |
+| L1 | `laneToken` (collector) | `failed:` to `failedX:` | "AC-QA-7: a gh run list that hangs, with a background grandchild ..." |
+| E1 | `collectEntries` (collector) | `if (entry) entries.push(entry)` to `if (false) ...` | "AC-QA-1: K ledger lines ..."; the AC-QA-6 per-run failure tests |
+| D3 | `repoFileStatus` (reader) | directory-on-the-way check disabled | "AC-SEC-11: a .claude directory that is itself a symlink ..."; "AC-SEC-11: the reader ledger command does not follow a .claude directory ..." |
+| D2 | `REPO_FILE_CAPS` (reader) | triggers size cap raised to 1 GiB | "AC-SEC-11: an oversize regular triggers file is not read" |
+| K1 | `repoFileStatus` (reader), the kind if/else | `kind = 'directory'` to `kind = 'other'` | "AC-QA-1: K ledger lines ..."; "AC-SEC-10: a copy of the reader or the collector inside the analysed repository ..." and others |
+| A1 | `repoFileStatus` (reader), `e?.code` | `e?.code === 'ENOENT'` to `false` | the same tests as K1 |
+
+Three sites are not pinned by any test; these were survivors on first run and are
+recorded as gaps, not as proofs. The tests were not edited (the brief forbade it).
+
+| id | function touched | the edit that survived | why it is out of reach |
+|---|---|---|---|
+| A2 | `readRepoFile`, the open's `ENOENT` branch | `if (e?.code === 'ENOENT')` to `if (false)` | the file must vanish between the status check and the open |
+| EL | `readRepoFile`, the open's `ELOOP` branch | `'ELOOP'` to `'ELOOPZ'` | the final segment must become a symlink between the check and the open |
+| UC | `readRepoFile`, the final `catch` | `'unreadable'` to `'not_regular'` | needs a read error on an open descriptor |
+| SC | the sidecar loader's malformed-JSON `catch` | its reason to `proposal-target sidecar not found` (also tried with the `return` dropped) | no test in `t1`, `optimise-read`, `harn-opt-4-t6` or `weekly-runner` feeds a malformed sidecar and reads the reason |
+| E-ran | `laneToken`, the `ran:<mode>` branch | `ran:` to `ran-` | no test reaches a ran lane with a mode in the log line |
+| O1 | `readerJson`, the over-size-limit detail | `'output over the size limit'` to `...Z` | the detail text is not asserted |
