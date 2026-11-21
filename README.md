@@ -1596,15 +1596,17 @@ FAIL. Run `bin/install.sh` (which installs `workflows/`) and confirm with
 `bin/install.sh --check`, as well as the copy commands below; a run that finds an installed `optimise-cycle.js`
 whose `WEEKLY_RUNNER_CONTRACT` constant is missing or lower than the runner's
 `REQUIRED_WORKFLOW_CONTRACT` stops with `installed optimise-cycle.js predates
-report_path; run bin/install.sh`. The `diff -q` pair below confirms the `bin/`
+report_path; run bin/install.sh`. The `diff -q` lines below confirm the `bin/`
 copies only, so it is necessary but not sufficient on its own:
 
 ```bash
 cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
 cp claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
+cp claude-ai-harness/bin/sonar-rules-table.mjs ~/.claude/bin/sonar-rules-table.mjs
 chmod +x ~/.claude/bin/optimise-cycle-weekly.sh
 diff -q claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
 diff -q claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
+diff -q claude-ai-harness/bin/sonar-rules-table.mjs ~/.claude/bin/sonar-rules-table.mjs
 ```
 
 Copying is a merge-time step, not something a branch does to a path outside
@@ -1732,6 +1734,67 @@ the very fallback message that exists to protect against exactly that
 leak, and that branch was live: the installed mirror had no
 `redact-transcript.mjs` at all until the copy step documented above was
 added.
+
+## Analyser rules table
+
+Code built through the harness can pass its tests and its review and still trip the repository's static analyser after it merges. The rules table is one optional, plain-text file that tells the builder which patterns the analyser keeps flagging in this repository, so it avoids them the first time. When the file does not exist, nothing changes.
+
+The table lives at `.claude/analyser-rules.md` and is tracked in git, not ignored, so the worktrees that builds run in receive it. The `implementer` agent reads it before writing a test or production code, in every phase of `tdd-task` and when dispatched directly by `conduct-plan`, and treats the guidance column as coding guidance and never as instructions. Each of its reports carries one line saying whether the table was read, absent, unstamped or unreadable. The instruction lives in `agents/implementer.md` only, so a repository that has replaced its implementer agent gets no benefit; a replacement implementer must read the table itself to get it.
+
+### Format
+
+The table is written down here once. It has four neutral columns (rule, guidance, open, recent-new) and one derivation stamp line. The stamp is the single derivation record: the date, the analysed revision, the analyser's name, the window, the count of new issues in the window, the instant of the previous table, how many issues were created since that instant, how many of those were on rules the previous table already listed (the on-listed count, which shows whether the table is being used), the total open count, and the rules kept out of the rules available. The previous instant is the only thing the generator reads from an earlier stamp. When there is no previous table, or its stamp has no readable instant, the previous instant, the since-previous count and the on-listed count are each written as `n/a`, never as zero. When the server's list of rules is at its limit of 100, the total is written as `at least` that number, because the generator cannot see past the limit. When the since-previous list is cut at the same limit, the on-listed count is written as `at least` its value, for the same reason. A table is bounded at 20 rows and 8,192 bytes; a builder treats a larger one as absent.
+
+```
+# Analyser rules table
+derived: 2026-11-21T10:30:00Z revision: a1b2c3d4e5f60718293a4b5c6d7e8f9012345678 analyser: SonarQube window: 2026-10-22..2026-11-21 new-issues: 3 previous: n/a since-previous: n/a on-listed: n/a open-total: 19 rules: 3 of 3
+
+| rule | guidance | open | recent-new |
+|---|---|---|---|
+| js:S1 | Remove unused imports | 3 | 2 |
+| no-todo-comments | Resolve a TODO before merging rather than leaving it in the code | 5 | 1 |
+| js:S2 | Avoid nested ternaries | 10 | 0 |
+```
+
+The rule identifier is any key of up to 64 letters, digits and `_ . : -`, so a rule from another analyser, such as the second row above, reads exactly as a generated one does. Guidance is one line of plain text.
+
+### The generator
+
+`bin/sonar-rules-table.mjs` fills the table from a SonarQube server. It is dependency-free Node, and it needs these environment variables and no others:
+
+| Variable | Meaning |
+|---|---|
+| `SONAR_HOST_URL` | The server address. https is accepted; a user name or password in the address is refused |
+| `SONAR_TOKEN` | The token, sent only in an Authorization header |
+| `SONAR_PROJECT_KEY` | The project to read |
+| `SONAR_ALLOW_HTTP` | Set to `1` to allow plain http. With http the token travels in cleartext, and the generator says so on stderr before it sends a request |
+
+A person runs it from the repository root, after the analyser has finished analysing a merge, from a checkout of this repository: `node bin/sonar-rules-table.mjs` from this repository's root, or, for another repository, from that repository's root with the path to the generator in a checkout of this one. `bin/install.sh` also copies the generator into `~/.claude/bin/` as one of the optional files the drift check watches (the installer and the check read the same list), so an installed copy works too; the manual copy and `diff -q` lines are with the other `bin/` files in the maintenance notes. Supply the token on the same command line that runs node, read from your token file at that moment:
+
+```bash
+SONAR_TOKEN="$(cat path/to/your-token-file)" SONAR_HOST_URL=https://sonar.example.invalid SONAR_PROJECT_KEY=my-project node bin/sonar-rules-table.mjs
+```
+
+Never export the token into a shell session, never write or copy it into another file and never echo it. Use a token with Browse permission on the one project it reads, not a global admin token. Plain http needs `SONAR_ALLOW_HTTP=1` and sends the token in cleartext. A token that may not read the analysed revision still works: the revision is recorded as unknown and the run says which cause applied: the token may not read it, the server returned no analysis, or the analysis carries no revision.
+
+What it does: it asks the server for the rules new code tripped in the last 30 days and for the largest open rules, chooses up to 20 rows with recent-new rules first and then by open count, looks up each new rule's own name for the guidance, and replaces the table atomically. It exits zero after writing, whatever the counts, and non-zero without writing when anything is wrong. Its summary says the rules kept out of the rules available, so a cut is never silent.
+
+It is never a gate. Nothing automated runs it: not the conductor, not CI, not a hook. It writes no ledger line, and a person decides when to run it and commits the result. Each run starts a new measurement interval (the previous instant in the stamp is the previous run), so run it once per analysed merge and commit the result; casual reruns leave short, empty intervals that say nothing about whether the table is used.
+
+Hand-written guidance survives a refresh. For a rule already in the table the generator updates the counts and leaves the guidance text as it found it; a rule new to the table arrives with the analyser's own rule name until someone improves it, and a rule the run no longer selects is dropped.
+
+To use another analyser, or none, write the table by hand to the format above, with the same four columns and a stamp line. The builder reads a hand-written table exactly as it reads a generated one.
+
+### Rollback
+
+Deleting the table is the rollback: with no file, the builder carries on as before. Commit the deletion: the table is tracked, so a table deleted only in one checkout is still in every new build worktree. The change to `agents/implementer.md` rolls out, or back, by reinstalling the harness with `bin/install.sh` and restarting the Claude Code session, as for any agent change.
+
+### Troubleshooting
+
+- The generator exits non-zero. Cause: a missing environment variable, an http address without the opt-in, a rejected token, a project key the server does not know, a timeout, a redirect, or an answer whose shape the generator does not recognise. Action: read the one stderr line, which names the condition and the request that failed, and fix that; the existing table is left untouched. A failure on the local side, such as a read-only `.claude` directory or a full disk, is named by the system call, the error code and the path relative to the repository root, for example `open failed (EACCES) on .claude/...`; the error's own text is never printed.
+- The table says zero rules. Cause: no issues were created in the window (issues since fixed still count, false positives and accepted ones do not), or the wrong project key was read. Action: check `SONAR_PROJECT_KEY` and that the analyser has finished analysing the merge, then run it again.
+- The builder reports absent although the file exists. Cause: the file is not at `.claude/analyser-rules.md` exactly, is a symlink, is over a bound, or is not committed so the worktree lacks it. Action: check the path and that the file is tracked in git.
+- The builder's report carries no rules-table line at all. Cause: the installed implementer is a replacement, or older than this change. Action: reinstall with `bin/install.sh`, restart the Claude Code session, and check the installed `implementer.md` names the table.
 
 ## Tests
 
