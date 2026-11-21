@@ -261,7 +261,10 @@ function parseJson(text) {
 async function readerJson(ctx, stats, command, input, extraArgs = []) {
   const res = await runTool(ctx, stats, 'reader', process.execPath, [READER_PATH, command, ...extraArgs], { input })
   const parsed = res.status === 0 && !res.tooLarge ? parseJson(res.stdout) : null
-  if (parsed === null || typeof parsed !== 'object') throw new LaneFailure('other', `the reader failed for ${command} (${res.tooLarge ? 'output over the size limit' : `status ${res.status}`})`)
+  if (parsed === null || typeof parsed !== 'object') {
+    const detail = res.tooLarge ? 'output over the size limit' : `status ${res.status}`
+    throw new LaneFailure('other', `the reader failed for ${command} (${detail})`)
+  }
   if (typeof parsed.error === 'string') throw new LaneFailure('other', `the reader reported an error for ${command}`)
   return parsed
 }
@@ -393,6 +396,7 @@ async function listRuns(ctx, stats) {
 async function collectEntries(ctx, stats, label, runs, deadline) {
   const entries = []
   for (const run of runs) {
+    // Deliberately sequential: gh's rate limit, the budget check before each call, and a deterministic order.
     const entry = await runEntry(ctx, stats, label, run, deadline)
     if (entry) entries.push(entry)
   }
@@ -479,7 +483,10 @@ function isDirectory(p) {
 }
 
 function laneToken(record) {
-  if (record.status === 'ran') return `${record.lane}=${record.mode ? `ran:${record.mode}` : 'ran'}`
+  if (record.status === 'ran') {
+    const state = record.mode ? `ran:${record.mode}` : 'ran'
+    return `${record.lane}=${state}`
+  }
   return `${record.lane}=failed:${record.mode}`
 }
 
