@@ -67,10 +67,13 @@ test('README: has a section for the analyser rules table (AC-PROD-5, AC-PROD-8)'
 })
 
 // ------------------------------------------------------------- the one path
-test('the table path is one literal in the generator and any other file that names it names the same path (AC-ARCH-1)', () => {
+// The table path is written as one literal in the generator. The files that name it
+// are agents/implementer.md, README.md and workflows/tdd-task.js (the pointer sentence
+// both phase prompts carry, AC-QA-22); each must name exactly that path.
+test('the table path is one literal in the generator and any other file that names it names the same path (AC-ARCH-1, AC-QA-22)', () => {
   const generatorLiterals = GENERATOR.match(/['"`]\.claude\/analyser-rules[^'"`]*['"`]/g) || []
   assert.deepEqual(generatorLiterals, [`'${TABLE_REL}'`], 'the generator holds the path as exactly one literal')
-  for (const f of ['agents/implementer.md', 'README.md']) {
+  for (const f of ['agents/implementer.md', 'README.md', 'workflows/tdd-task.js']) {
     const text = read(f)
     assert.ok(text.includes(TABLE_REL), `${f} does not name ${TABLE_REL}`)
     for (const m of text.match(/\.claude\/analyser[-\w./]*/g) || []) assert.equal(m.replace(/[.]+$/, ''), TABLE_REL, `${f} names a different table path: ${m}`)
@@ -82,7 +85,13 @@ test('the table path appears in agents/implementer.md and in no other tracked fi
   const files = scannedFiles()
   assert.ok(files.length > 100 && files.includes('.githooks/pre-push') && files.includes('agents/implementer.md'), `the scanned set looks wrong: ${files.length} files`)
   const hits = files.filter((f) => readRel(f).includes('analyser-rules'))
-  assert.deepEqual(hits, ['agents/implementer.md'])
+  assert.deepEqual(hits, ['agents/implementer.md', 'workflows/tdd-task.js'])
+})
+
+test('workflows/tdd-task.js names neither the generator nor any analyser API path (AC-QA-22)', () => {
+  const text = read('workflows', 'tdd-task.js')
+  assert.ok(!/sonar-rules-table/i.test(text), 'tdd-task.js names the generator')
+  assert.ok(!/\/api\//.test(text), 'tdd-task.js names an API path')
 })
 
 test('the table is not git-ignored, so a linked worktree receives it (AC-QA-14)', () => {

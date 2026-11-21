@@ -296,3 +296,16 @@ dispatch were not run separately. The dispatch here is a direct one through
 the Agent tool, which is the path `conduct-plan` uses, and `tdd-task` loads
 the same agent definition for both of its phases; the instruction is the same
 text in all three.
+
+## Follow-up: tdd-task pointer
+
+AC-QA-22. Each mutation was applied to `workflows/tdd-task.js`, confirmed landed
+by counting the matching text afterwards, run against
+`test/tdd-task.test.js` and `test/sonar-rules-docs.test.js`, and restored (the
+file was compared byte for byte with a copy taken before the first mutation).
+
+| Mutation | Landed (check) | Test that failed |
+|---|---|---|
+| Remove the constant from the Test prompt (`write-test` dispatch) | one `${rulesTableNote}` use left instead of two | `tdd-task.js: the Test and Implement prompts both carry the same rules-table pointer sentence (AC-QA-22)` |
+| Remove the constant from the Implement prompt | one `${rulesTableNote}` use left instead of two | the same test |
+| Alter the path inside the constant (`analyser-rules.md` to `analyser-rule.md`) | one match for the altered path, none for the real one | `the table path is one literal in the generator and any other file that names it names the same path (AC-ARCH-1, AC-QA-22)`, and `the table path appears in agents/implementer.md and in no other tracked file outside the generator, its tests and the documents about it (AC-SEC-8)` |

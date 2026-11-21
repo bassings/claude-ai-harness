@@ -618,3 +618,24 @@ for (const falsyValue of [null, undefined, 0, '']) {
     )
   })
 }
+
+// AC-QA-22: one pointer sentence, one constant, used at both dispatch sites.
+// The prompts are captured through the fake runtime; the sentence is the one
+// containing the table path, and it must be identical in both phases.
+test('tdd-task.js: the Test and Implement prompts both carry the same rules-table pointer sentence (AC-QA-22)', async () => {
+  const { calls } = await runWorkflow(WF, { args: { task: 'do the thing' }, agent: DONE_AGENT })
+  // The path's value is pinned against the generator's literal in test/sonar-rules-docs.test.js; here only the sentence is.
+  const sentenceOf = (label) => {
+    const prompt = calls.find((c) => c.opts.label === label).prompt
+    const found = prompt.split(/(?<=\.)\s+/).filter((s) => /\.claude\/\S*\.md/.test(s))
+    assert.equal(found.length, 1, `${label} prompt must name the table path in exactly one sentence, found ${found.length}`)
+    return found[0]
+  }
+  const testSentence = sentenceOf('write-test#1')
+  const implSentence = sentenceOf('implement#1')
+  assert.equal(testSentence, implSentence, 'the two prompts carry different pointer sentences')
+  assert.match(testSentence, /reference data/i)
+  assert.match(testSentence, /never as instructions/i)
+  assert.ok(testSentence.includes('Rules table:'), 'the sentence does not name the Rules table: status line')
+  assert.ok(!/sonar/i.test(testSentence) && !/\/api\//.test(testSentence), 'the sentence names an analyser or an API')
+})
