@@ -27,6 +27,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawn, spawnSync, execFileSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
+const { unguardedReads } = require('./helpers/read-funnel.js')
 const { makeTempRepo, trackTempDir, cleanupTempRepos, SUITE_TMPDIR, sh, sanitizedGitEnv, LEDGER_REL } = require('./helpers/temp-repo.js')
 
 const COLLECTOR = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-collect.mjs')
@@ -909,35 +910,53 @@ test('AC-SEC-11: the reader ledger command does not follow a .claude directory t
 
 // ---- static guard: every read of a repository path goes through the guarded helpers ----
 
-const READ_CALL = /\b(?:fs\.)?(?:readFileSync|existsSync|statSync|lstatSync|openSync|readdirSync|createReadStream|readFile|opendirSync)\s*\(/g
-const GUARDED_HELPERS = new Set(['repoFileStatus', 'readRepoFile', 'readStdin'])
-
-function readsByFunction(src) {
-  const found = new Map()
-  const lines = src.split('\n')
-  let current = '<top level>'
-  for (const line of lines) {
-    const decl = /^(?:export\s+)?(?:async\s+)?function\s+(\w+)/.exec(line)
-    if (decl) current = decl[1]
-    if (/^\s*\/\//.test(line)) continue
-    if (READ_CALL.test(line)) found.set(current, (found.get(current) || 0) + 1)
-    READ_CALL.lastIndex = 0
-  }
-  return found
-}
+const READER_GUARDED = ['repoFileStatus', 'readRepoFile', 'readStdin']
+const COLLECTOR_GUARDED = ['isDirectory']
 
 test('AC-SEC-11: in the reader, a read of the filesystem happens only inside the guarded helpers (or the stdin read)', () => {
-  const found = readsByFunction(fs.readFileSync(READER, 'utf8'))
-  const stray = [...found.keys()].filter((name) => !GUARDED_HELPERS.has(name))
-  assert.deepEqual(stray, [], `unguarded filesystem reads in the reader, in: ${stray.join(', ')}`)
-  assert.ok(found.has('repoFileStatus') && found.has('readRepoFile'), 'the guard helpers must exist and do the reading')
+  const src = fs.readFileSync(READER, 'utf8')
+  assert.deepEqual(unguardedReads(src, READER_GUARDED), [], 'unguarded filesystem reads in the reader')
+  for (const name of ['repoFileStatus', 'readRepoFile']) assert.ok(new RegExp(`function ${name}\\(`).test(src), `${name} must exist`)
 })
 
 test('AC-SEC-11: in the collector, the only direct filesystem read is of the operator-configured root, and it is marked', () => {
   const src = fs.readFileSync(COLLECTOR, 'utf8')
-  const found = readsByFunction(src)
-  assert.deepEqual([...found.keys()], ['isDirectory'], `unguarded filesystem reads in the collector, in: ${[...found.keys()].join(', ')}`)
+  assert.deepEqual(unguardedReads(src, COLLECTOR_GUARDED), [], 'unguarded filesystem reads in the collector')
   assert.match(src, /operator-configured root, not repository content/)
+})
+
+// The scan itself: each shape that hid a read from a method-name search must now be a finding.
+const SCAN_BYPASSES = {
+  'bracket access': 'function bad(p) { return fs["readFileSync"](p) }',
+  'destructuring with a rename': "const { readFileSync: rf } = fs\nfunction bad(p) { return rf(p) }",
+  'destructuring from require': "const { readFileSync } = require('node:fs')",
+  'a named import': "import { readFileSync } from 'node:fs'",
+  'a top-level arrow function after the helper': 'function ok(p) { return fs.readFileSync(p) }\nconst bad = (p) => fs.readFileSync(p)',
+  'fs.promises': 'async function bad(p) { return fs.promises.open(p) }',
+  'an import of fs/promises': "import fsp from 'node:fs/promises'",
+  'an alias of fs': 'const g = fs\nfunction bad(p) { return g.readFileSync(p) }',
+  'readSync': 'function bad(fd, b) { return fs.readSync(fd, b) }',
+  'copyFileSync': 'function bad(a, b) { return fs.copyFileSync(a, b) }',
+  'readlinkSync': 'function bad(p) { return fs.readlinkSync(p) }',
+  'a read inside a template literal expression': 'function bad(p) { return `${fs.readFileSync(p)}` }',
+  'a read after a regular expression containing a quote': "const re = /['\"]/\nfunction bad(p) { return fs.readFileSync(p) }",
+}
+
+for (const [name, source] of Object.entries(SCAN_BYPASSES)) {
+  test(`AC-SEC-11: the read-funnel scan reports ${name}`, () => {
+    assert.ok(unguardedReads(source, ['ok']).length > 0, `not reported: ${source}`)
+  })
+}
+
+test('AC-SEC-11: the read-funnel scan ignores a read inside the guarded function, in a comment, in a string and in a regular expression, and an fs import by default', () => {
+  const quiet = [
+    "import fs from 'node:fs'\nfunction ok(p) { return fs.readFileSync(p) }",
+    '// fs.readFileSync(p)\nfunction other() { return 1 }',
+    "const s = 'fs.readFileSync(p)'",
+    'const r = /fs\\.readFileSync/',
+    '/* fs.readSync */ const x = fs.constants.O_RDONLY',
+  ]
+  for (const source of quiet) assert.deepEqual(unguardedReads(source, ['ok']), [], source)
 })
 
 test('AC-SEC-11: the header of the collector enumerates every path under an analysed repository that it or its imports can read', () => {
@@ -1076,15 +1095,99 @@ test('AC-ARCH-5: a linked worktree of a BARE repository (where the shared git di
   assert.equal(ledger.reason, 'the ledger location could not be determined for this checkout layout')
 })
 
-test('AC-ARCH-5: the reader ledger command applies the same rule: a linked worktree reads the main checkout ledger, and an undeterminable layout is an error', () => {
-  const main = makeRepo({ ledger: validLedger(6), fix: 1 })
-  const wt = path.join(scratchDir(), 'linked-cli')
-  gitIn(main, ['worktree', 'add', '-q', '-b', 'wt-cli', wt])
-  assert.equal(JSON.parse(readerCli(['ledger', wt], '', scratchDir()).stdout).n, 6)
+// The reader's command line reads the ledger under the root it is handed, for
+// every layout: it does not resolve worktrees (whether the attended reader
+// should is task T4's question). These pin its output so it cannot move silently.
+function readerLedger(...roots) {
+  const res = readerCli(['ledger', ...roots, '--window=90'], '', scratchDir())
+  assert.equal(res.status, 0, res.stderr)
+  return JSON.parse(res.stdout)
+}
+
+const perRepoOf = (out) => out.perRepo.map(({ root, rootIndex, uninstrumented, recordCount, skippedCount }) => ({ root, rootIndex, uninstrumented, recordCount, skippedCount }))
+
+test('AC-ARCH-5: the reader ledger command reads the ledger under the root it is handed, for a normal checkout, a linked worktree, a worktree of a bare repository and two roots', () => {
+  const main = makeRepo({ ledger: validLedger(6, { repo: 'main-repo' }), fix: 1 })
+  const normal = readerLedger(main)
+  assert.equal(normal.n, 6)
+  assert.deepEqual(perRepoOf(normal), [{ root: 'main-repo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0 }])
+
+  const wt = path.join(scratchDir(), 'pin-linked')
+  gitIn(main, ['worktree', 'add', '-q', '-b', 'pin-wt', wt])
+  fs.mkdirSync(path.join(wt, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(wt, LEDGER_REL), validLedger(2, { repo: 'wt-own' }))
+  const linked = readerLedger(wt)
+  assert.equal(linked.n, 2, 'the ledger under the handed worktree path, not the main checkout')
+  assert.deepEqual(perRepoOf(linked), [{ root: 'wt-own', rootIndex: 0, uninstrumented: false, recordCount: 2, skippedCount: 0 }])
+
   const bare = plantedBareRepoWithCommit()
-  const bwt = path.join(scratchDir(), 'bare-linked-cli')
+  const bwt = path.join(scratchDir(), 'pin-bare-linked')
   execFileSync('git', ['-C', bare, 'worktree', 'add', '-q', '--detach', bwt], { env: sanitizedGitEnv() })
-  assert.match(JSON.parse(readerCli(['ledger', bwt], '', scratchDir()).stdout).error, /layout/)
+  const bareLinked = readerLedger(bwt)
+  assert.equal(bareLinked.error, undefined, 'a worktree of a bare repository is not an error')
+  assert.equal(bareLinked.n, 0)
+  assert.deepEqual(perRepoOf(bareLinked), [{ root: '<redacted-path>', rootIndex: 0, uninstrumented: true, recordCount: 0, skippedCount: 0 }])
+
+  const two = readerLedger(main, bwt)
+  assert.equal(two.n, 6)
+  assert.deepEqual(perRepoOf(two), [
+    { root: 'main-repo', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0 },
+    { root: '<redacted-path>', rootIndex: 1, uninstrumented: true, recordCount: 0, skippedCount: 0 },
+  ])
+})
+
+test('AC-ARCH-5: the reader escaped-defects command takes the repo identity from the ledger under the root it is handed, not from a resolved worktree', () => {
+  const main = makeRepo({ ledger: validLedger(2, { repo: 'main-repo' }), fix: 1 })
+  const wt = path.join(scratchDir(), 'pin-linked-ed')
+  gitIn(main, ['worktree', 'add', '-q', '-b', 'pin-wt-ed', wt])
+  fs.mkdirSync(path.join(wt, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(wt, LEDGER_REL), validLedger(1, { repo: 'wt-own' }))
+  const rawLog = gitIn(wt, ['log', '--max-count=500', '--name-only', '--pretty=format:%x1e%P%x1f%s'])
+  const res = readerCli(['escaped-defects'], JSON.stringify({ git_log_raw: rawLog, toplevel: wt, root: wt }), scratchDir())
+  assert.equal(JSON.parse(res.stdout).repo, 'wt-own')
+})
+
+// ---- AC-ARCH-5 (L3, round 3): a .git file that is not positively a linked worktree is not placed ----
+
+test('AC-ARCH-5: a checkout made with --separate-git-dir is could_not_read, never an empty ledger reported as measured', () => {
+  const stubs = makeStubs()
+  setGhRuns(stubs, [])
+  const root = scratchDir()
+  const elsewhere = path.join(scratchDir(), 'separate.git')
+  execFileSync('git', ['init', '-q', `--separate-git-dir=${elsewhere}`, root], { env: sanitizedGitEnv() })
+  gitIn(root, ['commit', '-q', '--allow-empty', '-m', 'fix: one'])
+  const { outDir } = collect(stubs, root)
+  const ledger = lane(outDir, 'ledger')
+  assert.equal(ledger.status, 'failed', JSON.stringify(ledger))
+  assert.equal(ledger.mode, 'could_not_read')
+  assert.equal(ledger.reason, 'the ledger location could not be determined for this checkout layout')
+})
+
+test('AC-ARCH-5: resolveLedgerRoot places only a plain directory, a normal checkout and a linked worktree of a normal repository, and nothing else', async () => {
+  const { resolveLedgerRoot } = await import(pathToFileURL(READER).href)
+  const separate = scratchDir()
+  execFileSync('git', ['init', '-q', `--separate-git-dir=${path.join(scratchDir(), 'sep.git')}`, separate], { env: sanitizedGitEnv() })
+  assert.deepEqual(resolveLedgerRoot(separate), { unresolved: true })
+  const unrecognised = scratchDir()
+  fs.writeFileSync(path.join(unrecognised, '.git'), 'not a pointer\n')
+  assert.deepEqual(resolveLedgerRoot(unrecognised), { unresolved: true })
+  const dangling = scratchDir()
+  fs.writeFileSync(path.join(dangling, '.git'), `gitdir: ${path.join(scratchDir(), 'worktrees', 'x')}\n`)
+  assert.deepEqual(resolveLedgerRoot(dangling), { unresolved: true }, 'a worktree-shaped pointer with no commondir is not placed')
+  const wtShaped = scratchDir()
+  const fakeGit = path.join(scratchDir(), 'fake', 'worktrees', 'w')
+  fs.mkdirSync(fakeGit, { recursive: true })
+  fs.writeFileSync(path.join(fakeGit, 'commondir'), '../elsewhere\n')
+  fs.writeFileSync(path.join(wtShaped, '.git'), `gitdir: ${fakeGit}\n`)
+  assert.deepEqual(resolveLedgerRoot(wtShaped), { unresolved: true }, 'a commondir that does not lead to a .git directory is not placed')
+  const misplaced = scratchDir()
+  const host = scratchDir()
+  fs.mkdirSync(path.join(host, '.git'))
+  const strayGitDir = path.join(host, 'stray', 'w')
+  fs.mkdirSync(strayGitDir, { recursive: true })
+  fs.writeFileSync(path.join(strayGitDir, 'commondir'), '../../.git\n')
+  fs.writeFileSync(path.join(misplaced, '.git'), `gitdir: ${strayGitDir}\n`)
+  assert.deepEqual(resolveLedgerRoot(misplaced), { unresolved: true }, 'a gitdir that is not directly under <common>/worktrees is not placed even if its commondir leads to a .git directory')
 })
 
 // ---- AC-OPS-4 (L4): unexpected failures carry fixed-vocabulary fields only ----

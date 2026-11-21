@@ -77,3 +77,28 @@ under the mutant).
 Not proven by a deterministic test, by design: the descriptor re-check and
 `O_NOFOLLOW` in `readRepoFile` close a race between the check and the open, which
 needs a concurrent writer to exercise.
+
+## Fix round 3
+
+Same method. Run against the `AC-ARCH-5` tests and the two static read-funnel
+tests of `test/harn-runner-2-t1.test.js`. The scan is `test/helpers/read-funnel.js`;
+rows S1 to S7 mutate the reader with one shape each, and the scan's own unit
+tests (one per shape, plus the quiet cases) pin each shape without a mutation.
+Rows S1, S4, S5, S6 and S7 also fail other tests because the injected call runs
+and throws; the first test named is the one the row proves.
+
+| id | criterion | the edit | named test that failed |
+|---|---|---|---|
+| R1 | AC-ARCH-5 (round 3 item 1) | the reader's `ledger` command resolves the root before reading | "the reader ledger command reads the ledger under the root it is handed, for a normal checkout, a linked worktree, a worktree of a bare repository and two roots" |
+| R2 | AC-ARCH-5 (round 3 item 1) | the reader's repo-identity read resolves the root first | "the reader escaped-defects command takes the repo identity from the ledger under the root it is handed" |
+| R3 | AC-ARCH-5 (round 3 item 2) | a gitdir with no commondir file returns the checkout itself | "a checkout made with --separate-git-dir is could_not_read"; "resolveLedgerRoot places only a plain directory ..." |
+| R4 | AC-ARCH-5 (round 3 item 2) | the "directly under <common>/worktrees" test dropped | "resolveLedgerRoot places only ..." |
+| R5 | AC-ARCH-5 (round 3 item 2) | an unrecognised `.git` file returns the checkout itself | "resolveLedgerRoot places only ..." |
+| R6 | AC-ARCH-5 (round 3 item 2) | the "common directory is named .git" test dropped | "a linked worktree of a BARE repository ... is could_not_read" |
+| S1 | AC-SEC-11 (round 3 item 3) | `fs["readFileSync"]('x')` added to a reader function | "in the reader, a read of the filesystem happens only inside the guarded helpers" |
+| S2 | AC-SEC-11 (round 3 item 3) | `const { readFileSync: rf } = fs` added at the top level | the same test |
+| S3 | AC-SEC-11 (round 3 item 3) | a top-level arrow function that calls `fs.readFileSync`, placed right after the guarded helpers | the same test |
+| S4 | AC-SEC-11 (round 3 item 3) | `fs.promises.open('x')` added to a reader function | the same test |
+| S5 | AC-SEC-11 (round 3 item 3) | `fs.readSync(...)` added | the same test |
+| S6 | AC-SEC-11 (round 3 item 3) | `fs.copyFileSync(...)` added | the same test |
+| S7 | AC-SEC-11 (round 3 item 3) | `fs.readlinkSync(...)` added | the same test |

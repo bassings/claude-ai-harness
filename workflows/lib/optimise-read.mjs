@@ -1611,10 +1611,12 @@ function pathMatchesAny(p, globs) {
 // path this module reads must not be followed, and an enormous file must not be
 // read. EVERY read of a path under a repository goes through these two helpers
 // (a static test in test/harn-runner-2-t1.test.js fails if one does not): the
-// directories on the way must be real directories, the final entry must be a
-// regular file under a size cap, and the file is opened without following a
-// symlink and checked again on the open descriptor, so a swap after the check is
-// refused too. Failures are a fixed vocabulary, never a message that can carry a path.
+// directories on the way must be real directories (checked with lstat, before the
+// open), the final entry must be a regular file under a size cap, and the file is
+// opened without following a symlink (O_NOFOLLOW) and checked again on the open
+// descriptor. That open-time protection covers the FINAL path segment only: a
+// directory on the way swapped for a symlink between the lstat and the open is
+// not caught. Failures are a fixed vocabulary, never a message that can carry a path.
 export const REPO_FILE_CAPS = { ledger: 64 * 1024 * 1024, triggers: 1024 * 1024, sidecar: 1024 * 1024, gitPointer: 4096 }
 
 // { status: 'absent' | 'ok' | 'not_regular' | 'too_large' | 'unreadable', kind?, size? }; reads nothing.
@@ -1914,12 +1916,13 @@ function derivePerRepoLabel(records, root) {
   return REDACTED_PATH_MARKER
 }
 
-// An unreadable ledger, or a layout the ledger's place cannot be determined for,
-// gives no identity (the fixed marker): the figure then cannot be matched to a
-// roster entry, which is safe; nothing is read through a symlink or off a device.
+// Read under the root it is handed, as the reader always has (no worktree
+// resolution here; whether the attended reader should resolve worktrees is task
+// T4's question). An unreadable ledger gives no identity (the fixed marker): the
+// figure then cannot be matched to a roster entry, which is safe; nothing is read
+// through a symlink or off a device.
 function ledgerIdentityForRoot(root) {
-  const location = resolveLedgerRoot(root)
-  const file = location.unresolved ? { status: 'unreadable' } : readRepoFile(location.root, LEDGER_RELATIVE_PATH, REPO_FILE_CAPS.ledger)
+  const file = readRepoFile(root, LEDGER_RELATIVE_PATH, REPO_FILE_CAPS.ledger)
   return derivePerRepoLabel(file.status === 'ok' ? parseLedgerContent(file.text).records : [], root)
 }
 
@@ -1943,16 +1946,21 @@ export function escapedDefectsFigures({ rawLog, toplevel, root, identity }) {
   return { ...countEscapedDefectCandidates(parseGitLogRaw(rawLog), resolveProductSourceExcludeGlobs(root)), repo: identity }
 }
 
-// THE rule for where a repository's ledger lives, used by this reader's own
-// commands and by the collector. A linked worktree keeps its ledger in the main
-// checkout, which is the checkout the ledger writer's `--git-common-dir` rule names
-// for the same worktree (a test pins this against real linked worktrees). It is
-// read from the filesystem alone, so no git command is run. Where the writer's rule
-// and this one could disagree (a worktree of a bare repository, a shared git
-// directory not named .git, a pointer that cannot be read) the answer is
-// { unresolved: true }, so a caller reports that it could not read the ledger
-// rather than reading a guessed path. A submodule is left at its own root: the
-// writer refuses to write from one, so there is no ledger elsewhere to find.
+// THE rule for where a repository's ledger lives, exported here as the single
+// implementation and called by the collector (before it hands a root to this
+// reader's own commands, which read under the root they are given). A linked
+// worktree keeps its ledger in the main checkout, which is the checkout the ledger
+// writer's `--git-common-dir` rule names for the same worktree (a test pins this
+// against real linked worktrees). It is read from the filesystem alone, so no git
+// command is run. The answer is { root } only for: a directory with no .git, an
+// ordinary checkout (.git is a directory), or a `.git` file positively recognised
+// as a linked worktree of a normal repository, meaning its gitdir lies directly
+// under <common>/worktrees, that gitdir has a readable commondir file, and the
+// common directory is named .git. Anything else, a --separate-git-dir checkout, a
+// submodule, a worktree of a bare repository, a pointer that cannot be read or is
+// not recognised, is { unresolved: true }: the writer's rule could place the ledger
+// somewhere this one cannot confirm, so a caller reports that it could not read the
+// ledger rather than reading a guessed path.
 export function resolveLedgerRoot(root) {
   const dotGit = repoFileStatus(root, '.git', REPO_FILE_CAPS.gitPointer)
   if (dotGit.status === 'absent' || dotGit.kind === 'directory') return { root }
@@ -1961,11 +1969,11 @@ export function resolveLedgerRoot(root) {
   const first = pointer.status === 'ok' ? pointer.text.split('\n')[0] : ''
   if (!first.startsWith('gitdir: ')) return { unresolved: true }
   const gitDir = path.resolve(root, first.slice('gitdir: '.length).trim())
-  if (path.basename(path.dirname(gitDir)) !== 'worktrees') return { root }
   const commondir = readRepoFile(gitDir, 'commondir', REPO_FILE_CAPS.gitPointer)
   if (commondir.status !== 'ok') return { unresolved: true }
   const common = path.resolve(gitDir, commondir.text.trim())
-  return path.basename(common) === '.git' ? { root: path.dirname(common) } : { unresolved: true }
+  const linked = path.basename(common) === '.git' && path.dirname(gitDir) === path.join(common, 'worktrees')
+  return linked ? { root: path.dirname(common) } : { unresolved: true }
 }
 
 // Round 2 F2 (AC-PROD-8, AC-SEC-10): the ledger holds only proposal ids, so the
@@ -2050,9 +2058,7 @@ function runLedgerCommand(roots, window) {
   let combinedSkipped = []
   for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
     const root = roots[rootIndex]
-    const location = resolveLedgerRoot(root)
-    if (location.unresolved) return { error: `the ledger for root ${rootIndex} could not be read (the ledger location could not be determined for this checkout layout)` }
-    const file = readRepoFile(location.root, LEDGER_RELATIVE_PATH, REPO_FILE_CAPS.ledger)
+    const file = readRepoFile(root, LEDGER_RELATIVE_PATH, REPO_FILE_CAPS.ledger)
     if (file.status !== 'ok' && file.status !== 'absent') return { error: `the ledger for root ${rootIndex} could not be read (${file.status})` }
     const exists = file.status === 'ok'
     const raw = exists ? file.text : ''
