@@ -1605,6 +1605,66 @@ function pathMatchesAny(p, globs) {
   return globs.some((g) => globToRe(g).test(p))
 }
 
+// ---- guarded reads of files inside an analysed repository ----
+//
+// An analysed repository is untrusted: a committed symlink or a device node at a
+// path this module reads must not be followed, and an enormous file must not be
+// read. EVERY read of a path under a repository goes through these two helpers
+// (a static test in test/harn-runner-2-t1.test.js fails if one does not): the
+// directories on the way must be real directories (checked with lstat, before the
+// open), the final entry must be a regular file under a size cap, and the file is
+// opened without following a symlink (O_NOFOLLOW) and checked again on the open
+// descriptor. That open-time protection covers the FINAL path segment only: a
+// directory on the way swapped for a symlink between the lstat and the open is
+// not caught. Failures are a fixed vocabulary, never a message that can carry a path.
+export const REPO_FILE_CAPS = { ledger: 64 * 1024 * 1024, triggers: 1024 * 1024, sidecar: 1024 * 1024, gitPointer: 4096 }
+
+// { status: 'absent' | 'ok' | 'not_regular' | 'too_large' | 'unreadable', kind?, size? }; reads nothing.
+export function repoFileStatus(root, rel, maxBytes) {
+  const parts = rel.split('/')
+  try {
+    for (let i = 1; i < parts.length; i++) {
+      const dir = fs.lstatSync(path.join(root, ...parts.slice(0, i)))
+      if (!dir.isDirectory()) return { status: 'not_regular', kind: 'other' }
+    }
+    const st = fs.lstatSync(path.join(root, rel))
+    const kind = st.isFile() ? 'file' : st.isDirectory() ? 'directory' : 'other'
+    if (kind !== 'file') return { status: 'not_regular', kind }
+    return st.size > maxBytes ? { status: 'too_large', kind, size: st.size } : { status: 'ok', kind, size: st.size }
+  } catch (e) {
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'unreadable' }
+  }
+}
+
+// { status: 'ok', text } or the same non-ok status repoFileStatus gives.
+export function readRepoFile(root, rel, maxBytes) {
+  const checked = repoFileStatus(root, rel, maxBytes)
+  if (checked.status !== 'ok') return checked
+  let fd
+  try {
+    fd = fs.openSync(path.join(root, rel), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+  } catch (e) {
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: e && e.code === 'ELOOP' ? 'not_regular' : 'unreadable' }
+  }
+  try {
+    const st = fs.fstatSync(fd)
+    if (!st.isFile()) return { status: 'not_regular' }
+    if (st.size > maxBytes) return { status: 'too_large' }
+    const buf = Buffer.alloc(st.size)
+    let offset = 0
+    while (offset < st.size) {
+      const n = fs.readSync(fd, buf, offset, st.size - offset, offset)
+      if (n === 0) break
+      offset += n
+    }
+    return { status: 'ok', text: buf.subarray(0, offset).toString('utf8') }
+  } catch (e) {
+    return { status: 'unreadable' }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 // AC-3/AC-4: resolves the exclude-glob list for ONE repo root, reading
 // `.claude/harness-triggers.json` directly (this module has real fs
 // access, unlike the workflow scripts -- see the file header) rather than
@@ -1619,21 +1679,10 @@ function pathMatchesAny(p, globs) {
 // different). A MISSING file, or a file that simply does not carry this
 // key, is the ordinary "no override" case: default excludes, no error.
 export function resolveProductSourceExcludeGlobs(root) {
-  const triggersPath = path.join(root, HARNESS_TRIGGERS_RELATIVE_PATH)
-  let exists = false
-  try {
-    exists = fs.existsSync(triggersPath)
-  } catch (e) {
-    return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
-  }
-  if (!exists) return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
-
-  let raw
-  try {
-    raw = fs.readFileSync(triggersPath, 'utf8')
-  } catch (e) {
-    return { excludeGlobs: null, configSource: 'repo-override', configError: `.claude/harness-triggers.json exists but could not be read (${e && e.code ? e.code : 'read error'})` }
-  }
+  const file = readRepoFile(root, HARNESS_TRIGGERS_RELATIVE_PATH, REPO_FILE_CAPS.triggers)
+  if (file.status === 'absent') return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
+  if (file.status !== 'ok') return { excludeGlobs: null, configSource: 'repo-override', configError: `.claude/harness-triggers.json exists but could not be read (${file.status})` }
+  const raw = file.text
 
   let parsed
   try {
@@ -1867,10 +1916,64 @@ function derivePerRepoLabel(records, root) {
   return REDACTED_PATH_MARKER
 }
 
+// Read under the root it is handed, as the reader always has (no worktree
+// resolution here; whether the attended reader should resolve worktrees is task
+// T4's question). An unreadable ledger gives no identity (the fixed marker): the
+// figure then cannot be matched to a roster entry, which is safe; nothing is read
+// through a symlink or off a device.
 function ledgerIdentityForRoot(root) {
-  const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
-  const raw = fs.existsSync(ledgerPath) ? fs.readFileSync(ledgerPath, 'utf8') : ''
-  return derivePerRepoLabel(parseLedgerContent(raw).records, root)
+  const file = readRepoFile(root, LEDGER_RELATIVE_PATH, REPO_FILE_CAPS.ledger)
+  return derivePerRepoLabel(file.status === 'ok' ? parseLedgerContent(file.text).records : [], root)
+}
+
+// Round 1 F5 (AC-SEC-10 integrity): the lane reports `git -C <root> rev-parse
+// --show-toplevel`; if that is not this root (after realpath on both, fs only),
+// git read an enclosing or different repo, so the figures are about the wrong
+// history. Rejected with a reason, never figures, and the reason echoes no path.
+// Round 2 F3 (AC-QA-19, AC-SEC-10): a missing or empty toplevel fails closed, the
+// same no-figures rejection as a mismatch. HARN-OPT-4 T6 (AC-DATA-11, AC-SEC-10):
+// `identity` is the ledger repo identity for this root (as the ledger command
+// derives perRepo[].root), attached so the figure can be matched to its roster
+// entry; the root path itself is never echoed.
+// Pure: reads no ledger and runs nothing, so a caller that must not read the
+// ledger (the collector refuses a symlinked one) passes the identity in.
+export function escapedDefectsFigures({ rawLog, toplevel, root, identity }) {
+  let same = false
+  if (typeof toplevel === 'string' && toplevel) {
+    try { same = fs.realpathSync(toplevel) === fs.realpathSync(root) } catch (e) { same = false }
+  }
+  if (!same) return { rejected: true, reason: 'git toplevel is missing or does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null, repo: identity }
+  return { ...countEscapedDefectCandidates(parseGitLogRaw(rawLog), resolveProductSourceExcludeGlobs(root)), repo: identity }
+}
+
+// THE rule for where a repository's ledger lives, exported here as the single
+// implementation and called by the collector (before it hands a root to this
+// reader's own commands, which read under the root they are given). A linked
+// worktree keeps its ledger in the main checkout, which is the checkout the ledger
+// writer's `--git-common-dir` rule names for the same worktree (a test pins this
+// against real linked worktrees). It is read from the filesystem alone, so no git
+// command is run. The answer is { root } only for: a directory with no .git, an
+// ordinary checkout (.git is a directory), or a `.git` file positively recognised
+// as a linked worktree of a normal repository, meaning its gitdir lies directly
+// under <common>/worktrees, that gitdir has a readable commondir file, and the
+// common directory is named .git. Anything else, a --separate-git-dir checkout, a
+// submodule, a worktree of a bare repository, a pointer that cannot be read or is
+// not recognised, is { unresolved: true }: the writer's rule could place the ledger
+// somewhere this one cannot confirm, so a caller reports that it could not read the
+// ledger rather than reading a guessed path.
+export function resolveLedgerRoot(root) {
+  const dotGit = repoFileStatus(root, '.git', REPO_FILE_CAPS.gitPointer)
+  if (dotGit.status === 'absent' || dotGit.kind === 'directory') return { root }
+  if (dotGit.status !== 'ok') return { unresolved: true }
+  const pointer = readRepoFile(root, '.git', REPO_FILE_CAPS.gitPointer)
+  const first = pointer.status === 'ok' ? pointer.text.split('\n')[0] : ''
+  if (!first.startsWith('gitdir: ')) return { unresolved: true }
+  const gitDir = path.resolve(root, first.slice('gitdir: '.length).trim())
+  const commondir = readRepoFile(gitDir, 'commondir', REPO_FILE_CAPS.gitPointer)
+  if (commondir.status !== 'ok') return { unresolved: true }
+  const common = path.resolve(gitDir, commondir.text.trim())
+  const linked = path.basename(common) === '.git' && path.dirname(gitDir) === path.join(common, 'worktrees')
+  return linked ? { root: path.dirname(common) } : { unresolved: true }
 }
 
 // Round 2 F2 (AC-PROD-8, AC-SEC-10): the ledger holds only proposal ids, so the
@@ -1882,7 +1985,6 @@ function ledgerIdentityForRoot(root) {
 // bounds every string it hands on. Mirrors PROPOSAL_TARGET_KEYS in
 // workflows/optimise-cycle.js (a workflow script cannot import this file).
 export const PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
-const SIDECAR_MAX_BYTES = 1024 * 1024
 const SIDECAR_STRING_MAX = 200
 const SIDECAR_BOOLEAN_KEYS = ['touches_always_on_lens', 'security_purposed']
 function sidecarTargetOrReason(t) {
@@ -1908,16 +2010,18 @@ function readProposalTargetsSidecar(roots) {
   const merged = {}
   let anyRead = false
   roots.forEach((root, i) => {
-    const file = path.join(root, PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH)
     let parsed
     try {
-      const st = fs.lstatSync(file)
-      if (!st.isFile() || st.size > SIDECAR_MAX_BYTES) throw new Error('not a plain bounded file')
-      parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const file = readRepoFile(root, PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH, REPO_FILE_CAPS.sidecar)
+      if (file.status !== 'ok') {
+        // Absent is the ordinary "not written yet"; anything else is unreadable.
+        if (i === 0) firstFailure = file.status === 'absent' ? 'proposal-target sidecar not found' : 'proposal-target sidecar unreadable or not valid JSON'
+        return
+      }
+      parsed = JSON.parse(file.text)
     } catch (e) {
-      // ENOENT is the ordinary "not written yet"; anything else is unreadable
-      // or malformed. The message is never echoed (it can carry the path).
-      if (i === 0) firstFailure = e && e.code === 'ENOENT' ? 'proposal-target sidecar not found' : 'proposal-target sidecar unreadable or not valid JSON'
+      // Malformed JSON. The message is never echoed (it can carry the path).
+      if (i === 0) firstFailure = 'proposal-target sidecar unreadable or not valid JSON'
       return
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -1954,13 +2058,10 @@ function runLedgerCommand(roots, window) {
   let combinedSkipped = []
   for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
     const root = roots[rootIndex]
-    const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
-    let raw = ''
-    let exists = false
-    if (fs.existsSync(ledgerPath)) {
-      exists = true
-      raw = fs.readFileSync(ledgerPath, 'utf8')
-    }
+    const file = readRepoFile(root, LEDGER_RELATIVE_PATH, REPO_FILE_CAPS.ledger)
+    if (file.status !== 'ok' && file.status !== 'absent') return { error: `the ledger for root ${rootIndex} could not be read (${file.status})` }
+    const exists = file.status === 'ok'
+    const raw = exists ? file.text : ''
     const { records, skipped, schemaVersionsSeen, truncatedFinalLine } = parseLedgerContent(raw)
     const label = derivePerRepoLabel(records, root)
     // Review round-1 M5: rootIndex is the stable, positional, non-
@@ -2140,28 +2241,14 @@ export function main() {
     // git_log_raw, and this script does all parsing/scoring deterministically
     // (parseGitLogRaw), so a mis-parse can never silently misattribute a
     // changed path to the wrong commit.
-    const commits = parseGitLogRaw(typeof payload.git_log_raw === 'string' ? payload.git_log_raw : '')
+    // AC-1: the agent no longer parses git log output itself; it captures the
+    // raw stdout verbatim into git_log_raw and escapedDefectsFigures parses and
+    // scores it deterministically. The integrity rule (the toplevel check) and
+    // the repo identity attachment live there, once, for this command and for
+    // the collector (workflows/lib/optimise-collect.mjs).
+    const rawLog = typeof payload.git_log_raw === 'string' ? payload.git_log_raw : ''
     const root = typeof payload.root === 'string' && payload.root ? payload.root : process.cwd()
-    // Round 1 F5 (AC-SEC-10 integrity): the lane reports `git -C <root>
-    // rev-parse --show-toplevel`; if that is not this root (after realpath on
-    // both, fs only), git read an enclosing or different repo, so the figures
-    // are about the wrong history. Rejected with a reason, never figures, and
-    // the reason echoes no path.
-    // Round 2 F3 (AC-QA-19, AC-SEC-10): this check used to be skipped when
-    // `toplevel` was missing or empty, so a lane that omitted it (or a failed
-    // rev-parse) got figures with no integrity check at all. It now fails
-    // closed: no toplevel is the same no-figures rejection as a mismatch.
-    let same = false
-    if (typeof payload.toplevel === 'string' && payload.toplevel) {
-      try { same = fs.realpathSync(payload.toplevel) === fs.realpathSync(root) } catch (e) { same = false }
-    }
-    if (!same) return { rejected: true, reason: 'git toplevel is missing or does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null, repo: ledgerIdentityForRoot(root) }
-    const config = resolveProductSourceExcludeGlobs(root)
-    // HARN-OPT-4 T6 (AC-DATA-11, AC-SEC-10): attach the ledger repo identity
-    // for this root, derived exactly as the ledger command derives perRepo[].root,
-    // so the script can match this figure to its roster entry. The root path
-    // itself is never echoed.
-    return { ...countEscapedDefectCandidates(commits, config), repo: ledgerIdentityForRoot(root) }
+    return escapedDefectsFigures({ rawLog, toplevel: payload.toplevel, root, identity: ledgerIdentityForRoot(root) })
   }
   if (command === 'ids') {
     const raw = readStdin()

@@ -675,6 +675,7 @@ function publishedSubsetTree(overrides = {}) {
     'workflows/review-cycle.js': 'review cycle\n',
     'workflows/lib/install-consistency.mjs': 'the lib file itself\n',
     'workflows/lib/ledger-append.mjs': 'ledger append\n',
+    'workflows/lib/optimise-collect.mjs': 'the collector\n',
     'hooks/hooks.json': '{}\n',
     'skills/optimise-cycle/SKILL.md': 'optimise-cycle skill\n',
     'skills/conduct-plan/SKILL.md': 'conduct-plan skill\n',
@@ -767,10 +768,22 @@ test('install-consistency: listConsumerSubsetFiles walks a real tree and returns
       'skills/conduct-plan/SKILL.md',
       'workflows/lib/install-consistency.mjs',
       'workflows/lib/ledger-append.mjs',
+      'workflows/lib/optimise-collect.mjs',
       'workflows/plan-cycle.js',
       'workflows/review-cycle.js',
     ].sort()
   )
+})
+
+// HARN-RUNNER-2 T1 (AC-ARCH-7): the collector the weekly runner invokes is
+// shipped by install. Checked against the REAL repository tree, not a fixture,
+// because a fixture lists only what its author remembered to add.
+test('install-consistency: HARN-RUNNER-2 AC-ARCH-7 -- the real tree ships workflows/lib/optimise-collect.mjs through the consumer subset', async () => {
+  const { listConsumerSubsetFiles, isConsumerSubsetPath } = await loadModule()
+  const repoRoot = path.join(__dirname, '..')
+  assert.equal(isConsumerSubsetPath('workflows/lib/optimise-collect.mjs'), true)
+  assert.ok(fs.existsSync(path.join(repoRoot, 'workflows', 'lib', 'optimise-collect.mjs')), 'the collector module must exist in the repository')
+  assert.ok(listConsumerSubsetFiles(repoRoot).includes('workflows/lib/optimise-collect.mjs'), 'the real tree walk must list the collector as shipped')
 })
 
 test('install-consistency: listConsumerSubsetFiles never throws when a pattern directory is absent from the tree entirely', async () => {
@@ -819,7 +832,7 @@ test('install-consistency: checkStaleness reports no drift when the install matc
   assert.deepEqual(result.missing, [])
   assert.equal(result.missing_count, 0)
   assert.deepEqual(result.drift, [])
-  assert.equal(result.published_files_checked, 14)
+  assert.equal(result.published_files_checked, 15)
   assert.deepEqual(result.unmatched_patterns, [])
   assert.equal(result.status, 'ok')
 })
@@ -850,6 +863,7 @@ test('install-consistency: checkStaleness reports a published REQUIRED file ABSE
     'workflows/review-cycle.js',
     'workflows/lib/install-consistency.mjs',
     'workflows/lib/ledger-append.mjs',
+    'workflows/lib/optimise-collect.mjs',
     'hooks/hooks.json',
     'skills/optimise-cycle/SKILL.md',
     'skills/conduct-plan/SKILL.md',
@@ -884,6 +898,7 @@ test('install-consistency: checkStaleness (HIGH-2) -- a published install with N
     'workflows/review-cycle.js',
     'workflows/lib/install-consistency.mjs',
     'workflows/lib/ledger-append.mjs',
+    'workflows/lib/optimise-collect.mjs',
     'hooks/hooks.json',
     'skills/optimise-cycle/SKILL.md',
     'skills/conduct-plan/SKILL.md',
@@ -961,6 +976,7 @@ test("install-consistency: checkStaleness (L-4, harn-fix-3) -- a manual install 
     'workflows/review-cycle.js',
     'workflows/lib/install-consistency.mjs',
     'workflows/lib/ledger-append.mjs',
+    'workflows/lib/optimise-collect.mjs',
     'skills/optimise-cycle/SKILL.md',
     'skills/conduct-plan/SKILL.md',
     'bin/optimise-cycle-weekly.sh',
@@ -1276,7 +1292,7 @@ test('install-consistency (HARN-RULES-1): bin/sonar-rules-table.mjs is an option
   assert.deepEqual(drifted.drifted, ['bin/sonar-rules-table.mjs'])
   assert.equal(drifted.status, 'drift')
   const installDir = fs.mkdtempSync(path.join(TMP_ROOT, 'tree-'))
-  for (const rel of ['AGENT-HARNESS.md', 'agents/lens-security.md', 'agents/lens-qa.md', 'agents/reviewer-verification.md', 'workflows/plan-cycle.js', 'workflows/review-cycle.js', 'workflows/lib/install-consistency.mjs', 'workflows/lib/ledger-append.mjs', 'hooks/hooks.json', 'skills/optimise-cycle/SKILL.md', 'skills/conduct-plan/SKILL.md']) {
+  for (const rel of ['AGENT-HARNESS.md', 'agents/lens-security.md', 'agents/lens-qa.md', 'agents/reviewer-verification.md', 'workflows/plan-cycle.js', 'workflows/review-cycle.js', 'workflows/lib/install-consistency.mjs', 'workflows/lib/ledger-append.mjs', 'workflows/lib/optimise-collect.mjs', 'hooks/hooks.json', 'skills/optimise-cycle/SKILL.md', 'skills/conduct-plan/SKILL.md']) {
     const dest = path.join(installDir, rel)
     fs.mkdirSync(path.dirname(dest), { recursive: true })
     fs.copyFileSync(path.join(published, rel), dest)
