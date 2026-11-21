@@ -1155,7 +1155,8 @@ test('AC-ARCH-5: a checkout made with --separate-git-dir is could_not_read, neve
   const root = scratchDir()
   const elsewhere = path.join(scratchDir(), 'separate.git')
   execFileSync('git', ['init', '-q', `--separate-git-dir=${elsewhere}`, root], { env: sanitizedGitEnv() })
-  gitIn(root, ['commit', '-q', '--allow-empty', '-m', 'fix: one'])
+  // An identity on the command line: this repository is not made by makeTempRepo, and a CI runner has no global one.
+  gitIn(root, ['-c', 'user.email=probe@example.invalid', '-c', 'user.name=probe', 'commit', '-q', '--allow-empty', '-m', 'fix: one'])
   const { outDir } = collect(stubs, root)
   const ledger = lane(outDir, 'ledger')
   assert.equal(ledger.status, 'failed', JSON.stringify(ledger))
