@@ -66,6 +66,7 @@
 //   .claude/harness-ledger.jsonl (64 MiB cap)
 //   .claude/optimise-proposal-targets.json (1 MiB cap)
 //   .claude/harness-triggers.json (1 MiB cap)
+//   specs/ (a real directory, listed; each specs/*.md a regular file under a 1 MiB cap, for plan labels)
 // The only unguarded read is the operator-configured root itself (isDirectory).
 // git and gh read the repository by their own means and are bounded by timeouts.
 //
@@ -84,7 +85,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { DEFAULT_LEDGER_WINDOW_LINES, MIN_RUNS_FOR_NEVER_FAILED, REPO_FILE_CAPS, escapedDefectsFigures, repoFileStatus, resolveLedgerRoot } from './optimise-read.mjs'
+import { MIN_RUNS_FOR_NEVER_FAILED, NEVER_FAILING_RENDER_KEYS, REPO_FILE_CAPS, escapedDefectsFigures, isPlainInsufficientRow, readRepoFile, repoFileStatus, resolveLedgerRoot } from './optimise-read.mjs'
 
 const READER_PATH = fileURLToPath(new URL('./optimise-read.mjs', import.meta.url))
 
@@ -112,6 +113,25 @@ const STDOUT_CAP_BYTES = 64 * 1024 * 1024
 const STDERR_KEEP_CHARS = 4096
 const GH_RUN_LIMIT = 100
 const GIT_LOG_MAX_COMMITS = 500
+
+// The ledger window the weekly runner has always passed; an option of collectRepo, not a setting.
+export const DEFAULT_COLLECT_WINDOW = 90
+
+// The digest (digest.json): ONE bounded document a workflow script can be handed whole.
+export const DIGEST_MAX_BYTES = 32_768
+export const DIGEST_MAX_LINE_CHARS = 2000
+export const BLOCKED_STRING_MAX_CHARS = 120
+// Entry-count caps. The entries kept are the LAST ones, the plans and proposals the
+// ledger saw most recently; the number left out is recorded in the digest's `dropped`.
+export const DIGEST_MAX_BYPLAN_ENTRIES = 12
+export const DIGEST_MAX_PROPOSAL_OUTCOMES = 16
+export const PLAN_LABELS_MAX = 40
+export const PLAN_LABEL_TITLE_MAX_CHARS = 80
+const SPECS_DIR = 'specs'
+const SPEC_FILE_MAX_BYTES = 1024 * 1024
+const SPEC_FILES_MAX = 200
+const TASK_LINE_RE = /^- \[[ xX]\] ([A-Za-z]{1,8}\d{1,4}[A-Za-z]{0,3}):(.*)$/
+const GIT_WINDOW_NOTE = `the git log was cut at ${GIT_LOG_MAX_COMMITS} commits; older history was not examined`
 
 const GH_LIST_ARGV = ['run', 'list', '--limit', String(GH_RUN_LIMIT), '--json', 'databaseId,attempt,status,workflowName,startedAt']
 const GIT_LOG_ARGV = ['log', `--max-count=${GIT_LOG_MAX_COMMITS}`, '--name-only', '--pretty=format:%x1e%P%x1f%s']
@@ -288,7 +308,7 @@ async function ledgerLane(ctx, stats) {
   const ledgerRoot = path.resolve(location.root)
   const unreadable = unreadableLedgerInput(ledgerRoot)
   if (unreadable) throw new LaneFailure('could_not_read', unreadable)
-  return { result: await readerJson(ctx, stats, 'ledger', undefined, [ledgerRoot, `--window=${DEFAULT_LEDGER_WINDOW_LINES}`]) }
+  return { result: await readerJson(ctx, stats, 'ledger', undefined, [ledgerRoot, `--window=${ctx.window}`]) }
 }
 
 // The ledger identity the git figure is matched by (null when the ledger lane
@@ -319,7 +339,8 @@ async function gitLane(ctx, stats, identity) {
   const toplevel = (await gitCall(ctx, stats, GIT_ROOT_ARGV)).trim()
   const figures = escapedDefectsFigures({ rawLog: log, toplevel, root: ctx.root, identity })
   if (figures.rejected) throw new LaneFailure('other', GIT_TOPLEVEL_REASON)
-  return { result: figures }
+  // The one repository the collector is given is root 0; a log that reached the commit cap may have more behind it.
+  return { result: { ...figures, root_index: 0, window_note: figures.n_commits_examined >= GIT_LOG_MAX_COMMITS ? GIT_WINDOW_NOTE : null } }
 }
 
 // ---- ci lane ----
@@ -433,6 +454,205 @@ async function ciLane(ctx, stats) {
   return { runCount, fetchFailedCount, timeoutCount, ...(timeoutCount > 0 ? { reason: budgetReason(runCount, entries.length) } : {}), result }
 }
 
+// ---- plan labels ----
+
+// The task id and one-line title of each task line in the Tasks section of each
+// specs/*.md, with no model: the labels the workflow's scope step used to have an
+// agent extract. The reads are the reader's guarded ones (a symlinked specs
+// directory or spec file, an oversize file and a device are refused); what could not
+// be read is said in a fixed note, never silently.
+function taskLabels(text) {
+  const labels = []
+  let inTasks = false
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#')) {
+      inTasks = line.trim() === '## Tasks'
+      continue
+    }
+    const match = inTasks ? line.match(TASK_LINE_RE) : null
+    const title = match ? match[2].trim() : ''
+    if (title) labels.push({ task_id: match[1], title: title.slice(0, PLAN_LABEL_TITLE_MAX_CHARS) })
+  }
+  return labels
+}
+
+function listSpecFiles(root) {
+  const dir = repoFileStatus(root, SPECS_DIR, SPEC_FILE_MAX_BYTES, { list: true })
+  if (dir.status === 'absent') return { names: [] }
+  if (dir.status !== 'ok') return { names: [], note: 'the specs directory is a symlink or could not be read, so no plan labels were collected' }
+  const names = dir.entries.filter((name) => name.endsWith('.md')).sort((a, b) => a.localeCompare(b, 'en'))
+  return { names: names.slice(0, SPEC_FILES_MAX), overFileCap: names.length > SPEC_FILES_MAX }
+}
+
+function planLabelsNote({ note, refused, overFileCap }) {
+  const parts = []
+  if (refused > 0) parts.push(`${refused} spec files were not read (symlink, over the size limit or unreadable)`)
+  if (overFileCap) parts.push(`only the first ${SPEC_FILES_MAX} spec files were read`)
+  return note ?? (parts.length > 0 ? parts.join('; ') : null)
+}
+
+function collectPlanLabels(root) {
+  const { names, note, overFileCap } = listSpecFiles(root)
+  const all = []
+  let refused = 0
+  for (const name of names) {
+    const file = readRepoFile(root, `${SPECS_DIR}/${name}`, SPEC_FILE_MAX_BYTES)
+    if (file.status === 'ok') all.push(...taskLabels(file.text))
+    else refused += 1
+  }
+  return { labels: all.slice(0, PLAN_LABELS_MAX), dropped: Math.max(0, all.length - PLAN_LABELS_MAX), note: planLabelsNote({ note, refused, overFileCap }) }
+}
+
+// ---- the digest ----
+
+// Where the digest holds text that originated in a repository (a plan label, a spec
+// path, a criterion id, a job name, a commit-derived string, a task title), so the
+// workflow can fence exactly those. Grammar: dot separated; `name` a member,
+// `name[*]` every element of the array at that member, `*` every member value of an
+// object, `*^` every member KEY of an object. Lane reasons are fixed text and are not here.
+const FREE_TEXT_PATHS = [
+  'ledger.perRepo[*].root',
+  'ledger.perRepo[*].schemaVersionsSeen.*^',
+  'ledger.rework.lensDispositionCounts.*^',
+  'ledger.blockedUnresolved.byReason.*^',
+  'ledger.blockedUnresolved.unresolved[*].repo',
+  'ledger.blockedUnresolved.unresolved[*].spec',
+  'ledger.blockedUnresolved.unresolved[*].task',
+  'ledger.wallClock.byPlan.*^',
+  'ledger.wallClock.byPlan.*.repo',
+  'ledger.wallClock.byPlan.*.plan',
+  'ledger.wallClock.byPlan.*.unusableIntervals[*].reason',
+  'ledger.proposalOutcomes.*^',
+  'ledger.proposalOutcomes.*.lastAdoptionTs',
+  'ledger.proposalOutcomes.*.lastRejectionTs',
+  'ledger.proposalOutcomes.*.target.kind',
+  'ledger.proposalOutcomes.*.target.component',
+  'ledger.proposalOutcomes.*.target.concern',
+  'ledger.proposalOutcomes.*.target.lens',
+  'ledger.proposalOutcomes.*.target.workflow',
+  'ledger.proposalOutcomes.*.target.job',
+  'ledger.triggerAccuracy.byLens.*^',
+  'ledger.citationPool[*]',
+  'ledger.neverFailingAcs[*].repo',
+  'ledger.neverFailingAcs[*].spec',
+  'ledger.neverFailingAcs[*].ac_id',
+  'git.repo',
+  'git.scoped_exclude_globs[*]',
+  'ci.byJob.*^',
+  'ci.byJob.*.repo',
+  'ci.byJob.*.workflow',
+  'ci.byJob.*.job',
+  'ci.repoStats.*^',
+  'ci.failures[*].repo',
+  'ci.ghStats[*].repo',
+  'plan_labels[*].task_id',
+  'plan_labels[*].title',
+]
+
+function omitKey(object, key) {
+  const copy = { ...object }
+  delete copy[key]
+  return copy
+}
+
+function cutStrings(value, max) {
+  if (typeof value === 'string') return value.slice(0, max)
+  if (Array.isArray(value)) return value.map((item) => cutStrings(item, max))
+  if (value !== null && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cutStrings(item, max)]))
+  return value
+}
+
+// The last `cap` entries of an object (the most recently seen) and how many were left out.
+function capEntries(object, cap) {
+  const entries = Object.entries(object ?? {})
+  return { kept: Object.fromEntries(entries.slice(-cap)), dropped: Math.max(0, entries.length - cap) }
+}
+
+function laneDigest(record) {
+  const base = { status: record.status, mode: record.mode ?? null, reason: record.reason ?? null }
+  if (record.lane !== 'ci') return base
+  return { ...base, runCount: record.runCount ?? null, fetchFailedCount: record.fetchFailedCount ?? null, timeoutCount: record.timeoutCount ?? null }
+}
+
+function neverFailingDigest(rows) {
+  const list = Array.isArray(rows) ? rows : []
+  const kept = list.filter((row) => !isPlainInsufficientRow(row))
+  return { rows: kept.map((row) => Object.fromEntries(NEVER_FAILING_RENDER_KEYS.map((key) => [key, row[key]]))), insufficientCount: list.length - kept.length }
+}
+
+// What the workflow computes on or renders from the ledger result, and nothing else.
+function ledgerDigest(result) {
+  const byPlan = capEntries(result.wallClock?.byPlan, DIGEST_MAX_BYPLAN_ENTRIES)
+  const outcomes = capEntries(result.proposalOutcomes, DIGEST_MAX_PROPOSAL_OUTCOMES)
+  const neverFailing = neverFailingDigest(result.neverFailingAcs)
+  const digest = {
+    n: result.n,
+    windowTruncated: result.windowTruncated,
+    windowDroppedCount: result.windowDroppedCount,
+    perRepo: result.perRepo,
+    skippedCount: Array.isArray(result.skipped) ? result.skipped.length : 0,
+    rework: omitKey(result.rework, 'acVerdicts'),
+    blockedUnresolved: cutStrings(omitKey(result.blockedUnresolved, 'byModel'), BLOCKED_STRING_MAX_CHARS),
+    wallClock: { totals: result.wallClock?.totals, byPlan: byPlan.kept, source: result.wallClock?.source },
+    triggerAccuracy: result.triggerAccuracy,
+    proposalOutcomes: outcomes.kept,
+    citationPool: result.citationPool,
+    neverFailingAcs: neverFailing.rows,
+    neverFailingInsufficientCount: neverFailing.insufficientCount,
+  }
+  return { digest, dropped: { wallClockByPlan: byPlan.dropped, proposalOutcomes: outcomes.dropped } }
+}
+
+function buildDigest(records, planLabels) {
+  const [ledger, git, ci] = records
+  const fromLedger = ledger.status === 'ran' && ledger.result ? ledgerDigest(ledger.result) : null
+  return {
+    lanes: { ledger: laneDigest(ledger), git: laneDigest(git), ci: laneDigest(ci) },
+    ledger: fromLedger ? fromLedger.digest : null,
+    git: git.status === 'ran' ? git.result : null,
+    ci: ci.status === 'ran' ? ci.result : null,
+    plan_labels: planLabels.labels,
+    plan_labels_note: planLabels.note,
+    dropped: { wallClockByPlan: fromLedger?.dropped.wallClockByPlan ?? 0, proposalOutcomes: fromLedger?.dropped.proposalOutcomes ?? 0, planLabels: planLabels.dropped },
+    freeTextPaths: FREE_TEXT_PATHS,
+  }
+}
+
+// Pretty printed, so no line grows with the data; a document that is still over a
+// bound is a failure of the digest, never a cut-down document.
+function digestText(digest) {
+  const text = JSON.stringify(digest, null, 2) + '\n'
+  if (Buffer.byteLength(text) > DIGEST_MAX_BYTES) throw new LaneFailure('over_size', `the digest is over the ${DIGEST_MAX_BYTES}-byte size limit after the entry caps were applied`)
+  if (text.split('\n').some((line) => line.length > DIGEST_MAX_LINE_CHARS)) throw new LaneFailure('line_too_long', `a line of the digest is over ${DIGEST_MAX_LINE_CHARS} characters`)
+  return text
+}
+
+function writeDigestFile(outDir, text) {
+  const file = path.join(outDir, 'digest.json')
+  const temporary = path.join(outDir, `.digest.json.${process.pid}.tmp`)
+  try {
+    fs.writeFileSync(temporary, text, { mode: 0o600 })
+    fs.chmodSync(temporary, 0o600)
+    fs.renameSync(temporary, file)
+  } catch (error) {
+    fs.rmSync(temporary, { force: true })
+    throw error
+  }
+}
+
+// Not a lane that runs a command: { lane: 'digest', status: 'ran' } once digest.json is
+// written, otherwise a failed record with a fixed reason and no digest.json (a stale
+// one from an earlier run in the same directory is removed, so it cannot be mistaken for this run's).
+function digestLane(ctx, records) {
+  try {
+    writeDigestFile(ctx.outDir, digestText(buildDigest(records, collectPlanLabels(ctx.root))))
+    return { lane: 'digest', status: 'ran' }
+  } catch (error) {
+    fs.rmSync(path.join(ctx.outDir, 'digest.json'), { force: true })
+    return failedRecord('digest', error)
+  }
+}
+
 // ---- lanes and files ----
 
 const seconds = (ms) => Math.round(ms) / 1000
@@ -494,20 +714,26 @@ function laneToken(record) {
 // Fixed fields only; nothing collected, and no path, appears in it. When the ci
 // lane measured runs, the counts fetched and not fetched (and how many of those
 // were never attempted for want of budget) show partial degradation.
-function logLine(records) {
+function logLine(records, digest) {
   const calls = records.map((r) => `${r.lane}:${r.calls}`).join(',')
   const wall = records.map((r) => `${r.lane}:${r.wall_clock_s}`).join(',')
   const ci = records.find((r) => r.lane === 'ci')
   const ciRuns = Number.isInteger(ci?.runCount) ? ` ci_runs=fetched:${ci.runCount},not_fetched:${ci.fetchFailedCount},timeout:${ci.timeoutCount}` : ''
-  return `COLLECT ${records.map(laneToken).join(' ')} calls=${calls} wall_clock_s=${wall}${ciRuns}`
+  const digestFailed = digest.status === 'failed' ? ` digest=failed:${digest.mode}` : ''
+  return `COLLECT ${records.map(laneToken).join(' ')} calls=${calls} wall_clock_s=${wall}${ciRuns}${digestFailed}`
 }
 
+const isWindow = (value) => Number.isSafeInteger(value) && value > 0
+
 // Collects one repository into outDir. Resolves with { lanes, line } even when
-// lanes failed; the failures are in the lane files. Rejects only for a bad call.
-export async function collectRepo({ root, outDir, timeoutMs } = {}) {
+// lanes failed; the failures are in the lane files (and the digest's, which is
+// lanes.digest here). Rejects only for a bad call, before anything runs or is written.
+// window: how many of the most recent ledger records are read, a positive integer.
+export async function collectRepo({ root, outDir, timeoutMs, window = DEFAULT_COLLECT_WINDOW } = {}) {
   if (typeof root !== 'string' || !root || typeof outDir !== 'string' || !outDir) throw new TypeError('collectRepo needs a root and an outDir')
+  if (!isWindow(window)) throw new TypeError('collectRepo window must be a positive integer')
   fs.mkdirSync(outDir, { recursive: true, mode: 0o700 })
-  const ctx = { root, outDir, timeouts: resolveTimeouts(timeoutMs), env: childEnv() }
+  const ctx = { root, outDir, window, timeouts: resolveTimeouts(timeoutMs), env: childEnv() }
   const bad = (mode) => () => {
     throw new LaneFailure(mode, 'the repository root is not a directory')
   }
@@ -516,7 +742,8 @@ export async function collectRepo({ root, outDir, timeoutMs } = {}) {
   const git = await runLane(ctx, 'git', rootOk ? (c, st) => gitLane(c, st, ledgerIdentity(ledger)) : bad('other'))
   const ci = await runLane(ctx, 'ci', rootOk ? ciLane : bad('other'))
   const records = [ledger, git, ci]
-  return { lanes: { ledger, git, ci }, line: logLine(records) }
+  const digest = digestLane(ctx, records)
+  return { lanes: { ledger, git, ci, digest }, line: logLine(records, digest) }
 }
 
 // ---- command line ----
@@ -531,14 +758,24 @@ function installSignalHandlers() {
   }
 }
 
+const USAGE = `usage: node optimise-collect.mjs <repository-root> <output-directory> [window: a positive integer, default ${DEFAULT_COLLECT_WINDOW}]\n`
+
+// The optional third argument: digits only (so no sign, fraction or exponent), a positive safe
+// integer; NaN when the arguments are not acceptable.
+function cliWindow(argv) {
+  if (argv.length === 2) return DEFAULT_COLLECT_WINDOW
+  return argv.length === 3 && /^\d{1,15}$/.test(argv[2]) && isWindow(Number(argv[2])) ? Number(argv[2]) : Number.NaN
+}
+
 async function cli(argv) {
-  if (argv.length !== 2) {
-    process.stderr.write('usage: node optimise-collect.mjs <repository-root> <output-directory>\n')
+  const window = cliWindow(argv)
+  if (argv.length < 2 || Number.isNaN(window)) {
+    process.stderr.write(USAGE)
     return 2
   }
   installSignalHandlers()
   try {
-    const { line } = await collectRepo({ root: argv[0], outDir: argv[1] })
+    const { line } = await collectRepo({ root: argv[0], outDir: argv[1], window })
     process.stdout.write(line + '\n')
     return 0
   } catch (error) {
