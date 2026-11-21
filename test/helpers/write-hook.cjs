@@ -12,7 +12,9 @@
 //   HOOK_RENAME_THROW=plain|coded
 //                            make the rename onto the table throw: plain is an Error
 //                            with no code, coded one with a code, syscall and path.
-//                            Both carry a free-text message holding a sentinel.
+//                            Both carry a free-text message holding a sentinel. named is
+//                            a third: an Error with no code whose name is the JSON value
+//                            in HOOK_ERROR_NAME_JSON, which need not be a string.
 //   HOOK_RENAME_DELAY_MS=n   stall n ms before renaming onto the table, so two
 //                            runs started together are both between write and
 //                            rename at once.
@@ -60,6 +62,7 @@ if (process.env.HOOK_RENAME_THROW) {
     if (!names(to)) return rename.apply(this, arguments)
     const e = new Error(`FREE-TEXT-SENTINEL ${to}`)
     if (process.env.HOOK_RENAME_THROW === 'coded') Object.assign(e, { code: 'ENOSPC', syscall: 'rename', path: String(to) })
+    if (process.env.HOOK_RENAME_THROW === 'named') e.name = JSON.parse(process.env.HOOK_ERROR_NAME_JSON)
     throw e
   }
 }
