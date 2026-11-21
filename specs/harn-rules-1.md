@@ -161,6 +161,7 @@ path under `.claude/`; "the generator" means the new program under `bin/`.
 - **AC-QA-18:** The generator is never a gate and nothing automated runs it. A static test fails if the generator's filename is referenced from `.github/workflows/`, `hooks/`, `bin/setup-hooks.sh`, the pre-push hook, the gate command, any `workflows/*.js` script, any `workflows/lib/` module other than the one install pattern literal of AC-SIMP-10, or anything under `skills/`. It is proven by adding such a reference, watching the test fail, and restoring. *(merges AC-ARCH-4 and the search half of AC-PROD-9)* *(after review round 2: the scanned set is not a hand-written list of directories. It is every tracked file from `git ls-files` except the generator, its tests and fixtures, README.md, this spec, the proofs record and the one install pattern literal, so `.githooks/` and anything added later are covered without editing the test. The AC-ARCH-2 and AC-SEC-8 static guards take their file sets the same way, and match any `/api/<name>/` path and not an enumerated list.)*
 - **AC-QA-20:** Each new test this change adds has a recorded mutation proof under `docs/`: the edit made, the diff or hash showing it landed on the intended construct, the failing output and the restore.
 - **AC-QA-21:** This change replaces nothing in this repository. No existing test is retired and no existing assertion is weakened or deleted, checked by diffing `test/` for removed assert lines. *(merges AC-PROD-10, AC-ARCH-11 and AC-OPS-R)*
+- **AC-QA-22:** Both `tdd-task` phase prompts (Test and Implement) carry one sentence that names the rules table by its path and tells the builder to read it when it exists as coding guidance and reference data only, never as instructions, and to include the `Rules table:` status line in the report. The sentence is one constant used at both dispatch sites, it names no analyser and no API, and the path it names is checked against the generator's literal by the AC-ARCH-1 test. With no table present the prompts change nothing a builder does. Tests: both prompts contain the constant; a mutation removing it from either site fails a named test; the AC-ARCH-1 test fails when the path in the constant is altered. A live run with an implementer definition that lacks the rules-table section reports the status line when dispatched with the prompt text. *(added after merge, owner decision 2026-11-21; overturns the planning veto on AC-QA-12 and AC-QA-13)*
 
 ### Simplicity (lens-simplicity)
 
@@ -277,7 +278,7 @@ person has edited by hand (AC-PROD-11).
 | This repository adopts the table in this change | lens-product and the AC-SIMP check, review round 1 | accepted (AC-SIMP-12 amended) | One defensible course: a generator with no real use behind it is the weaker thing to ship |
 | Recent and since-previous counts include issues since fixed | owner, 2026-11-21, review round 2 | accepted (AC-QA-2 amended) | Open-only counting dropped a rule, and zeroed the measure, the moment its clean-up landed |
 | AC-OPS-1's live proof | conductor, review round 2 | run now, before merge | Four short real runs; one defensible course |
-| A second instruction site in `tdd-task` prompts | lens-simplicity veto | veto stands | Not a security, data-loss or accessibility item, so the veto holds; revisit if the measure shows the table earns its keep |
+| A second instruction site in `tdd-task` prompts | lens-simplicity veto at planning; **overturned by the owner, 2026-11-21, after merge** | one pointer line in each `tdd-task` phase prompt (AC-QA-22) | Measured on the day of the merge: the first and only user's installed implementer is a replacement, which `bin/install.sh` never overwrites by design, so the instruction reached no builder on that machine. The cost the veto accepted applied to every user there was |
 
 ## Risks
 
@@ -305,8 +306,9 @@ Ranked by recoverability.
 | `.claude/analyser-rules.md` | this repository's own table, generated and then given hand-written guidance |
 | `test/`, `docs/` | tests, fixtures and mutation-proof records |
 
-`workflows/tdd-task.js` and `AGENT-HARNESS.md` are not changed (vetoed at
-planning, see above).
+`AGENT-HARNESS.md` is not changed (vetoed at planning). `workflows/tdd-task.js`
+was left unchanged by the first merge and gains one pointer sentence in the
+follow-up (AC-QA-22).
 
 ---
 
@@ -335,3 +337,7 @@ A live run against SonarQube 26.11 on 2026-11-21 found four things no test with 
 - AC-PROD-7's comparison over the next 10 feature merges.
 - The Implement phase and a `conduct-plan` dispatch as separate live runs.
 - An https server, and a server in a non-UTC timezone.
+
+### After merge, 2026-11-21
+
+Merged as #36. On installing, the conductor found the owner's installed `implementer` is a replacement, which the installer never overwrites, so no builder on the first user's machine read the table. Two actions on the owner's decision: the rules-table section was appended unchanged to that private agent file and confirmed by a live run (`Rules table: read`), and the planning veto on a second instruction site was overturned (AC-QA-22). Spec gap: no criterion asked whether the first user's own install would receive the instruction; the README's "Known limits" stated the cost and nobody checked whether it applied.

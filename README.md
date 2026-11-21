@@ -1739,7 +1739,7 @@ added.
 
 Code built through the harness can pass its tests and its review and still trip the repository's static analyser after it merges. The rules table is one optional, plain-text file that tells the builder which patterns the analyser keeps flagging in this repository, so it avoids them the first time. When the file does not exist, nothing changes.
 
-The table lives at `.claude/analyser-rules.md` and is tracked in git, not ignored, so the worktrees that builds run in receive it. The `implementer` agent reads it before writing a test or production code, in every phase of `tdd-task` and when dispatched directly by `conduct-plan`, and treats the guidance column as coding guidance and never as instructions. Each of its reports carries one line saying whether the table was read, absent, unstamped or unreadable. The instruction lives in `agents/implementer.md` only, so a repository that has replaced its implementer agent gets no benefit; a replacement implementer must read the table itself to get it.
+The table lives at `.claude/analyser-rules.md` and is tracked in git, not ignored, so the worktrees that builds run in receive it. The `implementer` agent reads it before writing a test or production code, in every phase of `tdd-task` and when dispatched directly by `conduct-plan`, and treats the guidance column as coding guidance and never as instructions. Each of its reports carries one line saying whether the table was read, absent, unstamped or unreadable. The instruction lives in `agents/implementer.md` and, as a short passage, in both phase prompts of `tdd-task` (where the status goes in an optional `rules_table` field and is logged once per phase as `Rules table (<phase>): ...`), so a repository that has replaced its implementer agent still gets the table read in `tdd-task` runs. A builder dispatched outside `tdd-task` (for example directly by `conduct-plan`) with a replaced implementer will not read it unless the replacement carries the `The analyser rules table` section from `agents/implementer.md`.
 
 ### Format
 
@@ -1787,14 +1787,14 @@ To use another analyser, or none, write the table by hand to the format above, w
 
 ### Rollback
 
-Deleting the table is the rollback: with no file, the builder carries on as before. Commit the deletion: the table is tracked, so a table deleted only in one checkout is still in every new build worktree. The change to `agents/implementer.md` rolls out, or back, by reinstalling the harness with `bin/install.sh` and restarting the Claude Code session, as for any agent change.
+Deleting the table is the rollback: with no file, the builder carries on as before. Commit the deletion: the table is tracked, so a table deleted only in one checkout is still in every new build worktree. The `tdd-task` change rolls out, or back, by reinstalling the harness with `bin/install.sh` and restarting the Claude Code session. The installer does not touch `agents/implementer.md`, so that file changes only when you copy it by hand.
 
 ### Troubleshooting
 
 - The generator exits non-zero. Cause: a missing environment variable, an http address without the opt-in, a rejected token, a project key the server does not know, a timeout, a redirect, or an answer whose shape the generator does not recognise. Action: read the one stderr line, which names the condition and the request that failed, and fix that; the existing table is left untouched. A failure on the local side, such as a read-only `.claude` directory or a full disk, is named by the system call, the error code and the path relative to the repository root, for example `open failed (EACCES) on .claude/...`; the error's own text is never printed.
 - The table says zero rules. Cause: no issues were created in the window (issues since fixed still count, false positives and accepted ones do not), or the wrong project key was read. Action: check `SONAR_PROJECT_KEY` and that the analyser has finished analysing the merge, then run it again.
 - The builder reports absent although the file exists. Cause: the file is not at `.claude/analyser-rules.md` exactly, is a symlink, is over a bound, or is not committed so the worktree lacks it. Action: check the path and that the file is tracked in git.
-- The builder's report carries no rules-table line at all. Cause: the installed implementer is a replacement, or older than this change. Action: reinstall with `bin/install.sh`, restart the Claude Code session, and check the installed `implementer.md` names the table.
+- The builder's report carries no rules-table line at all. Cause: the builder was dispatched outside `tdd-task` and the installed implementer is a replacement or older than this change; `bin/install.sh` never installs or updates `agents/implementer.md` at all (it is outside the installer's file set), so an operator's copy, whether replaced or simply older, is never changed by an install and reinstalling does not help. `tdd-task` names the table in its own prompts either way. Action: copy the current `agents/implementer.md` from a checkout into your agents directory by hand, or add the `The analyser rules table` section from it to your replacement.
 
 ## Tests
 

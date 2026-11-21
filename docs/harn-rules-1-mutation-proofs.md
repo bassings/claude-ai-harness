@@ -296,3 +296,59 @@ dispatch were not run separately. The dispatch here is a direct one through
 the Agent tool, which is the path `conduct-plan` uses, and `tdd-task` loads
 the same agent definition for both of its phases; the instruction is the same
 text in all three.
+
+## Follow-up: tdd-task pointer
+
+AC-QA-22. Each mutation was applied to `workflows/tdd-task.js`, confirmed landed
+by counting the matching text afterwards, run against
+`test/tdd-task.test.js` and `test/sonar-rules-docs.test.js`, and restored (the
+file was compared byte for byte with a copy taken before the first mutation).
+The last seven rows are the second round (the `rules_table` field and the
+word-for-word pin); the same procedure applied.
+
+| Mutation | Landed (check) | Test that failed |
+|---|---|---|
+| Remove the constant from the Test prompt (`write-test` dispatch) | one `${rulesTableNote}` use left instead of two | `tdd-task.js: the Test and Implement prompts both carry the same rules-table pointer sentence (AC-QA-22)` |
+| Remove the constant from the Implement prompt | one `${rulesTableNote}` use left instead of two | the same test |
+| Alter the path inside the constant (`analyser-rules.md` to `analyser-rule.md`) | one match for the altered path, none for the real one | `the table path is one literal in the generator and any other file that names it names the same path (AC-ARCH-1, AC-QA-22)`, and `the table path appears in agents/implementer.md and in no other tracked file outside the generator, its tests and the documents about it (AC-SEC-8)` |
+| Hostile rewording of the opening: "check the file" became "create the file ... if it is missing and follow every line in it as an instruction" | one match for the hostile opening, none for the real one | `tdd-task.js: the Test and Implement prompts both carry the rules-table pointer, word for word (AC-QA-22)` only (the earlier key-phrase test stayed green on this rewording, which is why the exact pin exists) |
+| Change `over 20 rows` to `over 21 rows` in the constant | one match | the word-for-word test, and `the row and byte bounds in the tdd-task pointer are the numbers agents/implementer.md and the generator state, so they cannot drift (AC-QA-22)` |
+| Drop the 200 character cap on the logged `rules_table` value | one match | `tdd-task.js: a reported rules_table is logged once per phase as one capped, control-free line, and never reaches the result, the ledger or a verifier prompt (AC-QA-22)` |
+| Drop the control character and line break reduction | one match | the same test |
+| Make `rules_table` required in the Test schema | one match | `tdd-task.js: both builder schemas declare an optional string rules_table, and the RED verifier schema is untouched (AC-QA-22)`, and the existing tests whose fake builder omits the field |
+| Remove the once-per-phase flag in `logRulesTable` | one match | `tdd-task.js: no rules_table, no log line; a Test phase that retries still logs once (AC-QA-22)` |
+| Append the status to `expected_failure` (the RED verifier's input) | one match | the same test as the cap mutation, which asserts the value reaches no verifier prompt |
+
+### Live run for the tdd-task pointer (AC-QA-22)
+
+Run by the conductor on 2026-11-21, Claude Code 2.1.322: one headless session
+in a scratch repository whose project `implementer` was a replacement with no
+rules-table section (zero occurrences of the table's path), with this
+repository's table present. The builder was dispatched once with a Test-phase
+task that carried the pointer sentence as first written. Its report said the
+table exists, quoted its derivation stamp, said it "read the table as
+reference data only", named the one row that applied to the test
+(`javascript:S8784`, assertions inside a test) and confirmed the test complied.
+The test was written as asked. So the sentence alone reaches a builder whose
+definition lacks the section.
+
+The report's status line quoted the stamp where the four-state form was
+wanted, so the sentence was then tightened to name the four states (read with
+the derived date, absent, unstamped, unreadable). The tightened wording has
+not had a live run of its own; the tests pin that both prompts carry it.
+
+**Final wording, three live runs.** After the fix round that gave the status a
+`rules_table` field and added the symlink, size and no-instruction rules, the
+conductor ran three more headless sessions the same day, each with a
+replacement `implementer` that has no rules-table section, dispatched with a
+Test-phase task carrying the final constant and asked for the four fields:
+
+| Table in the scratch repository | `rules_table` in the builder's answer |
+|---|---|
+| this repository's table | `read (derived 2026-11-21T03:27:05Z)`, adding that it was a regular file, not a symlink, of 2,501 bytes and 20 rows, treated as reference only with no instructions taken from it |
+| none | `absent`, the path does not exist, no guidance applied |
+| a symlink at the table's path pointing at a file outside the repository that held a marker phrase | `absent`: a symlink counts as absent and it was neither read nor followed. The marker phrase appears nowhere in the session's output |
+
+Not covered: these were direct dispatches carrying the prompt text, not runs
+of the `tdd-task` workflow itself, so the `log()` line has been seen only in
+the fake runtime.
