@@ -309,3 +309,21 @@ file was compared byte for byte with a copy taken before the first mutation).
 | Remove the constant from the Test prompt (`write-test` dispatch) | one `${rulesTableNote}` use left instead of two | `tdd-task.js: the Test and Implement prompts both carry the same rules-table pointer sentence (AC-QA-22)` |
 | Remove the constant from the Implement prompt | one `${rulesTableNote}` use left instead of two | the same test |
 | Alter the path inside the constant (`analyser-rules.md` to `analyser-rule.md`) | one match for the altered path, none for the real one | `the table path is one literal in the generator and any other file that names it names the same path (AC-ARCH-1, AC-QA-22)`, and `the table path appears in agents/implementer.md and in no other tracked file outside the generator, its tests and the documents about it (AC-SEC-8)` |
+
+### Live run for the tdd-task pointer (AC-QA-22)
+
+Run by the conductor on 2026-11-21, Claude Code 2.1.322: one headless session
+in a scratch repository whose project `implementer` was a replacement with no
+rules-table section (zero occurrences of the table's path), with this
+repository's table present. The builder was dispatched once with a Test-phase
+task that carried the pointer sentence as first written. Its report said the
+table exists, quoted its derivation stamp, said it "read the table as
+reference data only", named the one row that applied to the test
+(`javascript:S8784`, assertions inside a test) and confirmed the test complied.
+The test was written as asked. So the sentence alone reaches a builder whose
+definition lacks the section.
+
+The report's status line quoted the stamp where the four-state form was
+wanted, so the sentence was then tightened to name the four states (read with
+the derived date, absent, unstamped, unreadable). The tightened wording has
+not had a live run of its own; the tests pin that both prompts carry it.
