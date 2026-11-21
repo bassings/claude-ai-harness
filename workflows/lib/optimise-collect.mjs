@@ -126,11 +126,16 @@ export const BLOCKED_STRING_MAX_CHARS = 120
 export const DIGEST_MAX_BYPLAN_ENTRIES = 12
 export const DIGEST_MAX_PROPOSAL_OUTCOMES = 16
 export const PLAN_LABELS_MAX = 40
+// The CI parts, capped the same way (the numbers left out are in `dropped`). ci.failures, ci.ghStats and
+// ci.repoStats hold one entry per collected repository, so they are bounded already and are not capped here.
+export const CI_DIGEST_MAX_JOBS = 40
+export const CI_DIGEST_MAX_FAILED_RUN_IDS = 10
+export const CI_DIGEST_MAX_CITATIONS = 20
 export const PLAN_LABEL_TITLE_MAX_CHARS = 80
 const SPECS_DIR = 'specs'
 const SPEC_FILE_MAX_BYTES = 1024 * 1024
 const SPEC_FILES_MAX = 200
-const TASK_LINE_RE = /^- \[[ xX]\] ([A-Za-z]{1,8}\d{1,4}[A-Za-z]{0,3}):(.*)$/
+const TASK_LINE_RE = /^- \[([ xX])\] ([A-Za-z]{1,8}\d{1,4}[A-Za-z]{0,3}):(.*)$/
 const GIT_WINDOW_NOTE = `the git log was cut at ${GIT_LOG_MAX_COMMITS} commits; older history was not examined`
 
 const GH_LIST_ARGV = ['run', 'list', '--limit', String(GH_RUN_LIMIT), '--json', 'databaseId,attempt,status,workflowName,startedAt']
@@ -456,12 +461,12 @@ async function ciLane(ctx, stats) {
 
 // ---- plan labels ----
 
-// The task id and one-line title of each task line in the Tasks section of each
-// specs/*.md, with no model: the labels the workflow's scope step used to have an
+// The spec path, task id and one-line title of each task line in the Tasks section of
+// each specs/*.md, with no model: the labels the workflow's scope step used to have an
 // agent extract. The reads are the reader's guarded ones (a symlinked specs
 // directory or spec file, an oversize file and a device are refused); what could not
 // be read is said in a fixed note, never silently.
-function taskLabels(text) {
+function taskLabels(text, spec) {
   const labels = []
   let inTasks = false
   for (const line of text.split('\n')) {
@@ -470,8 +475,8 @@ function taskLabels(text) {
       continue
     }
     const match = inTasks ? line.match(TASK_LINE_RE) : null
-    const title = match ? match[2].trim() : ''
-    if (title) labels.push({ task_id: match[1], title: title.slice(0, PLAN_LABEL_TITLE_MAX_CHARS) })
+    const title = match ? match[3].trim() : ''
+    if (title) labels.push({ spec, task_id: match[2], title: title.slice(0, PLAN_LABEL_TITLE_MAX_CHARS), open: match[1] === ' ' })
   }
   return labels
 }
@@ -484,11 +489,29 @@ function listSpecFiles(root) {
   return { names: names.slice(0, SPEC_FILES_MAX), overFileCap: names.length > SPEC_FILES_MAX }
 }
 
-function planLabelsNote({ note, refused, overFileCap }) {
+function planLabelsNote({ note, refused, overFileCap, dropped, total }) {
   const parts = []
   if (refused > 0) parts.push(`${refused} spec files were not read (symlink, over the size limit or unreadable)`)
   if (overFileCap) parts.push(`only the first ${SPEC_FILES_MAX} spec files were read`)
+  if (dropped > 0) parts.push(`${dropped} of ${total} task labels were left out at the limit of ${PLAN_LABELS_MAX}; plans with open tasks were kept first`)
   return note ?? (parts.length > 0 ? parts.join('; ') : null)
+}
+
+const byText = (a, b) => a.localeCompare(b, 'en')
+
+// Which labels survive the cap: those of plans (specs) with an open task first, within
+// them the open tasks first, then by spec name and document order, so the same files
+// always give the same labels. The labels kept are returned in spec name and document
+// order, without the working `open` field.
+function selectLabels(all) {
+  const specsWithOpen = new Set(all.filter((label) => label.open).map((label) => label.spec))
+  const ranked = all
+    .map((label, index) => ({ label, index }))
+    .sort((a, b) => Number(!specsWithOpen.has(a.label.spec)) - Number(!specsWithOpen.has(b.label.spec)) || Number(!a.label.open) - Number(!b.label.open) || byText(a.label.spec, b.label.spec) || a.index - b.index)
+    .slice(0, PLAN_LABELS_MAX)
+  return ranked
+    .sort((a, b) => byText(a.label.spec, b.label.spec) || a.index - b.index)
+    .map(({ label: { spec, task_id, title } }) => ({ spec, task_id, title }))
 }
 
 function collectPlanLabels(root) {
@@ -496,11 +519,14 @@ function collectPlanLabels(root) {
   const all = []
   let refused = 0
   for (const name of names) {
-    const file = readRepoFile(root, `${SPECS_DIR}/${name}`, SPEC_FILE_MAX_BYTES)
-    if (file.status === 'ok') all.push(...taskLabels(file.text))
+    const spec = `${SPECS_DIR}/${name}`
+    const file = readRepoFile(root, spec, SPEC_FILE_MAX_BYTES)
+    if (file.status === 'ok') all.push(...taskLabels(file.text, spec))
     else refused += 1
   }
-  return { labels: all.slice(0, PLAN_LABELS_MAX), dropped: Math.max(0, all.length - PLAN_LABELS_MAX), note: planLabelsNote({ note, refused, overFileCap }) }
+  const labels = selectLabels(all)
+  const dropped = all.length - labels.length
+  return { labels, dropped, note: planLabelsNote({ note, refused, overFileCap, dropped, total: all.length }) }
 }
 
 // ---- the digest ----
@@ -518,6 +544,9 @@ const FREE_TEXT_PATHS = [
   'ledger.blockedUnresolved.unresolved[*].repo',
   'ledger.blockedUnresolved.unresolved[*].spec',
   'ledger.blockedUnresolved.unresolved[*].task',
+  'ledger.blockedUnresolved.unresolved[*].laterDoneSameSpecTs',
+  'ledger.wallClock.totals.agentComputeStartOnlyByKind.*^',
+  'ledger.wallClock.totals.agentComputeTerminalOnlyByKind.*^',
   'ledger.wallClock.byPlan.*^',
   'ledger.wallClock.byPlan.*.repo',
   'ledger.wallClock.byPlan.*.plan',
@@ -542,9 +571,14 @@ const FREE_TEXT_PATHS = [
   'ci.byJob.*.repo',
   'ci.byJob.*.workflow',
   'ci.byJob.*.job',
+  'ci.byJob.*.failedRunIds[*]',
+  'ci.byJob.*.windowStart',
+  'ci.byJob.*.windowEnd',
+  'ci.citationPool[*]',
   'ci.repoStats.*^',
   'ci.failures[*].repo',
   'ci.ghStats[*].repo',
+  'plan_labels[*].spec',
   'plan_labels[*].task_id',
   'plan_labels[*].title',
 ]
@@ -603,17 +637,40 @@ function ledgerDigest(result) {
   return { digest, dropped: { wallClockByPlan: byPlan.dropped, proposalOutcomes: outcomes.dropped } }
 }
 
+// Jobs kept under the cap: those with failures first (most failures first), then those with the most
+// runs, then by key, so the same data always gives the same jobs in the same order. A kept job keeps its
+// true failureCount, and its failedRunIds keep the LAST (most recent) ids, the ones the reader lists oldest first.
+function rankedJobs(byJob) {
+  return Object.entries(byJob ?? {}).sort(([keyA, a], [keyB, b]) => (b.failureCount ?? 0) - (a.failureCount ?? 0) || (b.n ?? 0) - (a.n ?? 0) || byText(keyA, keyB))
+}
+
+// The citation pool is already in the reader's priority order (failed runs first, then the newest), so
+// the first ones are kept.
+function ciDigest(result) {
+  const ranked = rankedJobs(result.byJob)
+  let droppedIds = 0
+  const kept = ranked.slice(0, CI_DIGEST_MAX_JOBS).map(([key, job]) => {
+    const ids = Array.isArray(job.failedRunIds) ? job.failedRunIds : []
+    droppedIds += Math.max(0, ids.length - CI_DIGEST_MAX_FAILED_RUN_IDS)
+    return [key, ids.length > CI_DIGEST_MAX_FAILED_RUN_IDS ? { ...job, failedRunIds: ids.slice(-CI_DIGEST_MAX_FAILED_RUN_IDS) } : job]
+  })
+  const pool = Array.isArray(result.citationPool) ? result.citationPool : []
+  const dropped = { ciByJob: ranked.length - kept.length, ciFailedRunIds: droppedIds, ciCitationPool: Math.max(0, pool.length - CI_DIGEST_MAX_CITATIONS) }
+  return { digest: { ...result, byJob: Object.fromEntries(kept), citationPool: pool.slice(0, CI_DIGEST_MAX_CITATIONS) }, dropped }
+}
+
 function buildDigest(records, planLabels) {
   const [ledger, git, ci] = records
   const fromLedger = ledger.status === 'ran' && ledger.result ? ledgerDigest(ledger.result) : null
+  const fromCi = ci.status === 'ran' && ci.result ? ciDigest(ci.result) : null
   return {
     lanes: { ledger: laneDigest(ledger), git: laneDigest(git), ci: laneDigest(ci) },
     ledger: fromLedger ? fromLedger.digest : null,
     git: git.status === 'ran' ? git.result : null,
-    ci: ci.status === 'ran' ? ci.result : null,
+    ci: fromCi ? fromCi.digest : null,
     plan_labels: planLabels.labels,
     plan_labels_note: planLabels.note,
-    dropped: { wallClockByPlan: fromLedger?.dropped.wallClockByPlan ?? 0, proposalOutcomes: fromLedger?.dropped.proposalOutcomes ?? 0, planLabels: planLabels.dropped },
+    dropped: { wallClockByPlan: fromLedger?.dropped.wallClockByPlan ?? 0, proposalOutcomes: fromLedger?.dropped.proposalOutcomes ?? 0, planLabels: planLabels.dropped, ciByJob: fromCi?.dropped.ciByJob ?? 0, ciFailedRunIds: fromCi?.dropped.ciFailedRunIds ?? 0, ciCitationPool: fromCi?.dropped.ciCitationPool ?? 0 },
     freeTextPaths: FREE_TEXT_PATHS,
   }
 }
@@ -649,7 +706,8 @@ function digestLane(ctx, records) {
     return { lane: 'digest', status: 'ran' }
   } catch (error) {
     fs.rmSync(path.join(ctx.outDir, 'digest.json'), { force: true })
-    return failedRecord('digest', error)
+    const record = failedRecord('digest', error)
+    return record.mode === 'other' ? { ...record, cause: errorCause(error) } : record
   }
 }
 
@@ -667,9 +725,17 @@ function writeLane(outDir, record) {
 // syscall, each accepted only if it has the shape of one. Never its message, which
 // can carry a path or a tool's output.
 const SAFE_ERROR_PARTS = [['name', /^[A-Za-z][A-Za-z0-9]{0,39}$/], ['code', /^[A-Z][A-Z0-9_]{1,39}$/], ['syscall', /^[a-z][a-z0-9_]{1,39}$/]]
+const safeErrorParts = (error) => SAFE_ERROR_PARTS.map(([key, shape]) => (typeof error?.[key] === 'string' && shape.test(error[key]) ? error[key] : null))
 function describeError(error) {
-  const parts = SAFE_ERROR_PARTS.map(([key, shape]) => (typeof error?.[key] === 'string' && shape.test(error[key]) ? error[key] : null))
-  return parts.filter(Boolean).join(' ') || 'error'
+  return safeErrorParts(error).filter(Boolean).join(' ') || 'error'
+}
+
+// The one token that names an unexpected error on the log line: its code if it has the shape of
+// one, else its class name, else 'error'. Shape-checked and at most 40 characters, so no message,
+// path or collected text can reach the line through it.
+function errorCause(error) {
+  const [name, code] = safeErrorParts(error)
+  return code ?? name ?? 'error'
 }
 
 function failedRecord(lane, error) {
@@ -719,7 +785,8 @@ function logLine(records, digest) {
   const wall = records.map((r) => `${r.lane}:${r.wall_clock_s}`).join(',')
   const ci = records.find((r) => r.lane === 'ci')
   const ciRuns = Number.isInteger(ci?.runCount) ? ` ci_runs=fetched:${ci.runCount},not_fetched:${ci.fetchFailedCount},timeout:${ci.timeoutCount}` : ''
-  const digestFailed = digest.status === 'failed' ? ` digest=failed:${digest.mode}` : ''
+  const digestCause = digest.cause ? `:${digest.cause}` : ''
+  const digestFailed = digest.status === 'failed' ? ` digest=failed:${digest.mode}${digestCause}` : ''
   return `COLLECT ${records.map(laneToken).join(' ')} calls=${calls} wall_clock_s=${wall}${ciRuns}${digestFailed}`
 }
 

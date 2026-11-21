@@ -790,8 +790,11 @@ export function aggregateRework(records, { root = '' } = {}) {
 // (workflows/optimise-cycle.js), and the one rule for which rows render as plain
 // insufficient data: the section shows "(insufficient data)" before any other reason,
 // and appends verdict_disagreements to every row unless it is absent, so a row is plain
-// only when it is insufficient data whose disagreement count is zero or absent. A digest
-// that leaves plain rows out and the render must not disagree on this, so it is one function.
+// only when it is insufficient data whose disagreement count is zero or absent (the render
+// prints a measured zero after "(insufficient data)" and nothing for an absent count). The
+// collector's digest uses this function to leave plain rows out. The workflow script cannot
+// import it, so the agreement between this function, this key list and the script's own
+// render is pinned by test/harn-runner-2-t1b.test.js, which drives the real render.
 export const NEVER_FAILING_RENDER_KEYS = ['repo', 'spec', 'ac_id', 'n', 'insufficient_data', 'unattributed_fail_in_window', 'unattributed_verdict_in_entry', 'truncated_in_window', 'never_failed', 'verdict_disagreements']
 export function isPlainInsufficientRow(row) {
   return Boolean(row?.insufficient_data) && (row.verdict_disagreements === 0 || row.verdict_disagreements === undefined)
