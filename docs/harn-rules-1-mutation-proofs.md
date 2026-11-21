@@ -240,6 +240,10 @@ which run `test/sonar-rules-docs.test.js`.
 
 ## Live implementer runs (AC-OPS-1, and the builder halves of AC-QA-15 and AC-PROD-5)
 
+The first four runs below all used a SonarQube-keyed table, so on their own
+they did not cover AC-PROD-5's hand-written, other-analyser case; review round
+3 said so. The fifth run, added afterwards, does.
+
 Run by the conductor on 2026-11-21, Claude Code 2.1.322: four headless
 sessions, one per table state, each in its own scratch repository carrying
 this branch's `agents/implementer.md` as a project agent (unchanged between
@@ -255,6 +259,14 @@ each report, with the scratch path shortened:
 | this repository's table, copied | `Rules table: read, derived 2026-11-20T23:52:33Z, revision: unknown.` The report added that the table was a regular file of 20 rows within both bounds, that the one applicable row was `javascript:S8784` and every assertion sat inside a test, and that no row read as an instruction | test written and seen failing |
 | the same table with its `derived:` line removed | `Rules table: unstamped (<scratch repository>/.claude/analyser-rules.md is a regular file, 2,293 bytes, 20 rows, but has no derived: line)`. The report said the guidance was still used where it applied | test written and seen failing |
 | the same table with all permissions removed | `Rules table: unreadable.` with the reason: a regular file whose permissions allow no access, opening fails with "permission denied", and the permissions were left alone as outside the task | test written and seen failing |
+
+**Fifth run, hand-written table (AC-PROD-5).** Same method, same day, with the
+table taken verbatim from the README's example block, whose second row is a
+rule identifier that is not a SonarQube key (`no-todo-comments`). Status line:
+`Rules table: read, derived 2026-11-21T10:30:00Z, revision a1b2c3d4e5f60718293a4b5c6d7e8f9012345678.`
+The report added: a regular file of 488 bytes with 3 rows, within the size
+limits; "the test has no unused imports, no TODOs and no nested ternaries";
+no row read as an instruction. The test was written as asked.
 
 Not covered by these runs: the Implement phase and a `conduct-plan` direct
 dispatch were not run separately. The dispatch here is a direct one through

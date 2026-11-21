@@ -5,7 +5,7 @@
 > A review finding with no AC behind it is a **spec bug**: record it in
 > "Spec gaps found at review" so the planning lens improves.
 
-**Status:** agreed
+**Status:** in progress
 **Lenses run:** security, QA, simplicity, product, architecture, operability (planning cycle `wf_7f82673d-a07`, 2026-11-21) · **Skipped:** design and accessibility (no interface), data (no stored records beyond one tracked text file)
 
 ## Problem
@@ -180,7 +180,7 @@ path under `.claude/`; "the generator" means the new program under `bin/`.
 - **AC-PROD-4:** Every rule that new code tripped in the recent window appears in the table, ranked ahead of rules that are open only as legacy debt. Test: a fixture with a new-code rule whose open count is lower than many legacy rules shows that rule present and ranked first. *(after review round 2: "tripped in the recent window" means created in it, fixed or not, per AC-QA-2. A second fixture has a rule whose only issue in the window has since been fixed and which has no open issue: it is present, with open 0 and recent-new 1, and its hand-written guidance survives.)*
 - **AC-PROD-5:** README.md documents the table format with a complete copyable example and says that a replacement implementer must honour the table to get the benefit. A table written by hand to that format, with a rule identifier that is not a SonarQube key, is read and reported by the builder exactly as a generated one is.
 - **AC-PROD-6:** Measurement. On each run the generator records in the table's stamp, and prints to stdout, the window start and end, the analysed revision, the count of new-code issues in the window, the total open count, and, when a previous table with a readable derivation instant exists, the count of issues created after that instant and how many of those were on rules that previous table listed, together with the instant itself. When there is no previous table or its stamp has no readable instant, those two counts are written as `n/a`, never as zero. Test: a first run writes `n/a`; a second run against fixtures holding one issue created before the previous instant on a listed rule, one created after it on a listed rule and one created after it on an unlisted rule gives 2 since the previous table and 1 on-listed; no author field appears in the file or the output. Mutation: count on-listed across the whole window and watch the test fail. *(amended after review round 1, owner decision 2026-11-21: the original count included issues that predate the table, so a first table read as a failure)*
-- **AC-PROD-7:** Before the build starts, this spec records the baseline the change is judged against: the sibling repository's 4 of 11 post-merge scans with new issues, 12 issues in all, from 2026-11-13 to 2026-11-21, and this repository's 3 new issues across 3 merges on 2026-11-13. It names the comparison point, which is the next 10 feature merges in a repository using the table, states the do-nothing cost, and names the result that means the generator is not earning its keep: a share of post-merge scans with new issues no lower than the baseline, or new issues that land mostly on rules the table already listed.
+- **AC-PROD-7:** Before the build starts, this spec records the baseline the change is judged against: the sibling repository's 4 of 11 post-merge scans with new issues, 12 issues in all, from 2026-11-13 to 2026-11-21, and this repository's 3 new issues across 3 merges on 2026-11-13. It names the comparison point, which is the next 10 feature merges in a repository using the table, states the do-nothing cost, and names the result that means the generator is not earning its keep: a share of post-merge scans with new issues no lower than the baseline, or new issues that land mostly on rules the table already listed. *(after review round 3: the reader is named. The conductor of this repository reads `git log -p .claude/analyser-rules.md` after the tenth feature merge that follows this change, counts the refreshes whose `since-previous` is above zero and the share of those issues that were `on-listed`, and writes the verdict into this spec's Review cycle section. The table is refreshed once per analysed merge and committed, which is what makes that history exist.)*
 - **AC-PROD-8:** The conductor does not run the generator. Before the build starts, this spec's Proposed shape and Affected files are corrected to say a person runs it, and README.md tells that person when: after the analyser has finished analysing the merge. The built change matches.
 - **AC-PROD-11:** Hand-written guidance survives a refresh (owner decision 2026-11-21). When the table already holds a row for a rule the new run also selects, the generator writes that row's existing guidance text unchanged, after applying the same sanitising and length bounds as to any guidance (AC-SEC-5 to AC-SEC-8), and updates only its counts; a rule not previously in the table gets the analyser's rule name. A row whose rule the new run does not select is dropped. Test: a table whose row for one rule carries hand-written guidance is regenerated from fixtures in which that rule is still selected with different counts, a second rule is new and a third has left; the first row keeps its text with the new counts, the second carries the analyser's name, the third is gone. Mutation: make the generator always use the analyser's name and watch the test fail.
 - **AC-PROD-9:** The generator exits zero after writing a table, whatever the issue counts. Test: a fixture with many new issues still exits zero. *(the no-reference searches are AC-QA-18 and AC-SEC-8)*
@@ -307,3 +307,31 @@ Ranked by recoverability.
 
 `workflows/tdd-task.js` and `AGENT-HARNESS.md` are not changed (vetoed at
 planning, see above).
+
+---
+
+## Review cycle
+
+**Round 1, 2026-11-21** (`wf_3311ead7-e32`, security, QA, architecture, product): 7 Medium, 6 Low. **Round 2** (`wf_b1374106-eee`, plus operability): security clean; 5 Medium, 7 Low; 8 of 11 prior findings confirmed fixed. **Round 3** (`wf_46a2d735-6bc`): security clean; 1 Medium, 12 Low; 11 of 12 prior findings confirmed fixed; no new class of defect. Three fix rounds, each test-first with recorded mutations (`docs/harn-rules-1-mutation-proofs.md`).
+
+### Spec gaps found at review
+
+Findings that had no criterion behind them when raised:
+
+- This repository adopting the table (round 1; AC-SIMP-12 amended).
+- Invisible characters beyond "bidi and zero-width" (round 1; AC-SEC-5 now states an allowlist).
+- A success measure confounded by issues that predate the table (round 1), then blind to issues fixed before the refresh (round 2); AC-PROD-6 and AC-QA-2 amended on the owner's decisions.
+- A capped rules facet on the server (round 1), and the same cap on the recent facet once fixed issues counted (round 3).
+- Local file failures, placeholder guidance that stuck, a changed response shape read as zero, an unknown revision with no stated cause (round 2).
+- Static guards built from hand-written directory lists (round 2; AC-QA-18 amended to take the file set from git).
+- A sweep race, a rollback that must be committed, the optional install path with no documented copy step, silent drops of rejected values, and no named reader for the comparison (round 3).
+
+### Measured against a real server
+
+A live run against SonarQube 26.11 on 2026-11-21 found four things no test with a fake server had shown: a read-only token is refused the analyses lookup; an unknown project key returns an empty result and not an error; a rules lookup by a list parameter returns unrelated rules; and the status list `OPEN,CONFIRMED,FIXED` is what counts created issues without false positives. Each is now a test against the fake.
+
+### Not yet measured
+
+- AC-PROD-7's comparison over the next 10 feature merges.
+- The Implement phase and a `conduct-plan` dispatch as separate live runs.
+- An https server, and a server in a non-UTC timezone.
