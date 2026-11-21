@@ -190,3 +190,27 @@ server answers 400 to a bare date. Sending a bare date (row N6) fails that test.
 | N16 | AC-QA-9 key tiebreak | Reverse the key comparison | generator:317 | generator: rules tied on recent-new are ordered by open count, then rules tied on both by key, whatever order the server lists them in |
 | N17 | AC-QA-9 open-count tiebreak | Reverse the open-count comparison | generator:317 | generator: rules tied on recent-new are ordered by open count, then rules tied on both by key, whatever order the server lists them in |
 | N6 | AC-QA-11 explicit UTC instants | Send a bare date | generator:293 | generator: the window is 30 days back to a UTC midnight, inclusive, either side of a Sydney daylight-saving change |
+
+## Live implementer runs (AC-OPS-1, and the builder halves of AC-QA-15 and AC-PROD-5)
+
+Run by the conductor on 2026-11-21, Claude Code 2.1.322: four headless
+sessions, one per table state, each in its own scratch repository carrying
+this branch's `agents/implementer.md` as a project agent (unchanged between
+these runs and the fix round 2 commit). Each session dispatched the
+`implementer` once through the Agent tool with a Test-phase task (write the
+minimal failing test for an `add(a, b)` that does not exist yet) and printed
+the report verbatim. No server and no token were involved. The status line of
+each report, with the scratch path shortened:
+
+| Table state in the scratch repository | Status line in the implementer's report | The task itself |
+|---|---|---|
+| no table | `Rules table: absent (checked <scratch repository>/.claude/analyser-rules.md)` | test written and seen failing; no warning, no request to create a table |
+| this repository's table, copied | `Rules table: read, derived 2026-11-20T23:52:33Z, revision: unknown.` The report added that the table was a regular file of 20 rows within both bounds, that the one applicable row was `javascript:S8784` and every assertion sat inside a test, and that no row read as an instruction | test written and seen failing |
+| the same table with its `derived:` line removed | `Rules table: unstamped (<scratch repository>/.claude/analyser-rules.md is a regular file, 2,293 bytes, 20 rows, but has no derived: line)`. The report said the guidance was still used where it applied | test written and seen failing |
+| the same table with all permissions removed | `Rules table: unreadable.` with the reason: a regular file whose permissions allow no access, opening fails with "permission denied", and the permissions were left alone as outside the task | test written and seen failing |
+
+Not covered by these runs: the Implement phase and a `conduct-plan` direct
+dispatch were not run separately. The dispatch here is a direct one through
+the Agent tool, which is the path `conduct-plan` uses, and `tdd-task` loads
+the same agent definition for both of its phases; the instruction is the same
+text in all three.
