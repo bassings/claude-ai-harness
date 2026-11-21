@@ -120,7 +120,7 @@ test('README names no SonarQube Web API path or SonarQube-only field name (AC-AR
 })
 
 // ------------------------------------------ the format, written down once
-const STAMP_RE = /^derived: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z revision: (?:[0-9a-f]{40}|unknown) analyser: \S+ window: \d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2} new-issues: \d+ previous: (?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z|n\/a) since-previous: (?:\d+|n\/a) on-listed: (?:\d+|n\/a) open-total: \d+ rules: \d+ of (?:at least )?\d+(?: note: .*)?$/
+const STAMP_RE = /^derived: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z revision: (?:[0-9a-f]{40}|unknown) analyser: \S+ window: \d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2} new-issues: \d+ previous: (?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z|n\/a) since-previous: (?:\d+|n\/a) on-listed: (?:(?:at least )?\d+|n\/a) open-total: \d+ rules: \d+ of (?:at least )?\d+(?: note: .*)?$/
 const fences = (text) => [...text.matchAll(/^```[^\n]*\n([\s\S]*?)^```/gm)].map((m) => m[1])
 const exampleBlock = () => fences(SECTION).find((b) => b.startsWith('# Analyser rules table'))
 
@@ -175,6 +175,16 @@ test('README says the table is tracked in git, hand-written guidance survives a 
   assert.match(SECTION, /another analyser|different analyser|other analyser/i)
 })
 
+test('README says the generator is run from a checkout of this repository, that bin/install.sh copies it as an optional file for the drift check, and gives the copy and diff lines beside the other two (L8)', () => {
+  assert.match(SECTION, /checkout of this repository/i)
+  assert.match(SECTION, /bin\/install\.sh[^\n]*optional[^\n]*drift check|optional[^\n]*drift check[^\n]*bin\/install\.sh/i)
+  for (const line of ['cp claude-ai-harness/bin/sonar-rules-table.mjs ~/.claude/bin/sonar-rules-table.mjs', 'diff -q claude-ai-harness/bin/sonar-rules-table.mjs ~/.claude/bin/sonar-rules-table.mjs']) assert.ok(README.includes(line), `README lacks: ${line}`)
+})
+
+test('README says on-listed is a lower bound when the since-previous list is cut at its limit (AC-OPS-6)', () => {
+  assert.match(SECTION, /the on-listed count is written as `at least`/i)
+})
+
 test('README says each run starts a new measurement interval, so run once per analysed merge and commit the result (AC-PROD-6)', () => {
   assert.match(SECTION, /each run starts a new measurement interval/i)
   assert.match(SECTION, /once per analysed merge/i)
@@ -211,6 +221,7 @@ test('README states the minimum permission, forbids a global admin token and exp
 // ------------------------------------------------------ rollback and support
 test('README says deleting the table is the rollback, and that reinstalling and restarting the session roll the implementer change out or back (AC-OPS-9)', () => {
   assert.match(SECTION, /delet(e|ing) the (table|file)[^\n]*rollback|rollback[^\n]*delet(e|ing) the (table|file)/i)
+  assert.match(SECTION, /commit the deletion/i, 'a deleted table that is not committed is still in every new worktree')
   assert.match(SECTION, /reinstall/i)
   assert.match(SECTION, /restart[^\n]*(Claude Code )?session|session[^\n]*restart/i)
 })

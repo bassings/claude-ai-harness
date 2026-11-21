@@ -49,4 +49,4 @@ function scannedFiles(extraExcluded = []) {
 
 const readRel = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8')
 
-module.exports = { allFiles, scannedFiles, readRel, GENERATOR_AND_ITS_TESTS, RECORDS, INSTALL_PATTERN_FILES, ROOT }
+module.exports = { scannedFiles, readRel, INSTALL_PATTERN_FILES }

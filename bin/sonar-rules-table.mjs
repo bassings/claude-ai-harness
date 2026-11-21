@@ -27,6 +27,8 @@ const REQUEST_TIMEOUT_MS = 8000
 const RULE_KEY_RE = /^[A-Za-z0-9_.:-]{1,64}$/
 const PLACEHOLDER = 'Rule name unavailable from the analyser; see the rule key'
 const DAY_MS = 86_400_000
+const ISSUES_PATH = '/api/issues/search'
+const HEADER_ROW = '| rule | guidance | open | recent-new |'
 
 class Fail extends Error {}
 
@@ -96,7 +98,7 @@ async function get(cfg, apiPath, params) {
 // 26.11 on 2026-11-21: issueStatuses with createdAfter is accepted, and sending
 // resolved as well is not needed.
 const CREATED_STATUSES = 'OPEN,CONFIRMED,FIXED'
-const issueFacet = (cfg, extra) => get(cfg, '/api/issues/search', { componentKeys: cfg.project, facets: 'rules', ps: '1', ...extra })
+const issueFacet = (cfg, extra) => get(cfg, ISSUES_PATH, { componentKeys: cfg.project, facets: 'rules', ps: '1', ...extra })
 const openFacet = (cfg) => issueFacet(cfg, { resolved: 'false' })
 const createdFacet = (cfg, instant) => issueFacet(cfg, { issueStatuses: CREATED_STATUSES, createdAfter: instant })
 
@@ -126,17 +128,16 @@ function totalOf(body) {
   return total
 }
 
-const ISSUES_PATH = '/api/issues/search'
-
 // A changed response shape is a failure that names the API path, never a
 // silent zero: a run that would have written an empty table for that reason
 // writes nothing.
-function facetCounts(body) {
+function facetCounts(body, tally) {
   const out = new Map()
   const facet = Array.isArray(body?.facets) ? body.facets.find((f) => f?.property === 'rules') : undefined
   if (!facet || !Array.isArray(facet.values)) throw new Fail(`the response has no rules facet on ${ISSUES_PATH}`)
   for (const v of facet.values) {
     if (typeof v?.val === 'string' && RULE_KEY_RE.test(v.val) && Number.isInteger(v.count) && v.count >= 0) out.set(v.val, v.count)
+    else tally.rejected++ // counted, never quoted: the rejected text is what the checks refuse
   }
   return out
 }
@@ -165,13 +166,16 @@ function sanitise(text) {
 function readPrevious(file) {
   const rules = new Map()
   let instant = null
+  let ignored = null // why the whole table was not read, when it was not
+  let unreadable = 0 // rows that could not be read, counted and never quoted
   let st
   try {
     st = fs.lstatSync(file)
   } catch {
-    return { rules, instant }
+    return { rules, instant, ignored, unreadable }
   }
-  if (!st.isFile() || st.size > BYTE_CAP) return { rules, instant }
+  if (!st.isFile()) return { rules, instant, ignored: 'is not a regular file', unreadable }
+  if (st.size > BYTE_CAP) return { rules, instant, ignored: 'is over the size bound', unreadable }
   for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
     if (instant === null) {
       const m = /^derived: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)(?: |$)/.exec(line)
@@ -181,13 +185,14 @@ function readPrevious(file) {
     if (!line.startsWith('|')) continue
     const c = line.split('|').slice(1, -1).map((x) => x.trim())
     if (c.length === 4 && RULE_KEY_RE.test(c[0])) rules.set(c[0], sanitise(c[1]))
+    else unreadable++
   }
-  return { rules, instant }
+  return { rules, instant, ignored, unreadable }
 }
 
 function render(stamp, rows) {
   const body = rows.map((r) => `| ${r.key} | ${r.guidance} | ${r.open} | ${r.recent} |`)
-  return ['# Analyser rules table', stamp, '', '| rule | guidance | open | recent-new |', '|---|---|---|---|', ...body].join('\n') + '\n'
+  return ['# Analyser rules table', stamp, '', HEADER_ROW, '|---|---|---|---|', ...body].join('\n') + '\n'
 }
 
 // ------------------------------------------------------------------ output
@@ -221,8 +226,14 @@ function removeDeadTemporaries(dir, file) {
     } catch (e) {
       alive = e.code !== 'ESRCH'
     }
-    const p = path.join(dir, name)
-    if (!alive && fs.lstatSync(p).isFile()) fs.rmSync(p, { force: true })
+    if (alive) continue
+    // Another run's sweep may remove the same file first; that is not a failure.
+    try {
+      const p = path.join(dir, name)
+      if (fs.lstatSync(p).isFile()) fs.rmSync(p, { force: true })
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e
+    }
   }
 }
 
@@ -293,12 +304,13 @@ async function main() {
   const instantOf = (iso) => iso.replace(/Z$/, '+0000')
   const recentBody = await createdFacet(cfg, instantOf(`${since}T00:00:00Z`))
   const openBody = await openFacet(cfg)
-  const recent = facetCounts(recentBody)
-  const open = facetCounts(openBody)
+  const tally = { rejected: 0 }
+  const recent = facetCounts(recentBody, tally)
+  const open = facetCounts(openBody, tally)
   const newIssues = totalOf(recentBody)
   const openTotal = totalOf(openBody)
 
-  const { rules: previous, instant: previousInstant } = readPrevious(file)
+  const { rules: previous, instant: previousInstant, ignored: previousIgnored, unreadable: previousUnreadable } = readPrevious(file)
   // Issues created after the previous table: the only ones that can show
   // whether the table was used. n/a, never zero, when there is nothing to compare with.
   let sincePrevious = 'n/a'
@@ -306,8 +318,11 @@ async function main() {
   if (previousInstant) {
     const sinceBody = await createdFacet(cfg, instantOf(previousInstant))
     sincePrevious = totalOf(sinceBody)
-    onListed = 0
-    for (const [k, n] of facetCounts(sinceBody)) if (previous.has(k)) onListed += n
+    const sinceRules = facetCounts(sinceBody, tally)
+    let listed = 0
+    for (const [k, n] of sinceRules) if (previous.has(k)) listed += n
+    // A listed rule outside the facet's first values is not seen, so at the cap the count is a floor.
+    onListed = sinceRules.size >= FACET_CAP ? `at least ${listed}` : listed
   }
 
   // Recent-new first, then open count, then key: a rule new code just tripped
@@ -331,9 +346,10 @@ async function main() {
     r.guidance = sanitise(found.mismatch ? r.key : found.name || '') || PLACEHOLDER
   }
 
-  // With a rules facet at its cap the total may be higher than we can see.
-  // Every rule with a new issue also has an open one, so the open facet is the one that hits the cap first.
-  const capped = open.size >= FACET_CAP
+  // With either rules facet at its cap the total may be higher than we can see.
+  // A rule whose only issue in the window has since been fixed is in the recent
+  // facet and not in the open one, so both are checked.
+  const capped = open.size >= FACET_CAP || recent.size >= FACET_CAP
   const total = `${capped ? 'at least ' : ''}${all.length}`
   const stampFor = (n) => `derived: ${cfg.now.toISOString().replace(/\.\d{3}Z$/, 'Z')} revision: ${revision} analyser: SonarQube window: ${since}..${end} new-issues: ${newIssues} previous: ${previousInstant || 'n/a'} since-previous: ${sincePrevious} on-listed: ${onListed} open-total: ${openTotal} rules: ${n} of ${total}` + (newIssues === 0 ? ' note: zero rules were tripped in the window' : '')
   let text = render(stampFor(rows.length), rows)
@@ -349,6 +365,10 @@ async function main() {
   console.log(`wrote ${TABLE_REL}: ${rows.length} rules (window ${since}..${end}, analysed revision ${revision})`)
   if (unknownCause) console.log(`note: ${unknownCause}; the revision is recorded as unknown`)
   for (const n of notes) console.log(n)
+  // Counts only: the text of what was rejected is what the checks refuse.
+  if (tally.rejected) console.log(`note: ${tally.rejected} rule key(s) or count(s) in the server's answers were rejected as unsafe and left out`)
+  if (previousIgnored) console.log(`note: the previous table was ignored because it ${previousIgnored}`)
+  if (previousUnreadable) console.log(`note: ${previousUnreadable} row(s) of the previous table could not be read and were left out`)
   if (!head && revision !== 'unknown') console.log('note: git is not available for the head comparison, so the server revision was not compared with the local head')
   if (head && revision !== 'unknown' && revision !== head) console.log(`note: the server has not yet analysed the current head (server revision ${revision}, local head ${head})`)
 }

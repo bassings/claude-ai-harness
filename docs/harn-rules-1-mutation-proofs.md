@@ -191,6 +191,53 @@ server answers 400 to a bare date. Sending a bare date (row N6) fails that test.
 | N17 | AC-QA-9 open-count tiebreak | Reverse the open-count comparison | generator:317 | generator: rules tied on recent-new are ordered by open count, then rules tied on both by key, whatever order the server lists them in |
 | N6 | AC-QA-11 explicit UTC instants | Send a bare date | generator:293 | generator: the window is 30 days back to a UTC midnight, inclusive, either side of a Sydney daylight-saving change |
 
+## Fix round 3: proofs for the survivors the round 3 review found and the new guards
+
+Same method as the earlier rounds (anchor line unique, old text unique on it,
+file and line printed, only the named test run, original restored and its hash
+compared; identical in every row). The review's four surviving mutants are rows
+H1 and H2 (its M4, the integer check on a facet count), H3 and H3b (M5, the
+40-hex check), H5 (M6, the previous-table size check) and H4 (M8, the
+negative-total check); its M3 (ANSI removal) is H11a. Row H11c first survived
+the exact-cell assertions, because whitespace collapsing removes the controls
+the fixtures used; a fixture with controls that are not whitespace (bell, NUL,
+DEL) was added and the row below is the second run. Two lines of code that no
+test could fail were removed instead of tested: the skip of the previous
+table's header and separator rows, which changed nothing, because neither row
+can be unreadable. Rows run `test/sonar-rules-table.test.js` except H13 to H15,
+which run `test/sonar-rules-docs.test.js`.
+
+| # | Criterion | Edit | Landed on | Failing test (name abridged) |
+|---|---|---|---|---|
+| H1 | AC-SEC-5 (review M4), facet counts must be integers | Drop the integer check on a facet count | generator:139 | generator: hostile server numbers and a hostile revision are dropped or made unknown, with one count-only note and no stray line |
+| H2 | AC-SEC-5, facet counts must not be negative | Drop the non-negative check on a facet count | generator:139 | generator: hostile server numbers and a hostile revision are dropped or made unknown, with one count-only note and no stray line |
+| H3 | AC-SEC-5 (review M5), revision must be 40 hex | Accept any revision string | generator:293 | generator: hostile server numbers and a hostile revision are dropped or made unknown, with one count-only note and no stray line |
+| H3b | AC-SEC-5, the revision check is anchored | Remove the anchors from the 40-hex pattern | generator:293 | generator: hostile server numbers and a hostile revision are dropped or made unknown, with one count-only note and no stray line |
+| H4 | AC-SEC-5 (review M8), a negative total fails | Drop the negative-total check | generator:127 | generator: a missing or non-integer total, or a missing rules facet, fails naming the API path and writes nothing |
+| H4b | AC-SEC-5, a fractional total fails | Drop the integer check on a total | generator:127 | generator: a missing or non-integer total, or a missing rules facet, fails naming the API path and writes nothing |
+| H5 | AC-SEC-6 (review M6), an oversize previous table is ignored | Drop the size check | generator:178 | generator: a previous table over the size bound is ignored with one note, and unreadable rows of a previous table are counted, never quoted |
+| H5b | L9, the previous-table-ignored note | Never print the note | generator:370 | generator: a previous table over the size bound is ignored with one note, and unreadable rows of a previous table are counted, never quoted |
+| H5c | L9, unreadable previous rows are counted | Count none | generator:188 | generator: a previous table over the size bound is ignored with one note, and unreadable rows of a previous table are counted, never quoted |
+| H6a | L9, rejected facet values are counted | Count none | generator:140 | generator: hostile server numbers and a hostile revision are dropped or made unknown, with one count-only note and no stray line |
+| H6b | L9, the rejected-values note | Never print the note | generator:369 | generator: hostile server numbers and a hostile revision are dropped or made unknown, with one count-only note and no stray line |
+| H7 | L1, the total is a floor when the recent facet is cut | Check the open facet only | generator:352 | generator: a rules facet cut at its cap makes the total a lower bound whichever facet is cut, and on-listed a lower bound when the since-previous facet is cut |
+| H8 | AC-OPS-6, on-listed is a floor when its facet is cut | Always print the exact value | generator:325 | generator: a rules facet cut at its cap makes the total a lower bound whichever facet is cut, and on-listed a lower bound when the since-previous facet is cut |
+| H9 | L2, a non-atomic writer is detected by the concurrency test | Write the table directly instead of through a temporary file and rename | generator:243, generator:245 | generator: two runs started together against a slow server always leave one complete table from one run, never an interleaving, and no temporary file |
+| H10a | AC-QA-1, README command variable names | Rename one variable in the command | README.md:1775 | README: the documented command invokes node bin/sonar-rules-table.mjs, shows exactly the variables the generator requires, and runs as written against the fake |
+| H10b | AC-QA-1, README command script path | Misspell the script path in the command | README.md:1775 | README: the documented command invokes node bin/sonar-rules-table.mjs, shows exactly the variables the generator requires, and runs as written against the fake |
+| H10c | AC-QA-1, the generator's required variables | Rename the project variable the generator requires | generator:44 | README: the documented command invokes node bin/sonar-rules-table.mjs, shows exactly the variables the generator requires, and runs as written against the fake |
+| H11a | AC-SEC-5 (review M3), ANSI sequences removed | Remove the ANSI-sequence step | generator:154 | generator: hostile rule names and keys become inert one-line data and a bad key is dropped |
+| H11b | AC-SEC-5, column separator replaced | Remove the separator replacement | generator:157 | generator: hostile rule names and keys become inert one-line data and a bad key is dropped |
+| H11c | AC-SEC-5, control characters become spaces | Remove the control-character class | generator:155 | generator: hostile rule names and keys become inert one-line data and a bad key is dropped |
+| H12 | L6, the sweep tolerates a vanished file | Rethrow ENOENT | generator:235 | generator: a dead run's temporary file that another run's sweep removes first does not fail this run |
+| H13 | L7, README: commit the deletion | Reword the sentence | README.md:1790 | README says deleting the table is the rollback, and that reinstalling and restarting the session roll the implementer change out or back |
+| H14a | L8, README: run from a checkout of this repository | Reword | README.md:1772 | README says the generator is run from a checkout of this repository, that bin/install.sh copies it as an optional file for the drift check, and gives the copy and diff lines beside the other two |
+| H14b | L8, README: the copy line for the generator | `cp` to `mv` | README.md:1605 | README says the generator is run from a checkout of this repository, that bin/install.sh copies it as an optional file for the drift check, and gives the copy and diff lines beside the other two |
+| H14c | L8, README: the diff line for the generator | `diff -q` to `diff` | README.md:1609 | README says the generator is run from a checkout of this repository, that bin/install.sh copies it as an optional file for the drift check, and gives the copy and diff lines beside the other two |
+| H15 | AC-OPS-6, README: on-listed is a floor | Reword | README.md:1746 | README says on-listed is a lower bound when the since-previous list is cut at its limit |
+| H16 | L11, the request uses the path constant | Write the path out in the request | generator:101 | static: the issues path is one constant, declared before its first use, and the request uses it |
+| H17 | L12, the helper exports only what tests use | Export one more name | test/helpers/tracked-files.js:52 | static: the tracked-files helper exports only what tests use |
+
 ## Live implementer runs (AC-OPS-1, and the builder halves of AC-QA-15 and AC-PROD-5)
 
 Run by the conductor on 2026-11-21, Claude Code 2.1.322: four headless

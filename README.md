@@ -1596,15 +1596,17 @@ FAIL. Run `bin/install.sh` (which installs `workflows/`) and confirm with
 `bin/install.sh --check`, as well as the copy commands below; a run that finds an installed `optimise-cycle.js`
 whose `WEEKLY_RUNNER_CONTRACT` constant is missing or lower than the runner's
 `REQUIRED_WORKFLOW_CONTRACT` stops with `installed optimise-cycle.js predates
-report_path; run bin/install.sh`. The `diff -q` pair below confirms the `bin/`
+report_path; run bin/install.sh`. The `diff -q` lines below confirms the `bin/`
 copies only, so it is necessary but not sufficient on its own:
 
 ```bash
 cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
 cp claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
+cp claude-ai-harness/bin/sonar-rules-table.mjs ~/.claude/bin/sonar-rules-table.mjs
 chmod +x ~/.claude/bin/optimise-cycle-weekly.sh
 diff -q claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
 diff -q claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
+diff -q claude-ai-harness/bin/sonar-rules-table.mjs ~/.claude/bin/sonar-rules-table.mjs
 ```
 
 Copying is a merge-time step, not something a branch does to a path outside
@@ -1741,7 +1743,7 @@ The table lives at `.claude/analyser-rules.md` and is tracked in git, not ignore
 
 ### Format
 
-The table is written down here once. It has four neutral columns (rule, guidance, open, recent-new) and one derivation stamp line. The stamp is the single derivation record: the date, the analysed revision, the analyser's name, the window, the count of new issues in the window, the instant of the previous table, how many issues were created since that instant, how many of those were on rules the previous table already listed (the on-listed count, which shows whether the table is being used), the total open count, and the rules kept out of the rules available. The previous instant is the only thing the generator reads from an earlier stamp. When there is no previous table, or its stamp has no readable instant, the previous instant, the since-previous count and the on-listed count are each written as `n/a`, never as zero. When the server's list of rules is at its limit of 100, the total is written as `at least` that number, because the generator cannot see past the limit. A table is bounded at 20 rows and 8,192 bytes; a builder treats a larger one as absent.
+The table is written down here once. It has four neutral columns (rule, guidance, open, recent-new) and one derivation stamp line. The stamp is the single derivation record: the date, the analysed revision, the analyser's name, the window, the count of new issues in the window, the instant of the previous table, how many issues were created since that instant, how many of those were on rules the previous table already listed (the on-listed count, which shows whether the table is being used), the total open count, and the rules kept out of the rules available. The previous instant is the only thing the generator reads from an earlier stamp. When there is no previous table, or its stamp has no readable instant, the previous instant, the since-previous count and the on-listed count are each written as `n/a`, never as zero. When the server's list of rules is at its limit of 100, the total is written as `at least` that number, because the generator cannot see past the limit. When the since-previous list is cut at the same limit, the on-listed count is written as `at least` its value, for the same reason. A table is bounded at 20 rows and 8,192 bytes; a builder treats a larger one as absent.
 
 ```
 # Analyser rules table
@@ -1767,7 +1769,7 @@ The rule identifier is any key of up to 64 letters, digits and `_ . : -`, so a r
 | `SONAR_PROJECT_KEY` | The project to read |
 | `SONAR_ALLOW_HTTP` | Set to `1` to allow plain http. With http the token travels in cleartext, and the generator says so on stderr before it sends a request |
 
-A person runs it from the repository root, after the analyser has finished analysing a merge. Supply the token on the same command line that runs node, read from your token file at that moment:
+A person runs it from the repository root, after the analyser has finished analysing a merge, from a checkout of this repository: `node bin/sonar-rules-table.mjs` from this repository's root, or, for another repository, from that repository's root with the path to the generator in a checkout of this one. `bin/install.sh` also copies the generator into `~/.claude/bin/` as one of the optional files the drift check watches (the installer and the check read the same list), so an installed copy works too; the manual copy and `diff -q` lines are with the other `bin/` files in the maintenance notes. Supply the token on the same command line that runs node, read from your token file at that moment:
 
 ```bash
 SONAR_TOKEN="$(cat path/to/your-token-file)" SONAR_HOST_URL=https://sonar.example.invalid SONAR_PROJECT_KEY=my-project node bin/sonar-rules-table.mjs
@@ -1785,7 +1787,7 @@ To use another analyser, or none, write the table by hand to the format above, w
 
 ### Rollback
 
-Deleting the table is the rollback: with no file, the builder carries on as before. The change to `agents/implementer.md` rolls out, or back, by reinstalling the harness with `bin/install.sh` and restarting the Claude Code session, as for any agent change.
+Deleting the table is the rollback: with no file, the builder carries on as before. Commit the deletion: the table is tracked, so a table deleted only in one checkout is still in every new build worktree. The change to `agents/implementer.md` rolls out, or back, by reinstalling the harness with `bin/install.sh` and restarting the Claude Code session, as for any agent change.
 
 ### Troubleshooting
 
