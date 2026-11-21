@@ -352,3 +352,44 @@ Test-phase task carrying the final constant and asked for the four fields:
 Not covered: these were direct dispatches carrying the prompt text, not runs
 of the `tdd-task` workflow itself, so the `log()` line has been seen only in
 the fake runtime.
+
+## After the complexity refactor
+
+The generator's long functions were split into named helpers with no change in
+behaviour (`readPrevious`, `removeDeadTemporaries` and `main` each over the
+analyser's limit of 15), and three regular-expression and top-level issues were
+cleared. The tests and fixtures were not edited. Rows below re-run recorded
+mutations against the refactored code, with the same method as the earlier
+rounds: each edit asserted exactly one match in the file and printed the line
+it landed on (the "Landed on" column, line numbers as at this run, so they have
+moved), only the named test was run, and the file was then restored and its
+hash compared with the pre-mutation hash (identical in every row). All rows run
+`test/sonar-rules-table.test.js`. Where the construct moved into a helper the
+row keeps its name and the edit is the same change to the same logic.
+
+| # | Criterion | Edit | Landed on | Failing test (name abridged) |
+|---|---|---|---|---|
+| Q1 | AC-QA-2 | Drop `resolved: 'false'` from the open query | generator:109 | generator: the open query counts unresolved issues only, the two creation-date queries count created issues whether or not since fixed... |
+| f | live defect 3 | Warning moved from before the first request to after the table is written | generator:442, generator:460 | generator: the cleartext warning is on stderr before the first request is answered, not after a successful run |
+| e | live defect 2 | Project-existence request disabled (`await (0 && confirmProject(cfg))`) | generator:448 | generator: the project is proved to exist before any issue query, and an unknown key fails naming it... |
+| N11 | AC-QA-10 | Write the table directly, no temporary file and rename | generator:284, generator:285 | generator: a run killed partway through the write leaves the previous table byte identical... |
+| H11c | AC-SEC-5 | Remove the control-character class from the sanitiser | generator:164 | generator: hostile rule names and keys become inert one-line data and a bad key is dropped |
+| N3b | AC-SEC-5 | Remove `.normalize('NFKC')` | generator:162 | the same test |
+| g | AC-PROD-11 | `isHandWritten` always false, so existing guidance is ignored | generator:386 | generator: hand-written guidance survives a refresh, a new rule gets the analyser name, a departed rule is dropped |
+| L1b | L1 | Treat the bare rule key as hand-written | generator:386 | generator: guidance equal to the placeholder or to the bare rule key was never hand-written... |
+| H7 | L1 | Total floor checks the open facet only | generator:408 | generator: a rules facet cut at its cap makes the total a lower bound whichever facet is cut... |
+| F3 | AC-OPS-6 | On-listed cap tests the filtered size of the since-previous facet | generator:373 | the same test |
+| H1 | AC-SEC-5 | Drop the integer check on a facet count | generator:146 | generator: hostile server numbers and a hostile revision are dropped or made unknown... |
+| H3b | AC-SEC-5 | Remove the anchors from the 40-hex pattern | generator:350 | the same test |
+| M4a | M4 | Append the error message to the coded failure line | generator:481 | generator: a local file failure names the system call, the code and the repository-relative path, never the error message |
+| L4a | AC-OPS-7 | Never take the token-denied cause | generator:341 | generator: an unknown revision says which cause applied, one note per cause, and nothing about the head |
+| S1 | AC-QA-10 | Remove the liveness skip | generator:250 | generator: a temporary file belonging to a live process is not removed by another run |
+| H5 | AC-SEC-6 | Drop the previous-table size check | generator:193 | generator: a previous table over the size bound is ignored with one note... |
+| N10 | AC-PROD-6 | Remove the invalid-date guard | generator:179 | generator: a table with no readable derivation instant, or an unreadable one, gives n/a and no extra query |
+| H12 | L6 | Sweep rethrows ENOENT | generator:275 | generator: a dead run's temporary file that another run's sweep removes first does not fail this run |
+| P8 | lookup fail-safe | Trust any returned rule | generator:125 | generator: a lookup that returns rules it was not asked for is never trusted... |
+| N16 | AC-QA-9 | Reverse the key comparison | generator:381 | generator: rules tied on recent-new are ordered by open count, then rules tied on both by key... |
+| N6 | AC-QA-11 | Send a bare date as the created-after parameter | generator:305 | generator: the window is 30 days back to a UTC midnight, inclusive, either side of a Sydney daylight-saving change |
+| B2 | AC-SEC-6 | Trim from the top of the ranking | generator:421 | generator: 20 rules with 160-character multibyte names stay within the byte cap... |
+| TLA | exit code | Exit code 0 on failure in the new top-level `catch` | generator:488 | generator: every unhappy server path exits non-zero in bounded time with one stderr line... |
+| X1 | trailing slash | `trimTrailingSlashes` returns its input unchanged (the replacement for the backtracking pattern) | generator:45 | all 86 tests in the file fail (every request URL gains a double slash) |
