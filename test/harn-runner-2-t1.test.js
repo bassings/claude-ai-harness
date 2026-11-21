@@ -53,17 +53,28 @@ function makeStubs({ gh = true } = {}) {
   return stubs
 }
 
-// Records argv (tab separated) and, when asked, sleeps with a pid witness. The
-// stubs reset their own PATH to the system tools, because the collector's PATH
-// is the stub directory alone (so a missing gh is genuinely missing).
-// `exec sleep` keeps the witnessed pid equal to the sleeping process.
+// Records argv (tab separated) and, when asked, hangs. The stubs reset their own
+// PATH to the system tools, because the collector's PATH is the stub directory
+// alone (so a missing gh is genuinely missing). A hang is the stub plus a
+// BACKGROUND GRANDCHILD that outlives the stub if only the stub is killed: both
+// pids are witnessed, and the grandchild keeps the stdout pipe open, so a kill of
+// the child alone leaves the collector waiting. Only the process group dies together.
+const HANG = `hang() { sleep 30 & echo $$ >> "$PIDS"; echo $! >> "$PIDS"; wait; exit 0; }`
+
 function gitStub({ dir, log, pids }) {
   return `#!/bin/sh
 PATH=/usr/bin:/bin
+PIDS="${pids}"
+${HANG}
 { printf 'GIT'; for a in "$@"; do printf '\\t%s' "$a"; done; printf '\\n'; } >> "${log}"
 root=''; prev=''
 for a in "$@"; do if [ "$prev" = "-C" ]; then root="$a"; fi; prev="$a"; done
-if [ -f "${dir}/git-sleep" ] && grep -qxF -- "$root" "${dir}/git-sleep"; then echo $$ >> "${pids}"; exec sleep 60; fi
+sub="$5"
+if [ -f "${dir}/git-sleep" ] && grep -qxF -- "$root" "${dir}/git-sleep"; then
+  if [ ! -f "${dir}/git-sleep-cmd" ] || [ "$(cat "${dir}/git-sleep-cmd")" = "$sub" ]; then hang; fi
+fi
+if [ -f "${dir}/git-stderr" ]; then cat "${dir}/git-stderr" >&2; exit 128; fi
+if [ -f "${dir}/git-empty-log" ] && [ "$sub" = "log" ]; then exit 0; fi
 exec "${REAL_GIT}" "$@"
 `
 }
@@ -71,17 +82,28 @@ exec "${REAL_GIT}" "$@"
 function ghStub({ dir, log, pids }) {
   return `#!/bin/sh
 PATH=/usr/bin:/bin
+PIDS="${pids}"
+${HANG}
 { printf 'GH\\t%s' "$(pwd -P)"; for a in "$@"; do printf '\\t%s' "$a"; done; printf '\\n'; } >> "${log}"
 printf 'ENV\\tGH_HOST=%s\\tGH_REPO=%s\\tGH_ENTERPRISE_TOKEN=%s\\n' "\${GH_HOST-unset}" "\${GH_REPO-unset}" "\${GH_ENTERPRISE_TOKEN-unset}" >> "${log}"
+fail_with() {
+  case "$1" in
+    sleep) hang ;;
+    unauth) echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4 ;;
+    ratelimit) echo 'gh: API rate limit exceeded for user ID 1 (HTTP 403)' >&2; exit 1 ;;
+    ratelimit429) echo 'gh: request failed (HTTP 429)' >&2; exit 1 ;;
+    ratelimittext) echo 'gh: API rate limit exceeded for user ID 1' >&2; exit 1 ;;
+    forbidden) echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1 ;;
+    other) echo 'gh: something unexpected happened' >&2; exit 1 ;;
+  esac
+}
 mode=$(cat "${dir}/gh-mode" 2>/dev/null || echo ok)
-case "$mode" in
-  sleep) echo $$ >> "${pids}"; exec sleep 60 ;;
-  unauth) echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4 ;;
-  ratelimit) echo 'gh: API rate limit exceeded for user ID 1 (HTTP 403)' >&2; exit 1 ;;
-  other) echo 'gh: something unexpected happened' >&2; exit 1 ;;
-esac
+fail_with "$mode"
 if [ "$1 $2" = "run list" ]; then cat "${dir}/runs.json"; exit 0; fi
 if [ "$1 $2" = "run view" ]; then
+  key="$3"; if [ "$4" = "--attempt" ]; then key="$3-a1"; fi
+  vmode=$(cat "${dir}/view-mode" 2>/dev/null || echo ok)
+  if [ "$vmode" != ok ] && { [ ! -f "${dir}/view-fail" ] || grep -qxF -- "$key" "${dir}/view-fail"; }; then fail_with "$vmode"; fi
   if [ "$4" = "--attempt" ]; then f="${dir}/view-$3-a1.json"; else f="${dir}/view-$3.json"; fi
   if [ -f "$f" ]; then cat "$f"; exit 0; fi
   echo 'no such run' >&2; exit 1
@@ -92,6 +114,13 @@ exit 2
 
 function setGhMode(stubs, mode) {
   fs.writeFileSync(path.join(stubs.dir, 'gh-mode'), mode)
+}
+
+// Failure for `gh run view` calls only. `keys` lists the calls that fail: a run id
+// for its latest-attempt call, `<id>-a1` for its attempt-1 call; omitted, every view fails.
+function setViewFailure(stubs, mode, keys = null) {
+  fs.writeFileSync(path.join(stubs.dir, 'view-mode'), mode)
+  if (keys) fs.writeFileSync(path.join(stubs.dir, 'view-fail'), keys.join('\n') + '\n')
 }
 
 function setGhRuns(stubs, runs, views = {}) {
@@ -158,7 +187,7 @@ function collect(stubs, root, extraEnv = {}) {
 
 const lane = (outDir, name) => JSON.parse(fs.readFileSync(path.join(outDir, `${name}.json`), 'utf8'))
 
-const DRIVER = `import(process.argv[1]).then(async (m) => { for (const o of JSON.parse(process.argv[2])) await m.collectRepo(o); process.stdout.write('done') }).catch((e) => { console.error(String(e && e.stack)); process.exit(3) })`
+const DRIVER = `import(process.argv[1]).then(async (m) => { const lines = []; for (const o of JSON.parse(process.argv[2])) lines.push((await m.collectRepo(o)).line); process.stdout.write(lines.join('\\n')) }).catch((e) => { console.error(String(e && e.stack)); process.exit(3) })`
 
 function runDriver(stubs, optsList, extraEnv = {}) {
   return spawnSync(process.execPath, ['-e', DRIVER, pathToFileURL(COLLECTOR).href, JSON.stringify(optsList)], { cwd: scratchDir(), env: childEnv(stubs, extraEnv), encoding: 'utf8', timeout: 120000 })
@@ -183,6 +212,14 @@ const alive = (pid) => {
 }
 
 const witnessedPids = (stubs) => fs.readFileSync(stubs.pids, 'utf8').split('\n').filter(Boolean).map(Number)
+
+// A stub hang is the stub and a background grandchild: both must have been seen,
+// and both must be gone, which only a kill of the whole process group achieves.
+async function assertWitnessedGone(stubs, label) {
+  const pids = witnessedPids(stubs)
+  assert.ok(pids.length >= 2, `${label}: the stub and its background grandchild must both have been witnessed, saw ${pids.length}`)
+  for (const pid of pids) assert.ok(await waitFor(() => !alive(pid), 3000), `${label}: process ${pid} survived`)
+}
 
 function killWitnessed(stubs) {
   for (const pid of witnessedPids(stubs)) if (alive(pid)) process.kill(pid, 'SIGKILL')
@@ -220,7 +257,7 @@ test('AC-QA-1: K ledger lines, R gh runs and F fix commits are collected into th
   setGhRuns(stubs, [run(9001), run(9002), run(9003)], { 9001: { jobs: [job('build'), job('test')] }, 9002: { jobs: [job('build')] }, 9003: { jobs: [job('build', 'failure')] } })
   const root = makeRepo({ ledger: validLedger(7), fix: 4, other: 2 })
   const before = treeListing(root)
-  const { outDir } = collect(stubs, root)
+  const { outDir, res } = collect(stubs, root)
 
   const ledger = lane(outDir, 'ledger')
   const ci = lane(outDir, 'ci')
@@ -234,8 +271,11 @@ test('AC-QA-1: K ledger lines, R gh runs and F fix commits are collected into th
   assert.equal(ledger.result.n, 7)
   assert.equal(ci.runCount, 3)
   assert.equal(git.result.count, 4)
+  assert.equal(git.result.repo, 'demo', 'the git figure carries the ledger identity the ledger lane produced')
 
   for (const f of fs.readdirSync(outDir)) assert.equal(fs.statSync(path.join(outDir, f)).mode & 0o077, 0, `${f} must be 0600 or tighter`)
+  assert.match(res.stdout, /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+\n$/, `the log line: ${res.stdout}`)
+  assert.equal(res.stdout.trim().split('\n').length, 1, 'one line per repository')
   assert.deepEqual(treeListing(root), before, 'the collector must write nothing into the analysed repository')
 })
 
@@ -337,6 +377,7 @@ function symlinkCase(relPath, makeLink) {
   assert.equal(ledger.result, null)
   assert.ok(!allOutput(outDir, res).includes('OUTSIDE-FILE-TOKEN-7731'), 'the link target must not be read')
   assert.equal(lane(outDir, 'git').status, 'ran', 'one unreadable lane must not stop the others')
+  assert.equal(lane(outDir, 'git').result.repo, null, 'a ledger lane that gave no identity leaves the git figure without one')
 }
 
 test('AC-SEC-11: a ledger that is a symlink to a file outside the repository is not read and the ledger lane is could_not_read', () => {
@@ -354,23 +395,41 @@ test('AC-SEC-11: a ledger path that is a directory (not a regular file) is could
   symlinkCase(LEDGER_REL, (link) => fs.mkdirSync(link))
 })
 
+test('AC-SEC-11: a .claude directory that is itself a symlink to an outside directory holding a ledger is not read and the ledger lane is could_not_read', () => {
+  const stubs = makeStubs()
+  setGhRuns(stubs, [])
+  const root = makeRepo({ fix: 1 })
+  const outsideDir = path.join(scratchDir(), 'elsewhere')
+  fs.mkdirSync(outsideDir)
+  fs.writeFileSync(path.join(outsideDir, 'harness-ledger.jsonl'), validLedger(3, { task: 'OUTSIDE-DIR-TOKEN-5519' }))
+  fs.symlinkSync(outsideDir, path.join(root, '.claude'))
+  const { outDir, res } = collect(stubs, root)
+  const ledger = lane(outDir, 'ledger')
+  assert.equal(ledger.status, 'failed', JSON.stringify(ledger))
+  assert.equal(ledger.mode, 'could_not_read')
+  assert.equal(ledger.result, null)
+  assert.ok(!allOutput(outDir, res).includes('OUTSIDE-DIR-TOKEN-5519'), 'the symlinked directory must not be read')
+  assert.equal(lane(outDir, 'git').status, 'ran', 'one unreadable lane must not stop the others')
+})
+
 // ---- AC-QA-6: gh failure modes ----
 
-function ciModeCase({ gh = true, mode = 'ok', runs = [] }) {
+function ciModeCase({ gh = true, mode = 'ok', runs = [], views = {}, viewFailure = null }) {
   const stubs = makeStubs({ gh })
   if (gh) {
     setGhMode(stubs, mode)
-    setGhRuns(stubs, runs)
+    setGhRuns(stubs, runs, views)
+    if (viewFailure) setViewFailure(stubs, viewFailure.mode, viewFailure.keys)
   }
   const root = makeRepo({ ledger: validLedger(3), fix: 2 })
-  const { outDir } = collect(stubs, root)
+  const { outDir, res } = collect(stubs, root)
   assert.equal(lane(outDir, 'ledger').status, 'ran', 'a gh failure must not stop the ledger lane')
   assert.equal(lane(outDir, 'git').status, 'ran', 'a gh failure must not stop the git lane')
-  return lane(outDir, 'ci')
+  return { ci: lane(outDir, 'ci'), res }
 }
 
 function assertFailedCi(ci, mode) {
-  assert.equal(ci.status, 'failed')
+  assert.equal(ci.status, 'failed', JSON.stringify(ci))
   assert.equal(ci.mode, mode)
   assert.ok(typeof ci.reason === 'string' && ci.reason.length > 0)
   assert.equal(ci.result, null)
@@ -378,72 +437,178 @@ function assertFailedCi(ci, mode) {
 }
 
 test('AC-QA-6: gh absent from PATH is a failed ci lane in mode absent_from_path', () => {
-  assertFailedCi(ciModeCase({ gh: false }), 'absent_from_path')
+  assertFailedCi(ciModeCase({ gh: false }).ci, 'absent_from_path')
 })
 
 test('AC-QA-6: gh reporting not authenticated is a failed ci lane in mode unauthenticated', () => {
-  assertFailedCi(ciModeCase({ mode: 'unauth' }), 'unauthenticated')
+  assertFailedCi(ciModeCase({ mode: 'unauth' }).ci, 'unauthenticated')
 })
 
 test('AC-QA-6: gh reporting an HTTP 403 rate limit is a failed ci lane in mode rate_limited', () => {
-  assertFailedCi(ciModeCase({ mode: 'ratelimit' }), 'rate_limited')
+  assertFailedCi(ciModeCase({ mode: 'ratelimit' }).ci, 'rate_limited')
+})
+
+test('AC-QA-6: gh reporting HTTP 429 alone is a failed ci lane in mode rate_limited', () => {
+  assertFailedCi(ciModeCase({ mode: 'ratelimit429' }).ci, 'rate_limited')
+})
+
+test('AC-QA-6: gh reporting a rate limit in words with no status code is a failed ci lane in mode rate_limited', () => {
+  assertFailedCi(ciModeCase({ mode: 'ratelimittext' }).ci, 'rate_limited')
+})
+
+test('AC-QA-6: an HTTP 403 that is a permission refusal, not a rate limit, is mode other and is not reported as a rate limit', () => {
+  const { ci } = ciModeCase({ mode: 'forbidden' })
+  assertFailedCi(ci, 'other')
+  assert.ok(!/rate limit/i.test(ci.reason), `a permission 403 must not read as a rate limit: ${ci.reason}`)
 })
 
 test('AC-QA-6: gh exiting non-zero with other text is a failed ci lane in mode other', () => {
-  assertFailedCi(ciModeCase({ mode: 'other' }), 'other')
+  assertFailedCi(ciModeCase({ mode: 'other' }).ci, 'other')
 })
 
 test('AC-QA-6: gh returning an empty list is status ran in mode no_history with no run count (not a measured 0)', () => {
-  const ci = ciModeCase({ runs: [] })
+  const { ci } = ciModeCase({ runs: [] })
   assert.equal(ci.status, 'ran')
   assert.equal(ci.mode, 'no_history')
   assert.equal(ci.runCount, null)
 })
 
-// ---- AC-QA-7, AC-OPS-4: timeouts, with a pid witness ----
+// ---- AC-QA-6 (M2): a gh run view that fails is data on that run, never a measurement ----
+//
+// Pinned decision: runCount is the number of runs whose jobs were fetched. A run
+// whose latest jobs could not be fetched is not counted in runCount and is counted
+// in fetchFailedCount; a run whose only the attempt-1 fetch failed is counted (its
+// jobs were measured). When no run's jobs could be fetched the lane measured no job
+// data, so it is status failed with the mode of the failure, never a ran lane with
+// a run count.
 
-test('AC-QA-7: a gh that sleeps past the timeout fails the ci lane as timeout naming gh, within the timeout plus grace, and no stub process survives', () => {
+const RUNS_3 = [run(9001), run(9002), run(9003)]
+const VIEWS_3 = { 9001: { jobs: [job('build')] }, 9002: { jobs: [job('build')] }, 9003: { jobs: [job('build')] } }
+
+test('AC-QA-6: one run whose gh run view is rate limited is a ran lane that counts the other runs, the failure and its mode', () => {
+  const { ci } = ciModeCase({ runs: RUNS_3, views: VIEWS_3, viewFailure: { mode: 'ratelimit', keys: ['9002'] } })
+  assert.equal(ci.status, 'ran', JSON.stringify(ci))
+  assert.equal(ci.runCount, 2, 'a run whose jobs could not be fetched is not a measured run')
+  assert.equal(ci.fetchFailedCount, 1)
+  const stats = Object.values(ci.result.repoStats)[0]
+  assert.deepEqual(stats.fetchFailures, { rate_limited: 1, unauthenticated: 0, other: 0 })
+})
+
+test('AC-QA-6: one run whose gh run view fails for another reason is counted as mode other', () => {
+  const { ci } = ciModeCase({ runs: RUNS_3, views: VIEWS_3, viewFailure: { mode: 'other', keys: ['9001'] } })
+  assert.equal(ci.status, 'ran', JSON.stringify(ci))
+  assert.equal(ci.runCount, 2)
+  assert.equal(ci.fetchFailedCount, 1)
+  assert.deepEqual(Object.values(ci.result.repoStats)[0].fetchFailures, { rate_limited: 0, unauthenticated: 0, other: 1 })
+})
+
+test('AC-QA-6: every gh run view rate limited is a failed ci lane in mode rate_limited with no run count and no result', () => {
+  const { ci } = ciModeCase({ runs: RUNS_3, views: VIEWS_3, viewFailure: { mode: 'ratelimit' } })
+  assertFailedCi(ci, 'rate_limited')
+  assert.match(ci.reason, /gh run view/)
+})
+
+test('AC-QA-6: every gh run view failing for another reason is a failed ci lane in mode other', () => {
+  assertFailedCi(ciModeCase({ runs: RUNS_3, views: VIEWS_3, viewFailure: { mode: 'other' } }).ci, 'other')
+})
+
+test('AC-QA-6: every gh run view unauthenticated is a failed ci lane in mode unauthenticated', () => {
+  assertFailedCi(ciModeCase({ runs: RUNS_3, views: VIEWS_3, viewFailure: { mode: 'unauth' } }).ci, 'unauthenticated')
+})
+
+test('AC-QA-6: a failed attempt-1 call only keeps the run counted and is recorded by mode, not dropped', () => {
+  const { ci } = ciModeCase({
+    runs: [run(9001), run(9002, 2)],
+    views: { 9001: { jobs: [job('build')] }, 9002: { jobs: [job('build', 'failure')] }, '9002-a1': { jobs: [job('build')] } },
+    viewFailure: { mode: 'ratelimit', keys: ['9002-a1'] },
+  })
+  assert.equal(ci.status, 'ran', JSON.stringify(ci))
+  assert.equal(ci.runCount, 2, 'the run whose latest jobs were fetched is measured')
+  assert.equal(ci.fetchFailedCount, 0)
+  const stats = Object.values(ci.result.repoStats)[0]
+  assert.equal(stats.attempt1Unfetched, 1)
+  assert.equal(stats.fetchFailures.rate_limited, 1)
+})
+
+test('AC-QA-6: gh returning runs whose ids are all non-digit is a failed ci lane, not a measured run count of 0', () => {
   const stubs = makeStubs()
-  setGhMode(stubs, 'sleep')
+  setGhRuns(stubs, [run('abc'), run('1;touch X'), run(null)])
+  const root = makeRepo({ ledger: validLedger(1), fix: 1 })
+  const { outDir } = collect(stubs, root)
+  assertFailedCi(lane(outDir, 'ci'), 'other')
+  assert.match(lane(outDir, 'ci').reason, /no run with a usable id/, 'the reason says why nothing was measured')
+  assert.equal(recorded(stubs, 'GH').filter((c) => c[2] === 'view').length, 0, 'no view call for a non-digit id')
+})
+
+test('AC-QA-6: a ran ci lane with every view fetched carries fetchFailedCount 0', () => {
+  const { ci } = ciModeCase({ runs: RUNS_3, views: VIEWS_3 })
+  assert.equal(ci.runCount, 3)
+  assert.equal(ci.fetchFailedCount, 0)
+})
+
+// ---- AC-QA-7, AC-OPS-4: timeouts, killed with the whole process group ----
+
+async function timeoutCase({ ghMode = null, viewMode = null, gitSleep = null, timeouts }) {
+  const stubs = makeStubs()
+  setGhRuns(stubs, [run(9001)], { 9001: { jobs: [job('build')] } })
+  if (ghMode) setGhMode(stubs, ghMode)
+  if (viewMode) setViewFailure(stubs, viewMode)
   const root = makeRepo({ ledger: validLedger(2), fix: 1 })
+  const next = makeRepo({ ledger: validLedger(3), fix: 3 })
+  if (gitSleep) {
+    fs.writeFileSync(path.join(stubs.dir, 'git-sleep'), root + '\n')
+    fs.writeFileSync(path.join(stubs.dir, 'git-sleep-cmd'), gitSleep)
+  }
   const outDir = scratchDir()
+  const nextOut = scratchDir()
   const started = Date.now()
   try {
-    const res = runDriver(stubs, [{ root, outDir, timeoutMs: 1500 }])
+    const res = runDriver(stubs, [{ root, outDir, timeoutMs: timeouts }, { root: next, outDir: nextOut, timeoutMs: timeouts }])
     assert.equal(res.status, 0, res.stderr)
-    assert.ok(Date.now() - started < 1500 + 8000, 'collection must stop within the timeout plus a grace period')
-    const ci = lane(outDir, 'ci')
-    assert.equal(ci.status, 'failed')
-    assert.equal(ci.mode, 'timeout')
-    assert.match(ci.reason, /gh/)
-    assert.match(ci.reason, /timeout/i)
-    assert.ok(witnessedPids(stubs).length >= 1, 'the stub gh never ran, so the timeout was not exercised')
-    for (const pid of witnessedPids(stubs)) assert.ok(!alive(pid), `stub gh process ${pid} survived the timeout`)
+    assert.ok(Date.now() - started < 2 * (1500 + 8000), 'collection must stop within the timeout plus a grace period')
+    return { stubs, outDir, nextOut, collected: collectLanes(outDir), lines: res.stdout.split('\n') }
+  } catch (error) {
+    killWitnessed(stubs)
+    throw error
+  }
+}
+
+const collectLanes = (outDir) => Object.fromEntries(['ledger', 'git', 'ci'].map((n) => [n, lane(outDir, n)]))
+
+function assertTimedOut(laneRecord, command) {
+  assert.equal(laneRecord.status, 'failed', JSON.stringify(laneRecord))
+  assert.equal(laneRecord.mode, 'timeout')
+  assert.ok(laneRecord.reason.includes(command), `the reason must name ${command}: ${laneRecord.reason}`)
+  assert.match(laneRecord.reason, /timeout/i)
+}
+
+test('AC-QA-7: a gh run list that hangs, with a background grandchild, fails the ci lane as timeout naming gh run list and no process survives', async () => {
+  const { stubs, collected, lines } = await timeoutCase({ ghMode: 'sleep', timeouts: { 'gh run list': 1500 } })
+  try {
+    assertTimedOut(collected.ci, 'gh run list')
+    assert.match(lines[0], /^COLLECT ledger=ran git=ran ci=failed:timeout calls=/, `the timeout must appear in the log line: ${lines[0]}`)
+    await assertWitnessedGone(stubs, 'gh run list')
   } finally {
     killWitnessed(stubs)
   }
 })
 
-test('AC-QA-7: a git that sleeps past the timeout fails the git lane as timeout naming git, kills the stub, and the next repository is still collected', () => {
-  const stubs = makeStubs()
-  setGhRuns(stubs, [])
-  const slow = makeRepo({ ledger: validLedger(2), fix: 1 })
-  const next = makeRepo({ ledger: validLedger(3), fix: 3 })
-  fs.writeFileSync(path.join(stubs.dir, 'git-sleep'), slow + '\n')
-  const slowOut = scratchDir()
-  const nextOut = scratchDir()
-  const started = Date.now()
+test('AC-OPS-4: a gh run view that hangs fails the ci lane as timeout naming gh run view, under its own timeout, and no process survives', async () => {
+  const { stubs, collected } = await timeoutCase({ viewMode: 'sleep', timeouts: { 'gh run view': 1500 } })
   try {
-    const res = runDriver(stubs, [{ root: slow, outDir: slowOut, timeoutMs: 1500 }, { root: next, outDir: nextOut, timeoutMs: 1500 }])
-    assert.equal(res.status, 0, res.stderr)
-    assert.ok(Date.now() - started < 2 * (1500 + 8000))
-    const git = lane(slowOut, 'git')
-    assert.equal(git.status, 'failed')
-    assert.equal(git.mode, 'timeout')
-    assert.match(git.reason, /git/)
-    assert.match(git.reason, /timeout/i)
-    assert.ok(witnessedPids(stubs).length >= 1, 'the stub git never ran, so the timeout was not exercised')
-    for (const pid of witnessedPids(stubs)) assert.ok(!alive(pid), `stub git process ${pid} survived the timeout`)
+    assertTimedOut(collected.ci, 'gh run view')
+    assert.equal(collected.ci.runCount, null)
+    await assertWitnessedGone(stubs, 'gh run view')
+  } finally {
+    killWitnessed(stubs)
+  }
+})
+
+test('AC-QA-7: a git log that hangs, with a background grandchild, fails the git lane as timeout naming git log, no process survives, and the next repository is still collected', async () => {
+  const { stubs, collected, nextOut } = await timeoutCase({ gitSleep: 'log', timeouts: { 'git log': 1500 } })
+  try {
+    assertTimedOut(collected.git, 'git log')
+    await assertWitnessedGone(stubs, 'git log')
     assert.equal(lane(nextOut, 'git').status, 'ran')
     assert.equal(lane(nextOut, 'git').result.count, 3)
   } finally {
@@ -451,40 +616,100 @@ test('AC-QA-7: a git that sleeps past the timeout fails the git lane as timeout 
   }
 })
 
+test('AC-OPS-4: a git rev-parse that hangs fails the git lane as timeout naming git rev-parse, under its own timeout, and no process survives', async () => {
+  const { stubs, collected } = await timeoutCase({ gitSleep: 'rev-parse', timeouts: { 'git rev-parse': 1500 } })
+  try {
+    assertTimedOut(collected.git, 'git rev-parse')
+    await assertWitnessedGone(stubs, 'git rev-parse')
+  } finally {
+    killWitnessed(stubs)
+  }
+})
+
+test('AC-OPS-4: a reader that overruns its own timeout fails the ledger lane as timeout naming the reader and leaves the git lane measured', async () => {
+  const { stubs, collected } = await timeoutCase({ timeouts: { reader: 1 } })
+  try {
+    assertTimedOut(collected.ledger, 'reader')
+    assert.equal(collected.git.status, 'ran', 'a reader timeout must not stop the git lane')
+  } finally {
+    killWitnessed(stubs)
+  }
+})
+
 // ---- AC-QA-8: git failure modes ----
 
-function assertGitNotMeasured(root) {
+function assertGitNotMeasured(root, expectedReason, { stubSetup } = {}) {
   const stubs = makeStubs()
   setGhRuns(stubs, [])
-  const { outDir } = collect(stubs, root)
+  if (stubSetup) stubSetup(stubs)
+  const { outDir, res } = collect(stubs, root)
   const git = lane(outDir, 'git')
   assert.equal(git.status, 'failed', JSON.stringify(git))
-  assert.ok(typeof git.reason === 'string' && git.reason.length > 0)
+  assert.equal(git.reason, expectedReason)
   assert.equal(git.result, null)
   assert.ok(!/"count"\s*:\s*0/.test(JSON.stringify(git)), 'a lane that did not measure must never show an escaped-defect count of 0')
+  return { git, outDir, res }
 }
 
-test('AC-QA-8: a configured path that is not a git repository leaves the git lane failed with a reason', () => {
-  assertGitNotMeasured(scratchDir())
+test('AC-QA-8: a configured path that is not a git repository leaves the git lane failed with the fixed reason naming that cause', () => {
+  assertGitNotMeasured(scratchDir(), 'the configured path is not a git repository')
 })
 
-test('AC-QA-8: a repository with no commits leaves the git lane failed with a reason', () => {
+test('AC-QA-8: a repository with no commits leaves the git lane failed with the fixed no-commits reason', () => {
   const root = scratchDir()
   gitIn(root, ['init', '-q', '-b', 'main'])
-  assertGitNotMeasured(root)
+  assertGitNotMeasured(root, 'the repository has no commits')
 })
 
-test('AC-QA-8: a planted bare-repository layout is refused under safe.bareRepository=explicit and the git lane is failed', () => {
-  const root = scratchDir()
-  gitIn(root, ['init', '--bare', '-q'])
-  assertGitNotMeasured(root)
+test('AC-QA-8: a git log that succeeds with no output leaves the git lane failed, not a measured count of 0', () => {
+  const root = makeRepo({ fix: 1 })
+  assertGitNotMeasured(root, 'git log returned no commits', { stubSetup: (stubs) => fs.writeFileSync(path.join(stubs.dir, 'git-empty-log'), '') })
 })
 
-test('AC-QA-8: a root that is a subdirectory of a repository (the reader rejects the toplevel) leaves the git lane failed with a reason', () => {
+// A bare repository that HAS a commit: only safe.bareRepository=explicit stops git
+// reading it, so this fails when the flag is removed or set to `all`.
+function plantedBareRepoWithCommit() {
+  const source = makeRepo({ fix: 2 })
+  const bare = path.join(scratchDir(), 'planted.git')
+  execFileSync('git', ['clone', '--bare', '-q', source, bare], { env: sanitizedGitEnv() })
+  return bare
+}
+
+test('AC-QA-8: a planted bare repository that has commits is refused under safe.bareRepository=explicit and the git lane is failed with the fixed bare-repository reason', () => {
+  assertGitNotMeasured(plantedBareRepoWithCommit(), 'git refused a bare repository layout')
+})
+
+test('AC-QA-8: the planted bare repository really has commits and is readable when the flag is not given (the fixture proves what the flag guards)', () => {
+  const bare = plantedBareRepoWithCommit()
+  const log = execFileSync('git', ['-c', 'safe.bareRepository=all', '-C', bare, 'log', '--max-count=5', '--pretty=format:%s'], { encoding: 'utf8', env: sanitizedGitEnv() })
+  assert.match(log, /fix: defect 1/)
+})
+
+test('AC-QA-8: a root that is a subdirectory of a repository (the reader rejects the toplevel) leaves the git lane failed with the fixed toplevel reason', () => {
   const repo = makeRepo({ fix: 2 })
   const sub = path.join(repo, 'sub')
   fs.mkdirSync(sub)
-  assertGitNotMeasured(sub)
+  assertGitNotMeasured(sub, 'git toplevel does not match the repository root; the git log was not read from that repository')
+})
+
+// ---- AC-PROD-3 (L8): git failure reasons are fixed text, never git's own output ----
+
+test('AC-PROD-3: git refusing a repository for its ownership leaves the git lane failed with the fixed ownership reason', () => {
+  const root = makeRepo({ fix: 1 })
+  assertGitNotMeasured(root, 'git refused the repository because of its ownership (safe.directory)', {
+    stubSetup: (stubs) => fs.writeFileSync(path.join(stubs.dir, 'git-stderr'), "fatal: detected dubious ownership in repository at '/some/path'\n"),
+  })
+})
+
+test('AC-SEC-12: a git failure of an unknown shape reports the exit status only, and git stderr (an address, a path, a token) reaches no file or log', () => {
+  const root = makeRepo({ fix: 1 })
+  const canary = 'fatal: CANARY-GIT-STDERR-0042 unable to access https://user:tok-canary-9@host.invalid/home/someone/repo'
+  const { git, outDir, res } = assertGitNotMeasured(root, 'git log exited with status 128', {
+    stubSetup: (stubs) => fs.writeFileSync(path.join(stubs.dir, 'git-stderr'), canary + '\n'),
+  })
+  assert.equal(git.mode, 'other')
+  const everything = allOutput(outDir, res)
+  for (const fragment of ['CANARY-GIT-STDERR-0042', 'tok-canary-9', 'host.invalid', '/home/someone']) assert.ok(!everything.includes(fragment), `git stderr leaked: ${fragment}`)
 })
 
 // ---- AC-QA-9: ledger states ----
@@ -540,14 +765,14 @@ test('AC-QA-16: SIGTERM while gh is running ends the collector without success, 
   const child = spawn(process.execPath, [COLLECTOR, root, outDir], { cwd: scratchDir(), env: childEnv(stubs), stdio: 'ignore' })
   const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })))
   try {
-    assert.ok(await waitFor(() => witnessedPids(stubs).length > 0), 'the collector never reached gh')
+    assert.ok(await waitFor(() => witnessedPids(stubs).length >= 2), 'the collector never reached the hanging gh and its grandchild')
     child.kill('SIGTERM')
     const timer = setTimeout(() => child.kill('SIGKILL'), 8000)
     const { code, signal } = await exited
     clearTimeout(timer)
     assert.ok(code !== 0 || signal !== null, 'a terminated collector must not exit 0')
     assert.notEqual(signal, 'SIGKILL', 'the collector did not exit promptly on SIGTERM')
-    for (const pid of witnessedPids(stubs)) assert.ok(await waitFor(() => !alive(pid), 3000), `stub gh ${pid} survived SIGTERM of the collector`)
+    await assertWitnessedGone(stubs, 'SIGTERM')
     for (const f of fs.readdirSync(outDir)) JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8'))
   } finally {
     child.kill('SIGKILL')
@@ -619,6 +844,57 @@ test('AC-QA-20: a repository path with a space and a non-ASCII character is coll
   assert.equal(lane(outDir, 'git').result.count, 3)
   assert.equal(lane(outDir, 'ci').runCount, 1)
   assert.ok(recorded(stubs, 'GIT').every((a) => a[3] === root), 'every git call must name the awkward path exactly')
+})
+
+// ---- AC-ARCH-5 (L5, L6, L7): one implementation, in the reader, shared ----
+
+test('AC-ARCH-5: the reader exports escapedDefectsFigures, which rejects a toplevel that is not the root and never derives the identity from a ledger', async () => {
+  const { escapedDefectsFigures } = await import(pathToFileURL(READER).href)
+  const root = makeRepo({ ledger: validLedger(2), fix: 1 })
+  const rawLog = '\x1e\x1ffix: a defect\nsrc/a.js\n'
+  const ok = escapedDefectsFigures({ rawLog, toplevel: root, root, identity: 'IDENTITY-PASSED-IN' })
+  assert.equal(ok.repo, 'IDENTITY-PASSED-IN', 'the identity is the caller\'s, not read from the ledger (which says demo)')
+  assert.equal(ok.count, 1)
+  for (const toplevel of [path.dirname(root), '', undefined, 42]) {
+    const rejected = escapedDefectsFigures({ rawLog, toplevel, root, identity: 'IDENTITY-PASSED-IN' })
+    assert.equal(rejected.rejected, true, `toplevel ${String(toplevel)}`)
+    assert.equal(rejected.count, null)
+    assert.equal(rejected.repo, 'IDENTITY-PASSED-IN')
+    assert.ok(!JSON.stringify(rejected).includes(root), 'the reason echoes no path')
+  }
+})
+
+test('AC-ARCH-5: the reader\'s escaped-defects command and the collector return the same figures for the same log', () => {
+  const root = makeRepo({ ledger: validLedger(2), fix: 3, other: 1 })
+  const rawLog = gitIn(root, ['log', '--max-count=500', '--name-only', '--pretty=format:%x1e%P%x1f%s'])
+  const viaCli = JSON.parse(spawnSync(process.execPath, [READER, 'escaped-defects'], { input: JSON.stringify({ git_log_raw: rawLog, toplevel: root, root }), encoding: 'utf8' }).stdout)
+  const stubs = makeStubs()
+  setGhRuns(stubs, [])
+  const { outDir } = collect(stubs, root)
+  assert.deepEqual(lane(outDir, 'git').result, viaCli)
+})
+
+test('AC-ARCH-5: the main-checkout root the collector reads a ledger from is the root the ledger writer resolves with git --git-common-dir, for a linked worktree and for a plain checkout', async () => {
+  const { resolveMainCheckoutRootFromFs } = await import(pathToFileURL(READER).href)
+  const main = makeRepo({ fix: 1 })
+  const wt = path.join(scratchDir(), 'linked')
+  gitIn(main, ['worktree', 'add', '-q', '-b', 'wt-equiv', wt])
+  for (const checkout of [main, wt]) {
+    const writerRoot = path.dirname(gitIn(checkout, ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim())
+    assert.equal(fs.realpathSync(resolveMainCheckoutRootFromFs(checkout)), fs.realpathSync(writerRoot))
+  }
+  const plain = scratchDir()
+  assert.equal(resolveMainCheckoutRootFromFs(plain), plain, 'a directory with no .git is returned as it was')
+})
+
+test('AC-ARCH-5: the collector carries no second copy of the minimum-runs constant, the worktree resolution or the toplevel comparison', () => {
+  const src = fs.readFileSync(COLLECTOR, 'utf8')
+  assert.match(src, /MIN_RUNS_FOR_NEVER_FAILED/, 'the minimum-runs floor comes from the reader')
+  assert.ok(!/MIN_RUNS_NEVER_FAILED\s*=/.test(src), 'a second minimum-runs constant')
+  assert.ok(!/commondir/.test(src), 'a second worktree resolution')
+  assert.ok(!/function\s+sameDirectory/.test(src), 'a second toplevel comparison')
+  assert.match(src, /escapedDefectsFigures/)
+  assert.match(src, /resolveMainCheckoutRootFromFs/)
 })
 
 // ---- static guards: AC-ARCH-1, AC-ARCH-5, AC-SIMP-1, AC-SEC-9 ----

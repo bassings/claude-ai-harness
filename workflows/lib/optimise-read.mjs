@@ -1873,6 +1873,45 @@ function ledgerIdentityForRoot(root) {
   return derivePerRepoLabel(parseLedgerContent(raw).records, root)
 }
 
+// Round 1 F5 (AC-SEC-10 integrity): the lane reports `git -C <root> rev-parse
+// --show-toplevel`; if that is not this root (after realpath on both, fs only),
+// git read an enclosing or different repo, so the figures are about the wrong
+// history. Rejected with a reason, never figures, and the reason echoes no path.
+// Round 2 F3 (AC-QA-19, AC-SEC-10): a missing or empty toplevel fails closed, the
+// same no-figures rejection as a mismatch. HARN-OPT-4 T6 (AC-DATA-11, AC-SEC-10):
+// `identity` is the ledger repo identity for this root (as the ledger command
+// derives perRepo[].root), attached so the figure can be matched to its roster
+// entry; the root path itself is never echoed.
+// Pure: reads no ledger and runs nothing, so a caller that must not read the
+// ledger (the collector refuses a symlinked one) passes the identity in.
+export function escapedDefectsFigures({ rawLog, toplevel, root, identity }) {
+  let same = false
+  if (typeof toplevel === 'string' && toplevel) {
+    try { same = fs.realpathSync(toplevel) === fs.realpathSync(root) } catch (e) { same = false }
+  }
+  if (!same) return { rejected: true, reason: 'git toplevel is missing or does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null, repo: identity }
+  return { ...countEscapedDefectCandidates(parseGitLogRaw(rawLog), resolveProductSourceExcludeGlobs(root)), repo: identity }
+}
+
+// A linked worktree keeps its ledger in the main checkout (the same checkout the
+// ledger writer's `--git-common-dir` rule names, which a test pins against a real
+// linked worktree). Read from the filesystem alone, so no git command is run;
+// anything unexpected, a submodule included, leaves the root as it was.
+export function resolveMainCheckoutRootFromFs(root) {
+  try {
+    const dotGit = path.join(root, '.git')
+    if (!fs.lstatSync(dotGit).isFile()) return root
+    const first = fs.readFileSync(dotGit, 'utf8').split('\n')[0]
+    if (!first.startsWith('gitdir: ')) return root
+    const gitDir = path.resolve(root, first.slice('gitdir: '.length).trim())
+    if (path.basename(path.dirname(gitDir)) !== 'worktrees') return root
+    const common = path.resolve(gitDir, fs.readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim())
+    return path.basename(common) === '.git' ? path.dirname(common) : root
+  } catch (e) {
+    return root
+  }
+}
+
 // Round 2 F2 (AC-PROD-8, AC-SEC-10): the ledger holds only proposal ids, so the
 // optimiser writes a per-run sidecar of id -> fixed-key target beside its
 // report. This is a per-run OUTPUT like the report, overwritten each run, not a
@@ -2140,28 +2179,14 @@ export function main() {
     // git_log_raw, and this script does all parsing/scoring deterministically
     // (parseGitLogRaw), so a mis-parse can never silently misattribute a
     // changed path to the wrong commit.
-    const commits = parseGitLogRaw(typeof payload.git_log_raw === 'string' ? payload.git_log_raw : '')
+    // AC-1: the agent no longer parses git log output itself; it captures the
+    // raw stdout verbatim into git_log_raw and escapedDefectsFigures parses and
+    // scores it deterministically. The integrity rule (the toplevel check) and
+    // the repo identity attachment live there, once, for this command and for
+    // the collector (workflows/lib/optimise-collect.mjs).
+    const rawLog = typeof payload.git_log_raw === 'string' ? payload.git_log_raw : ''
     const root = typeof payload.root === 'string' && payload.root ? payload.root : process.cwd()
-    // Round 1 F5 (AC-SEC-10 integrity): the lane reports `git -C <root>
-    // rev-parse --show-toplevel`; if that is not this root (after realpath on
-    // both, fs only), git read an enclosing or different repo, so the figures
-    // are about the wrong history. Rejected with a reason, never figures, and
-    // the reason echoes no path.
-    // Round 2 F3 (AC-QA-19, AC-SEC-10): this check used to be skipped when
-    // `toplevel` was missing or empty, so a lane that omitted it (or a failed
-    // rev-parse) got figures with no integrity check at all. It now fails
-    // closed: no toplevel is the same no-figures rejection as a mismatch.
-    let same = false
-    if (typeof payload.toplevel === 'string' && payload.toplevel) {
-      try { same = fs.realpathSync(payload.toplevel) === fs.realpathSync(root) } catch (e) { same = false }
-    }
-    if (!same) return { rejected: true, reason: 'git toplevel is missing or does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null, repo: ledgerIdentityForRoot(root) }
-    const config = resolveProductSourceExcludeGlobs(root)
-    // HARN-OPT-4 T6 (AC-DATA-11, AC-SEC-10): attach the ledger repo identity
-    // for this root, derived exactly as the ledger command derives perRepo[].root,
-    // so the script can match this figure to its roster entry. The root path
-    // itself is never echoed.
-    return { ...countEscapedDefectCandidates(commits, config), repo: ledgerIdentityForRoot(root) }
+    return escapedDefectsFigures({ rawLog, toplevel: payload.toplevel, root, identity: ledgerIdentityForRoot(root) })
   }
   if (command === 'ids') {
     const raw = readStdin()
