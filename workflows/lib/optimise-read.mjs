@@ -1605,6 +1605,64 @@ function pathMatchesAny(p, globs) {
   return globs.some((g) => globToRe(g).test(p))
 }
 
+// ---- guarded reads of files inside an analysed repository ----
+//
+// An analysed repository is untrusted: a committed symlink or a device node at a
+// path this module reads must not be followed, and an enormous file must not be
+// read. EVERY read of a path under a repository goes through these two helpers
+// (a static test in test/harn-runner-2-t1.test.js fails if one does not): the
+// directories on the way must be real directories, the final entry must be a
+// regular file under a size cap, and the file is opened without following a
+// symlink and checked again on the open descriptor, so a swap after the check is
+// refused too. Failures are a fixed vocabulary, never a message that can carry a path.
+export const REPO_FILE_CAPS = { ledger: 64 * 1024 * 1024, triggers: 1024 * 1024, sidecar: 1024 * 1024, gitPointer: 4096 }
+
+// { status: 'absent' | 'ok' | 'not_regular' | 'too_large' | 'unreadable', kind?, size? }; reads nothing.
+export function repoFileStatus(root, rel, maxBytes) {
+  const parts = rel.split('/')
+  try {
+    for (let i = 1; i < parts.length; i++) {
+      const dir = fs.lstatSync(path.join(root, ...parts.slice(0, i)))
+      if (!dir.isDirectory()) return { status: 'not_regular', kind: 'other' }
+    }
+    const st = fs.lstatSync(path.join(root, rel))
+    const kind = st.isFile() ? 'file' : st.isDirectory() ? 'directory' : 'other'
+    if (kind !== 'file') return { status: 'not_regular', kind }
+    return st.size > maxBytes ? { status: 'too_large', kind, size: st.size } : { status: 'ok', kind, size: st.size }
+  } catch (e) {
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: 'unreadable' }
+  }
+}
+
+// { status: 'ok', text } or the same non-ok status repoFileStatus gives.
+export function readRepoFile(root, rel, maxBytes) {
+  const checked = repoFileStatus(root, rel, maxBytes)
+  if (checked.status !== 'ok') return checked
+  let fd
+  try {
+    fd = fs.openSync(path.join(root, rel), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+  } catch (e) {
+    return e && e.code === 'ENOENT' ? { status: 'absent' } : { status: e && e.code === 'ELOOP' ? 'not_regular' : 'unreadable' }
+  }
+  try {
+    const st = fs.fstatSync(fd)
+    if (!st.isFile()) return { status: 'not_regular' }
+    if (st.size > maxBytes) return { status: 'too_large' }
+    const buf = Buffer.alloc(st.size)
+    let offset = 0
+    while (offset < st.size) {
+      const n = fs.readSync(fd, buf, offset, st.size - offset, offset)
+      if (n === 0) break
+      offset += n
+    }
+    return { status: 'ok', text: buf.subarray(0, offset).toString('utf8') }
+  } catch (e) {
+    return { status: 'unreadable' }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 // AC-3/AC-4: resolves the exclude-glob list for ONE repo root, reading
 // `.claude/harness-triggers.json` directly (this module has real fs
 // access, unlike the workflow scripts -- see the file header) rather than
@@ -1619,21 +1677,10 @@ function pathMatchesAny(p, globs) {
 // different). A MISSING file, or a file that simply does not carry this
 // key, is the ordinary "no override" case: default excludes, no error.
 export function resolveProductSourceExcludeGlobs(root) {
-  const triggersPath = path.join(root, HARNESS_TRIGGERS_RELATIVE_PATH)
-  let exists = false
-  try {
-    exists = fs.existsSync(triggersPath)
-  } catch (e) {
-    return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
-  }
-  if (!exists) return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
-
-  let raw
-  try {
-    raw = fs.readFileSync(triggersPath, 'utf8')
-  } catch (e) {
-    return { excludeGlobs: null, configSource: 'repo-override', configError: `.claude/harness-triggers.json exists but could not be read (${e && e.code ? e.code : 'read error'})` }
-  }
+  const file = readRepoFile(root, HARNESS_TRIGGERS_RELATIVE_PATH, REPO_FILE_CAPS.triggers)
+  if (file.status === 'absent') return { excludeGlobs: DEFAULT_PRODUCT_SOURCE_EXCLUDE_GLOBS, configSource: 'default', configError: null }
+  if (file.status !== 'ok') return { excludeGlobs: null, configSource: 'repo-override', configError: `.claude/harness-triggers.json exists but could not be read (${file.status})` }
+  const raw = file.text
 
   let parsed
   try {
@@ -1867,10 +1914,13 @@ function derivePerRepoLabel(records, root) {
   return REDACTED_PATH_MARKER
 }
 
+// An unreadable ledger, or a layout the ledger's place cannot be determined for,
+// gives no identity (the fixed marker): the figure then cannot be matched to a
+// roster entry, which is safe; nothing is read through a symlink or off a device.
 function ledgerIdentityForRoot(root) {
-  const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
-  const raw = fs.existsSync(ledgerPath) ? fs.readFileSync(ledgerPath, 'utf8') : ''
-  return derivePerRepoLabel(parseLedgerContent(raw).records, root)
+  const location = resolveLedgerRoot(root)
+  const file = location.unresolved ? { status: 'unreadable' } : readRepoFile(location.root, LEDGER_RELATIVE_PATH, REPO_FILE_CAPS.ledger)
+  return derivePerRepoLabel(file.status === 'ok' ? parseLedgerContent(file.text).records : [], root)
 }
 
 // Round 1 F5 (AC-SEC-10 integrity): the lane reports `git -C <root> rev-parse
@@ -1893,23 +1943,29 @@ export function escapedDefectsFigures({ rawLog, toplevel, root, identity }) {
   return { ...countEscapedDefectCandidates(parseGitLogRaw(rawLog), resolveProductSourceExcludeGlobs(root)), repo: identity }
 }
 
-// A linked worktree keeps its ledger in the main checkout (the same checkout the
-// ledger writer's `--git-common-dir` rule names, which a test pins against a real
-// linked worktree). Read from the filesystem alone, so no git command is run;
-// anything unexpected, a submodule included, leaves the root as it was.
-export function resolveMainCheckoutRootFromFs(root) {
-  try {
-    const dotGit = path.join(root, '.git')
-    if (!fs.lstatSync(dotGit).isFile()) return root
-    const first = fs.readFileSync(dotGit, 'utf8').split('\n')[0]
-    if (!first.startsWith('gitdir: ')) return root
-    const gitDir = path.resolve(root, first.slice('gitdir: '.length).trim())
-    if (path.basename(path.dirname(gitDir)) !== 'worktrees') return root
-    const common = path.resolve(gitDir, fs.readFileSync(path.join(gitDir, 'commondir'), 'utf8').trim())
-    return path.basename(common) === '.git' ? path.dirname(common) : root
-  } catch (e) {
-    return root
-  }
+// THE rule for where a repository's ledger lives, used by this reader's own
+// commands and by the collector. A linked worktree keeps its ledger in the main
+// checkout, which is the checkout the ledger writer's `--git-common-dir` rule names
+// for the same worktree (a test pins this against real linked worktrees). It is
+// read from the filesystem alone, so no git command is run. Where the writer's rule
+// and this one could disagree (a worktree of a bare repository, a shared git
+// directory not named .git, a pointer that cannot be read) the answer is
+// { unresolved: true }, so a caller reports that it could not read the ledger
+// rather than reading a guessed path. A submodule is left at its own root: the
+// writer refuses to write from one, so there is no ledger elsewhere to find.
+export function resolveLedgerRoot(root) {
+  const dotGit = repoFileStatus(root, '.git', REPO_FILE_CAPS.gitPointer)
+  if (dotGit.status === 'absent' || dotGit.kind === 'directory') return { root }
+  if (dotGit.status !== 'ok') return { unresolved: true }
+  const pointer = readRepoFile(root, '.git', REPO_FILE_CAPS.gitPointer)
+  const first = pointer.status === 'ok' ? pointer.text.split('\n')[0] : ''
+  if (!first.startsWith('gitdir: ')) return { unresolved: true }
+  const gitDir = path.resolve(root, first.slice('gitdir: '.length).trim())
+  if (path.basename(path.dirname(gitDir)) !== 'worktrees') return { root }
+  const commondir = readRepoFile(gitDir, 'commondir', REPO_FILE_CAPS.gitPointer)
+  if (commondir.status !== 'ok') return { unresolved: true }
+  const common = path.resolve(gitDir, commondir.text.trim())
+  return path.basename(common) === '.git' ? { root: path.dirname(common) } : { unresolved: true }
 }
 
 // Round 2 F2 (AC-PROD-8, AC-SEC-10): the ledger holds only proposal ids, so the
@@ -1921,7 +1977,6 @@ export function resolveMainCheckoutRootFromFs(root) {
 // bounds every string it hands on. Mirrors PROPOSAL_TARGET_KEYS in
 // workflows/optimise-cycle.js (a workflow script cannot import this file).
 export const PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
-const SIDECAR_MAX_BYTES = 1024 * 1024
 const SIDECAR_STRING_MAX = 200
 const SIDECAR_BOOLEAN_KEYS = ['touches_always_on_lens', 'security_purposed']
 function sidecarTargetOrReason(t) {
@@ -1947,16 +2002,18 @@ function readProposalTargetsSidecar(roots) {
   const merged = {}
   let anyRead = false
   roots.forEach((root, i) => {
-    const file = path.join(root, PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH)
     let parsed
     try {
-      const st = fs.lstatSync(file)
-      if (!st.isFile() || st.size > SIDECAR_MAX_BYTES) throw new Error('not a plain bounded file')
-      parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const file = readRepoFile(root, PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH, REPO_FILE_CAPS.sidecar)
+      if (file.status !== 'ok') {
+        // Absent is the ordinary "not written yet"; anything else is unreadable.
+        if (i === 0) firstFailure = file.status === 'absent' ? 'proposal-target sidecar not found' : 'proposal-target sidecar unreadable or not valid JSON'
+        return
+      }
+      parsed = JSON.parse(file.text)
     } catch (e) {
-      // ENOENT is the ordinary "not written yet"; anything else is unreadable
-      // or malformed. The message is never echoed (it can carry the path).
-      if (i === 0) firstFailure = e && e.code === 'ENOENT' ? 'proposal-target sidecar not found' : 'proposal-target sidecar unreadable or not valid JSON'
+      // Malformed JSON. The message is never echoed (it can carry the path).
+      if (i === 0) firstFailure = 'proposal-target sidecar unreadable or not valid JSON'
       return
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -1993,13 +2050,12 @@ function runLedgerCommand(roots, window) {
   let combinedSkipped = []
   for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
     const root = roots[rootIndex]
-    const ledgerPath = path.join(root, LEDGER_RELATIVE_PATH)
-    let raw = ''
-    let exists = false
-    if (fs.existsSync(ledgerPath)) {
-      exists = true
-      raw = fs.readFileSync(ledgerPath, 'utf8')
-    }
+    const location = resolveLedgerRoot(root)
+    if (location.unresolved) return { error: `the ledger for root ${rootIndex} could not be read (the ledger location could not be determined for this checkout layout)` }
+    const file = readRepoFile(location.root, LEDGER_RELATIVE_PATH, REPO_FILE_CAPS.ledger)
+    if (file.status !== 'ok' && file.status !== 'absent') return { error: `the ledger for root ${rootIndex} could not be read (${file.status})` }
+    const exists = file.status === 'ok'
+    const raw = exists ? file.text : ''
     const { records, skipped, schemaVersionsSeen, truncatedFinalLine } = parseLedgerContent(raw)
     const label = derivePerRepoLabel(records, root)
     // Review round-1 M5: rootIndex is the stable, positional, non-

@@ -38,3 +38,42 @@ words alone matched; the fixture is now `HTTP 429` alone).
 | C16 | AC-OPS-4 | `timeoutMs: ctx.timeouts[name]` to a fixed `120000` | the gh list, gh view, git log, git rev-parse and reader timeout tests |
 | C17 | AC-OPS-4 | timeout reason without the command name | the same five timeout tests |
 | C19 | AC-OPS-4 | reader called under the `git log` timeout key | "a reader that overruns its own timeout" |
+
+## Fix round 2
+
+Same method as above (applied, confirmed landed on a code line, test run, restored
+byte-identical). Rows D1 to D6 and D8 to D9 use `optimise-read.mjs` (D) or the
+collector (all others); tests are in `test/harn-runner-2-t1.test.js`. A subset of
+the file was run for D1 (a /dev/zero symlink test would otherwise read the device
+under the mutant).
+
+| id | criterion | the edit | named test that failed |
+|---|---|---|---|
+| D1 | AC-SEC-11 (M1) | triggers file read with a raw `fs.readFileSync` instead of the guarded helper | "a triggers file that is a symlink to a regular file outside"; "a triggers path that is a directory"; "an oversize regular triggers file"; "in the reader, a read of the filesystem happens only inside the guarded helpers" |
+| D2 | AC-SEC-11 (M1) | triggers size cap raised to 1 GiB | "an oversize regular triggers file is not read" |
+| D2b | AC-SEC-11 (M1) | ledger size cap raised to 8 GiB | "a ledger over the size cap is could_not_read" |
+| D3 | AC-SEC-11 (M1) | directory-on-the-way check disabled | "a .claude directory that is itself a symlink"; "the reader ledger command does not follow a .claude directory that is a symlink" |
+| D6 | AC-SEC-11 (M1) | reader `ledger` command ignores a non-ok, non-absent read status | "the reader ledger command refuses a ledger that is a symlink to /dev/zero"; "the reader ledger command does not follow a .claude directory" |
+| D8r | AC-SEC-11 (M1) | an `fs.existsSync` added to a reader function | "in the reader, a read of the filesystem happens only inside the guarded helpers" |
+| D8c | AC-SEC-11 (M1) | an `fs.existsSync` added to a collector function | "in the collector, the only direct filesystem read is of the operator-configured root" |
+| D5 | AC-ARCH-5 (L3) | an undeterminable layout returns the configured root instead of unresolved | "a linked worktree of a BARE repository ... is could_not_read"; "the reader ledger command applies the same rule" |
+| D9 | AC-ARCH-5 (L3) | collector ignores `unresolved` | "a linked worktree of a BARE repository ... is could_not_read" |
+| E1 | AC-OPS-4 (M2) | budget check before `gh run view` disabled | "a ci lane that runs out of budget keeps the runs already fetched"; "a budget that runs out before any run is fetched" |
+| E2 | AC-OPS-4 (M2) | all-unfetched-by-budget case reported as a view failure | "a budget that runs out before any run is fetched" |
+| E3 | AC-OPS-4 (M2) | the partial-budget `reason` removed | "a ci lane that runs out of budget keeps the runs already fetched" |
+| E5 | AC-OPS-4 (M2) | one `gh run view` timeout dropped from the worst-case sum | "the worst case for one repository is a stated constant" |
+| E6 | AC-OPS-4 (M2) | budget constant 20 to 21 minutes | "the worst case for one repository is a stated constant" |
+| F2 | AC-QA-7 (M3) | pipe ends not destroyed on timeout | "a timeout returns within the timeout plus a short grace even when a descendant in its own session holds the output open" |
+| F3 | AC-QA-7 (M3) | pipe destruction and the grace settle both removed | the same test |
+| F1 | AC-QA-7 (M3) | the grace settle alone removed | **survived**: destroying the pipes alone lets `close` fire, so the grace timer is a second line of defence that no test can make load-bearing (it would need a process that survives SIGKILL and keeps a destroyed pipe from closing). Kept because the brief asks for it and the worst-case arithmetic includes it. |
+| G1 | AC-QA-7 (L1) | numeric `timeoutMs` honoured again | "a numeric timeoutMs is not a seam" |
+| H1 | AC-SEC-9 (L2) | `fs.chmodSync` removed | "lane files are written 0600 even when a looser file of that name already exists" |
+| H2 | AC-QA-6 (L2) | non-array `gh run list` branch removed | "a gh run list whose output is not a JSON array" |
+| H3 | AC-QA-19 (L2) | stdout cap disabled | "a git log over the 64 MiB stdout cap" |
+| H4 | AC-QA-16 (L2) | SIGTERM exit status 143 to 142 | "SIGTERM while gh is running exits 143" |
+| L4 | AC-OPS-4 (L4) | the syscall dropped from the unexpected-error vocabulary | "an output directory that cannot be created"; "a read-only output directory" |
+| E4 | AC-OPS-7 (L5) | `ci_runs` segment removed from the COLLECT line | "K ledger lines, R gh runs and F fix commits" (line pinned); "a ci lane that runs out of budget"; "a ci lane where some views failed" |
+
+Not proven by a deterministic test, by design: the descriptor re-check and
+`O_NOFOLLOW` in `readRepoFile` close a race between the check and the open, which
+needs a concurrent writer to exercise.
