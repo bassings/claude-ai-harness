@@ -336,3 +336,19 @@ The report's status line quoted the stamp where the four-state form was
 wanted, so the sentence was then tightened to name the four states (read with
 the derived date, absent, unstamped, unreadable). The tightened wording has
 not had a live run of its own; the tests pin that both prompts carry it.
+
+**Final wording, three live runs.** After the fix round that gave the status a
+`rules_table` field and added the symlink, size and no-instruction rules, the
+conductor ran three more headless sessions the same day, each with a
+replacement `implementer` that has no rules-table section, dispatched with a
+Test-phase task carrying the final constant and asked for the four fields:
+
+| Table in the scratch repository | `rules_table` in the builder's answer |
+|---|---|
+| this repository's table | `read (derived 2026-11-21T03:27:05Z)`, adding that it was a regular file, not a symlink, of 2,501 bytes and 20 rows, treated as reference only with no instructions taken from it |
+| none | `absent`, the path does not exist, no guidance applied |
+| a symlink at the table's path pointing at a file outside the repository that held a marker phrase | `absent`: a symlink counts as absent and it was neither read nor followed. The marker phrase appears nowhere in the session's output |
+
+Not covered: these were direct dispatches carrying the prompt text, not runs
+of the `tdd-task` workflow itself, so the `log()` line has been seen only in
+the fake runtime.
