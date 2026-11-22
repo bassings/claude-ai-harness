@@ -470,8 +470,9 @@ function digestRefusal(digest, nonce) {
 
 // Mirrors isPlainInsufficientRow in workflows/lib/optimise-read.mjs (a script cannot import it): an insufficient-data
 // row with no measured verdict disagreement. The collector already leaves these out of the digest and counts them; the
-// render applies the same rule to what it was handed, so the two cannot disagree. Tied to the reader's by
-// test/harn-runner-2-t2-mirror.test.js and, for the render, by test/helpers/never-failing-render.js.
+// render applies the same rule to what it was handed, so the two cannot disagree. Tied to the reader's by the
+// parity test in test/harn-runner-2-t2.test.js (every branch, over a row table that varies each key in
+// NEVER_FAILING_RENDER_KEYS) and, for the render, by test/harn-runner-2-t1b.test.js with test/helpers/never-failing-render.js.
 function isPlainInsufficientRow(row) {
   return Boolean(row?.insufficient_data) && (row.verdict_disagreements === 0 || row.verdict_disagreements === undefined)
 }
@@ -519,7 +520,8 @@ function collectFromDigest(digest, nonce) {
   const R = makeRedactors([])
   const { ledgerAgg, skippedCount, neverFailingLeftOut } = digestLedger(digest)
   const ciAgg = laneRan(digest, 'ci') ? digest.ci : null
-  const label = [ledgerRepoLabel(ledgerAgg, 0), typeof digest.git?.repo === 'string' ? digest.git.repo : null].find((v) => v) || 'repository'
+  // Repository-originated text: flattened and redacted here, so no sink that prints the label can forge a line or leak a path.
+  const label = R.flat([ledgerRepoLabel(ledgerAgg, 0), typeof digest.git?.repo === 'string' ? digest.git.repo : null].find((v) => v) || 'repository')
   return {
     resolved: [{ label }], unresolved: [], planLabels: digest.plan_labels, nonce, R, repoLabels: [label], gitLabels: [label],
     ledgerAgg, ciAgg, skippedCount, neverFailingLeftOut,
@@ -819,7 +821,7 @@ const R = makeRedactors(roots)
 const { gitPerRepo, gitUnmatched } = matchGitResults(gitResults, scope.resolved.length, ledgerAgg, R)
 return {
   resolved: scope.resolved, unresolved: scope.unresolved, planLabels: scope.plan_labels, nonce: dataNonce, R,
-  repoLabels: scope.resolved.map((r) => r.label), gitLabels: scope.resolved.map((r, i) => ledgerRepoLabel(ledgerAgg, i) || r.label),
+  repoLabels: scope.resolved.map((r) => R.flat(r.label)), gitLabels: scope.resolved.map((r, i) => ledgerRepoLabel(ledgerAgg, i) || r.label),
   ledgerAgg, ciAgg, skippedCount: ledgerAgg && Array.isArray(ledgerAgg.skipped) ? ledgerAgg.skipped.length : 0, neverFailingLeftOut: 0,
   gitPerRepo, gitUnmatched, lanes: attendedLanes(ledgerAgg, ciAgg, gitPerRepo), ciRunLine: null, digestNotes: [],
 }
