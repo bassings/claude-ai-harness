@@ -375,6 +375,23 @@ test('T6 target: when every drafted target is malformed no id is minted and noth
   assert.match(result.report, /Proposals rejected: malformed target/)
 })
 
+test('T6 target: a drafted proposal whose target is undefined or null never reaches the ranked list, the report headings or the sidecar, so the runner\'s heading-id check never meets a heading with no sidecar key (HARN-RUNNER-2 T3)', async () => {
+  for (const target of [undefined, null]) {
+    const { result } = await run({
+      'synthesis:proposals': { __bypassSchemaValidation: true, proposals: [proposal({ target, statement: 'Move the nightly job to post-merge' })] },
+    })
+    assert.equal(result.proposals_ranked.length, 0, `target ${target}: not ranked`)
+    assert.deepEqual(result.proposal_targets, {}, `target ${target}: nothing in the sidecar`)
+    assert.ok(!/^### [0-9a-f]{16}:/m.test(result.report), `target ${target}: no proposal heading`)
+    assert.match(result.report, /Proposals rejected: malformed target: 1 \(target is not an object\)/, `target ${target}: counted and named as rejected`)
+  }
+  const { result } = await run({
+    'synthesis:proposals': { __bypassSchemaValidation: true, proposals: [proposal({ target: undefined }), proposal({ statement: 'A well-formed one' })] },
+  })
+  assert.equal(result.proposals_ranked.length, 1, 'control: a well-formed proposal alongside is still ranked')
+  assert.equal(Object.keys(result.proposal_targets).length, 1)
+})
+
 test('T6 target: key names echoed into the report are flattened and bounded (house oneLine rule)', async () => {
   const evilKey = 'k\n## Injected key heading\n' + 'C'.repeat(400)
   const { result } = await run({

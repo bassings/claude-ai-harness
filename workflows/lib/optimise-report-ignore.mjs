@@ -42,8 +42,15 @@ export function ensureIgnored(root, relativePath) {
     if (fs.existsSync(excludePath)) contents = fs.readFileSync(excludePath, 'utf8')
     const lines = contents.split('\n')
     if (!lines.some((l) => l.trim() === relativePath)) {
+      // Append, never rewrite: two callers at once (two runners against one
+      // repository) each add their own line, and a rewrite of the whole file
+      // from a stale read erased the other's line, or let a reader see the
+      // file half written. One small O_APPEND write cannot lose another
+      // writer's line. A leading newline is always safe (a blank line is
+      // harmless in an exclude file) and covers a file whose last line has no
+      // newline, which a stale read cannot be trusted to tell.
       const sep = contents.length && !contents.endsWith('\n') ? '\n' : ''
-      fs.writeFileSync(excludePath, contents + sep + relativePath + '\n')
+      fs.appendFileSync(excludePath, sep + relativePath + '\n')
     }
   } catch (e) {
     return { ignored: false, error: 'could not update .git/info/exclude: ' + e.message }

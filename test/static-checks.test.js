@@ -1114,43 +1114,28 @@ test('static: README.md documents the launchd rollback for com.local.optimise-cy
 // closes that coverage gap mechanically, so a future edit cannot silently
 // drop either control without a red test naming exactly which token
 // vanished.
-test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh contains every required --disallowedTools deny token and the allowlist flags, and no longer disables hooks (subtraction round item 3, reversed by T11 AC-SEC-8) -- deleting any previously shipped the suite green, since every test drives a stub `claude`, never the real flags', () => {
+test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh passes the allowlist, the bare-tool denies and the closed permission mode, holds no Bash, Edit or Write rule, and does not disable hooks -- every test drives a stub `claude`, never the real flags, so deleting any of these previously shipped the suite green (HARN-RUNNER-2 T3, AC-SEC-1, AC-SEC-2, AC-SEC-4, AC-SEC-16)', () => {
   const script = readAll('bin', 'optimise-cycle-weekly.sh')
   const lines = script.split('\n')
-  // Scoped to the ACTUAL invocation block, not the whole file: a whole-file
-  // .includes() check was tried first and was itself vacuous -- this
-  // script's own header comments quote the exact `--settings
-  // '{"disableAllHooks": true}'` string while narrating history, so a
-  // whole-file check kept passing even after the real call site's flag
-  // line was deleted (confirmed by deliberately deleting it and watching
-  // this test wrongly stay green, before this fix).
+  // Scoped to the ACTUAL invocation block, not the whole file: a whole-file .includes() check was itself vacuous --
+  // the script's header comments quote old flag strings while narrating history. The block runs from the line holding
+  // `claude -p ` to the first line after it that does not continue with a trailing backslash.
   const start = lines.findIndex((l) => l.includes('claude -p '))
-  const end = lines.findIndex((l, i) => i > start && l.includes('2>&1'))
-  assert.ok(start >= 0 && end > start, 'could not locate the claude -p invocation block in bin/optimise-cycle-weekly.sh')
+  let end = start
+  while (end >= 0 && lines[end].trimEnd().endsWith('\\')) end += 1
+  assert.ok(start >= 0 && end >= start, 'could not locate the claude -p invocation block in bin/optimise-cycle-weekly.sh')
   const callSite = lines.slice(start, end + 1).join('\n')
-  const requiredDenyTokens = [
-    'Bash(rm:*)',
-    'Bash(sudo:*)',
-    'Bash(git push:*)',
-    'Bash(git commit:*)',
-    'Bash(git reset:*)',
-    'Bash(gh pr merge:*)',
-    'Bash(gh pr create:*)',
-    'Bash(gh issue create:*)',
-    'Bash(gh release create:*)',
-    'Bash(gh workflow run:*)',
-    'Bash(curl:*)',
-    'Bash(wget:*)',
-  ]
-  assert.ok(callSite.includes('--disallowedTools'), 'the claude -p call site must pass --disallowedTools')
-  for (const token of requiredDenyTokens) {
-    assert.ok(callSite.includes(token), `the claude -p call site must deny ${token}`)
-  }
   assert.ok(callSite.includes('--allowedTools'), 'the claude -p call site must pass --allowedTools')
+  assert.match(callSite, /--allowedTools\s+"?Workflow"?\s+"Read\(\//, 'the allowlist is the Workflow tool and one Read rule, in that order, and nothing else')
+  assert.match(callSite, /--disallowedTools\s+Bash\s+Write\s+Edit\s+NotebookEdit\s+WebFetch\s+WebSearch(\s|$)/, 'the six whole tools are denied by bare name, so a user-level allow rule cannot hand the session one')
   assert.ok(callSite.includes('--permission-mode dontAsk'), 'the claude -p call site must refuse unlisted tools with --permission-mode dontAsk')
   assert.ok(callSite.includes('--session-id "$SESSION_ID"'), 'the claude -p call site must pass --session-id, which is how the plan marker is recognised and restored')
   assert.ok(callSite.includes('--setting-sources user'), 'the claude -p call site must load user settings only, so a repo cannot widen the allowlist')
+  assert.ok(callSite.includes('--output-format json'), 'the claude -p call site must ask for the JSON envelope the runner parses')
   assert.ok(!callSite.includes('--settings'), 'the claude -p call site must not override settings: the guard and snapshot hooks stay on')
+  for (const gone of ['Bash(', 'Edit(', 'Write(', 'dangerously-skip-permissions', 'bypassPermissions']) {
+    assert.ok(!callSite.includes(gone), `the claude -p call site must not contain ${gone}`)
+  }
 })
 
 test('static: bin/com.local.optimise-cycle-weekly.plist is tracked in the repo and is a valid plist containing no real account path (it is a template -- every path is a /Users/YOUR_USERNAME placeholder, since this repo is public)', () => {

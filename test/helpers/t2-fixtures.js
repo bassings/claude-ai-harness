@@ -107,4 +107,5 @@ const runDigest = (digest, options = {}) => {
   return runWorkflow(WORKFLOW, { args: { digest, nonce, ...args }, agent })
 }
 
-module.exports = { WORKFLOW, READER, NONCE, OTHER_NONCE, collection, attendedAgents, runDigest }
+// ledgerText, SPEC_A and SIZES are also what test/harn-runner-2-t3.test.js builds its fixture repositories from.
+module.exports = { WORKFLOW, READER, NONCE, OTHER_NONCE, SIZES, SPEC_A, ledgerText, collection, attendedAgents, runDigest }

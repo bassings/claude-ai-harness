@@ -1,130 +1,75 @@
 #!/usr/bin/env bash
-# Weekly delivery-optimiser run (HARN-OPT-2 T3).
+# Weekly delivery-optimiser run (HARN-OPT-2 T3, reshaped by HARN-RUNNER-2 T3).
 #
-# Runs /optimise-cycle against the delivery repos and leaves a report per
-# repo at <repo>/.claude/optimise-cycle-report.md (gitignored by the
-# optimiser itself). Read-only: the optimiser never applies a change, and
-# neither does this script. See skills/optimise-cycle/.
+# For each configured repository this script (1) collects the ledger, git and
+# CI data itself, with workflows/lib/optimise-collect.mjs, into a private
+# per-run directory; (2) starts ONE headless `claude -p` session that only
+# analyses what it is handed; (3) checks what the session returned against the
+# files it collected; and (4) writes <repo>/.claude/optimise-cycle-report.md and
+# <repo>/.claude/optimise-proposal-targets.json itself. Read-only otherwise: the
+# optimiser never applies a change, and neither does this script. See
+# skills/optimise-cycle/.
 #
-# D1 fix: PASS/FAIL is decided per repo from facts this script observes for
-# itself -- the report file exists, its mtime is at or after this run's own
-# start time (so a leftover report from a previous week reads as FAIL, not
-# as a silent pass), and it is non-empty and structurally plausible as a
-# report -- never from what claude's reply says. The model's reply is still
-# appended to the log as diagnostic context, but it is not consulted by
-# verdict_repo below.
+# The session's tool set is exactly what the invocation below passes: the
+# Workflow tool, and Read of the one per-run directory. Bash, Write, Edit,
+# NotebookEdit, WebFetch and WebSearch are denied as whole tools by bare name, so
+# an allow rule in the operator's user-level settings cannot hand the session a
+# shell, a file write or a network fetch. The session reads digest.json from the
+# per-run directory, calls the installed optimise-cycle workflow with the digest
+# and a nonce this script minted, and replies with only the object the workflow
+# returned. It runs no command and writes no file. The residual risk, stated
+# plainly: --setting-sources user loads the operator's own user-level
+# permissions, and an allow rule there still applies to any tool that is not
+# denied as a whole tool, namely Read, Skill, Agent and Workflow.
 #
-# D2 fix: this script now lives in version control (bin/) instead of only
-# at ~/.claude/bin/, and is covered by test/weekly-runner.test.js. Keep
-# ~/.claude/bin/optimise-cycle-weekly.sh AND ~/.claude/bin/redact-transcript.mjs
-# synced from this file -- see README.md's "Weekly optimiser run" section
-# for the exact sync step.
+# The verdict is decided per repository from content, never from what claude
+# said. PASS means every one of these held: the collector ran and its digest was
+# accepted; claude exited 0; its JSON envelope and the result inside it parsed
+# strictly (a report that is a string, starts with a heading, holds no NUL byte,
+# is valid UTF-8 and is at most 5,242,880 bytes; a sidecar object; lane
+# statuses); every measured figure in the report (ledger records, CI run counts,
+# the raw escaped-defect count, the digest's omission counts) equals the figure
+# in the lane files this script collected, which is what detects collected data
+# changed in transit; the report holds no absolute path under $HOME, the
+# repository or the per-run directory; the report and sidecar paths are
+# gitignored; and both files were placed. A lane that could not run for a reason
+# outside this script's control (gh unauthenticated, for instance) is a FAIL that
+# names the lane and the mode, and the report is still written with the other
+# lanes' real figures. Nothing is placed when the result is not trusted, so the
+# last good report is left as it was. A failed ledger lane is never shown as a
+# zero record count. One RESULT line per repository, PASS or FAIL, carries fixed
+# tokens and integers only; nothing the session said reaches the log.
 #
-# Round-2 fixes (T3 review round 1, three lenses, all reproduced by the
-# conductor -- specs/harn-opt-2.md conductor log ticks 40-43):
-#   Group 2 -- a vanished repo path and a linked git worktree used to hit
-#   the same "not a git repo" branch. `git -C "$repo" rev-parse --git-dir`
-#   distinguishes them: a missing path is a configuration FAIL, a worktree
-#   (whose .git is a FILE) is processed normally, and only a path that
-#   exists and genuinely isn't a repo is SKIPped.
-#   Group 4 -- the unattended `claude -p` invocation had no permission
-#   constraint at all. --disallowedTools below denies the destructive and
-#   outward-facing operations the read-only optimiser never needs;
-#   --permission-mode plan was considered and rejected, since plan mode
-#   would prevent the optimiser writing the very report this script's
-#   verdict depends on. Verified empirically end to end against a throwaway
-#   repo (not a delivery repo) with both flags applied: a well-formed report
-#   was still produced, exit 0, and no file outside .claude/optimise-cycle-
-#   report.md was created or modified.
-#   Group 5 -- the run should be read-only w.r.t. the repo it analyses.
-#   Measured: the conductor plan-guard Stop hook (installed globally, not
-#   by this script) touched .claude/active-plan on both real repos during
-#   the 2026-08-16 run. This group used to switch every hook off to stop
-#   that; T11 (specs/harn-audit-1.md) reversed it, because the same switch
-#   also removed the destructive-command guard and the snapshot hook from
-#   an unattended session. Hooks now stay on; see the invocation below.
-#   Group 6 -- the optimiser runs as a BACKGROUND workflow inside
-#   `claude -p`, so the real governing budget is
-#   CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (~600s unstated default), not the
-#   outer `timeout` (previously 3600s, wildly looser than the real budget).
-#   Both are now set explicitly and aligned, and a run that hits the
-#   ceiling is named as the cause rather than only read as a stale/missing
-#   report.
-#   Group 7 -- the transcript is redacted (bin/redact-transcript.mjs, reusing
-#   workflows/lib/ledger-append.mjs's redactPaths) before it reaches the
-#   log, and every repo reference this script itself writes uses the repo's
-#   basename rather than its absolute path, matching the account-name/path
-#   leak the ledger and report already refuse (AC-SEC-3 in
-#   specs/optimise-cycle.md).
-#   Group 8 -- small fail-open fixes: an invalid start_epoch now FAILS
-#   rather than silently skipping the staleness check; an empty REPOS array
-#   no longer crashes bash 3.2's `set -u`; a whitespace-only
-#   OPTIMISE_WEEKLY_REPOS line is trimmed away rather than becoming a bogus
-#   repo path; a leading UTF-8 BOM on an otherwise well-formed report no
-#   longer reads as "no heading".
+# Containment: the per-run directory is made mode 700 inside a parent that only
+# this runner writes to; every collected file in it is mode 600; it is removed
+# after a PASS, after a FAIL and on a signal; a directory left by a killed run is
+# swept at the next start, without following links and only inside the runner's
+# own parent. The nonce is 32 hex characters from a CSPRNG, minted per
+# repository, and never written to the log. Only the programs under
+# $CLAUDE_HOME/workflows/lib/ are run, never a copy inside the analysed
+# repository, and no collected value is interpolated into a command string or
+# evaluated. The hooks stay on: the destructive-command guard and the snapshot
+# hook stand between an unattended session and a destroyed working tree.
 #
-# SUBTRACTION ROUND (T3 review round 2, circuit-breaker escalated and
-# ruled -- specs/harn-opt-2.md conductor log ticks 46-48): review round 2
-# proved two of round 1's own guards cannot fail in the way they claimed to,
-# which is worse than no guard -- both are REMOVED here rather than patched
-# a third time:
-#   - The per-run verdict nonce (former Group 3) is GONE. It was meant to
-#     stop the model forging this script's own RESULT lines, but the header
-#     carrying `run=$NONCE` was written to a fixed, world-readable log path
-#     BEFORE `claude -p` ran, so a forger only had to `grep` its own log for
-#     the genuine nonce and echo it back -- proven live. A hardcoded guessed
-#     nonce also shipped the suite green, so the guard was not load-bearing
-#     against a guesser either. No replacement guard: the real containment
-#     for a compromised/malicious model reply is that verdict_repo below
-#     never trusts the model's stdout at all (D1), which the nonce was never
-#     actually adding to.
-#   - The `<repo>/.claude/` postcondition walk (former part of Group 5) is
-#     GONE. It was defeated by back-dating a written file's mtime with
-#     `touch`, missed any write outside `.claude/` entirely (a stub writing
-#     `.git/hooks/post-checkout` passed clean), and missed every deletion
-#     (no forward mtime to see). Measured against a real delivery repo whose
-#     `.claude/` held 50,120 orphaned-worktree files (778 MB): the per-file
-#     walk cost ~94s and its reason-string join was QUADRATIC, extrapolating
-#     to ~44 minutes and a ~3.6 MB single log line -- it would have wedged
-#     this job long after `claude` returned, for a check that a `touch -d`
-#     already defeated.
+# The optimiser runs as a BACKGROUND workflow inside `claude -p`, so the real
+# governing budget is CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, not the outer
+# `timeout`. Both are set explicitly and aligned, and a run that hits the ceiling
+# is named as the cause. A trapped signal stops the collector or the session,
+# and the EXIT trap then cleans up and reports the outcome, which defaults to
+# FAIL so a killed run can never leave the previous PASS standing.
 #
-# Round-2 fixes to what SURVIVED review round 2 (same conductor log ticks):
-#   - `--disallowedTools` is KEPT: it genuinely blocks its literal targets
-#     (proven by real `claude -p` runs), which is real defence in depth.
-#     What was false was the CLAIM that a denylist bounds the job: under
-#     that flag set alone a real run against a throwaway repo showed
-#     `Write`, `Edit`, `mv` and `python3 -c` all succeed. T11 adds the
-#     allowlist below, so a tool that is not listed is refused rather than
-#     reachable -- test/static-checks.test.js pins the deny tokens.
-#   - The background-wait ceiling detector no longer greps for the bare
-#     `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` variable NAME, which false-
-#     positived on any transcript merely mentioning it (this repo's own
-#     README now does). It anchors to the CLI's real message and captures
-#     the observed wait into the FAIL reason.
-#   - The ceiling is lowered from 1,800,000ms to 1,200,000ms (20 minutes):
-#     now that hitting it produces a self-diagnosing FAIL naming the cause,
-#     binding low costs one lost weekly report while binding high costs up
-#     to 31 minutes of unattended execution producing nothing. 1200s is
-#     2.3x the worst measured real run (515s).
-#   - A FAIL now prints one line to stderr before exiting, so the plist's
-#     already-wired StandardErrorPath channel (0 bytes since 11 Aug) turns
-#     non-empty exactly when there is something to see.
-#   - The default repo list no longer hardcodes this operator's private
-#     repo names and volume layout in a public repo. It is read from
-#     $HOME/.claude/optimise-weekly-repos (one path per line, never tracked
-#     anywhere), promoting the existing test-seam env var to real operator
-#     configuration.
-#   - The internal start_epoch validity check inside verdict_repo (former
-#     Group 8) is gone: it duplicated the caller's own check below, which
-#     already `continue`s past a repo before verdict_repo is ever called
-#     for it, so the internal branch could never fire.
+# This script lives in version control (bin/) and is covered by
+# test/weekly-runner.test.js and test/harn-runner-2-t3.test.js. Keep
+# ~/.claude/bin/optimise-cycle-weekly.sh synced from this file -- see README.md's
+# "Weekly optimiser run" section for the exact sync step.
 #
-# Two environment variables exist ONLY as a test seam, read by
-# test/weekly-runner.test.js, and are never operator-facing configuration:
-# OPTIMISE_WEEKLY_REPOS (newline-separated repo list) and
-# OPTIMISE_WEEKLY_LOG (log file path). Unset, both default to the real
-# weekly configuration below.
+# Three environment variables exist ONLY as a test seam and are never
+# operator-facing configuration: OPTIMISE_WEEKLY_REPOS (newline-separated repo
+# list), OPTIMISE_WEEKLY_LOG (log file path) and OPTIMISE_WEEKLY_STALENESS_REMOTE
+# (where the staleness check clones from). Unset, each defaults to the real
+# weekly configuration below. The delivery repo list itself is operator
+# configuration, read from $HOME/.claude/optimise-weekly-repos (one path per
+# line, never tracked anywhere), so no private repo name lives in this public repo.
 set -u
 
 # launchd's environment PATH is minimal (typically /usr/bin:/bin:/usr/sbin:
@@ -146,13 +91,15 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # was indistinguishable in the log from one that had it. Bump this whenever
 # this script's behaviour changes materially; test/static-checks.test.js
 # pins that it has moved past the pre-staleness-check value.
-SCRIPT_VERSION="2026-11-13.1"
+SCRIPT_VERSION="2026-11-22.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REDACT_SCRIPT="$SCRIPT_DIR/redact-transcript.mjs"
 
 LOG="${OPTIMISE_WEEKLY_LOG:-$HOME/.claude/logs/optimise-cycle-weekly.log}"
 REPORT_REL=".claude/optimise-cycle-report.md"
+SIDECAR_REL=".claude/optimise-proposal-targets.json"
+# The ledger window the weekly run has always passed to the optimiser.
+COLLECT_WINDOW=90
 
 # Subtraction round: the real budget is stated explicitly and lowered to
 # 1200s (20 minutes) -- 2.3x the worst measured real run (515s,
@@ -165,6 +112,16 @@ CEILING_MS=1200000
 export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CEILING_MS"
 CEILING_S=$(( CEILING_MS / 1000 ))
 TIMEOUT_S=$(( CEILING_S + 60 ))
+
+# The collector's own worst case for ONE repository, in seconds: ledger 122 s +
+# git 244 s + ci 1444 s (1200 s lane budget, then one 122 s call and one 122 s
+# reader) = 1810 s, 30 minutes 10 seconds, as perRepositoryWorstCaseMs() in
+# workflows/lib/optimise-collect.mjs states it. It is copied here as a literal because bash cannot import it;
+# test/harn-runner-2-t3.test.js fails when the two drift apart. The collector is
+# run under a hard bound of that plus a 30 s grace, with -k 30 forcing the kill.
+COLLECT_WORST_CASE_S=1810
+COLLECT_GRACE_S=30
+COLLECT_TIMEOUT_S=$(( COLLECT_WORST_CASE_S + COLLECT_GRACE_S ))
 
 # Trims leading/trailing whitespace from $1 and appends it to the REPOS
 # array unless the trimmed result is empty. Shared by both REPOS sources
@@ -207,39 +164,44 @@ LAST_RESULT="$HOME/.claude/logs/optimise-cycle-weekly.last-result"
 # Everything this run creates that must not outlive it. Each variable is empty
 # until the run creates the thing it names, and cleanup_run deletes only what
 # is named, so with every variable empty it deletes nothing.
-TRANSCRIPT_FILE=""
 STAGED_WORKFLOW=""      # the staged copy of optimise-cycle.js
 STAGED_MARKER=""        # byte copy of what was staged, left so a SIGKILL leftover is recognisable
 STAGED_SOURCE=""        # what the staged copy must still equal for it to be deleted
 STAGED_WORKFLOW_DIR=""  # set only when this run created .claude/workflows
 STALE_TMPDIR=""
-CLAUDE_PID=""
-RUNNER_PARENT=""        # the runner-owned mode-700 directory that holds one run.XXXXXX directory per invocation
-RUNNER_TMP=""           # THIS invocation's own directory: every per-run file lives in it, and nothing else does
+CLAUDE_PID=""           # the collector or the session while it runs (a trapped signal stops it)
+RUNNER_PARENT=""        # the runner-owned mode-700 directory that holds one run.XXXXXX directory at a time
+RUNNER_TMP=""           # the CURRENT directory: the collected files, the session's output and the checked result live in it, and nothing else does
+RUN_REAL=""             # RUNNER_TMP as a physical path, the one the session's Read rule names
 SWEEP_PENDING=0         # set once at start-up: remove stale run directories left by killed runs
-# A run directory older than this is a dead run's. It is 24 hours because one
-# invocation lasts at most (configured repos) x (the 21-minute session timeout
-# plus its grace), so a live sibling's directory is far younger than this.
-STALE_RUN_MINUTES=1440
+# A run directory older than this is a dead run's. One repository takes at most
+# 3130 s: the collector's worst case COLLECT_WORST_CASE_S = 1810 s plus the
+# session's CEILING_S = 1200 s, its 60 s timeout grace and its 60 s kill grace.
+# The owner's three repositories are 3 x 3130 s = 9390 s, 157 minutes, so a live
+# sibling's directory is far younger than the threshold. Each repository has a
+# directory of its own and removes it before the next, so the threshold only has
+# to outlast one repository; 1410 minutes covers 27 of them and stays under the
+# day between two weekly runs. test/harn-runner-2-t3.test.js holds this to the
+# collector's own figure and to 1440.
+STALE_RUN_MINUTES=1410
 RUN_COMPLETE=0          # set only when the normal end is reached
-SCRATCH_REPORT=""       # where the session writes its report (inside RUNNER_TMP); the runner moves it
-SCRATCH_SIDECAR=""      # the same for the proposal-targets sidecar
 MOVE_TMP=""             # a temp file beside the final path while a move is in flight
 PLAN_MARKER=""          # <repo>/.claude/active-plan, while a run may have it rewritten
 PLAN_SNAPSHOT=""        # its bytes from before the run
 PLAN_HAD=0              # 1 if the marker existed before the run
 PLAN_LABEL=""
 SESSION_ID=""           # this run's --session-id, which the plan-guard hook writes into a marker it claims
-OUTPUT_PROBLEM=""       # why a scratch output was rejected, for the verdict
+OUTPUT_PROBLEM=""       # why a result file could not be placed, for the verdict
 EXIT_REASON=""          # why the run ended abnormally, when the runner knows
 
 # The one cleanup function: the exit trap, the signal handlers and the end of
 # every repo's iteration all come through here, and it holds every rm in this
 # script. The staged copy goes only if it is still byte-identical to its
 # source, so a file the repo ships, or one replaced during the run, is kept.
-# Every invocation owns one directory of its own (RUNNER_TMP), so no file name
-# is shared between runs, and the final call ("final", from the exit path)
-# removes it once the outputs have been placed and the plan marker restored.
+# Every repository owns one directory of its own (RUNNER_TMP), so no file name
+# is shared between runs or between repositories, and the final call ("final",
+# from the end of each repository's iteration and from the exit path) removes it
+# once the outputs have been placed and the plan marker restored.
 # The one-off start-up sweep removes only STALE per-run directories: a real
 # directory (not a link, which find does not follow), named like the runner's
 # own mktemp pattern, owned by this user, older than STALE_RUN_MINUTES, and
@@ -285,15 +247,6 @@ cleanup_run() {
   if [ -n "$MOVE_TMP" ]; then
     rm -f "$MOVE_TMP"
   fi
-  if [ -n "$SCRATCH_REPORT" ]; then
-    rm -rf "$SCRATCH_REPORT"
-  fi
-  if [ -n "$SCRATCH_SIDECAR" ]; then
-    rm -rf "$SCRATCH_SIDECAR"
-  fi
-  if [ -n "$TRANSCRIPT_FILE" ]; then
-    rm -f "$TRANSCRIPT_FILE"
-  fi
   if [ -n "$STALE_TMPDIR" ]; then
     rm -rf "$STALE_TMPDIR"
   fi
@@ -309,9 +262,6 @@ cleanup_run() {
   PLAN_MARKER=""
   PLAN_SNAPSHOT=""
   MOVE_TMP=""
-  SCRATCH_REPORT=""
-  SCRATCH_SIDECAR=""
-  TRANSCRIPT_FILE=""
   STALE_TMPDIR=""
   STAGED_WORKFLOW=""
   STAGED_MARKER=""
@@ -322,132 +272,9 @@ cleanup_run() {
       run.??????) rm -rf "$RUNNER_TMP" ;;
     esac
     RUNNER_TMP=""
+    RUN_REAL=""
   fi
   return 0
-}
-
-# The tools the unattended optimiser may use, and nothing else (the run passes
-# --permission-mode dontAsk). Every entry is here because workflows/
-# optimise-cycle.js instructs it:
-#   - Edit, on the two scratch files the session writes its report and
-#     sidecar to, and nothing else (the entries are added once the runner
-#     directory exists, below). Measured for real: in dontAsk mode every
-#     write into .claude/ is refused whatever the rule, so the session never
-#     writes there; the runner moves the files into place afterwards. There
-#     is no Write entry, because the CLI matches only Edit rules to file
-#     writes (Edit rules cover every file-editing tool).
-#   - node: only the two helper scripts the workflow runs (optimise-read.mjs
-#     and optimise-report-ignore.mjs), by absolute path under $CLAUDE_HOME. A
-#     bare node entry would allow `node -e <anything>`, which is arbitrary
-#     code with network and write access, so it is never listed. The
-#     workflow also permits a repo-local copy when the repo is the harness
-#     itself; that is deliberately NOT allowed here, since a repo's own
-#     script is code the run did not install. A plugin-only install (no
-#     $CLAUDE_HOME mirror) therefore FAILS loudly, and is notified.
-#     optimise-read.mjs only reads files (it imports fs, path, crypto and url,
-#     and never writes or spawns), so it reaches nothing Read cannot, and its
-#     arguments stay free. optimise-report-ignore.mjs writes
-#     <root>/.git/info/exclude and runs git with its cwd at <root>, so it is
-#     allowed only with <root> naming the analysed repo (rooted_rules, below).
-#   - git log and git rev-parse: the plain forms run in the analysed repo
-#     (the session's cwd). The -C forms the git lane uses name the analysed
-#     repo's own root, never a wildcard path, because git run in a directory
-#     an attacker planted (a committed bare-repo layout) reads that
-#     directory's config, which can name a program git executes. They are
-#     spelled `git -C <root> log *`, because the CLI never matches a * mixed
-#     with the trailing :* syntax. A wildcard after the subcommand also
-#     approves inserted options, so -c, --output and --ext-diff are denied
-#     (see the invocation). cat, head, ls, wc and date were dropped
-#     because Read, Grep and Glob cover reading, and each of those commands
-#     takes any path. status, show, diff, ls-files and check-ignore were
-#     dropped as unused by the agent (the helper runs check-ignore itself).
-#     `git remote get-url origin`, which the scope step runs for a report
-#     label, is allowed in exactly that spelling and no other: it prints the
-#     configured URL and contacts nothing, while a wildcard would also admit
-#     `git remote set-url`, which writes config. The plain git rules follow
-#     the session's cwd, so the session is launched with
-#     safe.bareRepository=explicit (see the invocation): git then refuses to
-#     treat a committed bare-repo layout as a repository wherever it runs.
-#   - gh run list and gh run view, from the analysed repo's own directory.
-#     gh repo view is not listed: the workflow never runs it, and with a
-#     HOST/OWNER/REPO argument it sends a request to any host. -R, --repo and
-#     --hostname, which do the same on any gh command, are denied (see the
-#     invocation), as are the GH_HOST and GH_REPO environment prefixes.
-#   - openssl rand -hex 16, exactly: the per-run containment nonce. Any other
-#     openssl rand would allow `-out <file>`.
-# What this list does NOT prevent, stated plainly: Read, Grep and Glob can
-# read any file this user can read, so the boundary against exfiltration is
-# that no allowed command can send data to a host of the session's choosing:
-# WebFetch, curl and wget are refused, and gh may reach only the host the
-# analysed repo's own remote names. That boundary rests on the deny entries
-# below matching every spelling of -R, --repo and --hostname; a prefix rule
-# cannot see inside the arguments, so the deny entries are best effort and
-# not a guarantee. Shell chaining and command substitution inside an allowed
-# command are judged by the CLI's own parser, not by this script.
-# --setting-sources user also loads the operator's own permissions.allow rules
-# from ~/.claude/settings.json, and any such rule joins this allowlist for the
-# unattended session, so this list is the boundary only when the operator has
-# no user-level allow rules. Agent and Workflow start further sessions. Real
-# headless probes under these flags, run by hand during review, found that
-# agents defined inside an analysed repo (.claude/agents/) are not loaded, and
-# that a built-in subagent the session started was refused both a write
-# outside the repo and an unlisted Bash command. Agents the operator has
-# installed at user level do load, and are trusted as the operator's own.
-# The test suite still drives a stub claude. The same hand-run probes found
-# the gh host-naming forms refused, `git remote get-url origin` allowed and
-# `git remote set-url` refused, and safe.bareRepository reaching the
-# session's git; the full real weekly run is recorded in the release
-# checklist when it happens.
-ALLOWED_TOOLS=(
-  "Skill" "Workflow" "Agent" "Read" "Grep" "Glob"
-  "Bash(git log:*)" "Bash(git rev-parse:*)" "Bash(git remote get-url origin)"
-  "Bash(gh run list:*)" "Bash(gh run view:*)"
-  "Bash(node $CLAUDE_HOME/workflows/lib/optimise-read.mjs:*)"
-  "Bash(openssl rand -hex 16)"
-)
-IGNORE_HELPERS=("$CLAUDE_HOME/workflows/lib/optimise-report-ignore.mjs")
-# The workflow tells the agent the global mirror is ~/.claude/workflows/lib;
-# when that is where CLAUDE_HOME points, the tilde spelling is allowed too.
-if [ "$CLAUDE_HOME" = "$HOME/.claude" ]; then
-  ALLOWED_TOOLS+=("Bash(node ~/.claude/workflows/lib/optimise-read.mjs:*)")
-  IGNORE_HELPERS+=("~/.claude/workflows/lib/optimise-report-ignore.mjs")
-fi
-
-# The rules that name one analysed repo's own root, rebuilt for each repo into
-# REPO_ALLOWED. The roots are the two the workflow resolves (the toplevel, and
-# for a linked worktree the main checkout), each in its plain and its
-# double-quoted spelling, since which one the CLI compares is not known here.
-# A root that a rule cannot name exactly (anything but plain path characters)
-# gets no rule at all, never a wildcard: that repo's git lane and report-ignore
-# step are then refused, and the log says so.
-REPO_ALLOWED=()
-rooted_rules() {
-  local repo="$1" label="$2" root helper skipped=0 seen=""
-  REPO_ALLOWED=()
-  for root in "$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" \
-    "$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"; do
-    if [ -z "$root" ] || [ "$root" = "." ] || [ "$root" = "$seen" ]; then
-      continue
-    fi
-    seen="$root"
-    if ! printf '%s' "$root" | grep -Eq '^/[A-Za-z0-9_/.-]+$'; then
-      skipped=1
-      continue
-    fi
-    REPO_ALLOWED+=("Bash(git -C $root log *)" "Bash(git -C \"$root\" log *)" "Bash(git -C $root rev-parse *)" "Bash(git -C \"$root\" rev-parse *)")
-    for helper in "${IGNORE_HELPERS[@]}"; do
-      REPO_ALLOWED+=("Bash(node $helper $root *)" "Bash(node $helper \"$root\" *)")
-    done
-  done
-  # No rule may hold a command substitution: a real headless run printed
-  # `Ignoring --allowedTools rule "*)": Wildcard tool name "*)" is not supported
-  # in allow rules` for a rule holding "$(git rev-parse --show-toplevel)" (the
-  # CLI splits it at the inner parenthesis and discards it). The workflow
-  # therefore has the session run git rev-parse --show-toplevel on its own and
-  # pass the path as a quoted literal, which the rules above name.
-  if [ "$skipped" = 1 ]; then
-    echo "NO-ROOTED-RULES $label (the repo path holds characters a permission rule cannot name)" >> "$LOG"
-  fi
 }
 
 # What the run reports about its own outcome. note_fail is the only place a
@@ -459,8 +286,6 @@ PASS_LABELS=""
 FAIL_LABELS=""
 FAIL_DETAIL=""
 FIRST_FAIL_REASON=""
-VERDICT_FIRST=""
-VERDICT_ALL=""
 note_fail() {
   local label="${1//[$'\n\r']/ }" first="${2//[$'\n\r']/ }" all="${3:-$2}"
   all="${all//[$'\n\r']/ }"
@@ -550,35 +375,49 @@ trap on_exit EXIT
 trap 'on_signal 15 143' TERM
 trap 'on_signal 2 130' INT
 
-# The CLI spells an absolute path in a permission rule with a doubled leading
-# slash (a single slash means relative to the project root), so the rule for
-# /a/b is Edit(//a/b). Kept in one place so a real probe can change it once.
-edit_rule() {
-  printf 'Edit(/%s)' "$1"
+# An empty file of mode 600, made before anything is redirected into it, so a
+# file this script fills (the collector's output, the session's output) is
+# private from its first byte whatever the caller's umask.
+make_private_file() {
+  ( umask 077; : > "$1" )
 }
 
-# Moves a file the session wrote to a scratch path into the repo, after the
-# session has ended. The session is not trusted: the file is accepted only if
-# it is a regular file (not a symlink), non-empty and no larger than $3 bytes,
-# and it lands through a fresh exclusive temp file beside the destination and a
-# rename, which replaces a symlink at the destination instead of following it.
-# A file that is simply absent is left for the verdict to report; one that is
-# present and refused is recorded in OUTPUT_PROBLEM. $4 names it in the reason.
+# Starts this repository's own directory: a fresh mktemp -d inside the runner
+# parent (mode 700, which mktemp gives), and RUN_REAL, its physical path, which
+# is the one the session's Read rule names. Returns 1 when either cannot be had.
+new_run_dir() {
+  RUNNER_TMP="$(mktemp -d "$RUNNER_PARENT/run.XXXXXX" 2>/dev/null)"
+  if [ -z "$RUNNER_TMP" ]; then
+    return 1
+  fi
+  RUN_REAL="$(cd -P "$RUNNER_TMP" 2>/dev/null && pwd -P)"
+  [ -n "$RUN_REAL" ]
+}
+
+# Places a file this script itself wrote (inside the per-run directory, from a
+# result it has already checked) into the repo. It is never a file the session
+# wrote: the session has no file write. The file is accepted only if it is a
+# regular file (not a symlink), non-empty and no larger than $3 bytes, and it
+# lands through a fresh exclusive temp file beside the destination and a rename,
+# which replaces a symlink at the destination instead of following it, so a
+# reader never sees half a report. A file that is simply absent is left to the
+# caller; one that is present and refused is recorded in OUTPUT_PROBLEM, which
+# names it with $4.
 place_output() {
   local src="$1" dest="$2" cap="$3" what="$4" size destdir problem=""
   if [ ! -e "$src" ] && [ ! -L "$src" ]; then
     return 0
   fi
   if [ -L "$src" ]; then
-    problem="$what rejected: the scratch file is a symlink"
+    problem="$what rejected: the result file is a symlink"
   elif [ ! -f "$src" ]; then
-    problem="$what rejected: the scratch path is not a regular file"
+    problem="$what rejected: the result path is not a regular file"
   else
     size=$(wc -c < "$src" | tr -d ' ')
     if [ "$size" -eq 0 ]; then
-      problem="$what rejected: the scratch file is empty"
+      problem="$what rejected: the result file is empty"
     elif [ "$size" -gt "$cap" ]; then
-      problem="$what rejected: the scratch file is larger than $cap bytes"
+      problem="$what rejected: the result file is larger than $cap bytes"
     fi
   fi
   destdir="$(dirname "$dest")"
@@ -601,103 +440,309 @@ place_output() {
   return 1
 }
 
-# Per-repo verdict, decided entirely from the report artefact, claude's exit
-# code, and this script's own observations of the repo -- never from what
-# claude said. Echoes one RESULT line and returns 0 for PASS, 1 for FAIL.
-verdict_repo() {
-  local repo="$1"
-  local repo_label="$2"
-  local claude_exit="$3"
-  local start_epoch="$4"
-  local ceiling_hit="$5"
-  local ceiling_message="$6"
-  local report_path="$repo/$REPORT_REL"
-  local reasons=()
-  local mtime first_line
+# Makes the report and sidecar paths gitignored (the report-ignore helper, once
+# per path, before either file is written), then confirms both with git itself
+# rather than taking the helper's word: a negation in a tracked .gitignore beats
+# .git/info/exclude. $1 is the repo and $2 the root whose .git/info/exclude the
+# helper edits, which is the main checkout (the one shared exclude file) for a
+# linked worktree. Returns 0 only when both paths are confirmed ignored.
+ensure_ignored() {
+  local repo="$1" root="$2"
+  node "$IGNORE_SCRIPT" "$root" "$REPORT_REL" >/dev/null 2>&1
+  node "$IGNORE_SCRIPT" "$root" "$SIDECAR_REL" >/dev/null 2>&1
+  git -c safe.bareRepository=explicit -C "$repo" check-ignore -q -- "$REPORT_REL" 2>/dev/null \
+    && git -c safe.bareRepository=explicit -C "$root" check-ignore -q -- "$SIDECAR_REL" 2>/dev/null
+}
 
-  # 124 and 137 are what `timeout` itself exits with when it stops claude:
-  # 124 after the polite signal, 137 after the -k grace period's hard kill.
-  case "$claude_exit" in
-    0) ;;
-    124) reasons+=("timed out after ${TIMEOUT_S}s") ;;
-    137) reasons+=("killed after timeout grace") ;;
-    *) reasons+=("claude exited $claude_exit") ;;
-  esac
+# Checks what the session returned, against the files this script collected, and
+# prints fixed-vocabulary lines only: TOKENS (the figures for the RESULT line),
+# DENIED (the CLI's own count of refused tool calls), one REASON per problem and
+# PLACE yes|no. Arguments: the per-run directory, the session's output file or -
+# (no session ran), the collector's digest token (ran, or failed:<mode>), the
+# repository path, the physical per-run directory, and the per-run directory as
+# first made. The program is read
+# from stdin, so no collected value is ever spliced into a command string; it
+# imports only node built-ins. When the result is trusted (or the only problem
+# is a lane that could not run) it writes the report and the sidecar into the
+# per-run directory, ready to be placed. It never prints a word the session
+# said, or a path.
+verify_run() {
+  node - "$@" <<'VERIFY_JS'
+'use strict'
+const fs = require('node:fs')
 
-  if [ -n "$OUTPUT_PROBLEM" ]; then
-    reasons+=("$OUTPUT_PROBLEM")
-  fi
+const [dir, sessionPath, digestToken, repo, runDir, runTmp] = process.argv.slice(2)
+const REPORT_CAP = 5242880
+const SIDECAR_CAP = 1048576
+const FILE_CAP = 67108864
+const LANES = ['ledger', 'git', 'ci']
+const reasons = []
+let denied = 'unknown'
+let reportedLedger = null
 
-  # Subtraction round: anchored to the CLI's own message (captured below,
-  # at the call site) rather than a bare grep for the ceiling variable's
-  # NAME, which false-positived on any transcript merely mentioning it --
-  # this repo's own README does. The captured message states the observed
-  # wait in seconds, which also reveals whether the configured ceiling was
-  # actually honoured.
-  if [ "$ceiling_hit" = "1" ]; then
-    reasons+=("background wait ceiling reached before completion ($ceiling_message)")
-  fi
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
+const isCount = (v) => Number.isSafeInteger(v) && v >= 0
+const modeToken = (m) => (typeof m === 'string' && /^[a-z_]{1,32}$/.test(m) ? m : 'other')
+const fail = (reason) => {
+  reasons.push(reason)
+  return null
+}
 
-  if [ ! -f "$report_path" ]; then
-    reasons+=("report file missing at $REPORT_REL")
-  else
-    # GNU first, then BSD, and VALIDATE rather than trusting exit status.
-    #
-    # The previous form was `stat -f %m ... || stat -c %Y ...`, which is
-    # macOS-correct and silently wrong on Linux: GNU stat's -f means "file
-    # system status", not "format", so it SUCCEEDS and prints a block of
-    # filesystem information. Exit 0 meant the `||` fallback never ran and
-    # `[ "$mtime" -lt ... ]` then failed with "integer expression expected",
-    # printing that block to stderr on every clean pass. Found by this repo's
-    # first ever CI run, on both node versions; it had never been executed
-    # anywhere but macOS.
-    #
-    # A fallback chained on exit status cannot protect against a command that
-    # succeeds with the wrong output, so the result is checked for shape.
-    mtime=$(stat -c %Y "$report_path" 2>/dev/null || true)
-    case "$mtime" in
-      ''|*[!0-9]*) mtime=$(stat -f %m "$report_path" 2>/dev/null || true) ;;
-    esac
-    case "$mtime" in
-      ''|*[!0-9]*) mtime="" ;;
-    esac
-    if [ -z "$mtime" ]; then
-      reasons+=("could not read the report file's mtime")
-    elif [ "$mtime" -lt "$start_epoch" ]; then
-      reasons+=("stale report: mtime=$mtime predates this run's start=$start_epoch (not rewritten this run)")
-    fi
+function readText(file) {
+  try {
+    const st = fs.lstatSync(file)
+    return st.isFile() && st.size <= FILE_CAP ? fs.readFileSync(file, 'utf8') : null
+  } catch {
+    return null
+  }
+}
 
-    if [ ! -s "$report_path" ]; then
-      reasons+=("report file is empty")
-    else
-      # Only the first 4 KiB is looked at: bash 3.2 pattern matching on a
-      # multi-megabyte line is quadratic, and a report may be one.
-      first_line=$(grep -m1 -v '^[[:space:]]*$' "$report_path" 2>/dev/null | head -c 4096)
-      # Group 8: strip a leading UTF-8 BOM before checking for a heading --
-      # a BOM-prefixed "# Heading" is still a heading.
-      first_line="${first_line#$'\xef\xbb\xbf'}"
-      if [[ "$first_line" != '# '* ]]; then
-        reasons+=("report does not start with a markdown heading")
-      fi
-      if ! grep -q '^## ' "$report_path"; then
-        reasons+=("report has no section headings")
-      fi
-    fi
-  fi
+function readJson(file) {
+  const text = readText(file)
+  if (text === null) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
 
-  if [ ${#reasons[@]} -eq 0 ]; then
-    echo "RESULT PASS $repo_label report=$REPORT_REL mtime=$mtime"
-    return 0
-  fi
+const lane = { ledger: readJson(`${dir}/ledger.json`), git: readJson(`${dir}/git.json`), ci: readJson(`${dir}/ci.json`) }
+const digest = readJson(`${dir}/digest.json`)
+const state = (name) => (isObject(lane[name]) && (lane[name].status === 'ran' || lane[name].status === 'failed') ? lane[name].status : 'unreadable')
+const resultOf = (name) => (isObject(lane[name]) && isObject(lane[name].result) ? lane[name].result : {})
+const collectedLedger = () => (state('ledger') === 'ran' && isCount(resultOf('ledger').n) ? resultOf('ledger').n : null)
 
-  local joined="" r
-  for r in "${reasons[@]}"; do
-    if [ -z "$joined" ]; then joined="$r"; else joined="$joined; $r"; fi
-  done
-  VERDICT_FIRST="${reasons[0]}"
-  VERDICT_ALL="$joined"
-  echo "RESULT FAIL $repo_label reason=\"$joined\""
-  return 1
+// ---- the figures for the RESULT line: collected values only, fixed tokens and integers ----
+
+function laneToken(name, figure) {
+  if (state(name) === 'failed') return `${name}=failed:${modeToken(lane[name].mode)}`
+  return `${name}=${state(name) === 'ran' && figure !== null ? figure : 'unreadable'}`
+}
+
+function ciFigure() {
+  if (state('ci') !== 'ran') return null
+  if (isCount(lane.ci.runCount)) return String(lane.ci.runCount)
+  return typeof lane.ci.mode === 'string' ? modeToken(lane.ci.mode) : 'unmeasured'
+}
+
+function digestFields() {
+  if (digestToken !== 'ran') return `digest=${/^failed:[a-z_]{1,32}(:[A-Za-z0-9_]{1,40})?$/.test(digestToken) ? digestToken : 'failed:other'}`
+  if (!isObject(digest) || !isObject(digest.dropped)) return 'digest=failed:unreadable'
+  const omitted = Object.values(digest.dropped).filter((v) => Number.isInteger(v)).reduce((a, b) => a + b, 0)
+  return `digest=ran omitted=${omitted} trimmed=${digest.dropped.trimmedForSize === true ? 'yes' : 'no'}`
+}
+
+function tokens() {
+  const n = collectedLedger()
+  const ledger = n === null ? null : `${n}/${reportedLedger === null ? '-' : reportedLedger}`
+  const count = resultOf('git').count
+  return [laneToken('ledger', ledger), laneToken('ci', ciFigure()), laneToken('git', isCount(count) ? count : null), digestFields()].join(' ')
+}
+
+// ---- the session's output: the JSON envelope, then the result inside it ----
+
+function parseSession(text) {
+  if (text.trim() === '') return fail('session output: empty')
+  let envelope
+  try {
+    envelope = JSON.parse(text)
+  } catch {
+    return fail('session output: not a JSON envelope')
+  }
+  if (!isObject(envelope)) return fail('session output: not a JSON envelope')
+  if (Array.isArray(envelope.permission_denials)) denied = String(envelope.permission_denials.length)
+  if (envelope.is_error === true || typeof envelope.result !== 'string' || envelope.result === '') return fail('session output: envelope has no result')
+  let result
+  try {
+    result = JSON.parse(envelope.result)
+  } catch {
+    return fail('session output: result is not a JSON object')
+  }
+  return isObject(result) ? result : fail('session output: result is not a JSON object')
+}
+
+function startsWithHeading(report) {
+  const first = report.replace(/^﻿/, '').slice(0, 4096).split('\n').find((l) => l.trim() !== '')
+  return typeof first === 'string' && first.startsWith('# ')
+}
+
+const needles = []
+for (const value of [process.env.HOME, repo, runDir, runTmp]) {
+  if (typeof value !== 'string' || value.length < 2) continue
+  needles.push(value.replace(/\/+$/, ''))
+  try {
+    needles.push(fs.realpathSync(value))
+  } catch {
+    // a path that does not resolve has no second spelling
+  }
+}
+
+function holdsPath(text) {
+  return needles.some((needle) => {
+    let at = text.indexOf(needle)
+    while (at !== -1) {
+      if (!/[A-Za-z0-9_.-]/.test(text.charAt(at + needle.length))) return true
+      at = text.indexOf(needle, at + 1)
+    }
+    return false
+  })
+}
+
+// ---- the figure checks: what the report says against what the collector wrote ----
+
+const numbersIn = (report, re) => [...report.matchAll(re)].map((m) => m.slice(1).map(Number))
+
+function firstDifference(names, want, got) {
+  const i = want.findIndex((w, k) => w !== got[k])
+  return i < 0 ? null : { name: names[i], want: want[i], got: got[i] }
+}
+
+function checkLanes(said) {
+  for (const name of LANES) {
+    const st = state(name)
+    if (st === 'unreadable') {
+      reasons.push(`collected data unreadable: ${name}`)
+    } else if (!isObject(said[name]) || said[name].status !== st) {
+      const was = isObject(said[name]) && (said[name].status === 'ran' || said[name].status === 'failed') ? said[name].status : 'invalid'
+      reasons.push(`figure mismatch ${name}: lane reported ${was}, collected ${st}`)
+    } else if (st === 'failed' && modeToken(said[name].mode) !== modeToken(lane[name].mode)) {
+      reasons.push(`figure mismatch ${name}: lane mode reported ${modeToken(said[name].mode)}, collected ${modeToken(lane[name].mode)}`)
+    }
+  }
+}
+
+function checkLedger(report) {
+  const want = collectedLedger()
+  if (want === null) return
+  const found = numbersIn(report, /Ledger records in window: (\d{1,15})/g).map(([n]) => n)
+  if (found.length === 0) {
+    reasons.push(`figure mismatch ledger: collected ${want}, reported none`)
+    return
+  }
+  const wrong = found.find((n) => n !== want)
+  reportedLedger = wrong === undefined ? want : wrong
+  if (wrong !== undefined) reasons.push(`figure mismatch ledger: collected ${want}, reported ${wrong}`)
+}
+
+// A lane with a figure the report must show: every line of that shape in the report equals it. A lane with none:
+// the report shows no such line.
+function checkLine(name, report, re, names, want) {
+  const found = numbersIn(report, re)
+  if (want === null) {
+    if (found.length > 0) reasons.push(`figure mismatch ${name}: collected none, reported ${found[0][0]}`)
+    return
+  }
+  if (found.length === 0) {
+    reasons.push(`figure mismatch ${name}: ${names[0]} collected ${want[0]}, reported none`)
+    return
+  }
+  for (const got of found) {
+    const diff = firstDifference(names, want, got)
+    if (diff) {
+      reasons.push(`figure mismatch ${name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`)
+      return
+    }
+  }
+}
+
+function checkCi(report) {
+  const c = lane.ci
+  const measured = state('ci') === 'ran' && isCount(c.runCount) && isCount(c.fetchFailedCount) && isCount(c.timeoutCount)
+  const want = measured ? [c.runCount, c.fetchFailedCount, c.timeoutCount] : null
+  checkLine('ci', report, /CI runs: (\d{1,15}) fetched, (\d{1,15}) not fetched, (\d{1,15}) timed out/g, ['runs', 'not fetched', 'timed out'], want)
+}
+
+function checkGit(report) {
+  const g = resultOf('git')
+  const measured = state('git') === 'ran' && isCount(g.count) && isCount(g.n_commits_examined)
+  checkLine('git', report, /Raw \(unscoped\): (\d{1,15}) of (\d{1,15}) examined commits/g, ['count', 'examined'], measured ? [g.count, g.n_commits_examined] : null)
+}
+
+function checkDigest(report) {
+  if (!isObject(digest) || !isObject(digest.dropped)) {
+    reasons.push('collected data unreadable: digest')
+    return
+  }
+  const dropped = digest.dropped
+  const seen = new Set()
+  for (const [, key, n] of report.matchAll(/Digest omitted ([A-Za-z]{1,40}): (\d{1,15})/g)) {
+    if (!Object.hasOwn(dropped, key) || !isCount(dropped[key])) {
+      reasons.push(`figure mismatch digest: an omission line the digest does not hold, reported ${n}`)
+      return
+    }
+    seen.add(key)
+    if (Number(n) !== dropped[key]) {
+      reasons.push(`figure mismatch digest: omitted ${key} collected ${dropped[key]}, reported ${n}`)
+      return
+    }
+  }
+  for (const [key, value] of Object.entries(dropped)) {
+    if (isCount(value) && value > 0 && !seen.has(key)) {
+      reasons.push(`figure mismatch digest: omitted ${key} collected ${value}, reported none`)
+      return
+    }
+  }
+  if ((dropped.trimmedForSize === true) !== report.includes('Digest trimmed for size: yes')) reasons.push('figure mismatch digest: trimmed flag')
+}
+
+// ---- the result object ----
+
+function checkResult(result) {
+  if (Object.hasOwn(result, 'failed_step')) {
+    const step = typeof result.failed_step === 'string' && /^[a-z_]{1,32}$/.test(result.failed_step) ? ` (${result.failed_step})` : ''
+    return fail(`session returned failed_step${step}`)
+  }
+  if (!isObject(result.lanes)) return fail('session output: result has no lanes')
+  if (!Object.hasOwn(result, 'report')) return fail('session output: result has no report')
+  const report = result.report
+  if (typeof report !== 'string') return fail('session output: report is not a string')
+  if (!startsWithHeading(report)) return fail('report does not start with a markdown heading')
+  if (report.includes('\u0000')) return fail('report contains a NUL byte')
+  if (Buffer.from(report, 'utf8').toString('utf8') !== report) return fail('report is not valid UTF-8')
+  const bytes = Buffer.byteLength(report, 'utf8')
+  if (bytes > REPORT_CAP) return fail(`report is ${bytes} bytes, over the ${REPORT_CAP} cap`)
+  if (!Object.hasOwn(result, 'proposal_targets')) return fail('sidecar missing')
+  if (!isObject(result.proposal_targets)) return fail('sidecar is not a JSON object')
+  const sidecar = JSON.stringify(result.proposal_targets, null, 2) + '\n'
+  if (Buffer.byteLength(sidecar, 'utf8') > SIDECAR_CAP) return fail('sidecar is over the size cap')
+  const ids = [...report.matchAll(/^### ([0-9a-f]{16}):/gm)].map((m) => m[1])
+  if (ids.some((id) => !Object.hasOwn(result.proposal_targets, id))) return fail('sidecar is missing a proposal id the report names')
+  if (holdsPath(report) || holdsPath(sidecar)) return fail('report holds an absolute path (the home directory, the repository or the per-run directory)')
+  return { report, sidecar }
+}
+
+function checkFigures(result, report) {
+  checkLanes(result.lanes)
+  checkLedger(report)
+  checkCi(report)
+  checkGit(report)
+  checkDigest(report)
+}
+
+function main() {
+  let place = 'no'
+  if (sessionPath !== '-') {
+    const st = fs.lstatSync(sessionPath)
+    const text = st.isFile() && st.size <= FILE_CAP ? fs.readFileSync(sessionPath, 'utf8') : null
+    const result = text === null ? fail('session output: not a JSON envelope') : parseSession(text)
+    const checked = result === null ? null : checkResult(result)
+    if (checked !== null) {
+      checkFigures(result, checked.report)
+      if (reasons.length === 0) {
+        for (const name of LANES) if (state(name) === 'failed') reasons.push(`${name} lane could not run: ${modeToken(lane[name].mode)}`)
+        fs.writeFileSync(`${dir}/result-report.md`, checked.report, { mode: 0o600 })
+        fs.writeFileSync(`${dir}/result-sidecar.json`, checked.sidecar, { mode: 0o600 })
+        place = 'yes'
+      }
+    }
+  }
+  const lines = [`TOKENS ${tokens()}`, `DENIED ${denied}`, ...reasons.map((r) => `REASON ${r}`), `PLACE ${place}`]
+  process.stdout.write(`${lines.join('\n')}\n`)
+}
+
+main()
+VERIFY_JS
 }
 
 # ---- AC-OPS-1..5: consumer-install staleness check -
@@ -744,18 +789,16 @@ fi
 SWEEP_PENDING=1
 cleanup_run
 
-# The session writes its report and sidecar here, and the optimiser takes the
-# paths as arguments, so they must be plain absolute paths with no `.claude`
-# segment. The physical path is used, so a symlinked TMPDIR (macOS /var) cannot
-# make the permission rule and the path the session uses disagree.
+# The session is given a Read rule naming one per-run directory, so that path
+# must be a plain absolute path with no `.claude` segment. The physical path is
+# used, so a symlinked TMPDIR (macOS /var) cannot make the permission rule and
+# the path the session reads disagree. Every per-run directory is a run.XXXXXX
+# inside this parent, so checking the parent's directory once covers them all.
 RUNNER_REAL="$(cd -P "$RUNNER_TMP" 2>/dev/null && pwd -P)"
-SCRATCH_REPORT_PATH="$RUNNER_REAL/report.md"
-SCRATCH_SIDECAR_PATH="$RUNNER_REAL/proposal-targets.json"
 if ! printf '%s' "$RUNNER_REAL" | grep -Eq '^/[A-Za-z0-9_/.-]+$' || printf '%s' "$RUNNER_REAL" | grep -Eq '(^|/)(\.claude|\.\.|\.)(/|$)'; then
   EXIT_REASON="runner temp directory path cannot be given to the optimiser (plain characters only, no .claude segment)"
   exit 1
 fi
-ALLOWED_TOOLS+=("$(edit_rule "$SCRATCH_REPORT_PATH")" "$(edit_rule "$SCRATCH_SIDECAR_PATH")")
 
 log_staleness() {
   echo "STALENESS $1 $2" >> "$LOG"
@@ -852,6 +895,11 @@ else
 fi
 # ---- end AC-OPS-1..5 staleness check ---------------------------------
 
+# The staleness check borrowed the first per-run directory (its clone lives in
+# it) and the start-up sweep ran with it. Each repository now gets a directory
+# of its own, so that one is removed before any repository starts.
+cleanup_run final
+
 # T11: an empty repo list used to end the run with exit 0 and no RESULT line,
 # which reads as "nothing to do" when the real state is "nothing is being
 # checked". It is a FAIL, so it is logged, notified and non-zero like any other.
@@ -860,26 +908,90 @@ if [ ${#REPOS[@]} -eq 0 ]; then
   note_fail "-" "no repos configured"
 fi
 
-# The runner passes report_path and proposal_targets_path, which an installed
-# optimise-cycle.js older than this runner does not accept; every repo would
-# then FAIL with "report file missing", which names the symptom and not the
-# cause. Such a run stops here, before anything is staged or any session runs.
-# A plugin-only install has no global copy and is not checked. The check reads
-# the workflow's explicit WEEKLY_RUNNER_CONTRACT constant, not a word in it:
-# the copy on main before this change already contained "report_path" (as a
-# return-value key), so a grep for the word let exactly the old file through.
-REQUIRED_WORKFLOW_CONTRACT=1
+# The workflow takes the digest and the nonce as arguments and RETURNS its report
+# and sidecar (contract 2). An installed optimise-cycle.js from before that
+# neither accepts what this runner hands it nor returns what it checks, so every
+# repo would FAIL with a symptom and not the cause. Such a run stops here, before
+# any collector, staging or session. A plugin-only install has no global copy and
+# is not checked. The check reads the workflow's explicit WEEKLY_RUNNER_CONTRACT
+# constant, not a word in it, which an older file could already contain.
+REQUIRED_WORKFLOW_CONTRACT=2
 installed_contract="$(sed -n 's/^const WEEKLY_RUNNER_CONTRACT = \([0-9][0-9]*\)$/\1/p' "$CLAUDE_HOME/workflows/optimise-cycle.js" 2>/dev/null | head -n1)"
 if [ -f "$CLAUDE_HOME/workflows/optimise-cycle.js" ] && { [ -z "$installed_contract" ] || [ "$installed_contract" -lt "$REQUIRED_WORKFLOW_CONTRACT" ]; }; then
-  echo 'RESULT FAIL - reason="installed optimise-cycle.js predates report_path; run bin/install.sh"' >> "$LOG"
-  note_fail "-" "installed optimise-cycle.js predates report_path; run bin/install.sh"
+  echo 'RESULT FAIL - reason="installed optimise-cycle.js is older than this runner requires; run bin/install.sh"' >> "$LOG"
+  note_fail "-" "installed optimise-cycle.js is older than this runner requires; run bin/install.sh"
   REPOS=()
 fi
 
-# Group 8: bash 3.2's `set -u` treats "${REPOS[@]}" on a genuinely empty
-# array as an unbound-variable error; the ${arr[@]+"${arr[@]}"} idiom below
-# expands to nothing (not an error) when REPOS is empty.
-for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
+# The programs this runner runs, resolved from the install and never from the
+# analysed repository, and the shapes of the collector's one log line. Each is
+# checked per repository, before anything is staged or collected.
+COLLECT_SCRIPT="$CLAUDE_HOME/workflows/lib/optimise-collect.mjs"
+IGNORE_SCRIPT="$CLAUDE_HOME/workflows/lib/optimise-report-ignore.mjs"
+COLLECT_LINE_RE='^COLLECT [A-Za-z0-9_:=,. -]+$'
+DIGEST_RAN_RE=' digest=ran:bytes:[0-9]+,dropped:[0-9]+,trimmed:(yes|no)$'
+DIGEST_FAILED_RE=' digest=failed:([a-z_]+)(:[A-Za-z0-9_]+)?$'
+CEILING_RE='Background tasks still running after [0-9]+s; terminating'
+
+# One FAIL line for a repository that stopped before it had anything to count.
+fail_repo() {
+  echo "RESULT FAIL $1 reason=\"$2\"" >> "$LOG"
+  note_fail "$1" "$2"
+}
+
+# One RESULT line for the repository: PASS when no reason was recorded, else FAIL
+# with the reasons (the global array `reasons`). $2 is the figures verify_run
+# built from the collected files: fixed tokens and integers, so no field
+# identifies a person or carries a word the session said, and the line is the
+# only RESULT line the repository gets.
+record_result() {
+  local label="$1" figures="$2" joined="" r
+  if [ ${#reasons[@]} -eq 0 ]; then
+    echo "RESULT PASS $label${figures:+ $figures}" >> "$LOG"
+    PASS_LABELS="${PASS_LABELS:+$PASS_LABELS, }$label"
+    return 0
+  fi
+  for r in "${reasons[@]}"; do
+    if [ -z "$joined" ]; then joined="$r"; else joined="$joined; $r"; fi
+  done
+  echo "RESULT FAIL $label${figures:+ $figures} reason=\"$joined\"" >> "$LOG"
+  note_fail "$label" "${reasons[0]}" "$joined"
+}
+
+# Reads verify_run's lines (its stdout in $1, its exit status in $2) into the
+# figures, the denied-tool count, whether to place the files, and the reasons.
+read_verify() {
+  local vline
+  VERIFY_FIGURES=""
+  VERIFY_DENIED="unknown"
+  VERIFY_PLACE="no"
+  while IFS= read -r vline; do
+    case "$vline" in
+      "TOKENS "*) VERIFY_FIGURES="${vline#TOKENS }" ;;
+      "DENIED "*) VERIFY_DENIED="${vline#DENIED }" ;;
+      "PLACE "*) VERIFY_PLACE="${vline#PLACE }" ;;
+      "REASON "*) reasons+=("${vline#REASON }") ;;
+    esac
+  done <<< "$1"
+  case "$VERIFY_FIGURES" in
+    *[!A-Za-z0-9_:=/\ -]*) VERIFY_FIGURES="" ;;
+  esac
+  case "$VERIFY_DENIED" in
+    ''|*[!0-9]*) VERIFY_DENIED="unknown" ;;
+  esac
+  if [ "$2" -ne 0 ] || [ -z "$VERIFY_FIGURES" ]; then
+    VERIFY_PLACE="no"
+    reasons+=("the result check could not run")
+  fi
+}
+
+# One repository: collect, run the session, check, place, record. Every way out
+# is a `return`, and the loop below calls cleanup_run final after each, so the
+# per-run directory, the staged workflow and the plan marker are always dealt
+# with.
+process_repo() {
+  local repo="$1" repo_label
+  local global_workflow repo_workflow staged_marker linked
   repo_label="$(basename "$repo")"
 
   # Group 2: a configured path that no longer exists is a configuration
@@ -888,7 +1000,7 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   if [ ! -e "$repo" ]; then
     echo "RESULT FAIL $repo_label reason=\"configured repo path does not exist\"" >> "$LOG"
     note_fail "$repo_label" "configured repo path does not exist"
-    continue
+    return 0
   fi
 
   # Group 2: `git -C rev-parse --git-dir` resolves a linked worktree (whose
@@ -896,15 +1008,25 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   # so a worktree is processed normally rather than skipped.
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
     echo "SKIP $repo_label (not a git repo)" >> "$LOG"
-    continue
+    return 0
   fi
 
   echo "--- $repo_label ---" >> "$LOG"
   if ! cd "$repo"; then
     echo "RESULT FAIL $repo_label reason=\"cd into repo failed\"" >> "$LOG"
     note_fail "$repo_label" "cd into repo failed"
-    continue
+    return 0
   fi
+
+  # AC-OPS-12: every program the runner calls is resolved from the install. A
+  # missing one stops this repository with a reason naming the file, before
+  # anything is staged or any session starts.
+  for needed in "$COLLECT_SCRIPT" "$IGNORE_SCRIPT"; do
+    if [ ! -f "$needed" ]; then
+      fail_repo "$repo_label" "workflows/lib/${needed##*/} is missing from the install; run bin/install.sh"
+      return 0
+    fi
+  done
 
   # Stage the workflow script into the repo, so the run does not have to.
   #
@@ -936,7 +1058,7 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
     if [ -L "$repo/$linked" ]; then
       echo "RESULT FAIL $repo_label reason=\"refusing to stage: $linked is a symlink\"" >> "$LOG"
       note_fail "$repo_label" "refusing to stage: $linked is a symlink"
-      continue 2
+      return 0
     fi
   done
 
@@ -989,18 +1111,21 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
 
   start_epoch=$(date +%s)
   if ! [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
-    echo "RESULT FAIL $repo_label reason=\"could not capture a valid run start time (start_epoch)\"" >> "$LOG"
-    note_fail "$repo_label" "could not capture a valid run start time (start_epoch)"
-    cleanup_run
-    continue
+    fail_repo "$repo_label" "could not capture a valid run start time (start_epoch)"
+    return 0
   fi
 
   SESSION_ID="$( (uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null) | tr 'A-Z' 'a-z')"
   if ! [[ "$SESSION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-    echo "RESULT FAIL $repo_label reason=\"could not mint a session id\"" >> "$LOG"
-    note_fail "$repo_label" "could not mint a session id"
-    cleanup_run
-    continue
+    fail_repo "$repo_label" "could not mint a session id"
+    return 0
+  fi
+
+  # This repository's own directory, so no other repository's session can read
+  # its data.
+  if ! new_run_dir; then
+    fail_repo "$repo_label" "could not create this run's temp directory"
+    return 0
   fi
 
   # The plan-guard Stop hook can re-claim a dormant plan for this headless
@@ -1011,7 +1136,7 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   PLAN_HAD=0
   PLAN_SNAPSHOT="$RUNNER_TMP/active-plan.snapshot"
   if [ -f "$repo/.claude/active-plan" ] && [ ! -L "$repo/.claude/active-plan" ]; then
-    if cp "$repo/.claude/active-plan" "$PLAN_SNAPSHOT"; then
+    if cp "$repo/.claude/active-plan" "$PLAN_SNAPSHOT" && chmod 600 "$PLAN_SNAPSHOT"; then
       PLAN_HAD=1
       PLAN_MARKER="$repo/.claude/active-plan"
     else
@@ -1020,101 +1145,179 @@ for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
   elif [ ! -e "$repo/.claude/active-plan" ] && [ ! -L "$repo/.claude/active-plan" ]; then
     PLAN_MARKER="$repo/.claude/active-plan"
   fi
-  SCRATCH_REPORT="$SCRATCH_REPORT_PATH"
-  SCRATCH_SIDECAR="$SCRATCH_SIDECAR_PATH"
   OUTPUT_PROBLEM=""
+  reasons=()
 
-  # Headless, read-only run. The optimiser writes its report and sidecar to
-  # the scratch paths above, never under .claude/ (the session cannot write
-  # there); this script moves them into place afterwards. We
-  # capture the transcript as diagnostic context only -- verdict_repo above
-  # is what actually decides PASS/FAIL.
-  #
-  # T11 -- the hooks stay ON. The destructive-command guard and the snapshot
-  # hook are what stand between an unattended session and a destroyed
-  # working tree, so nothing here switches them off. The permission model is
-  # an explicit allowlist: --allowedTools names every tool the optimiser
-  # needs, and --permission-mode dontAsk refuses everything else instead of
-  # prompting (nobody is there to answer) or auto-approving it. Edit is
-  # scoped to the two scratch files. --disallowedTools stays as a
-  # second, explicit refusal of the destructive and outward-facing commands
-  # (a deny rule wins over an allow rule); --permission-mode plan was
-  # considered and rejected, since plan mode would block the optimiser
-  # writing the very report this script's verdict depends on.
-  # --setting-sources user loads only the user's own settings, so an analysed
-  # repo's committed or local settings can neither widen the allowlist nor add
-  # hooks. The guard, snapshot and plan-guard hooks are registered at user
-  # level, so they stay.
-  #
-  # The plan-guard Stop hook can still rewrite .claude/active-plan in a repo
-  # with a dormant plan (the 2026-08-16 measurement above); --session-id
-  # gives this run an id the hook then writes into the marker, which is how
-  # cleanup_run knows to put the saved bytes back. The snapshot hook still
-  # writes refs/harness-snapshots/* in each analysed repo; nothing here
-  # prevents that.
-  rooted_rules "$repo" "$repo_label"
-  # safe.bareRepository=explicit for the session's git, appended after any
-  # GIT_CONFIG_* entries the caller already passes rather than replacing them.
-  git_cfg_n="${GIT_CONFIG_COUNT:-0}"
-  case "$git_cfg_n" in
-    ''|*[!0-9]*) git_cfg_n=0 ;;
+  # ---- collect: the runner gathers the ledger, git and CI data itself, into the
+  # per-run directory, before any session starts. The collector is run from the
+  # install under a hard bound of its own worst case plus a grace; it is backgrounded
+  # and waited on so a trapped signal stops it at once (its own handler then ends
+  # the git and gh calls it started).
+  local collect_out="$RUNNER_TMP/collect.out" collect_err="$RUNNER_TMP/collect.err"
+  local collect_exit collect_reason="" collect_line="" collect_note digest_token="" collect_s verify_out verify_status
+  make_private_file "$collect_out"
+  make_private_file "$collect_err"
+  SECONDS=0
+  timeout -k "$COLLECT_GRACE_S" "$COLLECT_TIMEOUT_S" node "$COLLECT_SCRIPT" "$repo" "$RUN_REAL" "$COLLECT_WINDOW" > "$collect_out" 2> "$collect_err" &
+  CLAUDE_PID=$!
+  wait "$CLAUDE_PID"
+  collect_exit=$?
+  CLAUDE_PID=""
+  collect_s=$SECONDS
+  case "$collect_exit" in
+    0) ;;
+    124|137) collect_reason="collector timed out after ${COLLECT_TIMEOUT_S}s" ;;
+    *) collect_reason="collector failed (exit $collect_exit)" ;;
   esac
-  TRANSCRIPT_FILE="$(mktemp "$RUNNER_TMP/optimise-weekly-transcript.XXXXXX")"
-  timeout -k 60 "$TIMEOUT_S" env "GIT_CONFIG_COUNT=$((git_cfg_n + 1))" "GIT_CONFIG_KEY_$git_cfg_n=safe.bareRepository" "GIT_CONFIG_VALUE_$git_cfg_n=explicit" claude -p "Run /optimise-cycle against this repo (arguments: {\"repos\": [\"$repo\"], \"window\": 90, \"report_path\": \"$SCRATCH_REPORT_PATH\", \"proposal_targets_path\": \"$SCRATCH_SIDECAR_PATH\"}). Do not apply any proposal; the optimiser is read-only. When it finishes, reply with only the report file path and the count of ranked proposals." \
-    --allowedTools "${ALLOWED_TOOLS[@]}" ${REPO_ALLOWED[@]+"${REPO_ALLOWED[@]}"} \
+  if [ -z "$collect_reason" ]; then
+    collect_line="$(grep -m1 '^COLLECT ' "$collect_out" 2>/dev/null | head -c 600)"
+    if ! [[ "$collect_line" =~ $COLLECT_LINE_RE ]]; then
+      collect_reason="collector failed (no result line)"
+    elif [[ "$collect_line" =~ $DIGEST_RAN_RE ]]; then
+      digest_token="ran"
+    elif [[ "$collect_line" =~ $DIGEST_FAILED_RE ]]; then
+      digest_token="failed:${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+    else
+      collect_reason="collector failed (no digest field)"
+    fi
+  else
+    # The collector's own stderr line is a fixed vocabulary (its failure class,
+    # never a message), and is logged only if it has that shape.
+    collect_note="$(grep -m1 '^COLLECT ' "$collect_err" 2>/dev/null | head -c 200)"
+    if [[ "$collect_note" =~ $COLLECT_LINE_RE ]]; then
+      echo "$collect_note" >> "$LOG"
+    fi
+  fi
+  if [ -n "$collect_reason" ]; then
+    echo "TIMING $repo_label start_epoch=$start_epoch collect_s=$collect_s" >> "$LOG"
+    reasons+=("$collect_reason")
+    record_result "$repo_label" ""
+    return 0
+  fi
+  echo "$collect_line" >> "$LOG"
+  # A digest the collector refused, or one that is not on disk, is a FAIL with a
+  # fixed reason, and no session is launched for this repository.
+  if [ "${digest_token%%:*}" = ran ] && { [ -L "$RUN_REAL/digest.json" ] || [ ! -f "$RUN_REAL/digest.json" ]; }; then
+    digest_token="failed:missing"
+  fi
+  if [ "${digest_token%%:*}" != ran ]; then
+    echo "TIMING $repo_label start_epoch=$start_epoch collect_s=$collect_s" >> "$LOG"
+    reasons+=("digest refused: ${digest_token#failed:}")
+    verify_out="$(verify_run "$RUN_REAL" - "$digest_token" "$repo" "$RUN_REAL" "$RUNNER_TMP" 2>/dev/null)"
+    verify_status=$?
+    read_verify "$verify_out" "$verify_status"
+    record_result "$repo_label" "$VERIFY_FIGURES"
+    return 0
+  fi
+
+  # ---- the session: one headless run per repository, with the Workflow tool
+  # and a Read rule for this one directory, and no shell and no file write. It
+  # Reads digest.json, calls the installed optimise-cycle workflow with it and a
+  # fresh nonce, and replies with only what the workflow returned. The nonce is
+  # 32 hex characters from a CSPRNG, one per repository, and is never logged.
+  local nonce session_prompt session_out="$RUNNER_TMP/session.out" session_err="$RUNNER_TMP/session.err"
+  local claude_exit ceiling_hit=0 ceiling_message="" session_s
+  nonce="$(node -e "process.stdout.write(require('node:crypto').randomBytes(16).toString('hex'))" 2>/dev/null)"
+  if ! [[ "$nonce" =~ ^[0-9a-f]{32}$ ]]; then
+    reasons+=("could not mint a containment nonce")
+    record_result "$repo_label" ""
+    return 0
+  fi
+  session_prompt="Use the Read tool to read $RUN_REAL/digest.json. Then call the Workflow tool to run the installed optimise-cycle workflow, passing it one argument object with two keys: digest, the parsed content of that file exactly as read, and nonce, the string $nonce. When the workflow returns, reply with ONLY the object it returned, written as JSON, with no other text and no code fence. If you cannot do that, reply with ONLY this JSON object instead: {\"failed_step\": \"read or workflow\", \"reason\": \"one short sentence\"}. Do not run any command, write any file or apply any proposal; the optimiser is read-only."
+  make_private_file "$session_out"
+  make_private_file "$session_err"
+  # The hooks stay ON: the destructive-command guard and the snapshot hook are
+  # what stand between an unattended session and a destroyed working tree, so
+  # nothing here switches them off. --permission-mode dontAsk refuses everything
+  # not listed instead of prompting (nobody is there) or auto-approving it. The
+  # six whole tools are denied by bare name so a user-level allow rule cannot
+  # hand the session one. --setting-sources user loads only the user's own
+  # settings, so an analysed repo's committed or local settings can neither widen
+  # the allowlist nor add hooks. --session-id gives this run an id the plan-guard
+  # hook writes into a marker it claims, which is how cleanup_run knows to put the
+  # saved bytes back. The Read rule's doubled slash is how the CLI spells an
+  # absolute path.
+  SECONDS=0
+  timeout -k 60 "$TIMEOUT_S" claude -p "$session_prompt" \
+    --allowedTools "Workflow" "Read(/$RUN_REAL/**)" \
     --permission-mode dontAsk \
     --setting-sources user \
     --session-id "$SESSION_ID" \
-    --disallowedTools "Bash(rm:*)" "Bash(sudo:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(gh pr merge:*)" "Bash(gh pr create:*)" "Bash(gh issue create:*)" "Bash(gh release create:*)" "Bash(gh workflow run:*)" "Bash(curl:*)" "Bash(wget:*)" "Bash(git -c:*)" "Bash(git -C * -c *)" "Bash(git * --output*)" "Bash(git * --ext-diff*)" "Bash(gh * -R*)" "Bash(gh * -*R*)" "Bash(gh * --repo*)" "Bash(gh * --hostname*)" "Bash(gh -R*)" "Bash(gh --repo*)" "Bash(gh --hostname*)" "Bash(GH_HOST=*)" "Bash(GH_REPO=*)" \
-    > "$TRANSCRIPT_FILE" 2>&1 &
+    --disallowedTools Bash Write Edit NotebookEdit WebFetch WebSearch \
+    --output-format json \
+    > "$session_out" 2> "$session_err" &
   # Backgrounded and waited on, so a SIGTERM or SIGINT to this script is
   # handled at once (on_signal) rather than after claude finishes.
   CLAUDE_PID=$!
   wait "$CLAUDE_PID"
   claude_exit=$?
   CLAUDE_PID=""
-
-  # Subtraction round: anchored to the CLI's OWN message rather than a bare
-  # grep for the ceiling variable's name (which false-positived on any
-  # transcript merely mentioning it), and captures the observed wait so the
-  # FAIL reason states what actually happened, not just that it happened.
-  ceiling_hit=0
-  ceiling_message=""
-  if ceiling_message=$(grep -Eo 'Background tasks still running after [0-9]+s; terminating' "$TRANSCRIPT_FILE" 2>/dev/null | head -n1) && [ -n "$ceiling_message" ]; then
-    ceiling_hit=1
-  fi
-
-  # Group 7: redact the model's free-text transcript before it lands in the
-  # log -- it can and does echo the repo's absolute filesystem path back
-  # (measured, 2026-08-16 log). If redaction itself fails for any reason,
-  # never fall back to appending the raw transcript: log a labelled
-  # placeholder instead, so a redaction failure is visible, not a silent
-  # privacy leak. The relative script name is used in the placeholder, not
-  # $REDACT_SCRIPT's absolute path, so the fallback message itself never
-  # leaks the account path it exists to protect.
-  if [ -f "$REDACT_SCRIPT" ] && node "$REDACT_SCRIPT" "$repo" < "$TRANSCRIPT_FILE" >> "$LOG" 2>/dev/null; then
-    :
-  else
-    echo "[transcript omitted: redaction step failed or is unavailable -- see bin/redact-transcript.mjs]" >> "$LOG"
-  fi
-
-  # The sidecar belongs under the root the optimiser resolved, which for a
-  # linked worktree is the main checkout (the parent of the common git dir).
-  sidecar_root="$(dirname "$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"
-  if [ ! -d "$sidecar_root" ]; then
-    sidecar_root="$repo"
-  fi
-  place_output "$SCRATCH_REPORT" "$repo/$REPORT_REL" 5242880 report
-  place_output "$SCRATCH_SIDECAR" "$sidecar_root/.claude/optimise-proposal-targets.json" 1048576 sidecar
+  session_s=$SECONDS
+  nonce=""
+  session_prompt=""
+  # The session is over: the plan marker is restored and the staged copy removed
+  # now, before the result is checked, and the per-run directory stays until the
+  # repository is done.
   cleanup_run
+  echo "TIMING $repo_label start_epoch=$start_epoch collect_s=$collect_s session_s=$session_s" >> "$LOG"
 
-  echo "exit=$claude_exit $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"
-
-  if verdict_repo "$repo" "$repo_label" "$claude_exit" "$start_epoch" "$ceiling_hit" "$ceiling_message" >> "$LOG"; then
-    PASS_LABELS="${PASS_LABELS:+$PASS_LABELS, }$repo_label"
-  else
-    note_fail "$repo_label" "$VERDICT_FIRST" "$VERDICT_ALL"
+  # 124 and 137 are what `timeout` itself exits with when it stops claude: 124
+  # after the polite signal, 137 after the -k grace period's hard kill.
+  case "$claude_exit" in
+    0) ;;
+    124) reasons+=("timed out after ${TIMEOUT_S}s") ;;
+    137) reasons+=("killed after timeout grace") ;;
+    *) reasons+=("claude exited $claude_exit") ;;
+  esac
+  # Anchored to the CLI's OWN message rather than a bare grep for the ceiling
+  # variable's name (which false-positived on any text merely mentioning it), and
+  # captures the observed wait so the FAIL reason states what actually happened.
+  if ceiling_message=$(grep -h -Eo "$CEILING_RE" "$session_out" "$session_err" 2>/dev/null | head -n1) && [ -n "$ceiling_message" ]; then
+    ceiling_hit=1
+    reasons+=("background wait ceiling reached before completion ($ceiling_message)")
   fi
+
+  # ---- check: the session's reply is parsed strictly, never scanned, and every
+  # figure in it is compared with the lane files collected above. A session that
+  # did not exit 0 is not parsed at all.
+  if [ "$claude_exit" -eq 0 ]; then
+    verify_out="$(verify_run "$RUN_REAL" "$session_out" "$digest_token" "$repo" "$RUN_REAL" "$RUNNER_TMP" 2>/dev/null)"
+  else
+    verify_out="$(verify_run "$RUN_REAL" - "$digest_token" "$repo" "$RUN_REAL" "$RUNNER_TMP" 2>/dev/null)"
+  fi
+  verify_status=$?
+  read_verify "$verify_out" "$verify_status"
+  echo "DENIED-TOOLS $repo_label $VERIFY_DENIED" >> "$LOG"
+
+  # ---- place: only a result that passed every check, or whose one problem is a
+  # lane that could not run, is written; anything else leaves the last good
+  # report and sidecar as they were. The report and sidecar paths are made
+  # ignored, and confirmed so, before either is written.
+  if [ "$VERIFY_PLACE" = yes ] && [ "$claude_exit" -eq 0 ] && [ "$ceiling_hit" = 0 ]; then
+    local sidecar_root
+    sidecar_root="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+    sidecar_root="${sidecar_root%/*}"
+    if [ -z "$sidecar_root" ] || [ ! -d "$sidecar_root" ]; then
+      sidecar_root="$repo"
+    fi
+    if [ ! -f "$RUN_REAL/result-report.md" ] || [ ! -f "$RUN_REAL/result-sidecar.json" ]; then
+      reasons+=("the result check wrote no output")
+    elif ! ensure_ignored "$repo" "$sidecar_root"; then
+      reasons+=("report path is not gitignored")
+    elif ! { place_output "$RUN_REAL/result-report.md" "$repo/$REPORT_REL" 5242880 report \
+      && place_output "$RUN_REAL/result-sidecar.json" "$sidecar_root/$SIDECAR_REL" 1048576 sidecar; }; then
+      reasons+=("$OUTPUT_PROBLEM")
+    fi
+  fi
+  record_result "$repo_label" "$VERIFY_FIGURES"
+}
+
+# Group 8: bash 3.2's `set -u` treats "${REPOS[@]}" on a genuinely empty
+# array as an unbound-variable error; the ${arr[@]+"${arr[@]}"} idiom below
+# expands to nothing (not an error) when REPOS is empty.
+for repo in "${REPOS[@]+"${REPOS[@]}"}"; do
+  process_repo "$repo"
+  cleanup_run final
 done
 
 # A run whose every configured path was skipped checked nothing, which is not a

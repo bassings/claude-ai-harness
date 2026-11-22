@@ -71,3 +71,40 @@ test('optimise-report-ignore: works for a path other than the optimiser\'s own r
   const checkIgnore = spawnSync('git', ['check-ignore', '-q', '.claude/some-other-file.txt'], { cwd: repo })
   assert.equal(checkIgnore.status, 0)
 })
+
+// HARN-RUNNER-2 T3: the report and sidecar paths are made ignored by two runners
+// at once. The read-modify-write (read the file, then rewrite all of it) let one
+// writer's rewrite erase the other's line, or let a reader see the file half
+// written, so a caller's own check-ignore failed. Every caller must come out
+// with its own path ignored, and no line may be lost.
+const { spawn } = require('node:child_process')
+
+function ensureAsync(repo, relativePath) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [MODULE_PATH, repo, relativePath], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.on('data', (d) => { out += d })
+    child.on('close', (code) => resolve({ code, out }))
+  })
+}
+
+test('optimise-report-ignore: many callers at once on one repository each end with their own path ignored and no exclude line lost', async () => {
+  // Three repositories at once, 32 callers each, so the contention is high and one run is enough to show the race.
+  await Promise.all([0, 1, 2].map(async (round) => {
+    const repo = makeTempRepo()
+    const paths = Array.from({ length: 32 }, (_, i) => `.claude/stress-output-${i}.md`)
+    const results = await Promise.all(paths.map((p) => ensureAsync(repo, p)))
+    const failures = results.map((r, i) => ({ path: paths[i], r })).filter(({ r }) => r.code !== 0 || JSON.parse(r.out.trim()).ignored !== true)
+    assert.deepEqual(failures.map((f) => f.path), [], `round ${round}: every caller must be told its path is ignored`)
+    const lines = fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8').split('\n').map((l) => l.trim())
+    assert.deepEqual(paths.filter((p) => !lines.includes(p)), [], `round ${round}: no caller's line may be lost from the exclude file`)
+    for (const p of paths) assert.equal(spawnSync('git', ['check-ignore', '-q', p], { cwd: repo }).status, 0, `${p} is ignored afterwards`)
+  }))
+})
+
+test('optimise-report-ignore: many callers all asking for the same path leave it ignored and every one succeeds', async () => {
+  const repo = makeTempRepo()
+  const results = await Promise.all(Array.from({ length: 24 }, () => ensureAsync(repo, REPORT_REL)))
+  for (const r of results) assert.equal(JSON.parse(r.out.trim()).ignored, true, r.out)
+  assert.equal(spawnSync('git', ['check-ignore', '-q', REPORT_REL], { cwd: repo }).status, 0)
+})
