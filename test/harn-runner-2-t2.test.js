@@ -259,6 +259,18 @@ test('AC-PROD-3: a failed ledger lane leaves the good git figure in the report, 
   assert.equal(result.lanes.git.status, 'ran')
 })
 
+test('HARN-RUNNER-2 T3 M3: a failed ledger lane prints no ledger record count at all, only the lane\'s fixed reason, so no zero stands beside a lane that did not run', async () => {
+  const digest = T.collection('moderate').digest
+  digest.ledger = null
+  digest.lanes.ledger = failedLane('FIXED-LEDGER-REASON the ledger could not be read')
+  const { result } = await T.runDigest(digest)
+  assert.ok(!/Ledger records in window/.test(result.report), 'no record count line while the ledger lane failed')
+  assert.ok(!/minimum for harness-side proposals/.test(result.report), 'nor its minimum')
+  assert.ok(result.report.includes('Not measured: FIXED-LEDGER-REASON the ledger could not be read'), 'the lane\'s reason is shown instead')
+  const ran = await T.runDigest(T.collection('moderate').digest)
+  assert.match(ran.result.report, /^Ledger records in window: \d+ /m, 'control: a ledger that ran still prints its count')
+})
+
 test('AC-PROD-3: a failed ci lane and a failed git lane each show their fixed reason as Not measured and are returned as failed', async () => {
   const digest = T.collection('moderate').digest
   digest.ci = null

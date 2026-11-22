@@ -1341,7 +1341,9 @@ function buildReport(d) {
     // AC-PROD-3: the lane's own reason, so the cause is named and the section says Not measured.
     if (d.ledgerLaneReason) lines.push(`Not measured: ${laneReasonLine(d.ledgerLaneReason, d.flatten)}`)
   }
-  lines.push(`Ledger records in window: ${d.ledgerN} (minimum for harness-side proposals: ${d.minRecords}).`)
+  // HARN-RUNNER-2 T3 (M3): a count is printed only for a ledger that was read. ledgerN defaults to 0 for a lane that
+  // did not run, and a zero beside "Ledger analysis unavailable" reads as an idle repository, not a broken collector.
+  if (!d.ledgerLaneFailed) lines.push(`Ledger records in window: ${d.ledgerN} (minimum for harness-side proposals: ${d.minRecords}).`)
   if (!d.ledgerSufficient) lines.push(`**Insufficient data**: harness-side (rework/wall-clock/trigger) proposals are suppressed until the ledger holds at least ${d.minRecords} records.`)
   if (d.windowTruncated) lines.push('Ledger window was truncated to the most recent records; older history was not read (AC-ARCH-14 bound).')
   if (d.skippedCount > 0) lines.push(`${d.skippedCount} ledger line(s) were skipped as unparseable or missing a required field; see raw skip reasons in the agent transcript.`)

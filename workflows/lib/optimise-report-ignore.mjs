@@ -14,8 +14,9 @@
 // IS this ignore-ensure step. This file makes that claim true, without
 // touching ledger-append.mjs (a PR1 file): it is a deliberately SEPARATE,
 // small, single-purpose script, parameterised by path and root rather than
-// hardcoded to the ledger's own constant, invoked by the report:write
-// agent step (via Bash) before any content is written.
+// hardcoded to the ledger's own constant. Its one caller is the weekly
+// runner's ensure_ignored (bin/optimise-cycle-weekly.sh), which runs it once
+// per output path before either file is written; no session is given it.
 //
 // Kept OUT of workflows/lib/optimise-read.mjs on purpose: that file is
 // read-only by construction and mutation-proven never to invoke git or
@@ -46,9 +47,9 @@ export function ensureIgnored(root, relativePath) {
       // repository) each add their own line, and a rewrite of the whole file
       // from a stale read erased the other's line, or let a reader see the
       // file half written. One small O_APPEND write cannot lose another
-      // writer's line. A leading newline is always safe (a blank line is
-      // harmless in an exclude file) and covers a file whose last line has no
-      // newline, which a stale read cannot be trusted to tell.
+      // writer's line. A leading newline is added only when the file, as this
+      // call read it, does not end with one; a stale read can misjudge that,
+      // and the cost is one blank line, which an exclude file ignores.
       const sep = contents.length && !contents.endsWith('\n') ? '\n' : ''
       fs.appendFileSync(excludePath, sep + relativePath + '\n')
     }

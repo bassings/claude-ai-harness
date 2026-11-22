@@ -1,6 +1,6 @@
 // Integration tests for workflows/lib/optimise-report-ignore.mjs -- the
-// real-Node helper the report:write agent step invokes (via Bash) before
-// writing the optimiser's own report artefact, mirroring
+// real-Node helper the weekly runner's ensure_ignored invokes once per output
+// path before it writes the optimiser's own report and sidecar, mirroring
 // workflows/lib/ledger-append.mjs's ensureGitignored + check-ignore
 // discipline (review round-1 M1: the report had no such protection, while
 // both SKILL.md and optimise-cycle.js claimed "same convention as the

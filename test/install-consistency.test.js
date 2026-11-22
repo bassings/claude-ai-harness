@@ -786,6 +786,16 @@ test('install-consistency: HARN-RUNNER-2 AC-ARCH-7 -- the real tree ships workfl
   assert.ok(listConsumerSubsetFiles(repoRoot).includes('workflows/lib/optimise-collect.mjs'), 'the real tree walk must list the collector as shipped')
 })
 
+// HARN-RUNNER-2 T3 (L7): the result check the weekly runner invokes is shipped by install, like the collector.
+test('install-consistency: HARN-RUNNER-2 L7 -- the real tree ships workflows/lib/optimise-verify.mjs through the consumer subset, and the runner names it as a program it needs', async () => {
+  const { listConsumerSubsetFiles, isConsumerSubsetPath } = await loadModule()
+  const repoRoot = path.join(__dirname, '..')
+  assert.equal(isConsumerSubsetPath('workflows/lib/optimise-verify.mjs'), true)
+  assert.ok(fs.existsSync(path.join(repoRoot, 'workflows', 'lib', 'optimise-verify.mjs')), 'the result check module must exist in the repository')
+  assert.ok(listConsumerSubsetFiles(repoRoot).includes('workflows/lib/optimise-verify.mjs'), 'the real tree walk must list the result check as shipped')
+  assert.match(fs.readFileSync(path.join(repoRoot, 'bin', 'optimise-cycle-weekly.sh'), 'utf8'), /VERIFY_SCRIPT="\$CLAUDE_HOME\/workflows\/lib\/optimise-verify\.mjs"/)
+})
+
 test('install-consistency: listConsumerSubsetFiles never throws when a pattern directory is absent from the tree entirely', async () => {
   const { listConsumerSubsetFiles } = await loadModule()
   const dir = writeTree({ 'AGENT-HARNESS.md': 'x\n' }) // no agents/, workflows/, hooks/, skills/ at all

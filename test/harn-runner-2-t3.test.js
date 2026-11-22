@@ -80,9 +80,17 @@ function assertFailedOnce(res, repo, reasonRe) {
   assert.equal(lines.length, 1, `exactly one RESULT line for the repository, written by the runner:\n${res.logContents}`)
   const line = resultLine(res.logContents, label(repo))
   assert.ok(line?.startsWith('RESULT FAIL '), `expected RESULT FAIL for ${label(repo)}:\n${res.logContents}`)
-  if (reasonRe) assert.match(line, reasonRe, line)
+  if (reasonRe) assert.match(reasonOf(line), reasonRe, `the reason text, not the figure tokens before it: ${line}`)
   assert.equal(res.notifyCalls.length, 1, 'the FAIL notification fires once')
   return line
+}
+
+// The reason text of a RESULT line. Every line carries ledger=, ci=, git= and digest= tokens ahead of it, so a pattern
+// matched against the whole line can pass on a token while the reason names the wrong lane or no number at all (M7).
+function reasonOf(line) {
+  const m = /\breason="(.*)"$/.exec(line)
+  assert.ok(m, `the RESULT line has a reason: ${line}`)
+  return m[1]
 }
 
 // Stops a stub the test started, if it is still running; false when there was nothing to stop.
@@ -191,7 +199,7 @@ test('AC-SEC-10/AC-OPS-12: the collector is run from $CLAUDE_HOME, never from th
   const repo = repoWith()
   const canary = path.join(freshDir('canary-'), 'RAN')
   const hostile = `import fs from 'node:fs'\nfs.writeFileSync(${JSON.stringify(canary)}, 'ran')\nfs.writeFileSync('CANARY-IN-CWD', 'ran')\n`
-  for (const name of ['optimise-collect.mjs', 'optimise-read.mjs', 'optimise-report-ignore.mjs']) {
+  for (const name of ['optimise-collect.mjs', 'optimise-read.mjs', 'optimise-report-ignore.mjs', 'optimise-verify.mjs']) {
     fs.mkdirSync(path.join(repo, 'workflows', 'lib'), { recursive: true })
     fs.writeFileSync(path.join(repo, 'workflows', 'lib', name), hostile)
   }
@@ -207,6 +215,15 @@ test('AC-OPS-12: an install with no collector stops that repository with a reaso
   fs.rmSync(path.join(claudeHome, 'workflows', 'lib', 'optimise-collect.mjs'))
   const res = runRunner([repo], { claudeHome })
   assertFailedOnce(res, repo, /optimise-collect\.mjs/)
+  assert.deepEqual(res.sessions(), [], 'no session was launched')
+})
+
+test('AC-OPS-12/L7: an install with no result check module stops that repository with a reason naming the file, before any session', () => {
+  const repo = repoWith()
+  const claudeHome = provisionInstall(freshDir('claudehome-'))
+  fs.rmSync(path.join(claudeHome, 'workflows', 'lib', 'optimise-verify.mjs'))
+  const res = runRunner([repo], { claudeHome, stubs: ghWith() })
+  assertFailedOnce(res, repo, /optimise-verify\.mjs/)
   assert.deepEqual(res.sessions(), [], 'no session was launched')
 })
 
@@ -287,7 +304,7 @@ test('AC-PROD-1/AC-PROD-4/AC-OPS-7/AC-OPS-9/AC-OPS-17: a correct result is writt
   // The fixture's own untracked ledger shows in the status before any run; the
   // runner's two outputs must not.
   assert.doesNotMatch(sh('git status --porcelain', repo), /optimise-/, 'and neither output shows as a change')
-  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} 0$`, 'm'), 'the CLI\'s own count of refused tool calls is logged')
+  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} unknown$`, 'm'), 'an empty permission_denials list is unknown, not a count (M4)')
   assert.match(res.logContents, /collect_s=\d+/, 'collection wall-clock seconds are logged')
   assert.match(res.logContents, /session_s=\d+/, 'session wall-clock seconds are logged')
   assert.deepEqual(runDirsOf(res.tmpdir), [])
@@ -345,12 +362,12 @@ process.stdout.write(out.replace(/digest=ran:\\S+/, 'digest=failed:too_large'))
 // Every figure here is distinct (ledger 6, CI runs 4, fix commits 2, and each one's altered value), so a number named in a
 // reason cannot be matched by another lane's field.
 const MISMATCHES = [
-  ['ledger record count', 'ledger-plus1', /figure mismatch.*ledger|ledger.*figure mismatch/i, [/\b6\b/, /\b7\b/]],
-  ['CI run count', 'ci-plus1', /figure mismatch.*ci|ci.*figure mismatch/i, [/\b4\b/, /\b5\b/]],
-  ['escaped-defect raw count', 'git-plus1', /figure mismatch.*git|git.*figure mismatch/i, [/\b2\b/, /\b3\b/]],
-  ['hollow report (0 ledger records beside a ledger of 6) -- the 2026-11-13 shape', 'ledger-zero', /ledger/i, [/\b6\b/, /\b0\b/]],
-  ['hollow report built by the real workflow from a ledger emptied in transit', 'ledger-emptied', /ledger/i, [/\b6\b/, /\b0\b/]],
-  ['a lane reported as failed that the collector ran', 'lane-flip', /ledger/i, []],
+  ['ledger record count', 'ledger-plus1', /^figure mismatch ledger: collected 6, reported 7$/, [/\b6\b/, /\b7\b/]],
+  ['CI run count', 'ci-plus1', /^figure mismatch ci: runs collected 4, reported 5$/, [/\b4\b/, /\b5\b/]],
+  ['escaped-defect raw count', 'git-plus1', /^figure mismatch git: count collected 2, reported 3$/, [/\b2\b/, /\b3\b/]],
+  ['hollow report (0 ledger records beside a ledger of 6) -- the 2026-11-13 shape', 'ledger-zero', /^figure mismatch ledger: collected 6, reported 0$/, [/\b6\b/, /\b0\b/]],
+  ['hollow report built by the real workflow from a ledger emptied in transit', 'ledger-emptied', /^figure mismatch ledger: collected 6, reported 0(;|$)/, [/\b6\b/, /\b0\b/]],
+  ['a lane reported as failed that the collector ran', 'lane-flip', /^figure mismatch ledger: lane reported failed, collected ran$/, []],
 ]
 for (const [name, mode, reasonRe, numbers] of MISMATCHES) {
   test(`AC-QA-3/AC-QA-4/AC-SEC-14/AC-QA-13/AC-QA-15: ${name} FAILs naming the figure, writes nothing, and keeps the last good report`, () => {
@@ -359,7 +376,7 @@ for (const [name, mode, reasonRe, numbers] of MISMATCHES) {
     marker(repo, mode)
     const res = runRunner([repo], { stubs: ghWith([11, 12, 13, 14]) })
     const line = assertFailedOnce(res, repo, reasonRe)
-    for (const n of numbers) assert.match(line, n, `the reason names both numbers: ${line}`)
+    for (const n of numbers) assert.match(reasonOf(line), n, `the reason itself names both numbers: ${line}`)
     assertOutputsKept(seed)
     assert.deepEqual(res.sessions().length, 1, 'guard against vacuity: the session ran and returned a result')
   })
@@ -392,7 +409,7 @@ test('AC-QA-13: a run that PASSes replaces the last good report and sidecar with
   assert.equal(res.status, 0, res.logContents)
   assert.notEqual(sha(seed.report), seed.reportSha)
   assert.ok(fs.statSync(seed.report).mtimeMs >= started, 'the report was written during this run')
-  assert.deepEqual(JSON.parse(fs.readFileSync(seed.sidecar, 'utf8')), {}, 'and the sidecar is the returned one')
+  assert.deepEqual(JSON.parse(fs.readFileSync(seed.sidecar, 'utf8')), { last: 'good' }, 'and the sidecar is the returned one merged into the last good one: the entry the returned sidecar lacks is kept (M1)')
 })
 
 test('AC-QA-17/AC-OPS-1: three repositories, the middle one\'s collection fails -- the others PASS with only their own figures, the middle FAILs, one notification names it, and the overall verdict is FAIL', () => {
@@ -641,6 +658,30 @@ test('AC-SEC-12: a SIGTERM while the session runs removes the per-run directory 
   }
 })
 
+test('HARN-RUNNER-2 T3 L10: the plan marker is restored to what it held when the session started, not to what it held before a 30-minute collection', () => {
+  const repo = repoWith()
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, '.claude', 'active-plan'), 'plan.md\nconductor: before-collection\n')
+  const claudeHome = provisionInstall(freshDir('claudehome-'))
+  const lib = path.join(claudeHome, 'workflows', 'lib')
+  fs.renameSync(path.join(lib, 'optimise-collect.mjs'), path.join(lib, 'optimise-collect-real.mjs'))
+  // A conductor writes its own marker while the collector runs.
+  fs.writeFileSync(path.join(lib, 'optimise-collect.mjs'), `import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+const real = path.join(path.dirname(fileURLToPath(import.meta.url)), 'optimise-collect-real.mjs')
+fs.writeFileSync(path.join(process.argv[2], '.claude', 'active-plan'), 'plan.md\\nconductor: during-collection\\n')
+process.stdout.write(execFileSync(process.execPath, [real, ...process.argv.slice(2)], { encoding: 'utf8' }))
+`)
+  // The plan-guard hook re-claims the marker for the headless session.
+  const hook = freshDir('hook-')
+  fs.writeFileSync(path.join(hook, 'claude'), '#!/bin/sh\nsid=""\nwhile [ $# -gt 0 ]; do if [ "$1" = "--session-id" ]; then sid="$2"; fi; shift; done\nprintf \'/abs/plan.md\\nconductor: %s\\n\' "$sid" > .claude/active-plan\n', { mode: 0o755 })
+  const res = runRunner([repo], { claudeHome, stubs: ghWith(), extraPath: hook })
+  assert.match(res.logContents, /^RESTORED-ACTIVE-PLAN /m, `guard against vacuity: the marker was re-claimed and restored\n${res.logContents}`)
+  assert.equal(fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8'), 'plan.md\nconductor: during-collection\n')
+})
+
 test('AC-QA-21: two runners started together against one repository each log a RESULT line, use different directories, and leave one complete returned report in place', async () => {
   const repo = repoWith({ ledger: 5 })
   const stubs = ghWith()
@@ -709,4 +750,264 @@ test('AC-SIMP-6/portability: every RESULT line is PASS or FAIL, and the runner u
   const code = RUNNER_TEXT.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')
   for (const banned of [/declare\s+-A/, /\bmapfile\b/, /\breadarray\b/, /\$\{[A-Za-z_]+(,,|\^\^)\}/, /&>>/, /\|&/]) assert.ok(!banned.test(code), `bash 3.2 has no ${banned}`)
   for (const m of code.matchAll(/RESULT ([A-Z]+)/g)) assert.match(m[1], /^(PASS|FAIL)$/, `a third verdict state: ${m[0]}`)
+})
+
+// ---- T3 fix round 1 ----
+
+// B (M1, L9): the sidecar is the only copy of the id-to-target map for decided proposals, so a run never loses an entry from it.
+
+const SIDECAR_UNREADABLE = 'sidecar on disk cannot be read as a JSON object; left as it was'
+const targetOf = (job) => ({ kind: 'ci_demote', component: 'ci', concern: 'duration', lens: '', workflow: 'ci', job, touches_always_on_lens: false, security_purposed: false })
+const decided = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [String(i + 1).padStart(16, 'd'), targetOf(`job-${i}`)]))
+const OLD_REPORT = '# Delivery optimiser report\n\nThe last good report.\n'
+
+function seedDecided(repo, sidecar) {
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(repo, REPORT_REL), OLD_REPORT)
+  fs.writeFileSync(path.join(repo, SIDECAR_REL), typeof sidecar === 'string' ? sidecar : JSON.stringify(sidecar, null, 2) + '\n')
+}
+
+// A repository whose ledger lane cannot run: the ledger is a symlink, which the collector refuses to read.
+function repoWithUnreadableLedger() {
+  const repo = repoWith({ ledger: null, fix: 2 })
+  const target = path.join(freshDir('outside-'), 'ledger.jsonl')
+  fs.writeFileSync(target, F.validLedger(3))
+  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
+  fs.symlinkSync(target, path.join(repo, '.claude', 'harness-ledger.jsonl'))
+  return repo
+}
+
+test('M1: a failed ledger lane still replaces the report (AC-PROD-3) and never loses a decided target from the sidecar', () => {
+  const repo = repoWithUnreadableLedger()
+  seedDecided(repo, decided(3))
+  const res = runRunner([repo], { stubs: ghWith() })
+  assertFailedOnce(res, repo, /^ledger lane could not run: could_not_read$/)
+  assert.notEqual(fs.readFileSync(path.join(repo, REPORT_REL), 'utf8'), OLD_REPORT, 'the report is replaced')
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(repo, SIDECAR_REL), 'utf8')), decided(3), 'all three decided targets survive, in content')
+})
+
+test('M1/L9: a PASS whose returned sidecar holds fewer entries than the file keeps the file\'s extra ones, and a returned entry replaces the prior one', () => {
+  const repo = repoWith({ ledger: 5 })
+  const prior = { ...decided(2), '0123456789abcdef': targetOf('stale-job') }
+  seedDecided(repo, prior)
+  marker(repo, 'heading-with-key')
+  const res = runRunner([repo], { stubs: ghWith() })
+  assert.equal(res.status, 0, res.logContents)
+  const placed = JSON.parse(fs.readFileSync(path.join(repo, SIDECAR_REL), 'utf8'))
+  assert.deepEqual(Object.keys(placed).sort((a, b) => a.localeCompare(b)), Object.keys(prior).sort((a, b) => a.localeCompare(b)), 'no id was lost and none invented')
+  assert.deepEqual(placed['0123456789abcdef'], { kind: 'ci_demote' }, 'the returned entry replaced the prior one')
+  assert.deepEqual(placed[Object.keys(decided(2))[0]], targetOf('job-0'), 'a prior entry the returned sidecar lacks is kept')
+  const quiet = repoWith({ ledger: 5 })
+  seedDecided(quiet, decided(3))
+  const resQuiet = runRunner([quiet], { stubs: ghWith() })
+  assert.equal(resQuiet.status, 0, resQuiet.logContents)
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(quiet, SIDECAR_REL), 'utf8')), decided(3), 'a PASS that returns an empty sidecar removes nothing')
+})
+
+test('M1: a sidecar on disk that is not valid JSON is left byte for byte, nothing is placed, and the run FAILs with the fixed reason', () => {
+  const repo = repoWith({ ledger: 5 })
+  seedDecided(repo, '{"dddddddddddddddd": {"kind": ')
+  const before = sha(path.join(repo, SIDECAR_REL))
+  const reportBefore = sha(path.join(repo, REPORT_REL))
+  const res = runRunner([repo], { stubs: ghWith() })
+  assertFailedOnce(res, repo, new RegExp(`^${SIDECAR_UNREADABLE}$`))
+  assert.equal(sha(path.join(repo, SIDECAR_REL)), before, 'the sidecar is byte-identical')
+  assert.equal(sha(path.join(repo, REPORT_REL)), reportBefore, 'and no new report is placed over the old one')
+})
+
+test('M1: a sidecar on disk that is a JSON array, or a symlink, is refused the same way and never written through', () => {
+  const array = repoWith({ ledger: 5 })
+  seedDecided(array, '[1, 2, 3]\n')
+  assertFailedOnce(runRunner([array], { stubs: ghWith() }), array, new RegExp(`^${SIDECAR_UNREADABLE}$`))
+  assert.equal(fs.readFileSync(path.join(array, SIDECAR_REL), 'utf8'), '[1, 2, 3]\n')
+  const linked = repoWith({ ledger: 5 })
+  const outside = path.join(freshDir('outside-'), 'targets.json')
+  fs.writeFileSync(outside, JSON.stringify(decided(3)))
+  fs.mkdirSync(path.join(linked, '.claude'), { recursive: true })
+  fs.symlinkSync(outside, path.join(linked, SIDECAR_REL))
+  const res = runRunner([linked], { stubs: ghWith() })
+  assertFailedOnce(res, linked, new RegExp(SIDECAR_UNREADABLE))
+  assert.equal(fs.lstatSync(path.join(linked, SIDECAR_REL)).isSymbolicLink(), true, 'the link is still a link')
+  assert.deepEqual(JSON.parse(fs.readFileSync(outside, 'utf8')), decided(3), 'the file it points at is untouched')
+  assert.equal(fs.existsSync(path.join(linked, REPORT_REL)), false, 'no report was placed')
+})
+
+// D (M3): no zero record count beside a lane that did not run, in what the workflow prints and in what the runner accepts.
+
+test('M3: the report placed for a failed ledger lane holds no ledger record count, only the lane\'s reason', () => {
+  const repo = repoWithUnreadableLedger()
+  const res = runRunner([repo], { stubs: ghWith() })
+  assertFailedOnce(res, repo, /^ledger lane could not run: could_not_read$/)
+  const report = fs.readFileSync(path.join(repo, REPORT_REL), 'utf8')
+  assert.ok(!/Ledger records in window/.test(report), 'no record count line, zero or otherwise')
+  assert.match(report, /Not measured: /)
+})
+
+test('M3: a record count printed beside a ledger lane that did not run FAILs with the figure named, and nothing is placed', () => {
+  const repo = repoWithUnreadableLedger()
+  const seed = seedOutputs(repo)
+  marker(repo, 'ledger-line-added')
+  const res = runRunner([repo], { stubs: ghWith() })
+  assertFailedOnce(res, repo, /^figure mismatch ledger: collected none, reported 0$/)
+  assertOutputsKept(seed)
+})
+
+// C (M2, AC-SEC-14): every number-bearing row the workflow renders is held to the collected data, one class at a time. The
+// repository carries every kind of row (the rich ledger), so each stub mode finds its row; the unaltered result PASSes.
+
+function richRepo() {
+  return F.makeRepo({ ledger: T2.ledgerText(T2.SIZES.moderate), fix: 2, other: 1, author: AUTHOR })
+}
+
+test('M2: the control -- a repository with every kind of row PASSes unaltered, with every row class present in the report', () => {
+  const repo = richRepo()
+  const res = runRunner([repo], { stubs: ghWith() })
+  assert.equal(res.status, 0, res.logContents)
+  const report = fs.readFileSync(path.join(repo, REPORT_REL), 'utf8')
+  for (const [what, re] of [['a per-job CI row', /::ci::build: n=3, failed=0/], ['the scoped line', /Scoped to product source/], ['a per-repository CI row', /runs not completed/], ['a gh calls row', /gh calls/], ['a per-plan wall-clock row', /: ci_wait=\d+s \(n=/], ['the wall-clock totals', /^Totals: /m], ['a never-failing row', /AC-QA-1: n=6/], ['rows left out', /criteria rows left out/], ['a per-repository ledger row', /record\(s\) in window/], ['a trigger row', /total=\d+/], ['a rework row', /open=\d+/]]) assert.match(report, re, `guard against vacuity: the report has ${what}`)
+})
+
+const ROW_MISMATCHES = [
+  ['a per-job CI run count', 'job-n-plus1', /^figure mismatch ci job: n collected 3, reported 4$/],
+  ['a per-job CI failed count', 'job-failed-plus1', /^figure mismatch ci job: failed collected 0, reported 1$/],
+  ['a per-job row whose job the collected data does not hold', 'job-forged-row', /^figure mismatch ci job: a row the collected data does not hold; figure mismatch ci job: n collected 3, reported none$/],
+  ['the scoped escaped-defect excluded count', 'scoped-excluded-plus1', /^figure mismatch git scoped: scoped excluded collected \d+, reported \d+$/],
+  ['a per-repository CI fetch-failure count', 'repostats-plus1', /^figure mismatch ci repository: rate limited collected 0, reported 1$/],
+  ['a gh call count', 'ghcalls-plus1', /^figure mismatch gh calls: calls collected \d+, reported \d+$/],
+  ['a per-plan wall-clock figure', 'plan-wait-plus1', /^figure mismatch wall-clock plan: ci wait seconds collected 0, reported 1$/],
+  ['a wall-clock totals count', 'totals-plus1', /^figure mismatch wall-clock totals: /],
+  ['a never-failing row run count', 'neverfailing-n-plus1', /^figure mismatch never-failing: n collected 6, reported 7$/],
+  ['the criteria-rows-left-out count', 'leftout-plus1', /^figure mismatch never-failing: rows left out collected 16, reported 17$/],
+  ['a per-repository ledger record count', 'ledgerrow-plus1', /^figure mismatch ledger repository: records collected 18, reported 19$/],
+  ['a trigger-accuracy count', 'trigger-plus1', /^figure mismatch trigger accuracy: total collected 1, reported 2$/],
+  ['a rework disposition count', 'rework-plus1', /^figure mismatch rework: open collected 1, reported 2$/],
+  ['an unattributable-runs count', 'excluded-plus1', /^figure mismatch attribution counters: unattributable runs collected 0, reported 1$/],
+  ['a dropped-values counter', 'dropped-plus1', /^figure mismatch dropped counters: dropped count collected 0, reported 1$/],
+  ['an orphaned-runs count', 'orphaned-plus1', /^figure mismatch orphaned runs: terminal-only collected 14, reported 15$/],
+]
+for (const [name, mode, reasonRe] of ROW_MISMATCHES) {
+  test(`M2/AC-SEC-14: ${name} altered by one FAILs naming that figure, writes nothing, and keeps the last good report`, () => {
+    const repo = richRepo()
+    const seed = seedOutputs(repo)
+    marker(repo, mode)
+    const res = runRunner([repo], { stubs: ghWith() })
+    assertFailedOnce(res, repo, reasonRe)
+    assertOutputsKept(seed)
+    assert.equal(res.sessions().length, 1, 'guard against vacuity: the session ran and returned a result')
+  })
+}
+
+// E (M4, AC-OPS-6): `permission_denials` was measured empty although calls were refused, so an empty list is not a zero.
+
+test('M4/AC-OPS-6: a session whose envelope lists no denials logs DENIED-TOOLS unknown, never a confident 0', () => {
+  const repo = repoWith()
+  const res = runRunner([repo], { stubs: ghWith() })
+  assert.equal(res.status, 0, res.logContents)
+  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} unknown$`, 'm'), res.logContents)
+  assert.ok(!new RegExp(`^DENIED-TOOLS ${label(repo)} 0$`, 'm').test(res.logContents))
+})
+
+// F: the ceiling gate, the lane-mode comparison, the home directory spellings, the cause class and the completeness fields.
+
+test('M5: a run that hit the background-wait ceiling but printed a complete, correct result FAILs naming the ceiling and never replaces the last good report', () => {
+  const repo = repoWith()
+  const seed = seedOutputs(repo)
+  marker(repo, 'ceiling-with-envelope')
+  const res = runRunner([repo], { stubs: ghWith() })
+  assertFailedOnce(res, repo, /background wait ceiling reached/i)
+  assertOutputsKept(seed)
+  assert.equal(res.sessions().length, 1, 'guard against vacuity: the session returned a result the checks would have accepted')
+})
+
+test('L6/AC-QA-4: a session that relabels a failed lane\'s failure mode FAILs naming both modes', () => {
+  const repo = repoWith({ ledger: 5, fix: 2 })
+  const stubs = ghWith()
+  F.setGhMode(stubs, 'unauth')
+  marker(repo, 'ci-mode-relabel')
+  const res = runRunner([repo], { stubs })
+  assertFailedOnce(res, repo, /^figure mismatch ci: lane mode reported rate_limited, collected unauthenticated$/)
+})
+
+for (const [mode, suffix] of [['home-dot', '.bak'], ['home-dash', '-old'], ['home-underscore', '_x'], ['home-alnum', 'x']]) {
+  test(`L1/AC-SEC-15: a report holding the home directory followed by "${suffix}" is refused with nothing written`, () => {
+    const repo = repoWith()
+    const seed = seedOutputs(repo)
+    marker(repo, mode)
+    const res = runRunner([repo], { stubs: ghWith() })
+    assertFailedOnce(res, repo, /^report holds an absolute path/)
+    assertOutputsKept(seed)
+  })
+}
+
+const CAUSES = [
+  ['timeout', 'exit124', 'timeout'],
+  ['non-zero exit', 'exit3', 'exit'],
+  ['empty', 'noop', 'empty'],
+  ['malformed', 'not-envelope', 'malformed'],
+  ['failed_step', 'failed-step', 'failed_step'],
+  ['oversized', 'padded-over-cap', 'oversized'],
+  ['the ceiling', 'ceiling-with-envelope', 'timeout'],
+]
+for (const [name, mode, cause] of CAUSES) {
+  test(`L5: a session failure by ${name} names its cause class on the RESULT line`, () => {
+    const repo = repoWith()
+    marker(repo, mode)
+    const res = runRunner([repo], { stubs: ghWith() })
+    const line = assertFailedOnce(res, repo)
+    assert.match(line, new RegExp(` cause=${cause} reason=`), line)
+  })
+}
+
+test('L5: a figure mismatch and a PASS carry no cause class', () => {
+  const bad = repoWith({ ledger: 6 })
+  marker(bad, 'ledger-plus1')
+  assert.ok(!/ cause=/.test(assertFailedOnce(runRunner([bad], { stubs: ghWith() }), bad)))
+  const good = repoWith()
+  assert.ok(!/ cause=/.test(resultLine(runRunner([good], { stubs: ghWith() }).logContents, label(good))))
+})
+
+// L4 (AC-OPS-7): every per-repository RESULT FAIL line carries the completeness fields, `unknown` where a figure does not exist yet.
+const COMPLETENESS = / ledger=\S+ ci=\S+ git=\S+ digest=\S+/
+
+test('L4/AC-OPS-7: a repository that stopped before it had anything to count still logs the completeness fields, with unknown for each', () => {
+  const missing = path.join(freshDir('gone-'), 'no-such-repo')
+  const res = runRunner([missing], { stubs: ghWith() })
+  const line = resultLine(res.logContents, 'no-such-repo')
+  assert.ok(line?.startsWith('RESULT FAIL '), res.logContents)
+  assert.match(line, / ledger=unknown ci=unknown git=unknown digest=unknown reason="configured repo path does not exist"$/)
+  const linked = repoWith({ ledger: null })
+  fs.rmSync(path.join(linked, '.claude'), { recursive: true, force: true })
+  fs.symlinkSync(freshDir('target-'), path.join(linked, '.claude'))
+  const resLinked = runRunner([linked], { stubs: ghWith() })
+  assert.match(resultLine(resLinked.logContents, label(linked)), COMPLETENESS)
+  const noCollector = repoWith()
+  const claudeHome = provisionInstall(freshDir('claudehome-'))
+  fs.rmSync(path.join(claudeHome, 'workflows', 'lib', 'optimise-collect.mjs'))
+  const resNo = runRunner([noCollector], { claudeHome, stubs: ghWith() })
+  assert.match(resultLine(resNo.logContents, label(noCollector)), COMPLETENESS)
+})
+
+test('L4/AC-OPS-7: a collector that fails logs the completeness fields with unknown, and no RESULT FAIL line for a repository lacks them', () => {
+  const repo = repoWith()
+  const claudeHome = provisionInstall(freshDir('claudehome-'))
+  fs.writeFileSync(path.join(claudeHome, 'workflows', 'lib', 'optimise-collect.mjs'), 'process.exit(1)\n')
+  const res = runRunner([repo], { claudeHome, stubs: ghWith() })
+  const line = assertFailedOnce(res, repo, /^collector failed \(exit 1\)$/)
+  assert.match(line, / ledger=unknown ci=unknown git=unknown digest=unknown /)
+  for (const l of res.logContents.match(/^RESULT FAIL [^-].*$/gm) || []) assert.match(l, COMPLETENESS, l)
+})
+
+test('L7/AC-ARCH-6: the result check is a module and not a program inside the runner -- no heredoc node program, and no figure pattern, is left in bin/optimise-cycle-weekly.sh', () => {
+  assert.ok(!/VERIFY_JS|<<'[A-Z_]+'/.test(RUNNER_TEXT), 'no quoted heredoc program')
+  for (const gone of ['Ledger records in window', 'CI runs:', 'Raw (unscoped)', 'checkLedger', 'numbersIn']) assert.ok(!RUNNER_TEXT.includes(gone), `${gone} lives in workflows/lib/optimise-verify.mjs`)
+  assert.match(RUNNER_TEXT, /node "\$VERIFY_SCRIPT" "\$RUN_REAL"/)
+})
+
+test('L4/L8: the runner has one way to fail a repository -- no RESULT FAIL line is echoed outside fail_repo, record_result and the run-level exits', () => {
+  const lines = RUNNER_TEXT.split('\n')
+  const inline = lines.map((l, i) => ({ l, i })).filter(({ l }) => /RESULT FAIL/.test(l) && !/^\s*#/.test(l))
+  const allowed = inline.filter(({ l }) => /RESULT FAIL -|RESULT FAIL \$label|RESULT FAIL \$1|RESULT FAIL \$label\$\{figures/.test(l))
+  const stray = inline.filter((x) => !allowed.includes(x)).map(({ l, i }) => `${i + 1}: ${l.trim()}`)
+  assert.deepEqual(stray, [], 'every labelled RESULT FAIL goes through fail_repo or record_result')
+  assert.ok(!/echo "RESULT FAIL \$repo_label/.test(RUNNER_TEXT), 'no inline per-repository RESULT FAIL')
 })

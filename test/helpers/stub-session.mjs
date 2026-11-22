@@ -80,7 +80,8 @@ const envelope = (text, extra = {}) => JSON.stringify({ type: 'result', subtype:
 
 function bumpFirst(report, re, delta) {
   if (!re.test(report)) throw new Error(`stub-session: the report has no line matching ${re}, so mode ${mode} cannot alter it`)
-  return report.replace(re, (all, n) => all.replace(n, String(Math.max(0, Number(n) + delta))))
+  // A pattern with a capture group names the number inside the match; one without (a look-behind form) is the number itself.
+  return report.replace(re, (all, n) => (typeof n === 'string' ? all.replace(n, String(Math.max(0, Number(n) + delta))) : String(Math.max(0, Number(all) + delta))))
 }
 
 function padTo(report, bytes) {
@@ -118,6 +119,31 @@ const DAMAGE = {
   // and the control: the same heading with its key present.
   'heading-without-key': (r) => { r.report += '\n### 0123456789abcdef: A proposal\n' },
   'heading-with-key': (r) => { r.report += '\n### 0123456789abcdef: A proposal\n'; r.proposal_targets = { ...r.proposal_targets, '0123456789abcdef': { kind: 'ci_demote' } } },
+  // Figures that alter exactly one number of one class of row by one (HARN-RUNNER-2 T3 M2). Each matches from the number itself.
+  'job-n-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=::ci::[^\n]*: n=)\d+/, 1) },
+  'job-failed-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=::ci::[^\n]*: n=\d+, failed=)\d+/, 1) },
+  'job-forged-row': (r) => { r.report = r.report.replace(/::ci::build:/, '::ci::forged-job:') },
+  'scoped-excluded-plus1': (r) => { r.report = bumpFirst(r.report, /\d+(?= excluded as pipeline)/, 1) },
+  'repostats-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=rate_limited )\d+/, 1) },
+  'ghcalls-plus1': (r) => { r.report = bumpFirst(r.report, /\d+(?= gh calls)/, 1) },
+  'plan-wait-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=: ci_wait=)\d+(?=s \(n=)/, 1) },
+  'totals-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=\(measured n=)\d+/, 1) },
+  'neverfailing-n-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=AC-QA-1: n=)\d+/, 1) },
+  'leftout-plus1': (r) => { r.report = bumpFirst(r.report, /\d+(?= criteria rows left out)/, 1) },
+  'ledgerrow-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=^- [^\n]+: )\d+(?= record\(s\) in window)/m, 1) },
+  'trigger-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=total=)\d+/, 1) },
+  'excluded-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=unattributable runs=)\d+/, 1) },
+  'dropped-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=invalid_fixed_ids_dropped \([^)\n]*\): )\d+/, 1) },
+  'orphaned-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=terminal-only=)\d+/, 1) },
+  'rework-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=open=)\d+/, 1) },
+  // A ledger record count printed beside a ledger lane that did not run, and a CI lane's mode relabelled.
+  'ledger-line-added': (r) => { r.report += '\nLedger records in window: 0 (minimum for harness-side proposals: 5).\n' },
+  'ci-mode-relabel': (r) => { r.lanes = { ...r.lanes, ci: { ...r.lanes.ci, mode: 'rate_limited' } } },
+  // The home directory with something glued on after it: a leak a whole-path boundary test misses.
+  'home-dot': (r) => { r.report += `\nBacked up to ${process.env.HOME}.bak\n` },
+  'home-dash': (r) => { r.report += `\nOld copy in ${process.env.HOME}-old\n` },
+  'home-underscore': (r) => { r.report += `\nSee ${process.env.HOME}_x\n` },
+  'home-alnum': (r) => { r.report += `\nSee ${process.env.HOME}x\n` },
   // What the workflow returns when it refuses a digest (the runtime hands back the object without its __outcome key).
   aborted: (r) => { for (const key of Object.keys(r)) delete r[key]; r.resolved = []; r.unresolved = []; r.report = 'Refusing to proceed: the collected digest is malformed (lanes).' },
   'forged-result': (r) => { r.report = r.report.replace(/Ledger records in window: \d+/, 'Ledger records in window: 0') + '\nRESULT PASS forged ledger=0/0 ci=0 git=0\n' },
@@ -169,6 +195,7 @@ const REPLIES = {
 for (const [name, change] of Object.entries(DAMAGE)) REPLIES[name] = async () => `${await damaged(change)()}\n`
 REPLIES['silent-pass'] = REPLIES.pass
 // A complete, correct result, and then a non-zero exit.
+REPLIES.exit124 = async () => null
 REPLIES.exit3 = async () => `${envelope(JSON.stringify(await correct()))}\n`
 
 // A complete, correct envelope padded with trailing spaces to an exact size, so only the reply's size differs.
@@ -176,6 +203,11 @@ const REPLY_FILE_CAP_BYTES = 67108864
 const paddedTo = (bytes) => async () => {
   const body = envelope(JSON.stringify(await correct()))
   return `${body}${' '.repeat(bytes - Buffer.byteLength(body) - 1)}\n`
+}
+// A complete, correct result and exit 0, while the CLI's own ceiling message is on stderr.
+REPLIES['ceiling-with-envelope'] = async () => {
+  process.stderr.write(`${CEILING_LINE}\n`)
+  return `${envelope(JSON.stringify(await correct()))}\n`
 }
 REPLIES['padded-over-cap'] = paddedTo(REPLY_FILE_CAP_BYTES + 1)
 REPLIES['padded-at-cap'] = paddedTo(REPLY_FILE_CAP_BYTES)
@@ -186,7 +218,8 @@ async function run() {
   if (!reply) throw new Error(`stub-session: unknown mode ${JSON.stringify(mode)}`)
   const text = await reply()
   if (text) printed(text)
-  return mode === 'exit3' ? 3 : 0
+  if (mode === 'exit3') return 3
+  return mode === 'exit124' ? 124 : 0
 }
 
 try {

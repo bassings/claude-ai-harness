@@ -454,295 +454,35 @@ ensure_ignored() {
     && git -c safe.bareRepository=explicit -C "$root" check-ignore -q -- "$SIDECAR_REL" 2>/dev/null
 }
 
-# Checks what the session returned, against the files this script collected, and
+# Checks what the session returned, against the files this script collected, by
+# running the installed result check (workflows/lib/optimise-verify.mjs), which
 # prints fixed-vocabulary lines only: TOKENS (the figures for the RESULT line),
-# DENIED (the CLI's own count of refused tool calls), one REASON per problem and
-# PLACE yes|no. Arguments: the per-run directory, the session's output file or -
-# (no session ran), the collector's digest token (ran, or failed:<mode>), the
-# repository path, the physical per-run directory, and the per-run directory as
-# first made. The program is read
-# from stdin, so no collected value is ever spliced into a command string; it
-# imports only node built-ins. When the result is trusted (or the only problem
-# is a lane that could not run) it writes the report and the sidecar into the
-# per-run directory, ready to be placed. It never prints a word the session
-# said, or a path.
+# DENIED (the CLI's refused-tool count, or unknown), one REASON per problem and
+# PLACE yes|no. Arguments: the session's output file or - (no session ran), the
+# collector's digest token (ran, or failed:<mode>), the repository path and the
+# root whose .claude/ holds the proposal-targets sidecar (or - when no session
+# ran); the per-run directory and the runner's own temp directory come from
+# RUN_REAL and RUNNER_TMP. No collected value is ever spliced into a command string. When the
+# result is trusted (or the only problem is a lane that could not run) the module
+# writes the report and the sidecar into the per-run directory, ready to be
+# placed; the sidecar it writes is the returned one merged into the one on disk,
+# so no decided target is ever lost, and a sidecar on disk that cannot be read
+# stops the run with nothing placed. It never prints a word the session said, or
+# a path.
 verify_run() {
-  node - "$@" <<'VERIFY_JS'
-'use strict'
-const fs = require('node:fs')
-
-const [dir, sessionPath, digestToken, repo, runDir, runTmp] = process.argv.slice(2)
-const REPORT_CAP = 5242880
-const SIDECAR_CAP = 1048576
-const FILE_CAP = 67108864
-const LANES = ['ledger', 'git', 'ci']
-const reasons = []
-let denied = 'unknown'
-let reportedLedger = null
-
-const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
-const isCount = (v) => Number.isSafeInteger(v) && v >= 0
-const modeToken = (m) => (typeof m === 'string' && /^[a-z_]{1,32}$/.test(m) ? m : 'other')
-const fail = (reason) => {
-  reasons.push(reason)
-  return null
+  node "$VERIFY_SCRIPT" "$RUN_REAL" "$1" "$2" "$3" "$RUNNER_TMP" "$4"
 }
 
-function readText(file) {
-  try {
-    const st = fs.lstatSync(file)
-    return st.isFile() && st.size <= FILE_CAP ? fs.readFileSync(file, 'utf8') : null
-  } catch {
-    return null
-  }
-}
-
-function readJson(file) {
-  const text = readText(file)
-  if (text === null) return null
-  try {
-    return JSON.parse(text)
-  } catch {
-    return null
-  }
-}
-
-const lane = { ledger: readJson(`${dir}/ledger.json`), git: readJson(`${dir}/git.json`), ci: readJson(`${dir}/ci.json`) }
-const digest = readJson(`${dir}/digest.json`)
-const state = (name) => (isObject(lane[name]) && (lane[name].status === 'ran' || lane[name].status === 'failed') ? lane[name].status : 'unreadable')
-const resultOf = (name) => (isObject(lane[name]) && isObject(lane[name].result) ? lane[name].result : {})
-const collectedLedger = () => (state('ledger') === 'ran' && isCount(resultOf('ledger').n) ? resultOf('ledger').n : null)
-
-// ---- the figures for the RESULT line: collected values only, fixed tokens and integers ----
-
-function laneToken(name, figure) {
-  if (state(name) === 'failed') return `${name}=failed:${modeToken(lane[name].mode)}`
-  return `${name}=${state(name) === 'ran' && figure !== null ? figure : 'unreadable'}`
-}
-
-function ciFigure() {
-  if (state('ci') !== 'ran') return null
-  if (isCount(lane.ci.runCount)) return String(lane.ci.runCount)
-  return typeof lane.ci.mode === 'string' ? modeToken(lane.ci.mode) : 'unmeasured'
-}
-
-function digestFields() {
-  if (digestToken !== 'ran') return `digest=${/^failed:[a-z_]{1,32}(:[A-Za-z0-9_]{1,40})?$/.test(digestToken) ? digestToken : 'failed:other'}`
-  if (!isObject(digest) || !isObject(digest.dropped)) return 'digest=failed:unreadable'
-  const omitted = Object.values(digest.dropped).filter((v) => Number.isInteger(v)).reduce((a, b) => a + b, 0)
-  return `digest=ran omitted=${omitted} trimmed=${digest.dropped.trimmedForSize === true ? 'yes' : 'no'}`
-}
-
-function tokens() {
-  const n = collectedLedger()
-  const ledger = n === null ? null : `${n}/${reportedLedger === null ? '-' : reportedLedger}`
-  const count = resultOf('git').count
-  return [laneToken('ledger', ledger), laneToken('ci', ciFigure()), laneToken('git', isCount(count) ? count : null), digestFields()].join(' ')
-}
-
-// ---- the session's output: the JSON envelope, then the result inside it ----
-
-function parseSession(text) {
-  if (text.trim() === '') return fail('session output: empty')
-  let envelope
-  try {
-    envelope = JSON.parse(text)
-  } catch {
-    return fail('session output: not a JSON envelope')
-  }
-  if (!isObject(envelope)) return fail('session output: not a JSON envelope')
-  if (Array.isArray(envelope.permission_denials)) denied = String(envelope.permission_denials.length)
-  if (envelope.is_error === true || typeof envelope.result !== 'string' || envelope.result === '') return fail('session output: envelope has no result')
-  let result
-  try {
-    result = JSON.parse(envelope.result)
-  } catch {
-    return fail('session output: result is not a JSON object')
-  }
-  return isObject(result) ? result : fail('session output: result is not a JSON object')
-}
-
-function startsWithHeading(report) {
-  const first = report.replace(/^﻿/, '').slice(0, 4096).split('\n').find((l) => l.trim() !== '')
-  return typeof first === 'string' && first.startsWith('# ')
-}
-
-const needles = []
-for (const value of [process.env.HOME, repo, runDir, runTmp]) {
-  if (typeof value !== 'string' || value.length < 2) continue
-  needles.push(value.replace(/\/+$/, ''))
-  try {
-    needles.push(fs.realpathSync(value))
-  } catch {
-    // a path that does not resolve has no second spelling
-  }
-}
-
-function holdsPath(text) {
-  return needles.some((needle) => {
-    let at = text.indexOf(needle)
-    while (at !== -1) {
-      if (!/[A-Za-z0-9_.-]/.test(text.charAt(at + needle.length))) return true
-      at = text.indexOf(needle, at + 1)
-    }
-    return false
-  })
-}
-
-// ---- the figure checks: what the report says against what the collector wrote ----
-
-const numbersIn = (report, re) => [...report.matchAll(re)].map((m) => m.slice(1).map(Number))
-
-function firstDifference(names, want, got) {
-  const i = want.findIndex((w, k) => w !== got[k])
-  return i < 0 ? null : { name: names[i], want: want[i], got: got[i] }
-}
-
-function checkLanes(said) {
-  for (const name of LANES) {
-    const st = state(name)
-    if (st === 'unreadable') {
-      reasons.push(`collected data unreadable: ${name}`)
-    } else if (!isObject(said[name]) || said[name].status !== st) {
-      const was = isObject(said[name]) && (said[name].status === 'ran' || said[name].status === 'failed') ? said[name].status : 'invalid'
-      reasons.push(`figure mismatch ${name}: lane reported ${was}, collected ${st}`)
-    } else if (st === 'failed' && modeToken(said[name].mode) !== modeToken(lane[name].mode)) {
-      reasons.push(`figure mismatch ${name}: lane mode reported ${modeToken(said[name].mode)}, collected ${modeToken(lane[name].mode)}`)
-    }
-  }
-}
-
-function checkLedger(report) {
-  const want = collectedLedger()
-  if (want === null) return
-  const found = numbersIn(report, /Ledger records in window: (\d{1,15})/g).map(([n]) => n)
-  if (found.length === 0) {
-    reasons.push(`figure mismatch ledger: collected ${want}, reported none`)
-    return
-  }
-  const wrong = found.find((n) => n !== want)
-  reportedLedger = wrong === undefined ? want : wrong
-  if (wrong !== undefined) reasons.push(`figure mismatch ledger: collected ${want}, reported ${wrong}`)
-}
-
-// A lane with a figure the report must show: every line of that shape in the report equals it. A lane with none:
-// the report shows no such line.
-function checkLine(name, report, re, names, want) {
-  const found = numbersIn(report, re)
-  if (want === null) {
-    if (found.length > 0) reasons.push(`figure mismatch ${name}: collected none, reported ${found[0][0]}`)
-    return
-  }
-  if (found.length === 0) {
-    reasons.push(`figure mismatch ${name}: ${names[0]} collected ${want[0]}, reported none`)
-    return
-  }
-  for (const got of found) {
-    const diff = firstDifference(names, want, got)
-    if (diff) {
-      reasons.push(`figure mismatch ${name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`)
-      return
-    }
-  }
-}
-
-function checkCi(report) {
-  const c = lane.ci
-  const measured = state('ci') === 'ran' && isCount(c.runCount) && isCount(c.fetchFailedCount) && isCount(c.timeoutCount)
-  const want = measured ? [c.runCount, c.fetchFailedCount, c.timeoutCount] : null
-  checkLine('ci', report, /CI runs: (\d{1,15}) fetched, (\d{1,15}) not fetched, (\d{1,15}) timed out/g, ['runs', 'not fetched', 'timed out'], want)
-}
-
-function checkGit(report) {
-  const g = resultOf('git')
-  const measured = state('git') === 'ran' && isCount(g.count) && isCount(g.n_commits_examined)
-  checkLine('git', report, /Raw \(unscoped\): (\d{1,15}) of (\d{1,15}) examined commits/g, ['count', 'examined'], measured ? [g.count, g.n_commits_examined] : null)
-}
-
-function checkDigest(report) {
-  if (!isObject(digest) || !isObject(digest.dropped)) {
-    reasons.push('collected data unreadable: digest')
-    return
-  }
-  const dropped = digest.dropped
-  const seen = new Set()
-  for (const [, key, n] of report.matchAll(/Digest omitted ([A-Za-z]{1,40}): (\d{1,15})/g)) {
-    if (!Object.hasOwn(dropped, key) || !isCount(dropped[key])) {
-      reasons.push(`figure mismatch digest: an omission line the digest does not hold, reported ${n}`)
-      return
-    }
-    seen.add(key)
-    if (Number(n) !== dropped[key]) {
-      reasons.push(`figure mismatch digest: omitted ${key} collected ${dropped[key]}, reported ${n}`)
-      return
-    }
-  }
-  for (const [key, value] of Object.entries(dropped)) {
-    if (isCount(value) && value > 0 && !seen.has(key)) {
-      reasons.push(`figure mismatch digest: omitted ${key} collected ${value}, reported none`)
-      return
-    }
-  }
-  if ((dropped.trimmedForSize === true) !== report.includes('Digest trimmed for size: yes')) reasons.push('figure mismatch digest: trimmed flag')
-}
-
-// ---- the result object ----
-
-function checkResult(result) {
-  if (Object.hasOwn(result, 'failed_step')) {
-    const step = typeof result.failed_step === 'string' && /^[a-z_]{1,32}$/.test(result.failed_step) ? ` (${result.failed_step})` : ''
-    return fail(`session returned failed_step${step}`)
-  }
-  if (!isObject(result.lanes)) return fail('session output: result has no lanes')
-  if (!Object.hasOwn(result, 'report')) return fail('session output: result has no report')
-  const report = result.report
-  if (typeof report !== 'string') return fail('session output: report is not a string')
-  if (!startsWithHeading(report)) return fail('report does not start with a markdown heading')
-  if (report.includes('\u0000')) return fail('report contains a NUL byte')
-  if (Buffer.from(report, 'utf8').toString('utf8') !== report) return fail('report is not valid UTF-8')
-  const bytes = Buffer.byteLength(report, 'utf8')
-  if (bytes > REPORT_CAP) return fail(`report is ${bytes} bytes, over the ${REPORT_CAP} cap`)
-  if (!Object.hasOwn(result, 'proposal_targets')) return fail('sidecar missing')
-  if (!isObject(result.proposal_targets)) return fail('sidecar is not a JSON object')
-  const sidecar = JSON.stringify(result.proposal_targets, null, 2) + '\n'
-  if (Buffer.byteLength(sidecar, 'utf8') > SIDECAR_CAP) return fail('sidecar is over the size cap')
-  const ids = [...report.matchAll(/^### ([0-9a-f]{16}):/gm)].map((m) => m[1])
-  if (ids.some((id) => !Object.hasOwn(result.proposal_targets, id))) return fail('sidecar is missing a proposal id the report names')
-  if (holdsPath(report) || holdsPath(sidecar)) return fail('report holds an absolute path (the home directory, the repository or the per-run directory)')
-  return { report, sidecar }
-}
-
-function checkFigures(result, report) {
-  checkLanes(result.lanes)
-  checkLedger(report)
-  checkCi(report)
-  checkGit(report)
-  checkDigest(report)
-}
-
-function main() {
-  let place = 'no'
-  if (sessionPath !== '-') {
-    const st = fs.lstatSync(sessionPath)
-    const text = st.isFile() && st.size <= FILE_CAP ? fs.readFileSync(sessionPath, 'utf8') : null
-    const result = text === null ? fail('session output: not a JSON envelope') : parseSession(text)
-    const checked = result === null ? null : checkResult(result)
-    if (checked !== null) {
-      checkFigures(result, checked.report)
-      if (reasons.length === 0) {
-        for (const name of LANES) if (state(name) === 'failed') reasons.push(`${name} lane could not run: ${modeToken(lane[name].mode)}`)
-        fs.writeFileSync(`${dir}/result-report.md`, checked.report, { mode: 0o600 })
-        fs.writeFileSync(`${dir}/result-sidecar.json`, checked.sidecar, { mode: 0o600 })
-        place = 'yes'
-      }
-    }
-  }
-  const lines = [`TOKENS ${tokens()}`, `DENIED ${denied}`, ...reasons.map((r) => `REASON ${r}`), `PLACE ${place}`]
-  process.stdout.write(`${lines.join('\n')}\n`)
-}
-
-main()
-VERIFY_JS
+# The root whose .claude/ holds the sidecar: the main checkout (the one shared
+# git directory's parent) for a linked worktree, else the repository itself.
+sidecar_root_of() {
+  local root
+  root="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  root="${root%/*}"
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
+    root="$1"
+  fi
+  printf '%s' "$root"
 }
 
 # ---- AC-OPS-1..5: consumer-install staleness check -
@@ -928,14 +668,24 @@ fi
 # checked per repository, before anything is staged or collected.
 COLLECT_SCRIPT="$CLAUDE_HOME/workflows/lib/optimise-collect.mjs"
 IGNORE_SCRIPT="$CLAUDE_HOME/workflows/lib/optimise-report-ignore.mjs"
+VERIFY_SCRIPT="$CLAUDE_HOME/workflows/lib/optimise-verify.mjs"
 COLLECT_LINE_RE='^COLLECT [A-Za-z0-9_:=,. -]+$'
 DIGEST_RAN_RE=' digest=ran:bytes:[0-9]+,dropped:[0-9]+,trimmed:(yes|no)$'
 DIGEST_FAILED_RE=' digest=failed:([a-z_]+)(:[A-Za-z0-9_]+)?$'
 CEILING_RE='Background tasks still running after [0-9]+s; terminating'
 
+# What the completeness fields say when no figure exists yet: every per-repository
+# RESULT line carries them (AC-OPS-7), with this fixed token where a figure was
+# never collected.
+UNKNOWN_FIGURES="ledger=unknown ci=unknown git=unknown digest=unknown"
+# The class of a session failure (timeout, exit, empty, malformed, failed_step,
+# oversized), set from the exit status or from the result check; empty when the
+# session did not fail.
+SESSION_CAUSE=""
+
 # One FAIL line for a repository that stopped before it had anything to count.
 fail_repo() {
-  echo "RESULT FAIL $1 reason=\"$2\"" >> "$LOG"
+  echo "RESULT FAIL $1 $UNKNOWN_FIGURES reason=\"$2\"" >> "$LOG"
   note_fail "$1" "$2"
 }
 
@@ -945,16 +695,17 @@ fail_repo() {
 # identifies a person or carries a word the session said, and the line is the
 # only RESULT line the repository gets.
 record_result() {
-  local label="$1" figures="$2" joined="" r
+  local label="$1" figures="${2:-$UNKNOWN_FIGURES}" joined="" r
+  figures="$figures${SESSION_CAUSE:+ cause=$SESSION_CAUSE}"
   if [ ${#reasons[@]} -eq 0 ]; then
-    echo "RESULT PASS $label${figures:+ $figures}" >> "$LOG"
+    echo "RESULT PASS $label $figures" >> "$LOG"
     PASS_LABELS="${PASS_LABELS:+$PASS_LABELS, }$label"
     return 0
   fi
   for r in "${reasons[@]}"; do
     if [ -z "$joined" ]; then joined="$r"; else joined="$joined; $r"; fi
   done
-  echo "RESULT FAIL $label${figures:+ $figures} reason=\"$joined\"" >> "$LOG"
+  echo "RESULT FAIL $label $figures reason=\"$joined\"" >> "$LOG"
   note_fail "$label" "${reasons[0]}" "$joined"
 }
 
@@ -965,8 +716,10 @@ read_verify() {
   VERIFY_FIGURES=""
   VERIFY_DENIED="unknown"
   VERIFY_PLACE="no"
+  VERIFY_CAUSE=""
   while IFS= read -r vline; do
     case "$vline" in
+      "CAUSE "*) VERIFY_CAUSE="${vline#CAUSE }" ;;
       "TOKENS "*) VERIFY_FIGURES="${vline#TOKENS }" ;;
       "DENIED "*) VERIFY_DENIED="${vline#DENIED }" ;;
       "PLACE "*) VERIFY_PLACE="${vline#PLACE }" ;;
@@ -978,6 +731,10 @@ read_verify() {
   esac
   case "$VERIFY_DENIED" in
     ''|*[!0-9]*) VERIFY_DENIED="unknown" ;;
+  esac
+  case "$VERIFY_CAUSE" in
+    empty|malformed|failed_step|oversized) ;;
+    *) VERIFY_CAUSE="" ;;
   esac
   if [ "$2" -ne 0 ] || [ -z "$VERIFY_FIGURES" ]; then
     VERIFY_PLACE="no"
@@ -998,8 +755,7 @@ process_repo() {
   # FAIL, not a silent skip -- distinct from a path that exists and is
   # deliberately not a repo (SKIP, below).
   if [ ! -e "$repo" ]; then
-    echo "RESULT FAIL $repo_label reason=\"configured repo path does not exist\"" >> "$LOG"
-    note_fail "$repo_label" "configured repo path does not exist"
+    fail_repo "$repo_label" "configured repo path does not exist"
     return 0
   fi
 
@@ -1013,15 +769,14 @@ process_repo() {
 
   echo "--- $repo_label ---" >> "$LOG"
   if ! cd "$repo"; then
-    echo "RESULT FAIL $repo_label reason=\"cd into repo failed\"" >> "$LOG"
-    note_fail "$repo_label" "cd into repo failed"
+    fail_repo "$repo_label" "cd into repo failed"
     return 0
   fi
 
   # AC-OPS-12: every program the runner calls is resolved from the install. A
   # missing one stops this repository with a reason naming the file, before
   # anything is staged or any session starts.
-  for needed in "$COLLECT_SCRIPT" "$IGNORE_SCRIPT"; do
+  for needed in "$COLLECT_SCRIPT" "$IGNORE_SCRIPT" "$VERIFY_SCRIPT"; do
     if [ ! -f "$needed" ]; then
       fail_repo "$repo_label" "workflows/lib/${needed##*/} is missing from the install; run bin/install.sh"
       return 0
@@ -1056,8 +811,7 @@ process_repo() {
   # refused outright rather than staged into.
   for linked in ".claude" ".claude/workflows" ".claude/workflows/.optimise-cycle.js.staged" ".claude/workflows/optimise-cycle.js"; do
     if [ -L "$repo/$linked" ]; then
-      echo "RESULT FAIL $repo_label reason=\"refusing to stage: $linked is a symlink\"" >> "$LOG"
-      note_fail "$repo_label" "refusing to stage: $linked is a symlink"
+      fail_repo "$repo_label" "refusing to stage: $linked is a symlink"
       return 0
     fi
   done
@@ -1128,25 +882,9 @@ process_repo() {
     return 0
   fi
 
-  # The plan-guard Stop hook can re-claim a dormant plan for this headless
-  # session and rewrite .claude/active-plan (measured: it writes
-  # `conductor: <session id>`). The marker's bytes are saved here, and
-  # cleanup_run puts them back if the marker carries this run's session id.
-  PLAN_LABEL="$repo_label"
-  PLAN_HAD=0
-  PLAN_SNAPSHOT="$RUNNER_TMP/active-plan.snapshot"
-  if [ -f "$repo/.claude/active-plan" ] && [ ! -L "$repo/.claude/active-plan" ]; then
-    if cp "$repo/.claude/active-plan" "$PLAN_SNAPSHOT" && chmod 600 "$PLAN_SNAPSHOT"; then
-      PLAN_HAD=1
-      PLAN_MARKER="$repo/.claude/active-plan"
-    else
-      echo "could not snapshot .claude/active-plan; it will not be restored" >> "$LOG"
-    fi
-  elif [ ! -e "$repo/.claude/active-plan" ] && [ ! -L "$repo/.claude/active-plan" ]; then
-    PLAN_MARKER="$repo/.claude/active-plan"
-  fi
   OUTPUT_PROBLEM=""
   reasons=()
+  SESSION_CAUSE=""
 
   # ---- collect: the runner gathers the ledger, git and CI data itself, into the
   # per-run directory, before any session starts. The collector is run from the
@@ -1203,7 +941,7 @@ process_repo() {
   if [ "${digest_token%%:*}" != ran ]; then
     echo "TIMING $repo_label start_epoch=$start_epoch collect_s=$collect_s" >> "$LOG"
     reasons+=("digest refused: ${digest_token#failed:}")
-    verify_out="$(verify_run "$RUN_REAL" - "$digest_token" "$repo" "$RUN_REAL" "$RUNNER_TMP" 2>/dev/null)"
+    verify_out="$(verify_run - "$digest_token" "$repo" - 2>/dev/null)"
     verify_status=$?
     read_verify "$verify_out" "$verify_status"
     record_result "$repo_label" "$VERIFY_FIGURES"
@@ -1237,6 +975,25 @@ process_repo() {
   # hook writes into a marker it claims, which is how cleanup_run knows to put the
   # saved bytes back. The Read rule's doubled slash is how the CLI spells an
   # absolute path.
+  # The plan-guard Stop hook can re-claim a dormant plan for this headless
+  # session and rewrite .claude/active-plan (measured: it writes
+  # `conductor: <session id>`). The marker's bytes are saved here, immediately
+  # before the session starts and not before the collection (which can take half
+  # an hour, during which a real conductor may write its own marker), and
+  # cleanup_run puts them back if the marker carries this run's session id.
+  PLAN_LABEL="$repo_label"
+  PLAN_HAD=0
+  PLAN_SNAPSHOT="$RUNNER_TMP/active-plan.snapshot"
+  if [ -f "$repo/.claude/active-plan" ] && [ ! -L "$repo/.claude/active-plan" ]; then
+    if cp "$repo/.claude/active-plan" "$PLAN_SNAPSHOT" && chmod 600 "$PLAN_SNAPSHOT"; then
+      PLAN_HAD=1
+      PLAN_MARKER="$repo/.claude/active-plan"
+    else
+      echo "could not snapshot .claude/active-plan; it will not be restored" >> "$LOG"
+    fi
+  elif [ ! -e "$repo/.claude/active-plan" ] && [ ! -L "$repo/.claude/active-plan" ]; then
+    PLAN_MARKER="$repo/.claude/active-plan"
+  fi
   SECONDS=0
   timeout -k 60 "$TIMEOUT_S" claude -p "$session_prompt" \
     --allowedTools "Workflow" "Read(/$RUN_REAL/**)" \
@@ -1265,15 +1022,16 @@ process_repo() {
   # after the polite signal, 137 after the -k grace period's hard kill.
   case "$claude_exit" in
     0) ;;
-    124) reasons+=("timed out after ${TIMEOUT_S}s") ;;
-    137) reasons+=("killed after timeout grace") ;;
-    *) reasons+=("claude exited $claude_exit") ;;
+    124) reasons+=("timed out after ${TIMEOUT_S}s"); SESSION_CAUSE="timeout" ;;
+    137) reasons+=("killed after timeout grace"); SESSION_CAUSE="timeout" ;;
+    *) reasons+=("claude exited $claude_exit"); SESSION_CAUSE="exit" ;;
   esac
   # Anchored to the CLI's OWN message rather than a bare grep for the ceiling
   # variable's name (which false-positived on any text merely mentioning it), and
   # captures the observed wait so the FAIL reason states what actually happened.
   if ceiling_message=$(grep -h -Eo "$CEILING_RE" "$session_out" "$session_err" 2>/dev/null | head -n1) && [ -n "$ceiling_message" ]; then
     ceiling_hit=1
+    SESSION_CAUSE="timeout"
     reasons+=("background wait ceiling reached before completion ($ceiling_message)")
   fi
 
@@ -1281,12 +1039,15 @@ process_repo() {
   # figure in it is compared with the lane files collected above. A session that
   # did not exit 0 is not parsed at all.
   if [ "$claude_exit" -eq 0 ]; then
-    verify_out="$(verify_run "$RUN_REAL" "$session_out" "$digest_token" "$repo" "$RUN_REAL" "$RUNNER_TMP" 2>/dev/null)"
+    verify_out="$(verify_run "$session_out" "$digest_token" "$repo" "$(sidecar_root_of "$repo")" 2>/dev/null)"
   else
-    verify_out="$(verify_run "$RUN_REAL" - "$digest_token" "$repo" "$RUN_REAL" "$RUNNER_TMP" 2>/dev/null)"
+    verify_out="$(verify_run - "$digest_token" "$repo" - 2>/dev/null)"
   fi
   verify_status=$?
   read_verify "$verify_out" "$verify_status"
+  if [ -z "$SESSION_CAUSE" ]; then
+    SESSION_CAUSE="$VERIFY_CAUSE"
+  fi
   echo "DENIED-TOOLS $repo_label $VERIFY_DENIED" >> "$LOG"
 
   # ---- place: only a result that passed every check, or whose one problem is a
@@ -1295,11 +1056,7 @@ process_repo() {
   # ignored, and confirmed so, before either is written.
   if [ "$VERIFY_PLACE" = yes ] && [ "$claude_exit" -eq 0 ] && [ "$ceiling_hit" = 0 ]; then
     local sidecar_root
-    sidecar_root="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-    sidecar_root="${sidecar_root%/*}"
-    if [ -z "$sidecar_root" ] || [ ! -d "$sidecar_root" ]; then
-      sidecar_root="$repo"
-    fi
+    sidecar_root="$(sidecar_root_of "$repo")"
     if [ ! -f "$RUN_REAL/result-report.md" ] || [ ! -f "$RUN_REAL/result-sidecar.json" ]; then
       reasons+=("the result check wrote no output")
     elif ! ensure_ignored "$repo" "$sidecar_root"; then
