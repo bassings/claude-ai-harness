@@ -35,13 +35,18 @@ test('static: the module is spawn-free and reads only through the reader\'s guar
   assert.match(SOURCE, /import \{[^}]*\breadRepoFile\b[^}]*\} from '\.\/optimise-read\.mjs'/)
 })
 
-test('parseSession: an empty permission_denials list is unknown, not a confident zero, and a list with entries is its length', async () => {
+test('parseSession: an array of permission_denials is a count (zero included) with its tool names from a known set, anything else is unknown, and tool_input is never carried', async () => {
   const { parseSession } = await load()
   const inner = JSON.stringify({ lanes: {}, report: '# R' })
   const env = (extra) => JSON.stringify({ type: 'result', is_error: false, result: inner, ...extra })
-  assert.equal(parseSession(env({ permission_denials: [] })).denied, 'unknown')
-  assert.equal(parseSession(env({})).denied, 'unknown')
-  assert.equal(parseSession(env({ permission_denials: [{ tool_name: 'Bash' }, { tool_name: 'Write' }] })).denied, '2')
+  const none = parseSession(env({ permission_denials: [] }))
+  assert.deepEqual([none.denied, none.tools], ['0', 'none'], 'measured 2026-11-22: the list is filled for refused Reads, so an empty list is a real zero')
+  for (const extra of [{}, { permission_denials: null }, { permission_denials: 'two' }, { permission_denials: { length: 2 } }]) assert.equal(parseSession(env(extra)).denied, 'unknown', JSON.stringify(extra))
+  const two = parseSession(env({ permission_denials: [{ tool_name: 'Write', tool_input: { file_path: '/secret/place' } }, { tool_name: 'Bash' }, { tool_name: 'Write' }] }))
+  assert.deepEqual([two.denied, two.tools], ['3', 'Bash,Write'], 'sorted and de-duplicated, the count still counts every refusal')
+  const odd = parseSession(env({ permission_denials: [{ tool_name: 'Mystery/../x' }, { tool_name: 'Read' }, { nope: 1 }, 7] }))
+  assert.deepEqual([odd.denied, odd.tools], ['4', 'other,Read'], 'a name outside the known set, or none, is `other`')
+  assert.ok(!JSON.stringify(odd).includes('/secret') && !JSON.stringify(two).includes('/secret'), 'tool_input never reaches the result')
 })
 
 test('holdsPath: the home directory and the per-run directory are held wherever they appear, and the repository path only as a whole path', async () => {
@@ -110,9 +115,9 @@ test('mergeSidecar: every prior entry the returned sidecar lacks is kept, return
 
 test('mergeSidecar: past the carry maximum the oldest entries go first, never the newest, and never before the maximum is passed', async () => {
   const { mergeSidecar, SIDECAR_CARRY_MAX } = await load()
-  assert.equal(SIDECAR_CARRY_MAX, 500, 'the same carry maximum the workflow\'s own sidecar uses')
+  assert.equal(SIDECAR_CARRY_MAX, 500, 'the carry maximum, owned here')
   const workflow = fs.readFileSync(T.WORKFLOW, 'utf8')
-  assert.match(workflow, /^const SIDECAR_CARRY_MAX = 500$/m, 'parity: the workflow\'s constant is the module\'s')
+  assert.ok(!/SIDECAR_CARRY_MAX|\.slice\(0, 500\)/.test(workflow), 'the workflow decides no retention of its own (L12): it carries every outcome the digest holds and the merge here owns what is kept')
   const prior = Object.fromEntries(Array.from({ length: SIDECAR_CARRY_MAX }, (_, i) => [`k${i}`, { i }]))
   assert.equal(Object.keys(mergeSidecar(prior, {})).length, SIDECAR_CARRY_MAX, 'exactly at the maximum nothing goes')
   const merged = mergeSidecar(prior, { new1: { n: 1 }, new2: { n: 2 } })
@@ -361,4 +366,45 @@ test('nonceProblem: the result must carry the SHA-256 of this run\'s nonce; anot
   assert.equal(nonceProblem({ nonce_sha256: 42 }, nonce), 'result carries no nonce hash')
   assert.equal(nonceProblem({ nonce_sha256: hash('') }, ''), 'result nonce hash does not match this run', 'a run given no nonce accepts nothing, not even the hash of nothing')
   assert.equal(nonceProblem({ nonce_sha256: hash(nonce) }, undefined), 'result nonce hash does not match this run')
+})
+
+// ---- L5: every line of a figure shape must match, not just the first ----
+
+test('every line of each figure shape is held to the data: a later line with a different figure is refused, for the ledger, CI, git and scoped lines and the digest omissions', async () => {
+  const { checkFigures, checkDigest } = await load()
+  const { col, report } = await real()
+  const lanes = { ledger: { status: 'ran' }, git: { status: 'ran' }, ci: { status: 'ran' } }
+  const reasonsFor = (text) => checkFigures({ lanes }, text, col).reasons
+  const second = (re, bumped) => `${report}\n${report.split('\n').find((l) => re.test(l)).replace(...bumped)}\n`
+  assert.ok(reasonsFor(second(/^Ledger records in window: /, [/\d+/, '19'])).includes('figure mismatch ledger: collected 18, reported 19'))
+  assert.ok(reasonsFor(second(/^CI runs: /, [/\d+/, '4'])).includes('figure mismatch ci: runs collected 3, reported 4'))
+  assert.ok(reasonsFor(second(/^Raw \(unscoped\): /, [/\d+/, '4'])).includes('figure mismatch git: count collected 3, reported 4'))
+  assert.ok(reasonsFor(second(/^Scoped to product source /, [/: \d+ counted/, ': 1 counted'])).includes('figure mismatch git scoped: scoped counted collected 0, reported 1'))
+  const colDropped = { ...col, digest: { ...col.digest, dropped: { ...col.digest.dropped, ciByJob: 4 } } }
+  assert.deepEqual(checkDigest('Digest omitted ciByJob: 4\nDigest omitted ciByJob: 5\n', colDropped), ['figure mismatch digest: omitted ciByJob collected 4, reported 5'])
+})
+
+// ---- L6: an envelope that says it is an error is refused even when it carries a result that would parse ----
+
+test('parseSession: an envelope with is_error true is refused as having no result, even though its result string is a valid result', async () => {
+  const { parseSession } = await load()
+  const valid = JSON.stringify({ lanes: {}, report: '# R' })
+  assert.equal(parseSession(JSON.stringify({ type: 'result', is_error: true, result: valid })).reason, 'session output: envelope has no result')
+  assert.ok(parseSession(JSON.stringify({ type: 'result', is_error: false, result: valid })).result, 'control: the same result without the error flag parses')
+})
+
+// ---- L8: fail-closed guards that no test used to remove ----
+
+test('checkResult: a report that is not valid UTF-8 (a lone surrogate) is refused, so what is placed is exactly what was judged', async () => {
+  const { checkResult } = await load()
+  assert.equal(checkResult({ lanes: {}, report: '# R\n\ud800\n', proposal_targets: {} }, [], []).reason, 'report is not valid UTF-8')
+  assert.ok(checkResult({ lanes: {}, report: '# R\nplain\n', proposal_targets: {} }, [], []).report, 'control')
+})
+
+test('checkLanes and checkDigest: collected data that cannot be read is named, never treated as a lane that ran', async () => {
+  const { checkLanes, checkDigest } = await load()
+  const { col } = await real()
+  const broken = { lane: { ...col.lane, ledger: null }, digest: col.digest }
+  assert.ok(checkLanes({ ledger: { status: 'ran' }, git: { status: 'ran' }, ci: { status: 'ran' } }, broken).includes('collected data unreadable: ledger'))
+  assert.deepEqual(checkDigest('# R', { lane: col.lane, digest: null }), ['collected data unreadable: digest'])
 })

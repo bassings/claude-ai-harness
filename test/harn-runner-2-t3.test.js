@@ -23,7 +23,7 @@ const assert = require('node:assert/strict')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
-const { spawnSync } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
 const { cleanupTempRepos, sanitizedGitEnv, sh } = require('./helpers/temp-repo.js')
 const SB = require('./helpers/weekly-sandbox.js')
@@ -169,7 +169,7 @@ test('AC-SEC-1/AC-SEC-2/AC-SEC-4: the session is given exactly the Workflow tool
   const argv = s.argv
   assert.deepEqual(flag(argv, '--allowedTools'), ['Workflow', `Read(/${s.runDir}/**)`])
   assert.ok(s.runDir.startsWith('/') && fs.realpathSync(path.dirname(s.runDir)) === path.dirname(s.runDir), 'the directory in the rule is a physical absolute path')
-  assert.deepEqual(flag(argv, '--disallowedTools').sort((a, b) => a.localeCompare(b)), ['Bash', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Write'])
+  assert.deepEqual(flag(argv, '--disallowedTools').sort((a, b) => a.localeCompare(b)), ['Bash', 'Edit', 'Glob', 'Grep', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Write'])
   assert.deepEqual(flag(argv, '--permission-mode'), ['dontAsk'])
   assert.deepEqual(flag(argv, '--setting-sources'), ['user'])
   assert.deepEqual(flag(argv, '--output-format'), ['json'])
@@ -177,6 +177,8 @@ test('AC-SEC-1/AC-SEC-2/AC-SEC-4: the session is given exactly the Workflow tool
     assert.ok(!/^(Bash|Edit|Write)\(/.test(a), `no pattern rule for a denied tool: ${a}`)
     assert.ok(!/bypassPermissions|dangerously-skip-permissions|disableAllHooks/.test(a), a)
   }
+  assert.ok(argv.includes('--strict-mcp-config') && !argv.includes('--mcp-config'), 'no MCP server loads: --strict-mcp-config with no --mcp-config (M2)')
+  assert.ok(argv.includes('--no-session-persistence'), 'the session is not saved to disk (L3)')
   const allowed = flag(argv, '--allowedTools').join(' ')
   for (const gone of ['git', 'gh', 'node', 'openssl', 'optimise-read', 'optimise-report-ignore', 'Grep', 'Glob', 'Skill', 'Agent']) assert.ok(!allowed.includes(gone), `${gone} is not granted`)
 })
@@ -304,18 +306,25 @@ test('AC-PROD-1/AC-PROD-4/AC-OPS-7/AC-OPS-9/AC-OPS-17: a correct result is writt
   // The fixture's own untracked ledger shows in the status before any run; the
   // runner's two outputs must not.
   assert.doesNotMatch(sh('git status --porcelain', repo), /optimise-/, 'and neither output shows as a change')
-  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} unknown$`, 'm'), 'an empty permission_denials list is unknown, not a count (M4)')
+  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} 0 none$`, 'm'), 'an empty permission_denials list is a count of zero: the CLI fills it for refused Reads')
   assert.match(res.logContents, /collect_s=\d+/, 'collection wall-clock seconds are logged')
   assert.match(res.logContents, /session_s=\d+/, 'session wall-clock seconds are logged')
   assert.deepEqual(runDirsOf(res.tmpdir), [])
 })
 
-test('AC-OPS-6: the number of refused tool calls is the CLI\'s own report, an integer, and the refusals themselves are not logged', () => {
+test('AC-OPS-6: the number of refused tool calls and the names of the tools are the CLI\'s own report, and the refusals\' inputs are not logged', () => {
   const repo = repoWith()
   marker(repo, 'denials')
   const res = runRunner([repo], { stubs: ghWith() })
-  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} 2$`, 'm'), res.logContents)
+  assert.equal(returnedEnvelope(res).permission_denials.length, 2, 'guard against vacuity: the stub really reported two refusals')
+  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} 2 Bash,Write$`, 'm'), res.logContents)
   assert.ok(!/tool_use_id|tool_name/.test(res.logContents))
+  const odd = repoWith()
+  marker(odd, 'denials-odd')
+  const resOdd = runRunner([odd], { stubs: ghWith() })
+  assert.equal(returnedEnvelope(resOdd).permission_denials.length, 2)
+  assert.match(resOdd.logContents, new RegExp(`^DENIED-TOOLS ${label(odd)} 2 other,Read$`, 'm'), resOdd.logContents)
+  assert.ok(!resOdd.logContents.includes('/Users/someone') && !resOdd.logContents.includes('Mystery'), 'a path in tool_input and an unknown name never reach the log')
 })
 
 test('AC-OPS-17: what the digest left out is on the RESULT line as integers, and a figure for it altered in transit FAILs', () => {
@@ -656,7 +665,7 @@ test('AC-QA-16: SIGTERM while the collector is running places nothing, removes t
 test('AC-SEC-12: a SIGTERM while the session runs removes the per-run directory and every collected file in it', async () => {
   const repo = repoWith()
   const hang = freshDir('hang-')
-  fs.writeFileSync(path.join(hang, 'claude'), '#!/bin/sh\necho $$ > .claude-pid\n: > .ready\nexec sleep 30\n', { mode: 0o755 })
+  fs.writeFileSync(path.join(hang, 'claude'), `#!/bin/sh\necho $$ > ${JSON.stringify(path.join(repo, '.claude-pid'))}\n: > ${JSON.stringify(path.join(repo, '.ready'))}\nexec sleep 30\n`, { mode: 0o755 })
   const run = startRunner([repo], { stubs: ghWith(), extraPath: hang })
   try {
     assert.ok(await F.waitFor(() => fs.existsSync(path.join(repo, '.ready')), 30000), 'the session started')
@@ -667,30 +676,6 @@ test('AC-SEC-12: a SIGTERM while the session runs removes the per-run directory 
   } finally {
     killIfAlive(path.join(repo, '.claude-pid'))
   }
-})
-
-test('HARN-RUNNER-2 T3 L10: the plan marker is restored to what it held when the session started, not to what it held before a 30-minute collection', () => {
-  const repo = repoWith()
-  fs.mkdirSync(path.join(repo, '.claude'), { recursive: true })
-  fs.writeFileSync(path.join(repo, '.claude', 'active-plan'), 'plan.md\nconductor: before-collection\n')
-  const claudeHome = provisionInstall(freshDir('claudehome-'))
-  const lib = path.join(claudeHome, 'workflows', 'lib')
-  fs.renameSync(path.join(lib, 'optimise-collect.mjs'), path.join(lib, 'optimise-collect-real.mjs'))
-  // A conductor writes its own marker while the collector runs.
-  fs.writeFileSync(path.join(lib, 'optimise-collect.mjs'), `import { execFileSync } from 'node:child_process'
-import fs from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-const real = path.join(path.dirname(fileURLToPath(import.meta.url)), 'optimise-collect-real.mjs')
-fs.writeFileSync(path.join(process.argv[2], '.claude', 'active-plan'), 'plan.md\\nconductor: during-collection\\n')
-process.stdout.write(execFileSync(process.execPath, [real, ...process.argv.slice(2)], { encoding: 'utf8' }))
-`)
-  // The plan-guard hook re-claims the marker for the headless session.
-  const hook = freshDir('hook-')
-  fs.writeFileSync(path.join(hook, 'claude'), '#!/bin/sh\nsid=""\nwhile [ $# -gt 0 ]; do if [ "$1" = "--session-id" ]; then sid="$2"; fi; shift; done\nprintf \'/abs/plan.md\\nconductor: %s\\n\' "$sid" > .claude/active-plan\n', { mode: 0o755 })
-  const res = runRunner([repo], { claudeHome, stubs: ghWith(), extraPath: hook })
-  assert.match(res.logContents, /^RESTORED-ACTIVE-PLAN /m, `guard against vacuity: the marker was re-claimed and restored\n${res.logContents}`)
-  assert.equal(fs.readFileSync(path.join(repo, '.claude', 'active-plan'), 'utf8'), 'plan.md\nconductor: during-collection\n')
 })
 
 test('AC-QA-21: two runners started together against one repository each log a RESULT line, use different directories, and leave one complete returned report in place', async () => {
@@ -797,6 +782,13 @@ test('M1: a failed ledger lane still replaces the report (AC-PROD-3) and never l
 // The result the stub session returned, as the runner was handed it (read from the stub's own witness of its reply). A test
 // asserts on this FIRST, so a stub mode that silently altered nothing cannot make a runner assertion pass or fail for the
 // wrong reason.
+// The whole envelope the stub printed, as the runner was handed it.
+function returnedEnvelope(res) {
+  const [reply] = fs.readdirSync(res.witness).filter((n) => n.startsWith('reply-'))
+  assert.ok(reply, 'the stub session printed a reply')
+  return JSON.parse(fs.readFileSync(path.join(res.witness, reply), 'utf8'))
+}
+
 function returnedResult(res) {
   const [reply] = fs.readdirSync(res.witness).filter((n) => n.startsWith('reply-'))
   assert.ok(reply, 'the stub session printed a reply')
@@ -943,14 +935,15 @@ for (const [name, mode, reasonRe] of ROW_MISMATCHES) {
   })
 }
 
-// E (M4, AC-OPS-6): `permission_denials` was measured empty although calls were refused, so an empty list is not a zero.
+// E (M4, AC-OPS-6): measured 2026-11-22, `permission_denials` is filled for refused Reads, so an empty list is a zero; absent is unknown.
 
-test('M4/AC-OPS-6: a session whose envelope lists no denials logs DENIED-TOOLS unknown, never a confident 0', () => {
+test('M4/AC-OPS-6: an envelope with no permission_denials list at all logs DENIED-TOOLS unknown, never a zero', () => {
   const repo = repoWith()
+  marker(repo, 'denials-absent')
   const res = runRunner([repo], { stubs: ghWith() })
+  assert.equal(Object.hasOwn(returnedEnvelope(res), 'permission_denials'), false, 'guard against vacuity: the stub really left the list out')
   assert.equal(res.status, 0, res.logContents)
-  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} unknown$`, 'm'), res.logContents)
-  assert.ok(!new RegExp(`^DENIED-TOOLS ${label(repo)} 0$`, 'm').test(res.logContents))
+  assert.match(res.logContents, new RegExp(`^DENIED-TOOLS ${label(repo)} unknown none$`, 'm'), res.logContents)
 })
 
 // F: the ceiling gate, the lane-mode comparison, the home directory spellings, the cause class and the completeness fields.
@@ -1038,7 +1031,7 @@ test('L4/AC-OPS-7: a collector that fails logs the completeness fields with unkn
   const claudeHome = provisionInstall(freshDir('claudehome-'))
   fs.writeFileSync(path.join(claudeHome, 'workflows', 'lib', 'optimise-collect.mjs'), 'process.exit(1)\n')
   const res = runRunner([repo], { claudeHome, stubs: ghWith() })
-  const line = assertFailedOnce(res, repo, /^collector failed \(exit 1\)$/)
+  const line = assertFailedOnce(res, repo, /^collector failed \(exit 1, unknown\)$/)
   assert.match(line, / ledger=unknown ci=unknown git=unknown digest=unknown /)
   for (const l of res.logContents.match(/^RESULT FAIL [^-].*$/gm) || []) assert.match(l, COMPLETENESS, l)
 })
@@ -1116,9 +1109,8 @@ test('L2: a lock left by a process that is gone, or one older than the stale lim
   const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout
   const mkLock = (repo, pid, ageHours) => {
     const dir = path.join(repo, LOCK_REL)
-    fs.mkdirSync(dir)
-    fs.writeFileSync(path.join(dir, 'pid'), `${pid}\n`)
-    if (ageHours) fs.utimesSync(dir, new Date(Date.now() - ageHours * 3600 * 1000), new Date(Date.now() - ageHours * 3600 * 1000))
+    fs.symlinkSync(`${pid}:test-owner`, dir)
+    if (ageHours) fs.lutimesSync(dir, new Date(Date.now() - ageHours * 3600 * 1000), new Date(Date.now() - ageHours * 3600 * 1000))
     return dir
   }
   const instantSleep = shimDir('sleep', 'exit 0')
@@ -1126,7 +1118,7 @@ test('L2: a lock left by a process that is gone, or one older than the stale lim
   mkLock(gone, dead, 0)
   const resGone = runRunner([gone], { stubs: ghWith(), extraPath: instantSleep })
   assert.equal(resGone.status, 0, resGone.logContents)
-  assert.equal(fs.existsSync(path.join(gone, LOCK_REL)), false, 'its own lock is released afterwards')
+  assert.equal(fs.lstatSync(path.join(gone, LOCK_REL), { throwIfNoEntry: false }), undefined, 'its own lock is released afterwards')
   const old = repoWith({ ledger: 5 })
   mkLock(old, process.pid, 3)
   assert.equal(runRunner([old], { stubs: ghWith(), extraPath: instantSleep }).status, 0, 'a lock older than the stale limit is broken even if its pid is alive')
@@ -1136,7 +1128,7 @@ test('L2: a lock left by a process that is gone, or one older than the stale lim
   const resBusy = runRunner([busy], { stubs: ghWith(), extraPath: instantSleep })
   assertFailedOnce(resBusy, busy, /^could not take the sidecar lock$/)
   assertOutputsKept(seed)
-  assert.equal(fs.existsSync(held), true, 'a lock the run does not own is never removed')
+  assert.ok(fs.lstatSync(held, { throwIfNoEntry: false }), 'a lock the run does not own is never removed')
 })
 
 test('L4: the sidecar path and the report and sidecar size caps the runner uses are the module\'s, so the two cannot drift apart', async () => {
@@ -1290,7 +1282,7 @@ for (const code of [124, 137]) {
     assert.match(resultLine(res.logContents, label(second)), /^RESULT PASS .*ledger=7\/7/)
     assert.equal(res.notifyCalls.length, 1, 'one notification, for the failure')
     assert.equal(res.sessions().length, 1, 'only the second repository got a session')
-    assert.equal(fs.realpathSync(res.sessions()[0].cwd), fs.realpathSync(second), 'and it was the second')
+    assert.equal(res.sessions()[0].ledger.result.n, 7, 'and it was the second repository\'s (the one with seven ledger records)')
     assert.deepEqual(runDirsOf(res.tmpdir), [], 'no per-run directory is left')
     assert.equal(fs.existsSync(path.join(first, REPORT_REL)), false, 'nothing was placed for the first')
   })
@@ -1336,7 +1328,7 @@ test('L5: the reason a decided proposal has no target is the reader\'s fixed one
 test('L9/AC-OPS-7: a SIGTERM while the session runs gives the repository its own RESULT FAIL line with the fixed cause, as well as the run-level one', async () => {
   const repo = repoWith()
   const hang = freshDir('hang-')
-  fs.writeFileSync(path.join(hang, 'claude'), '#!/bin/sh\necho $$ > .claude-pid\n: > .ready\nexec sleep 30\n', { mode: 0o755 })
+  fs.writeFileSync(path.join(hang, 'claude'), `#!/bin/sh\necho $$ > ${JSON.stringify(path.join(repo, '.claude-pid'))}\n: > ${JSON.stringify(path.join(repo, '.ready'))}\nexec sleep 30\n`, { mode: 0o755 })
   const run = startRunner([repo], { stubs: ghWith(), extraPath: hang })
   try {
     assert.ok(await F.waitFor(() => fs.existsSync(path.join(repo, '.ready')), 30000), 'the session started')
@@ -1361,4 +1353,254 @@ process.stdout.write(out + 'PLACE no\\n')
   const line = assertFailedOnce(res, repo)
   assert.ok(reasonOf(line).split('; ').length > 20, 'guard against vacuity: thousands of reasons were handed to the runner')
   assert.ok(line.length < 2300, `the RESULT line is ${line.length} bytes`)
+})
+
+// ---- T3 fix round 3: M3 and L10, a crashed program is named by exit status and at most one fixed-shape token ----
+
+// An install with one lib program replaced by the given source.
+function installWithProgram(name, source) {
+  const claudeHome = provisionInstall(freshDir('claudehome-'))
+  fs.writeFileSync(path.join(claudeHome, 'workflows', 'lib', name), source)
+  return claudeHome
+}
+
+const IGNORE_CRASHES = [
+  ['exits 9', 'process.exit(9)\n', /^report-ignore helper failed \(exit 9, unknown\)$/],
+  ['cannot load a module it imports', "import './no-such-module.mjs'\n", /^report-ignore helper failed \(exit 1, ERR_MODULE_NOT_FOUND\)$/],
+  ['prints a path to stderr and exits 3', "console.error('/Users/someone/secret/project/file.js exploded')\nprocess.exit(3)\n", /^report-ignore helper failed \(exit 3, unknown\)$/],
+]
+for (const [name, source, reasonRe] of IGNORE_CRASHES) {
+  test(`M3/AC-OPS-9: a report-ignore helper that ${name} is named as the helper that failed, not as a .gitignore problem, and nothing is written`, () => {
+    const repo = repoWith({ ledger: 5 })
+    const seed = seedOutputs(repo)
+    const res = runRunner([repo], { claudeHome: installWithProgram('optimise-report-ignore.mjs', source), stubs: ghWith() })
+    assert.equal(res.sessions().length, 1, 'guard against vacuity: the session ran and its result was accepted up to the placement')
+    assertFailedOnce(res, repo, reasonRe)
+    assertOutputsKept(seed)
+    assert.ok(!res.logContents.includes('/Users/someone'), 'a path the program printed never reaches the log')
+    assert.ok(!/report path is not gitignored/.test(res.logContents), 'and it is not reported as the .gitignore outcome')
+  })
+}
+
+test('M3: a report path a tracked .gitignore really does re-include is still reported as not gitignored, apart from a helper that crashed', () => {
+  const repo = repoWith()
+  fs.writeFileSync(path.join(repo, '.gitignore'), '!.claude/optimise-cycle-report.md\n!.claude/optimise-proposal-targets.json\n')
+  assertFailedOnce(runRunner([repo], { stubs: ghWith() }), repo, /^report path is not gitignored$/)
+})
+
+test('L10: a collector that cannot load a module is named with its exit status and the fixed error code, and a stderr path never reaches the log', () => {
+  const noModule = repoWith({ ledger: 5 })
+  const res = runRunner([noModule], { claudeHome: installWithProgram('optimise-collect.mjs', "import './no-such-module.mjs'\n"), stubs: ghWith() })
+  assertFailedOnce(res, noModule, /^collector failed \(exit 1, ERR_MODULE_NOT_FOUND\)$/)
+  const withPath = repoWith({ ledger: 5 })
+  const resPath = runRunner([withPath], { claudeHome: installWithProgram('optimise-collect.mjs', "console.error('/Users/someone/secret/collector.js exploded')\nprocess.exit(4)\n"), stubs: ghWith() })
+  assertFailedOnce(resPath, withPath, /^collector failed \(exit 4, unknown\)$/)
+  assert.ok(!resPath.logContents.includes('/Users/someone'))
+})
+
+test('L10: a result check that cannot load a module logs its exit status, the bytes it printed and the fixed error code on its status line', () => {
+  const repo = repoWith({ ledger: 5 })
+  const res = runRunner([repo], { claudeHome: installWithVerifier("import './no-such-module.mjs'\n"), stubs: ghWith() })
+  assertFailedOnce(res, repo, /^the result check could not run$/)
+  assert.match(res.logContents, new RegExp(`^RESULT-CHECK-STATUS ${label(repo)} exit=1 bytes=0 err=ERR_MODULE_NOT_FOUND$`, 'm'), res.logContents)
+})
+
+// ---- T3 fix round 3: L1, the sidecar lock is held by one runner at a time and only its holder can release it ----
+
+// The lock functions taken verbatim from the runner and run in their own bash processes, so two takers can be started on a
+// real repository and their interleaving forced with a shim, without a full run for each.
+function lockHarness(repo, name, { hold = 0, then = '' } = {}) {
+  const functions = ['lock_looks_stale', 'lock_sidecar', 'unlock_sidecar'].map((fn) => {
+    const m = RUNNER_TEXT.match(new RegExp(`^${fn}\\(\\) \\{\\n[\\s\\S]*?^\\}\\n`, 'm'))
+    return m ? m[0] : ''
+  }).join('\n')
+  assert.match(functions, /lock_sidecar\(\)/, 'the runner defines lock_sidecar')
+  const log = path.join(repo, 'lock-events.log')
+  return `#!/bin/bash
+LOCK_TRIES=100
+LOCK_STALE_MIN=10
+SIDECAR_LOCK=""
+SIDECAR_TOKEN=""
+${functions}
+if ! lock_sidecar ${JSON.stringify(repo)}; then echo "${name} failed" >> ${JSON.stringify(log)}; exit 1; fi
+echo "${name} acquired" >> ${JSON.stringify(log)}
+sleep ${hold}
+echo "${name} released" >> ${JSON.stringify(log)}
+${then}
+unlock_sidecar
+`
+}
+
+function runLock(script, env = {}) {
+  const dir = freshDir('lockrun-')
+  const file = path.join(dir, 'run.sh')
+  fs.writeFileSync(file, script, { mode: 0o755 })
+  return spawn('/bin/bash', [file], { env: { ...process.env, ...env }, stdio: 'ignore' })
+}
+
+const exited = (child) => new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })))
+
+test('L1: a stale lock taken over by two runners at once is held by one of them at a time -- the second taker never removes the first taker\'s fresh lock', async () => {
+  const repo = repoWith()
+  const events = path.join(repo, 'lock-events.log')
+  // A runner that takes the lock and is killed: the stale lock it leaves, in whatever form the runner keeps it.
+  const dead = runLock(lockHarness(repo, 'DEAD', { hold: 0, then: 'kill -9 $$' }).replace('unlock_sidecar\n', ''), {})
+  await exited(dead)
+  fs.writeFileSync(events, '')
+  const once = path.join(freshDir('once-'), 'seen')
+  const slowMv = shimDir('mv', `case "$*" in *.stale.*) if [ ! -e ${JSON.stringify(once)} ]; then : > ${JSON.stringify(once)}; sleep 2; fi ;; esac\nexec /bin/mv "$@"`)
+  // B reaches the stale lock first and is held up between judging it stale and taking it away.
+  const b = runLock(lockHarness(repo, 'B', { hold: 0 }), { PATH: `${slowMv}:${process.env.PATH}` })
+  assert.ok(await F.waitFor(() => fs.existsSync(once), 20000), 'guard against vacuity: B is held up inside its takeover')
+  // A comes later, takes the stale lock over properly and holds the new lock for a while.
+  const a = runLock(lockHarness(repo, 'A', { hold: 4 }))
+  const [ra, rb] = await Promise.all([exited(a), exited(b)])
+  assert.equal(ra.code, 0)
+  assert.equal(rb.code, 0)
+  const order = fs.readFileSync(events, 'utf8').trim().split('\n').filter((l) => !l.startsWith('DEAD'))
+  assert.deepEqual(order, ['A acquired', 'A released', 'B acquired', 'B released'], 'B only acquires after A has released')
+})
+
+test('L1: a runner that does not hold the lock cannot release it, and the holder still can', async () => {
+  const repo = repoWith()
+  const events = path.join(repo, 'lock-events.log')
+  fs.writeFileSync(events, '')
+  // The holder takes the lock and keeps it; the other process believes it holds a lock at the same path with a token of its own.
+  const holder = runLock(lockHarness(repo, 'HOLDER', { hold: 3 }))
+  assert.ok(await F.waitFor(() => fs.readFileSync(events, 'utf8').includes('HOLDER acquired'), 20000))
+  const lockPath = path.join(repo, '.git', 'optimise-sidecar.lock')
+  assert.ok(fs.existsSync(lockPath) || fs.lstatSync(lockPath, { throwIfNoEntry: false }), 'guard against vacuity: the lock is there')
+  const impostor = runLock(lockHarness(repo, 'IMPOSTOR', { hold: 0 }).replace(/if ! lock_sidecar[^\n]*\n/, `SIDECAR_LOCK=${JSON.stringify(lockPath)}; SIDECAR_TOKEN="999999:forged"\n`))
+  await exited(impostor)
+  assert.ok(fs.lstatSync(lockPath, { throwIfNoEntry: false }), 'the lock is still there after a non-owner\'s unlock')
+  await exited(holder)
+  assert.equal(fs.lstatSync(lockPath, { throwIfNoEntry: false }), undefined, 'and the holder\'s own unlock removed it')
+})
+
+// ---- T3 fix round 3: L11, the reader's command-line form works through a symlinked path, output unchanged ----
+
+test('L11: the reader prints its answer when started through a symlinked path, exactly as it does through the real one', () => {
+  const lib = path.join(SB.ROOT, 'workflows', 'lib')
+  const link = path.join(freshDir('links-'), 'lib')
+  fs.symlinkSync(lib, link)
+  const repo = repoWith({ ledger: 5 })
+  const viaReal = spawnSync(process.execPath, [path.join(lib, 'optimise-read.mjs'), 'ledger', repo], { encoding: 'utf8' })
+  const viaLink = spawnSync(process.execPath, [path.join(link, 'optimise-read.mjs'), 'ledger', repo], { encoding: 'utf8' })
+  assert.match(viaReal.stdout, /^\{/, 'guard against vacuity: the real path printed JSON')
+  assert.equal(viaLink.stdout, viaReal.stdout, 'the output through the link is byte for byte the same')
+})
+
+// ---- T3 fix round 3: L6, L7, L8 ----
+
+test('L6/AC-QA-11: an envelope that says it is an error is refused even when its result is a complete, correct one', () => {
+  const repo = repoWith()
+  const seed = seedOutputs(repo)
+  marker(repo, 'error-envelope-valid-result')
+  const res = runRunner([repo], { stubs: ghWith() })
+  const reply = JSON.parse(fs.readFileSync(path.join(res.witness, fs.readdirSync(res.witness).find((n) => n.startsWith('reply-'))), 'utf8'))
+  assert.equal(reply.is_error, true, 'guard against vacuity: the stub really printed an error envelope')
+  assert.ok(JSON.parse(reply.result).report.startsWith('# '), 'and its result is a complete report the checks would otherwise accept')
+  assertFailedOnce(res, repo, /^session output: envelope has no result$/)
+  assertOutputsKept(seed)
+})
+
+test('L7/AC-OPS-9: a repository that re-includes only the sidecar path in a tracked .gitignore FAILs with neither file written, in a plain checkout and in a linked worktree', () => {
+  const plain = repoWith()
+  fs.writeFileSync(path.join(plain, '.gitignore'), '!.claude/optimise-proposal-targets.json\n')
+  assertFailedOnce(runRunner([plain], { stubs: ghWith() }), plain, /^report path is not gitignored$/)
+  assert.equal(fs.existsSync(path.join(plain, SIDECAR_REL)), false, 'no sidecar was written')
+  assert.equal(fs.existsSync(path.join(plain, REPORT_REL)), false, 'and no report')
+  const main = repoWith()
+  fs.writeFileSync(path.join(main, '.gitignore'), '!.claude/optimise-proposal-targets.json\n')
+  sh('git add .gitignore && git -c user.email=fixture@example.invalid -c user.name=Fixture commit -q -m "ignore rules"', main)
+  const tree = path.join(freshDir('worktrees-'), 'linked')
+  sh(`git worktree add -q ${JSON.stringify(tree)} -b linked-branch`, main)
+  fs.mkdirSync(path.join(tree, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(tree, '.claude', 'harness-ledger.jsonl'), F.validLedger(3))
+  assertFailedOnce(runRunner([tree], { stubs: ghWith() }), tree, /^report path is not gitignored$/)
+  assert.equal(fs.existsSync(path.join(main, SIDECAR_REL)), false, 'the main checkout\'s sidecar was not written')
+  assert.equal(fs.existsSync(path.join(tree, REPORT_REL)), false, 'nor the worktree\'s report')
+})
+
+test('L8: a collector whose digest is not on disk although it said digest=ran stops that repository before any session, with the fixed reason', () => {
+  const repo = repoWith()
+  const lib = (home) => path.join(home, 'workflows', 'lib')
+  const claudeHome = provisionInstall(freshDir('claudehome-'))
+  fs.renameSync(path.join(lib(claudeHome), 'optimise-collect.mjs'), path.join(lib(claudeHome), 'optimise-collect-real.mjs'))
+  fs.writeFileSync(path.join(lib(claudeHome), 'optimise-collect.mjs'), `import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+const real = path.join(path.dirname(fileURLToPath(import.meta.url)), 'optimise-collect-real.mjs')
+const out = execFileSync(process.execPath, [real, ...process.argv.slice(2)], { encoding: 'utf8' })
+fs.rmSync(path.join(process.argv[3], 'digest.json'), { force: true })
+process.stdout.write(out)
+`)
+  const res = runRunner([repo], { claudeHome, stubs: ghWith() })
+  const line = assertFailedOnce(res, repo, /^digest refused: missing$/)
+  assert.match(line, /digest=failed:missing/)
+  assert.deepEqual(res.sessions(), [], 'no session was launched')
+})
+
+for (const [name, output, reasonRe] of [
+  ['prints no result line', '', /^collector failed \(no result line\)$/],
+  ['prints a result line with no digest field', 'COLLECT ledger=ran git=ran ci=ran\n', /^collector failed \(no digest field\)$/],
+]) {
+  test(`L8: a collector that ${name} is a FAIL with the fixed reason and no session`, () => {
+    const repo = repoWith()
+    const claudeHome = installWithProgram('optimise-collect.mjs', `process.stdout.write(${JSON.stringify(output)})\n`)
+    const res = runRunner([repo], { claudeHome, stubs: ghWith() })
+    assertFailedOnce(res, repo, reasonRe)
+    assert.deepEqual(res.sessions(), [], 'no session was launched')
+  })
+}
+
+test('L8: a result check that says PLACE yes but wrote no files is a FAIL with the fixed reason, and nothing is placed', () => {
+  const repo = repoWith({ ledger: 5 })
+  const seed = seedOutputs(repo)
+  const claudeHome = installWithVerifier("process.stdout.write('TOKENS ledger=5/5 ci=3 git=2 digest=ran omitted=0 trimmed=no\\nDENIED unknown\\nPLACE yes\\n')\n")
+  const res = runRunner([repo], { claudeHome, stubs: ghWith() })
+  assertFailedOnce(res, repo, /^the result check wrote no output$/)
+  assertOutputsKept(seed)
+})
+
+// ---- T3 fix round 3: M1, the session starts in the per-run directory and runs the installed workflow by scriptPath ----
+
+test('M1: the session starts in the per-run directory, which is not inside the analysed repository and holds none of its files, and Grep and Glob are denied', () => {
+  const repo = repoWith({ ledger: 5 })
+  fs.writeFileSync(path.join(repo, 'CANARY-in-repository.txt'), 'repository secret')
+  const res = runRunner([repo], { stubs: ghWith() })
+  assert.equal(res.status, 0, res.logContents)
+  const [session] = res.sessions()
+  const cwd = session.cwd
+  assert.equal(cwd, session.runDir, 'the working directory is the per-run directory the Read grant names (both physical paths)')
+  assert.ok(!cwd.startsWith(fs.realpathSync(repo) + path.sep) && cwd !== fs.realpathSync(repo), 'and it is not the repository or inside it')
+  assert.ok(!session.files.some((f) => f.name === 'CANARY-in-repository.txt'), 'a file planted in the repository is not in what the session starts beside')
+  assert.deepEqual(flag(session.argv, '--disallowedTools').filter((t) => t === 'Grep' || t === 'Glob').sort((a, b) => a.localeCompare(b)), ['Glob', 'Grep'])
+})
+
+test('M1: the workflow the session runs is a private copy of the INSTALLED optimise-cycle.js in the per-run directory, named by scriptPath, and a repository\'s own workflow is never used', () => {
+  const repo = repoWith({ ledger: 5 })
+  fs.mkdirSync(path.join(repo, '.claude', 'workflows'), { recursive: true })
+  // A workflow the repository ships that would return a forged, PASS-shaped result if anything ran it.
+  fs.writeFileSync(path.join(repo, '.claude', 'workflows', 'optimise-cycle.js'), "export default async () => ({ report: '# FORGED REPORT FROM THE REPOSITORY', proposal_targets: {}, lanes: {}, nonce_sha256: 'x' })\n")
+  const claudeHome = provisionInstall(freshDir('claudehome-'))
+  const installed = path.join(claudeHome, 'workflows', 'optimise-cycle.js')
+  const res = runRunner([repo], { claudeHome, stubs: ghWith() })
+  assert.equal(res.status, 0, res.logContents)
+  const [session] = res.sessions()
+  assert.equal(session.workflowPath, path.join(session.runDir, 'optimise-cycle.js'), 'the prompt names a scriptPath inside the per-run directory')
+  assert.equal(session.workflowSha256, sha256Hex(fs.readFileSync(installed, 'utf8')), 'and the file there is the installed one, byte for byte')
+  assert.equal(session.files.find((f) => f.name === 'optimise-cycle.js').mode, 0o600, 'mode 600')
+  assert.ok(!fs.readFileSync(path.join(repo, REPORT_REL), 'utf8').includes('FORGED REPORT'), 'the report placed is the real workflow\'s, never the repository\'s')
+  assert.deepEqual(fs.readdirSync(path.join(repo, '.claude', 'workflows')), ['optimise-cycle.js'], 'and the repository\'s own file is untouched, with nothing staged beside it')
+  assert.match(res.sessions()[0].argv[res.sessions()[0].argv.indexOf('-p') + 1], /with its scriptPath set to \S+optimise-cycle\.js/)
+})
+
+test('M1: an install with no optimise-cycle.js stops each repository before collection, naming the file', () => {
+  const repo = repoWith()
+  const claudeHome = provisionInstall(freshDir('claudehome-'), { workflow: false })
+  const res = runRunner([repo], { claudeHome, stubs: ghWith() })
+  assertFailedOnce(res, repo, /^workflows\/optimise-cycle\.js is missing from the install; run bin\/install\.sh$/)
+  assert.deepEqual(res.sessions(), [], 'no session was launched')
 })

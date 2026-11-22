@@ -29,7 +29,7 @@ function freshDir(prefix) {
 
 // The programs the runner runs from $CLAUDE_HOME/workflows/lib/: byte copies of this repository's own.
 // Nothing already in the install is replaced, so a test that put its own file there keeps it.
-function provisionInstall(claudeHome, { workflow = false } = {}) {
+function provisionInstall(claudeHome, { workflow = true } = {}) {
   const lib = path.join(claudeHome, 'workflows', 'lib')
   fs.mkdirSync(lib, { recursive: true })
   const copyNew = (from, to) => {
@@ -67,7 +67,7 @@ function runnerEnv(repos, opts = {}) {
   const tmpdir = opts.tmpdir || freshDir('tmp-')
   const log = path.join(freshDir('log-'), 'weekly.log')
   // The workflow is installed only when a test asks for it: with one the runner stages a copy into each repo.
-  const claudeHome = opts.claudeHome || provisionInstall(freshDir('claudehome-'), { workflow: opts.workflow === true })
+  const claudeHome = opts.claudeHome || provisionInstall(freshDir('claudehome-'), { workflow: opts.workflow !== false })
   const witness = freshDir('witness-')
   const bin = opts.stubBin || stubBin()
   // A recording stub set comes before the plain stubs, so its `gh` is the one that runs.
@@ -84,6 +84,7 @@ function runnerEnv(repos, opts = {}) {
     OSA_RECORD: `${log}.notify`,
     OSA_EXIT: '0',
     STUB_WITNESS_DIR: witness,
+    STUB_REPOS: repos.join('\n'),
     // A repository's marker file overrides this; without either the stub session returns nothing.
     STUB_SESSION_MODE: 'pass',
     ...(opts.env || {}),

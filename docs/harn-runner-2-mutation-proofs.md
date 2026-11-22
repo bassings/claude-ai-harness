@@ -137,9 +137,9 @@ recorded as gaps, not as proofs. The tests were not edited (the brief forbade it
 | E-ran | `laneToken`, the `ran:<mode>` branch | `ran:` to `ran-` | no test reaches a ran lane with a mode in the log line |
 | O1 | `readerJson`, the over-size-limit detail | `'output over the size limit'` to `...Z` | the detail text is not asserted |
 
-## HARN-RUNNER-2 T3 mutation proofs (fix rounds 1 and 2, M6, AC-QA-3)
+## HARN-RUNNER-2 T3 mutation proofs (fix rounds 1 to 3, M6, AC-QA-3)
 
-Re-run on the final code of fix round 2, so every row is true of the code that
+Re-run on the final code of fix round 3, so every row is true of the code that
 ships (the result check lives in `workflows/lib/optimise-verify.mjs`). Each row:
 the edit was applied to the file named, confirmed to have changed exactly the
 one place the `old` text occurs (the script refuses an edit whose text occurs
@@ -152,32 +152,32 @@ Row `V0` is the mutation AC-QA-3 names: the verdict put back to scoring on shape
 alone (every figure check dropped from `checkFigures`), so a heading and a
 section heading would be enough. The hollow-report tests then fail.
 
-Rows added in round 2: `H1a` to `H1e` (each acceptance rule for a returned
-sidecar entry, and the validation as a whole), `H2a` to `H2e` (the nonce hash
-comparison, a missing hash, the environment hand-over, the prompt wording and the
-workflow's returned hash), `L1a`, `L2a` to `L2d`, `L4a`, `L4b`, `M1a` to `M1d`,
-`M6a`, `M6b`, `M2a` to `M2d`, `M3a`, `M3b`, `M5a` to `M5d`, `M4a`, `M4b`, `L5a`,
-`L6a`, `L6b`, `L9a`, and the row classes `R1` onwards, one removal per class.
+Rows added in round 3 carry the suffix `_r3`: `M2a_r3`, `L3a_r3` (the two session
+flags), `M3i_r3` and `M3t_r3` (a crashed helper is its own outcome, and only a
+fixed-shape token of its stderr reaches the log), `L10a_r3`, `L10b_r3`, `L1a_r3` to
+`L1d_r3` (the sidecar lock), `L5a_r3` to `L5c_r3`, `L6a_r3`, `L7a_r3`, `L8a_r3` to
+`L8f_r3`, `L11a_r3`, `L12a_r3`, and for the working-directory change `M1a_r3` to
+`M1f_r3` and `D1_r3`, `D2_r3` (the refused-tool count and names).
 
-Notes on rows that needed more than one edit or a stronger test:
+Notes:
 
-- `M1a` removes two guards together. A result check that prints no verdict line is
-  caught by two independent guards (the missing-line test and the "no verdict and
-  no reason" test), so either alone survives by design; the test pins that the
-  pair cannot both go. `M1b`, `M1c` and `M1d` each survived their first test and
-  led to a case that only that guard catches (a complete verdict then exit 1; an
-  unknown line before the verdict; a no-place verdict with no reason).
-- `M5d` survived until a test handed the runner thousands of reasons from a
-  program other than the check.
-- `L2a` (the sidecar lock removed) was run three times in a row and failed the
-  six-runner test each time.
+- The tests for the working-directory change (`M1a_r3` to `M1f_r3`) were written after
+  the change, not before it, so they were not seen red against the old code; each
+  is shown load-bearing by its row here instead.
+- `M1a` (round 2) removes two guards together: a result check that prints no
+  verdict line is caught by two independent guards, so either alone survives by
+  design; the test pins that the pair cannot both go. `M1b`, `M1c` and `M1d`
+  each survived their first test and led to a case that only that guard catches.
+  `M5d` survived until a test handed the runner thousands of reasons from a
+  program other than the check. `L2a` was run three times in a row and failed
+  the six-runner test each time.
+- The plan-marker snapshot and restore, and the staging of a workflow into the
+  repository, were removed in round 3 together with their tests and their rows
+  (L10 of round 1 included): the session no longer starts in the repository, and
+  the plan-guard Stop hook looks only for `<cwd>/.claude/active-plan`.
 
 Not mutated, and why:
 
-- L10, the plan-marker snapshot taken immediately before the session. The test was
-  written first and seen red against the old placement (the marker was restored to
-  its pre-collection bytes). Moving the snapshot back is a block move, not a
-  one-token edit, so no honest single-edit mutation exists; the red run is the proof.
 - The `claude_exit -eq 0` half of the placement gate. `verify_run` is handed `-`
   (no session) whenever `claude` did not exit 0, so `PLACE yes` cannot be reached
   and removing the condition changes nothing: an equivalent mutant.
@@ -197,7 +197,6 @@ Not mutated, and why:
 | V9 | NUL byte refusal (AC-QA-11) | `if (report.includes('\u0000'))` to `if (false)` | optimise-verify.mjs | "the report holds a NUL byte -- FAIL with a reason naming the case, nothing placed, the la..." |
 | V10 | report size cap (AC-QA-11) | `return bytes > REPORT_CAP ?` to `return false ?` | optimise-verify.mjs | "the report is one byte over the cap -- FAIL with a reason naming the case, nothing placed..." |
 | V11 | oversized reply refusal (AC-SEC-13) | `const got = readRepoFile(path.dirname(sessionPath), path.basename(sessionPath), FILE_CAP)` to `const got = readRepoFile(path.dirname(sessionPath), path.basename(sessionPath), Number.MAX_SAFE_INTEGER)` | optimise-verify.mjs | "a session reply one byte over the 64 MiB file cap is refused unread even though it is a c..." |
-| V12 | an empty permission_denials list is unknown (M4) | `envelope.permission_denials.length > 0 ? String` to `true ? String` | optimise-verify.mjs | "a session whose envelope lists no denials logs DENIED-TOOLS unknown, never a confident 0"; "an empty permission_denials list is unknown, not a confident zero, and a list with entrie..." |
 | V13 | no record count beside a lane that did not run, verifier side (M3) | `reasons: found.length > 0 ? [`figure mismatch ledger: collected none` to `reasons: false ? [`figure mismatch ledger: collected none` | optimise-verify.mjs | "a record count printed beside a ledger lane that did not run FAILs with the figure named,..."; "a ledger record count printed beside a ledger lane that did not run is refused, whatever ..." |
 | V14 | no record count printed for a failed ledger lane, workflow side (M3) | `if (!d.ledgerLaneFailed) lines.push(`Ledger records in window` to `if (true) lines.push(`Ledger records in window` | optimise-cycle.js | "a failed ledger lane prints no ledger record count at all, only the lane's fixed reason, ..."; "the report placed for a failed ledger lane holds no ledger record count, only the lane's ..." |
 | V0 | the verdict scored on shape only: every figure check dropped (AC-QA-3, the 2026-11-13 shape) | `const reasons = [...checkLanes(result.lanes, col), ...ledger.reasons, ...checkCi(report, col), ...checkGit(re...` to `const reasons = []` | optimise-verify.mjs | "AC-QA-3/AC-QA-4/AC-SEC-14/AC-QA-13/AC-QA-15: hollow report"; "AC-QA-3/AC-QA-4/AC-SEC-14/AC-QA-13/AC-QA-15: hollow report built by the real workflow fro..."; "AC-QA-3/AC-QA-4/AC-SEC-14/AC-QA-13/AC-QA-15: ledger record count FAILs naming the figure,..." (and 2 more) |
@@ -224,7 +223,7 @@ Not mutated, and why:
 | R21 | row check class UNTERMINATED_TOTAL (AC-SEC-14, M2, M4) | `const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVE...` to `const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVE...` | optimise-verify.mjs | "the total unterminated-waits count altered by one is refused with a reason naming that fi..." |
 | R22 | row check class SUPPRESSION_SHARE (AC-SEC-14, M2, M4) | `const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVE...` to `const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVE...` | optimise-verify.mjs | "a suppression-share count altered by one is refused with a reason naming that figure"; "a suppression-share total altered by one is refused with a reason naming that figure" |
 | R23 | row check class WALL_CLOCK_SOURCES (AC-SEC-14, M2, M4) | `const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVE...` to `const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVE...` | optimise-verify.mjs | "the sources line altered by one is refused with a reason naming that figure" |
-| RS | scoped escaped-defect line (M2) | remove `...checkScoped(report, col),` | optimise-verify.mjs | "the scoped count altered by one is refused with a reason naming that figure"; "the scoped excluded count altered by one is refused with a reason naming that figure"; "the scoped unavailable count altered by one is refused with a reason naming that figure" |
+| RS | scoped escaped-defect line (M2) | remove `...checkScoped(report, col),` | optimise-verify.mjs | "the scoped count altered by one is refused with a reason naming that figure"; "the scoped excluded count altered by one is refused with a reason naming that figure"; "the scoped unavailable count altered by one is refused with a reason naming that figure" (and 1 more) |
 | RP | proposal adoption and rejection dates (M2) | remove `...checkProposalOutcomes(report, col),` | optimise-verify.mjs | "a proposal's recorded adoption and rejection dates are held to the outcome the ledger hol..." |
 | RU | a row the data does not hold (M2) | `if (want === undefined) { reasons.push(`figure mismatch ${spec.name}: a row the collected data does not hold`...` to `if (want === undefined) return` | optimise-verify.mjs | "a per-job row whose key the data does not hold altered by one is refused with a reason na..." |
 | RL | a row the report leaves out (M2) | `for (const [key, want] of wants) if (!seen.has(key)) reasons.push` to `for (const [key, want] of wants) if (false) reasons.push` | optimise-verify.mjs | "a per-job row left out altered by one is refused with a reason naming that figure" |
@@ -264,9 +263,6 @@ Not mutated, and why:
 | H2e | the workflow returns the nonce hash (H2) | `nonce_sha256: typeof dataNonce === 'string' ? sha256Hex(dataNonce) : null,` to `nonce_sha256: null,` | optimise-cycle.js | "a result carrying the hash of this run's nonce PASSes, and the hash is of the nonce the r..."; "the result carries the SHA-256 of the nonce the workflow fenced with, and never the nonce..." |
 | L1a | sidecar renamed before the report (L1) | `elif ! mv -f "$STAGED_SIDECAR_TMP" "$sidecar_root/$SIDECAR_REL" 2>/dev/null; then reasons+=("could not move t...` to `elif ! mv -f "$STAGED_REPORT_TMP" "$repo/$REPORT_REL" 2>/dev/null; then reasons+=("could not move the result ...` | optimise-cycle-weekly.sh | "both outputs are staged first and the sidecar is renamed before the report, so a failure ..." |
 | L2a | the sidecar lock serialises read, merge and rename (L2) | `if [ "$claude_exit" -eq 0 ] && lock_sidecar "$repo"; then` to `if [ "$claude_exit" -eq 0 ] && true; then` | optimise-cycle-weekly.sh | "runners started together against one repository each add their own entry, and none is lost" |
-| L2b | a lock whose owner is gone is broken (L2) | `if { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; } \|\|` to `if false \|\|` | optimise-cycle-weekly.sh | "a lock left by a process that is gone, or one older than the stale limit, is broken; a li..." |
-| L2c | a lock older than the stale limit is broken (L2) | `\|\| [ -n "$(find "$dir" -maxdepth 0 -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]; then` to `\|\| false; then` | optimise-cycle-weekly.sh | "a lock left by a process that is gone, or one older than the stale limit, is broken; a li..." |
-| L2d | a lock the run does not own is never removed (L2) | `if [ -n "$SIDECAR_LOCK" ]; then rm -rf "$SIDECAR_LOCK"` to `if true; then rm -rf "${SIDECAR_LOCK:-$PWD/.git/optimise-sidecar.lock}"` | optimise-cycle-weekly.sh | "a lock left by a process that is gone, or one older than the stale limit, is broken; a li..." |
 | L4a | the report size cap is the module's (L4) | `REPORT_CAP_BYTES=5242880` to `REPORT_CAP_BYTES=5242881` | optimise-cycle-weekly.sh | "the sidecar path and the report and sidecar size caps the runner uses are the module's, s..." |
 | L4b | the sidecar relative path is the module's (L4) | `export const SIDECAR_REL = '.claude/optimise-proposal-targets.json'` to `export const SIDECAR_REL = '.claude/optimise-proposal-targets.jsn'` | optimise-verify.mjs | "the sidecar path and the report and sidecar size caps the runner uses are the module's, s..." |
 | M1a | a result check that prints no verdict line is a FAIL; double-guarded with M1d, so both are removed together (M1) | `\|\| [ "$seen_place" -eq 0 ]; then` to `\|\| false; then` (together with `if [ "$VERIFY_PLACE" != yes ] && [ ${#reasons[@]} -eq 0 ]; ...` to `if false; then`) | optimise-cycle-weekly.sh | "a result check that prints a no-place verdict with no reason for it is a FAIL with the fi..."; "a result check that prints figures but no verdict line is a FAIL with the fixed reason an..." |
@@ -280,7 +276,7 @@ Not mutated, and why:
 | M2c | a digest omission line left out is refused (M2) | `if (isCount(value) && value > 0 && !seen.has(key)) return` to `if (false) return` | optimise-verify.mjs | "a report with a figure line left out is refused with the exact "reported none" reason, on..." |
 | M2d | the digest trimmed flag (M2) | `return (dropped.trimmedForSize === true) !== report.includes('Digest trimmed for size: yes') ?` to `return false ?` | optimise-verify.mjs | "a report with a figure line left out is refused with the exact "reported none" reason, on..." |
 | M3a | a collector stopped at its bound is a FAIL (M3) | `124\|137) collect_reason="collector timed out after ${COLLECT_TIMEOUT_S}s" ;;` to `124) collect_reason="collector timed out after ${COLLECT_TIMEOUT_S}s" ;;` | optimise-cycle-weekly.sh | "a collector stopped at the runner's bound (exit 137) FAILs that repository with the fixed..." |
-| M3b | a collector stopped at its bound names the bound (M3) | `124\|137) collect_reason="collector timed out after ${COLLECT_TIMEOUT_S}s" ;;` to `124\|137) collect_reason="collector failed (exit $collect_exit)" ;;` | optimise-cycle-weekly.sh | "a collector stopped at the runner's bound (exit 124) FAILs that repository with the fixed..."; "a collector stopped at the runner's bound (exit 137) FAILs that repository with the fixed..." |
+| M3t | only a fixed-shape token of a crashed program's stderr reaches the log (M3, L10) | `sed -n "s/.*Error \[\([A-Z_][A-Z_]*\)\].*/\1/p;` to `sed -n "s/^\(.*\)$/\1/p;` (together with `''\|*[!A-Z_]*) tok=unknown ;;` to `'') tok=unknown ;;`) | optimise-cycle-weekly.sh | "a collector that cannot load a module is named with its exit status and the fixed error c..."; "a result check that cannot load a module logs its exit status, the bytes it printed and t..."; "a report-ignore helper that cannot load a module it imports is named as the helper that f..." |
 | M5a | reasons are capped (M5) | `export const MAX_REASONS = 8` to `export const MAX_REASONS = 800000` | optimise-verify.mjs | "a report engineered to produce thousands of reasons FAILs quickly with a bounded RESULT l..."; "reasons are de-duplicated, only the first few are printed, the rest are counted as more_r..." |
 | M5b | reasons are de-duplicated (M5) | `const distinct = [...new Set(reasons)]` to `const distinct = [...reasons]` | optimise-verify.mjs | "reasons are de-duplicated, only the first few are printed, the rest are counted as more_r..." |
 | M5c | each reason is bounded in length (M5) | `.map((r) => r.slice(0, MAX_REASON_CHARS))` to `.map((r) => r)` | optimise-verify.mjs | "reasons are de-duplicated, only the first few are printed, the rest are counted as more_r..." |
@@ -291,3 +287,33 @@ Not mutated, and why:
 | L6a | the repository path is held in a report (L6) | `const bounded = pathNeedles([repo])` to `const bounded = []` | optimise-verify.mjs | "a report holding the repository path and nothing else that is an absolute path is refused..." |
 | L6b | the per-run directory is held in a report (L6) | `const strict = pathNeedles([home, dir, runTmp])` to `const strict = pathNeedles([home])` | optimise-verify.mjs | "a report holding the per-run directory and nothing else that is an absolute path is refus..." |
 | L9a | a repository interrupted by a signal gets its own FAIL line (L9) | `if [ -n "$CURRENT_LABEL" ]; then local interrupted_cause=abort` to `if false; then local interrupted_cause=abort` | optimise-cycle-weekly.sh | "a SIGTERM while the session runs gives the repository its own RESULT FAIL line with the f..." |
+| M2a_r3 | no MCP server loads in the unattended session (M2) | remove `--strict-mcp-config \` | optimise-cycle-weekly.sh | "the session is given exactly the Workflow tool and a Read rule for the per-run directory,..."; "the real `claude -p` call site in bin/optimise-cycle-weekly.sh passes the allowlist, the ..." |
+| L3a_r3 | the session is not saved to disk (L3) | `--no-session-persistence ) \` to `) \` | optimise-cycle-weekly.sh | "the session is given exactly the Workflow tool and a Read rule for the per-run directory,..."; "the real `claude -p` call site in bin/optimise-cycle-weekly.sh passes the allowlist, the ..." |
+| M3i_r3 | a crashed report-ignore helper is its own outcome (M3) | `if [ "$status" -ne 0 ]; then # The helper crashed` to `if false; then # The helper crashed` | optimise-cycle-weekly.sh | "a report-ignore helper that cannot load a module it imports is named as the helper that f..."; "a report-ignore helper that exits 9 is named as the helper that failed, not as a .gitigno..."; "a report-ignore helper that prints a path to stderr and exits 3 is named as the helper th..." |
+| L10a_r3 | a crashed collector is named with a fixed-shape token (L10) | `collector failed (exit $collect_exit, $(stderr_token "$(head -c 4000 "$collect_err" 2>/dev/null)"))` to `collector failed (exit $collect_exit)` | optimise-cycle-weekly.sh | "a collector that cannot load a module is named with its exit status and the fixed error c..." |
+| L10b_r3 | a crashed result check logs a fixed-shape token (L10) | remove `err=$(stderr_token "$(head -c 4000 "$RUNNER_TMP/verify.err" 2>/dev/null)")` | optimise-cycle-weekly.sh | "a result check that cannot load a module logs its exit status, the bytes it printed and t..." |
+| L1a_r3 | a stale lock taken by mistake is put back, so two takers never both hold it (L1) | `if [ "$taken" != "$owner" ]; then ln -s "$taken" "$dir" 2>/dev/null` to `if false; then ln -s "$taken" "$dir" 2>/dev/null` | optimise-cycle-weekly.sh | "a stale lock taken over by two runners at once is held by one of them at a time -- the se..." |
+| L1b_r3 | only the holder can release the lock (L1) | `if [ "$taken" != "$SIDECAR_TOKEN" ]; then ln -s "$taken" "$SIDECAR_LOCK" 2>/dev/null` to `if false; then ln -s "$taken" "$SIDECAR_LOCK" 2>/dev/null` | optimise-cycle-weekly.sh | "a runner that does not hold the lock cannot release it, and the holder still can" |
+| L1c_r3 | a lock whose owner is gone is stale (L1) | `if ! kill -0 "$pid" 2>/dev/null; then return 0` to `if false; then return 0` | optimise-cycle-weekly.sh | "a lock left by a process that is gone, or one older than the stale limit, is broken; a li..." |
+| L1d_r3 | a lock older than the stale limit is stale (L1) | `[ -n "$(find "$dir" -maxdepth 0 -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ] }` to `false }` | optimise-cycle-weekly.sh | "a lock left by a process that is gone, or one older than the stale limit, is broken; a li..." |
+| L5a_r3 | every ledger line must match, not the first (L5) | `const wrong = found.find((n) => n !== want)` to `const wrong = found[0] !== want ? found[0] : undefined` | optimise-verify.mjs | "every line of each figure shape is held to the data: a later line with a different figure..." |
+| L5b_r3 | every CI, git and scoped line must match (L5) | `for (const got of found) { const diff = firstDifference(names, want, got)` to `for (const got of found.slice(0, 1)) { const diff = firstDifference(names, want, got)` | optimise-verify.mjs | "every line of each figure shape is held to the data: a later line with a different figure..." |
+| L5c_r3 | every digest omission line must match (L5) | `for (const [, key, n] of report.matchAll(/Digest omitted ([A-Za-z]{1,40}): (\d{1,15})/g)) {` to `for (const [, key, n] of [...report.matchAll(/Digest omitted ([A-Za-z]{1,40}): (\d{1,15})/g)].slice(0, 1)) {` | optimise-verify.mjs | "every line of each figure shape is held to the data: a later line with a different figure..." |
+| L6a_r3 | an envelope that says it is an error is refused (L6) | `if (envelope.is_error === true \|\| typeof envelope.result` to `if (typeof envelope.result` | optimise-verify.mjs | "an envelope that says it is an error is refused even when its result is a complete, corre..."; "an envelope with is_error true is refused as having no result, even though its result str..." |
+| L7a_r3 | the sidecar path is confirmed gitignored too (L7) | `&& git -c safe.bareRepository=explicit -C "$root" check-ignore -q -- "$SIDECAR_REL" 2>/dev/null` to `&& true` | optimise-cycle-weekly.sh | "a repository that re-includes only the sidecar path in a tracked .gitignore FAILs with ne..." |
+| L8a_r3 | a report that is not valid UTF-8 is refused (L8) | `if (Buffer.from(report, 'utf8').toString('utf8') !== report) return` to `if (false) return` | optimise-verify.mjs | "a report that is not valid UTF-8 (a lone surrogate) is refused, so what is placed is exac..." |
+| L8b_r3 | a digest that is not on disk stops the repository (L8) | `[ -L "$RUN_REAL/digest.json" ] \|\| [ ! -f "$RUN_REAL/digest.json" ]` to `[ -L "$RUN_REAL/digest.json" ] \|\| false` | optimise-cycle-weekly.sh | "a collector whose digest is not on disk although it said digest=ran stops that repository..." |
+| L8c_r3 | a collector that prints no result line is a FAIL (L8) | `if ! [[ "$collect_line" =~ $COLLECT_LINE_RE ]]; then` to `if false; then` | optimise-cycle-weekly.sh | "a collector that prints no result line is a FAIL with the fixed reason and no session" |
+| L8d_r3 | a result check that wrote no files places nothing (L8) | `if [ ! -f "$RUN_REAL/result-report.md" ] \|\| [ ! -f "$RUN_REAL/result-sidecar.json" ]; then` to `if false; then` | optimise-cycle-weekly.sh | "a result check that says PLACE yes but wrote no files is a FAIL with the fixed reason, an..." |
+| L8e_r3 | unreadable collected lane data is named (L8) | `if (st === 'unreadable') { reasons.push` to `if (false) { reasons.push` | optimise-verify.mjs | "collected data that cannot be read is named, never treated as a lane that ran" |
+| L8f_r3 | an unreadable digest is named (L8) | remove `if (!isObject(digest) \|\| !isObject(digest.dropped)) return ['collected data unreadable: digest']` | optimise-verify.mjs | "collected data that cannot be read is named, never treated as a lane that ran" |
+| L11a_r3 | the reader runs through a symlinked path (L11) | `=== fs.realpathSync(path.resolve(process.argv[1]))` to `=== path.resolve(process.argv[1])` | optimise-read.mjs | "the reader prints its answer when started through a symlinked path, exactly as it does th..." |
+| L12a_r3 | the workflow decides no sidecar retention of its own (L12) | `Object.entries(ledgerAgg?.proposalOutcomes \|\| {})) { if (o && o.target` to `Object.entries(ledgerAgg?.proposalOutcomes \|\| {}).slice(0, 500)) { if (o && o.target` | optimise-cycle.js | "past the carry maximum the oldest entries go first, never the newest, and never before th..." |
+| M1a_r3 | the session starts in the per-run directory, not the repository (M1) | `( cd "$RUN_REAL" && exec timeout` to `( exec timeout` | optimise-cycle-weekly.sh | "the session starts in the per-run directory, which is not inside the analysed repository ..."; "the real `claude -p` call site in bin/optimise-cycle-weekly.sh passes the allowlist, the ..." |
+| M1b_r3 | Grep and Glob are denied as whole tools (M1) | `WebSearch Grep Glob \` to `WebSearch \` | optimise-cycle-weekly.sh | "the session is given exactly the Workflow tool and a Read rule for the per-run directory,..."; "the real `claude -p` call site in bin/optimise-cycle-weekly.sh passes the allowlist, the ..." |
+| M1c_r3 | the session is told the scriptPath of the copy in the per-run directory (M1) | `with its scriptPath set to $WORKFLOW_FILE` to `with its scriptPath set to $WORKFLOW_SOURCE` | optimise-cycle-weekly.sh | "the workflow the session runs is a private copy of the INSTALLED optimise-cycle.js in the..." |
+| M1d_r3 | the workflow the session runs is the installed one, never the repository's (M1) | `if ! { cp "$WORKFLOW_SOURCE" "$WORKFLOW_FILE" && chmod 600 "$WORKFLOW_FILE"; }; then` to `if ! { { cp "$repo/.claude/workflows/optimise-cycle.js" "$WORKFLOW_FILE" 2>/dev/null \|\| cp "$WORKFLOW_SOURC...` | optimise-cycle-weekly.sh | "the workflow the session runs is a private copy of the INSTALLED optimise-cycle.js in the..." |
+| M1e_r3 | the copied workflow is mode 600 (M1) | `cp "$WORKFLOW_SOURCE" "$WORKFLOW_FILE" && chmod 600 "$WORKFLOW_FILE"; }; then` to `cp "$WORKFLOW_SOURCE" "$WORKFLOW_FILE"; }; then` | optimise-cycle-weekly.sh | "the workflow the session runs is a private copy of the INSTALLED optimise-cycle.js in the..." |
+| M1f_r3 | an install with no workflow stops the repository (M1) | `if [ ! -f "$WORKFLOW_SOURCE" ]; then` to `if false; then` | optimise-cycle-weekly.sh | "an install with no optimise-cycle.js stops each repository before collection, naming the ..." |
+| D1_r3 | a list of permission_denials is a count (M4, round 3) | `return { denied: String(envelope.permission_denials.length),` to `return { denied: 'unknown',` | optimise-verify.mjs | "the number of refused tool calls and the names of the tools are the CLI's own report, and..."; "an array of permission_denials is a count (zero included) with its tool names from a know..." |
+| D2_r3 | refused tool names come from a known set (M4, round 3) | `KNOWN_TOOL_NAMES.includes(entry.tool_name) ? entry.tool_name : 'other'` to `typeof entry?.tool_name === 'string' ? entry.tool_name : 'other'` | optimise-verify.mjs | "the number of refused tool calls and the names of the tools are the CLI's own report, and..."; "an array of permission_denials is a count (zero included) with its tool names from a know..." |

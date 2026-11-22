@@ -1127,12 +1127,18 @@ test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh pas
   const callSite = lines.slice(start, end + 1).join('\n')
   assert.ok(callSite.includes('--allowedTools'), 'the claude -p call site must pass --allowedTools')
   assert.match(callSite, /--allowedTools\s+"?Workflow"?\s+"Read\(\//, 'the allowlist is the Workflow tool and one Read rule, in that order, and nothing else')
-  assert.match(callSite, /--disallowedTools\s+Bash\s+Write\s+Edit\s+NotebookEdit\s+WebFetch\s+WebSearch(\s|$)/, 'the six whole tools are denied by bare name, so a user-level allow rule cannot hand the session one')
+  assert.match(callSite, /--disallowedTools\s+Bash\s+Write\s+Edit\s+NotebookEdit\s+WebFetch\s+WebSearch\s+Grep\s+Glob(\s|$)/, 'the six whole tools are denied by bare name, so a user-level allow rule cannot hand the session one')
   assert.ok(callSite.includes('--permission-mode dontAsk'), 'the claude -p call site must refuse unlisted tools with --permission-mode dontAsk')
-  assert.ok(callSite.includes('--session-id "$SESSION_ID"'), 'the claude -p call site must pass --session-id, which is how the plan marker is recognised and restored')
+  assert.ok(callSite.includes('cd "$RUN_REAL"'), 'the session starts in the per-run directory, never in the analysed repository (M1)')
+  assert.ok(!callSite.includes('--session-id'), 'no session id is needed: the session cannot touch a repository plan marker')
   assert.ok(callSite.includes('--setting-sources user'), 'the claude -p call site must load user settings only, so a repo cannot widen the allowlist')
   assert.ok(callSite.includes('--output-format json'), 'the claude -p call site must ask for the JSON envelope the runner parses')
   assert.ok(!callSite.includes('--settings'), 'the claude -p call site must not override settings: the guard and snapshot hooks stay on')
+  // `claude --help` (2.1.330): "--strict-mcp-config  Only use MCP servers from --mcp-config, ignoring all other MCP configurations",
+  // and with no --mcp-config no MCP server loads at all; "--no-session-persistence  Don't save sessions to disk; they can't be
+  // resumed (only works with --print)", so collected data is not left in a saved transcript.
+  assert.ok(/--strict-mcp-config(\s|$)/.test(callSite) && !callSite.includes('--mcp-config'), 'no MCP server may load in the unattended session: --strict-mcp-config and no --mcp-config')
+  assert.ok(/--no-session-persistence(\s|$)/.test(callSite), 'the session is not saved to disk')
   for (const gone of ['Bash(', 'Edit(', 'Write(', 'dangerously-skip-permissions', 'bypassPermissions']) {
     assert.ok(!callSite.includes(gone), `the claude -p call site must not contain ${gone}`)
   }

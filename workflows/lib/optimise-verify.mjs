@@ -28,7 +28,8 @@ import { isPlainInsufficientRow, readRepoFile, sidecarTargetOrReason, stableProp
 export const REPORT_CAP = 5242880
 export const SIDECAR_CAP = 1048576
 export const FILE_CAP = 67108864
-// The workflow's own carry maximum for its sidecar (SIDECAR_CARRY_MAX in optimise-cycle.js); a parity test holds them equal.
+// How many entries the sidecar file keeps. This module is the only place retention is decided (the workflow carries every
+// outcome the digest holds and decides nothing; a test holds it to that).
 export const SIDECAR_CARRY_MAX = 500
 export const SIDECAR_REL = '.claude/optimise-proposal-targets.json'
 export const LANES = ['ledger', 'git', 'ci']
@@ -98,31 +99,41 @@ export function tokensFor(col, digestToken, reportedLedger) {
 
 // ---- the session's output: the JSON envelope, then the result inside it ----
 
-// The CLI's own refused-tool count is not evidence of none: the spec measured `permission_denials` empty although
-// calls were refused. A list with entries proves refusals happened and its length is a floor; an empty or absent list
-// proves nothing, so it is `unknown`, never a confident 0.
-const deniedCount = (envelope) => (Array.isArray(envelope.permission_denials) && envelope.permission_denials.length > 0 ? String(envelope.permission_denials.length) : 'unknown')
+// The CLI's own report of the tool calls it refused. Measured on 2026-11-22 (claude 2.1.330): the list holds one entry per
+// refused Read, so a list is a count, zero included. Whether a refused SHELL call appears in it is not established (an
+// earlier measurement found it empty for those), so the count is what the CLI said, not a proof that nothing else was
+// attempted. An absent or non-list value is `unknown`. Only the tool NAMES are kept, drawn from a known set (anything else is
+// `other`); an entry's tool_input holds paths and is never carried.
+export const KNOWN_TOOL_NAMES = ['Agent', 'Bash', 'Edit', 'Glob', 'Grep', 'NotebookEdit', 'Read', 'Skill', 'WebFetch', 'WebSearch', 'Workflow', 'Write']
+const toolNameOf = (entry) => (isObject(entry) && KNOWN_TOOL_NAMES.includes(entry.tool_name) ? entry.tool_name : 'other')
 
-// { result, denied } or { reason, cause, denied }: the result object, or the one fixed reason it could not be had and the
+export function deniedReport(envelope) {
+  if (!Array.isArray(envelope.permission_denials)) return { denied: 'unknown', tools: 'none' }
+  const names = [...new Set(envelope.permission_denials.map(toolNameOf))].sort((a, b) => a.localeCompare(b))
+  return { denied: String(envelope.permission_denials.length), tools: names.length > 0 ? names.join(',') : 'none' }
+}
+
+// { result, denied, tools } or { reason, cause, denied, tools }: the result object, or the one fixed reason it could not be had and the
 // class of the failure (empty, malformed).
 export function parseSession(text) {
-  if (text.trim() === '') return { reason: 'session output: empty', cause: 'empty', denied: 'unknown' }
+  const empty = { denied: 'unknown', tools: 'none' }
+  if (text.trim() === '') return { reason: 'session output: empty', cause: 'empty', ...empty }
   let envelope
   try {
     envelope = JSON.parse(text)
   } catch {
-    return { reason: 'session output: not a JSON envelope', cause: 'malformed', denied: 'unknown' }
+    return { reason: 'session output: not a JSON envelope', cause: 'malformed', ...empty }
   }
-  if (!isObject(envelope)) return { reason: 'session output: not a JSON envelope', cause: 'malformed', denied: 'unknown' }
-  const denied = deniedCount(envelope)
-  if (envelope.is_error === true || typeof envelope.result !== 'string' || envelope.result === '') return { reason: 'session output: envelope has no result', cause: 'malformed', denied }
+  if (!isObject(envelope)) return { reason: 'session output: not a JSON envelope', cause: 'malformed', ...empty }
+  const denied = deniedReport(envelope)
+  if (envelope.is_error === true || typeof envelope.result !== 'string' || envelope.result === '') return { reason: 'session output: envelope has no result', cause: 'malformed', ...denied }
   let result
   try {
     result = JSON.parse(envelope.result)
   } catch {
-    return { reason: 'session output: result is not a JSON object', cause: 'malformed', denied }
+    return { reason: 'session output: result is not a JSON object', cause: 'malformed', ...denied }
   }
-  return isObject(result) ? { result, denied } : { reason: 'session output: result is not a JSON object', cause: 'malformed', denied }
+  return isObject(result) ? { result, ...denied } : { reason: 'session output: result is not a JSON object', cause: 'malformed', ...denied }
 }
 
 export function startsWithHeading(report) {
@@ -801,17 +812,17 @@ function readSession(sessionPath) {
 
 // What a session's reply amounts to: { reasons, cause, denied, reportedLedger, place, report, sidecar, targets }.
 function judgeSession(sessionPath, col, strict, bounded, nonce) {
-  const out = { reasons: [], denied: 'unknown', reportedLedger: null, place: 'no' }
+  const out = { reasons: [], denied: 'unknown', tools: 'none', reportedLedger: null, place: 'no' }
   const read = readSession(sessionPath)
   const parsed = read.reason ? read : parseSession(read.text)
-  if (parsed.reason) return { ...out, denied: parsed.denied ?? 'unknown', reasons: [parsed.reason], cause: parsed.cause }
+  if (parsed.reason) return { ...out, denied: parsed.denied, tools: parsed.tools, reasons: [parsed.reason], cause: parsed.cause }
   const checked = checkResult(parsed.result, strict, bounded)
-  if (checked.reason) return { ...out, denied: parsed.denied, reasons: [checked.reason], cause: checked.cause }
+  if (checked.reason) return { ...out, denied: parsed.denied, tools: parsed.tools, reasons: [checked.reason], cause: checked.cause }
   const wrongNonce = nonceProblem(parsed.result, nonce)
-  if (wrongNonce !== null) return { ...out, denied: parsed.denied, reasons: [wrongNonce], cause: 'nonce' }
+  if (wrongNonce !== null) return { ...out, denied: parsed.denied, tools: parsed.tools, reasons: [wrongNonce], cause: 'nonce' }
   const figures = checkFigures(parsed.result, checked.report, col)
   const reasons = figures.reasons.length === 0 ? lanesThatCouldNotRun(col) : figures.reasons
-  return { ...out, denied: parsed.denied, reasons, reportedLedger: figures.reportedLedger, place: figures.reasons.length === 0 ? 'yes' : 'no', report: checked.report, sidecar: checked.sidecar, targets: checked.targets }
+  return { ...out, denied: parsed.denied, tools: parsed.tools, reasons, reportedLedger: figures.reportedLedger, place: figures.reasons.length === 0 ? 'yes' : 'no', report: checked.report, sidecar: checked.sidecar, targets: checked.targets }
 }
 
 // A trusted result's sidecar is validated (H1), then merged into the one on disk. One that fails a rule, or an on-disk one
@@ -847,7 +858,7 @@ export function cappedReasons(reasons) {
 }
 
 export function formatVerdict(v) {
-  return [`TOKENS ${v.tokens}`, `DENIED ${v.denied}`, ...(v.cause ? [`CAUSE ${v.cause}`] : []), ...cappedReasons(v.reasons).map((r) => `REASON ${r}`), `PLACE ${v.place}`].join('\n') + '\n'
+  return [`TOKENS ${v.tokens}`, `DENIED ${v.denied}`, ...(v.tools === undefined ? [] : [`TOOLS ${v.tools}`]), ...(v.cause ? [`CAUSE ${v.cause}`] : []), ...cappedReasons(v.reasons).map((r) => `REASON ${r}`), `PLACE ${v.place}`].join('\n') + '\n'
 }
 
 function main(argv) {
@@ -862,5 +873,12 @@ function main(argv) {
 
 // Compared by real path: import.meta.url is the real file, argv[1] may be reached through a symlink (an install whose
 // ~/.claude is a link), and a lexical comparison then silently runs nothing.
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(path.resolve(process.argv[1]))
+function isMainModule() {
+  try {
+    return Boolean(process.argv[1]) && fileURLToPath(import.meta.url) === fs.realpathSync(path.resolve(process.argv[1]))
+  } catch {
+    return false
+  }
+}
+const isMain = isMainModule()
 if (isMain) main(process.argv.slice(2))

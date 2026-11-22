@@ -1179,11 +1179,11 @@ const previouslyAdopted = ranked.filter(isAdoptedElsewhere)
 // Round 3 M2 (AC-PROD-8, AC-QA-20): seeded with every prior outcome target the
 // reader supplied this run, then overlaid with this run's proposals, so a
 // decided target survives cycles in which the drafter does not re-raise it.
-// Bounded: an outcome without a target is skipped, and at most
-// SIDECAR_CARRY_MAX prior entries are carried.
-const SIDECAR_CARRY_MAX = 500
+// An outcome without a target is skipped. How many entries the sidecar FILE keeps is not decided here: the result check
+// (workflows/lib/optimise-verify.mjs mergeSidecar) owns retention, so this carries every outcome the digest holds and
+// there is one eviction rule, not two with opposite orders (HARN-RUNNER-2 T3 L12).
 const proposalTargetsSidecar = {}
-for (const [id, o] of Object.entries((ledgerAgg && ledgerAgg.proposalOutcomes) || {}).slice(0, SIDECAR_CARRY_MAX)) {
+for (const [id, o] of Object.entries(ledgerAgg?.proposalOutcomes || {})) {
   if (o && o.target && typeof o.target === 'object' && /^[0-9a-f]{16}$/.test(id)) proposalTargetsSidecar[id] = redactDeep(o.target)
 }
 for (const p of [...ranked, ...insufficientDataProposals]) if (p.proposal_id) proposalTargetsSidecar[p.proposal_id] = redactDeep(p.target)

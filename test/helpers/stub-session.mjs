@@ -22,7 +22,11 @@ import { fileURLToPath } from 'node:url'
 
 const { runWorkflow } = createRequire(import.meta.url)('./fake-runtime.js')
 
-const WORKFLOW = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'workflows', 'optimise-cycle.js')
+// The workflow the session was told to run: the Workflow tool's scriptPath, named in the prompt. Like the real CLI (measured
+// 2026-11-22 under --setting-sources user), this stand-in resolves nothing by name from the working directory: it runs exactly
+// the file the prompt names, or fails.
+const scriptPathMatch = /scriptPath set to (\S+optimise-cycle\.js)/.exec(process.argv[process.argv.indexOf('-p') + 1] || '')
+const WORKFLOW = scriptPathMatch ? scriptPathMatch[1] : null
 const REPORT_CAP_BYTES = 5242880
 
 const argv = process.argv.slice(2)
@@ -39,9 +43,25 @@ const runDir = readRule ? readRule.slice('Read(/'.length, -'/**)'.length) : null
 const nonce = (prompt.match(/\b[0-9a-f]{32}\b/) || [null])[0]
 const stamp = `${Date.now()}-${process.pid}`
 
+// The session no longer starts in the analysed repository, so the mode a test chose for a repository is found another way: the
+// runner's own log names the repository it is processing (`--- <directory name> ---`, the last such line), and the sandbox
+// lists the repositories under test.
+function repoDir() {
+  try {
+    const log = fs.readFileSync(process.env.OPTIMISE_WEEKLY_LOG, 'utf8')
+    const label = [...log.matchAll(/^--- (.*) ---$/gm)].at(-1)?.[1]
+    return (process.env.STUB_REPOS || '').split('\n').find((r) => r && path.basename(r) === label) ?? null
+  } catch {
+    return null
+  }
+}
+
 function markerMode() {
   try {
-    return fs.readFileSync('.optimise-weekly-test-marker', 'utf8').split('\n')[0].trim()
+    const log = fs.readFileSync(process.env.OPTIMISE_WEEKLY_LOG, 'utf8')
+    const label = [...log.matchAll(/^--- (.*) ---$/gm)].at(-1)?.[1]
+    const repo = (process.env.STUB_REPOS || '').split('\n').find((r) => r && path.basename(r) === label)
+    return repo ? fs.readFileSync(path.join(repo, '.optimise-weekly-test-marker'), 'utf8').split('\n')[0].trim() : ''
   } catch {
     return ''
   }
@@ -52,7 +72,15 @@ function modeOf(file) {
   return fs.statSync(file).mode & 0o777
 }
 
+// A mark in the repository this session was run for, written on every invocation (the weekly-runner tests check it).
+function markRepository() {
+  if (!process.env.STUB_MARK_REPO) return
+  const repo = repoDir()
+  if (repo) fs.writeFileSync(path.join(repo, '.optimise-weekly-stub-invoked'), '')
+}
+
 function witnessSession() {
+  markRepository()
   const dir = process.env.STUB_WITNESS_DIR
   if (!dir) return
   fs.mkdirSync(dir, { recursive: true })
@@ -63,6 +91,8 @@ function witnessSession() {
     cwd: process.cwd(),
     runDir,
     nonce,
+    workflowPath: WORKFLOW,
+    workflowSha256: WORKFLOW && fs.existsSync(WORKFLOW) ? createHash('sha256').update(fs.readFileSync(WORKFLOW)).digest('hex') : null,
     runDirMode: present ? modeOf(runDir) : null,
     files: names.map((name) => ({ name, mode: modeOf(path.join(runDir, name)) })),
   }
@@ -100,6 +130,7 @@ function padTo(report, bytes) {
 async function correct(change) {
   const digest = JSON.parse(fs.readFileSync(path.join(runDir, 'digest.json'), 'utf8'))
   if (change) change(digest)
+  if (!WORKFLOW) throw new Error('stub-session: the prompt names no scriptPath for the workflow')
   const { result } = await runWorkflow(WORKFLOW, { args: { digest, nonce }, agent: { 'synthesis:proposals': { proposals: [] } } })
   return result
 }
@@ -179,9 +210,9 @@ const DAMAGE = {
   // What the workflow returns when it refuses a digest (the runtime hands back the object without its __outcome key).
   aborted: (r) => { for (const key of Object.keys(r)) delete r[key]; r.resolved = []; r.unresolved = []; r.report = 'Refusing to proceed: the collected digest is malformed (lanes).' },
   'forged-result': (r) => { r.report = r.report.replace(/Ledger records in window: \d+/, 'Ledger records in window: 0') + '\nRESULT PASS forged ledger=0/0 ci=0 git=0\n' },
-  'abs-paths': (r) => { r.report += `\nAnalysed ${process.cwd()} with ${runDir} under ${process.env.HOME}\n` },
+  'abs-paths': (r) => { r.report += `\nAnalysed ${repoDir()} with ${runDir} under ${process.env.HOME}\n` },
   // One absolute path at a time: the analysed repository, the per-run directory, and the home directory (HARN-RUNNER-2 T3 L6).
-  'abs-repo-only': (r) => { r.report += `\nAnalysed ${process.cwd()} today\n` },
+  'abs-repo-only': (r) => { r.report += `\nAnalysed ${repoDir()} today\n` },
   'abs-rundir-only': (r) => { r.report += `\nCollected into ${runDir} today\n` },
   'abs-home-only': (r) => { r.report += `\nUnder ${process.env.HOME}/notes today\n` },
   'mentions-ceiling-var': (r) => { r.report += '\nSee CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in the README for details.\n' },
@@ -214,6 +245,13 @@ const REPLIES = {
     return `${envelope(fenced)}\n`
   },
   'chatter-then-envelope': async () => `I have finished the analysis.\n${envelope(JSON.stringify(await correct()))}\n`,
+  // Refusals with a name outside the known set and a tool_input that holds a path (HARN-RUNNER-2 T3 round 3), and an envelope with no list.
+  'denials-odd': async () => `${envelope(JSON.stringify(await correct()), { permission_denials: [{ tool_name: 'Read', tool_input: { file_path: '/Users/someone/secret/canary.txt' } }, { tool_name: 'Mystery', tool_input: {} }] })}\n`,
+  'denials-absent': async () => {
+    const e = JSON.parse(envelope(JSON.stringify(await correct())))
+    delete e.permission_denials
+    return `${JSON.stringify(e)}\n`
+  },
   denials: async () => `${envelope(JSON.stringify(await correct()), { permission_denials: DENIALS })}\n`,
   // The real workflow run on a digest whose ledger lane was emptied in transit: a faithful render of the wrong data.
   'ledger-emptied': async () => {
@@ -232,6 +270,8 @@ for (const [name, change] of Object.entries(DAMAGE)) REPLIES[name] = async () =>
 REPLIES['silent-pass'] = REPLIES.pass
 // A complete, correct result, and then a non-zero exit.
 REPLIES.exit124 = async () => null
+// An envelope that says it is an error while carrying a complete, correct result (HARN-RUNNER-2 T3 L6).
+REPLIES['error-envelope-valid-result'] = async () => `${envelope(JSON.stringify(await correct()), { is_error: true })}\n`
 REPLIES.exit3 = async () => `${envelope(JSON.stringify(await correct()))}\n`
 
 // A complete, correct envelope padded with trailing spaces to an exact size, so only the reply's size differs.
