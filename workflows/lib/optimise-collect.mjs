@@ -66,6 +66,7 @@
 //   .claude/harness-ledger.jsonl (64 MiB cap)
 //   .claude/optimise-proposal-targets.json (1 MiB cap)
 //   .claude/harness-triggers.json (1 MiB cap)
+//   specs/ (a real directory, listed; each specs/*.md a regular file under a 1 MiB cap, for plan labels)
 // The only unguarded read is the operator-configured root itself (isDirectory).
 // git and gh read the repository by their own means and are bounded by timeouts.
 //
@@ -84,7 +85,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { DEFAULT_LEDGER_WINDOW_LINES, MIN_RUNS_FOR_NEVER_FAILED, REPO_FILE_CAPS, escapedDefectsFigures, repoFileStatus, resolveLedgerRoot } from './optimise-read.mjs'
+import { MIN_RUNS_FOR_NEVER_FAILED, NEVER_FAILING_RENDER_KEYS, REPO_FILE_CAPS, escapedDefectsFigures, isPlainInsufficientRow, readRepoFile, repoFileStatus, resolveLedgerRoot } from './optimise-read.mjs'
 
 const READER_PATH = fileURLToPath(new URL('./optimise-read.mjs', import.meta.url))
 
@@ -113,8 +114,39 @@ const STDERR_KEEP_CHARS = 4096
 const GH_RUN_LIMIT = 100
 const GIT_LOG_MAX_COMMITS = 500
 
+// The ledger window the weekly runner has always passed; an option of collectRepo, not a setting.
+export const DEFAULT_COLLECT_WINDOW = 90
+
+// The digest (digest.json): ONE bounded document a workflow script can be handed whole.
+export const DIGEST_MAX_BYTES = 32_768
+export const DIGEST_MAX_LINE_CHARS = 2000
+export const BLOCKED_STRING_MAX_CHARS = 120
+// Entry-count caps. The entries kept are the LAST ones, the plans and proposals the
+// ledger saw most recently; the number left out is recorded in the digest's `dropped`.
+export const DIGEST_MAX_BYPLAN_ENTRIES = 12
+export const DIGEST_MAX_PROPOSAL_OUTCOMES = 16
+export const PLAN_LABELS_MAX = 40
+// The CI parts, capped the same way (the numbers left out are in `dropped`). ci.failures, ci.ghStats and
+// ci.repoStats hold one entry per collected repository, so they are bounded already and are not capped here.
+export const CI_DIGEST_MAX_JOBS = 40
+export const CI_DIGEST_MAX_FAILED_RUN_IDS = 10
+export const CI_DIGEST_MAX_CITATIONS = 20
+export const PLAN_LABEL_TITLE_MAX_CHARS = 80
+const SPECS_DIR = 'specs'
+const SPEC_FILE_MAX_BYTES = 1024 * 1024
+const SPEC_FILES_MAX = 200
+// A task line: a box (open, done in either case, or `~` as this repository's own specs use for a dropped task), an id
+// of letters, digits and letters, then a colon, a space or an opening parenthesis and the rest. Every part is a bounded
+// run of its own class, so there is nothing for the match to backtrack over.
+const TASK_LINE_RE = /^- \[([ xX~])\] ([A-Za-z]{1,8}\d{1,4}[A-Za-z]{0,3})([: (].*)$/
+// Any checkbox-shaped line, so one under the Tasks heading that is not a task line can be counted.
+const CHECKBOX_LINE_RE = /^- \[[^\]]{0,2}\] /
+const GIT_WINDOW_NOTE = `the git log was cut at ${GIT_LOG_MAX_COMMITS} commits; older history was not examined`
+const GIT_FULL_HISTORY_NOTE = 'the full git history was examined'
+
 const GH_LIST_ARGV = ['run', 'list', '--limit', String(GH_RUN_LIMIT), '--json', 'databaseId,attempt,status,workflowName,startedAt']
-const GIT_LOG_ARGV = ['log', `--max-count=${GIT_LOG_MAX_COMMITS}`, '--name-only', '--pretty=format:%x1e%P%x1f%s']
+// One commit more than the cap is fetched, only as the signal that history goes further back.
+const GIT_LOG_ARGV = ['log', `--max-count=${GIT_LOG_MAX_COMMITS + 1}`, '--name-only', '--pretty=format:%x1e%P%x1f%s']
 const GIT_ROOT_ARGV = ['rev-parse', '--show-toplevel']
 
 const LEDGER_INPUT_FILES = [
@@ -288,7 +320,7 @@ async function ledgerLane(ctx, stats) {
   const ledgerRoot = path.resolve(location.root)
   const unreadable = unreadableLedgerInput(ledgerRoot)
   if (unreadable) throw new LaneFailure('could_not_read', unreadable)
-  return { result: await readerJson(ctx, stats, 'ledger', undefined, [ledgerRoot, `--window=${DEFAULT_LEDGER_WINDOW_LINES}`]) }
+  return { result: await readerJson(ctx, stats, 'ledger', undefined, [ledgerRoot, `--window=${ctx.window}`]) }
 }
 
 // The ledger identity the git figure is matched by (null when the ledger lane
@@ -317,9 +349,11 @@ async function gitLane(ctx, stats, identity) {
   const log = await gitCall(ctx, stats, GIT_LOG_ARGV)
   if (log.length === 0) throw new LaneFailure('other', 'git log returned no commits')
   const toplevel = (await gitCall(ctx, stats, GIT_ROOT_ARGV)).trim()
-  const figures = escapedDefectsFigures({ rawLog: log, toplevel, root: ctx.root, identity })
+  // The reader cuts the log at the cap and says whether a commit lay beyond it (the 501st is only that signal).
+  const { more: cut, ...figures } = escapedDefectsFigures({ rawLog: log, toplevel, root: ctx.root, identity, maxCommits: GIT_LOG_MAX_COMMITS })
   if (figures.rejected) throw new LaneFailure('other', GIT_TOPLEVEL_REASON)
-  return { result: figures }
+  // The one repository the collector is given is root 0. The note is a fixed string on every run, the cut wording only when a commit beyond the cap came back.
+  return { result: { ...figures, root_index: 0, window_note: cut ? GIT_WINDOW_NOTE : GIT_FULL_HISTORY_NOTE } }
 }
 
 // ---- ci lane ----
@@ -433,6 +467,355 @@ async function ciLane(ctx, stats) {
   return { runCount, fetchFailedCount, timeoutCount, ...(timeoutCount > 0 ? { reason: budgetReason(runCount, entries.length) } : {}), result }
 }
 
+// ---- plan labels ----
+
+// The spec path, task id and one-line title of each task line in the Tasks section of
+// each specs/*.md, with no model: the labels the workflow's scope step used to have an
+// agent extract. The reads are the reader's guarded ones (a symlinked specs
+// directory or spec file, an oversize file and a device are refused); what could not
+// be read is said in a fixed note, never silently.
+function taskLabels(text, spec) {
+  const labels = []
+  let unmatched = 0
+  let inTasks = false
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('#')) {
+      inTasks = line.trim() === '## Tasks'
+      continue
+    }
+    if (!inTasks || !CHECKBOX_LINE_RE.test(line)) continue
+    const match = line.match(TASK_LINE_RE)
+    const rest = match ? match[3] : ''
+    const title = (rest.startsWith(':') ? rest.slice(1) : rest).trim()
+    if (title) labels.push({ spec, task_id: match[2], title: title.slice(0, PLAN_LABEL_TITLE_MAX_CHARS), open: match[1] === ' ' })
+    else unmatched += 1
+  }
+  return { labels, unmatched }
+}
+
+function listSpecFiles(root) {
+  const dir = repoFileStatus(root, SPECS_DIR, SPEC_FILE_MAX_BYTES, { list: true })
+  if (dir.status === 'absent') return { names: [] }
+  if (dir.status !== 'ok') return { names: [], note: 'the specs directory is a symlink or could not be read, so no plan labels were collected' }
+  const names = dir.entries.filter((name) => name.endsWith('.md')).sort((a, b) => a.localeCompare(b, 'en'))
+  return { names: names.slice(0, SPEC_FILES_MAX), overFileCap: names.length > SPEC_FILES_MAX }
+}
+
+function planLabelsNote({ note, refused, overFileCap, unmatched, dropped, total, sizeTrimmed }) {
+  const parts = []
+  if (refused > 0) parts.push(`${refused} spec files were not read (symlink, over the size limit or unreadable)`)
+  if (overFileCap) parts.push(`only the first ${SPEC_FILES_MAX} spec files were read`)
+  if (unmatched > 0) parts.push(`${unmatched} checkbox lines under "## Tasks" were not recognised as tasks and were left out`)
+  if (dropped > 0 && sizeTrimmed) parts.push(`${dropped} of ${total} task labels were left out to keep the digest within its size limit; plans with open tasks were kept first`)
+  else if (dropped > 0) parts.push(`${dropped} of ${total} task labels were left out at the limit of ${PLAN_LABELS_MAX}; plans with open tasks were kept first`)
+  return note ?? (parts.length > 0 ? parts.join('; ') : null)
+}
+
+const byText = (a, b) => a.localeCompare(b, 'en')
+
+// Every label in priority order: those of plans (specs) with an open task first, within them the open
+// tasks first, then by spec name and document order, so the same files always give the same order. The
+// digest keeps a prefix of this list (the cap, then any trimming for size), so the labels of plans with
+// no open task are the first to go, then the finished tasks of plans that have one.
+function rankLabels(all) {
+  const specsWithOpen = new Set(all.filter((label) => label.open).map((label) => label.spec))
+  return all
+    .map((label, index) => ({ label, index }))
+    .sort((a, b) => Number(!specsWithOpen.has(a.label.spec)) - Number(!specsWithOpen.has(b.label.spec)) || Number(!a.label.open) - Number(!b.label.open) || byText(a.label.spec, b.label.spec) || a.index - b.index)
+}
+
+// The labels kept, in spec name and document order, without the working `open` field.
+function orderedLabels(ranked) {
+  return [...ranked]
+    .sort((a, b) => byText(a.label.spec, b.label.spec) || a.index - b.index)
+    .map(({ label: { spec, task_id, title } }) => ({ spec, task_id, title }))
+}
+
+function collectPlanLabels(root) {
+  const { names, note, overFileCap } = listSpecFiles(root)
+  const all = []
+  let refused = 0
+  let unmatched = 0
+  for (const name of names) {
+    const spec = `${SPECS_DIR}/${name}`
+    const file = readRepoFile(root, spec, SPEC_FILE_MAX_BYTES)
+    if (file.status !== 'ok') {
+      refused += 1
+      continue
+    }
+    const parsed = taskLabels(file.text, spec)
+    all.push(...parsed.labels)
+    unmatched += parsed.unmatched
+  }
+  return { ranked: rankLabels(all), unmatched, noteInput: { note, refused, overFileCap, unmatched } }
+}
+
+// ---- the digest ----
+
+// Where the digest holds text that originated in a repository (a plan label, a spec
+// path, a criterion id, a job name, a commit-derived string, a task title), so the
+// workflow can fence exactly those. Grammar: dot separated; `name` a member,
+// `name[*]` every element of the array at that member, `*` every member value of an
+// object, `*^` every member KEY of an object. Lane reasons are fixed text and are not here.
+const FREE_TEXT_PATHS = [
+  'ledger.perRepo[*].root',
+  'ledger.perRepo[*].schemaVersionsSeen.*^',
+  'ledger.rework.lensDispositionCounts.*^',
+  'ledger.blockedUnresolved.byReason.*^',
+  'ledger.blockedUnresolved.unresolved[*].repo',
+  'ledger.blockedUnresolved.unresolved[*].spec',
+  'ledger.blockedUnresolved.unresolved[*].task',
+  'ledger.blockedUnresolved.unresolved[*].laterDoneSameSpecTs',
+  'ledger.wallClock.totals.agentComputeStartOnlyByKind.*^',
+  'ledger.wallClock.totals.agentComputeTerminalOnlyByKind.*^',
+  'ledger.wallClock.byPlan.*^',
+  'ledger.wallClock.byPlan.*.repo',
+  'ledger.wallClock.byPlan.*.plan',
+  'ledger.wallClock.byPlan.*.unusableIntervals[*].reason',
+  'ledger.proposalOutcomes.*^',
+  'ledger.proposalOutcomes.*.lastAdoptionTs',
+  'ledger.proposalOutcomes.*.lastRejectionTs',
+  'ledger.proposalOutcomes.*.target.kind',
+  'ledger.proposalOutcomes.*.target.component',
+  'ledger.proposalOutcomes.*.target.concern',
+  'ledger.proposalOutcomes.*.target.lens',
+  'ledger.proposalOutcomes.*.target.workflow',
+  'ledger.proposalOutcomes.*.target.job',
+  'ledger.triggerAccuracy.byLens.*^',
+  'ledger.citationPool[*]',
+  'ledger.neverFailingAcs[*].repo',
+  'ledger.neverFailingAcs[*].spec',
+  'ledger.neverFailingAcs[*].ac_id',
+  'git.repo',
+  'git.scoped_exclude_globs[*]',
+  'ci.byJob.*^',
+  'ci.byJob.*.repo',
+  'ci.byJob.*.workflow',
+  'ci.byJob.*.job',
+  'ci.byJob.*.failedRunIds[*]',
+  'ci.byJob.*.windowStart',
+  'ci.byJob.*.windowEnd',
+  'ci.citationPool[*]',
+  'ci.repoStats.*^',
+  'ci.failures[*].repo',
+  'ci.ghStats[*].repo',
+  'plan_labels[*].spec',
+  'plan_labels[*].task_id',
+  'plan_labels[*].title',
+]
+
+function omitKey(object, key) {
+  const copy = { ...object }
+  delete copy[key]
+  return copy
+}
+
+function cutStrings(value, max) {
+  if (typeof value === 'string') return value.slice(0, max)
+  if (Array.isArray(value)) return value.map((item) => cutStrings(item, max))
+  if (value !== null && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cutStrings(item, max)]))
+  return value
+}
+
+function laneDigest(record) {
+  const base = { status: record.status, mode: record.mode ?? null, reason: record.reason ?? null }
+  if (record.lane !== 'ci') return base
+  return { ...base, runCount: record.runCount ?? null, fetchFailedCount: record.fetchFailedCount ?? null, timeoutCount: record.timeoutCount ?? null }
+}
+
+function neverFailingDigest(rows) {
+  const list = Array.isArray(rows) ? rows : []
+  const kept = list.filter((row) => !isPlainInsufficientRow(row))
+  return { rows: kept.map((row) => Object.fromEntries(NEVER_FAILING_RENDER_KEYS.map((key) => [key, row[key]]))), insufficientCount: list.length - kept.length }
+}
+
+// ---- trimming the digest to its size ----
+
+// The lists the digest may shorten, least important first. The entry caps are the starting ceilings; when the
+// document is still over DIGEST_MAX_BYTES the first list in this order is shortened (just as far as needed, or to
+// its floor if that is not enough) before the next is touched, and so on. A list is never shortened below its floor.
+// Why this order: the plan labels are only drafting hints; the two citation pools only need one valid id to remain
+// for the workflow's citation gate (a proposal needs a citation found in the pools it was shown) so each keeps
+// a few; CI jobs go from the lowest-ranked end (the ones without failures, with the fewest runs); the per-plan
+// wall-clock and the proposal outcomes go oldest first; the never-failing rows that carry a verdict are the
+// figures the report is about, so they are the last resort and go lowest run count first.
+export const DIGEST_TRIM_ORDER = ['planLabels', 'ciCitationPool', 'ledgerCitationPool', 'ciByJob', 'wallClockByPlan', 'proposalOutcomes', 'neverFailingAcs']
+export const DIGEST_TRIM_FLOORS = { planLabels: 5, ciCitationPool: 5, ledgerCitationPool: 10, ciByJob: 5, wallClockByPlan: 3, proposalOutcomes: 4, neverFailingAcs: 3 }
+// The starting ceilings (the entry caps); the two without a cap here are bounded by the reader already.
+const DIGEST_CEILINGS = { planLabels: PLAN_LABELS_MAX, ciCitationPool: CI_DIGEST_MAX_CITATIONS, ledgerCitationPool: Infinity, ciByJob: CI_DIGEST_MAX_JOBS, wallClockByPlan: DIGEST_MAX_BYPLAN_ENTRIES, proposalOutcomes: DIGEST_MAX_PROPOSAL_OUTCOMES, neverFailingAcs: Infinity }
+// A hard bound on one list's search for the length that fits (a binary search needs about ten steps for a list of 1,000).
+const TRIM_MAX_SEARCH_STEPS = 32
+
+const asArray = (value) => (Array.isArray(value) ? value : [])
+
+// Jobs in priority order: those with failures first (most failures first), then those with the most runs, then by
+// key, so the same data always gives the same jobs in the same order. A job keeps its true failureCount, and its
+// failedRunIds keep the LAST (most recent) ids, the ones the reader lists oldest first; the ids left out are counted with the job.
+function rankedJobs(byJob) {
+  const ranked = Object.entries(byJob ?? {}).sort(([keyA, a], [keyB, b]) => (b.failureCount ?? 0) - (a.failureCount ?? 0) || (b.n ?? 0) - (a.n ?? 0) || byText(keyA, keyB))
+  return ranked.map(([key, job]) => {
+    const ids = asArray(job.failedRunIds)
+    const idsDropped = Math.max(0, ids.length - CI_DIGEST_MAX_FAILED_RUN_IDS)
+    return { key, job: idsDropped > 0 ? { ...job, failedRunIds: ids.slice(-CI_DIGEST_MAX_FAILED_RUN_IDS) } : job, idsDropped }
+  })
+}
+
+// Verdict-carrying rows in priority order: the most runs first, then ledger order.
+function rankedRows(rows) {
+  return rows.map((row, index) => ({ row, index })).sort((a, b) => (b.row.n ?? 0) - (a.row.n ?? 0) || a.index - b.index)
+}
+
+// The lists, each in priority order (most important first, so a prefix is what is kept); the per-plan and outcome
+// lists are newest first and are put back in ledger order when the digest is made.
+function digestLists(records, planLabels) {
+  const [ledger, , ci] = records
+  const fromLedger = ledger.status === 'ran' && ledger.result ? ledger.result : null
+  const fromCi = ci.status === 'ran' && ci.result ? ci.result : null
+  return {
+    planLabels: planLabels.ranked,
+    ciCitationPool: asArray(fromCi?.citationPool),
+    ledgerCitationPool: asArray(fromLedger?.citationPool),
+    ciByJob: rankedJobs(fromCi?.byJob),
+    wallClockByPlan: Object.entries(fromLedger?.wallClock?.byPlan ?? {}).reverse(),
+    proposalOutcomes: Object.entries(fromLedger?.proposalOutcomes ?? {}).reverse(),
+    neverFailingAcs: rankedRows(neverFailingDigest(fromLedger?.neverFailingAcs).rows),
+  }
+}
+
+// What the workflow computes on or renders from the ledger result, and nothing else, less the lists above.
+function ledgerBase(result) {
+  return {
+    n: result.n,
+    windowTruncated: result.windowTruncated,
+    windowDroppedCount: result.windowDroppedCount,
+    perRepo: result.perRepo,
+    skippedCount: asArray(result.skipped).length,
+    rework: omitKey(result.rework, 'acVerdicts'),
+    blockedUnresolved: cutStrings(omitKey(result.blockedUnresolved, 'byModel'), BLOCKED_STRING_MAX_CHARS),
+    wallClock: { totals: result.wallClock?.totals, source: result.wallClock?.source },
+    triggerAccuracy: result.triggerAccuracy,
+    neverFailingInsufficientCount: neverFailingDigest(result.neverFailingAcs).insufficientCount,
+  }
+}
+
+function shapeLedger(base, kept) {
+  return {
+    ...base,
+    wallClock: { ...base.wallClock, byPlan: Object.fromEntries([...kept.wallClockByPlan].reverse()) },
+    proposalOutcomes: Object.fromEntries([...kept.proposalOutcomes].reverse()),
+    citationPool: kept.ledgerCitationPool,
+    neverFailingAcs: [...kept.neverFailingAcs].sort((a, b) => a.index - b.index).map(({ row }) => row),
+  }
+}
+
+// Counts of what each list left out against what it was given, and whether any list is shorter than its ceiling.
+function droppedCounts(lists, counts, keptJobs, unmatched) {
+  const left = (name) => lists[name].length - counts[name]
+  const trimmedForSize = DIGEST_TRIM_ORDER.some((name) => counts[name] < Math.min(lists[name].length, DIGEST_CEILINGS[name]))
+  return {
+    wallClockByPlan: left('wallClockByPlan'),
+    proposalOutcomes: left('proposalOutcomes'),
+    planLabels: left('planLabels'),
+    ciByJob: left('ciByJob'),
+    ciFailedRunIds: keptJobs.reduce((sum, { idsDropped }) => sum + idsDropped, 0),
+    ciCitationPool: left('ciCitationPool'),
+    ledgerCitationPool: left('ledgerCitationPool'),
+    neverFailingAcs: left('neverFailingAcs'),
+    planLabelsUnmatched: unmatched,
+    trimmedForSize,
+  }
+}
+
+// The digest for a given length of each list.
+function assemble(source, counts) {
+  const { records, lists, planLabels } = source
+  const [ledger, git, ci] = records
+  const kept = Object.fromEntries(DIGEST_TRIM_ORDER.map((name) => [name, lists[name].slice(0, counts[name])]))
+  const dropped = droppedCounts(lists, counts, kept.ciByJob, planLabels.unmatched)
+  const sizeTrimmed = counts.planLabels < Math.min(lists.planLabels.length, PLAN_LABELS_MAX)
+  return {
+    lanes: { ledger: laneDigest(ledger), git: laneDigest(git), ci: laneDigest(ci) },
+    ledger: source.ledgerBase ? shapeLedger(source.ledgerBase, kept) : null,
+    git: git.status === 'ran' ? git.result : null,
+    ci: ci.status === 'ran' && ci.result ? { ...ci.result, byJob: Object.fromEntries(kept.ciByJob.map(({ key, job }) => [key, job])), citationPool: kept.ciCitationPool } : null,
+    plan_labels: orderedLabels(kept.planLabels),
+    plan_labels_note: planLabelsNote({ ...planLabels.noteInput, dropped: dropped.planLabels, total: lists.planLabels.length, sizeTrimmed }),
+    dropped,
+    freeTextPaths: FREE_TEXT_PATHS,
+  }
+}
+
+const digestBytes = (digest) => Buffer.byteLength(JSON.stringify(digest, null, 2) + '\n')
+
+// The largest length of one list, between its floor and its present length, at which the digest fits; the floor
+// if none does. Fewer entries is never a bigger document, so a binary search finds it, in a bounded number of steps.
+function fittingLength(source, counts, name) {
+  const floor = Math.min(DIGEST_TRIM_FLOORS[name], counts[name])
+  let low = floor
+  let high = counts[name] - 1
+  let best = floor
+  for (let step = 0; step < TRIM_MAX_SEARCH_STEPS && low <= high; step++) {
+    const middle = Math.floor((low + high) / 2)
+    if (digestBytes(assemble(source, { ...counts, [name]: middle })) <= DIGEST_MAX_BYTES) {
+      best = middle
+      low = middle + 1
+    } else high = middle - 1
+  }
+  return best
+}
+
+function buildDigest(records, planLabels) {
+  const ledger = records[0]
+  const source = { records, planLabels, lists: digestLists(records, planLabels), ledgerBase: ledger.status === 'ran' && ledger.result ? ledgerBase(ledger.result) : null }
+  const counts = Object.fromEntries(DIGEST_TRIM_ORDER.map((name) => [name, Math.min(source.lists[name].length, DIGEST_CEILINGS[name])]))
+  for (const name of DIGEST_TRIM_ORDER) {
+    if (digestBytes(assemble(source, counts)) <= DIGEST_MAX_BYTES) break
+    counts[name] = fittingLength(source, counts, name)
+  }
+  return assemble(source, counts)
+}
+
+// Pretty printed, so no line grows with the data; a document that is still over a bound with every list at its
+// floor is a failure of the digest, never a cut-down document.
+function digestText(digest) {
+  const text = JSON.stringify(digest, null, 2) + '\n'
+  if (Buffer.byteLength(text) > DIGEST_MAX_BYTES) throw new LaneFailure('over_size', `the digest is over the ${DIGEST_MAX_BYTES}-byte size limit with every list at its minimum`)
+  if (text.split('\n').some((line) => line.length > DIGEST_MAX_LINE_CHARS)) throw new LaneFailure('line_too_long', `a line of the digest is over ${DIGEST_MAX_LINE_CHARS} characters`)
+  return text
+}
+
+function writeDigestFile(outDir, text) {
+  const file = path.join(outDir, 'digest.json')
+  const temporary = path.join(outDir, `.digest.json.${process.pid}.tmp`)
+  try {
+    fs.writeFileSync(temporary, text, { mode: 0o600 })
+    fs.chmodSync(temporary, 0o600)
+    fs.renameSync(temporary, file)
+  } catch (error) {
+    fs.rmSync(temporary, { force: true })
+    throw error
+  }
+}
+
+const droppedTotal = (dropped) => Object.values(dropped).reduce((sum, value) => sum + (typeof value === 'number' ? value : 0), 0)
+
+// Not a lane that runs a command: { lane: 'digest', status: 'ran', bytes, dropped } once digest.json is
+// written (bytes its size, dropped the sum of every count left out, both integers), otherwise a failed record
+// with a fixed reason and no digest.json (a stale one from an earlier run in the same directory is removed, so
+// it cannot be mistaken for this run's).
+function digestLane(ctx, records) {
+  try {
+    const digest = buildDigest(records, collectPlanLabels(ctx.root))
+    const text = digestText(digest)
+    writeDigestFile(ctx.outDir, text)
+    return { lane: 'digest', status: 'ran', bytes: Buffer.byteLength(text), dropped: droppedTotal(digest.dropped), trimmed: digest.dropped.trimmedForSize }
+  } catch (error) {
+    fs.rmSync(path.join(ctx.outDir, 'digest.json'), { force: true })
+    const record = failedRecord('digest', error)
+    return record.mode === 'other' ? { ...record, cause: errorCause(error) } : record
+  }
+}
+
 // ---- lanes and files ----
 
 const seconds = (ms) => Math.round(ms) / 1000
@@ -447,9 +830,17 @@ function writeLane(outDir, record) {
 // syscall, each accepted only if it has the shape of one. Never its message, which
 // can carry a path or a tool's output.
 const SAFE_ERROR_PARTS = [['name', /^[A-Za-z][A-Za-z0-9]{0,39}$/], ['code', /^[A-Z][A-Z0-9_]{1,39}$/], ['syscall', /^[a-z][a-z0-9_]{1,39}$/]]
+const safeErrorParts = (error) => SAFE_ERROR_PARTS.map(([key, shape]) => (typeof error?.[key] === 'string' && shape.test(error[key]) ? error[key] : null))
 function describeError(error) {
-  const parts = SAFE_ERROR_PARTS.map(([key, shape]) => (typeof error?.[key] === 'string' && shape.test(error[key]) ? error[key] : null))
-  return parts.filter(Boolean).join(' ') || 'error'
+  return safeErrorParts(error).filter(Boolean).join(' ') || 'error'
+}
+
+// The one token that names an unexpected error on the log line: its code if it has the shape of
+// one, else its class name, else 'error'. Shape-checked and at most 40 characters, so no message,
+// path or collected text can reach the line through it.
+function errorCause(error) {
+  const [name, code] = safeErrorParts(error)
+  return code ?? name ?? 'error'
 }
 
 function failedRecord(lane, error) {
@@ -494,20 +885,29 @@ function laneToken(record) {
 // Fixed fields only; nothing collected, and no path, appears in it. When the ci
 // lane measured runs, the counts fetched and not fetched (and how many of those
 // were never attempted for want of budget) show partial degradation.
-function logLine(records) {
+function logLine(records, digest) {
   const calls = records.map((r) => `${r.lane}:${r.calls}`).join(',')
   const wall = records.map((r) => `${r.lane}:${r.wall_clock_s}`).join(',')
   const ci = records.find((r) => r.lane === 'ci')
   const ciRuns = Number.isInteger(ci?.runCount) ? ` ci_runs=fetched:${ci.runCount},not_fetched:${ci.fetchFailedCount},timeout:${ci.timeoutCount}` : ''
-  return `COLLECT ${records.map(laneToken).join(' ')} calls=${calls} wall_clock_s=${wall}${ciRuns}`
+  const digestCause = digest.cause ? `:${digest.cause}` : ''
+  const trimmed = digest.trimmed ? 'yes' : 'no'
+  const digestRan = ` digest=ran:bytes:${digest.bytes},dropped:${digest.dropped},trimmed:${trimmed}`
+  const digestField = digest.status === 'failed' ? ` digest=failed:${digest.mode}${digestCause}` : digestRan
+  return `COLLECT ${records.map(laneToken).join(' ')} calls=${calls} wall_clock_s=${wall}${ciRuns}${digestField}`
 }
 
+const isWindow = (value) => Number.isSafeInteger(value) && value > 0
+
 // Collects one repository into outDir. Resolves with { lanes, line } even when
-// lanes failed; the failures are in the lane files. Rejects only for a bad call.
-export async function collectRepo({ root, outDir, timeoutMs } = {}) {
+// lanes failed; the failures are in the lane files (and the digest's, which is
+// lanes.digest here). Rejects only for a bad call, before anything runs or is written.
+// window: how many of the most recent ledger records are read, a positive integer.
+export async function collectRepo({ root, outDir, timeoutMs, window = DEFAULT_COLLECT_WINDOW } = {}) {
   if (typeof root !== 'string' || !root || typeof outDir !== 'string' || !outDir) throw new TypeError('collectRepo needs a root and an outDir')
+  if (!isWindow(window)) throw new TypeError('collectRepo window must be a positive integer')
   fs.mkdirSync(outDir, { recursive: true, mode: 0o700 })
-  const ctx = { root, outDir, timeouts: resolveTimeouts(timeoutMs), env: childEnv() }
+  const ctx = { root, outDir, window, timeouts: resolveTimeouts(timeoutMs), env: childEnv() }
   const bad = (mode) => () => {
     throw new LaneFailure(mode, 'the repository root is not a directory')
   }
@@ -516,7 +916,8 @@ export async function collectRepo({ root, outDir, timeoutMs } = {}) {
   const git = await runLane(ctx, 'git', rootOk ? (c, st) => gitLane(c, st, ledgerIdentity(ledger)) : bad('other'))
   const ci = await runLane(ctx, 'ci', rootOk ? ciLane : bad('other'))
   const records = [ledger, git, ci]
-  return { lanes: { ledger, git, ci }, line: logLine(records) }
+  const digest = digestLane(ctx, records)
+  return { lanes: { ledger, git, ci, digest }, line: logLine(records, digest) }
 }
 
 // ---- command line ----
@@ -531,14 +932,24 @@ function installSignalHandlers() {
   }
 }
 
+const USAGE = `usage: node optimise-collect.mjs <repository-root> <output-directory> [window: a positive integer, default ${DEFAULT_COLLECT_WINDOW}]\n`
+
+// The optional third argument: digits only (so no sign, fraction or exponent), a positive safe
+// integer; NaN when the arguments are not acceptable.
+function cliWindow(argv) {
+  if (argv.length === 2) return DEFAULT_COLLECT_WINDOW
+  return argv.length === 3 && /^\d{1,15}$/.test(argv[2]) && isWindow(Number(argv[2])) ? Number(argv[2]) : Number.NaN
+}
+
 async function cli(argv) {
-  if (argv.length !== 2) {
-    process.stderr.write('usage: node optimise-collect.mjs <repository-root> <output-directory>\n')
+  const window = cliWindow(argv)
+  if (argv.length < 2 || Number.isNaN(window)) {
+    process.stderr.write(USAGE)
     return 2
   }
   installSignalHandlers()
   try {
-    const { line } = await collectRepo({ root: argv[0], outDir: argv[1] })
+    const { line } = await collectRepo({ root: argv[0], outDir: argv[1], window })
     process.stdout.write(line + '\n')
     return 0
   } catch (error) {

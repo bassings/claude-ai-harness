@@ -786,6 +786,20 @@ export function aggregateRework(records, { root = '' } = {}) {
   }
 }
 
+// The keys the report's "Never-failing acceptance criteria" section renders for a row
+// (workflows/optimise-cycle.js), and the one rule for which rows render as plain
+// insufficient data: the section shows "(insufficient data)" before any other reason,
+// and appends verdict_disagreements to every row unless it is absent, so a row is plain
+// only when it is insufficient data whose disagreement count is zero or absent (the render
+// prints a measured zero after "(insufficient data)" and nothing for an absent count). The
+// collector's digest uses this function to leave plain rows out. The workflow script cannot
+// import it, so the agreement between this function, this key list and the script's own
+// render is pinned by test/harn-runner-2-t1b.test.js, which drives the real render.
+export const NEVER_FAILING_RENDER_KEYS = ['repo', 'spec', 'ac_id', 'n', 'insufficient_data', 'unattributed_fail_in_window', 'unattributed_verdict_in_entry', 'truncated_in_window', 'never_failed', 'verdict_disagreements']
+export function isPlainInsufficientRow(row) {
+  return Boolean(row?.insufficient_data) && (row.verdict_disagreements === 0 || row.verdict_disagreements === undefined)
+}
+
 // AC-DATA-8: a "has never failed" claim states its window (here: the run
 // count backing it) and is insufficient_data below minRuns, regardless of
 // whether every recorded verdict happens to be PASS.
@@ -1619,8 +1633,11 @@ function pathMatchesAny(p, globs) {
 // not caught. Failures are a fixed vocabulary, never a message that can carry a path.
 export const REPO_FILE_CAPS = { ledger: 64 * 1024 * 1024, triggers: 1024 * 1024, sidecar: 1024 * 1024, gitPointer: 4096 }
 
-// { status: 'absent' | 'ok' | 'not_regular' | 'too_large' | 'unreadable', kind?, size? }; reads nothing.
-export function repoFileStatus(root, rel, maxBytes) {
+// { status: 'absent' | 'ok' | 'not_regular' | 'too_large' | 'unreadable', kind?, size? }; reads
+// no file content. With { list: true } a real directory (never a symlink to one) is { status:
+// 'ok', kind: 'directory', entries } with its entry NAMES, the one guarded way to list a
+// directory under a repository; without it a directory is 'not_regular' as it always was.
+export function repoFileStatus(root, rel, maxBytes, { list = false } = {}) {
   const parts = rel.split('/')
   try {
     for (let i = 1; i < parts.length; i++) {
@@ -1631,6 +1648,7 @@ export function repoFileStatus(root, rel, maxBytes) {
     let kind = 'other'
     if (st.isFile()) kind = 'file'
     else if (st.isDirectory()) kind = 'directory'
+    if (kind === 'directory' && list) return { status: 'ok', kind, entries: fs.readdirSync(path.join(root, rel)) }
     if (kind !== 'file') return { status: 'not_regular', kind }
     return st.size > maxBytes ? { status: 'too_large', kind, size: st.size } : { status: 'ok', kind, size: st.size }
   } catch (e) {
@@ -1942,13 +1960,19 @@ function ledgerIdentityForRoot(root) {
 // entry; the root path itself is never echoed.
 // Pure: reads no ledger and runs nothing, so a caller that must not read the
 // ledger (the collector refuses a symlinked one) passes the identity in.
-export function escapedDefectsFigures({ rawLog, toplevel, root, identity }) {
+// maxCommits (optional, a positive integer): the figures are those of the first maxCommits records of the log, and
+// the result gains `more`, true when the log had a record beyond them. Without it the result is exactly as it was,
+// so the escaped-defects command's output does not change. All parsing of the log stays here.
+export function escapedDefectsFigures({ rawLog, toplevel, root, identity, maxCommits }) {
   let same = false
   if (typeof toplevel === 'string' && toplevel) {
     try { same = fs.realpathSync(toplevel) === fs.realpathSync(root) } catch (e) { same = false }
   }
   if (!same) return { rejected: true, reason: 'git toplevel is missing or does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null, repo: identity }
-  return { ...countEscapedDefectCandidates(parseGitLogRaw(rawLog), resolveProductSourceExcludeGlobs(root)), repo: identity }
+  const commits = parseGitLogRaw(rawLog)
+  const counted = Number.isSafeInteger(maxCommits) && maxCommits > 0 ? commits.slice(0, maxCommits) : commits
+  const figures = { ...countEscapedDefectCandidates(counted, resolveProductSourceExcludeGlobs(root)), repo: identity }
+  return counted === commits ? figures : { ...figures, more: commits.length > counted.length }
 }
 
 // THE rule for where a repository's ledger lives, exported here as the single
