@@ -149,16 +149,56 @@ const GH_LIST_ARGV = ['run', 'list', '--limit', String(GH_RUN_LIMIT), '--json', 
 const GIT_LOG_ARGV = ['log', `--max-count=${GIT_LOG_MAX_COMMITS + 1}`, '--name-only', '--pretty=format:%x1e%P%x1f%s']
 const GIT_ROOT_ARGV = ['rev-parse', '--show-toplevel']
 
+// BEGIN FIXED REASONS
+// Every fixed reason a lane of this collector can fail with, spelled once. The README's runbook has a row for each, and a test holds
+// the two to each other in both directions and holds this file to this list (a reason-shaped string anywhere else fails it). One that
+// starts with a file or command name is listed by the words that follow, and a placeholder (<n>) is filled by fill().
+export const FIXED_REASONS = Object.freeze({
+  TIMEOUT: 'timeout: exceeded <n> ms',
+  READER_FAILED: 'the reader failed for',
+  READER_ERROR: 'the reader reported an error for',
+  LEDGER_LOCATION: 'the ledger location could not be determined for this checkout layout',
+  NOT_REGULAR: 'is a symlink or not a regular file',
+  TOO_LARGE: 'is over the size limit',
+  UNINSPECTABLE: 'could not be inspected',
+  GIT_NOT_REPO: 'the configured path is not a git repository',
+  GIT_OWNERSHIP: 'git refused the repository because of its ownership (safe.directory)',
+  GIT_BARE: 'git refused a bare repository layout',
+  GIT_NO_COMMITS: 'the repository has no commits',
+  GIT_TOPLEVEL: 'git toplevel does not match the repository root; the git log was not read from that repository',
+  GIT_NOT_FOUND: 'git was not found on PATH',
+  GIT_NOT_STARTED: 'git <command> could not be started',
+  GIT_TOO_LARGE: 'git <command> output exceeded the size limit',
+  GIT_EXITED: 'git <command> exited with status <n>',
+  GIT_LOG_EMPTY: 'git log returned no commits',
+  GH_NOT_FOUND: 'gh was not found on PATH',
+  GH_UNAUTHENTICATED: 'gh is not authenticated',
+  GH_RATE_LIMITED: 'gh reported a rate limit',
+  GH_LIST_EXITED: 'gh run list exited with status <n>',
+  GH_LIST_NOT_ARRAY: 'gh run list returned output that is not a JSON array',
+  GH_LIST_NO_RUN: 'gh run list returned no run with a usable id',
+  GH_VIEW_ALL_FAILED: 'gh run view failed for all <n> runs, so no job data was measured',
+  CI_BUDGET: 'ci lane budget exhausted: <fetched> of <total> runs fetched',
+  DIGEST_OVER_SIZE: 'the digest is over the <bytes>-byte size limit with every list at its minimum',
+  DIGEST_LINE: 'a line of the digest is over <chars> characters',
+  ROOT_NOT_DIRECTORY: 'the repository root is not a directory',
+})
+// The failure modes a lane can carry (failed:<mode> in the log).
+export const FAILURE_MODES = Object.freeze(['timeout', 'other', 'could_not_read', 'absent_from_path', 'unauthenticated', 'rate_limited', 'over_size', 'line_too_long'])
+// END FIXED REASONS
+
+const C = FIXED_REASONS
+const fill = (template, values) => template.replaceAll(/<(\w+)>/g, (whole, name) => String(values[name]))
+
 const LEDGER_INPUT_FILES = [
   ['.claude/harness-ledger.jsonl', REPO_FILE_CAPS.ledger],
   ['.claude/optimise-proposal-targets.json', REPO_FILE_CAPS.sidecar],
 ]
 const UNREADABLE_INPUT_REASONS = {
-  not_regular: (rel) => `${rel} is a symlink or not a regular file`,
-  too_large: (rel) => `${rel} is over the size limit`,
-  unreadable: (rel) => `${rel} could not be inspected`,
+  not_regular: (rel) => `${rel} ${C.NOT_REGULAR}`,
+  too_large: (rel) => `${rel} ${C.TOO_LARGE}`,
+  unreadable: (rel) => `${rel} ${C.UNINSPECTABLE}`,
 }
-const LEDGER_LOCATION_REASON = 'the ledger location could not be determined for this checkout layout'
 
 const SCRUBBED_ENV = ['GH_HOST', 'GH_REPO', 'GH_ENTERPRISE_TOKEN', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']
 // A 403 alone is a permission refusal, not a rate limit: only the words, or a 429, are.
@@ -169,16 +209,15 @@ const FETCH_MODES = new Set(['rate_limited', 'unauthenticated'])
 // git's complaints mapped to fixed text; anything else is the exit status alone.
 // git's own words (which can carry a path or an address) never reach a reason.
 const GIT_FAILURE_REASONS = [
-  [/not a git repository/i, 'the configured path is not a git repository'],
-  [/dubious ownership|safe\.directory/i, 'git refused the repository because of its ownership (safe.directory)'],
-  [/safe\.bareRepository|cannot use bare repository/i, 'git refused a bare repository layout'],
-  [/does not have any commits yet|bad default revision/i, 'the repository has no commits'],
+  [/not a git repository/i, C.GIT_NOT_REPO],
+  [/dubious ownership|safe\.directory/i, C.GIT_OWNERSHIP],
+  [/safe\.bareRepository|cannot use bare repository/i, C.GIT_BARE],
+  [/does not have any commits yet|bad default revision/i, C.GIT_NO_COMMITS],
 ]
-const GIT_TOPLEVEL_REASON = 'git toplevel does not match the repository root; the git log was not read from that repository'
 
 function gitFailureReason(subcommand, res) {
   const known = GIT_FAILURE_REASONS.find(([pattern]) => pattern.test(res.stderr))
-  return known ? known[1] : `git ${subcommand} exited with status ${res.status}`
+  return known ? known[1] : fill(C.GIT_EXITED, { command: subcommand, n: res.status })
 }
 
 // An object of per-command overrides; anything else (a number included) is ignored.
@@ -276,7 +315,7 @@ function runCommand(cmd, args, { cwd, env, input, timeoutMs }) {
 async function runTool(ctx, stats, name, cmd, args, { cwd, input } = {}) {
   stats.calls += 1
   const res = await runCommand(cmd, args, { cwd, env: ctx.env, input, timeoutMs: ctx.timeouts[name] })
-  if (res.timedOut) throw new LaneFailure('timeout', `${name} timeout: exceeded ${ctx.timeouts[name]} ms`)
+  if (res.timedOut) throw new LaneFailure('timeout', `${name} ${fill(C.TIMEOUT, { n: ctx.timeouts[name] })}`)
   return res
 }
 
@@ -295,9 +334,9 @@ async function readerJson(ctx, stats, command, input, extraArgs = []) {
   const parsed = res.status === 0 && !res.tooLarge ? parseJson(res.stdout) : null
   if (parsed === null || typeof parsed !== 'object') {
     const detail = res.tooLarge ? 'output over the size limit' : `status ${res.status}`
-    throw new LaneFailure('other', `the reader failed for ${command} (${detail})`)
+    throw new LaneFailure('other', `${C.READER_FAILED} ${command} (${detail})`)
   }
-  if (typeof parsed.error === 'string') throw new LaneFailure('other', `the reader reported an error for ${command}`)
+  if (typeof parsed.error === 'string') throw new LaneFailure('other', `${C.READER_ERROR} ${command}`)
   return parsed
 }
 
@@ -316,7 +355,7 @@ function unreadableLedgerInput(ledgerRoot) {
 
 async function ledgerLane(ctx, stats) {
   const location = resolveLedgerRoot(ctx.root)
-  if (location.unresolved) throw new LaneFailure('could_not_read', LEDGER_LOCATION_REASON)
+  if (location.unresolved) throw new LaneFailure('could_not_read', C.LEDGER_LOCATION)
   const ledgerRoot = path.resolve(location.root)
   const unreadable = unreadableLedgerInput(ledgerRoot)
   if (unreadable) throw new LaneFailure('could_not_read', unreadable)
@@ -334,8 +373,8 @@ function ledgerIdentity(ledgerRecord) {
 
 async function gitCall(ctx, stats, argv) {
   const res = await runTool(ctx, stats, `git ${argv[0]}`, 'git', ['-c', 'safe.bareRepository=explicit', '-C', ctx.root, ...argv])
-  if (res.error) throw new LaneFailure('other', res.error.code === 'ENOENT' ? 'git was not found on PATH' : `git ${argv[0]} could not be started`)
-  if (res.tooLarge) throw new LaneFailure('other', `git ${argv[0]} output exceeded the size limit`)
+  if (res.error) throw new LaneFailure('other', res.error.code === 'ENOENT' ? C.GIT_NOT_FOUND : fill(C.GIT_NOT_STARTED, { command: argv[0] }))
+  if (res.tooLarge) throw new LaneFailure('other', fill(C.GIT_TOO_LARGE, { command: argv[0] }))
   if (res.status !== 0) throw new LaneFailure('other', gitFailureReason(argv[0], res))
   return res.stdout
 }
@@ -347,11 +386,11 @@ async function gitCall(ctx, stats, argv) {
 // not an enclosing repository's.
 async function gitLane(ctx, stats, identity) {
   const log = await gitCall(ctx, stats, GIT_LOG_ARGV)
-  if (log.length === 0) throw new LaneFailure('other', 'git log returned no commits')
+  if (log.length === 0) throw new LaneFailure('other', C.GIT_LOG_EMPTY)
   const toplevel = (await gitCall(ctx, stats, GIT_ROOT_ARGV)).trim()
   // The reader cuts the log at the cap and says whether a commit lay beyond it (the 501st is only that signal).
   const { more: cut, ...figures } = escapedDefectsFigures({ rawLog: log, toplevel, root: ctx.root, identity, maxCommits: GIT_LOG_MAX_COMMITS })
-  if (figures.rejected) throw new LaneFailure('other', GIT_TOPLEVEL_REASON)
+  if (figures.rejected) throw new LaneFailure('other', C.GIT_TOPLEVEL)
   // The one repository the collector is given is root 0. The note is a fixed string on every run, the cut wording only when a commit beyond the cap came back.
   return { result: { ...figures, root_index: 0, window_note: cut ? GIT_WINDOW_NOTE : GIT_FULL_HISTORY_NOTE } }
 }
@@ -368,9 +407,9 @@ function ghFailureMode(res) {
 }
 
 const GH_FAILURE_REASONS = {
-  absent_from_path: 'gh was not found on PATH',
-  unauthenticated: 'gh is not authenticated',
-  rate_limited: 'gh reported a rate limit',
+  absent_from_path: C.GH_NOT_FOUND,
+  unauthenticated: C.GH_UNAUTHENTICATED,
+  rate_limited: C.GH_RATE_LIMITED,
 }
 
 function ghCall(ctx, stats, argv) {
@@ -419,9 +458,9 @@ async function runEntry(ctx, stats, label, run, deadline) {
 async function listRuns(ctx, stats) {
   const res = await ghCall(ctx, stats, GH_LIST_ARGV)
   const mode = ghFailureMode(res)
-  if (mode) throw new LaneFailure(mode, GH_FAILURE_REASONS[mode] || `gh run list exited with status ${res.status}`)
+  if (mode) throw new LaneFailure(mode, GH_FAILURE_REASONS[mode] || fill(C.GH_LIST_EXITED, { n: res.status }))
   const runs = parseJson(res.stdout)
-  if (!Array.isArray(runs)) throw new LaneFailure('other', 'gh run list returned output that is not a JSON array')
+  if (!Array.isArray(runs)) throw new LaneFailure('other', C.GH_LIST_NOT_ARRAY)
   return runs
 }
 
@@ -437,16 +476,16 @@ async function collectEntries(ctx, stats, label, runs, deadline) {
   return entries
 }
 
-const budgetReason = (fetched, total) => `ci lane budget exhausted: ${fetched} of ${total} runs fetched`
+const budgetReason = (fetched, total) => fill(C.CI_BUDGET, { fetched, total })
 
 // No run's jobs were measured: gh listed nothing usable, every view failed, or
 // the budget ran out before the first one.
 function assertJobsMeasured(entries) {
-  if (entries.length === 0) throw new LaneFailure('other', 'gh run list returned no run with a usable id')
+  if (entries.length === 0) throw new LaneFailure('other', C.GH_LIST_NO_RUN)
   const failed = entries.filter((entry) => entry.fetch_error)
   if (failed.length < entries.length) return
   if (failed.some((entry) => entry.fetch_error === 'timeout')) throw new LaneFailure('timeout', budgetReason(0, entries.length))
-  throw new LaneFailure(failed[0].fetch_error, `gh run view failed for all ${entries.length} runs, so no job data was measured`)
+  throw new LaneFailure(failed[0].fetch_error, fill(C.GH_VIEW_ALL_FAILED, { n: entries.length }))
 }
 
 async function ciLane(ctx, stats) {
@@ -779,8 +818,8 @@ function buildDigest(records, planLabels) {
 // floor is a failure of the digest, never a cut-down document.
 function digestText(digest) {
   const text = JSON.stringify(digest, null, 2) + '\n'
-  if (Buffer.byteLength(text) > DIGEST_MAX_BYTES) throw new LaneFailure('over_size', `the digest is over the ${DIGEST_MAX_BYTES}-byte size limit with every list at its minimum`)
-  if (text.split('\n').some((line) => line.length > DIGEST_MAX_LINE_CHARS)) throw new LaneFailure('line_too_long', `a line of the digest is over ${DIGEST_MAX_LINE_CHARS} characters`)
+  if (Buffer.byteLength(text) > DIGEST_MAX_BYTES) throw new LaneFailure('over_size', fill(C.DIGEST_OVER_SIZE, { bytes: DIGEST_MAX_BYTES }))
+  if (text.split('\n').some((line) => line.length > DIGEST_MAX_LINE_CHARS)) throw new LaneFailure('line_too_long', fill(C.DIGEST_LINE, { chars: DIGEST_MAX_LINE_CHARS }))
   return text
 }
 
@@ -912,7 +951,7 @@ export async function collectRepo({ root, outDir, timeoutMs, window = DEFAULT_CO
   fs.mkdirSync(outDir, { recursive: true, mode: 0o700 })
   const ctx = { root, outDir, window, timeouts: resolveTimeouts(timeoutMs), env: childEnv() }
   const bad = (mode) => () => {
-    throw new LaneFailure(mode, 'the repository root is not a directory')
+    throw new LaneFailure(mode, C.ROOT_NOT_DIRECTORY)
   }
   const rootOk = isDirectory(root)
   const ledger = await runLane(ctx, 'ledger', rootOk ? ledgerLane : bad('could_not_read'))

@@ -1154,17 +1154,11 @@ test('L4: the sidecar path and the report and sidecar size caps the runner uses 
 
 // ---- T3 fix round 2: a result check that crashes is a FAIL (M1), and one reached through a symlink works (M6) ----
 
-// An install whose result check is the given program in place of the real one. The forms the runner shares with the attended
-// entry (the sidecar lock and the placement) are the real module's: the program stands in for the result check only.
+// An install whose result check module is the given program in place of the real one. The runner reaches the module through one
+// command (settle) for the whole of the check, the lock and the placement (T4 round 1, L8), so the program stands in for all of it.
 function installWithVerifier(source) {
   const claudeHome = provisionInstall(freshDir('claudehome-'))
-  const lib = path.join(claudeHome, 'workflows', 'lib')
-  fs.copyFileSync(path.join(lib, 'optimise-verify.mjs'), path.join(lib, 'optimise-verify-real.mjs'))
-  fs.writeFileSync(path.join(lib, 'optimise-verify-stub.mjs'), source)
-  fs.writeFileSync(path.join(lib, 'optimise-verify.mjs'), `import { main } from './optimise-verify-real.mjs'
-if (['lock-try', 'unlock', 'place'].includes(process.argv[2])) await main(process.argv.slice(2))
-else await import('./optimise-verify-stub.mjs')
-`)
+  fs.writeFileSync(path.join(claudeHome, 'workflows', 'lib', 'optimise-verify.mjs'), source)
   return claudeHome
 }
 

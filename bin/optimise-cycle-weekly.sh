@@ -101,9 +101,70 @@ export PATH="$PATH:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # was indistinguishable in the log from one that had it. Bump this whenever
 # this script's behaviour changes materially; test/static-checks.test.js
 # pins that it has moved past the pre-staleness-check value.
-SCRIPT_VERSION="2026-11-22.1"
+SCRIPT_VERSION="2026-11-23.1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---- the fixed words of every reason, cause and failure mode this runner records, each spelled once ----
+# The README's runbook has a row for each (test/harn-runner-2-t4.test.js holds the two to each other in both directions, and fails
+# when this script records one in words anywhere else). A reason that carries a value has it as <name> and is filled by fill_reason.
+# BEGIN FIXED REASONS
+REASON_NO_REPOS="no repos configured"
+REASON_ALL_SKIPPED="no repos checked (all skipped)"
+REASON_PATH_MISSING="configured repo path does not exist"
+REASON_CD_FAILED="cd into repo failed"
+REASON_TMP_PARENT="runner temp directory is not a directory this user owns"
+REASON_TMP_DIR="could not create this run's temp directory"
+REASON_TMP_PATH="runner temp directory path cannot be given to the optimiser (plain characters only, no .claude segment)"
+REASON_START_TIME="could not capture a valid run start time (start_epoch)"
+REASON_CONTRACT="installed optimise-cycle.js is older than this runner requires; run bin/install.sh"
+REASON_WORKFLOW_MISSING="workflows/optimise-cycle.js is missing from the install; run bin/install.sh"
+REASON_LIB_MISSING="workflows/lib/<file> is missing from the install; run bin/install.sh"
+REASON_WORKFLOW_COPY="could not copy the installed workflow into the per-run directory"
+REASON_NONCE="could not mint a containment nonce"
+REASON_COLLECT_TIMEOUT="collector timed out after <n>s"
+REASON_COLLECT_EXIT="collector failed (exit <n>, <token>)"
+REASON_COLLECT_NO_LINE="collector failed (no result line)"
+REASON_COLLECT_NO_DIGEST="collector failed (no digest field)"
+REASON_DIGEST_REFUSED="digest refused: <mode>"
+REASON_CLAUDE_EXIT="claude exited <n>"
+REASON_TIMEOUT="timed out after <n>s"
+REASON_KILLED="killed after timeout grace"
+REASON_CEILING="background wait ceiling reached before completion (<message>)"
+REASON_CHECK_CRASH="the result check could not run"
+REASON_NO_OUTPUT="the result check wrote no output"
+REASON_IGNORE_HELPER="report-ignore helper failed (exit <n>, <token>)"
+REASON_NOT_IGNORED="report path is not gitignored"
+REASON_ABORTED="aborted before completion (exit status <n>)"
+REASON_SIGNAL="killed by signal <n>"
+CAUSE_TIMEOUT="timeout"
+CAUSE_EXIT="exit"
+CAUSE_ABORT="abort"
+CAUSE_SIGNAL="signal"
+CAUSE_CHECK_FAILED="check_failed"
+CAUSE_EMPTY="empty"
+CAUSE_MALFORMED="malformed"
+CAUSE_FAILED_STEP="failed_step"
+CAUSE_OVERSIZED="oversized"
+CAUSE_NONCE="nonce"
+CAUSE_REFUSED="refused"
+MODE_MISSING="missing"
+MODE_OTHER="other"
+# END FIXED REASONS
+
+# A reason with its <name> placeholders filled: fill_reason "$REASON_X" name value [name value ...]. The first placeholder of each
+# name only, which is all any reason has.
+fill_reason() {
+  local text="$1" before after
+  shift
+  while [ "$#" -ge 2 ]; do
+    before="${text%%<$1>*}"
+    after="${text#*<$1>}"
+    text="$before$2$after"
+    shift 2
+  done
+  printf '%s' "$text"
+}
 
 LOG="${OPTIMISE_WEEKLY_LOG:-$HOME/.claude/logs/optimise-cycle-weekly.log}"
 REPORT_REL=".claude/optimise-cycle-report.md"
@@ -195,15 +256,12 @@ SWEEP_PENDING=0         # set once at start-up: remove stale run directories lef
 STALE_RUN_MINUTES=1410
 RUN_COMPLETE=0          # set only when the normal end is reached
 CURRENT_LABEL=""        # the repository being processed, until its one RESULT line is written
-SIDECAR_LOCK=""         # the main checkout whose sidecar lock this run holds, while it holds one
-SIDECAR_TOKEN=""        # this run's owner token on that lock
-LOCK_TRIES=150          # 150 tries 0.2 s apart: a held lock is waited for 30 s, then the repository FAILs (the module's LOCK_TRIES; a test keeps them equal)
 EXIT_REASON=""          # why the run ended abnormally, when the runner knows
 
 # The one cleanup function: the exit trap, the signal handlers and the end of
 # every repo's iteration all come through here, and it holds every rm in this
-# script. It deletes only what this run made: its lock,
-# its per-run directory and stale run directories under the runner's own parent.
+# script. It deletes only what this run made: its per-run directory and stale run
+# directories under the runner's own parent (the sidecar lock is the result check module's, taken and released inside its one command).
 # Every repository owns one directory of its own (RUNNER_TMP), so no file name
 # is shared between runs or between repositories, and the final call ("final",
 # from the end of each repository's iteration and from the exit path) removes it
@@ -222,7 +280,6 @@ cleanup_run() {
       fi
     done < <(find "$RUNNER_PARENT" -mindepth 1 -maxdepth 1 -type d -name 'run.??????' -user "$(id -u)" -mmin +"$STALE_RUN_MINUTES" 2>/dev/null)
   fi
-  unlock_sidecar
   if [ -n "$STALE_TMPDIR" ]; then
     rm -rf "$STALE_TMPDIR"
   fi
@@ -287,7 +344,7 @@ notify_fail() {
 # claude runs in the background and is waited on; this stops it and exits,
 # and the EXIT trap (on_exit) then cleans up and reports the outcome.
 on_signal() {
-  EXIT_REASON="killed by signal $1"
+  EXIT_REASON="$(fill_reason "$REASON_SIGNAL" n "$1")"
   if [ -n "$CLAUDE_PID" ]; then
     kill "$CLAUDE_PID" 2>/dev/null
     wait "$CLAUDE_PID" 2>/dev/null
@@ -306,12 +363,12 @@ on_exit() {
   local status=$?
   cleanup_run final
   if [ "$RUN_COMPLETE" -eq 0 ]; then
-    local reason="${EXIT_REASON:-aborted before completion (exit status $status)}"
+    local reason="${EXIT_REASON:-$(fill_reason "$REASON_ABORTED" n "$status")}"
     # The repository that was being processed gets its own line, as every repository does, with the cause.
     if [ -n "$CURRENT_LABEL" ]; then
-      local interrupted_cause=abort
+      local interrupted_cause="$CAUSE_ABORT"
       case "$reason" in
-        "killed by signal "*) interrupted_cause=signal ;;
+        "${REASON_SIGNAL%%<*}"*) interrupted_cause="$CAUSE_SIGNAL" ;;
       esac
       echo "RESULT FAIL $CURRENT_LABEL $UNKNOWN_FIGURES cause=$interrupted_cause reason=\"$reason\"" >> "$LOG"
       CURRENT_LABEL=""
@@ -357,42 +414,6 @@ new_run_dir() {
   [ -n "$RUN_REAL" ]
 }
 
-# The lock that serialises the sidecar's read, merge and rename across runners
-# and the attended /optimise-cycle. Its code is in workflows/lib/optimise-verify.mjs
-# (lock-try and unlock), the one copy, so the two callers cannot disagree about
-# it; this loop only waits between tries. $1 is the main checkout. A held lock is
-# waited for LOCK_TRIES tries 0.2 s apart, then the caller FAILs.
-lock_sidecar() {
-  local root="$1" out tries=0
-  while :; do
-    out="$(node "$VERIFY_SCRIPT" lock-try "$root" "$$" 2>/dev/null)"
-    case "$out" in
-      "LOCK held "*)
-        SIDECAR_LOCK="$root"
-        SIDECAR_TOKEN="${out#LOCK held }"
-        return 0
-        ;;
-      "LOCK busy") ;;
-      *) return 1 ;;
-    esac
-    tries=$((tries + 1))
-    if [ "$tries" -gt "$LOCK_TRIES" ]; then
-      return 1
-    fi
-    sleep 0.2
-  done
-}
-
-# Releases the lock this run holds, and only that one (the module puts back a
-# lock that carries another token).
-unlock_sidecar() {
-  if [ -n "$SIDECAR_LOCK" ]; then
-    node "$VERIFY_SCRIPT" unlock "$SIDECAR_LOCK" "$SIDECAR_TOKEN" >/dev/null 2>&1
-    SIDECAR_LOCK=""
-    SIDECAR_TOKEN=""
-  fi
-}
-
 # The one token a crashed program's stderr may contribute to the log: a Node error code such as
 # ERR_MODULE_NOT_FOUND, taken from an `Error [CODE]` or `code: 'CODE'` mention and kept only if it is 1 to 32
 # capital letters and underscores. Anything else, including any free text or path, is the fixed word `unknown`.
@@ -422,7 +443,7 @@ ensure_ignored() {
     status=$?
     if [ "$status" -ne 0 ]; then
       # The helper crashed: that is its own outcome, never "not gitignored". Exit status and one fixed-shape token only.
-      IGNORE_FAILURE="report-ignore helper failed (exit $status, $(stderr_token "$err"))"
+      IGNORE_FAILURE="$(fill_reason "$REASON_IGNORE_HELPER" n "$status" token "$(stderr_token "$err")")"
       return 1
     fi
   done
@@ -430,6 +451,7 @@ ensure_ignored() {
     && git -c safe.bareRepository=explicit -C "$root" check-ignore -q -- "$SIDECAR_REL" 2>/dev/null
 }
 
+# (Now used only for a repository where no session ran, to print its figures: a session's reply goes through settle_run below.)
 # Checks what the session returned, against the files this script collected, by
 # running the installed result check (workflows/lib/optimise-verify.mjs), which
 # prints fixed-vocabulary lines only: TOKENS (the figures for the RESULT line),
@@ -450,6 +472,14 @@ ensure_ignored() {
 # a path.
 verify_run() {
   OPTIMISE_VERIFY_NONCE="${nonce:-}" node "$VERIFY_SCRIPT" "$RUN_REAL" "$1" "$2" "$3" "$RUNNER_TMP" "$4" 2> "$RUNNER_TMP/verify.err"
+}
+
+# The whole of the sidecar's critical section in the module's one command (settle): it waits for the sidecar lock, reads, validates
+# and merges the sidecar, places the two outputs and releases the lock, and prints the same lines as verify_run. Arguments: the
+# session's output file, the collector's digest token, the repository, the root whose .claude/ holds the sidecar, and `ignored`
+# (both output paths confirmed ignored, so a trusted result is placed) or `withheld` (it is checked and merged but nothing is placed).
+settle_run() {
+  OPTIMISE_VERIFY_NONCE="${nonce:-}" node "$VERIFY_SCRIPT" settle "$RUN_REAL" "$1" "$2" "$3" "$RUNNER_TMP" "$4" "$5" 2> "$RUNNER_TMP/verify.err"
 }
 
 # The root whose .claude/ holds the sidecar: the main checkout (the one shared
@@ -496,13 +526,13 @@ WORK_REAL="$(cd -P "$WORK_DIR" 2>/dev/null && pwd -P)"
 mkdir -p "$RUNNER_PARENT" 2>/dev/null
 PARENT_REAL="$(cd -P "$RUNNER_PARENT" 2>/dev/null && pwd -P)"
 if [ -L "$RUNNER_PARENT" ] || [ ! -d "$RUNNER_PARENT" ] || [ ! -O "$RUNNER_PARENT" ] || [ -z "$WORK_REAL" ] || [ "$PARENT_REAL" != "$WORK_REAL/optimise-weekly-runner" ]; then
-  EXIT_REASON="runner temp directory is not a directory this user owns"
+  EXIT_REASON="$REASON_TMP_PARENT"
   exit 1
 fi
 chmod 700 "$RUNNER_PARENT"
 RUNNER_TMP="$(mktemp -d "$RUNNER_PARENT/run.XXXXXX" 2>/dev/null)"
 if [ -z "$RUNNER_TMP" ]; then
-  EXIT_REASON="could not create this run's temp directory"
+  EXIT_REASON="$REASON_TMP_DIR"
   exit 1
 fi
 SWEEP_PENDING=1
@@ -515,7 +545,7 @@ cleanup_run
 # inside this parent, so checking the parent's directory once covers them all.
 RUNNER_REAL="$(cd -P "$RUNNER_TMP" 2>/dev/null && pwd -P)"
 if ! printf '%s' "$RUNNER_REAL" | grep -Eq '^/[A-Za-z0-9_/.-]+$' || printf '%s' "$RUNNER_REAL" | grep -Eq '(^|/)(\.claude|\.\.|\.)(/|$)'; then
-  EXIT_REASON="runner temp directory path cannot be given to the optimiser (plain characters only, no .claude segment)"
+  EXIT_REASON="$REASON_TMP_PATH"
   exit 1
 fi
 
@@ -623,8 +653,8 @@ cleanup_run final
 # which reads as "nothing to do" when the real state is "nothing is being
 # checked". It is a FAIL, so it is logged, notified and non-zero like any other.
 if [ ${#REPOS[@]} -eq 0 ]; then
-  echo 'RESULT FAIL - reason="no repos configured"' >> "$LOG"
-  note_fail "-" "no repos configured"
+  echo "RESULT FAIL - reason=\"$REASON_NO_REPOS\"" >> "$LOG"
+  note_fail "-" "$REASON_NO_REPOS"
 fi
 
 # The workflow takes the digest and the nonce as arguments and RETURNS its report
@@ -637,8 +667,8 @@ fi
 REQUIRED_WORKFLOW_CONTRACT=2
 installed_contract="$(sed -n 's/^const WEEKLY_RUNNER_CONTRACT = \([0-9][0-9]*\)$/\1/p' "$CLAUDE_HOME/workflows/optimise-cycle.js" 2>/dev/null | head -n1)"
 if [ -f "$CLAUDE_HOME/workflows/optimise-cycle.js" ] && { [ -z "$installed_contract" ] || [ "$installed_contract" -lt "$REQUIRED_WORKFLOW_CONTRACT" ]; }; then
-  echo 'RESULT FAIL - reason="installed optimise-cycle.js is older than this runner requires; run bin/install.sh"' >> "$LOG"
-  note_fail "-" "installed optimise-cycle.js is older than this runner requires; run bin/install.sh"
+  echo "RESULT FAIL - reason=\"$REASON_CONTRACT\"" >> "$LOG"
+  note_fail "-" "$REASON_CONTRACT"
   REPOS=()
 fi
 
@@ -693,6 +723,15 @@ record_result() {
   note_fail "$label" "${reasons[0]}" "$joined"
 }
 
+# One fixed token the result check raised about the sidecar lock, logged as NOTICE <repository> <token>; anything not shaped like one
+# is dropped, so nothing but a lower-case token with hyphens reaches the log.
+log_notice() {
+  case "$1" in
+    ''|*[!a-z-]*) return 0 ;;
+  esac
+  echo "NOTICE $repo_label $1" >> "$LOG"
+}
+
 # Reads verify_run's lines (its stdout in $1, its exit status in $2) into the
 # figures, the denied-tool count, whether to place the files, and the reasons.
 # Only a well-formed result is believed: exit status 0, a TOKENS line, a DENIED
@@ -707,9 +746,10 @@ read_verify() {
   VERIFY_DENIED="unknown"
   VERIFY_TOOLS="none"
   VERIFY_PLACE="no"
+  VERIFY_PLACED="no"
   VERIFY_CAUSE=""
   while IFS= read -r vline; do
-    if [ "$seen_place" -eq 1 ]; then
+    if [ "$seen_place" -eq 1 ] && [ "$vline" != "PLACED yes" ]; then
       malformed=1
     fi
     case "$vline" in
@@ -717,7 +757,9 @@ read_verify() {
       "TOKENS "*) VERIFY_FIGURES="${vline#TOKENS }"; seen_tokens=1 ;;
       "DENIED "*) VERIFY_DENIED="${vline#DENIED }"; seen_denied=1 ;;
       "TOOLS "*) VERIFY_TOOLS="${vline#TOOLS }" ;;
+      "NOTICE "*) log_notice "${vline#NOTICE }" ;;
       "PLACE "*) VERIFY_PLACE="${vline#PLACE }"; seen_place=1 ;;
+      "PLACED yes") VERIFY_PLACED=yes ;;
       "REASON "*) reasons+=("${vline#REASON }") ;;
       *) malformed=1 ;;
     esac
@@ -732,7 +774,7 @@ read_verify() {
     ''|*[!A-Za-z,]*) VERIFY_TOOLS="none" ;;
   esac
   case "$VERIFY_CAUSE" in
-    empty|malformed|failed_step|oversized|nonce) ;;
+    "$CAUSE_EMPTY"|"$CAUSE_MALFORMED"|"$CAUSE_FAILED_STEP"|"$CAUSE_OVERSIZED"|"$CAUSE_NONCE"|"$CAUSE_REFUSED") ;;
     *) VERIFY_CAUSE="" ;;
   esac
   case "$VERIFY_PLACE" in
@@ -743,8 +785,8 @@ read_verify() {
     bytes=${#1}
     echo "RESULT-CHECK-STATUS $repo_label exit=$2 bytes=$bytes err=$(stderr_token "$(head -c 4000 "$RUNNER_TMP/verify.err" 2>/dev/null)")" >> "$LOG"
     VERIFY_PLACE="no"
-    VERIFY_CAUSE="check_failed"
-    reasons+=("the result check could not run")
+    VERIFY_CAUSE="$CAUSE_CHECK_FAILED"
+    reasons+=("$REASON_CHECK_CRASH")
     if [ "$malformed" -ne 0 ] || [ "$seen_tokens" -eq 0 ]; then
       VERIFY_FIGURES=""
     fi
@@ -763,7 +805,7 @@ process_repo() {
   # FAIL, not a silent skip -- distinct from a path that exists and is
   # deliberately not a repo (SKIP, below).
   if [ ! -e "$repo" ]; then
-    fail_repo "$repo_label" "configured repo path does not exist"
+    fail_repo "$repo_label" "$REASON_PATH_MISSING"
     return 0
   fi
 
@@ -777,7 +819,7 @@ process_repo() {
 
   echo "--- $repo_label ---" >> "$LOG"
   if ! cd "$repo"; then
-    fail_repo "$repo_label" "cd into repo failed"
+    fail_repo "$repo_label" "$REASON_CD_FAILED"
     return 0
   fi
 
@@ -785,26 +827,26 @@ process_repo() {
   # missing one stops this repository with a reason naming the file, before
   # anything is staged or any session starts.
   if [ ! -f "$WORKFLOW_SOURCE" ]; then
-    fail_repo "$repo_label" "workflows/optimise-cycle.js is missing from the install; run bin/install.sh"
+    fail_repo "$repo_label" "$REASON_WORKFLOW_MISSING"
     return 0
   fi
   for needed in "$COLLECT_SCRIPT" "$IGNORE_SCRIPT" "$VERIFY_SCRIPT"; do
     if [ ! -f "$needed" ]; then
-      fail_repo "$repo_label" "workflows/lib/${needed##*/} is missing from the install; run bin/install.sh"
+      fail_repo "$repo_label" "$(fill_reason "$REASON_LIB_MISSING" file "${needed##*/}")"
       return 0
     fi
   done
 
   start_epoch=$(date +%s)
   if ! [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
-    fail_repo "$repo_label" "could not capture a valid run start time (start_epoch)"
+    fail_repo "$repo_label" "$REASON_START_TIME"
     return 0
   fi
 
   # This repository's own directory, so no other repository's session can read
   # its data.
   if ! new_run_dir; then
-    fail_repo "$repo_label" "could not create this run's temp directory"
+    fail_repo "$repo_label" "$REASON_TMP_DIR"
     return 0
   fi
 
@@ -829,19 +871,19 @@ process_repo() {
   collect_s=$SECONDS
   case "$collect_exit" in
     0) ;;
-    124|137) collect_reason="collector timed out after ${COLLECT_TIMEOUT_S}s" ;;
-    *) collect_reason="collector failed (exit $collect_exit, $(stderr_token "$(head -c 4000 "$collect_err" 2>/dev/null)"))" ;;
+    124|137) collect_reason="$(fill_reason "$REASON_COLLECT_TIMEOUT" n "$COLLECT_TIMEOUT_S")" ;;
+    *) collect_reason="$(fill_reason "$REASON_COLLECT_EXIT" n "$collect_exit" token "$(stderr_token "$(head -c 4000 "$collect_err" 2>/dev/null)")")" ;;
   esac
   if [ -z "$collect_reason" ]; then
     collect_line="$(grep -m1 '^COLLECT ' "$collect_out" 2>/dev/null | head -c 600)"
     if ! [[ "$collect_line" =~ $COLLECT_LINE_RE ]]; then
-      collect_reason="collector failed (no result line)"
+      collect_reason="$REASON_COLLECT_NO_LINE"
     elif [[ "$collect_line" =~ $DIGEST_RAN_RE ]]; then
       digest_token="ran"
     elif [[ "$collect_line" =~ $DIGEST_FAILED_RE ]]; then
       digest_token="failed:${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
     else
-      collect_reason="collector failed (no digest field)"
+      collect_reason="$REASON_COLLECT_NO_DIGEST"
     fi
   else
     # The collector's own stderr line is a fixed vocabulary (its failure class,
@@ -861,11 +903,11 @@ process_repo() {
   # A digest the collector refused, or one that is not on disk, is a FAIL with a
   # fixed reason, and no session is launched for this repository.
   if [ "${digest_token%%:*}" = ran ] && { [ -L "$RUN_REAL/digest.json" ] || [ ! -f "$RUN_REAL/digest.json" ]; }; then
-    digest_token="failed:missing"
+    digest_token="failed:$MODE_MISSING"
   fi
   if [ "${digest_token%%:*}" != ran ]; then
     echo "TIMING $repo_label start_epoch=$start_epoch collect_s=$collect_s" >> "$LOG"
-    reasons+=("digest refused: ${digest_token#failed:}")
+    reasons+=("$(fill_reason "$REASON_DIGEST_REFUSED" mode "${digest_token#failed:}")")
     verify_out="$(verify_run - "$digest_token" "$repo" - 2>/dev/null)"
     verify_status=$?
     read_verify "$verify_out" "$verify_status"
@@ -883,7 +925,7 @@ process_repo() {
   WORKFLOW_FILE="$RUN_REAL/optimise-cycle.js"
   nonce="$(node -e "process.stdout.write(require('node:crypto').randomBytes(16).toString('hex'))" 2>/dev/null)"
   if ! [[ "$nonce" =~ ^[0-9a-f]{32}$ ]]; then
-    reasons+=("could not mint a containment nonce")
+    reasons+=("$REASON_NONCE")
     record_result "$repo_label" ""
     return 0
   fi
@@ -896,7 +938,7 @@ process_repo() {
   # says how the workflow is reached; nothing is read from the analysed repository,
   # so a workflow the repository ships is never run.
   if ! { cp "$WORKFLOW_SOURCE" "$WORKFLOW_FILE" && chmod 600 "$WORKFLOW_FILE"; }; then
-    reasons+=("could not copy the installed workflow into the per-run directory")
+    reasons+=("$REASON_WORKFLOW_COPY")
     record_result "$repo_label" ""
     return 0
   fi
@@ -956,67 +998,59 @@ process_repo() {
   # after the polite signal, 137 after the -k grace period's hard kill.
   case "$claude_exit" in
     0) ;;
-    124) reasons+=("timed out after ${TIMEOUT_S}s"); SESSION_CAUSE="timeout" ;;
-    137) reasons+=("killed after timeout grace"); SESSION_CAUSE="timeout" ;;
-    *) reasons+=("claude exited $claude_exit"); SESSION_CAUSE="exit" ;;
+    124) reasons+=("$(fill_reason "$REASON_TIMEOUT" n "$TIMEOUT_S")"); SESSION_CAUSE="$CAUSE_TIMEOUT" ;;
+    137) reasons+=("$REASON_KILLED"); SESSION_CAUSE="$CAUSE_TIMEOUT" ;;
+    *) reasons+=("$(fill_reason "$REASON_CLAUDE_EXIT" n "$claude_exit")"); SESSION_CAUSE="$CAUSE_EXIT" ;;
   esac
   # Anchored to the CLI's OWN message rather than a bare grep for the ceiling
   # variable's name (which false-positived on any text merely mentioning it), and
   # captures the observed wait so the FAIL reason states what actually happened.
   if ceiling_message=$(grep -h -Eo "$CEILING_RE" "$session_out" "$session_err" 2>/dev/null | head -n1) && [ -n "$ceiling_message" ]; then
     ceiling_hit=1
-    SESSION_CAUSE="timeout"
-    reasons+=("background wait ceiling reached before completion ($ceiling_message)")
+    SESSION_CAUSE="$CAUSE_TIMEOUT"
+    reasons+=("$(fill_reason "$REASON_CEILING" message "$ceiling_message")")
   fi
 
-  # ---- check: the session's reply is parsed strictly, never scanned, and every
-  # figure in it is compared with the lane files collected above. A session that
-  # did not exit 0 is not parsed at all.
-  # The sidecar is read by the check and renamed after it: no other runner may do the same in between, so the check that
-  # can place anything runs only while this run holds the lock.
-  if [ "$claude_exit" -eq 0 ] && lock_sidecar "$(sidecar_root_of "$repo")"; then
-    verify_out="$(verify_run "$session_out" "$digest_token" "$repo" "$(sidecar_root_of "$repo")" 2>/dev/null)"
-  else
-    if [ "$claude_exit" -eq 0 ]; then
-      reasons+=("could not take the sidecar lock")
+  # ---- check and place: the session's reply is parsed strictly, never scanned, and every figure in it is compared with the lane
+  # files collected above; a result that passes (or whose one problem is a lane that could not run) is placed. All of it, with the
+  # sidecar lock it needs, is one command of the result check module (settle_run), so this script holds no lock and no
+  # sequence of its own. The output paths are made ignored, and confirmed so with git itself, before that command runs; a result
+  # is placed only when they are (`ignored`), else it is checked and held (`withheld`), as it is when the CLI hit its ceiling. A
+  # session that did not exit 0 is not parsed at all. Anything but a well-formed answer is a FAIL, never a PASS by default.
+  local sidecar_root settle_mode=ignored ignore_failed=0
+  if [ "$claude_exit" -eq 0 ]; then
+    sidecar_root="$(sidecar_root_of "$repo")"
+    if [ "$ceiling_hit" != 0 ]; then
+      settle_mode=withheld
+    elif ! ensure_ignored "$repo" "$sidecar_root"; then
+      settle_mode=withheld
+      ignore_failed=1
     fi
+    verify_out="$(settle_run "$session_out" "$digest_token" "$repo" "$sidecar_root" "$settle_mode" 2>/dev/null)"
+  else
     verify_out="$(verify_run - "$digest_token" "$repo" - 2>/dev/null)"
   fi
   verify_status=$?
   nonce=""
   read_verify "$verify_out" "$verify_status"
   if [ "$VERIFY_PLACE" != yes ] && [ ${#reasons[@]} -eq 0 ]; then
-    VERIFY_CAUSE="check_failed"
-    reasons+=("the result check could not run")
+    VERIFY_CAUSE="$CAUSE_CHECK_FAILED"
+    reasons+=("$REASON_CHECK_CRASH")
   fi
   if [ -z "$SESSION_CAUSE" ]; then
     SESSION_CAUSE="$VERIFY_CAUSE"
   fi
   echo "DENIED-TOOLS $repo_label $VERIFY_DENIED $VERIFY_TOOLS" >> "$LOG"
 
-  # ---- place: only a result that passed every check, or whose one problem is a
-  # lane that could not run, is written; anything else leaves the last good
-  # report and sidecar as they were. The report and sidecar paths are made
-  # ignored, and confirmed so, before either is written.
+  # A trusted result must be confirmed placed by the check itself (its PLACED yes line, printed only after both renames), so a check
+  # that says PLACE yes and places nothing is a FAIL. The files are not compared here: another run may have merged into them since.
   if [ "$VERIFY_PLACE" = yes ] && [ "$claude_exit" -eq 0 ] && [ "$ceiling_hit" = 0 ]; then
-    local sidecar_root place_out
-    sidecar_root="$(sidecar_root_of "$repo")"
-    if [ ! -f "$RUN_REAL/result-report.md" ] || [ ! -f "$RUN_REAL/result-sidecar.json" ]; then
-      reasons+=("the result check wrote no output")
-    elif ! ensure_ignored "$repo" "$sidecar_root"; then
-      reasons+=("${IGNORE_FAILURE:-report path is not gitignored}")
-    else
-      # Placement is the module's (workflows/lib/optimise-verify.mjs place), the one copy the attended entry also uses: both
-      # outputs are staged before either is renamed, the sidecar first. It prints REASON lines and PLACED yes|no only.
-      place_out="$(node "$VERIFY_SCRIPT" place "$RUN_REAL" "$repo" "$sidecar_root" 2>/dev/null)"
-      case "$place_out" in
-        "PLACED yes") ;;
-        *REASON*) reasons+=("$(printf '%s\n' "$place_out" | sed -n 's/^REASON //p' | head -n 1)") ;;
-        *) reasons+=("could not move the result into place") ;;
-      esac
+    if [ "$ignore_failed" -eq 1 ]; then
+      reasons+=("${IGNORE_FAILURE:-$REASON_NOT_IGNORED}")
+    elif [ "$VERIFY_PLACED" != yes ]; then
+      reasons+=("$REASON_NO_OUTPUT")
     fi
   fi
-  unlock_sidecar
   record_result "$repo_label" "$VERIFY_FIGURES"
 }
 
@@ -1032,8 +1066,8 @@ done
 # PASS: if git stopped resolving under launchd, or refused every repo, the job
 # would otherwise be green every week while analysing nothing.
 if [ -z "$PASS_LABELS" ] && [ -z "$FAIL_LABELS" ]; then
-  echo 'RESULT FAIL - reason="no repos checked (all skipped)"' >> "$LOG"
-  note_fail "-" "no repos checked (all skipped)"
+  echo "RESULT FAIL - reason=\"$REASON_ALL_SKIPPED\"" >> "$LOG"
+  note_fail "-" "$REASON_ALL_SKIPPED"
 fi
 echo "=== done $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> "$LOG"
 

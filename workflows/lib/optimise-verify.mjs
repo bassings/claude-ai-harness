@@ -8,15 +8,19 @@
 //                       <sidecar root, or ->
 // and the other forms, which the runner and the attended /optimise-cycle share so that neither has a second copy of the
 // lock or of the placement (HARN-RUNNER-2 T4, AC-DATA-2):
-//   optimise-verify.mjs place <per-run dir> <repository> <sidecar root>   places result-report.md and result-sidecar.json
-//   optimise-verify.mjs lock-try <sidecar root> <owner pid>               one attempt at the sidecar lock
-//   optimise-verify.mjs unlock <sidecar root> <token>                     releases the lock that token holds
-//   OPTIMISE_VERIFY_NONCE=<nonce> optimise-verify.mjs attended <per-run dir> <result file> <repository>
-//        the attended entry: the whole of the above in one run, for the object the Workflow tool returned, saved unchanged
+//   (when the outputs were placed it prints PLACED yes after PLACE yes, which the runner requires before it believes a placement)
+//   optimise-verify.mjs settle <per-run dir> <session reply file> <digest token> <repository> <runner temp dir> <sidecar root> <ignored|withheld>
+//        the runner's whole critical section in one run: wait for the sidecar lock, read, validate and merge the sidecar, place the
+//        two outputs (unless withheld because the caller could not confirm the output paths are ignored) and release the lock
+//   OPTIMISE_VERIFY_NONCE=<nonce> optimise-verify.mjs attended <per-run dir> <result file> <repository> <main checkout>
+//        the attended entry: the same critical section (settleRun), for the object the Workflow tool returned, saved unchanged.
+//        <main checkout> is the root the skill resolved for <repository> (the repository itself, or the main checkout of a linked
+//        worktree); it is checked against the repository before anything is read or written, and both outputs are placed there
 // (the per-run directory is physical; the runner temp dir is the same directory as first made, so a path spelled
 // either way is caught; the sidecar root is the checkout whose .claude/ holds the proposal-targets sidecar)
 // It prints fixed-vocabulary lines only: TOKENS (the figures for the RESULT line), DENIED, CAUSE (a session
-// failure's class), one REASON per problem and PLACE yes|no. It never prints a word the session said, or a path.
+// failure's class), NOTICE (a fixed token for something the lock code had to report), one REASON per problem and PLACE yes|no
+// (the attended entry prints a VERDICT line first). It never prints a word the session said, or a path.
 // When the result is trusted (or the only problem is a lane that could not run) it writes result-report.md and
 // result-sidecar.json into the per-run directory, ready for the runner to place. The sidecar it writes is the
 // returned one MERGED into the one on disk: the sidecar is the only copy of the id-to-target map for decided
@@ -25,15 +29,15 @@
 // Spawn-free, and read-only toward everything but those two files: every read goes through the reader's guarded
 // helper (readRepoFile: no symlink, regular file, size cap), like the collector's reads of collected files, and a
 // static test fails if this file imports child_process or reads any other way. The result check itself writes only
-// those two files. The lock and placement forms (and the attended entry, which uses them) also write the sidecar lock,
-// the staged temp files and the two outputs; the attended entry alone loads optimise-report-ignore.mjs (the one helper
-// that runs git, to make the output paths ignored), and only when a result is trusted.
+// those two files. The critical section (settleRun, which the runner's settle form and the attended entry both call) also
+// writes the sidecar lock, the staged temp files and the two outputs. It runs no git: making the two output paths ignored, and
+// confirming it, is the caller's step before it is called (the runner's ensure_ignored, the skill's own commands).
 
 import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { isPlainInsufficientRow, readRepoFile, resolveLedgerRoot, sidecarTargetOrReason, stableProposalId } from './optimise-read.mjs'
+import { isPlainInsufficientRow, readRepoFile, REPO_FILE_CAPS, resolveLedgerRoot, sidecarTargetOrReason, stableProposalId } from './optimise-read.mjs'
 
 export const REPORT_CAP = 5242880
 export const SIDECAR_CAP = 1048576
@@ -44,7 +48,69 @@ export const SIDECAR_CARRY_MAX = 500
 export const SIDECAR_REL = '.claude/optimise-proposal-targets.json'
 export const REPORT_REL = '.claude/optimise-cycle-report.md'
 export const LANES = ['ledger', 'git', 'ci']
-export const SIDECAR_UNREADABLE = 'sidecar on disk cannot be read as a JSON object; left as it was'
+
+// BEGIN FIXED REASONS
+// Every reason this module can print, spelled once. The README's runbook has a row for each (a test holds the two to each other
+// in both directions, and holds this file to this list: a reason-shaped string anywhere else fails it). A reason that starts with
+// a name or a figure is listed by the words that follow it, and one with a placeholder (<n>) is filled by fill(). The code takes
+// every reason from here through F (below).
+export const FIXED_REASONS = Object.freeze({
+  SESSION_EMPTY: 'session output: empty',
+  SESSION_NOT_ENVELOPE: 'session output: not a JSON envelope',
+  SESSION_NO_RESULT: 'session output: envelope has no result',
+  SESSION_NOT_OBJECT: 'session output: result is not a JSON object',
+  NO_LANES: 'session output: result has no lanes',
+  NO_REPORT: 'session output: result has no report',
+  REPORT_NOT_STRING: 'session output: report is not a string',
+  FAILED_STEP: 'session returned failed_step',
+  WORKFLOW_REFUSED: 'workflow refused to run',
+  NO_HEADING: 'report does not start with a markdown heading',
+  NUL_BYTE: 'report contains a NUL byte',
+  NOT_UTF8: 'report is not valid UTF-8',
+  OVER_CAP: 'report is <n> bytes, over the <cap> cap',
+  SIDECAR_MISSING: 'sidecar missing',
+  SIDECAR_NOT_OBJECT: 'sidecar is not a JSON object',
+  SIDECAR_OVER_CAP: 'sidecar is over the size cap',
+  SIDECAR_MISSING_ID: 'sidecar is missing a proposal id the report names',
+  SIDECAR_UNREADABLE: 'sidecar on disk cannot be read as a JSON object; left as it was',
+  RETURNED_KEY: 'returned sidecar has a key that is not a proposal id',
+  RETURNED_SHAPE: 'returned sidecar has a target that is not the fixed shape',
+  RETURNED_HASH: 'returned sidecar has a target that does not hash to its id',
+  RETURNED_UNNAMED: 'returned sidecar has an id this run does not name',
+  NO_NONCE_HASH: 'result carries no nonce hash',
+  NONCE_MISMATCH: 'result nonce hash does not match this run',
+  ABSOLUTE_PATH: 'report holds an absolute path (the home directory, the repository or the per-run directory)',
+  UNREADABLE: 'collected data unreadable',
+  FIGURE_MISMATCH: 'figure mismatch',
+  LANE_COULD_NOT_RUN: 'lane could not run',
+  REPORT_REJECTED: 'report rejected:',
+  SIDECAR_REJECTED: 'sidecar rejected:',
+  MOVE_FAILED: 'could not move the result into place',
+  MAIN_CHECKOUT: 'main checkout does not match the repository',
+  LOCK_BUSY: 'could not take the sidecar lock',
+  LOCK_UNUSABLE: 'the sidecar lock path is not usable',
+  LOCK_HELPER_FAILED: 'the sidecar lock helper failed',
+})
+// What follows `report rejected:` or `sidecar rejected:`: the runbook row for those two says "the rest of the line says which".
+export const REASON_DETAILS = Object.freeze({
+  EMPTY: 'the result file is empty',
+  TOO_LARGE: 'the result file is larger than <cap> bytes',
+  IS_SYMLINK: 'the result file is a symlink',
+  NOT_REGULAR: 'the result path is not a regular file',
+  DESTINATION: 'the destination is a symlinked directory or a directory',
+  NO_DESTINATION_DIR: 'could not create the destination directory',
+  NO_STAGING: 'could not stage it',
+})
+// The class of a session failure, printed as CAUSE <token>.
+export const CAUSE_TOKENS = Object.freeze(['empty', 'malformed', 'failed_step', 'oversized', 'nonce', 'refused'])
+// Fixed tokens the lock code raises for the caller to print as NOTICE <token>.
+export const NOTICE_TOKENS = Object.freeze(['lock-restore-failed'])
+// END FIXED REASONS
+
+const F = FIXED_REASONS
+const D = REASON_DETAILS
+const fill = (template, values) => template.replaceAll(/<(\w+)>/g, (whole, name) => String(values[name]))
+export const SIDECAR_UNREADABLE = F.SIDECAR_UNREADABLE
 
 export const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 export const isCount = (v) => Number.isSafeInteger(v) && v >= 0
@@ -135,36 +201,36 @@ export function deniedReport(envelope) {
 // class of the failure (empty, malformed).
 export function parseSession(text) {
   const empty = { denied: 'unknown', tools: 'none' }
-  if (text.trim() === '') return { reason: 'session output: empty', cause: 'empty', ...empty }
+  if (text.trim() === '') return { reason: F.SESSION_EMPTY, cause: 'empty', ...empty }
   let envelope
   try {
     envelope = JSON.parse(text)
   } catch {
-    return { reason: 'session output: not a JSON envelope', cause: 'malformed', ...empty }
+    return { reason: F.SESSION_NOT_ENVELOPE, cause: 'malformed', ...empty }
   }
-  if (!isObject(envelope)) return { reason: 'session output: not a JSON envelope', cause: 'malformed', ...empty }
+  if (!isObject(envelope)) return { reason: F.SESSION_NOT_ENVELOPE, cause: 'malformed', ...empty }
   const denied = deniedReport(envelope)
-  if (envelope.is_error === true || typeof envelope.result !== 'string' || envelope.result === '') return { reason: 'session output: envelope has no result', cause: 'malformed', ...denied }
+  if (envelope.is_error === true || typeof envelope.result !== 'string' || envelope.result === '') return { reason: F.SESSION_NO_RESULT, cause: 'malformed', ...denied }
   let result
   try {
     result = JSON.parse(envelope.result)
   } catch {
-    return { reason: 'session output: result is not a JSON object', cause: 'malformed', ...denied }
+    return { reason: F.SESSION_NOT_OBJECT, cause: 'malformed', ...denied }
   }
-  return isObject(result) ? { result, ...denied } : { reason: 'session output: result is not a JSON object', cause: 'malformed', ...denied }
+  return isObject(result) ? { result, ...denied } : { reason: F.SESSION_NOT_OBJECT, cause: 'malformed', ...denied }
 }
 
 // The attended form's input: the object the Workflow tool returned, saved unchanged, not the CLI's envelope around one.
 export function parseResultObject(text) {
   const empty = { denied: 'unknown', tools: 'none' }
-  if (text.trim() === '') return { reason: 'session output: empty', cause: 'empty', ...empty }
+  if (text.trim() === '') return { reason: F.SESSION_EMPTY, cause: 'empty', ...empty }
   let value
   try {
     value = JSON.parse(text)
   } catch {
-    return { reason: 'session output: result is not a JSON object', cause: 'malformed', ...empty }
+    return { reason: F.SESSION_NOT_OBJECT, cause: 'malformed', ...empty }
   }
-  return isObject(value) ? { result: value, ...empty } : { reason: 'session output: result is not a JSON object', cause: 'malformed', ...empty }
+  return isObject(value) ? { result: value, ...empty } : { reason: F.SESSION_NOT_OBJECT, cause: 'malformed', ...empty }
 }
 
 export function startsWithHeading(report) {
@@ -209,37 +275,38 @@ export function holdsPath(text, strict, bounded = []) {
 const failure = (reason, cause) => ({ reason, ...(cause ? { cause } : {}) })
 
 function checkSidecar(result, report) {
-  if (!Object.hasOwn(result, 'proposal_targets')) return failure('sidecar missing', 'malformed')
-  if (!isObject(result.proposal_targets)) return failure('sidecar is not a JSON object', 'malformed')
+  if (!Object.hasOwn(result, 'proposal_targets')) return failure(F.SIDECAR_MISSING, 'malformed')
+  if (!isObject(result.proposal_targets)) return failure(F.SIDECAR_NOT_OBJECT, 'malformed')
   const sidecar = JSON.stringify(result.proposal_targets, null, 2) + '\n'
-  if (Buffer.byteLength(sidecar, 'utf8') > SIDECAR_CAP) return failure('sidecar is over the size cap', 'oversized')
+  if (Buffer.byteLength(sidecar, 'utf8') > SIDECAR_CAP) return failure(F.SIDECAR_OVER_CAP, 'oversized')
   const ids = [...report.matchAll(/^### ([0-9a-f]{16}):/gm)].map((m) => m[1])
-  if (ids.some((id) => !Object.hasOwn(result.proposal_targets, id))) return failure('sidecar is missing a proposal id the report names', 'malformed')
+  if (ids.some((id) => !Object.hasOwn(result.proposal_targets, id))) return failure(F.SIDECAR_MISSING_ID, 'malformed')
   return { sidecar, targets: result.proposal_targets }
 }
 
 function checkReportText(report) {
-  if (typeof report !== 'string') return failure('session output: report is not a string', 'malformed')
-  if (!startsWithHeading(report)) return failure('report does not start with a markdown heading', 'malformed')
-  if (report.includes('\u0000')) return failure('report contains a NUL byte', 'malformed')
-  if (Buffer.from(report, 'utf8').toString('utf8') !== report) return failure('report is not valid UTF-8', 'malformed')
+  if (typeof report !== 'string') return failure(F.REPORT_NOT_STRING, 'malformed')
+  if (!startsWithHeading(report)) return failure(F.NO_HEADING, 'malformed')
+  if (report.includes('\u0000')) return failure(F.NUL_BYTE, 'malformed')
+  if (Buffer.from(report, 'utf8').toString('utf8') !== report) return failure(F.NOT_UTF8, 'malformed')
   const bytes = Buffer.byteLength(report, 'utf8')
-  return bytes > REPORT_CAP ? failure(`report is ${bytes} bytes, over the ${REPORT_CAP} cap`, 'oversized') : null
+  return bytes > REPORT_CAP ? failure(fill(F.OVER_CAP, { n: bytes, cap: REPORT_CAP }), 'oversized') : null
 }
 
 // { report, sidecar, targets } or { reason, cause }.
 export function checkResult(result, strict, bounded = []) {
+  if (result.__outcome === 'aborted') return failure(F.WORKFLOW_REFUSED, 'refused')
   if (Object.hasOwn(result, 'failed_step')) {
     const step = typeof result.failed_step === 'string' && /^[a-z_]{1,32}$/.test(result.failed_step) ? ` (${result.failed_step})` : ''
-    return failure(`session returned failed_step${step}`, 'failed_step')
+    return failure(`${F.FAILED_STEP}${step}`, 'failed_step')
   }
-  if (!isObject(result.lanes)) return failure('session output: result has no lanes', 'malformed')
-  if (!Object.hasOwn(result, 'report')) return failure('session output: result has no report', 'malformed')
+  if (!isObject(result.lanes)) return failure(F.NO_LANES, 'malformed')
+  if (!Object.hasOwn(result, 'report')) return failure(F.NO_REPORT, 'malformed')
   const reportProblem = checkReportText(result.report)
   if (reportProblem !== null) return reportProblem
   const side = checkSidecar(result, result.report)
   if (side.reason) return side
-  if (holdsPath(result.report, strict, bounded) || holdsPath(side.sidecar, strict, bounded)) return failure('report holds an absolute path (the home directory, the repository or the per-run directory)', 'malformed')
+  if (holdsPath(result.report, strict, bounded) || holdsPath(side.sidecar, strict, bounded)) return failure(F.ABSOLUTE_PATH, 'malformed')
   return { report: result.report, sidecar: side.sidecar, targets: side.targets }
 }
 
@@ -257,12 +324,12 @@ export function checkLanes(said, col) {
   for (const name of LANES) {
     const st = laneState(col, name)
     if (st === 'unreadable') {
-      reasons.push(`collected data unreadable: ${name}`)
+      reasons.push(`${F.UNREADABLE}: ${name}`)
     } else if (!isObject(said[name]) || said[name].status !== st) {
       const was = isObject(said[name]) && (said[name].status === 'ran' || said[name].status === 'failed') ? said[name].status : 'invalid'
-      reasons.push(`figure mismatch ${name}: lane reported ${was}, collected ${st}`)
+      reasons.push(`${F.FIGURE_MISMATCH} ${name}: lane reported ${was}, collected ${st}`)
     } else if (st === 'failed' && modeToken(said[name].mode) !== modeToken(col.lane[name].mode)) {
-      reasons.push(`figure mismatch ${name}: lane mode reported ${modeToken(said[name].mode)}, collected ${modeToken(col.lane[name].mode)}`)
+      reasons.push(`${F.FIGURE_MISMATCH} ${name}: lane mode reported ${modeToken(said[name].mode)}, collected ${modeToken(col.lane[name].mode)}`)
     }
   }
   return reasons
@@ -274,22 +341,22 @@ export function checkLanes(said, col) {
 export function checkLedger(report, col) {
   const want = collectedLedger(col)
   const found = numbersIn(report, /Ledger records in window: (\d{1,15})/g).map(([n]) => n)
-  if (want === null) return { reasons: found.length > 0 ? [`figure mismatch ledger: collected none, reported ${found[0]}`] : [], reported: null }
-  if (found.length === 0) return { reasons: [`figure mismatch ledger: collected ${want}, reported none`], reported: null }
+  if (want === null) return { reasons: found.length > 0 ? [`${F.FIGURE_MISMATCH} ledger: collected none, reported ${found[0]}`] : [], reported: null }
+  if (found.length === 0) return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported none`], reported: null }
   const wrong = found.find((n) => n !== want)
   if (wrong === undefined) return { reasons: [], reported: want }
-  return { reasons: [`figure mismatch ledger: collected ${want}, reported ${wrong}`], reported: wrong }
+  return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported ${wrong}`], reported: wrong }
 }
 
 // A lane with a figure the report must show: every line of that shape in the report equals it. A lane with none:
 // the report shows no such line.
 export function checkLine(name, report, re, names, want) {
   const found = numbersIn(report, re)
-  if (want === null) return found.length > 0 ? [`figure mismatch ${name}: collected none, reported ${found[0][0]}`] : []
-  if (found.length === 0) return [`figure mismatch ${name}: ${names[0]} collected ${want[0]}, reported none`]
+  if (want === null) return found.length > 0 ? [`${F.FIGURE_MISMATCH} ${name}: collected none, reported ${found[0][0]}`] : []
+  if (found.length === 0) return [`${F.FIGURE_MISMATCH} ${name}: ${names[0]} collected ${want[0]}, reported none`]
   for (const got of found) {
     const diff = firstDifference(names, want, got)
-    if (diff) return [`figure mismatch ${name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`]
+    if (diff) return [`${F.FIGURE_MISMATCH} ${name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`]
   }
   return []
 }
@@ -317,18 +384,18 @@ export function checkScoped(report, col) {
 
 export function checkDigest(report, col) {
   const { digest } = col
-  if (!isObject(digest) || !isObject(digest.dropped)) return ['collected data unreadable: digest']
+  if (!isObject(digest) || !isObject(digest.dropped)) return [`${F.UNREADABLE}: digest`]
   const dropped = digest.dropped
   const seen = new Set()
   for (const [, key, n] of report.matchAll(/Digest omitted ([A-Za-z]{1,40}): (\d{1,15})/g)) {
-    if (!Object.hasOwn(dropped, key) || !isCount(dropped[key])) return [`figure mismatch digest: an omission line the digest does not hold, reported ${n}`]
+    if (!Object.hasOwn(dropped, key) || !isCount(dropped[key])) return [`${F.FIGURE_MISMATCH} digest: an omission line the digest does not hold, reported ${n}`]
     seen.add(key)
-    if (Number(n) !== dropped[key]) return [`figure mismatch digest: omitted ${key} collected ${dropped[key]}, reported ${n}`]
+    if (Number(n) !== dropped[key]) return [`${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${dropped[key]}, reported ${n}`]
   }
   for (const [key, value] of Object.entries(dropped)) {
-    if (isCount(value) && value > 0 && !seen.has(key)) return [`figure mismatch digest: omitted ${key} collected ${value}, reported none`]
+    if (isCount(value) && value > 0 && !seen.has(key)) return [`${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${value}, reported none`]
   }
-  return (dropped.trimmedForSize === true) !== report.includes('Digest trimmed for size: yes') ? ['figure mismatch digest: trimmed flag'] : []
+  return (dropped.trimmedForSize === true) !== report.includes('Digest trimmed for size: yes') ? [`${F.FIGURE_MISMATCH} digest: trimmed flag`] : []
 }
 
 // ---- the number-bearing rows the workflow renders from the digest ----
@@ -667,15 +734,15 @@ function checkRowClass(spec, report, col) {
     const key = spec.byPosition ? String(index) : parsed.key
     const want = wants.get(key)
     if (want === undefined) {
-      reasons.push(`figure mismatch ${spec.name}: a row the collected data does not hold`)
+      reasons.push(`${F.FIGURE_MISMATCH} ${spec.name}: a row the collected data does not hold`)
       return
     }
     seen.add(key)
     const diff = firstDifference(spec.names, want, parsed.got)
-    if (diff) reasons.push(spec.textual ? `figure mismatch ${spec.name}: ${diff.name} differs from the collected one` : `figure mismatch ${spec.name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`)
+    if (diff) reasons.push(spec.textual ? `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} differs from the collected one` : `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`)
   })
-  for (const [key, want] of wants) if (!seen.has(key)) reasons.push(`figure mismatch ${spec.name}: ${spec.names[0]} collected ${want[0]}, reported none`)
-  if (report.split('\n').filter(spec.isRow).length !== matches.length) reasons.push(`figure mismatch ${spec.name}: a row in a shape the check does not know`)
+  for (const [key, want] of wants) if (!seen.has(key)) reasons.push(`${F.FIGURE_MISMATCH} ${spec.name}: ${spec.names[0]} collected ${want[0]}, reported none`)
+  if (report.split('\n').filter(spec.isRow).length !== matches.length) reasons.push(`${F.FIGURE_MISMATCH} ${spec.name}: a row in a shape the check does not know`)
   return reasons
 }
 
@@ -696,7 +763,7 @@ function dateClaimIn(line) {
 
 function outcomeProblem(claim, outcome) {
   const held = claim.kind === 'adoption' ? outcome.lastAdoptionTs : outcome.lastRejectionTs
-  return held === claim.ts ? null : `figure mismatch proposal outcome: ${claim.kind} date differs from the collected one`
+  return held === claim.ts ? null : `${F.FIGURE_MISMATCH} proposal outcome: ${claim.kind} date differs from the collected one`
 }
 
 // The recorded adoption and rejection dates a proposal's annotation shows, held to the outcome the ledger holds for that id.
@@ -709,7 +776,7 @@ export function checkProposalOutcomes(report, col) {
     const claim = dateClaimIn(line)
     if (claim === null) continue
     const held = id !== null && isObject(outcomes) && Object.hasOwn(outcomes, id) ? outcomes[id] : null
-    const problem = held === null ? 'figure mismatch proposal outcome: an outcome the collected data does not hold' : outcomeProblem(claim, held)
+    const problem = held === null ? `${F.FIGURE_MISMATCH} proposal outcome: an outcome the collected data does not hold` : outcomeProblem(claim, held)
     if (problem !== null) reasons.push(problem)
   }
   return reasons
@@ -720,7 +787,7 @@ export function checkPlanLabelNote(report, col) {
   const note = col.digest?.plan_labels_note
   if (typeof note !== 'string' || note.trim() === '') return []
   const expected = note.replaceAll(/\s+/g, ' ').slice(0, 400)
-  return report.split('\n').includes(expected) ? [] : ['figure mismatch plan labels: note differs from the collected one']
+  return report.split('\n').includes(expected) ? [] : [`${F.FIGURE_MISMATCH} plan labels: note differs from the collected one`]
 }
 
 // The single-line figure shapes that are not row classes: each has its own check above.
@@ -810,10 +877,10 @@ export function namedProposalIds(report, col) {
 // null when every entry passes, else the one fixed reason for the first that does not.
 export function validateReturnedSidecar(targets, named) {
   for (const [id, value] of Object.entries(targets)) {
-    if (!PROPOSAL_ID.test(id)) return 'returned sidecar has a key that is not a proposal id'
-    if (sidecarTargetOrReason(value).target === undefined) return 'returned sidecar has a target that is not the fixed shape'
-    if (stableProposalId(value) !== id) return 'returned sidecar has a target that does not hash to its id'
-    if (!named.has(id)) return 'returned sidecar has an id this run does not name'
+    if (!PROPOSAL_ID.test(id)) return F.RETURNED_KEY
+    if (sidecarTargetOrReason(value).target === undefined) return F.RETURNED_SHAPE
+    if (stableProposalId(value) !== id) return F.RETURNED_HASH
+    if (!named.has(id)) return F.RETURNED_UNNAMED
   }
   return null
 }
@@ -824,21 +891,21 @@ export function validateReturnedSidecar(targets, named) {
 // never in its arguments), so a session steered by text in the digest into passing another nonce, or a result that did not
 // come from a workflow run on this run's digest, is refused. null when it matches, else the one fixed reason.
 export function nonceProblem(result, nonce) {
-  if (typeof result.nonce_sha256 !== 'string') return 'result carries no nonce hash'
+  if (typeof result.nonce_sha256 !== 'string') return F.NO_NONCE_HASH
   const want = createHash('sha256').update(typeof nonce === 'string' ? nonce : '').digest('hex')
-  return result.nonce_sha256 === want && typeof nonce === 'string' && nonce !== '' ? null : 'result nonce hash does not match this run'
+  return result.nonce_sha256 === want && typeof nonce === 'string' && nonce !== '' ? null : F.NONCE_MISMATCH
 }
 
 // ---- the whole check ----
 
 function lanesThatCouldNotRun(col) {
-  return LANES.filter((name) => laneState(col, name) === 'failed').map((name) => `${name} lane could not run: ${modeToken(col.lane[name].mode)}`)
+  return LANES.filter((name) => laneState(col, name) === 'failed').map((name) => `${name} ${F.LANE_COULD_NOT_RUN}: ${modeToken(col.lane[name].mode)}`)
 }
 
 function readSession(sessionPath) {
   const got = readRepoFile(path.dirname(sessionPath), path.basename(sessionPath), FILE_CAP)
   if (got.status === 'ok') return { text: got.text }
-  return { reason: 'session output: not a JSON envelope', cause: got.status === 'too_large' ? 'oversized' : 'malformed' }
+  return { reason: F.SESSION_NOT_ENVELOPE, cause: got.status === 'too_large' ? 'oversized' : 'malformed' }
 }
 
 // What a session's reply amounts to: { reasons, cause, denied, reportedLedger, place, report, sidecar, targets }.
@@ -870,10 +937,10 @@ function withMergedSidecar(judged, sidecarRoot, col) {
 
 // { tokens, denied, cause, reasons, place, report, sidecar }. `sessionPath` of '-' means no session ran; `attended` reads the
 // returned object itself (parseResultObject) and prints the collected ledger count alone.
-export function verifyRun({ dir, sessionPath, digestToken, repo, runTmp, home, sidecarRoot, nonce, attended = false }) {
+export function verifyRun({ dir, sessionPath, digestToken, repo, runTmp, home, sidecarRoot, nonce, attended = false, boundedPaths = [repo] }) {
   const col = loadCollected(dir)
   const strict = pathNeedles([home, dir, runTmp])
-  const bounded = pathNeedles([repo])
+  const bounded = pathNeedles(boundedPaths)
   const parse = attended ? parseResultObject : parseSession
   const judged = sessionPath === '-' ? { reasons: [], denied: 'unknown', reportedLedger: null, place: 'no' } : withMergedSidecar(judgeSession(sessionPath, col, strict, bounded, nonce, parse), sidecarRoot, col)
   return { ...judged, tokens: tokensFor(col, digestToken, attended ? undefined : judged.reportedLedger) }
@@ -884,17 +951,26 @@ export function verifyRun({ dir, sessionPath, digestToken, repo, runTmp, home, s
 // The lock serialises the sidecar's read, merge and rename across runs ($1 is the main checkout, whose git directory is shared
 // by its linked worktrees). It is a symlink whose target is its owner's token (`<pid>:<random>`): creating it is atomic with
 // the owner already recorded, so no instant exists in which a held lock has no owner. A stale lock (its owner pid gone, or
-// older than LOCK_STALE_MIN minutes) is taken over by renaming it to a name only this taker uses and then looking at what was
-// actually taken: only if it is the owner that was judged stale is it dropped; a fresh lock taken by mistake is put straight
-// back. The file system calls go through `ops` so a test can place a fault between two steps.
+// older than LOCK_STALE_MIN minutes, whatever the owner token says) is taken over by renaming it to a name only this taker uses
+// and then looking at what was actually taken: only if it is the owner that was judged stale is it dropped; a fresh lock taken
+// by mistake is put straight back (and, if that fails, a NOTICE is raised). Something that is not a symlink at the lock path (a
+// directory or file an older version left) is not a lock of ours: it is renamed aside and removed, recursively only when it is a
+// real directory. A link is only ever inspected with lstat and readlink, never followed. The file system calls go through `ops`
+// so a test can place a fault between two steps.
 export const LOCK_NAME = 'optimise-sidecar.lock'
 export const LOCK_TRIES = 150
 export const LOCK_WAIT_MS = 200
 export const LOCK_STALE_MIN = 10
 const STALE_BREAK_ATTEMPTS = 10
-const MOVE_PROBLEM = 'could not move the result into place'
-const REJECTED = { report: 'report rejected: ', sidecar: 'sidecar rejected: ' }
 const TOKEN_RE = /^\d{1,10}:[0-9a-f]{12}$/
+const STAGED_RE = /^\.optimise-output\.[0-9a-f]{12}$/
+
+const notices = []
+const raiseNotice = (token) => {
+  if (!notices.includes(token)) notices.push(token)
+}
+// The notices raised since the last call, cleared.
+export const drainNotices = () => notices.splice(0)
 
 const lstatOrNull = (p) => {
   try {
@@ -916,6 +992,15 @@ const removeFile = (p) => {
     return true
   } catch {
     return false
+  }
+}
+
+// Removes what was just renamed aside: a real directory recursively, anything else (a link included) as one file.
+function discardAside(moved) {
+  try {
+    fs.rmSync(moved, { recursive: lstatOrNull(moved)?.isDirectory() === true, force: true })
+  } catch {
+    // a leftover renamed copy is harmless, and the next taker uses another name
   }
 }
 
@@ -948,9 +1033,8 @@ export function lockLooksStale(lockPath, owner, now = Date.now()) {
 function restoreLock(lockPath, taken, ops) {
   try {
     ops.symlinkSync(taken, lockPath)
-    return true
   } catch {
-    return false
+    raiseNotice('lock-restore-failed')
   }
 }
 
@@ -964,12 +1048,24 @@ function takeAway(lockPath, moved, keep, ops) {
   }
   const taken = readlinkOrNull(moved)
   if (taken !== null && taken !== keep) restoreLock(lockPath, taken, ops)
-  removeFile(moved)
+  discardAside(moved)
   return true
 }
 
 export function breakStale(lockPath, owner, token, ops = fs) {
   return takeAway(lockPath, `${lockPath}.stale.${token}`, owner, ops)
+}
+
+// A directory or file where the lock should be: not a lock of ours, so it is renamed aside and removed.
+function breakForeign(lockPath, token, ops) {
+  const moved = `${lockPath}.foreign.${token}`
+  try {
+    ops.renameSync(lockPath, moved)
+  } catch {
+    return false
+  }
+  discardAside(moved)
+  return true
 }
 
 function makeLink(token, lockPath, ops) {
@@ -981,7 +1077,20 @@ function makeLink(token, lockPath, ops) {
   }
 }
 
-// One attempt, with stale locks broken: { status: 'held', token } | { status: 'busy' } | { status: 'none' } (no lock can be made here).
+// Looks at what is in the way of a lock that could not be made. True when it was stale or foreign and is gone (try again), false
+// when it is somebody's live lock.
+function clearInTheWay(lockPath, token, ops) {
+  const st = lstatOrNull(lockPath)
+  if (st === null) return true
+  if (!st.isSymbolicLink()) return breakForeign(lockPath, token, ops)
+  const owner = readlinkOrNull(lockPath)
+  if (owner === null || !lockLooksStale(lockPath, owner)) return false
+  breakStale(lockPath, owner, token, ops)
+  return true
+}
+
+// One attempt, with stale locks broken: { status: 'held', token } | { status: 'busy' } | { status: 'none' } (no git directory to
+// hold a lock) | { status: 'error' } (a lock could not be made here).
 export function tryLock(root, pid, ops = fs) {
   const lockPath = lockPathOf(root)
   if (lockPath === null) return { status: 'none' }
@@ -989,10 +1098,8 @@ export function tryLock(root, pid, ops = fs) {
   for (let attempt = 0; attempt < STALE_BREAK_ATTEMPTS; attempt += 1) {
     const made = makeLink(token, lockPath, ops)
     if (made === 'held') return { status: 'held', token }
-    if (made === 'error') return { status: 'none' }
-    const owner = readlinkOrNull(lockPath)
-    if (owner === null || !lockLooksStale(lockPath, owner)) return { status: 'busy' }
-    breakStale(lockPath, owner, token, ops)
+    if (made === 'error') return { status: 'error' }
+    if (!clearInTheWay(lockPath, token, ops)) return { status: 'busy' }
   }
   return { status: 'busy' }
 }
@@ -1007,9 +1114,9 @@ export function unlock(root, token, ops = fs) {
 const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 
 // Waits for a held lock: LOCK_TRIES tries LOCK_WAIT_MS apart, then `busy`.
-export function acquireLock(root, pid, { tries = LOCK_TRIES, wait = pause } = {}) {
+export function acquireLock(root, pid, { tries = LOCK_TRIES, wait = pause, ops = fs } = {}) {
   for (let i = 0; i <= tries; i += 1) {
-    const got = tryLock(root, pid)
+    const got = tryLock(root, pid, ops)
     if (got.status !== 'busy') return got
     wait(LOCK_WAIT_MS)
   }
@@ -1020,37 +1127,57 @@ export function acquireLock(root, pid, { tries = LOCK_TRIES, wait = pause } = {}
 // empty, within its cap. { text } or { problem }.
 function resultText(dir, name, cap) {
   const got = readRepoFile(dir, name, cap)
-  if (got.status === 'ok') return got.text === '' ? { problem: 'the result file is empty' } : { text: got.text }
-  if (got.status === 'too_large') return { problem: `the result file is larger than ${cap} bytes` }
-  return { problem: lstatOrNull(path.join(dir, name))?.isSymbolicLink() ? 'the result file is a symlink' : 'the result path is not a regular file' }
+  if (got.status === 'ok') return got.text === '' ? { problem: D.EMPTY } : { text: got.text }
+  if (got.status === 'too_large') return { problem: fill(D.TOO_LARGE, { cap }) }
+  return { problem: lstatOrNull(path.join(dir, name))?.isSymbolicLink() ? D.IS_SYMLINK : D.NOT_REGULAR }
 }
 
 // Stages the text beside its destination as a fresh exclusive file of mode 0600. { tmp } or { problem }.
 function stageText(text, dest, ops) {
   const destDir = path.dirname(dest)
-  if (lstatOrNull(destDir)?.isSymbolicLink() || lstatOrNull(dest)?.isDirectory()) return { problem: 'the destination is a symlinked directory or a directory' }
+  if (lstatOrNull(destDir)?.isSymbolicLink() || lstatOrNull(dest)?.isDirectory()) return { problem: D.DESTINATION }
   try {
     ops.mkdirSync(destDir, { recursive: true })
   } catch {
-    return { problem: 'could not create the destination directory' }
+    return { problem: D.NO_DESTINATION_DIR }
   }
   const tmp = path.join(destDir, `.optimise-output.${randomBytes(6).toString('hex')}`)
   try {
     ops.writeFileSync(tmp, text, { flag: 'wx', mode: 0o600 })
   } catch {
-    return { problem: 'could not stage it' }
+    return { problem: D.NO_STAGING }
   }
   return { tmp }
 }
 
+// Removes the staged temp files a killed run left in the destination directories: regular files named exactly as this module names
+// them, nothing else, and nothing reached through a link. Only called while the sidecar lock is held, so no other run of this
+// module is staging at the same moment.
+function sweepStaged(destDirs) {
+  for (const dir of new Set(destDirs)) {
+    if (lstatOrNull(dir)?.isDirectory() !== true) continue
+    let names = []
+    try {
+      names = fs.readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) if (STAGED_RE.test(name) && lstatOrNull(path.join(dir, name))?.isFile()) removeFile(path.join(dir, name))
+  }
+}
+
+const rejection = (what, problem) => `${what === 'report' ? F.REPORT_REJECTED : F.SIDECAR_REJECTED} ${problem}`
+
 // Both outputs staged before either is renamed, the sidecar renamed first: it is a superset of the old one, so a failure
 // before the report's rename leaves the old report beside a sidecar that still maps every id it names, never a new report
-// beside an old sidecar. { problem } is null when both are in place; a failure leaves no staged temp file behind.
+// beside an old sidecar. { problem } is null when both are in place; a failure leaves no staged temp file behind. The caller holds
+// the sidecar lock.
 export function placeOutputs({ dir, repo, sidecarRoot }, ops = fs) {
   const parts = [
     { what: 'report', name: 'result-report.md', cap: REPORT_CAP, dest: path.join(repo, REPORT_REL) },
     { what: 'sidecar', name: 'result-sidecar.json', cap: SIDECAR_CAP, dest: path.join(sidecarRoot, SIDECAR_REL) },
   ]
+  sweepStaged(parts.map((part) => path.dirname(part.dest)))
   const staged = []
   const discard = () => staged.forEach((tmp) => removeFile(tmp))
   for (const part of parts) {
@@ -1058,7 +1185,7 @@ export function placeOutputs({ dir, repo, sidecarRoot }, ops = fs) {
     const got = read.problem ? read : stageText(read.text, part.dest, ops)
     if (got.problem) {
       discard()
-      return { problem: `${REJECTED[part.what]}${got.problem}` }
+      return { problem: rejection(part.what, got.problem) }
     }
     staged.push(got.tmp)
   }
@@ -1072,12 +1199,12 @@ export function placeOutputs({ dir, repo, sidecarRoot }, ops = fs) {
   }
   if (!moved(staged[1], parts[1].dest)) {
     discard()
-    return { problem: MOVE_PROBLEM }
+    return { problem: F.MOVE_FAILED }
   }
   staged.pop()
   if (!moved(staged[0], parts[0].dest)) {
     discard()
-    return { problem: MOVE_PROBLEM }
+    return { problem: F.MOVE_FAILED }
   }
   return { problem: null }
 }
@@ -1094,61 +1221,110 @@ export function cappedReasons(reasons) {
 }
 
 export function formatVerdict(v) {
-  return [`TOKENS ${v.tokens}`, `DENIED ${v.denied}`, ...(v.tools === undefined ? [] : [`TOOLS ${v.tools}`]), ...(v.cause ? [`CAUSE ${v.cause}`] : []), ...cappedReasons(v.reasons).map((r) => `REASON ${r}`), `PLACE ${v.place}`].join('\n') + '\n'
+  const lines = [`TOKENS ${v.tokens}`, `DENIED ${v.denied}`]
+  if (v.tools !== undefined) lines.push(`TOOLS ${v.tools}`)
+  if (v.cause) lines.push(`CAUSE ${v.cause}`)
+  for (const token of v.notices ?? []) lines.push(`NOTICE ${token}`)
+  for (const reason of cappedReasons(v.reasons)) lines.push(`REASON ${reason}`)
+  lines.push(`PLACE ${v.place}`)
+  if (v.placed === true) lines.push('PLACED yes')
+  return `${lines.join('\n')}\n`
 }
 
-// ---- the attended entry (T4) ----
-//
-// The operator's own session collected into a private directory, called the workflow with the digest and a nonce, and saved
-// the object it returned unchanged. This is the whole of what happens next, in one run and in this order: the same result
-// check the weekly runner uses, then (only for a trusted result) the two outputs made ignored and placed under the sidecar
-// lock. The session writes neither output itself.
-
-// The main checkout whose .claude/ holds the sidecar, when `repo` is that checkout; null for a linked worktree or a layout the
-// reader cannot resolve (the ignore rule is confirmed for the main checkout only, so a worktree is refused rather than guessed at).
-function mainCheckoutOf(repo) {
-  const resolved = resolveLedgerRoot(repo)
-  if (resolved.unresolved) return null
-  const root = realPathOrNull(resolved.root)
-  return root !== null && root === realPathOrNull(repo) ? resolved.root : null
+// The attended entry's output: one verdict first (PASS only when the report was placed and no reason was raised: a lane that
+// could not run places the report and is still a FAIL), then the lines above.
+export function formatAttended(v) {
+  return `VERDICT ${v.place === 'yes' && v.reasons.length === 0 ? 'PASS' : 'FAIL'}\n${formatVerdict(v)}`
 }
+
+// ---- the critical section: the runner's settle form and the attended entry both come through here ----
+
+// A signal that arrives while the lock is held is answered only after the section has finished: the handler runs when the event
+// loop next turns, which is after the (synchronous) read, merge and placement, so a stop never leaves a half-placed pair, a
+// staged temp file or a held lock. Installed once, when the first lock is taken; before that a signal stops the process at once.
+const SIGNAL_EXIT_CODES = { SIGTERM: 143, SIGINT: 130, SIGHUP: 129 }
+let signalsGuarded = false
+function guardSignals() {
+  if (signalsGuarded) return
+  signalsGuarded = true
+  for (const [name, code] of Object.entries(SIGNAL_EXIT_CODES)) process.on(name, () => process.exit(code))
+}
+
+const lockReasons = { busy: F.LOCK_BUSY, none: F.LOCK_UNUSABLE, error: F.LOCK_UNUSABLE }
 
 function writeResultFiles(dir, v) {
   fs.writeFileSync(`${dir}/result-report.md`, v.report, { mode: 0o600 })
   fs.writeFileSync(`${dir}/result-sidecar.json`, v.sidecar, { mode: 0o600 })
 }
 
-// null when both output paths are ignored, else the one fixed reason. The helper is loaded only here, so the runner's own check
-// does not depend on it.
-async function ignoreProblem(root) {
-  let helper
-  try {
-    helper = await import('./optimise-report-ignore.mjs')
-  } catch {
-    return 'report-ignore helper failed (cannot load)'
-  }
-  return [REPORT_REL, SIDECAR_REL].every((rel) => helper.ensureIgnored(root, rel).ignored) ? null : 'report path is not gitignored'
-}
-
-async function placeTrusted(v, { dir, repo, sidecarRoot }) {
+// A trusted result is placed when the caller confirmed the output paths are ignored; otherwise it is only held (PLACE yes, nothing
+// written), and the caller says why.
+function placeTrusted(v, { dir, repo, sidecarRoot, ignored }, ops) {
+  if (v.place !== 'yes' || !ignored) return v
   writeResultFiles(dir, v)
-  const notIgnored = await ignoreProblem(sidecarRoot)
-  const placed = notIgnored === null ? placeOutputs({ dir, repo, sidecarRoot }) : { problem: notIgnored }
-  return placed.problem === null ? v : { ...v, reasons: [...v.reasons, placed.problem], place: 'no' }
+  const placed = placeOutputs({ dir, repo, sidecarRoot }, ops)
+  return placed.problem === null ? { ...v, placed: true } : { ...v, reasons: [...v.reasons, placed.problem], place: 'no' }
 }
 
-export async function attendedRun({ dir, resultFile, repo, home, nonce, wait }) {
-  const base = { dir, digestToken: 'ran', repo, runTmp: dir, home, nonce, attended: true }
-  const sidecarRoot = mainCheckoutOf(repo)
-  if (sidecarRoot === null) return { ...verifyRun({ ...base, sessionPath: '-' }), reasons: ['repository is not a main checkout'] }
-  const lock = acquireLock(sidecarRoot, process.pid, { wait })
-  if (lock.status !== 'held') return { ...verifyRun({ ...base, sessionPath: '-' }), reasons: ['could not take the sidecar lock'] }
+// `repo` is where the report is placed and `sidecarRoot` the main checkout whose .claude/ holds the sidecar and whose git directory
+// holds the lock; `ignored` is the caller's word that both output paths are confirmed ignored there. The whole of this runs
+// while the lock is held: the sidecar is read, validated, merged and placed inside it and nowhere else. { ...verdict, notices }.
+async function criticalSection(opts, ops) {
+  const { sidecarRoot, wait, tries } = opts
+  const lock = acquireLock(sidecarRoot, process.pid, { wait, ops, ...(tries === undefined ? {} : { tries }) })
+  if (lock.status !== 'held') return { ...verifyRun({ ...opts, sessionPath: '-' }), reasons: [lockReasons[lock.status]], place: 'no' }
+  guardSignals()
   try {
-    const v = verifyRun({ ...base, sessionPath: resultFile, sidecarRoot })
-    return v.place === 'yes' ? await placeTrusted(v, { dir, repo, sidecarRoot }) : v
+    return placeTrusted(verifyRun(opts), opts, ops)
   } finally {
-    unlock(sidecarRoot, lock.token)
+    unlock(sidecarRoot, lock.token, ops)
   }
+}
+
+export async function settleRun(opts, ops = fs) {
+  let verdict
+  try {
+    verdict = await criticalSection(opts, ops)
+  } catch {
+    verdict = { ...verifyRun({ ...opts, sessionPath: '-' }), reasons: [F.LOCK_HELPER_FAILED], place: 'no' }
+  }
+  return { ...verdict, notices: drainNotices() }
+}
+
+// ---- the attended entry (T4) ----
+//
+// The operator's own session collected into a private directory, called the workflow with the digest and a nonce, saved the object
+// it returned unchanged, and made the two output paths ignored in the main checkout (and confirmed it with git). This is the whole
+// of what happens next, in one run: the main checkout the skill resolved is checked against the repository, then the same
+// critical section the runner uses. The session writes neither output itself.
+
+// The pointer a linked worktree's .git file holds must name an entry under the main checkout's own worktrees directory, and that
+// entry must point back at this worktree (git writes both): otherwise a repository could name another repository's entry as its own.
+function pointsBackAtRepo(repo) {
+  const pointer = readRepoFile(repo, '.git', REPO_FILE_CAPS.gitPointer)
+  const first = pointer.status === 'ok' ? pointer.text.split('\n')[0] : ''
+  if (!first.startsWith('gitdir: ')) return false
+  const back = readRepoFile(path.resolve(repo, first.slice('gitdir: '.length).trim()), 'gitdir', REPO_FILE_CAPS.gitPointer)
+  if (back.status !== 'ok') return false
+  const named = realPathOrNull(back.text.trim())
+  return named !== null && named === realPathOrNull(path.join(repo, '.git'))
+}
+
+// Whether `root` (an absolute path to a real directory that is not a link, holding a real .git directory) is the main checkout of
+// `repo`: the repository itself, or the main checkout a linked worktree's pointer resolves to, by the reader's guarded reads.
+export function isMainCheckoutOf(repo, root) {
+  if (typeof root !== 'string' || !path.isAbsolute(root)) return false
+  if (!lstatOrNull(root)?.isDirectory() || !lstatOrNull(path.join(root, '.git'))?.isDirectory()) return false
+  const resolved = resolveLedgerRoot(repo)
+  const want = realPathOrNull(root)
+  if (resolved.unresolved || want === null || realPathOrNull(resolved.root) !== want) return false
+  return realPathOrNull(repo) === want || pointsBackAtRepo(repo)
+}
+
+export async function attendedRun({ dir, resultFile, repo, root, home, nonce, wait, tries }, ops = fs) {
+  const base = { dir, digestToken: 'ran', repo: root, boundedPaths: [repo, root], runTmp: dir, home, nonce, attended: true }
+  if (!isMainCheckoutOf(repo, root)) return { ...verifyRun({ ...base, repo, boundedPaths: [repo], sessionPath: '-' }), reasons: [F.MAIN_CHECKOUT], place: 'no', notices: [] }
+  return settleRun({ ...base, sessionPath: resultFile, sidecarRoot: root, ignored: true, wait, tries }, ops)
 }
 
 // ---- command line ----
@@ -1160,30 +1336,19 @@ function verifyMain(argv) {
   process.stdout.write(formatVerdict(v))
 }
 
-async function attendedMain(argv) {
-  const [dir, resultFile, repo] = argv
-  const v = await attendedRun({ dir, resultFile, repo, home: process.env.HOME, nonce: process.env.OPTIMISE_VERIFY_NONCE })
+async function settleMain(argv) {
+  const [dir, sessionPath, digestToken, repo, runTmp, sidecarRoot, mode] = argv
+  const v = await settleRun({ dir, sessionPath, digestToken, repo, runTmp, home: process.env.HOME, sidecarRoot, nonce: process.env.OPTIMISE_VERIFY_NONCE, ignored: mode === 'ignored' })
   process.stdout.write(formatVerdict(v))
 }
 
-function placeMain(argv) {
-  const [dir, repo, sidecarRoot] = argv
-  const { problem } = placeOutputs({ dir, repo, sidecarRoot })
-  process.stdout.write(problem === null ? 'PLACED yes\n' : `REASON ${problem}\nPLACED no\n`)
+async function attendedMain(argv) {
+  const [dir, resultFile, repo, root] = argv
+  const v = await attendedRun({ dir, resultFile, repo, root, home: process.env.HOME, nonce: process.env.OPTIMISE_VERIFY_NONCE })
+  process.stdout.write(formatAttended(v))
 }
 
-function lockMain(argv) {
-  const [root, pid] = argv
-  const got = /^\d{1,10}$/.test(pid ?? '') ? tryLock(root, pid) : { status: 'none' }
-  process.stdout.write(got.status === 'held' ? `LOCK held ${got.token}\n` : `LOCK ${got.status}\n`)
-}
-
-function unlockMain(argv) {
-  const [root, token] = argv
-  process.stdout.write(unlock(root, token ?? '') ? 'UNLOCKED yes\n' : 'UNLOCKED no\n')
-}
-
-const COMMANDS = { attended: attendedMain, place: placeMain, 'lock-try': lockMain, unlock: unlockMain }
+const COMMANDS = { settle: settleMain, attended: attendedMain }
 
 export async function main(argv) {
   const command = COMMANDS[argv[0]]

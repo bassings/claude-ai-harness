@@ -131,7 +131,9 @@ async function correct(change) {
   const digest = JSON.parse(fs.readFileSync(path.join(runDir, 'digest.json'), 'utf8'))
   if (change) change(digest)
   if (!WORKFLOW) throw new Error('stub-session: the prompt names no scriptPath for the workflow')
-  const { result } = await runWorkflow(WORKFLOW, { args: { digest, nonce }, agent: { 'synthesis:proposals': { proposals: [] } } })
+  // A test may hand the drafter proposals through a file named in the environment (a path, never the proposals themselves).
+  const proposals = process.env.STUB_SESSION_PROPOSALS ? JSON.parse(fs.readFileSync(process.env.STUB_SESSION_PROPOSALS, 'utf8')) : []
+  const { result } = await runWorkflow(WORKFLOW, { args: { digest, nonce }, agent: { 'synthesis:proposals': { proposals } } })
   return result
 }
 
@@ -265,6 +267,8 @@ const REPLIES = {
   // The old shape-only fixture: a heading and a section heading, no figures at all.
   'shape-only': async () => `${await damaged((r) => { r.report = SHAPE_ONLY_REPORT })()}\n`,
   'failed-step': async () => `${envelope(JSON.stringify({ failed_step: 'workflow', reason: 'SESSION-FREE-TEXT-REASON' }))}\n`,
+  // What the workflow returns for a call it refuses (a digest or nonce it does not accept): a refusal object, not a result.
+  'workflow-refused': async () => `${envelope(JSON.stringify({ report: 'Refusing to proceed: the collected digest is malformed (plan_labels).', __outcome: 'aborted' }))}\n`,
 }
 for (const [name, change] of Object.entries(DAMAGE)) REPLIES[name] = async () => `${await damaged(change)()}\n`
 REPLIES['silent-pass'] = REPLIES.pass

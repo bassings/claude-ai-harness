@@ -90,7 +90,7 @@ and throws; the first test named is the one the row proves.
 | id | criterion | the edit | named test that failed |
 |---|---|---|---|
 | R1 | AC-ARCH-5 (round 3 item 1) | the reader's `ledger` command resolves the root before reading | "the reader ledger command reads the ledger under the root it is handed, for a normal checkout, a linked worktree, a worktree of a bare repository and two roots" |
-| R2 | AC-ARCH-5 (round 3 item 1) | the reader's repo-identity read resolves the root first | "the reader escaped-defects command takes the repo identity from the ledger under the root it is handed" |
+| R2 | the runner believes a placement only when the check prints `PLACED yes` | the `elif [ "$VERIFY_PLACED" != yes ]` condition to `elif false` | T3 L8 "a result check that says PLACE yes but wrote no files"; removing the module's `PLACED yes` line fails the attended M4 test and the attended-plus-runner stress test |
 | R3 | AC-ARCH-5 (round 3 item 2) | a gitdir with no commondir file returns the checkout itself | "a checkout made with --separate-git-dir is could_not_read"; "resolveLedgerRoot places only a plain directory ..." |
 | R4 | AC-ARCH-5 (round 3 item 2) | the "directly under <common>/worktrees" test dropped | "resolveLedgerRoot places only ..." |
 | R5 | AC-ARCH-5 (round 3 item 2) | an unrecognised `.git` file returns the checkout itself | "resolveLedgerRoot places only ..." |
@@ -318,51 +318,63 @@ Not mutated, and why:
 | D1_r3 | a list of permission_denials is a count (M4, round 3) | `return { denied: String(envelope.permission_denials.length),` to `return { denied: 'unknown',` | optimise-verify.mjs | "the number of refused tool calls and the names of the tools are the CLI's own report, and..."; "an array of permission_denials is a count (zero included) with its tool names from a know..." |
 | D2_r3 | refused tool names come from a known set (M4, round 3) | `KNOWN_TOOL_NAMES.includes(entry.tool_name) ? entry.tool_name : 'other'` to `typeof entry?.tool_name === 'string' ? entry.tool_name : 'other'` | optimise-verify.mjs | "the number of refused tool calls and the names of the tools are the CLI's own report, and..."; "an array of permission_denials is a count (zero included) with its tool names from a know..." |
 
-## HARN-RUNNER-2 T4 mutation proofs (the attended entry, the shared lock and placement, the runbook)
+## HARN-RUNNER-2 T4 mutation proofs (the attended entry, the shared critical section, the runbook), after review round 1
 
-Run on the final code of T4. Same method as above: the edit was applied to the
-file named, the script refused any edit whose text did not occur exactly once
-(so a match in a comment cannot stand in for the code), the named tests were
-run, the file was restored and compared with the original (every row restored
-identical, `landed=True` and `restored=True` in the run output). Tests are named
-by their leading words. `test/harn-runner-2-t4.test.js` is the frozen test
-file the task was given; `test/harn-runner-2-t4-attended.test.js` is the file
-added for the edges it does not reach.
+Run on the final code of fix round 1. Method: the edit was applied with a script that refuses any edit whose text does not occur
+exactly once (so a match in a comment cannot stand in for the code), the named tests were run, the file was restored and compared
+by hash (every row below: `landed=true`, `restored=true`). Tests are named by their leading words. The files are
+`test/harn-runner-2-t4.test.js` (A) and `test/harn-runner-2-t4-attended.test.js` (B); T3 is `test/harn-runner-2-t3.test.js`.
 
-**Survivor found and closed (B1).** The first run of row B1 survived: the frozen
-test that says the attended mode "holds no lock afterwards" asserts
-`fs.existsSync(lock)` is false, and the lock is a symlink to a name that does
-not exist, so `existsSync` answers false whether or not the lock was released.
-The mutation removed the release and that test stayed green. The row below is
-true only because `test/harn-runner-2-t4-attended.test.js` now checks with
-`lstat`. The frozen test is unchanged and still cannot fail for that reason.
+**Defects confirmed before the fix.** Re-applied to the code as it stood at 76347da, with the old tests, these all stayed green
+(37 of 37): deleting the runbook row for `report rejected:` (M2a); renaming `MOVE_PROBLEM` to a string with no row (M2b); reading
+the sidecar before the lock is taken and using the result (M3a); ignoring `lock.status` (M3b). Removing the release in `unlock`
+failed only the one test that already used lstat (L5): the four existsSync assertions could not fail.
+
+The lock, the placement, the runner's sequencing and the attended entry were rewritten, so the earlier T3 rows L1a_r3 to L1d_r3 and
+the earlier T4 rows A1 to J2 no longer describe the code and are replaced by this table. T3 row L8d_r3 (the runner checks that the
+result check wrote both files) now mutates the runner's PLACED confirmation: row R2. (A first version compared the placed files with the checked ones in bash; the six-runner test T3 L2 failed once in five repeat runs because another run had merged into the sidecar in between. The confirmation is now the module's own line, printed while it holds the lock.)
 
 | Row | Guard | Mutation | Tests that failed |
 |---|---|---|---|
-| A1 | a call with no digest is refused before any agent runs | `if (opts.digest === undefined) {` to `if (false) {` in `workflows/optimise-cycle.js` | three of the four "a call with no digest" tests in the frozen file (the fourth, a nonce and no digest, still gets a refusal that names the digest, so it passes) and the removed-arguments test |
-| A2 | the removed `repos` and `window` arguments are named in the refusal | `opts.repos === undefined && opts.window === undefined ? '' :` to `true ? '' :` | "a call that carries the removed repos or window arguments" |
-| B1 | the attended run releases the sidecar lock | `unlock(sidecarRoot, lock.token)` to `void lock.token` in `attendedRun` | "attended: the sidecar lock is released after a placed run and after a refused one" (the frozen "holds no lock" test stayed green, see above) |
-| C1 | a lock whose owner process is gone is stale | `if (pid !== null && pid > 0 && pidGone(pid)) return true` to `if (false) return true` | "AC-QA-21 (attended): a stale sidecar lock", and the runner's "L2: a lock left by a process that is gone" |
-| C2 | a lock older than the stale limit is stale | `return st !== null && now - st.mtimeMs > LOCK_STALE_MIN * 60000` to `return false` | "L2: a lock left by a process that is gone, or one older than the stale limit" |
-| C3 | a lock taken by mistake, or released by one who does not hold it, is put back | `if (taken !== null && taken !== keep) restoreLock(lockPath, taken, ops)` to `if (false) restoreLock(...)` | "L1: a runner that does not hold the lock cannot release it", "L1: a taker that judged a lock stale but finds a fresh one", "lock-try and unlock: one attempt" |
-| D1 | the sidecar is renamed before the report | the two `parts` entries of `placeOutputs` swapped | "L1: both outputs are staged first and the sidecar is renamed before the report" |
-| D2 | a result file that is a link is named as one | the symlink branch of `resultText` removed | "place: puts both result files in place" |
-| D3 | a destination that is a directory is refused | `if (lstatOrNull(destDir)?.isSymbolicLink() \|\| lstatOrNull(dest)?.isDirectory()) return` to `if (false) return` | "place: puts both result files in place", "the weekly runner reports the module's fixed reason when the placement is refused" |
-| E1 | the attended entry places into a main checkout only | `return root !== null && root === realPathOrNull(repo) ? resolved.root : null` to `return resolved.root` | "attended: a linked worktree is refused" |
-| E2 | the output paths must be confirmed ignored before anything is written | `helper.ensureIgnored(root, rel).ignored)` to `helper.ensureIgnored(root, rel) !== null)` | "attended: a tracked .gitignore that re-includes the report path stops the run" |
-| F1 | the attended tokens carry the collected ledger count alone | `if (reportedLedger === undefined) return` to `if (false) return` | "AC-DATA-2 (attended): a result file that is not the returned JSON object" (frozen), "the attended mode prints the collected ledger count alone" |
-| F2 | the attended input must be a JSON object | `parseResultObject` returns the parsed value whatever it is | "the attended mode prints the collected ledger count alone" |
-| G1 | the runner counts a placement as done only on the module's `PLACED yes` line | `"PLACED yes") ;;` to `"PLACED yes"\|*) ;;` in `bin/optimise-cycle-weekly.sh` | "the weekly runner reports the module's fixed reason when the placement is refused" |
-| G2 | the runner waits the module's number of tries for the lock | `LOCK_TRIES=150` to `LOCK_TRIES=3` in `bin/optimise-cycle-weekly.sh` | "acquireLock waits LOCK_TRIES times" |
-| H1 | the gh wall-clock in the digest is carried to the whole second | `Math.round(ms / 1000)` to `Math.round(ms) / 1000` in `workflows/lib/optimise-collect.mjs` | "the collector carries the gh wall-clock in ghStats to the whole second" |
-| I1 | the skill says the digest is read unfenced | both occurrences of the word removed (one occurrence alone leaves the test green: it matches the word anywhere) | "AC-DATA-2/AC-SEC-6: the skill drives the attended run step by step" |
-| I2 | the runbook has a row for every failure mode, and none for a mode the code does not emit | the first cell `failed:rate_limited` to `failed:rate_slowed` | "every cause token and every collector failure mode has a runbook row", "no runbook row names a reason, cause or mode the code no longer emits" |
-| I3 | the README names none of the removed mechanisms | the text `report_path` added to the README | "AC-SEC-18/AC-PROD-8: README.md describes none of the removed mechanisms" |
-| J1 | the attended entry passes the operator's nonce to the check | `nonce` dropped from the options of `attendedRun` | six tests, among them "AC-DATA-1 (attended)" and "AC-PROD-8 (attended)" |
-| J2 | the attended entry merges into the sidecar on disk | `sidecarRoot` dropped from the `verifyRun` call in `attendedRun` | "AC-PROD-8 (attended): a decided entry already in the sidecar is carried forward" |
+| G1 | the main checkout is checked against the repository | `if (!isMainCheckoutOf(repo, root)) return` to `if (false) return` | seven D3 tests (another repository, a link, outside, missing, relative, empty, a hostile pointer) |
+| G2 | a main checkout that is a symlink is refused | `lstatOrNull(root)?.isDirectory()` to `fs.statSync(root, ...)?.isDirectory()` | D3 "a symlink to the real main checkout" |
+| G3 | a worktree's entry must point back at the worktree | `|| pointsBackAtRepo(repo)` to `|| true` | D3 "a checkout whose .git pointer names another repository's worktree directory" |
+| G4 | the main checkout must be an absolute path | `!path.isAbsolute(root)` removed | D3 "a relative path that names the real main checkout" |
+| G5 | the sidecar is read only while the lock is held | a `verifyRun` before `acquireLock`, its result used | M3 "an entry a second writer adds while this run waits" and M3 "an attended run and weekly runners started together" (first attempt, which computed the early read but did not use it, was an equivalent mutant and is not counted) |
+| G6 | a lock that is not held stops the run | `if (lock.status !== 'held') return` to `if (false) return` | M3 "a lock held by a live run past the wait", M3 "no git directory ... or a lock that cannot be made" |
+| G7 | each lock failure has its own reason | `busy: F.LOCK_BUSY` to `busy: F.LOCK_UNUSABLE` | M3 "a lock held by a live run past the wait" |
+| G8 | the lock is released on every exit (lstat) | `unlock(...)` in the `finally` to `void lock.token` | nine tests in A and B, including the four assertions L5 rewrote |
+| L5 | the release itself | `unlock` body to `return true` | eleven tests in A and B (the tryLock/unlock library test, the three assertions in the frozen file, the lstat tests) |
+| G9 | a directory or file at the lock path is set aside | `breakForeign` call to `return false` | "a lock path that is a directory left by an earlier mkdir-style lock", "... a regular file" |
+| G10 | a directory set aside is removed recursively | `recursive: ...isDirectory() === true` to `recursive: false` | "a lock path that is a directory" (a renamed copy is left) |
+| G10b | (not a guard) recursion only for a real directory | the same to `recursive: true` | none: **equivalent mutant**, `rmSync` does not follow a link even when recursive, so the restriction is defensive and nothing observable depends on it |
+| G11 | the age rule applies to a malformed owner | `return st !== null && now - ...` to `return false` | "a lock symlink whose target is an existing directory", "the age rule applies when the owner token is malformed" |
+| G12 | a lock that cannot be put back is noticed | `raiseNotice('lock-restore-failed')` to `void 0` | "a fresh lock that was taken away by mistake" |
+| G13 | a signal is answered after the critical section | `guardSignals()` removed | L4 "a SIGTERM that arrives between staging ... and renaming" (staged files left, exit by the default action) |
+| G14 | staged leftovers are swept | the `sweepStaged(...)` call removed | L4 "a staged temp file left by a killed run is swept" |
+| G14b | the sweep never follows a link | `lstat ... isFile()` to `statSync ... isFile()` | the same test (a link of that name was removed) |
+| G14c | only the module's own name pattern | the name pattern loosened to a prefix | the same test (13-hex and short names were removed) |
+| G15 | VERDICT PASS needs no reason | `v.place === 'yes' && v.reasons.length === 0` to `v.place === 'yes'` | M4/AC-PROD-3 "a lane that could not run is VERDICT FAIL" |
+| G16 | a trusted result is placed only when the output paths were confirmed ignored | `if (v.place !== 'yes' \|\| !ignored)` to `if (v.place !== 'yes')` | six T3 tests (AC-OPS-9, M3 helper, M5 ceiling) |
+| G17 | a workflow refusal is its own reason and cause | the `__outcome === 'aborted'` branch removed | L3 attended and L3 runner tests |
+| G18 | a sidecar over the carry maximum is trimmed oldest first | `keys.slice(Math.max(0, keys.length - max))` to `keys` | M3/AC-DATA-1 "more than the carry maximum" |
+| G19 | removed arguments are refused even beside a digest | `if (removedGiven) return refusal(` to `if (false) ...` | three D2 tests |
+| G20 | `digests` is a removed argument | `['repos', 'window', 'digests']` to `['repos', 'window']` | D2 "a list of digests beside the digest" |
+| M2a | a runbook row for every reason (forward) | the `report rejected:` row deleted | now fails the forward test (it passed before the fix) |
+| M2c | the same for a runner reason | the `could not move the result into place` row deleted | the forward test |
+| M2d | a reason renamed in the module | `MOVE_FAILED: '... into place'` to `'... into position'` | the forward and the stale-row tests (it passed before the fix) |
+| M2e | a reason added outside the list | `reasons.push(`${F.UNREADABLE}...`)` to a literal sentence | "the result check spells no reason-shaped string outside its list" |
+| M2f | the same in the collector | `C.GIT_LOG_EMPTY` to a literal | "the collector spells no reason-shaped string" |
+| M2g | the same in the runner | `"$REASON_NONCE"` to a literal | "the runner records every reason ... from its REASON_ variables" |
+| M2h, M2i | a reason renamed in the runner block / the collector list | `REASON_KILLED=...`, `GH_NOT_FOUND: ...` | the forward and stale-row tests |
+| M2j | a cause outside CAUSE_TOKENS | `failure(F.NO_LANES, 'malformed')` to `'garbled'` | "every cause the result check prints is one of its CAUSE_TOKENS" |
+| R1 | the runner withholds placement when the paths are not confirmed ignored | `elif ! ensure_ignored ...` to `elif false` | seven T3 tests (AC-OPS-9 and others) |
+| R2 | the runner confirms the placed files are the checked ones | the `cmp` condition to `false` | T3 L8 "a result check that says PLACE yes but wrote no files" |
+| R3 | a NOTICE line is logged | `"NOTICE "*) log_notice ...` to `"NOTICE "*) ;;` | L2 "a notice the result check raises is logged" |
+| R4 | the `refused` cause is accepted from the check | `|"$CAUSE_REFUSED"` removed | L3 runner test |
+| S1, S2, S3, S4, S5, S6 | the skill's text (stop and report; clean-up on failure; only a pass is clean; one run in each; the confirm command; the warning before the Read) | one sentence removed or moved | D1, L1, M4, D2, the step-order test, D1 (S3 and S6 first survived: the M4 test matched a different sentence, and the swap kept the warning before the Read; the M4 test now pins the sentence and S6 moves the Read in front of it) |
+| P1 | the parity test compares real proposals | the weekly run given no proposals file | AC-PROD-5 (L6) |
 
-**T3 rows that no longer describe the code.** Rows L1a_r3 to L1d_r3 above
-mutate the runner's bash lock functions, which T4 moved into
-`workflows/lib/optimise-verify.mjs` (the runner now only waits between tries).
-Their guards are rows C1, C2 and C3 here. Row L8d_r3 (the runner's check that the
-result check wrote both files) is unchanged and still true.
+**Not proved by mutation.** A lock symlink whose target is a directory is never followed: that is how `symlinkSync` behaves, no edit
+of this code makes it write inside the directory, so the test is a behaviour check. The attended-plus-runner stress test is
+probabilistic; G5 killed it, but removing the lock altogether was not tried.

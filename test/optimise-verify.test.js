@@ -31,7 +31,11 @@ const bump = (report, re, delta = 1) => {
 
 test('static: the module is spawn-free and reads only through the reader\'s guarded helper', () => {
   assert.ok(!/child_process|\bspawn|(?<![.\w])exec(File)?(Sync)?\(/.test(CODE), 'no child process of any kind')
-  for (const banned of ['readFileSync', 'readdirSync', 'openSync', 'createReadStream', 'readSync']) assert.ok(!CODE.includes(banned), `no ${banned}: reads go through readRepoFile`)
+  for (const banned of ['readFileSync', 'openSync', 'createReadStream', 'readSync']) assert.ok(!CODE.includes(banned), `no ${banned}: reads go through readRepoFile`)
+  // One directory listing is allowed (T4 round 1, L4): the sweep of staged temp files names the entries of a directory it has
+  // already found to be a real directory, and reads no file's content. Anywhere else a listing is still a read the helper must make.
+  assert.equal(CODE.split('readdirSync').length - 1, 1, 'readdirSync appears once')
+  assert.match(CODE, /function sweepStaged[\s\S]*?readdirSync[\s\S]*?\n\}/, 'and it is in sweepStaged')
   assert.match(SOURCE, /import \{[^}]*\breadRepoFile\b[^}]*\} from '\.\/optimise-read\.mjs'/)
 })
 

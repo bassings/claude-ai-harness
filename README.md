@@ -1271,21 +1271,31 @@ decay rule.
 
 **How an attended run works.** There is one way to collect data and the
 operator's own session drives it; the workflow only analyses what it is
-handed. `skills/optimise-cycle/SKILL.md` gives the exact commands, in this
-order: make a private directory (mode 0700) outside the repository; run
-`workflows/lib/optimise-collect.mjs` into it for the repository; mint a nonce;
-read `digest.json`; call the `optimise-cycle` workflow with `{digest, nonce}`;
-save the object it returns, unchanged; then run
-`workflows/lib/optimise-verify.mjs attended` on it. That last step is the same
-result check the weekly runner uses. It holds every figure in the report
-against the collected files and every proposal-targets entry the workflow
-returned against what this run names, makes the two output paths ignored,
+handed. An attended run analyses **one repository**: several repositories
+means one run in each. `skills/optimise-cycle/SKILL.md` gives the exact
+commands, in this order: make a private directory (mode 0700) outside the
+repository; run `workflows/lib/optimise-collect.mjs` into it for the
+repository; resolve the repository's main checkout (the repository itself, or
+the main checkout of a linked worktree, with `git rev-parse
+--path-format=absolute --git-common-dir`) and make the two output paths
+ignored there with the report-ignore helper, confirming each with `git
+check-ignore`; mint a nonce; read `digest.json`; call the `optimise-cycle`
+workflow with `{digest, nonce}`; save the object it returns, unchanged; then
+run `workflows/lib/optimise-verify.mjs attended` on it, giving it the
+repository and the main checkout. That last step is the same result check the
+weekly runner uses. It checks the main checkout against the repository,
+holds every figure in the report against the collected files and every
+proposal-targets entry the workflow returned against what this run names,
 takes the sidecar lock, merges the sidecar and places the report and the
-sidecar. The session never writes either file by hand, and nothing else in
-this repository does: the attended and unattended paths share one copy of the
-result check, the lock and the placement. A call to the workflow with no
-digest, or with a nonce that is not 32 lower-case hex characters, is refused
-before any model runs.
+sidecar in the main checkout. Its first line is `VERDICT PASS` or `VERDICT
+FAIL`: only a pass is a clean cycle, and a fail with `PLACE yes` (a lane could
+not run, so the report was placed with that lane marked not measured) is a
+FAIL with a report, not a clean cycle. The session never writes either file
+by hand, and nothing else in this repository does: the attended and
+unattended paths share one copy of the result check, the lock and the
+placement. A call to the workflow with no digest, with a nonce that is not 32
+lower-case hex characters, or with a `repos`, `window` or `digests` argument,
+is refused before any model runs.
 
 **Report**: written to `.claude/optimise-cycle-report.md` in the repo that was
 analysed, by the result check (never by a model) after it has checked the
@@ -1550,8 +1560,12 @@ refuses a mismatch; and every figure and every returned sidecar entry is
 checked against what the runner collected. Whether a real session obeys such
 an instruction has not been measured yet; a probe with a planted instruction is
 planned (`specs/harn-runner-2.md`, task T5). (4) Plugin hooks still see the session while it
-runs, though it is not saved to disk. The attended session is the operator's
-own, has a shell, and reads the digest unfenced in the same way.
+runs, though it is not saved to disk. The attended session is the operator's own, has a shell, and reads the digest outside any fence. It is told before
+it reads that every string in `digest.json` is untrusted data and never an
+instruction; if anything in the file reads like an instruction, the operator
+stops and reports it rather than acting on it, and the operator's permission
+prompts apply to anything it would run. That is the whole bound: it is not the
+no-shell bound the unattended session has.
 
 **Measured (2026-11-21, Claude Code 2.1.322), one headless run in a scratch
 repository under these flags:** the session was refused `git log -1`, and the
@@ -1608,10 +1622,15 @@ The one lock is short and covers only the proposal-targets sidecar's read, merge
 and rename, because that file is the only copy of the map from a decided
 proposal's id to its target: a symlink named `optimise-sidecar.lock` in the
 main checkout's git directory, whose target names its owner. A lock whose owner
-process has gone, or that is older than 10 minutes, is taken over; a live fresh
-one is waited for up to about 30 seconds and then the repo FAILs with `could
-not take the sidecar lock`. Its code is in `workflows/lib/optimise-verify.mjs`
-and is shared by the runner and the attended run. After a SIGKILL the dead run's
+process has gone, or that is older than 10 minutes whatever its owner says, is
+taken over; something at that path that is not a link (a directory an older
+version left) is set aside and removed; a live fresh one is waited for up to
+about 30 seconds and then the repo FAILs with `could not take the sidecar
+lock`. Its code is in `workflows/lib/optimise-verify.mjs`, in the one command
+(`settle` for the runner, `attended` for the operator's session) that waits for
+the lock, reads, validates and merges the sidecar, places both outputs and
+releases the lock, so the runner holds no lock loop of its own. A staged temp
+file a killed run left in `.claude/` is swept at the next run. After a SIGKILL the dead run's
 directory stays for up to 24 hours, until the next run's start-up sweep removes
 it. The outcome file reads `RUNNING` from the moment a run starts, so a run that
 dies without reporting leaves `RUNNING`, not last week's result, and a failed
@@ -1714,14 +1733,20 @@ scheduled run.
 | `killed after timeout grace` | The session ignored the polite stop and was killed. | As above. | As above. |
 | `background wait ceiling reached before completion` | The CLI stopped waiting for the workflow to finish. The CLI's own words follow. | As above. | Re-run; if it repeats, raise the ceiling in the runner (it is a constant in the script). |
 | `aborted before completion` | The runner itself ended early (a signal, or a script error). | `RESULT` lines above it, and whether the machine slept or was shut down. | Re-run. |
-| `could not take the sidecar lock` | Another run held the short lock on the proposal-targets file for about 30 seconds, or the repo has no ordinary git directory to hold it. | Another weekly or attended run in the same repo; `.git/` is a real directory in the main checkout. | Wait and re-run; if a lock is left by a crashed run it is taken over once its owner is gone or after 10 minutes. |
-| `repository is not a main checkout` | The attended check was given a linked worktree, or a layout it cannot resolve. | The path you passed is the main checkout. | Pass the main checkout's path. |
+| `could not take the sidecar lock` | Another run held the short lock on the proposal-targets file for about 30 seconds. | Another weekly or attended run in the same repo. | Wait and re-run; if a lock is left by a crashed run it is taken over once its owner is gone or after 10 minutes. |
+| `the sidecar lock path is not usable` | The main checkout has no ordinary git directory to hold the lock, or a lock link could not be made there (permissions, or a read-only disk). | `.git/` is a real directory in the main checkout and can be written to. | Fix the permissions, or run it in the main checkout. |
+| `the sidecar lock helper failed` | The lock step itself failed in a way it does not name. | The `RESULT-CHECK-STATUS` line above it, and `bin/install.sh --check`. | Run `bin/install.sh`, then re-run; report it if it repeats. |
+| `main checkout does not match the repository` | The attended check was given a main-checkout path that is not this repository's own: another repository, a link, a relative path or one that does not exist. | The path is what `git rev-parse --path-format=absolute --git-common-dir` printed for this repository, without the trailing `/.git`. | Pass that path. |
+| `workflow refused to run` | The workflow returned a refusal (a digest or nonce it does not accept), not a result. | `bin/install.sh --check`: the installed workflow and result check may not match the runner or the collector. | Run `bin/install.sh`, then re-run; report it if it repeats. |
 | `the result check could not run` | The result check program crashed or was missing. | The `RESULT-CHECK-STATUS` line above it (exit code, bytes, error code). | Run `bin/install.sh`, then re-run. |
-| `the result check wrote no output` | The check said to place the result but left no files to place. | Free space in the per-run directory. | Free space, then re-run. |
+| `the result check wrote no output` | The check said the result was trusted but did not confirm it had placed it. | Free space in the per-run directory and in the repo's `.claude/`. | Free space, then re-run. |
 | `report path is not gitignored` | The report or the proposal-targets path is not ignored by git, so it was not written. | A tracked `.gitignore` in the repo that re-includes `.claude/` files. | Remove that rule, then re-run. |
 | `report-ignore helper failed` | The helper that makes the paths ignored crashed (the exit code and an error code follow). | `bin/install.sh --check`. | Run `bin/install.sh`, then re-run. |
 | `report rejected:` | The checked report could not be staged for placing (it was a link, empty, over the size cap or its folder was a link). The rest of the line says which. | `.claude/` in the repo is a real folder and `.claude/optimise-cycle-report.md` is not a link or folder. | Remove the link or folder, then re-run. |
 | `sidecar rejected:` | Same as above, for `.claude/optimise-proposal-targets.json` under the main checkout. | The same, for that file. | Same. |
+| `runner temp directory is not a directory this user owns` | The runner's own temp folder under `$TMPDIR` is a link, not a folder, or someone else's. | `ls -ld "$TMPDIR/optimise-weekly-runner"`. | Remove it if it is yours and not in use, or fix `$TMPDIR`, then re-run. |
+| `runner temp directory path cannot be given to the optimiser` | `$TMPDIR` has characters the session's read rule cannot name, or a `.claude` segment. | `echo "$TMPDIR"`. | Use a plain path for `$TMPDIR`. |
+| `killed by signal` | The runner was stopped by a signal while a repository was being processed (the number follows). | When it happened. | Re-run. |
 | `could not move the result into place` | The final rename failed. Nothing new was written (or only the proposal-targets file, which is always safe to keep). | Free space and permissions in the repo's `.claude/`. | Fix, then re-run. |
 | `session output: empty` | The session printed nothing. | The log's `claude exited` line, and the network. | Re-run. |
 | `session output: not a JSON envelope` | The session's output was not the agreed JSON. | Whether `claude` printed an error instead. | Re-run; if it repeats, report the CLI version. |
@@ -1752,6 +1777,13 @@ scheduled run.
 | `lane could not run: <mode>` | The lane named before it could not run, so the report was written without it and the run is a FAIL by design. Follow the `failed:<mode>` row. | The mode. | See the `failed:` rows. |
 | `the reader failed for` | The reader program failed on a collected command. | `bin/install.sh --check`. | Run `bin/install.sh`. |
 | `the reader reported an error for` | The reader returned an error for this repo's data. | As above. | As above. |
+| `is a symlink or not a regular file` | The ledger or the proposal-targets file named before it is a link or not a plain file. | The file under `.claude/` in the main checkout. | Replace it with a plain file. |
+| `is over the size limit` | The ledger or the proposal-targets file named before it is over its size cap. | Its size. | Trim or archive it. |
+| `could not be inspected` | The ledger or the proposal-targets file named before it could not be looked at. | Permissions on the file and its folders. | Fix them. |
+| `gh was not found on PATH` | The `gh` program is not on the job's PATH (the `failed:absent_from_path` row). | `command -v gh` from the job's environment. | See the `failed:absent_from_path` row. |
+| `gh is not authenticated` | `gh` is not signed in for the job (the `failed:unauthenticated` row). | `gh auth status` as the job's user. | See the `failed:unauthenticated` row. |
+| `gh reported a rate limit` | GitHub said to slow down (the `failed:rate_limited` row). | `gh api rate_limit` by hand. | See the `failed:rate_limited` row. |
+| `the repository root is not a directory` | The path given to the collector is not a folder. | The path. | Fix it. |
 | `git <command> ...` | A git command in the collector failed or was not found. The rest of the line says how. | `git --version`, and `git -C <repo> log -1` by hand. | Fix git or the repo, then re-run. |
 | `git log returned no commits` | The repo has a history the collector could not read. | `git -C <repo> log -1`. | Fix the repo. |
 | `git toplevel does not match the repository root` | The configured path is inside another repository, not its root. | The configured path is the repository's top directory. | Configure the top directory. |
@@ -1778,6 +1810,8 @@ scheduled run.
 | `cause=nonce` | The returned nonce hash did not match. | See the two `nonce hash` rows. | Same. |
 | `cause=oversized` | The report or the proposal-targets object was over its size cap. | See the size rows. | Same. |
 | `cause=failed_step` | The workflow stopped at a step. | See `session returned failed_step`. | Same. |
+| `cause=refused` | The workflow refused the call. | See `workflow refused to run`. | Same. |
+| `notice=lock-restore-failed` | A sidecar lock that turned out to be a live run's was taken away by mistake and could not be put back (a `NOTICE <repo> lock-restore-failed` line in the log). The run that owned it may have gone on without its lock. | Whether two runs were active on that repo at that moment, and that `.claude/optimise-proposal-targets.json` still holds every entry you expect. | Re-run; if an entry is missing, restore the file from backup. |
 | `failed:timeout` | A lane's command ran past its limit. | The lane named on the line. | Fix the slow command, then re-run. |
 | `failed:absent_from_path` | `gh` is not on the job's PATH (launchd's PATH is short). | `command -v gh` from the job's environment. | Put `gh` where launchd can find it, then re-run. |
 | `failed:unauthenticated` | `gh` is not logged in for the job. | `gh auth status` as the job's user. | Run `gh auth login`, then re-run. |

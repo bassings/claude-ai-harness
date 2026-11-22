@@ -206,7 +206,7 @@ test('optimise-cycle: a two-repo fixture with unterminatedWaits>0 and one uninst
       triggerAccuracy: { byLens: { 'lens-operability': { cleanWithZeroTrigger: 2, cleanWithMatches: 1, findingsWithMatches: 0, cleanTriggerUnmeasured: 0, total: 3 } } },
     }),
   })
-  const { result } = await runWorkflow(WORKFLOW, { args: { repos: ['.', '../other'] }, agent: responses })
+  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
 
   for (const needle of [
     'unterminated', // AC-OPS-12: unterminated_waits signal

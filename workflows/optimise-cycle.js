@@ -324,8 +324,8 @@ function makeRedactors(roots) {
   }
 }
 
-function ledgerRepoLabel(ledgerAgg, i) {
-  const root = ledgerAgg?.perRepo?.[i]?.root
+function ledgerRepoLabel(ledgerAgg) {
+  const root = ledgerAgg?.perRepo?.[0]?.root
   return typeof root === 'string' ? root : null
 }
 
@@ -391,7 +391,7 @@ function digestProblem(digest) {
     || (digest.plan_labels_note == null || typeof digest.plan_labels_note === 'string' ? null : 'plan_labels_note')
 }
 
-const refusal = (why) => ({ resolved: [], unresolved: [], report: `Refusing to proceed: ${why}`, __outcome: 'aborted' })
+const refusal = (why) => ({ report: `Refusing to proceed: ${why}`, __outcome: 'aborted' })
 // A digest is only ever used with the nonce the runner minted for it, so a missing or malformed nonce stops the run
 // before any prompt embeds collected data (AC-SEC-5); then a malformed digest stops it with a fixed reason (AC-SIMP-5).
 function digestRefusal(digest, nonce) {
@@ -453,11 +453,11 @@ function collectFromDigest(digest, nonce) {
   const { ledgerAgg, skippedCount, neverFailingLeftOut } = digestLedger(digest)
   const ciAgg = laneRan(digest, 'ci') ? digest.ci : null
   // Repository-originated text: flattened and redacted here, so no sink that prints the label can forge a line or leak a path.
-  const label = R.flat([ledgerRepoLabel(ledgerAgg, 0), typeof digest.git?.repo === 'string' ? digest.git.repo : null].find((v) => v) || 'repository')
+  const label = R.flat([ledgerRepoLabel(ledgerAgg), typeof digest.git?.repo === 'string' ? digest.git.repo : null].find((v) => v) || 'repository')
   return {
-    resolved: [{ label }], unresolved: [], planLabels: digest.plan_labels, nonce, R, repoLabels: [label], gitLabels: [label],
+    planLabels: digest.plan_labels, nonce, R, repoLabels: [label], gitLabels: [label],
     ledgerAgg, ciAgg, skippedCount, neverFailingLeftOut,
-    gitPerRepo: [digestGit(digest, R)], gitUnmatched: [],
+    gitPerRepo: [digestGit(digest, R)],
     lanes: { ledger: laneView(digest.lanes.ledger), git: laneView(digest.lanes.git), ci: laneView(digest.lanes.ci) },
     ciRunLine: ciRunCountLine(digest.lanes.ci), digestNotes: digestNoteLines(digest),
   }
@@ -490,7 +490,7 @@ const PROPOSAL_TARGET_SCHEMA = {
 
 // ---- Synthesis: drafting, the mechanical gates and the report ----
 async function analyse(input) {
-const { resolved, unresolved, planLabels, nonce: dataNonce, R, repoLabels, gitLabels, ledgerAgg, ciAgg, skippedCount, neverFailingLeftOut, gitPerRepo, gitUnmatched, lanes } = input
+const { planLabels, nonce: dataNonce, R, repoLabels, gitLabels, ledgerAgg, ciAgg, skippedCount, neverFailingLeftOut, gitPerRepo, lanes } = input
 const { redact, redactDeep, flat, redactRoots, redactRootsDeep } = R
 phase('Synthesis')
 
@@ -848,14 +848,8 @@ for (const [id, o] of Object.entries(ledgerAgg?.proposalOutcomes || {})) {
 }
 for (const p of [...ranked, ...insufficientDataProposals]) if (p.proposal_id) proposalTargetsSidecar[p.proposal_id] = redactDeep(p.target)
 
-// Review round-1 M5: keyed by POSITION (matching `roots`, and therefore
-// `ledgerAgg.perRepo[].rootIndex`), not by the raw absolute root path --
-// optimise-read.mjs's own perRepo[].root is a derived, non-identifying
-// label after round-2's AC-SEC-3 fix, so a lookup keyed by the raw path
-// would never hit.
 const reportMarkdown = buildReport({
   reposLabel: repoLabels.join(', '),
-  unresolved,
   ledgerN, minRecords: MIN_RECORDS_FOR_PROPOSALS, ledgerSufficient,
   windowTruncated: ledgerAgg ? ledgerAgg.windowTruncated : null,
   ledgerLaneFailed: !ledgerAgg,
@@ -877,7 +871,6 @@ const reportMarkdown = buildReport({
   ciRepoStats: ciRepoStatsSafe,
   ciGhStats: ciGhStatsSafe,
   escapedDefects: gitPerRepo.map((g, i) => ({ ...g, label: gitLabels[i] })),
-  escapedDefectsUnmatched: gitUnmatched,
   draftedCount,
   droppedAlwaysOnSecurityCount: droppedAlwaysOnSecurity.length,
   droppedNoReinstatementCount: droppedNoReinstatement.length,
@@ -930,8 +923,6 @@ const reportMarkdown = buildReport({
 })
 
 return {
-  resolved,
-  unresolved,
   ledger_sufficient: ledgerSufficient,
   ledger_n: ledgerN,
   // H1: the headline aggregates were computed and rendered into the report
@@ -955,11 +946,16 @@ return {
 } // end analyse
 
 // The entry point: the caller's digest, then one analysis. A call with no digest is refused with a fixed reason.
+// One repository is analysed per run (owner decision 2026-11-23): the several-repository form is gone, so these arguments are refused
+// rather than ignored, and a list given as `digest` fails the digest check.
+const REMOVED_ARGUMENTS = ['repos', 'window', 'digests']
 async function run() {
+  const removedGiven = REMOVED_ARGUMENTS.some((name) => opts[name] !== undefined)
   if (opts.digest === undefined) {
-    const removed = opts.repos === undefined && opts.window === undefined ? '' : ' The repos and window arguments no longer exist: the collector decides both.'
+    const removed = removedGiven ? ' The repos and window arguments no longer exist: the collector decides both.' : ''
     return refusal(`no collected digest was given. Collect with workflows/lib/optimise-collect.mjs and pass its digest.json and a nonce (see skills/optimise-cycle/SKILL.md).${removed}`)
   }
+  if (removedGiven) return refusal('one repository is analysed per run, so a repos, window or digests argument is refused: pass one collected digest and a nonce, and make one run for each repository.')
   const refused = digestRefusal(opts.digest, opts.nonce)
   if (refused) return refused
   log('Optimising from the collected digest.')
@@ -984,7 +980,6 @@ function buildReport(d) {
   lines.push('# Delivery optimiser report')
   lines.push('')
   lines.push(`Repos: ${d.reposLabel || 'none resolved'}`)
-  if (d.unresolved && d.unresolved.length) lines.push(`Unresolved: ${d.unresolved.map((u) => `${u.requested} (${u.reason})`).join('; ')}`)
   lines.push('')
 
   // H1 / AC-OPS-11: sample completeness, per repo, with an uninstrumented
@@ -1012,18 +1007,8 @@ function buildReport(d) {
   if (d.windowTruncated) lines.push('Ledger window was truncated to the most recent records; older history was not read (AC-ARCH-14 bound).')
   if (d.skippedCount > 0) lines.push(`${d.skippedCount} ledger line(s) were skipped as unparseable or missing a required field; see raw skip reasons in the agent transcript.`)
   for (const entry of d.perRepo || []) {
-    // Review round-1 M5 (SPEC BUG SB-1): perRepo[].root is now a DERIVED,
-    // non-identifying label (round-2's AC-SEC-3 fix), not the raw absolute
-    // path scope.resolved[].root still is -- so repoLabels, keyed by that
-    // raw path, is a guaranteed miss against it, AND two different roots
-    // whose derived identity happens to collide (two checkouts of the same
-    // origin) render as indistinguishable lines. rootIndex is the stable,
-    // positional key both sides agree on: the reader's own perRepo[i]
-    // corresponds to roots[i], which is exactly scope.resolved[i]. Falls
-    // back to the reader's own (already-safe) derived label when no
-    // rootIndex is present (an older reader) or repoLabels has nothing at
-    // that index -- never to the raw root, which is never available here.
-    const label = (d.repoLabels && typeof entry.rootIndex === 'number' && d.repoLabels[entry.rootIndex]) || entry.root
+    // The one repository's own label (the ledger's derived, non-identifying one, never the raw path), else the reader's.
+    const label = (d.perRepo.length === 1 && d.repoLabels?.[0]) || entry.root
     if (entry.uninstrumented) {
       lines.push(`- ${label}: **uninstrumented** (no ledger file found -- not "no activity"; the harness has never written a ledger here)`)
     } else {
@@ -1401,7 +1386,6 @@ function buildReport(d) {
       lines.push(`Scoped figure unavailable: ${oneLine(f.scoped_method || 'no reason given by the git lane')}`)
     }
   })
-  for (const u of d.escapedDefectsUnmatched || []) lines.push(`- Unmatched git result: ${u}`)
   lines.push('')
   // Round 2 F1/F7 (AC-SEC-15, AC-PROD-8): ONE annotation renderer for all three
   // proposal sections, so a flag or an outcome shown in one cannot be dropped in

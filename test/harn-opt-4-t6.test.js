@@ -484,7 +484,7 @@ test('T6 scope: no install-consistency check in optimise-cycle.js, no new workfl
   assert.ok(!/install[-_ ]consistency|allow_inconsistent_install|checkInstall/i.test(src), 'T6 declined the install-consistency check')
   const argNames = [...new Set([...src.matchAll(/\bopts\.([A-Za-z_]+)/g)].map((m) => m[1]))].sort()
   // HARN-RUNNER-2 T2 (AC-SIMP-5): the output paths are gone; the collected digest and the runner's nonce came in.
-  assert.deepEqual(argNames, ['digest', 'nonce', 'repos', 'window'], 'no workflow argument beyond the digest and the runner nonce')
+  assert.deepEqual(argNames, ['digest', 'nonce'], 'no workflow argument beyond the digest and the runner nonce (the repos and window arguments are refused, not read: D2)')
   const readerSrc = fs.readFileSync(MODULE_PATH, 'utf8')
   assert.ok(!/child_process|execSync|execFileSync|spawnSync|\bspawn\(/.test(readerSrc), 'reader functions run no subprocess')
 })
@@ -880,6 +880,6 @@ test('T6 round 3 L4: `ids` with legacy_targets also returns a sidecar_entry in t
 test("T6 round 3 L4: the skill tells the conductor to seed the sidecar under the roster's first repo root from sidecar_entry when it re-records outcome events, and says the sidecar carries prior targets forward (AC-PROD-8)", () => {
   const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
   assert.match(skill, /sidecar_entry/, 'names the field the ids command returns')
-  assert.match(skill, /first (roster )?repo root|roster'?s first repo/i, 'names where the sidecar lives')
+  assert.match(skill, /first (roster )?repo root|roster'?s first repo|main checkout of the repository/i, 'names where the sidecar lives')
   assert.match(skill, /carried forward|carries forward|survives/i, 'states that prior targets are carried forward')
 })
