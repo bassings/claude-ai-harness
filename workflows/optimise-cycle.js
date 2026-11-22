@@ -1,11 +1,11 @@
 export const meta = {
   name: 'optimise-cycle',
-  description: 'Delivery optimiser: reads the run ledger, conducted plan files, git history and GitHub Actions history to propose measured, cited changes to the harness, pipelines or process. Read-only -- never applies a change itself.',
-  whenToUse: 'On a scheduled cadence, never per-PR (default: weekly per delivery repo -- see skills/optimise-cycle/SKILL.md). Args: {repos?: string[] (repo root paths to analyse; default: the current repo), window?: number (ledger lines per repo; default 2000)}',
+  description: 'Delivery optimiser: reads the run ledger, conducted plan files, git history and GitHub Actions history to propose measured, cited changes to the harness, pipelines or process. Read-only -- never applies a change itself, and writes nothing: it returns the report and the proposal-targets sidecar.',
+  whenToUse: 'On a scheduled cadence, never per-PR (default: weekly per delivery repo -- see skills/optimise-cycle/SKILL.md). Args: {digest?: object (ONE repository digest from workflows/lib/optimise-collect.mjs; with it the workflow runs no scope or lane agent), nonce?: 32 lower-case hex characters (the runner containment nonce; required with a digest), repos?: string[] (attended only: repo root paths to analyse; default: the current repo), window?: number (attended only: ledger lines per repo; default 2000)}',
   phases: [
-    { title: 'Scope', detail: 'resolve target repos, main-checkout roots, and plan-file labels' },
-    { title: 'Lanes', detail: 'ledger-derived, gh-derived and git-derived analyses run in parallel' },
-    { title: 'Synthesis', detail: 'draft proposals from aggregated measurements only, filter mechanically, persist the report' },
+    { title: 'Scope', detail: 'resolve target repos, main-checkout roots, and plan-file labels (attended path only)' },
+    { title: 'Lanes', detail: 'ledger-derived, gh-derived and git-derived analyses run in parallel (attended path only)' },
+    { title: 'Synthesis', detail: 'draft proposals from aggregated measurements only, filter mechanically, return the report and the sidecar' },
   ],
 }
 
@@ -16,25 +16,19 @@ opts = opts || {}
 const requestedRepos = Array.isArray(opts.repos) && opts.repos.length ? opts.repos : ['.']
 const requestedWindow = typeof opts.window === 'number' && opts.window > 0 ? opts.window : 2000
 
-// Optional output paths, for a caller whose session may not write under
-// .claude/ (the unattended weekly runner): when given, the report and the
-// proposal-targets sidecar are written to these absolute paths instead of the
-// default .claude/ locations, and the caller moves them into place. Absent,
-// nothing here changes. A path that is given must be a plain absolute path
-// with no `..`, `.` or `.claude` segment and only path-safe characters; a bad
-// one stops the run before any agent step rather than being silently ignored.
+// HARN-RUNNER-2 T2 (AC-SIMP-5): the unattended runner collects the data itself and hands over ONE repository's digest
+// and the nonce it minted for that repository. A workflow script can read no file, so both arrive in args. A given
+// digest (even a malformed or empty one) selects the digest path; absent, the attended path runs its own scope and lane
+// agents as it always has.
 //
-// The weekly runner (bin/optimise-cycle-weekly.sh) reads this constant from the
-// installed copy before it stages anything, and refuses to run against a copy
-// whose contract is lower than its own REQUIRED_WORKFLOW_CONTRACT. Raise both
-// together whenever the runner starts relying on a new argument or behaviour
-// here. 1: report_path, proposal_targets_path, and no command substitution.
-const WEEKLY_RUNNER_CONTRACT = 1
-const OUTPUT_PATH_RE = /^\/[A-Za-z0-9_\/.-]+$/
-const outputPathOk = (p) => typeof p === 'string' && OUTPUT_PATH_RE.test(p) && p.split('/').every((seg) => seg !== '..' && seg !== '.' && seg !== '.claude')
-const reportOut = opts.report_path == null ? null : opts.report_path
-const sidecarOut = opts.proposal_targets_path == null ? null : opts.proposal_targets_path
-const badOutputPaths = [['report_path', reportOut], ['proposal_targets_path', sidecarOut]].filter(([, v]) => v !== null && !outputPathOk(v)).map(([k]) => k)
+// The weekly runner (bin/optimise-cycle-weekly.sh) reads this constant from the installed copy before it stages
+// anything, and refuses to run against a copy whose contract is lower than its own REQUIRED_WORKFLOW_CONTRACT. Raise
+// both together whenever the runner starts relying on a new argument or behaviour here. 1: output-path arguments
+// and no command substitution. 2: the digest and nonce arguments, and a structured
+// result (report, sidecar, lanes) in place of files the workflow wrote.
+const WEEKLY_RUNNER_CONTRACT = 2
+const digestGiven = opts.digest !== undefined
+const NONCE_RE = /^[0-9a-f]{32}$/
 
 // AC-SIMP-10 / AC-QA-17: below this many usable ledger records, the
 // optimiser reports insufficient data and emits zero LEDGER-CITED
@@ -65,16 +59,6 @@ const MIN_RECORDS_FOR_PROPOSALS = 5
 // constant, the same discipline as MIN_RECORDS_FOR_PROPOSALS above.
 const UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD = 0.2
 
-// The optimiser's own report artefact: the ONE file any of its agent steps
-// may create or modify (AC-SEC-9), written into the CURRENT repo (the one
-// /optimise-cycle was invoked in), documented in README.md. Not
-// configurable (AC-SIMP-2): a single hard-coded path, same discipline as
-// LEDGER_RELATIVE_PATH in workflows/lib/ledger-append.mjs.
-const REPORT_RELATIVE_PATH = '.claude/optimise-cycle-report.md'
-// Round 2 F2: the per-run sidecar beside the report (proposal id -> fixed-key
-// target); read back by optimise-read.mjs's ledger command. Same one-path discipline.
-const PROPOSAL_TARGETS_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
-
 // AC-SEC-8: every place untrusted text (a ledger free-text field, a gh
 // workflow/job name, a commit subject, a repo root path or display label)
 // reaches an agent prompt, it is wrapped in an explicit, clearly-labelled
@@ -101,8 +85,12 @@ const PROPOSAL_TARGETS_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
 // `</UNTRUSTED-DATA>` (the OLD, un-nonced form) appearing inside hostile
 // content is therefore just inert text: it does not match the real
 // closing tag and cannot end the block early.
+const FENCE_TAG_RE = /<(\/?UNTRUSTED-DATA-)/gi
 function wrapAsData(nonce, label, value) {
-  const text = typeof value === 'string' ? value : JSON.stringify(value)
+  // HARN-RUNNER-2 T2 (AC-SEC-5, AC-SEC-6): the nonce is the runner's, so it is not secret from the data (a digest string
+  // may carry it, or a closing tag copied from a prompt). Any `<` that opens a fence-shaped tag inside the data is
+  // written as its JSON escape, so no string in the data can spell this block's closing tag or open another block.
+  const text = (typeof value === 'string' ? value : JSON.stringify(value)).replace(FENCE_TAG_RE, '\\u003c$1')
   const tag = `UNTRUSTED-DATA-${nonce}`
   return (
     `<${tag} label="${label}">\n${text}\n</${tag}>\n` +
@@ -218,22 +206,358 @@ function hasReinstatementEvidence(p) {
   return typeof p.reinstatement_evidence === 'string' && p.reinstatement_evidence.trim().length > 0
 }
 
-// The entire pre-existing workflow body sits in run() so the single report-
-// persistence step below is reachable from every terminating return, the
-// same shape the three PR1 workflows use for their single ledger write
-// (AC-ARCH-3's discipline; the optimiser has no ledger write of its own --
-// AC-SEC-9 -- but the SAME "exactly one funnel point" discipline applies to
-// its one allowed write, the report file).
-async function run() {
+// HARN-RUNNER-2 T2 (AC-SIMP-4): proposal identifiers are computed HERE, so the sidecar and the
+// previously-rejected / previously-adopted annotations come out of one program with the report. A workflow script has
+// no Node hash and no UTF-8 encoder, so this is a pure-JS SHA-256, a second implementation held to workflows/lib/optimise-read.mjs's
+// stableProposalId by test/harn-runner-2-t2.test.js (the published vectors, the padding boundaries, and every target
+// shape). The block is self-contained on purpose: that test lifts it out of this file by its two markers and runs it alone.
+const SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]
+// UTF-8 exactly as Node encodes a string: an unpaired surrogate is U+FFFD (EF BF BD), because the ids already in the
+// ledger were hashed by Node.
+function utf8Bytes(input) {
+  const bytes = []
+  for (const ch of String(input)) {
+    let cp = ch.codePointAt(0)
+    if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd
+    if (cp < 0x80) bytes.push(cp)
+    else if (cp < 0x800) bytes.push(0xc0 | (cp >> 6), 0x80 | (cp & 63))
+    else if (cp < 0x10000) bytes.push(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63))
+    else bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63))
+  }
+  return bytes
+}
+function sha256Pad(bytes) {
+  const byteLength = bytes.length
+  bytes.push(0x80)
+  while (bytes.length % 64 !== 56) bytes.push(0)
+  const bitsHigh = Math.floor(byteLength / 0x20000000)
+  const bitsLow = (byteLength * 8) >>> 0
+  bytes.push(bitsHigh >>> 24, (bitsHigh >>> 16) & 255, (bitsHigh >>> 8) & 255, bitsHigh & 255, bitsLow >>> 24, (bitsLow >>> 16) & 255, (bitsLow >>> 8) & 255, bitsLow & 255)
+  return bytes
+}
+function sha256Hex(input) {
+  const bytes = sha256Pad(utf8Bytes(input))
+  const h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+  const w = new Array(64)
+  const rotr = (x, n) => (x >>> n) | (x << (32 - n))
+  for (let offset = 0; offset < bytes.length; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = offset + i * 4
+      w[i] = ((bytes[j] << 24) | (bytes[j + 1] << 16) | (bytes[j + 2] << 8) | bytes[j + 3]) | 0
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)
+      const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0
+    }
+    let [a, b, c, d, e, f, g, hh] = h
+    for (let i = 0; i < 64; i++) {
+      const t1 = (hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + SHA256_K[i] + w[i]) | 0
+      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0
+      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0
+    }
+    h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0; h[3] = (h[3] + d) | 0
+    h[4] = (h[4] + e) | 0; h[5] = (h[5] + f) | 0; h[6] = (h[6] + g) | 0; h[7] = (h[7] + hh) | 0
+  }
+  return h.map((x) => (x >>> 0).toString(16).padStart(8, '0')).join('')
+}
+// Canonical JSON: keys sorted at every depth, so key order never changes the hash (the reader's canonicalJson).
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+// The six identity keys, in the reader's order (PROPOSAL_IDENTITY_KEYS there); the two gate booleans are not identity.
+const PROPOSAL_ID_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+function idValue(v) {
+  if (typeof v === 'string') return v.trim().toLowerCase()
+  const text = v === null || v === undefined ? '' : String(v)
+  return text.trim().toLowerCase()
+}
+function stableProposalId(target) {
+  const t = target && typeof target === 'object' ? target : {}
+  if (!PROPOSAL_ID_KEYS.some((k) => k in t)) return sha256Hex(canonicalJson(target)).slice(0, 16)
+  return sha256Hex(canonicalJson(PROPOSAL_ID_KEYS.map((k) => idValue(t[k])))).slice(0, 16)
+}
+// END proposal-id block
 
-if (badOutputPaths.length) {
+// ---- HARN-RUNNER-2 T2: what both entry points share, and the digest path ----
+
+// Every path-shaped string and every roster root an agent or the digest supplied is redacted BEFORE it is flattened,
+// bounded or echoed (Round 1 F4, AC-SEC-10): a root becomes the marker the reader uses for an unidentified repo, and so
+// does any absolute path. ABSOLUTE_PATH_RE mirrors the one in workflows/lib/ledger-append.mjs (a workflow script cannot
+// import it). Redacting before the 120-character slice stops a truncation leaving a root half-visible. The digest path
+// has no roots (the runner resolved them), so only the absolute-path pattern applies there.
+const REDACTED_PATH_MARKER = '<redacted-path>'
+const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+function mapDeep(value, onString) {
+  if (typeof value === 'string') return onString(value)
+  if (Array.isArray(value)) return value.map((item) => mapDeep(item, onString))
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, x]) => [k, mapDeep(x, onString)]))
+  return value
+}
+// Round 1 L2 (AC-SEC-10): the CI aggregate's copy that reaches the synthesis prompt and the report has roster roots
+// removed, keys included, but NOT the absolute-path pattern: a job name such as 'build</UNTRUSTED-DATA>' is inert data
+// inside the nonce-fenced block, and the path pattern would rewrite it (pinned by the AC-SEC-8 M3 breakout test). The
+// report line applies the full flattener on top.
+function makeRedactors(roots) {
+  const longestFirst = [...roots].sort((a, b) => b.length - a.length)
+  const redactRoots = (v) => {
+    let t = String(v)
+    for (const r of longestFirst) if (r) t = t.split(r).join(REDACTED_PATH_MARKER)
+    return t
+  }
+  const redact = (v) => redactRoots(v).replace(ABSOLUTE_PATH_RE, (whole, prefix) => `${prefix}${REDACTED_PATH_MARKER}`)
   return {
-    resolved: [],
-    unresolved: [],
-    report: `Refusing to proceed: ${badOutputPaths.join(' and ')} must be a plain absolute path with no "..", "." or ".claude" segment.`,
-    __outcome: 'aborted',
+    redact,
+    redactRoots,
+    redactDeep: (v) => mapDeep(v, redact),
+    redactRootsDeep: (v) => mapDeep(v, redactRoots),
+    flat: (v) => redact(v).replace(/\s+/g, ' ').slice(0, 120),
   }
 }
+
+function ledgerRepoLabel(ledgerAgg, i) {
+  const root = ledgerAgg?.perRepo?.[i]?.root
+  return typeof root === 'string' ? root : null
+}
+
+// One git entry that is about its roster repo (identity already settled by the caller): a reader rejection, or any
+// entry without an integer count, is a failed measurement, never zero (Round 2 F3, AC-QA-19, AC-SEC-10). `rejected` wins
+// over a stale count; the reason is redacted, flattened and bounded before it is echoed.
+function classifyGitEntry(e, R) {
+  if (e.rejected === true || !Number.isInteger(e.count)) {
+    return { status: 'failed', reason: R.flat(typeof e.reason === 'string' && e.reason ? e.reason : 'git lane returned no integer count'), figures: null }
+  }
+  return { status: 'ok', reason: null, figures: R.redactDeep(e) }
+}
+
+// The git results the lane agents returned that claim the roster index asked about (the SCRIPT attached the index,
+// never a path the agent supplies); any other claim is reported as unmatched with the reason.
+function gitClaimsFor(res, k, count, unmatched, R) {
+  const claims = []
+  for (const e of res.repos) {
+    if (!e || !Number.isInteger(e.root_index) || e.root_index < 0 || e.root_index >= count) {
+      unmatched.push(`result with root_index ${R.flat(e?.root_index)} (repo ${R.flat(e?.repo)}): out of range for ${count} roster repo(s); not used`)
+    } else if (e.root_index !== k) {
+      // The script asked lane k about roster repo k only; an answer about another index is a swap or a forgery, never a figure for either.
+      unmatched.push(`roster repo ${k + 1}: result claimed root_index ${e.root_index} (repo ${R.flat(e.repo)}); not used`)
+    } else {
+      claims.push(e)
+    }
+  }
+  return claims
+}
+
+// Matched to its roster entry by the ledger identity label the ledger lane derived for that root (AC-SEC-10 matches by
+// identity, never by position alone). Anything else is reported as unmatched, never merged into another repo's figure (AC-DATA-11).
+function gitMatchOne(e, k, ledgerAgg, unmatched, R) {
+  const ledgerRepo = ledgerRepoLabel(ledgerAgg, k)
+  if (ledgerRepo === null) {
+    // Round 3 L2 (AC-QA-19): with no ledger identity to confirm against, the figure is unconfirmed, not mismatched.
+    const why = ledgerAgg ? 'the ledger lane has no entry for this root' : 'the ledger lane failed'
+    unmatched.push(`roster repo ${k + 1}: ledger identity unavailable (${why}); result repo ${R.flat(e.repo)} could not be confirmed and was not used`)
+    return { status: 'unmatched', reason: `ledger identity unavailable (${why}); the figure could not be confirmed as this repo's`, figures: null }
+  }
+  if (e.repo !== ledgerRepo) {
+    unmatched.push(`roster repo ${k + 1}: result repo ${R.flat(e.repo)} does not match ledger repo ${R.flat(ledgerRepo)}; not used`)
+    return { status: 'unmatched', reason: `repo mismatch (result ${R.flat(e.repo)}, ledger ${R.flat(ledgerRepo)})`, figures: null }
+  }
+  return classifyGitEntry(e, R)
+}
+
+function matchGitResults(gitResults, count, ledgerAgg, R) {
+  const gitPerRepo = Array.from({ length: count }, () => ({ status: 'failed', reason: 'git lane returned no result', figures: null }))
+  const gitUnmatched = []
+  gitResults.forEach((res, k) => {
+    if (!res || !Array.isArray(res.repos)) return
+    const claims = gitClaimsFor(res, k, count, gitUnmatched, R)
+    if (claims.length > 1) {
+      gitUnmatched.push(`roster repo ${k + 1}: ${claims.length} results claimed root_index ${k}; none used`)
+      gitPerRepo[k] = { status: 'unmatched', reason: 'duplicate results for this roster repo', figures: null }
+    } else if (claims.length === 1) {
+      gitPerRepo[k] = gitMatchOne(claims[0], k, ledgerAgg, gitUnmatched, R)
+    }
+  })
+  return { gitPerRepo, gitUnmatched }
+}
+
+// What each lane reports in the result (AC-ARCH-9): its status, mode and a reason. On the attended path a lane is
+// failed when its agent returned nothing (or, for git, any roster repo's figure was not usable).
+const LANE_RAN = { status: 'ran', mode: null, reason: null }
+const laneFailed = (reason) => ({ status: 'failed', mode: 'other', reason })
+function attendedLanes(ledgerAgg, ciAgg, gitPerRepo) {
+  const gitFailed = gitPerRepo.find((g) => g.status !== 'ok')
+  return {
+    ledger: ledgerAgg ? LANE_RAN : laneFailed('the ledger lane returned no result'),
+    git: gitFailed ? laneFailed(gitFailed.reason) : LANE_RAN,
+    ci: ciAgg ? LANE_RAN : laneFailed('the CI lane returned no result'),
+  }
+}
+
+// ---- the digest ----
+
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
+const isCount = (v) => Number.isInteger(v) && v >= 0
+const DIGEST_LANE_NAMES = ['ledger', 'git', 'ci']
+const DIGEST_LANE_STATUSES = ['ran', 'failed']
+// The omission counts the collector records in the digest's `dropped` (its trimmedForSize flag is the one boolean).
+const DIGEST_DROPPED_COUNT_KEYS = ['wallClockByPlan', 'proposalOutcomes', 'planLabels', 'ciByJob', 'ciFailedRunIds', 'ciCitationPool', 'ledgerCitationPool', 'neverFailingAcs', 'planLabelsUnmatched']
+const laneRan = (digest, name) => digest.lanes[name].status === 'ran'
+
+function digestLaneProblem(digest) {
+  if (!isObject(digest.lanes)) return 'lanes'
+  for (const name of DIGEST_LANE_NAMES) {
+    const lane = digest.lanes[name]
+    if (!isObject(lane) || !DIGEST_LANE_STATUSES.includes(lane.status)) return `lanes.${name}`
+    if (lane.status === 'ran' && !isObject(digest[name])) return name
+  }
+  return null
+}
+
+// AC-QA-10: the ledger figures must agree with each other, which the reader guarantees (n plus the records the window
+// dropped is the records every repository holds), so a record dropped or a count changed in transit is caught here.
+function digestLedgerProblem(ledger) {
+  if (!isCount(ledger.n) || !isCount(ledger.windowDroppedCount) || !isCount(ledger.neverFailingInsufficientCount)) return 'ledger.n'
+  if (!Array.isArray(ledger.perRepo) || !ledger.perRepo.every((e) => isObject(e) && isCount(e.recordCount))) return 'ledger.perRepo'
+  if (ledger.n + ledger.windowDroppedCount !== ledger.perRepo.reduce((sum, e) => sum + e.recordCount, 0)) return 'ledger figures'
+  return Array.isArray(ledger.neverFailingAcs) && Array.isArray(ledger.citationPool) ? null : 'ledger.neverFailingAcs'
+}
+
+function digestCiProblem(ci) {
+  if (!isObject(ci.byJob) || !Array.isArray(ci.citationPool) || !Array.isArray(ci.failures)) return 'ci.byJob'
+  if (ci.ghStats !== undefined && !Array.isArray(ci.ghStats)) return 'ci.ghStats'
+  return ci.repoStats === undefined || isObject(ci.repoStats) ? null : 'ci.repoStats'
+}
+
+function digestDroppedProblem(dropped) {
+  if (!isObject(dropped) || typeof dropped.trimmedForSize !== 'boolean') return 'dropped'
+  return DIGEST_DROPPED_COUNT_KEYS.every((k) => isCount(dropped[k])) ? null : 'dropped'
+}
+
+// The first thing wrong with the digest, named from a fixed list (never from its content), or null.
+function digestProblem(digest) {
+  if (!isObject(digest)) return 'digest'
+  const lanes = digestLaneProblem(digest)
+  if (lanes) return lanes
+  return (laneRan(digest, 'ledger') ? digestLedgerProblem(digest.ledger) : null)
+    || (laneRan(digest, 'ci') ? digestCiProblem(digest.ci) : null)
+    || digestDroppedProblem(digest.dropped)
+    || (Array.isArray(digest.plan_labels) ? null : 'plan_labels')
+    || (digest.plan_labels_note == null || typeof digest.plan_labels_note === 'string' ? null : 'plan_labels_note')
+}
+
+const refusal = (why) => ({ resolved: [], unresolved: [], report: `Refusing to proceed: ${why}`, __outcome: 'aborted' })
+// A digest is only ever used with the nonce the runner minted for it, so a missing or malformed nonce stops the run
+// before any prompt embeds collected data (AC-SEC-5); then a malformed digest stops it with a fixed reason (AC-SIMP-5).
+function digestRefusal(digest, nonce) {
+  if (typeof nonce !== 'string' || !NONCE_RE.test(nonce)) return refusal('the runner\'s containment nonce is missing or is not 32 lower-case hex characters.')
+  const problem = digestProblem(digest)
+  return problem ? refusal(`the collected digest is malformed (${problem}).`) : null
+}
+
+// Mirrors isPlainInsufficientRow in workflows/lib/optimise-read.mjs (a script cannot import it): an insufficient-data
+// row with no measured verdict disagreement. The collector already leaves these out of the digest and counts them; the
+// render applies the same rule to what it was handed, so the two cannot disagree. Tied to the reader's by
+// test/harn-runner-2-t2-mirror.test.js and, for the render, by test/helpers/never-failing-render.js.
+function isPlainInsufficientRow(row) {
+  return Boolean(row?.insufficient_data) && (row.verdict_disagreements === 0 || row.verdict_disagreements === undefined)
+}
+
+const laneView = ({ status, mode, reason }) => ({ status, mode: typeof mode === 'string' ? mode : null, reason: typeof reason === 'string' ? reason : null })
+
+function ciRunCountLine(lane) {
+  if (lane.status !== 'ran' || !isCount(lane.runCount) || !isCount(lane.fetchFailedCount) || !isCount(lane.timeoutCount)) return null
+  return `CI runs: ${lane.runCount} fetched, ${lane.fetchFailedCount} not fetched, ${lane.timeoutCount} timed out`
+}
+
+// AC-OPS-17: what the digest left out, stated in the report, one line each: every non-zero omission count, whether it
+// was trimmed for size, and the collector's own plan-label note.
+function digestNoteLines(digest) {
+  const lines = DIGEST_DROPPED_COUNT_KEYS.filter((k) => digest.dropped[k] > 0).map((k) => `Digest omitted ${k}: ${digest.dropped[k]}`)
+  if (digest.dropped.trimmedForSize) lines.push('Digest trimmed for size: yes')
+  if (digest.plan_labels_note) lines.push(String(digest.plan_labels_note).replace(/\s+/g, ' ').slice(0, 400))
+  return lines
+}
+
+// The digest path's single git entry. A lane that did not run is a failed measurement with the lane's fixed reason; a
+// good figure is kept whatever the ledger lane did (AC-PROD-3): it came from the same collection of the same repository,
+// so there is no second identity to match it against.
+function digestGit(digest, R) {
+  if (digest.lanes.git.status !== 'ran') return { status: 'failed', reason: R.flat(digest.lanes.git.reason || 'the git lane did not run'), figures: null }
+  return classifyGitEntry(digest.git, R)
+}
+
+// The ledger as the shared analysis reads it: only the never-failing rows that are not plain insufficient data
+// (the collector's rule, applied again), and the number left out.
+function digestLedger(digest) {
+  if (!laneRan(digest, 'ledger')) return { ledgerAgg: null, skippedCount: 0, neverFailingLeftOut: 0 }
+  const carried = digest.ledger.neverFailingAcs
+  const rows = carried.filter((row) => !isPlainInsufficientRow(row))
+  return {
+    ledgerAgg: { ...digest.ledger, neverFailingAcs: rows },
+    skippedCount: isCount(digest.ledger.skippedCount) ? digest.ledger.skippedCount : 0,
+    neverFailingLeftOut: digest.ledger.neverFailingInsufficientCount + carried.length - rows.length,
+  }
+}
+
+// Everything the analysis reads, from the digest alone: no agent runs, nothing is fetched (AC-QA-2, AC-SEC-17). The
+// one repository is labelled with the ledger's own label for it, else the git result's.
+function collectFromDigest(digest, nonce) {
+  const R = makeRedactors([])
+  const { ledgerAgg, skippedCount, neverFailingLeftOut } = digestLedger(digest)
+  const ciAgg = laneRan(digest, 'ci') ? digest.ci : null
+  const label = [ledgerRepoLabel(ledgerAgg, 0), typeof digest.git?.repo === 'string' ? digest.git.repo : null].find((v) => v) || 'repository'
+  return {
+    resolved: [{ label }], unresolved: [], planLabels: digest.plan_labels, nonce, R, repoLabels: [label], gitLabels: [label],
+    ledgerAgg, ciAgg, skippedCount, neverFailingLeftOut,
+    gitPerRepo: [digestGit(digest, R)], gitUnmatched: [],
+    lanes: { ledger: laneView(digest.lanes.ledger), git: laneView(digest.lanes.git), ci: laneView(digest.lanes.ci) },
+    ciRunLine: ciRunCountLine(digest.lanes.ci), digestNotes: digestNoteLines(digest),
+  }
+}
+
+// HARN-OPT-4 T6 (AC-QA-20, AC-PROD-8, AC-DATA-15): the proposal target is a
+// FIXED key set, not a free object, so the stable id and the removal gates
+// read the same keys every time. The six string fields may be empty or null
+// where not applicable; the two booleans are required and are gate inputs.
+// Mirrors PROPOSAL_IDENTITY_KEYS in workflows/lib/optimise-read.mjs
+// (workflow scripts cannot import it, so the list is duplicated and the T6
+// test pins both).
+const PROPOSAL_TARGET_STRING_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+const PROPOSAL_TARGET_KEYS = [...PROPOSAL_TARGET_STRING_KEYS, 'touches_always_on_lens', 'security_purposed']
+const PROPOSAL_TARGET_SCHEMA = {
+  type: 'object',
+  required: PROPOSAL_TARGET_KEYS,
+  additionalProperties: false,
+  properties: {
+    kind: { type: ['string', 'null'] },
+    component: { type: ['string', 'null'] },
+    concern: { type: ['string', 'null'] },
+    lens: { type: ['string', 'null'] },
+    workflow: { type: ['string', 'null'] },
+    job: { type: ['string', 'null'] },
+    touches_always_on_lens: { type: 'boolean' },
+    security_purposed: { type: 'boolean' },
+  },
+}
+
+// The attended path: its own scope agent, then the three lane agents in parallel. Everything that stops the run early
+// comes back as { stop }, the result run() returns as it is.
+const stopWith = (result) => ({ stop: result })
+async function collectFromAgents() {
 
 // ---- Phase 1: scope ----
 phase('Scope')
@@ -278,23 +602,23 @@ const scope = await agent(
   }
 )
 if (!scope || !scope.resolved.length) {
-  return {
+  return stopWith({
     resolved: [],
     unresolved: (scope && scope.unresolved) || requestedRepos.map((r) => ({ requested: r, reason: 'scope agent failed or resolved nothing' })),
     report: 'No repo could be resolved; nothing to analyse.',
     __outcome: 'no-op',
-  }
+  })
 }
 // Round-2 M3: without a nonce, wrapAsData below would have to fall back to
 // a guessable, un-nonced tag -- refuse to proceed at all rather than
 // silently weaken every containment boundary in this run.
 if (!scope.nonce || typeof scope.nonce !== 'string') {
-  return {
+  return stopWith({
     resolved: scope.resolved,
     unresolved: scope.unresolved,
     report: 'Scope agent did not return a containment nonce; aborting before any untrusted data would be embedded without it.',
     __outcome: 'aborted',
-  }
+  })
 }
 const dataNonce = scope.nonce
 const roots = scope.resolved.map((r) => r.root)
@@ -308,12 +632,12 @@ const roots = scope.resolved.map((r) => r.root)
 const SHELL_METACHAR_RE = /[`$"'\\;&|<>(){}!\n]/
 const unsafeRoots = roots.filter((r) => SHELL_METACHAR_RE.test(r))
 if (unsafeRoots.length) {
-  return {
+  return stopWith({
     resolved: scope.resolved,
     unresolved: scope.unresolved,
     report: `Refusing to proceed: resolved repo root(s) contain a shell metacharacter and cannot be safely embedded in a command: ${unsafeRoots.join(', ')}.`,
     __outcome: 'aborted',
-  }
+  })
 }
 log(`Optimising over ${roots.length} repo(s): ${scope.resolved.map((r) => r.label).join(', ')}. Window: ${requestedWindow} lines per repo.`)
 
@@ -397,31 +721,6 @@ const GIT_LANE_SCHEMA = {
   type: 'object',
   required: ['repos'],
   properties: { repos: { type: 'array', items: GIT_LANE_ENTRY_SCHEMA } },
-}
-
-// HARN-OPT-4 T6 (AC-QA-20, AC-PROD-8, AC-DATA-15): the proposal target is a
-// FIXED key set, not a free object, so the stable id and the removal gates
-// read the same keys every time. The six string fields may be empty or null
-// where not applicable; the two booleans are required and are gate inputs.
-// Mirrors PROPOSAL_IDENTITY_KEYS in workflows/lib/optimise-read.mjs
-// (workflow scripts cannot import it, so the list is duplicated and the T6
-// test pins both).
-const PROPOSAL_TARGET_STRING_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
-const PROPOSAL_TARGET_KEYS = [...PROPOSAL_TARGET_STRING_KEYS, 'touches_always_on_lens', 'security_purposed']
-const PROPOSAL_TARGET_SCHEMA = {
-  type: 'object',
-  required: PROPOSAL_TARGET_KEYS,
-  additionalProperties: false,
-  properties: {
-    kind: { type: ['string', 'null'] },
-    component: { type: ['string', 'null'] },
-    concern: { type: ['string', 'null'] },
-    lens: { type: ['string', 'null'] },
-    workflow: { type: ['string', 'null'] },
-    job: { type: ['string', 'null'] },
-    touches_always_on_lens: { type: 'boolean' },
-    security_purposed: { type: 'boolean' },
-  },
 }
 
 const ledgerLanePrompt =
@@ -515,73 +814,22 @@ const gitLaneFor = (r, i) => () => agent(gitLanePrompt(r.root, i), { label: 'lan
 
 const [ledgerAgg, ciAgg, ...gitResults] = await parallel([ledgerLane, ciLane, ...scope.resolved.map(gitLaneFor)])
 
-// Match each git result to its roster entry by the index the SCRIPT attached
-// (never a path the agent supplies) AND by the ledger identity label the
-// ledger lane derived for that root. Anything else is reported as unmatched
-// with the reason, never merged into another repo's figure (AC-DATA-11).
-// Round 1 F4 (AC-SEC-10): every agent-supplied string is redacted BEFORE it is
-// flattened, bounded, or echoed: any substring equal to a roster root, and any
-// absolute path, becomes the same marker the reader uses for an unidentified
-// repo. ABSOLUTE_PATH_RE mirrors the one in workflows/lib/ledger-append.mjs
-// (a workflow script cannot import it). Redacting before the 120-char slice
-// stops a truncation leaving a root half-visible.
-const REDACTED_PATH_MARKER = '<redacted-path>'
-const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
-const rootsLongestFirst = [...roots].sort((a, b) => b.length - a.length)
-const redact = (v) => {
-  let t = String(v)
-  for (const r of rootsLongestFirst) if (r) t = t.split(r).join(REDACTED_PATH_MARKER)
-  return t.replace(ABSOLUTE_PATH_RE, (whole, prefix) => `${prefix}${REDACTED_PATH_MARKER}`)
-}
-const redactDeep = (v) => (typeof v === 'string' ? redact(v) : Array.isArray(v) ? v.map(redactDeep) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactDeep(x)])) : v)
-const flat = (v) => redact(v).replace(/\s+/g, ' ').slice(0, 120)
-const gitPerRepo = scope.resolved.map(() => ({ status: 'failed', reason: 'git lane returned no result', figures: null }))
-const gitUnmatched = []
-const ledgerRepoLabel = (i) => (ledgerAgg && ledgerAgg.perRepo && ledgerAgg.perRepo[i] && typeof ledgerAgg.perRepo[i].root === 'string' ? ledgerAgg.perRepo[i].root : null)
-gitResults.forEach((res, k) => {
-  if (!res || !Array.isArray(res.repos)) return
-  const claims = []
-  for (const e of res.repos) {
-    if (!e || !Number.isInteger(e.root_index) || e.root_index < 0 || e.root_index >= scope.resolved.length) {
-      gitUnmatched.push(`result with root_index ${flat(e && e.root_index)} (repo ${flat(e && e.repo)}): out of range for ${scope.resolved.length} roster repo(s); not used`)
-    } else if (e.root_index !== k) {
-      // The script asked lane k about roster repo k only; an answer about
-      // another index is a swap or a forgery, never a figure for either.
-      gitUnmatched.push(`roster repo ${k + 1}: result claimed root_index ${e.root_index} (repo ${flat(e.repo)}); not used`)
-    } else {
-      claims.push(e)
-    }
-  }
-  if (claims.length > 1) {
-    gitUnmatched.push(`roster repo ${k + 1}: ${claims.length} results claimed root_index ${k}; none used`)
-    gitPerRepo[k] = { status: 'unmatched', reason: 'duplicate results for this roster repo', figures: null }
-  } else if (claims.length === 1) {
-    const e = claims[0]
-    const ledgerRepo = ledgerRepoLabel(k)
-    if (ledgerRepo === null) {
-      // Round 3 L2 (AC-QA-19): with no ledger identity to confirm against,
-      // the figure is unconfirmed, not mismatched. Still not used (AC-SEC-10
-      // matches by identity, never by position alone), but the reason says
-      // what actually happened.
-      const why = ledgerAgg ? 'the ledger lane has no entry for this root' : 'the ledger lane failed'
-      gitUnmatched.push(`roster repo ${k + 1}: ledger identity unavailable (${why}); result repo ${flat(e.repo)} could not be confirmed and was not used`)
-      gitPerRepo[k] = { status: 'unmatched', reason: `ledger identity unavailable (${why}); the figure could not be confirmed as this repo's`, figures: null }
-    } else if (e.repo !== ledgerRepo) {
-      gitUnmatched.push(`roster repo ${k + 1}: result repo ${flat(e.repo)} does not match ledger repo ${flat(ledgerRepo)}; not used`)
-      gitPerRepo[k] = { status: 'unmatched', reason: `repo mismatch (result ${flat(e.repo)}, ledger ${flat(ledgerRepo)})`, figures: null }
-    } else if (e.rejected === true || !Number.isInteger(e.count)) {
-      // Round 2 F3 (AC-QA-19, AC-SEC-10): a rejection the reader made (or any
-      // entry without an integer count) is a failed measurement, never zero.
-      // `rejected` wins over a stale count; the reason is redacted, flattened
-      // and bounded by flat() before it is echoed.
-      gitPerRepo[k] = { status: 'failed', reason: flat(typeof e.reason === 'string' && e.reason ? e.reason : 'git lane returned no integer count'), figures: null }
-    } else {
-      gitPerRepo[k] = { status: 'ok', reason: null, figures: redactDeep(e) }
-    }
-  }
-})
 
-// ---- Phase 3: synthesis ----
+const R = makeRedactors(roots)
+const { gitPerRepo, gitUnmatched } = matchGitResults(gitResults, scope.resolved.length, ledgerAgg, R)
+return {
+  resolved: scope.resolved, unresolved: scope.unresolved, planLabels: scope.plan_labels, nonce: dataNonce, R,
+  repoLabels: scope.resolved.map((r) => r.label), gitLabels: scope.resolved.map((r, i) => ledgerRepoLabel(ledgerAgg, i) || r.label),
+  ledgerAgg, ciAgg, skippedCount: ledgerAgg && Array.isArray(ledgerAgg.skipped) ? ledgerAgg.skipped.length : 0, neverFailingLeftOut: 0,
+  gitPerRepo, gitUnmatched, lanes: attendedLanes(ledgerAgg, ciAgg, gitPerRepo), ciRunLine: null, digestNotes: [],
+}
+
+} // end collectFromAgents
+
+// ---- Phase 3: synthesis, the same for both entry points ----
+async function analyse(input) {
+const { resolved, unresolved, planLabels, nonce: dataNonce, R, repoLabels, gitLabels, ledgerAgg, ciAgg, skippedCount, neverFailingLeftOut, gitPerRepo, gitUnmatched, lanes } = input
+const { redact, redactDeep, flat, redactRoots, redactRootsDeep } = R
 phase('Synthesis')
 
 const ledgerN = ledgerAgg && typeof ledgerAgg.n === 'number' ? ledgerAgg.n : 0
@@ -589,18 +837,9 @@ const ledgerSufficient = ledgerN >= MIN_RECORDS_FOR_PROPOSALS
 const ledgerCitations = new Set((ledgerAgg && ledgerAgg.citationPool) || [])
 // Round 1 L2 (AC-SEC-10): the CI aggregate is agent-supplied, so the copy that
 // reaches the synthesis prompt and the report is redacted, keys included
-// (redactDeep leaves keys alone, and the key carries the repo and job name).
-// The brake below keeps reading the raw ciAgg: it only compares, never echoes.
-// Only roster roots are removed here, not the absolute-path pattern: a job
-// name such as 'build</UNTRUSTED-DATA>' is inert data inside the nonce-fenced
-// block, and the path pattern would rewrite it (pinned by the AC-SEC-8 M3
-// breakout test). The report line applies the full flattener on top.
-const redactRoots = (v) => {
-  let t = String(v)
-  for (const r of rootsLongestFirst) if (r) t = t.split(r).join(REDACTED_PATH_MARKER)
-  return t
-}
-const redactRootsDeep = (v) => (typeof v === 'string' ? redactRoots(v) : Array.isArray(v) ? v.map(redactRootsDeep) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactRootsDeep(x)])) : v)
+// (redactDeep leaves keys alone, and the key carries the repo and job name; see
+// makeRedactors). The brake below keeps reading the raw ciAgg: it only compares,
+// never echoes.
 const ciByJobSafe = ciAgg ? Object.fromEntries(Object.entries(ciAgg.byJob || {}).map(([k, v]) => [redactRoots(k), redactRootsDeep(v)])) : {}
 const ciFailuresSafe = ciAgg ? redactRootsDeep(ciAgg.failures) : []
 // Round 2 L1 (AC-SEC-10): repoStats keys and ghStats repos are lane-supplied
@@ -650,9 +889,9 @@ const synthesisPrompt =
   `\n\n` +
   wrapAsData(dataNonce, 'ci-aggregate', { byJob: ciByJobSafe, citationPool: ciAgg ? ciAgg.citationPool : [], failures: ciAgg ? ciFailuresSafe : [] }) +
   `\n\n` +
-  wrapAsData(dataNonce, 'escaped-defect-heuristic', gitPerRepo.map((g, i) => (g.figures ? { ...g.figures, repo: flat(g.figures.repo), root_index: undefined } : { repo: flat(ledgerRepoLabel(i) || scope.resolved[i].label), count: null, method: 'unavailable' }))) +
+  wrapAsData(dataNonce, 'escaped-defect-heuristic', gitPerRepo.map((g, i) => (g.figures ? { ...g.figures, repo: flat(g.figures.repo), root_index: undefined } : { repo: flat(gitLabels[i]), count: null, method: 'unavailable' }))) +
   `\n\n` +
-  wrapAsData(dataNonce, 'plan-labels', scope.plan_labels) +
+  wrapAsData(dataNonce, 'plan-labels', planLabels) +
   `\n\n` +
   priorTargetsSection +
   `Draft a ranked list of proposed changes to the harness, the pipelines, or the process (never apply anything -- ` +
@@ -895,33 +1134,10 @@ for (const p of proposals) {
 }
 ranked.sort((a, b) => (b.n || 0) - (a.n || 0))
 
-// AC-DATA-10: stable proposal ids, derived from `target` (never wording),
-// computed in real script code (workflows/lib/optimise-read.mjs's sha256
-// helper, since this sandboxed script has no node:crypto).
-const idTargets = [...ranked, ...insufficientDataProposals].map((p) => p.target)
-let idResults = []
-// Round-4 Low-1 (spec bug): on an ids-step failure, idResults used to fall
-// back to [] with no signal beyond every proposal_id ending up null -- the
-// same silent-swallow shape AC-QA-7 forbids for the ledger write, and the
-// same discipline round-2 L3 already applied to report_write_error just
-// below this step. proposalIdsComputed surfaces it in the return AND the
-// log the same turn, so a §12 outcome annotation (prior_rejection_ts /
-// reverted_twice) that could not be looked up this run is distinguishable
-// from one that was looked up and found nothing.
-let proposalIdsComputed = true
-if (idTargets.length) {
-  const idResponse = await agent(
-    `Find optimise-read.mjs the same way the lanes above did. Pipe ${wrapAsData(dataNonce, 'proposal-targets', { targets: idTargets })} ` +
-    `(as literal JSON, {"targets": [...]}) into \`node <path> ids\` and return exactly what it printed.`,
-    { label: 'synthesis:ids', phase: 'Synthesis', effort: 'low', schema: { type: 'object', required: ['ids'], properties: { ids: { type: 'array', items: { type: 'object', required: ['target', 'proposal_id'], properties: { target: { type: 'object' }, proposal_id: { type: 'string' } } } } } } }
-  )
-  idResults = (idResponse && Array.isArray(idResponse.ids)) ? idResponse.ids : []
-  if (idResults.length < idTargets.length) {
-    proposalIdsComputed = false
-    log('proposal id computation failed: outcome annotations suppressed this run')
-  }
-}
-const idByIndex = idTargets.map((t, i) => (idResults[i] && idResults[i].proposal_id) || null)
+// AC-DATA-10, AC-SIMP-4: stable proposal ids, derived from `target` (never wording) by this script's own
+// stableProposalId (the proposal-id block above), the same value workflows/lib/optimise-read.mjs computes. No agent
+// step, so an id can never be missing: every target here already passed malformedTargetReason.
+const idByIndex = [...ranked, ...insufficientDataProposals].map((p) => stableProposalId(p.target))
 ranked.forEach((p, i) => { p.proposal_id = idByIndex[i] })
 insufficientDataProposals.forEach((p, i) => { p.proposal_id = idByIndex[ranked.length + i] })
 
@@ -954,10 +1170,10 @@ const rankedNew = ranked.filter((p) => !isAdoptedElsewhere(p))
 const previouslyAdopted = ranked.filter(isAdoptedElsewhere)
 
 // Round 2 F2 (AC-PROD-8): the ledger holds only ids, so the target a later run
-// shows the drafter comes from this per-run sidecar, written beside the report
-// under the same ensure-ignored check and read by optimise-read.mjs's ledger
-// command. A per-run output like the report (overwritten each run), not a cache
-// of gh or ledger reads. Redacted like everything else this step writes.
+// shows the drafter comes from this per-run sidecar, RETURNED beside the report
+// (the caller writes both) and read by optimise-read.mjs's ledger command. A
+// per-run output like the report (replaced each run), not a cache of gh or
+// ledger reads. Redacted like everything else this step returns.
 // Round 3 M2 (AC-PROD-8, AC-QA-20): seeded with every prior outcome target the
 // reader supplied this run, then overlaid with this run's proposals, so a
 // decided target survives cycles in which the drafter does not re-raise it.
@@ -975,14 +1191,18 @@ for (const p of [...ranked, ...insufficientDataProposals]) if (p.proposal_id) pr
 // optimise-read.mjs's own perRepo[].root is a derived, non-identifying
 // label after round-2's AC-SEC-3 fix, so a lookup keyed by the raw path
 // would never hit.
-const repoLabels = scope.resolved.map((r) => r.label)
 const reportMarkdown = buildReport({
-  reposLabel: scope.resolved.map((r) => r.label).join(', '),
-  unresolved: scope.unresolved,
+  reposLabel: repoLabels.join(', '),
+  unresolved,
   ledgerN, minRecords: MIN_RECORDS_FOR_PROPOSALS, ledgerSufficient,
   windowTruncated: ledgerAgg ? ledgerAgg.windowTruncated : null,
   ledgerLaneFailed: !ledgerAgg,
-  skipped: ledgerAgg ? ledgerAgg.skipped : [],
+  ledgerLaneReason: ledgerAgg ? null : lanes.ledger.reason,
+  ciLaneReason: ciAgg ? null : lanes.ci.reason,
+  ciRunLine: input.ciRunLine,
+  digestNotes: input.digestNotes,
+  neverFailingLeftOut,
+  skippedCount,
   perRepo: ledgerAgg ? ledgerAgg.perRepo : [],
   repoLabels,
   rework: ledgerAgg ? ledgerAgg.rework : null,
@@ -994,7 +1214,7 @@ const reportMarkdown = buildReport({
   ciFailures: ciAgg ? ciFailuresSafe : [],
   ciRepoStats: ciRepoStatsSafe,
   ciGhStats: ciGhStatsSafe,
-  escapedDefects: gitPerRepo.map((g, i) => ({ ...g, label: ledgerRepoLabel(i) || scope.resolved[i].label })),
+  escapedDefects: gitPerRepo.map((g, i) => ({ ...g, label: gitLabels[i] })),
   escapedDefectsUnmatched: gitUnmatched,
   draftedCount,
   droppedAlwaysOnSecurityCount: droppedAlwaysOnSecurity.length,
@@ -1047,58 +1267,9 @@ const reportMarkdown = buildReport({
   flatten: flat,
 })
 
-const reportWriteTarget = reportOut
-  ? `"${reportOut}" (an absolute path; its directory already exists, so create no directory; overwrite the file if it already exists)`
-  : `"${REPORT_RELATIVE_PATH}" at the CURRENT repo's root (create the .claude/ directory first if it does not exist; overwrite the file if it already exists)`
-const sidecarWriteTarget = sidecarOut
-  ? `"${sidecarOut}" (an absolute path; its directory already exists, so create no directory; overwrite it if it exists)`
-  : `"${roots[0]}/${PROPOSAL_TARGETS_RELATIVE_PATH}" (create its .claude/ directory first if needed; overwrite it if it exists)`
-const reportWrite = await agent(
-  `Before writing anything, ensure the report path is gitignored -- mirroring ledger-append.mjs's own discipline ` +
-  `(the SAME protection the ledger already has, which the report previously lacked despite documentation claiming ` +
-  `parity, review round-1 finding M1). Find this harness's optimise-report-ignore.mjs script the same way the ` +
-  `lanes above found optimise-read.mjs (global mirror, then any installed plugin, then this repo's own copy ONLY ` +
-  `if this repo is claude-ai-harness itself). From the CURRENT repo, first run exactly \`git rev-parse --show-toplevel\` ` +
-  `on its own and take its output, an absolute path, as <toplevel>. Then run exactly: \`node <path-to-optimise-report-ignore.mjs> ` +
-  `"<toplevel>" "${REPORT_RELATIVE_PATH}"\`, with <toplevel> written out as that literal absolute path inside the ` +
-  `double quotes -- never a \`$\`-parenthesis or backtick command substitution, which an unattended run's permission ` +
-  `rules cannot name and therefore refuse. It appends the path to ` +
-  `.git/info/exclude if not already present, then verifies with \`git check-ignore -q\`, printing {ignored, error}.\n` +
-  `If ignored is NOT true: do NOT write the report at all -- return written:false and error naming this reason ` +
-  `(e.g. "the report path is not gitignored: <the script's own error>"), and stop here.\n` +
-  `Then run the same script once more for the sidecar path, under the roster's FIRST repo root (round 3 M2: the reader ` +
-  `looks there first; the invoking repo need not be on the roster at all), exactly: \`node <path-to-optimise-report-ignore.mjs> ` +
-  `"${roots[0]}" "${PROPOSAL_TARGETS_RELATIVE_PATH}"\`. If ITS ignored is not true, do NOT write the ` +
-  `sidecar (still write the report) and say so in error.\n` +
-  `Only once ignored is true, write EXACTLY the content below, verbatim, to the file ${reportWriteTarget}. ` +
-  `Once the sidecar path is ignored, also write EXACTLY the second data block below, verbatim, to ` +
-  `${sidecarWriteTarget}. Apart from that sidecar, the report is the only file you may create or modify in this step. Do NOT run \`git add\`, ` +
-  `\`git commit\`, \`git push\`, any \`gh\` command with \`-X POST/PATCH/PUT/DELETE\`, or any other command that ` +
-  `changes repo or remote state.\n\n` +
-  wrapAsData(dataNonce, 'report-content-to-write-verbatim', reportMarkdown) +
-  `\n\n` + wrapAsData(dataNonce, 'proposal-targets-sidecar-to-write-verbatim', JSON.stringify(proposalTargetsSidecar)) +
-  `\n\nReturn written (boolean), path, and error (null on success).`,
-  {
-    label: 'report:write',
-    phase: 'Synthesis',
-    effort: 'low',
-    schema: { type: 'object', required: ['written', 'path', 'error'], properties: { written: { type: 'boolean' }, path: { type: 'string' }, error: { type: ['string', 'null'] } } },
-  }
-)
-// Round-2 L3 (spec bug, no AC): the report:write agent already returns a
-// reason on failure, but the workflow used to keep only the boolean and
-// silently drop it -- the exact swallowed-failure shape PR1's AC-QA-7
-// exists to forbid for the ledger write. Surfaced in the return AND
-// logged visibly in the same turn, never only one or the other.
-let reportWriteError = null
-if (!reportWrite) reportWriteError = 'report:write agent failed or returned no result'
-else if (!reportWrite.written) reportWriteError = reportWrite.error || 'report:write reported written:false with no reason given'
-if (reportWriteError) log(`Report write failed: ${reportWriteError}`)
-else if (reportWrite.error) log(`Report written; sidecar note: ${reportWrite.error}`)
-
 return {
-  resolved: scope.resolved,
-  unresolved: scope.unresolved,
+  resolved,
+  unresolved,
   ledger_sufficient: ledgerSufficient,
   ledger_n: ledgerN,
   // H1: the headline aggregates were computed and rendered into the report
@@ -1106,10 +1277,9 @@ return {
   // (rather than parsing the markdown) saw none of it.
   wall_clock: ledgerAgg ? ledgerAgg.wallClock : null,
   per_repo: ledgerAgg ? ledgerAgg.perRepo : [],
-  report_path: reportOut || REPORT_RELATIVE_PATH,
-  report_written: !!(reportWrite && reportWrite.written),
-  report_write_error: reportWriteError,
-  proposal_ids_computed: proposalIdsComputed,
+  // AC-ARCH-9: the report and the sidecar are RETURNED, never written here, and each lane says whether it ran.
+  proposal_targets: proposalTargetsSidecar,
+  lanes,
   proposals_ranked: rankedNew,
   proposals_previously_adopted: previouslyAdopted,
   proposals_insufficient_data: insufficientDataProposals,
@@ -1117,7 +1287,23 @@ return {
   __outcome: 'done',
 }
 
-} // end run()
+} // end analyse
+
+// The entry point for both paths: a digest (the runner's), or the attended agents; then one analysis.
+async function run() {
+  if (digestGiven) {
+    const refused = digestRefusal(opts.digest, opts.nonce)
+    if (refused) return refused
+    log('Optimising from the collected digest: no scope or lane agent runs.')
+  }
+  const input = digestGiven ? collectFromDigest(opts.digest, opts.nonce) : await collectFromAgents()
+  return input.stop || (await analyse(input))
+}
+
+// A lane's fixed reason as one bounded line (it is shown after "Not measured: ").
+function laneReasonLine(reason, flatten) {
+  return (flatten || ((v) => String(v).replace(/\s+/g, ' ').slice(0, 120)))(reason)
+}
 
 function fmtPct(n, d) {
   return d > 0 ? `${Math.round((n / d) * 100)}%` : 'n/a'
@@ -1150,11 +1336,13 @@ function buildReport(d) {
   // THIRD state, distinct from both, and must say so.
   if (d.ledgerLaneFailed) {
     lines.push('**Ledger analysis unavailable**: the ledger lane failed to run (e.g. optimise-read.mjs may not be resolvable yet -- see the rollout\'s global-mirror step). This is NOT the same as an empty ledger: a fixed install may already show real data.')
+    // AC-PROD-3: the lane's own reason, so the cause is named and the section says Not measured.
+    if (d.ledgerLaneReason) lines.push(`Not measured: ${laneReasonLine(d.ledgerLaneReason, d.flatten)}`)
   }
   lines.push(`Ledger records in window: ${d.ledgerN} (minimum for harness-side proposals: ${d.minRecords}).`)
   if (!d.ledgerSufficient) lines.push(`**Insufficient data**: harness-side (rework/wall-clock/trigger) proposals are suppressed until the ledger holds at least ${d.minRecords} records.`)
   if (d.windowTruncated) lines.push('Ledger window was truncated to the most recent records; older history was not read (AC-ARCH-14 bound).')
-  if (d.skipped && d.skipped.length) lines.push(`${d.skipped.length} ledger line(s) were skipped as unparseable or missing a required field; see raw skip reasons in the agent transcript.`)
+  if (d.skippedCount > 0) lines.push(`${d.skippedCount} ledger line(s) were skipped as unparseable or missing a required field; see raw skip reasons in the agent transcript.`)
   for (const entry of d.perRepo || []) {
     // Review round-1 M5 (SPEC BUG SB-1): perRepo[].root is now a DERIVED,
     // non-identifying label (round-2's AC-SEC-3 fix), not the raw absolute
@@ -1189,6 +1377,8 @@ function buildReport(d) {
       )
     }
   }
+  // AC-OPS-17: what the collected digest left out (empty on the attended path, which reads the full lane results).
+  lines.push(...(d.digestNotes || []))
   lines.push('Instrumented invocation routes: conducted runs and every direct invocation of the harness\'s other workflows write the ledger identically (AC-ARCH-4); conduct-plan wait/PR events are conductor-only.')
   // Review round-1 M2: runs excluded from byPlan (unattributable specs,
   // fully-degraded records, unattributable ci_wait/human_wait observations)
@@ -1453,7 +1643,7 @@ function buildReport(d) {
       const disagreements = a.verdict_disagreements === undefined ? '' : `, verdict_disagreements=${a.verdict_disagreements === null ? 'not measured' : a.verdict_disagreements}`
       lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}${disagreements}`)
     }
-  } else {
+  } else if (!(d.neverFailingLeftOut > 0)) {
     // H3 (round 3 review, AC-PROD-7): "None recorded." on its own reads
     // like "no data ever entered this window" -- indistinguishable from
     // "every value that could have populated this section was discarded".
@@ -1461,6 +1651,8 @@ function buildReport(d) {
     // zero here readable as a genuine zero.
     lines.push(`None recorded (invalid_ac_ids_dropped in window: ${fmtCountOrUnavailable(d.rework && d.rework.invalidAcIdsDropped)}).`)
   }
+  // AC-OPS-17: the digest carries only the rows that say something; the rest are counted, not listed.
+  if (d.neverFailingLeftOut > 0) lines.push(`${d.neverFailingLeftOut} criteria rows left out as insufficient data`)
   lines.push('')
 
   // Trigger accuracy (spec item 4).
@@ -1480,8 +1672,12 @@ function buildReport(d) {
   lines.push('## CI section (source: gh)')
   const ciFlat = d.flatten || ((v) => String(v).replace(/\s+/g, ' ').slice(0, 120))
   const ciNum = (x) => (Number.isFinite(+x) ? +x : 'n/a')
-  const jobKeys = Object.keys(d.ciByJob || {})
+  // Sorted, so the digest's own job order (failures first) and the lane's order print the same rows the same way.
+  const jobKeys = Object.keys(d.ciByJob || {}).sort((a, b) => a.localeCompare(b))
   if (!jobKeys.length && (!d.ciFailures || !d.ciFailures.length)) lines.push('No CI data available.')
+  if (d.ciLaneReason) lines.push(`Not measured: ${laneReasonLine(d.ciLaneReason, d.flatten)}`)
+  // AC-QA-2: the number of runs the collector fetched, did not fetch and timed out on (digest path only).
+  if (d.ciRunLine) lines.push(d.ciRunLine)
   for (const key of jobKeys) {
     const j = d.ciByJob[key]
     const qualifiers = []

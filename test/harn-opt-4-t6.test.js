@@ -106,11 +106,6 @@ function fixedTarget(overrides = {}) {
 function proposal(overrides = {}) {
   return { target: fixedTarget(), statement: 'Narrow a trigger glob', motivating_measurement: '3 of 5 runs were CLEAN (run-1..run-3)', confirming_measurement: 'accuracy improves', n: 6, citations: ['run-1'], reinstatement_evidence: null, ...overrides }
 }
-function extractTargets(prompt) {
-  const m = /<UNTRUSTED-DATA-([^\s>]+) label="proposal-targets">\n([\s\S]*?)\n<\/UNTRUSTED-DATA-\1>/.exec(prompt)
-  return m ? JSON.parse(m[2]).targets : []
-}
-const idsResponder = (prompt) => ({ ids: extractTargets(prompt).map((t, i) => ({ target: t, proposal_id: `id-${i}` })) })
 
 function responses(overrides = {}) {
   return {
@@ -119,8 +114,6 @@ function responses(overrides = {}) {
     'lane:ci': ciFixture(),
     'lane:git': gitResponder(goodPair()),
     'synthesis:proposals': { proposals: [] },
-    'synthesis:ids': idsResponder,
-    'report:write': { written: true, path: '.claude/optimise-cycle-report.md', error: null },
     ...overrides,
   }
 }
@@ -356,9 +349,9 @@ test('T6 target: a drafted target missing a key, or carrying an extra key, is re
   })
   assert.equal(result.proposals_ranked.length, 1)
   assert.equal(result.proposals_ranked[0].target.component, 'good-one')
-  assert.equal(result.proposals_ranked[0].proposal_id, 'id-0')
-  const idCall = calls.find((c) => c.opts.label === 'synthesis:ids')
-  assert.deepEqual(extractTargets(idCall.prompt).map((t) => t.component), ['good-one'], 'only the well-formed target reaches the id step')
+  assert.equal(result.proposals_ranked[0].proposal_id, reader.stableProposalId(fixedTarget({ component: 'good-one' })))
+  assert.deepEqual(Object.keys(result.proposal_targets), [reader.stableProposalId(fixedTarget({ component: 'good-one' }))], 'only the well-formed target is given an id and reaches the sidecar')
+  assert.ok(!calls.some((c) => c.opts.label === 'synthesis:ids'), 'no ids agent exists: the script computes the ids')
   const at = result.report.indexOf('Proposals rejected: malformed target')
   assert.ok(at >= 0, `report lists the rejection:\n${result.report}`)
   // Round 2 F6 (AC-QA-20): `at` is the index of the very string searched for, so
@@ -372,13 +365,13 @@ test('T6 target: a drafted target missing a key, or carrying an extra key, is re
   assert.match(tail, /segment/, 'names the extra key')
 })
 
-test('T6 target: when every drafted target is malformed no id step runs, and an extra key cannot smuggle a security signal past the gates (AC-QA-20, AC-SEC-9)', async () => {
+test('T6 target: when every drafted target is malformed no id is minted and nothing reaches the sidecar, and an extra key cannot smuggle a security signal past the gates (AC-QA-20, AC-SEC-9)', async () => {
   const smuggle = { ...fixedTarget(), note: 'gitleaks secret scanning' }
-  const { result, calls } = await run({
+  const { result } = await run({
     'synthesis:proposals': { __bypassSchemaValidation: true, proposals: [proposal({ target: smuggle, statement: 'Move the nightly job to post-merge', reinstatement_evidence: 'reinstate on failure' })] },
   })
   assert.equal(result.proposals_ranked.length, 0)
-  assert.equal(calls.filter((c) => c.opts.label === 'synthesis:ids').length, 0)
+  assert.deepEqual(result.proposal_targets, {}, 'no id was minted for a malformed target')
   assert.match(result.report, /Proposals rejected: malformed target/)
 })
 
@@ -588,9 +581,8 @@ test('T6 scope: no install-consistency check in optimise-cycle.js, no new workfl
   const src = fs.readFileSync(WORKFLOW, 'utf8')
   assert.ok(!/install[-_ ]consistency|allow_inconsistent_install|checkInstall/i.test(src), 'T6 declined the install-consistency check')
   const argNames = [...new Set([...src.matchAll(/\bopts\.([A-Za-z_]+)/g)].map((m) => m[1]))].sort()
-  // T11 (owner-approved): report_path and proposal_targets_path let the
-  // unattended weekly runner write its outputs outside .claude/.
-  assert.deepEqual(argNames, ['proposal_targets_path', 'report_path', 'repos', 'window'], 'no new workflow argument beyond the two T11 output paths')
+  // HARN-RUNNER-2 T2 (AC-SIMP-5): the output paths are gone; the collected digest and the runner's nonce came in.
+  assert.deepEqual(argNames, ['digest', 'nonce', 'repos', 'window'], 'no workflow argument beyond the digest and the runner nonce')
   const readerSrc = fs.readFileSync(MODULE_PATH, 'utf8')
   assert.ok(!/child_process|execSync|execFileSync|spawnSync|\bspawn\(/.test(readerSrc), 'reader functions run no subprocess')
 })
@@ -598,9 +590,6 @@ test('T6 scope: no install-consistency check in optimise-cycle.js, no new workfl
 // ==== review round 1 fixes (PR #9): F1 to F6 ====
 
 const outcome = (overrides = {}) => ({ adoptedCount: 0, rejectedCount: 0, revertedCount: 0, lastRejectionTs: null, lastAdoptionTs: null, revertedTwiceOrMore: false, ...overrides })
-// An ids step that returns the REAL derived id for each target, so a ledger
-// fixture keyed by stableProposalId(target) is found by the annotation.
-const realIdsResponder = (prompt) => ({ ids: extractTargets(prompt).map((t) => ({ target: t, proposal_id: reader.stableProposalId(t) })) })
 function rankedSection(report) {
   const start = report.indexOf('## Proposals (ranked)')
   assert.ok(start >= 0, 'report has the ranked proposals section')
@@ -633,7 +622,6 @@ test('T6 round 1 F1: a re-proposed target whose id already has a proposal_adopte
   const { result } = await run({
     'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: '2026-09-01T00:00:00.000Z' }) } },
     'synthesis:proposals': { proposals: [proposal({ target: adopted, statement: 'Narrow the lens-operability trigger glob' }), proposal({ target: fresh, statement: 'Silence the noisy note' })] },
-    'synthesis:ids': realIdsResponder,
   })
   assert.match(result.report, /Already adopted on 2026-09-01T00:00:00\.000Z/)
   assert.match(result.report, /^## Proposals previously adopted \(not ranked as new\)$/m)
@@ -801,7 +789,6 @@ test('T6 round 2 F1: an adopted security-purposed removal stays in the ranked li
   const { result } = await run({
     'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS }) } },
     'synthesis:proposals': { proposals: [proposal({ target, statement: 'our-custom-vuln-scanner is noisy lately', reinstatement_evidence: 'reinstate on any new CVE class' })] },
-    'synthesis:ids': realIdsResponder,
   })
   assert.equal(result.proposals_ranked.length, 1, 'a security-flagged proposal is never moved out of the ranked list')
   assert.equal(result.proposals_ranked[0].category, 'security_removal_flagged')
@@ -820,7 +807,6 @@ test('T6 round 2 F1: a proposal adopted and reverted twice stays in the ranked l
   const { result } = await run({
     'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 2, lastAdoptionTs: ADOPTED_TS, revertedCount: 2, revertedTwiceOrMore: true }) } },
     'synthesis:proposals': { proposals: [proposal({ target, statement: 'Narrow the lens-operability trigger glob' })] },
-    'synthesis:ids': realIdsResponder,
   })
   assert.equal(result.proposals_ranked.length, 1, 'reverted twice is never moved out of the ranked list')
   assert.equal(result.proposals_previously_adopted.length, 0)
@@ -835,7 +821,6 @@ test('T6 round 2 F1: the previously-adopted section carries the same annotations
   const { result } = await run({
     'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS, rejectedCount: 1, lastRejectionTs: REJECTED_TS }) } },
     'synthesis:proposals': { proposals: [proposal({ target, statement: 'Narrow the lens-operability trigger glob', reinstatement_evidence: 'keep the glob broad on revert' })] },
-    'synthesis:ids': realIdsResponder,
   })
   assert.equal(result.proposals_previously_adopted.length, 1, 'precondition: an ordinary adopted proposal does move')
   const sec = sectionOf(result.report, ADOPTED_HEADING)
@@ -850,7 +835,6 @@ test('T6 round 2 F1: an insufficient-data proposal with a prior adoption and a p
   const { result } = await run({
     'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS, rejectedCount: 1, lastRejectionTs: REJECTED_TS }) } },
     'synthesis:proposals': { proposals: [proposal({ target, statement: 'Silence the thin-evidence note', n: 2 })] },
-    'synthesis:ids': realIdsResponder,
   })
   assert.equal(result.proposals_insufficient_data.length, 1, 'precondition: the proposal is in the insufficient-data list')
   const sec = sectionOf(result.report, INSUFFICIENT_HEADING)
@@ -872,7 +856,6 @@ test('T6 round 2 F7: every proposal shows its six identity fields on one exact "
       proposal({ target: adopted, statement: 'Narrow the lens-operability trigger glob' }),
       proposal({ target: thin, statement: 'Look at the test job duration', n: 2 }),
     ] },
-    'synthesis:ids': realIdsResponder,
   })
   assert.ok(rankedSection(result.report).split('\n').includes('Target: kind=ci_note component=fresh-thing concern=noise lens= workflow= job='), `ranked:\n${rankedSection(result.report)}`)
   assert.ok(sectionOf(result.report, ADOPTED_HEADING).split('\n').includes('Target: kind=trigger_tune component=lens-operability concern=trigger glob lens=lens-operability workflow= job='))
@@ -891,21 +874,15 @@ test('T6 round 2 F7: the target line is flattened, bounded and redacted: a newli
 
 // ---- F2 (AC-PROD-8): the sidecar the optimiser writes beside its report ----
 
-test('T6 round 2 F2: the report:write step is handed a sidecar mapping every proposal id computed this run (ranked, previously adopted, insufficient-data) to its fixed-key target, under the same ensure-ignored step (AC-PROD-8)', async () => {
+test('T6 round 2 F2: the result carries a sidecar mapping every proposal id computed this run (ranked, previously adopted, insufficient-data) to its fixed-key target (AC-PROD-8)', async () => {
   const fresh = fixedTarget({ kind: 'ci_note', component: 'fresh-thing', concern: 'noise' })
   const adopted = fixedTarget({ kind: 'trigger_tune', component: 'lens-operability', concern: 'trigger glob', lens: 'lens-operability' })
   const thin = fixedTarget({ kind: 'ci_note', component: 'thin-thing', concern: 'noise' })
-  const { calls } = await run({
+  const { result } = await run({
     'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [reader.stableProposalId(adopted)]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS }) } },
     'synthesis:proposals': { proposals: [proposal({ target: fresh }), proposal({ target: adopted }), proposal({ target: thin, n: 2 })] },
-    'synthesis:ids': realIdsResponder,
   })
-  const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
-  assert.ok(prompt.includes('.claude/optimise-proposal-targets.json'), 'the step is told the sidecar path')
-  assert.ok(prompt.includes('optimise-report-ignore.mjs'), 'the existing ensure-ignored script is the guard')
-  const block = extractBlock(prompt, 'proposal-targets-sidecar-to-write-verbatim')
-  assert.ok(block, 'the sidecar content is its own nonce-wrapped data block')
-  assert.deepEqual(JSON.parse(block), {
+  assert.deepEqual(result.proposal_targets, {
     [reader.stableProposalId(fresh)]: fresh,
     [reader.stableProposalId(adopted)]: adopted,
     [reader.stableProposalId(thin)]: thin,
@@ -914,9 +891,9 @@ test('T6 round 2 F2: the report:write step is handed a sidecar mapping every pro
 
 test('T6 round 2 F2: the sidecar is redacted like everything else the optimiser writes: a roster root in a target value never reaches it (AC-SEC-10)', async () => {
   const target = fixedTarget({ kind: 'ci_note', component: `uses ${ALPHA}/sub`, concern: 'noise' })
-  const { calls } = await run({ 'synthesis:proposals': { proposals: [proposal({ target })] }, 'synthesis:ids': realIdsResponder })
-  const block = extractBlock(calls.find((c) => c.opts.label === 'report:write').prompt, 'proposal-targets-sidecar-to-write-verbatim')
-  assert.ok(block, 'precondition: the sidecar block exists')
+  const { result } = await run({ 'synthesis:proposals': { proposals: [proposal({ target })] } })
+  const block = JSON.stringify(result.proposal_targets)
+  assert.ok(Object.keys(result.proposal_targets).length === 1, 'precondition: the sidecar has the proposal')
   assert.ok(!block.includes(ALPHA))
 })
 
@@ -1049,17 +1026,9 @@ test('T6 round 3 M2: the sidecar the run writes is seeded with every prior outco
   const id = reader.stableProposalId(decided)
   const repo = repoWithOutcomes([[id, 'proposal_adopted']], { [id]: decided })
   const real = runCli('ledger', {}, [repo]).out
-  const { calls } = await run({ 'lane:ledger': { ...ledgerFixture(), proposalOutcomes: real.proposalOutcomes }, 'synthesis:proposals': { proposals: [] } })
-  const sidecar = JSON.parse(extractBlock(calls.find((c) => c.opts.label === 'report:write').prompt, 'proposal-targets-sidecar-to-write-verbatim'))
+  const { result } = await run({ 'lane:ledger': { ...ledgerFixture(), proposalOutcomes: real.proposalOutcomes }, 'synthesis:proposals': { proposals: [] } })
+  const sidecar = result.proposal_targets
   assert.deepEqual(sidecar[id], decided, `the decided target is carried forward with the full fixed key set:\n${JSON.stringify(sidecar)}`)
-})
-
-test("T6 round 3 M2: the sidecar is written under the roster's first repo root, where the reader looks first, not under whichever repo the cycle was invoked from (AC-PROD-8)", async () => {
-  const { calls } = await run()
-  const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
-  assert.ok(prompt.includes(`"${ALPHA}" ".claude/optimise-proposal-targets.json"`), `the ensure-ignored check for the sidecar names roster root 1:\n${prompt.slice(0, 2500)}`)
-  assert.ok(prompt.includes(`${ALPHA}/.claude/optimise-proposal-targets.json`), 'the write target is the sidecar path under roster root 1')
-  assert.ok(prompt.includes('"<toplevel>" ".claude/optimise-cycle-report.md"'), 'the report still goes to the current repo')
 })
 
 test('T6 round 3 L1: a ledger label that is a roster root path is redacted in the escaped-defect header, not printed (AC-SEC-10)', async () => {

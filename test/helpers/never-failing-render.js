@@ -35,8 +35,6 @@ const responses = (neverFailingAcs) => ({
   'lane:ci': ciLane,
   'lane:git': gitLane,
   'synthesis:proposals': { proposals: [] },
-  'synthesis:ids': { ids: [] },
-  'report:write': { written: true, path: '.claude/optimise-cycle-report.md', error: null },
 })
 
 // The report's line for each row, in row order (a row's repo/spec/criterion must be unique in the table).

@@ -6,6 +6,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
+const { pathToFileURL } = require('node:url')
 const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { makeTempRepo, runAppend, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
@@ -14,13 +15,18 @@ const OPTIMISE_READ_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optim
 
 test.after(cleanupTempRepos)
 
+// HARN-RUNNER-2 T2: the workflow computes proposal ids itself (no ids agent), so the ids a test expects are the
+// reader's own, from the same target.
+let reader = null
+test.before(async () => { reader = await import(pathToFileURL(OPTIMISE_READ_PATH).href) })
+const idOf = (t) => reader.stableProposalId(t)
+
 // Round-2 M3: a fixed, known nonce for fixtures. In production this comes
 // from a Bash-generated random token (openssl rand -hex 16 or equivalent)
 // returned by the scope agent step -- workflow scripts cannot generate
 // their own randomness (Math.random() is statically rejected), so this is
 // the one place it can originate. Tests use a fixed value so assertions
-// are deterministic; extractTargets() below still finds it DYNAMICALLY
-// from the prompt, the same way a real ids-computing agent would have to.
+// are deterministic.
 const TEST_NONCE = 'deadbeefcafef00d0123456789abcdef01'
 
 function scopeFixture(overrides = {}) {
@@ -107,27 +113,6 @@ function proposalLegacy(overrides = {}) {
   return { target: { category: 'trigger_tune', lens: 'lens-operability' }, statement: 'Narrow the lens-operability trigger glob', motivating_measurement: '3 of 5 runs were CLEAN with zero trigger matches (run-1..run-3)', confirming_measurement: 'trigger accuracy improves next cycle', n: 6, citations: ['run-1'], reinstatement_evidence: null, ...overrides }
 }
 
-// Extracts the {"targets": [...]} payload embedded by the workflow's own
-// wrapAsData() helper into the synthesis:ids prompt, so the scripted
-// response can mint one id per target WITHOUT hardcoding a count -- the
-// same technique a real ids-computing agent would use (read the data
-// block, act on exactly what's there).
-// Round-2 M3: the tag now carries a per-run nonce (UNTRUSTED-DATA-<nonce>),
-// so extraction must find whatever nonce was actually used, with the
-// opening and closing tags matched via backreference -- exactly the
-// technique a real ids-computing agent has to use, since it cannot
-// hardcode the tag name either.
-function extractTargets(prompt) {
-  const m = /<UNTRUSTED-DATA-([^\s>]+) label="proposal-targets">\n([\s\S]*?)\n<\/UNTRUSTED-DATA-\1>/.exec(prompt)
-  if (!m) return []
-  const parsed = JSON.parse(m[2])
-  return parsed.targets
-}
-function idsResponder(prompt) {
-  const targets = extractTargets(prompt)
-  return { ids: targets.map((t, i) => ({ target: t, proposal_id: `id-${i}` })) }
-}
-
 function baseResponses(overrides = {}) {
   return {
     'scope:repos': scopeFixture(),
@@ -135,8 +120,6 @@ function baseResponses(overrides = {}) {
     'lane:ci': ciFixture(),
     'lane:git': gitFixture(),
     'synthesis:proposals': { proposals: [proposal()] },
-    'synthesis:ids': idsResponder,
-    'report:write': { written: true, path: '.claude/optimise-cycle-report.md', error: null },
     ...overrides,
   }
 }
@@ -155,15 +138,15 @@ test('optimise-cycle: happy path returns ranked proposals, writes the report, an
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
   assert.equal(result.ledger_sufficient, true)
   assert.equal(result.ledger_n, 6)
-  assert.equal(result.report_written, true)
-  assert.equal(result.report_path, '.claude/optimise-cycle-report.md')
+  assert.equal(typeof result.report, 'string')
+  assert.equal(typeof result.proposal_targets, 'object', 'the sidecar is returned, not written')
   assert.equal(result.proposals_ranked.length, 1)
-  assert.equal(result.proposals_ranked[0].proposal_id, 'id-0')
+  assert.equal(result.proposals_ranked[0].proposal_id, idOf(proposal().target))
   assert.ok(result.report.includes('Delivery optimiser report'))
   // Round-4 Low-1: the happy path must NOT report suppression -- proven
   // alongside the failure-path tests below so the guard cannot be
   // satisfied by simply always returning false.
-  assert.equal(result.proposal_ids_computed, true)
+  assert.ok(!('proposal_ids_computed' in result), 'the ids are computed in the script and cannot fail')
 })
 
 // ---- AC-2/AC-4: the escaped-defect counter-metric section renders BOTH the raw and the scoped figure, clearly labelled, and never silently drops the scoped one ----
@@ -1171,7 +1154,7 @@ test('optimise-cycle: all four gh failure modes are surfaced in the report witho
     'synthesis:proposals': { proposals: [proposal({ target: { category: 'ci_demote', job: 'flaky' }, citations: ['nonexistent-gh-id'], reinstatement_evidence: 'n/a' })] },
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  assert.equal(result.report_written, true, 'a run must complete and still write a report despite every gh failure mode')
+  assert.ok(result.report.startsWith('# Delivery optimiser report'), 'a run must complete and still return a report despite every gh failure mode')
   for (const f of failures) assert.ok(result.report.includes(f.mode), `report must mention gh failure mode "${f.mode}"`)
   assert.equal(result.proposals_ranked.length, 0, 'no proposal whose only citation is a gh id may survive when gh itself failed for every repo')
 })
@@ -1716,7 +1699,7 @@ test('optimise-cycle: the same gitleaks removal with no reinstatement_evidence i
 
 test('optimise-cycle: a proposal whose target matches a prior proposal_rejected event is annotated with the rejection date, not silently re-raised (M7)', async () => {
   const responses = baseResponses({
-    'lane:ledger': ledgerFixture({ proposalOutcomes: { 'id-0': { adoptedCount: 0, rejectedCount: 1, revertedCount: 0, lastRejectionTs: '2026-07-01T00:00:00.000Z', revertedTwiceOrMore: false } } }),
+    'lane:ledger': ledgerFixture({ proposalOutcomes: { [idOf(proposal().target)]: { adoptedCount: 0, rejectedCount: 1, revertedCount: 0, lastRejectionTs: '2026-07-01T00:00:00.000Z', revertedTwiceOrMore: false } } }),
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 1)
@@ -1726,7 +1709,7 @@ test('optimise-cycle: a proposal whose target matches a prior proposal_rejected 
 
 test('optimise-cycle: a proposal whose target matches a proposal_reverted at least twice is flagged reverted_twice (M7, §12)', async () => {
   const responses = baseResponses({
-    'lane:ledger': ledgerFixture({ proposalOutcomes: { 'id-0': { adoptedCount: 1, rejectedCount: 0, revertedCount: 2, lastRejectionTs: null, revertedTwiceOrMore: true } } }),
+    'lane:ledger': ledgerFixture({ proposalOutcomes: { [idOf(proposal().target)]: { adoptedCount: 1, rejectedCount: 0, revertedCount: 2, lastRejectionTs: null, revertedTwiceOrMore: true } } }),
   })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked[0].reverted_twice, true)
@@ -1737,82 +1720,6 @@ test('optimise-cycle: a proposal with no recorded outcome events is not annotate
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
   assert.equal(result.proposals_ranked[0].prior_rejection_ts, undefined)
   assert.equal(result.proposals_ranked[0].reverted_twice, undefined)
-})
-
-// ---- Review round-4 Low-1 (spec bug): a synthesis:ids step failure must not silently disable §12 outcome annotation ----
-
-test('optimise-cycle: when the synthesis:ids agent call fails entirely (stopped/undefined response), proposal_ids_computed is reported false and the suppression is logged, not just silently absent from the annotation (round-4 Low-1)', async () => {
-  const responses = baseResponses({
-    'lane:ledger': ledgerFixture({ proposalOutcomes: { 'id-0': { adoptedCount: 1, rejectedCount: 0, revertedCount: 2, lastRejectionTs: null, revertedTwiceOrMore: true } } }),
-  })
-  delete responses['synthesis:ids'] // undefined response: the ids agent failed/was stopped, same convention as the ledger-lane and report:write failure tests above
-  const { result, logs } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  assert.equal(result.proposal_ids_computed, false)
-  assert.equal(result.proposals_ranked[0].proposal_id, null)
-  // The reverted-twice flag is exactly what silently fails to attach on an
-  // ids-step failure -- proposalOutcomes is keyed by proposal_id, and every
-  // id is null here, so the lookup can never hit.
-  assert.equal(result.proposals_ranked[0].reverted_twice, undefined)
-  assert.ok(logs.some((l) => l.includes('outcome annotations suppressed')), 'the suppression must be logged visibly in the same turn, never swallowed')
-})
-
-test('optimise-cycle: when the synthesis:ids agent returns fewer ids than targets (a partial/malformed response), proposal_ids_computed is still reported false (round-4 Low-1)', async () => {
-  const responses = baseResponses({
-    'synthesis:proposals': { proposals: [proposal({ target: { category: 'trigger_tune', lens: 'lens-operability' }, statement: 'Narrow the lens-operability trigger glob (proposal A)', citations: ['run-1'] }), proposal({ target: { category: 'trigger_tune', lens: 'lens-design' }, statement: 'Narrow the lens-design trigger glob (proposal B)', citations: ['run-2'] })] },
-    'synthesis:ids': (prompt) => { const targets = extractTargets(prompt); return { ids: targets.slice(0, 1).map((t, i) => ({ target: t, proposal_id: `id-${i}` })) } },
-  })
-  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  assert.equal(result.proposal_ids_computed, false)
-})
-
-// ---- Report persistence (AC-PROD-5) and no-mutation instruction (AC-SEC-9) ----
-
-test('optimise-cycle: the report:write step is instructed to write only the documented report path, and never to run a mutating git/gh command', async () => {
-  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  const writeCall = calls.find((c) => c.opts.label === 'report:write')
-  assert.ok(writeCall, 'expected a report:write agent step')
-  assert.ok(writeCall.prompt.includes('.claude/optimise-cycle-report.md'))
-  assert.ok(/only file you may create or modify/i.test(writeCall.prompt))
-  assert.ok(/git commit|git push/.test(writeCall.prompt) && /do not/i.test(writeCall.prompt), 'must explicitly instruct against git commit/push')
-})
-
-test('optimise-cycle: if the report:write step fails, the run still completes and reports report_written:false rather than throwing', async () => {
-  const responses = baseResponses({ 'report:write': { written: false, path: '.claude/optimise-cycle-report.md', error: 'disk full' } })
-  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  assert.equal(result.report_written, false)
-})
-
-// ---- Review round-2 L3 (spec bug, no AC): the report-write refusal reason must not be swallowed ----
-
-test('optimise-cycle: when report:write fails, its error reason reaches the return (report_write_error) and is logged visibly in the same turn -- matching PR1\'s AC-QA-7 ledger-write-failure discipline (round-2 L3)', async () => {
-  const responses = baseResponses({ 'report:write': { written: false, path: '.claude/optimise-cycle-report.md', error: 'the report path is not gitignored: a tracked .gitignore re-includes it with a negation pattern' } })
-  const { result, logs } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  assert.equal(result.report_write_error, 'the report path is not gitignored: a tracked .gitignore re-includes it with a negation pattern')
-  assert.ok(logs.some((l) => l.includes('negation pattern')), 'the failure reason must be logged visibly in the same turn, never swallowed')
-})
-
-test('optimise-cycle: report_write_error is null (not merely falsy/absent) when the write succeeds', async () => {
-  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  assert.equal(result.report_write_error, null)
-})
-
-test('optimise-cycle: report_write_error names the failure even when the report:write agent call itself returns nothing (a stopped/undefined response, not just a written:false result)', async () => {
-  const responses = baseResponses()
-  delete responses['report:write'] // undefined response, same as a stopped agent
-  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  assert.equal(result.report_written, false)
-  assert.match(result.report_write_error, /failed|no result/i)
-})
-
-// ---- Review round-1 M1 (AC-SEC-9): the report must be gitignored before writing, mirroring ledger-append.mjs ----
-
-test('optimise-cycle: the report:write step is instructed to ensure the report path is gitignored (via optimise-report-ignore.mjs, mirroring ledger-append.mjs\'s ensureGitignored + check-ignore discipline) BEFORE writing, and to skip the write entirely if it is not (M1)', async () => {
-  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  const writeCall = calls.find((c) => c.opts.label === 'report:write')
-  assert.ok(writeCall, 'expected a report:write agent step')
-  assert.ok(/optimise-report-ignore\.mjs/.test(writeCall.prompt), 'must instruct locating and running the ignore-ensure helper')
-  assert.ok(/check-ignore/.test(writeCall.prompt), 'must instruct verifying with git check-ignore, not just appending to .git/info/exclude and trusting it')
-  assert.ok(/do not write|skip the write|not.*ignored/i.test(writeCall.prompt), 'must instruct refusing to write when the ignore check fails')
 })
 
 // ---- AC-ARCH-14: bounded prompt even with a large aggregate ----
@@ -2158,55 +2065,16 @@ test('optimise-cycle (HARN-OPT-4 T5, round 2 L5): SKILL.md softens the later-don
   assert.ok(!/is the likely re-briefed case/.test(skill), 'the confident "likely re-briefed" claim must go')
 })
 
-// ---- T11: optional output paths for a caller that may not write under .claude/ ----
+// ---- T11 (kept parts): no command substitution, and the CI lane never offers gh --repo ----
+// The report-path arguments, the report:write step and its ignore helper are gone (HARN-RUNNER-2 T2, AC-ARCH-9,
+// AC-SIMP-5): the workflow returns the report and the sidecar and writes nothing.
 
-const WRITE_SENTENCE_DEFAULT = 'to the file ".claude/optimise-cycle-report.md" at the CURRENT repo\'s root (create the .claude/ directory first if it does not exist; overwrite the file if it already exists). Once the sidecar path is ignored, also write EXACTLY the second data block below, verbatim, to "/repo/.claude/optimise-proposal-targets.json" (create its .claude/ directory first if needed; overwrite it if it exists). Apart from that sidecar,'
-
-test('optimise-cycle (T11): with no output-path arguments the report:write instruction is byte-for-byte the documented default, and report_path is the default', async () => {
-  const { calls, result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  const writeCall = calls.find((c) => c.opts.label === 'report:write')
-  assert.ok(writeCall.prompt.includes(WRITE_SENTENCE_DEFAULT), 'the default write instruction must be unchanged')
-  assert.equal(result.report_path, '.claude/optimise-cycle-report.md')
-})
-
-test('optimise-cycle (T11): given report_path and proposal_targets_path, the write instructions name those paths and no longer tell the agent to write under .claude/, while the ignore step still covers the final .claude/ locations', async () => {
-  const args = { report_path: '/scratch/runner/report.md', proposal_targets_path: '/scratch/runner/targets.json' }
-  const { calls, result } = await runWorkflow(WORKFLOW, { args, agent: baseResponses() })
-  const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
-  assert.ok(prompt.includes('to the file "/scratch/runner/report.md"'), prompt)
-  assert.ok(prompt.includes('to "/scratch/runner/targets.json"'), prompt)
-  assert.ok(!prompt.includes('to the file ".claude/optimise-cycle-report.md"'), 'no instruction to write the default report path')
-  assert.ok(!prompt.includes('"/repo/.claude/optimise-proposal-targets.json" (create'), 'no instruction to write the default sidecar path')
-  assert.ok(prompt.includes('"<toplevel>" ".claude/optimise-cycle-report.md"'), 'the report is still ignored at its final location')
-  assert.ok(prompt.includes('"/repo" ".claude/optimise-proposal-targets.json"'), 'the sidecar is still ignored at its final location')
-  assert.equal(result.report_path, '/scratch/runner/report.md')
-})
-
-// T11 escalation (real headless probe): the weekly runner's permission rules
-// cannot name a command substitution (the CLI discards any rule holding
-// "$(git rev-parse --show-toplevel)"), so no command the workflow tells the
-// session to run may contain one; the agent runs the inner command on its own
-// and passes its output as a double-quoted literal.
-for (const [why, args] of [['default arguments', {}], ['the weekly runner\'s output paths', { report_path: '/scratch/runner/report.md', proposal_targets_path: '/scratch/runner/targets.json' }]]) {
-  test(`optimise-cycle (T11 escalation): with ${why}, no agent prompt asks for a $( command substitution`, async () => {
-    const { calls } = await runWorkflow(WORKFLOW, { args, agent: baseResponses() })
-    assert.ok(calls.length >= 5, 'guard against vacuity: the run reached its agent steps')
-    assert.ok(calls.some((c) => c.opts.label === 'report:write'), 'guard against vacuity: the report:write step ran')
-    for (const c of calls) {
-      assert.ok(!c.prompt.includes('$('), `${c.opts.label} asks for a command substitution:\n${c.prompt.slice(Math.max(0, c.prompt.indexOf('$(') - 200), c.prompt.indexOf('$(') + 200)}`)
-    }
-  })
-}
-
-test('optimise-cycle (T11 escalation): report:write runs git rev-parse --show-toplevel on its own first, passes that absolute path to the helper as a double-quoted literal, and still writes nothing unless the helper says ignored', async () => {
-  const { calls } = await runWorkflow(WORKFLOW, { args: { report_path: '/scratch/runner/report.md' }, agent: baseResponses() })
-  const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
-  const first = prompt.indexOf('`git rev-parse --show-toplevel` on its own')
-  const helper = prompt.indexOf('`node <path-to-optimise-report-ignore.mjs> "<toplevel>" ".claude/optimise-cycle-report.md"`')
-  assert.ok(first >= 0, `the agent must run rev-parse on its own:\n${prompt.slice(0, 1500)}`)
-  assert.ok(helper > first, 'and only then the helper, with <toplevel> as its first argument')
-  assert.match(prompt, /<toplevel> written out as that literal absolute path/, 'the placeholder is filled with the literal path, never a substitution')
-  assert.match(prompt, /If ignored is NOT true: do NOT write the report at all/, 'fail closed: no write unless ignored')
+test('optimise-cycle (T11 escalation): no agent prompt asks for a $( command substitution', async () => {
+  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
+  assert.ok(calls.length >= 5, 'guard against vacuity: the run reached its agent steps')
+  for (const c of calls) {
+    assert.ok(!c.prompt.includes('$('), `${c.opts.label} asks for a command substitution:\n${c.prompt.slice(Math.max(0, c.prompt.indexOf('$(') - 200), c.prompt.indexOf('$(') + 200)}`)
+  }
 })
 
 test('optimise-cycle (T11 escalation): the CI lane no longer offers gh --repo, which the weekly runner denies; gh runs from inside each repo root', async () => {
@@ -2225,33 +2093,3 @@ test('optimise-cycle (T11 escalation, static): SKILL.md asks for no $( command s
   assert.ok(!skill.includes('$('), 'SKILL.md must not instruct a command substitution')
 })
 
-test('optimise-cycle (T11): overriding only the report leaves the sidecar instruction at its default', async () => {
-  const { calls } = await runWorkflow(WORKFLOW, { args: { report_path: '/scratch/runner/report.md' }, agent: baseResponses() })
-  const prompt = calls.find((c) => c.opts.label === 'report:write').prompt
-  assert.ok(prompt.includes('to the file "/scratch/runner/report.md"'))
-  assert.ok(prompt.includes('"/repo/.claude/optimise-proposal-targets.json" (create its .claude/ directory first if needed'))
-})
-
-for (const [why, bad] of [
-  ['relative', 'runner/report.md'],
-  ['a .. segment', '/scratch/../etc/report.md'],
-  ['a . segment', '/scratch/./report.md'],
-  ['a .claude segment', '/repo/.claude/report.md'],
-  ['a space', '/scratch dir/report.md'],
-  ['a shell metacharacter', '/scratch/$(x)/report.md'],
-  ['an empty string', ''],
-  ['a non-string', 5],
-]) {
-  test(`optimise-cycle (T11): a report_path that is ${why} stops the run before any agent step`, async () => {
-    const { calls, result } = await runWorkflow(WORKFLOW, { args: { report_path: bad }, agent: baseResponses() })
-    assert.equal(calls.length, 0, 'no agent may run')
-    assert.match(result.report, /Refusing to proceed: report_path must be a plain absolute path/)
-  })
-}
-
-test('optimise-cycle (T11): a bad proposal_targets_path stops the run too, naming it', async () => {
-  const { calls, result } = await runWorkflow(WORKFLOW, { args: { report_path: '/scratch/r.md', proposal_targets_path: '/x/.claude/t.json' }, agent: baseResponses() })
-  assert.equal(calls.length, 0)
-  assert.match(result.report, /proposal_targets_path must be a plain absolute path/)
-  assert.ok(!/report_path and/.test(result.report), 'only the bad one is named')
-})

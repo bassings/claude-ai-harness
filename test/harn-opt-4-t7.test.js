@@ -519,8 +519,7 @@ const ciLane = (rows, extra = {}) => ({ byJob: Object.fromEntries(rows.map((r) =
 function responses(overrides = {}) {
   return {
     'scope:repos': scope, 'lane:ledger': ledger, 'lane:ci': ciLane([jobRow()]), 'lane:git': gitOk,
-    'synthesis:proposals': { proposals: [] }, 'synthesis:ids': { ids: [] },
-    'report:write': { written: true, path: '.claude/optimise-cycle-report.md', error: null },
+    'synthesis:proposals': { proposals: [] },
     ...overrides,
   }
 }
