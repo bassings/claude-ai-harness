@@ -7,7 +7,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
-const { runWorkflow } = require('./helpers/fake-runtime.js')
+const { runWorkflow } = require('./helpers/digest-run.js')
 const { makeTempRepo, runAppend, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
 const WORKFLOW = path.join(__dirname, '..', 'workflows', 'optimise-cycle.js')
@@ -21,13 +21,9 @@ let reader = null
 test.before(async () => { reader = await import(pathToFileURL(OPTIMISE_READ_PATH).href) })
 const idOf = (t) => reader.stableProposalId(t)
 
-// Round-2 M3: a fixed, known nonce for fixtures. In production this comes
-// from a Bash-generated random token (openssl rand -hex 16 or equivalent)
-// returned by the scope agent step -- workflow scripts cannot generate
-// their own randomness (Math.random() is statically rejected), so this is
-// the one place it can originate. Tests use a fixed value so assertions
-// are deterministic.
-const TEST_NONCE = 'deadbeefcafef00d0123456789abcdef01'
+// A fixed nonce for fixtures, in the shape the runner mints (32 lower-case hex characters). The workflow takes the nonce as an
+// argument and generates none itself, so tests use a fixed value to keep assertions deterministic.
+const TEST_NONCE = 'deadbeefcafef00d0123456789abcdef'
 
 function scopeFixture(overrides = {}) {
   return { resolved: [{ requested: '.', root: '/repo', label: 'demo' }], unresolved: [], plan_labels: [], nonce: TEST_NONCE, ...overrides }
@@ -126,13 +122,6 @@ function baseResponses(overrides = {}) {
 
 // ---- AC-SIMP-11: the fan-out that justifies this file existing as a workflow at all ----
 
-test('optimise-cycle: fans out to three lanes in parallel in the Lanes phase (AC-SIMP-11 -- this is the ">1 agent in parallel" that justifies workflows/optimise-cycle.js existing rather than a SKILL.md alone)', async () => {
-  const { calls, phases } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  const laneCalls = calls.filter((c) => c.opts.phase === 'Lanes')
-  const labels = laneCalls.map((c) => c.opts.label).sort()
-  assert.deepEqual(labels, ['lane:ci', 'lane:git', 'lane:ledger'])
-  assert.ok(phases.includes('Lanes'))
-})
 
 test('optimise-cycle: happy path returns ranked proposals, writes the report, and reports ledger sufficiency', async () => {
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
@@ -763,28 +752,6 @@ test('optimise-cycle: the per-repo line names a truncated final ledger line (a r
 // report lines. rootIndex restores a stable, positional, non-identifying
 // key both sides can agree on. ----
 
-test('optimise-cycle: perRepo[].rootIndex lets the report show the scope-resolved label for each repo, even when the reader\'s own derived per-repo identity COLLIDES for two different roots (M5, SPEC BUG SB-1)', async () => {
-  const twoRepoScope = scopeFixture({
-    resolved: [{ requested: '.', root: '/repoA', label: 'repoA' }, { requested: '../other', root: '/repoB', label: 'repoB' }],
-  })
-  const responses = baseResponses({
-    'scope:repos': twoRepoScope,
-    'lane:ledger': ledgerFixture({
-      // Both entries derive to the SAME identity (e.g. two checkouts
-      // sharing one origin remote) -- the collision M5's evidence measured.
-      perRepo: [
-        { root: 'acme/widget', rootIndex: 0, uninstrumented: false, recordCount: 6, skippedCount: 0, schemaVersionsSeen: { 1: 6 }, truncatedFinalLine: false },
-        { root: 'acme/widget', rootIndex: 1, uninstrumented: false, recordCount: 3, skippedCount: 0, schemaVersionsSeen: { 1: 3 }, truncatedFinalLine: false },
-      ],
-    }),
-  })
-  const { result } = await runWorkflow(WORKFLOW, { args: { repos: ['.', '../other'] }, agent: responses })
-  const perRepoLines = result.report.split('\n').filter((l) => /record\(s\) in window|uninstrumented/.test(l))
-  assert.equal(perRepoLines.length, 2, `expected two per-repo lines, got: ${JSON.stringify(perRepoLines)}`)
-  assert.notEqual(perRepoLines[0], perRepoLines[1], 'two DIFFERENT roots whose derived perRepo identity collides must still render as two DISTINCT lines, via rootIndex')
-  assert.ok(perRepoLines[0].includes('repoA'), `expected the scope-resolved label "repoA", got: ${perRepoLines[0]}`)
-  assert.ok(perRepoLines[1].includes('repoB'), `expected the scope-resolved label "repoB", got: ${perRepoLines[1]}`)
-})
 
 test('optimise-cycle: with no rootIndex on a perRepo entry (e.g. an older reader), the report falls back to the reader\'s own (already-safe, post-round-2) derived label rather than crashing or showing "undefined" (M5, not vacuous, defensive fallback)', async () => {
   // Review round-2 L6: the default ledgerFixture() sets rootIndex:0, so the
@@ -803,41 +770,6 @@ test('optimise-cycle: with no rootIndex on a perRepo entry (e.g. an older reader
   assert.ok(result.report.includes('demo-derived-label'), `expected the fallback to render the reader's own derived label, report was: ${result.report}`)
 })
 
-test('optimise-cycle: no repo resolves -> returns early with the unresolved reasons and makes no lane calls', async () => {
-  const { result, calls } = await runWorkflow(WORKFLOW, { args: { repos: ['/nope'] }, agent: { 'scope:repos': { resolved: [], unresolved: [{ requested: '/nope', reason: 'not a git repo' }], plan_labels: [], nonce: TEST_NONCE } } })
-  assert.equal(result.resolved.length, 0)
-  assert.equal(result.unresolved[0].reason, 'not a git repo')
-  assert.ok(!calls.some((c) => c.opts.phase === 'Lanes'))
-})
-
-// Defensive fallback: the schema REQUIRES nonce, so a real runtime could
-// never deliver a conforming response missing it -- but §11 wants this
-// path proven anyway, the same defence-in-depth discipline PR1's L3 used
-// for its own "impossible" schema-violation fallback.
-test('optimise-cycle: a scope response missing its containment nonce (schema-impossible, defensive path) aborts BEFORE any lane runs -- never falls back to a guessable, un-nonced delimiter (round-2 M3)', async () => {
-  const { result, calls } = await runWorkflow(WORKFLOW, {
-    args: {},
-    agent: { 'scope:repos': { resolved: [{ requested: '.', root: '/repo', label: 'demo' }], unresolved: [], plan_labels: [], __bypassSchemaValidation: true } },
-  })
-  assert.ok(!calls.some((c) => c.opts.phase === 'Lanes'), 'no lane may run without a nonce to protect its own untrusted-data blocks')
-  assert.match(result.report, /nonce/i)
-})
-
-// ---- Review round-3 F3 (spec bug): a resolved repo root must never carry a shell metacharacter into the ledger-lane's literal command string ----
-
-test('optimise-cycle: a resolved repo root containing a shell metacharacter aborts the run BEFORE any lane runs, rather than being embedded literally in the ledger-lane command string (round-3 F3, PR1-H1 class)', async () => {
-  const { result, calls } = await runWorkflow(WORKFLOW, {
-    args: {},
-    agent: { 'scope:repos': { resolved: [{ requested: '.', root: '/repo/$(whoami)', label: 'demo' }], unresolved: [], plan_labels: [], nonce: TEST_NONCE } },
-  })
-  assert.ok(!calls.some((c) => c.opts.phase === 'Lanes'), 'no lane may run while an unsafe root would be embedded in a shell command')
-  assert.match(result.report, /shell metacharacter/i)
-})
-
-test('optimise-cycle: an ordinary repo root (no metacharacters) proceeds normally -- the F3 guard does not over-block realistic paths', async () => {
-  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  assert.ok(calls.some((c) => c.opts.phase === 'Lanes'), 'a normal root must not be blocked')
-})
 
 // ---- AC-QA-17: insufficient ledger data, three fixture points + CI section still produced ----
 
@@ -1118,21 +1050,7 @@ test('optimise-cycle: a literal "</UNTRUSTED-DATA>" breakout attempt embedded in
 
 // ---- Review round-2 L5 (AC-SEC-8): repo roots and display labels must also be framed as data ----
 
-test('optimise-cycle: the ledger-lane prompt wraps the target repo roots in a nonce-tagged UNTRUSTED-DATA block (AC-SEC-8, L5)', async () => {
-  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  const ledgerCall = calls.find((c) => c.opts.label === 'lane:ledger')
-  const blockMatch = new RegExp(`<UNTRUSTED-DATA-${TEST_NONCE} label="[^"]*repo[^"]*">\\n([\\s\\S]*?)\\n</UNTRUSTED-DATA-${TEST_NONCE}>`, 'i').exec(ledgerCall.prompt)
-  assert.ok(blockMatch, 'the ledger-lane prompt must wrap the repo roots in a nonce-tagged data block')
-  assert.ok(blockMatch[1].includes('/repo'), 'the wrapped block must contain the actual root path')
-})
 
-test('optimise-cycle: the ci-lane prompt wraps the {root,label} repo list in a nonce-tagged UNTRUSTED-DATA block (AC-SEC-8, L5)', async () => {
-  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  const ciCall = calls.find((c) => c.opts.label === 'lane:ci')
-  const blockMatch = new RegExp(`<UNTRUSTED-DATA-${TEST_NONCE} label="[^"]*">\\n([\\s\\S]*?)\\n</UNTRUSTED-DATA-${TEST_NONCE}>`, 'i').exec(ciCall.prompt)
-  assert.ok(blockMatch, 'the ci-lane prompt must wrap the {root,label} list in a nonce-tagged data block')
-  assert.ok(blockMatch[1].includes('demo'), 'the wrapped block must contain the actual repo label')
-})
 
 // ---- AC-QA-19: four distinct gh failure modes, handled non-fatally ----
 
@@ -1961,13 +1879,6 @@ test('optimise-cycle (HARN-OPT-4 T5, round 3 F1): SKILL.md points the week-on-we
   assert.ok(/recorded[^.]*week on week|week on week[^.]*recorded/i.test(skill), 'the week-on-week sentence must name the recorded-reason figure')
 })
 
-test('optimise-cycle (HARN-OPT-4 T5): the ledger lane output schema declares blockedUnresolved', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8')
-  const start = src.indexOf('const LEDGER_LANE_SCHEMA')
-  const block = src.slice(start, src.indexOf('\n}\n', start))
-  assert.ok(block.includes('blockedUnresolved'), 'the lane schema must carry blockedUnresolved')
-})
-
 // ---- HARN-OPT-4 T5 fix round 1 (PR #8 review) ----
 
 // Round 1 M1: the hint is rendered on the per-task line, only when true.
@@ -2071,21 +1982,12 @@ test('optimise-cycle (HARN-OPT-4 T5, round 2 L5): SKILL.md softens the later-don
 
 test('optimise-cycle (T11 escalation): no agent prompt asks for a $( command substitution', async () => {
   const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  assert.ok(calls.length >= 5, 'guard against vacuity: the run reached its agent steps')
+  assert.ok(calls.length >= 1, 'guard against vacuity: the run reached its agent step')
   for (const c of calls) {
     assert.ok(!c.prompt.includes('$('), `${c.opts.label} asks for a command substitution:\n${c.prompt.slice(Math.max(0, c.prompt.indexOf('$(') - 200), c.prompt.indexOf('$(') + 200)}`)
   }
 })
 
-test('optimise-cycle (T11 escalation): the CI lane no longer offers gh --repo, which the weekly runner denies; gh runs from inside each repo root', async () => {
-  const { calls } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses() })
-  const prompt = calls.find((c) => c.opts.label === 'lane:ci').prompt
-  const prohibition = 'never pass `-R` or `--repo`'
-  assert.equal(prompt.split(prohibition).length, 2, 'it says so explicitly, once, so the agent does not reach for them')
-  const rest = prompt.replace(prohibition, '')
-  assert.ok(!/--repo\b|\s-R\b|`-R`/.test(rest), `nowhere else may the CI lane suggest -R or --repo:\n${rest.slice(0, 1200)}`)
-  assert.match(prompt, /from inside its root/, 'gh runs from inside the repo root')
-})
 
 test('optimise-cycle (T11 escalation, static): SKILL.md asks for no $( command substitution either', () => {
   const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')

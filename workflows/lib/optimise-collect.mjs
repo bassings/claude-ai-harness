@@ -33,7 +33,7 @@
 // its own command-line interface, never reimplemented here.
 //
 // Containment, in one place:
-//  - git is run only as `git -c safe.bareRepository=explicit -C <root> log ...`
+//  - git is run only as `git -c safe.bareRepository=explicit -C <root> log --max-count=<N> --name-only ...`
 //    and `... rev-parse --show-toplevel`; gh only as `gh run list ...` and
 //    `gh run view <id> [--attempt 1] --json jobs`, from the repository root,
 //    with GH_HOST, GH_REPO and GH_ENTERPRISE_TOKEN removed from its environment.
@@ -459,7 +459,7 @@ async function ciLane(ctx, stats) {
   const fetchFailedCount = entries.filter((entry) => entry.fetch_error).length
   const timeoutCount = entries.filter((entry) => entry.fetch_error === 'timeout').length
   const failures = noHistory ? [{ repo: label, mode: 'no_history', command: 'gh run list', error: '' }] : []
-  const ghStats = [{ repo: label, wall_clock_s: seconds(Date.now() - startedAt), gh_calls: stats.calls }]
+  const ghStats = [{ repo: label, wall_clock_s: wholeSeconds(Date.now() - startedAt), gh_calls: stats.calls }]
   const payload = JSON.stringify({ runs: entries, requestedLimit: GH_RUN_LIMIT, minRunsNeverFailed: MIN_RUNS_FOR_NEVER_FAILED })
   const result = { ...(await readerJson(ctx, stats, 'ci', payload)), failures, ghStats }
   if (noHistory) return { mode: 'no_history', runCount: null, fetchFailedCount: null, timeoutCount: null, result }
@@ -819,6 +819,9 @@ function digestLane(ctx, records) {
 // ---- lanes and files ----
 
 const seconds = (ms) => Math.round(ms) / 1000
+// The report's CI section prints this lane's gh wall-clock, and the same collected data must give the same text whenever it is
+// collected (the attended and weekly reports are held identical, AC-PROD-5), so it is carried to the second, not the millisecond.
+const wholeSeconds = (ms) => Math.round(ms / 1000)
 
 function writeLane(outDir, record) {
   const file = path.join(outDir, `${record.lane}.json`)

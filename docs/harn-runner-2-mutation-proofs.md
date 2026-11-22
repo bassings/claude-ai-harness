@@ -317,3 +317,52 @@ Not mutated, and why:
 | M1f_r3 | an install with no workflow stops the repository (M1) | `if [ ! -f "$WORKFLOW_SOURCE" ]; then` to `if false; then` | optimise-cycle-weekly.sh | "an install with no optimise-cycle.js stops each repository before collection, naming the ..." |
 | D1_r3 | a list of permission_denials is a count (M4, round 3) | `return { denied: String(envelope.permission_denials.length),` to `return { denied: 'unknown',` | optimise-verify.mjs | "the number of refused tool calls and the names of the tools are the CLI's own report, and..."; "an array of permission_denials is a count (zero included) with its tool names from a know..." |
 | D2_r3 | refused tool names come from a known set (M4, round 3) | `KNOWN_TOOL_NAMES.includes(entry.tool_name) ? entry.tool_name : 'other'` to `typeof entry?.tool_name === 'string' ? entry.tool_name : 'other'` | optimise-verify.mjs | "the number of refused tool calls and the names of the tools are the CLI's own report, and..."; "an array of permission_denials is a count (zero included) with its tool names from a know..." |
+
+## HARN-RUNNER-2 T4 mutation proofs (the attended entry, the shared lock and placement, the runbook)
+
+Run on the final code of T4. Same method as above: the edit was applied to the
+file named, the script refused any edit whose text did not occur exactly once
+(so a match in a comment cannot stand in for the code), the named tests were
+run, the file was restored and compared with the original (every row restored
+identical, `landed=True` and `restored=True` in the run output). Tests are named
+by their leading words. `test/harn-runner-2-t4.test.js` is the frozen test
+file the task was given; `test/harn-runner-2-t4-attended.test.js` is the file
+added for the edges it does not reach.
+
+**Survivor found and closed (B1).** The first run of row B1 survived: the frozen
+test that says the attended mode "holds no lock afterwards" asserts
+`fs.existsSync(lock)` is false, and the lock is a symlink to a name that does
+not exist, so `existsSync` answers false whether or not the lock was released.
+The mutation removed the release and that test stayed green. The row below is
+true only because `test/harn-runner-2-t4-attended.test.js` now checks with
+`lstat`. The frozen test is unchanged and still cannot fail for that reason.
+
+| Row | Guard | Mutation | Tests that failed |
+|---|---|---|---|
+| A1 | a call with no digest is refused before any agent runs | `if (opts.digest === undefined) {` to `if (false) {` in `workflows/optimise-cycle.js` | three of the four "a call with no digest" tests in the frozen file (the fourth, a nonce and no digest, still gets a refusal that names the digest, so it passes) and the removed-arguments test |
+| A2 | the removed `repos` and `window` arguments are named in the refusal | `opts.repos === undefined && opts.window === undefined ? '' :` to `true ? '' :` | "a call that carries the removed repos or window arguments" |
+| B1 | the attended run releases the sidecar lock | `unlock(sidecarRoot, lock.token)` to `void lock.token` in `attendedRun` | "attended: the sidecar lock is released after a placed run and after a refused one" (the frozen "holds no lock" test stayed green, see above) |
+| C1 | a lock whose owner process is gone is stale | `if (pid !== null && pid > 0 && pidGone(pid)) return true` to `if (false) return true` | "AC-QA-21 (attended): a stale sidecar lock", and the runner's "L2: a lock left by a process that is gone" |
+| C2 | a lock older than the stale limit is stale | `return st !== null && now - st.mtimeMs > LOCK_STALE_MIN * 60000` to `return false` | "L2: a lock left by a process that is gone, or one older than the stale limit" |
+| C3 | a lock taken by mistake, or released by one who does not hold it, is put back | `if (taken !== null && taken !== keep) restoreLock(lockPath, taken, ops)` to `if (false) restoreLock(...)` | "L1: a runner that does not hold the lock cannot release it", "L1: a taker that judged a lock stale but finds a fresh one", "lock-try and unlock: one attempt" |
+| D1 | the sidecar is renamed before the report | the two `parts` entries of `placeOutputs` swapped | "L1: both outputs are staged first and the sidecar is renamed before the report" |
+| D2 | a result file that is a link is named as one | the symlink branch of `resultText` removed | "place: puts both result files in place" |
+| D3 | a destination that is a directory is refused | `if (lstatOrNull(destDir)?.isSymbolicLink() \|\| lstatOrNull(dest)?.isDirectory()) return` to `if (false) return` | "place: puts both result files in place", "the weekly runner reports the module's fixed reason when the placement is refused" |
+| E1 | the attended entry places into a main checkout only | `return root !== null && root === realPathOrNull(repo) ? resolved.root : null` to `return resolved.root` | "attended: a linked worktree is refused" |
+| E2 | the output paths must be confirmed ignored before anything is written | `helper.ensureIgnored(root, rel).ignored)` to `helper.ensureIgnored(root, rel) !== null)` | "attended: a tracked .gitignore that re-includes the report path stops the run" |
+| F1 | the attended tokens carry the collected ledger count alone | `if (reportedLedger === undefined) return` to `if (false) return` | "AC-DATA-2 (attended): a result file that is not the returned JSON object" (frozen), "the attended mode prints the collected ledger count alone" |
+| F2 | the attended input must be a JSON object | `parseResultObject` returns the parsed value whatever it is | "the attended mode prints the collected ledger count alone" |
+| G1 | the runner counts a placement as done only on the module's `PLACED yes` line | `"PLACED yes") ;;` to `"PLACED yes"\|*) ;;` in `bin/optimise-cycle-weekly.sh` | "the weekly runner reports the module's fixed reason when the placement is refused" |
+| G2 | the runner waits the module's number of tries for the lock | `LOCK_TRIES=150` to `LOCK_TRIES=3` in `bin/optimise-cycle-weekly.sh` | "acquireLock waits LOCK_TRIES times" |
+| H1 | the gh wall-clock in the digest is carried to the whole second | `Math.round(ms / 1000)` to `Math.round(ms) / 1000` in `workflows/lib/optimise-collect.mjs` | "the collector carries the gh wall-clock in ghStats to the whole second" |
+| I1 | the skill says the digest is read unfenced | both occurrences of the word removed (one occurrence alone leaves the test green: it matches the word anywhere) | "AC-DATA-2/AC-SEC-6: the skill drives the attended run step by step" |
+| I2 | the runbook has a row for every failure mode, and none for a mode the code does not emit | the first cell `failed:rate_limited` to `failed:rate_slowed` | "every cause token and every collector failure mode has a runbook row", "no runbook row names a reason, cause or mode the code no longer emits" |
+| I3 | the README names none of the removed mechanisms | the text `report_path` added to the README | "AC-SEC-18/AC-PROD-8: README.md describes none of the removed mechanisms" |
+| J1 | the attended entry passes the operator's nonce to the check | `nonce` dropped from the options of `attendedRun` | six tests, among them "AC-DATA-1 (attended)" and "AC-PROD-8 (attended)" |
+| J2 | the attended entry merges into the sidecar on disk | `sidecarRoot` dropped from the `verifyRun` call in `attendedRun` | "AC-PROD-8 (attended): a decided entry already in the sidecar is carried forward" |
+
+**T3 rows that no longer describe the code.** Rows L1a_r3 to L1d_r3 above
+mutate the runner's bash lock functions, which T4 moved into
+`workflows/lib/optimise-verify.mjs` (the runner now only waits between tries).
+Their guards are rows C1, C2 and C3 here. Row L8d_r3 (the runner's check that the
+result check wrote both files) is unchanged and still true.

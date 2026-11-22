@@ -394,7 +394,7 @@ test('T1b digest: the shared pure function says which never-failing rows are pla
   for (const [name, row, want] of table) assert.equal(isPlainInsufficientRow(row), want, name)
 })
 
-test('T1b digest: the workflow\'s real render shows a never-failing row as plain "(insufficient data)" exactly when the shared function says plain, and reads no key outside the shared list', async () => {
+test('T1b digest: the workflow\'s real render leaves a never-failing row out, and counts it, exactly when the shared function says plain, and reads no key outside the shared list', async () => {
   const { isPlainInsufficientRow, NEVER_FAILING_RENDER_KEYS } = await loadReader()
   const { outDir } = rich()
   const real = lane(outDir, 'ledger').result.neverFailingAcs
@@ -415,13 +415,15 @@ test('T1b digest: the workflow\'s real render shows a never-failing row as plain
   const full = await renderNeverFailing(rows)
   const projected = await renderNeverFailing(rows.map(project))
   rows.forEach((row, i) => {
-    // The render appends a measured zero (", verdict_disagreements=0") to an insufficient-data row and nothing for an
-    // absent count; those two lines are the plain rows the digest leaves out and counts. Every other row line differs.
-    const head = `- ${row.repo}/${row.spec} ${row.ac_id}: n=${row.n} (insufficient data)`
-    const plainLine = full[i] === head || full[i] === `${head}, verdict_disagreements=0`
-    assert.equal(plainLine, isPlainInsufficientRow(row), `${row.ac_id}: the render and the shared function must agree on a plain row: ${full[i]}`)
+    // The workflow leaves a plain insufficient-data row out of the report and counts it, by the shared rule; every other row is
+    // listed. A row the render lists must be the same line whether or not the keys outside the shared list are present.
+    assert.equal(full[i] === null, isPlainInsufficientRow(row), `${row.ac_id}: the report omits a row exactly when the shared function says plain: ${full[i]}`)
     assert.equal(full[i], projected[i], `${row.ac_id}: the render reads a key outside NEVER_FAILING_RENDER_KEYS`)
   })
+  const plainCount = rows.filter((row) => isPlainInsufficientRow(row)).length
+  assert.ok(plainCount > 0, 'the table holds plain rows')
+  assert.equal(full.leftOut, plainCount, 'the report states how many rows it left out')
+  assert.equal(projected.leftOut, plainCount)
 })
 
 test('T1b digest: wallClock.byPlan and proposalOutcomes are capped by entry count and the number dropped is recorded', async () => {
@@ -1036,37 +1038,6 @@ test('T1b git: window_note is the cut wording only when more than 500 commits ex
     assert.deepEqual(figures, viaCli, `${added + 1} commits: the figures are the reader's for the first 500`)
   }
 })
-
-// The workflow's own schema for a git lane entry, read from its source (a workflow script cannot be imported).
-function workflowGitSchema() {
-  const source = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8')
-  const start = source.indexOf('const GIT_LANE_ENTRY_SCHEMA = {')
-  assert.ok(start >= 0, 'GIT_LANE_ENTRY_SCHEMA is in the workflow')
-  const end = source.indexOf('\n}\n', start)
-  return new Function(`return ${source.slice(start + 'const GIT_LANE_ENTRY_SCHEMA = '.length, end + 2)}`)()
-}
-
-test('T1b git: the collector\'s git result, as the lane file and as the digest carries it, is valid against the workflow\'s GIT_LANE_ENTRY_SCHEMA, with window_note a string in every case', async () => {
-  const { validateEntry } = await import(pathToFileURL(path.join(__dirname, '..', 'workflows', 'lib', 'ledger-append.mjs')).href)
-  const schema = workflowGitSchema()
-  assert.ok(schema.required.includes('window_note') && schema.properties.window_note.type === 'string', 'the schema still requires a string window_note')
-  const stubs = stubsWithRuns()
-  for (const added of [2, 499, 519]) {
-    const root = makeRepo({ ledger: validLedger(3), fix: 1 })
-    addCommits(root, added)
-    const outDir = scratchDir()
-    drive(stubs, { root, outDir })
-    assert.deepEqual(validateEntry(lane(outDir, 'git').result, schema), [], `lane file, ${added + 1} commits`)
-    assert.deepEqual(validateEntry(digestOf(outDir).git, schema), [], `digest, ${added + 1} commits`)
-  }
-  assert.ok(validateEntry({ ...lane(scratchDirWithGit(stubs), 'git').result, window_note: null }, schema).length > 0, 'a null window_note is refused by the schema, so the check can fail')
-})
-
-function scratchDirWithGit(stubs) {
-  const outDir = scratchDir()
-  drive(stubs, { root: makeRepo({ ledger: validLedger(3), fix: 1 }), outDir })
-  return outDir
-}
 
 // ---- 4. the plan labels ----
 

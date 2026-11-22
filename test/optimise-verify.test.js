@@ -183,7 +183,7 @@ const ROW_ALTERATIONS = [
   ['a per-repository CI not-completed count', (r) => bump(r, /\d+(?= runs not completed)/), /^figure mismatch ci repository: not completed collected 0, reported 1$/],
   ['a per-repository CI fetch-failure count', (r) => bump(r, /(?<=rate_limited )\d+/), /^figure mismatch ci repository: rate limited collected 0, reported 1$/],
   ['a gh call count', (r) => bump(r, /\d+(?= gh calls)/), /^figure mismatch gh calls: calls collected 4, reported 5$/],
-  ['a gh wall-clock figure', (r) => bump(r, /(?<=wall-clock )\d+(?=\.\d+s, \d+ gh calls)/), /^figure mismatch gh calls: wall-clock seconds collected/],
+  ['a gh wall-clock figure', (r) => bump(r, /(?<=wall-clock )\d+(?=(?:\.\d+)?s, \d+ gh calls)/), /^figure mismatch gh calls: wall-clock seconds collected/],
   ['a per-plan wait figure', (r) => bump(r, /(?<=: ci_wait=)\d+(?=s \(n=)/), /^figure mismatch wall-clock plan: ci wait seconds collected 0, reported 1$/],
   ['a per-plan run count', (r) => bump(r, /(?<=human_wait=\d+s \(n=)\d+/), /^figure mismatch wall-clock plan: human wait runs collected 0, reported 1$/],
   ['a per-plan unterminated-waits count', (r) => bump(r, /(?<=unterminated_waits: )\d+/), /^figure mismatch wall-clock plan: unterminated waits collected 1, reported 2$/],

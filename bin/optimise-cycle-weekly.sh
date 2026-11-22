@@ -194,19 +194,15 @@ SWEEP_PENDING=0         # set once at start-up: remove stale run directories lef
 # collector's own figure and to 1440.
 STALE_RUN_MINUTES=1410
 RUN_COMPLETE=0          # set only when the normal end is reached
-STAGED_REPORT_TMP=""    # the report, staged beside its final path until both outputs are staged
-STAGED_SIDECAR_TMP=""   # likewise the sidecar
 CURRENT_LABEL=""        # the repository being processed, until its one RESULT line is written
-SIDECAR_LOCK=""         # the lock on the sidecar, while this run holds it
+SIDECAR_LOCK=""         # the main checkout whose sidecar lock this run holds, while it holds one
 SIDECAR_TOKEN=""        # this run's owner token on that lock
-LOCK_TRIES=150          # 150 tries 0.2 s apart: a held lock is waited for 30 s, then the repository FAILs
-LOCK_STALE_MIN=10       # a lock older than this many minutes is broken whatever its pid
-OUTPUT_PROBLEM=""       # why a result file could not be placed, for the verdict
+LOCK_TRIES=150          # 150 tries 0.2 s apart: a held lock is waited for 30 s, then the repository FAILs (the module's LOCK_TRIES; a test keeps them equal)
 EXIT_REASON=""          # why the run ended abnormally, when the runner knows
 
 # The one cleanup function: the exit trap, the signal handlers and the end of
 # every repo's iteration all come through here, and it holds every rm in this
-# script. It deletes only what this run made: its staged output temp files, its lock,
+# script. It deletes only what this run made: its lock,
 # its per-run directory and stale run directories under the runner's own parent.
 # Every repository owns one directory of its own (RUNNER_TMP), so no file name
 # is shared between runs or between repositories, and the final call ("final",
@@ -226,18 +222,10 @@ cleanup_run() {
       fi
     done < <(find "$RUNNER_PARENT" -mindepth 1 -maxdepth 1 -type d -name 'run.??????' -user "$(id -u)" -mmin +"$STALE_RUN_MINUTES" 2>/dev/null)
   fi
-  if [ -n "$STAGED_REPORT_TMP" ]; then
-    rm -f "$STAGED_REPORT_TMP"
-  fi
-  if [ -n "$STAGED_SIDECAR_TMP" ]; then
-    rm -f "$STAGED_SIDECAR_TMP"
-  fi
   unlock_sidecar
   if [ -n "$STALE_TMPDIR" ]; then
     rm -rf "$STALE_TMPDIR"
   fi
-  STAGED_REPORT_TMP=""
-  STAGED_SIDECAR_TMP=""
   STALE_TMPDIR=""
   if [ "${1:-}" = final ] && [ -n "$RUNNER_PARENT" ] && [ "${RUNNER_TMP%/*}" = "$RUNNER_PARENT" ]; then
     case "${RUNNER_TMP##*/}" in
@@ -369,120 +357,37 @@ new_run_dir() {
   [ -n "$RUN_REAL" ]
 }
 
-# Stages a file this script itself wrote (inside the per-run directory, from a
-# result it has already checked) beside where it will go in the repo, as a fresh
-# exclusive temp file: it is never a file the session wrote, as the session has
-# no file write. The file is accepted only if it is a regular file (not a
-# symlink), non-empty and no larger than $3 bytes. $4 names it in a refusal,
-# which is recorded in OUTPUT_PROBLEM; $5 is the global that receives the temp
-# path (STAGED_REPORT_TMP or STAGED_SIDECAR_TMP). Staging both before renaming
-# either means a failure to stage leaves both destinations as they were.
-stage_output() {
-  local src="$1" dest="$2" cap="$3" what="$4" holder="$5" size destdir tmp problem=""
-  if [ -L "$src" ]; then
-    problem="$what rejected: the result file is a symlink"
-  elif [ ! -f "$src" ]; then
-    problem="$what rejected: the result path is not a regular file"
-  else
-    size=$(wc -c < "$src" | tr -d ' ')
-    if [ "$size" -eq 0 ]; then
-      problem="$what rejected: the result file is empty"
-    elif [ "$size" -gt "$cap" ]; then
-      problem="$what rejected: the result file is larger than $cap bytes"
-    fi
-  fi
-  destdir="$(dirname "$dest")"
-  if [ -z "$problem" ]; then
-    if [ -L "$destdir" ] || [ -d "$dest" ]; then
-      problem="$what rejected: the destination is a symlinked directory or a directory"
-    elif ! mkdir -p "$destdir" 2>/dev/null; then
-      problem="$what rejected: could not create the destination directory"
-    fi
-  fi
-  if [ -z "$problem" ]; then
-    tmp="$(mktemp "$destdir/.optimise-output.XXXXXX" 2>/dev/null)"
-    if [ -n "$tmp" ]; then
-      printf -v "$holder" '%s' "$tmp"
-      if cat "$src" > "$tmp"; then
-        return 0
-      fi
-    fi
-    problem="$what rejected: could not stage it"
-  fi
-  OUTPUT_PROBLEM="${OUTPUT_PROBLEM:+$OUTPUT_PROBLEM; }$problem"
-  return 1
-}
-
 # The lock that serialises the sidecar's read, merge and rename across runners
-# ($1 is the repository), keyed on the main checkout's git directory so two
-# linked worktrees of one repository share it. It is a symlink whose target is
-# its owner's token (`pid:random`): `ln -s` creates it atomically with the owner
-# already recorded, so no instant exists in which a held lock has no owner. A
-# held lock is waited for LOCK_TRIES tries 0.2 s apart, then the caller FAILs.
-# A stale lock (owner pid gone, or older than LOCK_STALE_MIN minutes) is taken
-# over by renaming it to a name only this taker uses, then looking at what was
-# actually taken: only if it is the owner that was judged stale is it removed;
-# a fresh lock taken by mistake is put straight back. macOS ships no file-lock
-# utility, and this needs none.
-lock_looks_stale() {
-  local dir="$1" pid="${2%%:*}"
-  case "$pid" in
-    ''|*[!0-9]*) ;;
-    *)
-      if ! kill -0 "$pid" 2>/dev/null; then
-        return 0
-      fi
-      ;;
-  esac
-  [ -n "$(find "$dir" -maxdepth 0 -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]
-}
-
+# and the attended /optimise-cycle. Its code is in workflows/lib/optimise-verify.mjs
+# (lock-try and unlock), the one copy, so the two callers cannot disagree about
+# it; this loop only waits between tries. $1 is the main checkout. A held lock is
+# waited for LOCK_TRIES tries 0.2 s apart, then the caller FAILs.
 lock_sidecar() {
-  local common dir token owner moved taken tries=0
-  common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-  if [ -z "$common" ]; then
-    return 1
-  fi
-  dir="$common/optimise-sidecar.lock"
-  token="$$:$RANDOM$RANDOM"
-  while ! ln -s "$token" "$dir" 2>/dev/null; do
-    owner="$(readlink "$dir" 2>/dev/null)"
-    if [ -n "$owner" ] && lock_looks_stale "$dir" "$owner"; then
-      moved="$dir.stale.$token"
-      if mv "$dir" "$moved" 2>/dev/null; then
-        taken="$(readlink "$moved" 2>/dev/null)"
-        if [ "$taken" != "$owner" ]; then
-          ln -s "$taken" "$dir" 2>/dev/null
-        fi
-        rm -f "$moved"
-      fi
-      continue
-    fi
+  local root="$1" out tries=0
+  while :; do
+    out="$(node "$VERIFY_SCRIPT" lock-try "$root" "$$" 2>/dev/null)"
+    case "$out" in
+      "LOCK held "*)
+        SIDECAR_LOCK="$root"
+        SIDECAR_TOKEN="${out#LOCK held }"
+        return 0
+        ;;
+      "LOCK busy") ;;
+      *) return 1 ;;
+    esac
     tries=$((tries + 1))
     if [ "$tries" -gt "$LOCK_TRIES" ]; then
       return 1
     fi
     sleep 0.2
   done
-  SIDECAR_LOCK="$dir"
-  SIDECAR_TOKEN="$token"
-  return 0
 }
 
-# Releases the lock this run holds, and only that one: the lock is renamed away
-# first, and removed only if it still carries this run's token; one that carries
-# another's is put straight back.
+# Releases the lock this run holds, and only that one (the module puts back a
+# lock that carries another token).
 unlock_sidecar() {
-  local moved taken
   if [ -n "$SIDECAR_LOCK" ]; then
-    moved="$SIDECAR_LOCK.release.$SIDECAR_TOKEN"
-    if mv "$SIDECAR_LOCK" "$moved" 2>/dev/null; then
-      taken="$(readlink "$moved" 2>/dev/null)"
-      if [ "$taken" != "$SIDECAR_TOKEN" ]; then
-        ln -s "$taken" "$SIDECAR_LOCK" 2>/dev/null
-      fi
-      rm -f "$moved"
-    fi
+    node "$VERIFY_SCRIPT" unlock "$SIDECAR_LOCK" "$SIDECAR_TOKEN" >/dev/null 2>&1
     SIDECAR_LOCK=""
     SIDECAR_TOKEN=""
   fi
@@ -903,7 +808,6 @@ process_repo() {
     return 0
   fi
 
-  OUTPUT_PROBLEM=""
   reasons=()
   SESSION_CAUSE=""
 
@@ -1070,7 +974,7 @@ process_repo() {
   # did not exit 0 is not parsed at all.
   # The sidecar is read by the check and renamed after it: no other runner may do the same in between, so the check that
   # can place anything runs only while this run holds the lock.
-  if [ "$claude_exit" -eq 0 ] && lock_sidecar "$repo"; then
+  if [ "$claude_exit" -eq 0 ] && lock_sidecar "$(sidecar_root_of "$repo")"; then
     verify_out="$(verify_run "$session_out" "$digest_token" "$repo" "$(sidecar_root_of "$repo")" 2>/dev/null)"
   else
     if [ "$claude_exit" -eq 0 ]; then
@@ -1095,26 +999,21 @@ process_repo() {
   # report and sidecar as they were. The report and sidecar paths are made
   # ignored, and confirmed so, before either is written.
   if [ "$VERIFY_PLACE" = yes ] && [ "$claude_exit" -eq 0 ] && [ "$ceiling_hit" = 0 ]; then
-    local sidecar_root
+    local sidecar_root place_out
     sidecar_root="$(sidecar_root_of "$repo")"
     if [ ! -f "$RUN_REAL/result-report.md" ] || [ ! -f "$RUN_REAL/result-sidecar.json" ]; then
       reasons+=("the result check wrote no output")
     elif ! ensure_ignored "$repo" "$sidecar_root"; then
       reasons+=("${IGNORE_FAILURE:-report path is not gitignored}")
-    elif ! { stage_output "$RUN_REAL/result-report.md" "$repo/$REPORT_REL" "$REPORT_CAP_BYTES" report STAGED_REPORT_TMP \
-      && stage_output "$RUN_REAL/result-sidecar.json" "$sidecar_root/$SIDECAR_REL" "$SIDECAR_CAP_BYTES" sidecar STAGED_SIDECAR_TMP; }; then
-      reasons+=("$OUTPUT_PROBLEM")
-    elif ! mv -f "$STAGED_SIDECAR_TMP" "$sidecar_root/$SIDECAR_REL" 2>/dev/null; then
-      reasons+=("could not move the result into place")
     else
-      # The sidecar first: it is a superset of the old one, so a failure before the report's rename leaves the old report
-      # beside a sidecar that still maps every id it names, never a new report beside an old sidecar.
-      STAGED_SIDECAR_TMP=""
-      if mv -f "$STAGED_REPORT_TMP" "$repo/$REPORT_REL" 2>/dev/null; then
-        STAGED_REPORT_TMP=""
-      else
-        reasons+=("could not move the result into place")
-      fi
+      # Placement is the module's (workflows/lib/optimise-verify.mjs place), the one copy the attended entry also uses: both
+      # outputs are staged before either is renamed, the sidecar first. It prints REASON lines and PLACED yes|no only.
+      place_out="$(node "$VERIFY_SCRIPT" place "$RUN_REAL" "$repo" "$sidecar_root" 2>/dev/null)"
+      case "$place_out" in
+        "PLACED yes") ;;
+        *REASON*) reasons+=("$(printf '%s\n' "$place_out" | sed -n 's/^REASON //p' | head -n 1)") ;;
+        *) reasons+=("could not move the result into place") ;;
+      esac
     fi
   fi
   unlock_sidecar

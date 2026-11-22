@@ -84,17 +84,10 @@ function collection(kind) {
   return structuredClone(cache[kind])
 }
 
-// The attended path's scripted agents for the same data: what the three lane agents would have returned.
-function attendedAgents(col, overrides = {}) {
-  const label = col.lanes.ledger.result.perRepo[0].root
-  return {
-    'scope:repos': { resolved: [{ requested: '.', root: '/repo', label }], unresolved: [], plan_labels: col.digest.plan_labels.map(({ task_id: taskId, title }) => ({ task_id: taskId, title })), nonce: 'deadbeefcafef00d0123456789abcdef01' },
-    'lane:ledger': col.lanes.ledger.result,
-    'lane:ci': col.lanes.ci.result,
-    'lane:git': { repos: [col.lanes.git.result] },
-    'synthesis:proposals': { proposals: [] },
-    ...overrides,
-  }
+// The same data as a digest that holds the FULL lane results (nothing left out, nothing capped), so a test can compare the
+// report the workflow builds from the collector's bounded digest with the one it builds from everything the lanes measured.
+function fullLanesDigest(col) {
+  return { ...col.digest, ledger: { ...col.lanes.ledger.result, skippedCount: col.digest.ledger.skippedCount, neverFailingInsufficientCount: 0 }, ci: col.lanes.ci.result, git: col.lanes.git.result }
 }
 
 // A caller that passes the `nonce` key, even as undefined, sends exactly that:
@@ -108,4 +101,4 @@ const runDigest = (digest, options = {}) => {
 }
 
 // ledgerText, SPEC_A and SIZES are also what test/harn-runner-2-t3.test.js builds its fixture repositories from.
-module.exports = { WORKFLOW, READER, NONCE, OTHER_NONCE, SIZES, SPEC_A, ledgerText, collection, attendedAgents, runDigest }
+module.exports = { WORKFLOW, READER, NONCE, OTHER_NONCE, SIZES, SPEC_A, ledgerText, collection, fullLanesDigest, runDigest }

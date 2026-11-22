@@ -1347,7 +1347,7 @@ export function normaliseJobName(name) {
 }
 
 // HARN-OPT-4 T7 (AC-SEC-11): a run id is interpolated into
-// `gh run view <id>` by the lane, so only an integer or an all-digit string
+// the per-run job fetch of the collector, so only an integer or an all-digit string
 // is ever accepted; anything else is ignored and never echoed.
 const RUN_ID_RE = /^\d+$/
 const validRunId = (id) => (typeof id === 'number' ? Number.isSafeInteger(id) && id >= 0 : typeof id === 'string' && RUN_ID_RE.test(id))
@@ -1725,8 +1725,8 @@ export function resolveProductSourceExcludeGlobs(root) {
   return { excludeGlobs: value, configSource: 'repo-override', configError: null }
 }
 
-// AC-1: parses the raw stdout of exactly
-//   git log --max-count=<N> --name-only --pretty=format:'%x1e%P%x1f%s'
+// AC-1: parses the raw stdout of the collector's one git history command (its fixed form is in optimise-collect.mjs):
+//   the log with a --max-count bound, --name-only and the pretty format '%x1e%P%x1f%s'
 // (metadata only -- parent hashes, subject line, changed-file paths;
 // NEVER a diff, NEVER file contents) into one {subject, paths} record per
 // commit. %P is the space-separated list of parent hashes: a commit with

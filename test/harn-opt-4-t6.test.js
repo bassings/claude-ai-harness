@@ -27,13 +27,13 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { spawnSync } = require('node:child_process')
-const { runWorkflow } = require('./helpers/fake-runtime.js')
+const { runWorkflow } = require('./helpers/digest-run.js')
 const { makeTempRepo, runAppend, sh, sanitizedGitEnv, cleanupTempRepos } = require('./helpers/temp-repo.js')
 
 const WORKFLOW = path.join(__dirname, '..', 'workflows', 'optimise-cycle.js')
 const MODULE_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')
 const LEDGER_APPEND_PATH = path.join(__dirname, '..', 'workflows', 'lib', 'ledger-append.mjs')
-const NONCE = 'deadbeefcafef00d0123456789abcdef01'
+const NONCE = 'deadbeefcafef00d0123456789abcdef'
 const REDACTED = '<redacted-path>'
 
 test.after(cleanupTempRepos)
@@ -142,135 +142,20 @@ function blockFor(section, labels, k) {
 
 // ==== (1) git lane per roster repo ====
 
-test('T6 git lane: runs once per scope.resolved entry, each prompt naming only that root as a double-quoted git -C target, never the CURRENT repo (AC-DATA-12, AC-SEC-10, AC-OPS-13)', async () => {
-  const { calls } = await run()
-  const gitCalls = calls.filter((c) => c.opts.label === 'lane:git')
-  assert.equal(gitCalls.length, 2, 'one git lane call per roster entry')
-  for (const [i, root] of ROOTS.entries()) {
-    const others = ROOTS.filter((r) => r !== root)
-    const p = gitCalls[i].prompt
-    // Full regex escape (CodeQL js/incomplete-sanitization on the first draft,
-    // which escaped only dots and slashes): a root is a filesystem path and
-    // may carry any metacharacter, backslash included.
-    const literal = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    // Round 1 F5: ONE command with the root double-quoted, not a cd step whose
-    // directory change a later step could silently lose.
-    assert.ok(new RegExp(`git -C "${literal}" log`).test(p), `prompt ${i} runs git -C "${root}" log as one command`)
-    assert.ok(!/\bcd\s/.test(p), `prompt ${i} must not use a separate cd step`)
-    for (const o of others) assert.ok(!p.includes(o), `prompt ${i} must not name another roster root`)
-    assert.ok(!/CURRENT repo/.test(p), 'no CURRENT repo instruction')
-  }
-})
 
 test('T6 git lane: the source no longer carries the CURRENT-repo instruction (AC-DATA-12)', () => {
   const src = fs.readFileSync(WORKFLOW, 'utf8')
   assert.ok(!src.includes('In the CURRENT repo'), 'gitLanePrompt must not tell the agent to run in the CURRENT repo')
 })
 
-test('T6 git lane: a single unkeyed figure object fails GIT_LANE_SCHEMA, the per-repo form passes (AC-DATA-11)', async () => {
-  const { calls } = await run()
-  const schema = calls.find((c) => c.opts.label === 'lane:git').opts.schema
-  assert.ok(validateEntry(figures(), schema).length > 0, 'today\'s single unkeyed object must be rejected')
-  assert.deepEqual(validateEntry({ repos: [entry(0, 'alpha-repo')] }, schema), [])
-  assert.ok(validateEntry({ repos: [{ ...entry(0, 'alpha-repo'), root_index: 'zero' }] }, schema).length > 0, 'root_index is an integer')
-  assert.ok(validateEntry({ repos: [figures({ repo: 'alpha-repo' })] }, schema).length > 0, 'an entry with no root_index is rejected')
-})
 
-test('T6 git lane: two repos with different fix counts give two different figures, each under the right repo label (AC-QA-19, AC-DATA-11)', async () => {
-  const { result } = await run()
-  const section = escapedSection(result.report)
-  const labels = ['alpha-repo', 'beta-repo']
-  const a = blockFor(section, labels, 0)
-  const b = blockFor(section, labels, 1)
-  assert.match(a, /\b3 of 480\b/); assert.match(a, /\b2 counted\b/)
-  assert.doesNotMatch(a, /\b7 of 350\b/)
-  assert.match(b, /\b7 of 350\b/); assert.match(b, /\b5 counted\b/)
-  assert.doesNotMatch(b, /\b3 of 480\b/)
-})
 
-test('T6 git lane: a forged third result is listed as unmatched and its figure never rendered (AC-SEC-10, AC-DATA-11)', async () => {
-  const forged = entry(2, 'forged-repo', { count: 999, n_commits_examined: 888 })
-  const perRoot = goodPair()
-  perRoot[BETA] = { repos: [...perRoot[BETA].repos, forged] }
-  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
-  const section = escapedSection(result.report)
-  assert.match(section, /unmatched/i)
-  assert.doesNotMatch(section, /999|888/)
-  assert.match(blockFor(section, ['alpha-repo', 'beta-repo'], 1), /\b7 of 350\b/, 'the genuine beta result survives the forgery')
-})
 
-test('T6 git lane: a result whose ledger identity does not match its root is unmatched, naming BOTH repo values, and is not merged into another repo (AC-DATA-11, AC-OPS-13)', async () => {
-  const perRoot = goodPair()
-  perRoot[BETA] = { repos: [entry(1, 'alpha-repo', { count: 11, n_commits_examined: 777 })] } // beta's index, alpha's identity
-  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
-  const section = escapedSection(result.report)
-  assert.doesNotMatch(section, /\b11 of 777\b/, 'the mismatched figure is never rendered as a count')
-  const lines = section.split('\n').filter((l) => /mismatch|does not match|unmatched/i.test(l))
-  assert.ok(lines.some((l) => l.includes('alpha-repo') && l.includes('beta-repo')), `a reason line names both repo values:\n${section}`)
-  assert.match(blockFor(section, ['alpha-repo', 'beta-repo'], 0), /\b3 of 480\b/, 'alpha keeps its own figure')
-})
 
-test('T6 git lane: a duplicated root_index is unmatched and neither duplicate is rendered (AC-DATA-11)', async () => {
-  const perRoot = goodPair()
-  perRoot[ALPHA] = { repos: [entry(0, 'alpha-repo', { count: 55, n_commits_examined: 555 }), entry(0, 'alpha-repo', { count: 66, n_commits_examined: 666 })] }
-  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
-  const section = escapedSection(result.report)
-  assert.match(section, /unmatched/i)
-  assert.doesNotMatch(section, /\b55 of 555\b|\b66 of 666\b/)
-})
 
-test('T6 git lane: a repo whose lane failed gets its own line naming the reason, and the other repo is unaffected (AC-OPS-13, AC-PROD-7)', async () => {
-  const perRoot = goodPair()
-  perRoot[BETA] = () => undefined
-  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
-  const section = escapedSection(result.report)
-  const b = blockFor(section, ['alpha-repo', 'beta-repo'], 1)
-  assert.match(b, /not measured|failed|unavailable/i)
-  assert.doesNotMatch(b, /\b3 of 480\b/)
-  assert.match(blockFor(section, ['alpha-repo', 'beta-repo'], 0), /\b3 of 480\b/)
-})
 
-test('T6 git lane: two uninstrumented roots both labelled by the redaction marker stay distinct, by roster position, never merged or cross-matched (AC-DATA-11)', async () => {
-  const perRoot = {
-    [ALPHA]: { repos: [entry(0, REDACTED, { count: 5, n_commits_examined: 501 })] },
-    [BETA]: { repos: [entry(1, REDACTED, { count: 9, n_commits_examined: 502 })] },
-  }
-  const { result } = await run({ 'lane:ledger': ledgerFixture([REDACTED, REDACTED], true), 'lane:git': gitResponder(perRoot) })
-  const section = escapedSection(result.report)
-  assert.match(section, /\b5 of 501\b/); assert.match(section, /\b9 of 502\b/)
-  assert.ok(section.indexOf('5 of 501') < section.indexOf('9 of 502'), 'roster order')
-  const headers = section.split('\n').filter((l) => l.includes(REDACTED))
-  assert.ok(headers.length >= 2, 'one labelled line per roster repo')
-  assert.equal(new Set(headers).size, headers.length, 'the lines are told apart by roster position, not identical')
-  // a swap is caught: beta's result carrying alpha's index is a duplicate, so it is not counted twice
-  const swapped = { [ALPHA]: perRoot[ALPHA], [BETA]: { repos: [entry(0, REDACTED, { count: 9, n_commits_examined: 502 })] } }
-  const r2 = await run({ 'lane:ledger': ledgerFixture([REDACTED, REDACTED], true), 'lane:git': gitResponder(swapped) })
-  assert.doesNotMatch(escapedSection(r2.result.report), /\b9 of 502\b/)
-})
 
-test('T6 git lane: no roster root path appears anywhere in the report, including the unmatched and failed lines (AC-SEC-10)', async () => {
-  const forged = { repos: [entry(0, 'alpha-repo'), entry(5, 'forged-repo')] }
-  for (const git of [gitResponder(goodPair()), gitResponder({ ...goodPair(), [ALPHA]: forged, [BETA]: () => undefined })]) {
-    const { result } = await run({ 'lane:git': git })
-    assert.match(escapedSection(result.report), /\b7 of 350\b|unmatched/i, 'precondition: the per-repo section really rendered')
-    for (const root of ROOTS) assert.ok(!result.report.includes(root), `${root} leaked into the report`)
-  }
-})
 
-test('T6 git lane: repo values echoed from the agent or ledger are flattened and bounded (house oneLine rule)', async () => {
-  const evil = 'x\n## Injected heading\n' + 'A'.repeat(400)
-  const perRoot = goodPair()
-  perRoot[BETA] = { repos: [entry(1, evil, { count: 11, n_commits_examined: 777 })] }
-  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
-  assert.match(escapedSection(result.report), /unmatched|mismatch/i, 'precondition: the bad identity was reported, so the echo path ran')
-  assert.ok(!result.report.split('\n').some((l) => l.startsWith('## Injected')), 'agent text must not open a heading')
-  assert.ok(!/A{200}/.test(result.report), 'agent text is bounded')
-  const evilLabel = 'y\n## Injected label\n' + 'B'.repeat(400)
-  const r2 = await run({ 'lane:ledger': ledgerFixture(['alpha-repo', evilLabel]), 'lane:git': gitResponder({ [ALPHA]: goodPair()[ALPHA], [BETA]: { repos: [entry(1, evilLabel, { count: 7, n_commits_examined: 350 })] } }) })
-  assert.match(escapedSection(r2.result.report), /\b7 of 350\b/, 'precondition: the matched figure rendered under the hostile label')
-  assert.ok(!r2.result.report.split('\n').some((l) => l.startsWith('## Injected')))
-  assert.ok(!/B{200}/.test(r2.result.report), 'the ledger label is bounded in the escaped-defect section')
-})
 
 // ---- the reader's escaped-defects command: per-repo identity, no path ----
 
@@ -712,35 +597,9 @@ test('T6 round 1 F3: an outcome whose target is not known carries the id and say
 
 // ---- F4 (AC-SEC-10): agent text is redacted before it reaches the report or the synthesis block ----
 
-test('T6 round 1 F4: a forged entry whose repo is another roster root, and a matched entry whose method text carries a root or an absolute path, leave no root string in the report or the synthesis prompt (AC-SEC-10)', async () => {
-  const perRoot = goodPair()
-  // Forged: lane alpha answers about index 1 and names beta's ROOT as its repo.
-  perRoot[ALPHA] = { repos: [entry(1, BETA, { count: 999, n_commits_examined: 888 })] }
-  // Matched: beta's genuine entry, but the agent-supplied prose names both roots and a home path.
-  perRoot[BETA] = { repos: [entry(1, 'beta-repo', { count: 7, n_commits_examined: 350, method: `heuristic, see ${ALPHA} and /Users/someone/secret/dir`, scoped_method: `scoped in ${BETA}/sub` })] }
-  const { result, calls } = await run({ 'lane:git': gitResponder(perRoot) })
-  const section = escapedSection(result.report)
-  assert.match(blockFor(section, ['alpha-repo', 'beta-repo'], 1), /\b7 of 350\b/, 'precondition: the matched entry rendered, so the method lines ran')
-  assert.match(section, /unmatched/i, 'precondition: the forged entry was reported')
-  assert.ok(section.includes(REDACTED), 'the redaction marker stands where the path was')
-  for (const root of ROOTS) assert.ok(!result.report.includes(root), `${root} leaked into the report`)
-  assert.ok(!result.report.includes('/Users/someone'), 'an arbitrary absolute path is redacted too')
-  const prompt = calls.find((c) => c.opts.label === 'synthesis:proposals').prompt
-  const block = extractBlock(prompt, 'escaped-defect-heuristic')
-  assert.ok(block, 'precondition: the synthesis data block exists')
-  for (const root of ROOTS) assert.ok(!block.includes(root), `${root} leaked into the synthesis data block`)
-  assert.ok(!block.includes('/Users/someone'))
-})
 
 // ---- F5 (AC-SEC-10 integrity): one quoted command, and a toplevel check in the script ----
 
-test('T6 round 1 F5: the git lane prompt is ONE git -C "<root>" command per step and asks for the toplevel to pass through (AC-SEC-10)', async () => {
-  const { calls } = await run()
-  const p = calls.find((c) => c.opts.label === 'lane:git').prompt
-  assert.ok(p.includes(`git -C "${ALPHA}" rev-parse --show-toplevel`), 'the lane also reports the repo toplevel of that root')
-  assert.ok(p.includes('"toplevel"'), 'the toplevel is passed to the script in the JSON payload')
-  assert.ok(!/\bcd\s/.test(p), 'no separate cd step')
-})
 
 test('T6 round 1 F5: escaped-defects rejects a toplevel that is not the root (after realpath on both), as a rejected result with a reason and no figures; a matching or symlinked root still passes (AC-SEC-10)', () => {
   const a = makeTempRepo(); const b = makeTempRepo()
@@ -935,57 +794,9 @@ const rejectedEntry = (rootIndex, repo, reason, overrides = {}) => ({
   rejected: true, reason, ...overrides,
 })
 
-test('T6 round 2 F3: GIT_LANE_ENTRY_SCHEMA can represent a reader rejection (null figures, optional rejected boolean and reason) and still rejects a non-boolean rejected or a string count (AC-QA-19)', async () => {
-  const { calls } = await run()
-  const schema = calls.find((c) => c.opts.label === 'lane:git').opts.schema
-  assert.deepEqual(validateEntry({ repos: [rejectedEntry(0, 'alpha-repo', 'git toplevel does not match the roster root')] }, schema), [])
-  assert.ok(validateEntry({ repos: [rejectedEntry(0, 'alpha-repo', 'r', { rejected: 'yes' })] }, schema).length > 0, 'rejected is a boolean')
-  assert.ok(validateEntry({ repos: [rejectedEntry(0, 'alpha-repo', 'r', { reason: 5 })] }, schema).length > 0, 'reason is a string')
-  assert.ok(validateEntry({ repos: [rejectedEntry(0, 'alpha-repo', 'r', { count: 'many' })] }, schema).length > 0, 'count is an integer or null, nothing else')
-  assert.deepEqual(validateEntry({ repos: [entry(0, 'alpha-repo')] }, schema), [], 'an ordinary entry without the new fields still validates')
-})
 
-test('T6 round 2 F3: a relayed rejected entry is rendered as "Not measured: <reason>", never as figures and never as "0 of 0" (AC-QA-19)', async () => {
-  const perRoot = goodPair()
-  perRoot[BETA] = { repos: [rejectedEntry(1, 'beta-repo', 'git toplevel does not match the roster root; the git log was not read from that repo')] }
-  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
-  const section = escapedSection(result.report)
-  const b = blockFor(section, ['alpha-repo', 'beta-repo'], 1)
-  assert.match(b, /Not measured: git toplevel does not match the roster root/, `the reason is shown:\n${b}`)
-  assert.doesNotMatch(b, /\bof 0\b|\b0 of\b|examined commits/, 'no figures line')
-  assert.match(blockFor(section, ['alpha-repo', 'beta-repo'], 0), /\b3 of 480\b/, 'the other repo is unaffected')
-})
 
-test('T6 round 2 F3: rejected true wins over a stale integer count, and a null count without the flag is also "Not measured" (AC-QA-19)', async () => {
-  const forged = goodPair()
-  forged[BETA] = { repos: [rejectedEntry(1, 'beta-repo', 'rejected upstream', { count: 7, n_commits_examined: 350 })] }
-  const r1 = await run({ 'lane:git': gitResponder(forged) })
-  const b1 = blockFor(escapedSection(r1.result.report), ['alpha-repo', 'beta-repo'], 1)
-  assert.match(b1, /Not measured: rejected upstream/)
-  assert.doesNotMatch(b1, /\b7 of 350\b/)
-  const nulled = goodPair()
-  // An ordinary (accepted) entry OMITS the rejection keys; a key present with
-  // an undefined value is not JSON and would need a non-standard schema type.
-  const accepted = rejectedEntry(1, 'beta-repo', 'unused')
-  delete accepted.rejected
-  delete accepted.reason
-  nulled[BETA] = { repos: [accepted] }
-  const r2 = await run({ 'lane:git': gitResponder(nulled) })
-  const b2 = blockFor(escapedSection(r2.result.report), ['alpha-repo', 'beta-repo'], 1)
-  assert.match(b2, /Not measured: .+/, `a non-integer count is a failed lane, not zero:\n${b2}`)
-  assert.doesNotMatch(b2, /\bof 0\b|\b0 of\b/)
-})
 
-test('T6 round 2 F3: a rejection reason is flattened, bounded and redacted before it is echoed (AC-SEC-10)', async () => {
-  const perRoot = goodPair()
-  perRoot[BETA] = { repos: [rejectedEntry(1, 'beta-repo', `bad ${BETA}/x\n## Injected reason heading\n${'R'.repeat(400)}`)] }
-  const { result } = await run({ 'lane:git': gitResponder(perRoot) })
-  const b = blockFor(escapedSection(result.report), ['alpha-repo', 'beta-repo'], 1)
-  assert.match(b, /Not measured: bad /, 'precondition: the reason rendered')
-  assert.ok(!result.report.split('\n').some((l) => l.startsWith('## Injected')))
-  assert.ok(!result.report.includes(BETA))
-  assert.ok(!/R{200}/.test(result.report))
-})
 
 // ---- F5 (AC-QA-21): each brake test needs a control proving the entry is otherwise found ----
 
@@ -1055,22 +866,7 @@ test('T6 round 3 L1: a ledger label that is a roster root path is redacted in th
   assert.ok(section.includes(`Repo 1 (${REDACTED})`), `the header shows the redaction marker:\n${section}`)
 })
 
-test('T6 round 3 L2: when the ledger lane fails, a measured git figure is reported as not measured because the ledger identity is unavailable, never as a "repo mismatch" against null (AC-QA-19)', async () => {
-  const res = responses(); delete res['lane:ledger'] // fake-runtime convention: a missing response is a lane that failed
-  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: res })
-  const section = escapedSection(result.report)
-  assert.doesNotMatch(section, /repo mismatch/, `no mismatch is claimed against a ledger that never answered:\n${section}`)
-  assert.match(section, /ledger (lane |identity )?(unavailable|failed)/i, `the real reason is named:\n${section}`)
-})
 
-test('T6 round 3 L3: the escaped-defect-heuristic data block carries the flattened repo label, not the raw one (the flat() used to be overwritten by the spread)', async () => {
-  const messy = 'alpha\n   repo'
-  const perRoot = { [ALPHA]: { repos: [entry(0, messy, { count: 3, n_commits_examined: 480 })] }, [BETA]: goodPair()[BETA] }
-  const { calls } = await run({ 'lane:ledger': ledgerFixture([messy, 'beta-repo']), 'lane:git': gitResponder(perRoot) })
-  const block = JSON.parse(extractBlock(calls.find((c) => c.opts.label === 'synthesis:proposals').prompt, 'escaped-defect-heuristic'))
-  assert.equal(block[0].count, 3, 'the figure matched its repo')
-  assert.equal(block[0].repo, 'alpha repo', `the repo label is flattened:\n${JSON.stringify(block[0])}`)
-})
 
 test('T6 round 3 L4: `ids` with legacy_targets also returns a sidecar_entry in the fixed key set for every mappable target, null otherwise, and the real reader accepts it once written beside an outcome event (AC-PROD-8, AC-DATA-14)', () => {
   const [r, bad] = legacy([{ kind: 'ci_demote', component: 'lens-operability', concern: 'trigger glob', security_purposed: true }, { cycle: 5, change: 'x' }])

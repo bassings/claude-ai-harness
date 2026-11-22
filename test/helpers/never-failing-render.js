@@ -3,10 +3,10 @@
 // digest keeps (HARN-RUNNER-2 T1b, F4). The fixtures are the smallest set of lane
 // responses the workflow accepts; only the ledger lane's neverFailingAcs matters here.
 const path = require('node:path')
-const { runWorkflow } = require('./fake-runtime.js')
+const { runWorkflow } = require('./digest-run.js')
 
 const WORKFLOW = path.join(__dirname, '..', '..', 'workflows', 'optimise-cycle.js')
-const NONCE = 'deadbeefcafef00d0123456789abcdef01'
+const NONCE = 'deadbeefcafef00d0123456789abcdef'
 
 const SOURCES = { ci_wait: 'ledger:conduct_plan_event', human_wait: 'ledger:conduct_plan_event', agent_compute: 'ledger:tdd_task|review_cycle|plan_cycle start/terminal pair' }
 const TOTALS = { ciWaitSeconds: 0, humanWaitSeconds: 0, agentComputeSeconds: 0, unterminatedWaits: 0, agentComputeStartOnlyRuns: 0, agentComputeTerminalOnlyRuns: 0, agentComputeStartOnlyByKind: {}, agentComputeTerminalOnlyByKind: {}, agentComputeAbortedPairs: 0 }
@@ -37,15 +37,19 @@ const responses = (neverFailingAcs) => ({
   'synthesis:proposals': { proposals: [] },
 })
 
-// The report's line for each row, in row order (a row's repo/spec/criterion must be unique in the table).
+// The report's line for each row, in row order (a row's repo/spec/criterion must be unique in the table), or null for a row the
+// report does not list: the digest path leaves a plain insufficient-data row out and counts it (HARN-RUNNER-2 T1b, T4).
+// `leftOut` is that count as the report states it.
 async function renderNeverFailing(rows) {
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses(rows) })
   const lines = result.report.split('\n')
-  return rows.map((row) => {
-    const found = lines.filter((line) => line.startsWith(`- ${row.repo}/${row.spec} ${row.ac_id}:`))
-    if (found.length !== 1) throw new Error(`expected one report line for ${row.ac_id}, found ${found.length}`)
-    return found[0]
+  const found = rows.map((row) => {
+    const own = lines.filter((line) => line.startsWith(`- ${row.repo}/${row.spec} ${row.ac_id}:`))
+    if (own.length > 1) throw new Error(`expected at most one report line for ${row.ac_id}, found ${own.length}`)
+    return own[0] ?? null
   })
+  const stated = /(\d+) criteria rows left out as insufficient data/.exec(result.report)
+  return Object.assign(found, { leftOut: stated ? Number(stated[1]) : 0 })
 }
 
 module.exports = { renderNeverFailing }

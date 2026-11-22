@@ -23,21 +23,6 @@ test('static: workflows/optimise-cycle.js and workflows/lib/optimise-read.mjs re
   }
 })
 
-test('static: the optimiser reads only run/job METADATA via gh, never a job log -- every mention of --log or a /logs endpoint in workflows/optimise-cycle.js sits within a clear prohibition ("never"/"do not"), never as an instruction to actually fetch one (AC-SEC-7)', () => {
-  const contents = readAll('workflows', 'optimise-cycle.js')
-  for (const re of [/--log\b/g, /\/logs\b/g]) {
-    let m
-    let matched = false
-    while ((m = re.exec(contents))) {
-      matched = true
-      const windowStart = Math.max(0, m.index - 60)
-      const windowText = contents.slice(windowStart, m.index + m[0].length + 10)
-      assert.ok(/never|do not|don't/i.test(windowText), `mention of "${m[0]}" at offset ${m.index} is not clearly a prohibition: ...${windowText}...`)
-    }
-    assert.ok(matched, `sanity: expected at least one mention of ${re} (the explicit prohibition itself)`)
-  }
-})
-
 // ---- AC-SEC-9: mechanical no-mutation grep ----
 
 test('static: workflows/lib/optimise-read.mjs contains no filesystem WRITE call anywhere (fs.writeFileSync, fs.appendFileSync, fs.rmSync, fs.unlinkSync, fs.mkdirSync, fs.rename*) -- it is read-only by construction, not by discipline alone (AC-SEC-9)', () => {
@@ -207,24 +192,6 @@ test('static: isWeakCiEvidenceRemoval keys on neverFailed !== true, names none o
   assert.match(body, /neverFailed\s*!==\s*true/)
   for (const flag of ['insufficientData', 'truncated', 'renameSuspect', 'reRun', 'partialFetch']) assert.ok(!body.includes(flag), `the brake body must not name ${flag}`)
   assert.ok(!/pin the opposite|T6 brake controls|Keying on `neverFailed/.test(src), 'the comment explaining why the code did not key on neverFailed is gone')
-})
-
-test('static: the CI lane prompt gains exactly one further gh invocation, the attempt-1 jobs fetch, for runs with attempt > 1, and still caches nothing (AC-SIMP-11, AC-DATA-17)', () => {
-  const src = readAll('workflows', 'optimise-cycle.js')
-  const start = src.indexOf('const ciLanePrompt')
-  const end = src.indexOf('const ciLane = ', start)
-  assert.ok(start >= 0 && end > start, 'sanity: the lane prompt was located')
-  const prompt = src.slice(start, end)
-  assert.equal((prompt.match(/gh run view <id> --attempt 1 --json jobs/g) || []).length, 1, 'the attempt-1 fetch is named once, verbatim')
-  assert.equal((prompt.match(/gh run view <id>/g) || []).length, 2, 'two gh run view invocations in total: latest jobs and attempt-1 jobs')
-  assert.equal((prompt.match(/gh run list/g) || []).length >= 1, true)
-  assert.ok(!/gh (?!run (?:list|view))\w+/.test(prompt.replace(/`gh` /g, '')), 'no other gh subcommand is introduced')
-  const at = prompt.indexOf('--attempt 1')
-  const near = prompt.slice(Math.max(0, at - 300), at + 300)
-  assert.match(near, /attempt[^.]{0,40}(?:> ?1|greater than 1|more than 1|above 1)/i, 'issued only for runs with attempt > 1')
-  // T7 round 2 L1 (AC-SEC-14): the id restriction is stated inline on the attempt-1 command, not by reference.
-  assert.match(near, /<id> MUST be an all-digit databaseId taken from that repo's own list/, 'the all-digits, own-list id rule is restated on the attempt-1 command')
-  assert.ok(prompt.includes('attempt1_jobs') && prompt.includes('attempt1_fetch_error'), 'each such run carries its attempt-1 jobs or a fetch-failed marker')
 })
 
 test('static: SKILL.md describes the attempt-1 re-run qualification (AC-SIMP-5, AC-DATA-16)', () => {

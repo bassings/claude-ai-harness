@@ -1406,13 +1406,16 @@ test('T11 AC-SEC-8: neither the runner nor its plist contains disableAllHooks, e
 
 test('T11 AC-SIMP-3: the runner adds no overlap lock and no log rotation', () => {
   const text = fs.readFileSync(SCRIPT_PATH, 'utf8')
-  // No overlap lock: runs are never serialised or refused because another is running. The one lock the runner takes is the short
-  // mkdir lock on the proposal-targets sidecar's read, merge and rename (HARN-RUNNER-2 T3 L2), which only orders those few
-  // seconds between runners that really do overlap, and is the only lock file named anywhere in the script.
+  // No overlap lock: runs are never serialised or refused because another is running. The one lock is the short lock on the
+  // proposal-targets sidecar's read, merge and rename (HARN-RUNNER-2 T3 L2), which only orders those few seconds between runs that
+  // really do overlap. Its code is the result check module's, shared with the attended entry (T4), so the runner names no lock file
+  // at all; the module names exactly that one.
   for (const banned of [/\bflock\b/, /\.pid\b/, /mv "\$LOG"/, /logrotate/]) {
     assert.ok(!banned.test(text), `the runner must not contain ${banned}`)
   }
-  assert.deepEqual([...new Set(text.match(/[\w.-]*\.lock\b/g) || [])], ['optimise-sidecar.lock'], 'the sidecar lock is the only lock file')
+  assert.deepEqual([...new Set(text.match(/[\w.-]*\.lock\b/g) || [])], [], 'the runner names no lock file: the lock lives in the result check module')
+  const verify = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'lib', 'optimise-verify.mjs'), 'utf8')
+  assert.deepEqual([...new Set(verify.match(/[\w.-]*\.lock\b/g) || [])], ['optimise-sidecar.lock'], 'the sidecar lock is the only lock file the module names')
 })
 
 // AC-OPS-4 and AC-DATA-14: cleanup -----------------------------------------

@@ -318,12 +318,12 @@ see "Delivery optimiser" below; never per-PR):
 
 ```
 /optimise-cycle
-/optimise-cycle {"repos": ["../delivery-repo-a", "../delivery-repo-b"]}
 ```
 
-Read-only: fans out to three parallel lanes (ledger, GitHub Actions via
-`gh`, git history) and writes a ranked, cited report of proposed changes —
-it never applies one itself.
+Read-only: your session collects the ledger, GitHub Actions and git data with
+one collector program, the workflow analyses it, and a result check places a
+ranked, cited report of proposed changes in the repository (see "Delivery
+optimiser" below for the steps) — it never applies a change itself.
 
 ## Per-repo trigger customisation
 
@@ -1177,8 +1177,8 @@ decision:
   `### NOTES` section to `AGENT-HARNESS.md`, inside the existing contract
   fence, used to make every install report `consistent:false` on a routine
   documentation edit (H1, fixed).
-- The **in-process cross-check** compares the fields the scope agent
-  reports as instructed against the literal `PLAN_SCHEMA`/`REVIEW_SCHEMA`
+- The **in-process cross-check** compares the fields the plan or review
+  cycle's first (scoping) step reports as instructed against the literal `PLAN_SCHEMA`/`REVIEW_SCHEMA`
   object the running workflow script itself holds -- no filesystem, no
   subprocess, no model, nothing left to parse. This is the reliable half.
 
@@ -1269,12 +1269,33 @@ it (weekly → fortnightly → monthly); a third dry cycle at monthly retires
 the routine. See `skills/optimise-cycle/SKILL.md` for the full rollout and
 decay rule.
 
-**Report**: written to `.claude/optimise-cycle-report.md` in the repo the
-cycle was invoked in — gitignored via `.git/info/exclude` and verified with
-`git check-ignore -q` before every write (the write is refused if that
-check fails), mirroring `ledger-append.mjs`'s own discipline exactly via
-`workflows/lib/optimise-report-ignore.mjs`, and the **only** file any of
-its steps may create or modify.
+**How an attended run works.** There is one way to collect data and the
+operator's own session drives it; the workflow only analyses what it is
+handed. `skills/optimise-cycle/SKILL.md` gives the exact commands, in this
+order: make a private directory (mode 0700) outside the repository; run
+`workflows/lib/optimise-collect.mjs` into it for the repository; mint a nonce;
+read `digest.json`; call the `optimise-cycle` workflow with `{digest, nonce}`;
+save the object it returns, unchanged; then run
+`workflows/lib/optimise-verify.mjs attended` on it. That last step is the same
+result check the weekly runner uses. It holds every figure in the report
+against the collected files and every proposal-targets entry the workflow
+returned against what this run names, makes the two output paths ignored,
+takes the sidecar lock, merges the sidecar and places the report and the
+sidecar. The session never writes either file by hand, and nothing else in
+this repository does: the attended and unattended paths share one copy of the
+result check, the lock and the placement. A call to the workflow with no
+digest, or with a nonce that is not 32 lower-case hex characters, is refused
+before any model runs.
+
+**Report**: written to `.claude/optimise-cycle-report.md` in the repo that was
+analysed, by the result check (never by a model) after it has checked the
+report. The path is gitignored through `.git/info/exclude` and confirmed with
+`git check-ignore -q` before either output is written, and the write is
+refused if that check fails (`workflows/lib/optimise-report-ignore.mjs`,
+mirroring `ledger-append.mjs`'s own discipline). The proposal-targets sidecar,
+`.claude/optimise-proposal-targets.json`, is placed beside it under the main
+checkout. These two files are the only ones a run creates or modifies in the
+analysed repository.
 
 **Retention (F12, round-7 review)**: the report is a SECOND artefact
 derived from the ledger (plan keys, run ids, per-plan seconds, orphan
@@ -1293,34 +1314,50 @@ other removal, demotion or skip proposal must state the evidence that would
 reinstate it, alongside the escaped-defect counter-metric (a stated
 heuristic derived from git history, not a verified per-PR attribution).
 
-**Args**: `{repos?: string[] (default: the current repo), window?: number
-(ledger lines per repo; default 2000)}` — never a hardcoded path or repo
-name; the repos it reads always come from `args` or its documented default.
+**Arguments of the workflow**: `{digest, nonce}` and nothing else: the digest
+is one repository's `digest.json` from the collector and the nonce is 32
+lower-case hex characters minted by the caller. The workflow reads no file and
+runs no command; which repository and how much of its ledger (90 records)
+are decided by the collector, not by an argument.
 
 ### Weekly scheduled run (HARN-OPT-2 T3)
 
 The weekly cadence above runs as a local launchd job
 (`com.local.optimise-cycle-weekly`, Mondays 07:41 local), driven by
-`bin/optimise-cycle-weekly.sh` in this repo. That script loops over the
-configured delivery repos, invokes `claude -p "/optimise-cycle ..."`
-headlessly against each (read-only, never applying a proposal, same as
-every other invocation of the cycle), and appends one redacted transcript
-per repo to `~/.claude/logs/optimise-cycle-weekly.log`.
+`bin/optimise-cycle-weekly.sh` in this repo. For each configured delivery
+repo the runner collects the ledger, git and GitHub Actions data itself, with
+`workflows/lib/optimise-collect.mjs`, into a private directory; starts one
+headless `claude -p` session that only analyses what it is handed and returns
+text (read-only, never applying a proposal); checks what came back against
+the files it collected; and writes the report and the sidecar itself. It
+appends one `RESULT PASS` or `RESULT FAIL` line per repo, plus a few
+fixed-vocabulary lines, to `~/.claude/logs/optimise-cycle-weekly.log`. No text
+the model wrote reaches the log.
 
-**PASS/FAIL is decided from the report artefact and this script's own
-observations, never from what the model said.** A repo passes only if,
-after the run: `<repo>/.claude/optimise-cycle-report.md` exists; its mtime
-is at or after the timestamp captured immediately before that repo's run
-started (this is what catches a stale report left over from a previous
-week -- the one failure mode a status-only check cannot see, since a
-leftover file looks identical to a fresh one to anything that only asks
-"does it exist"); and it is non-empty with at least a markdown heading and
-a section heading. The model's free-text reply is still appended to the
-log as diagnostic context, but the verdict never depends on it: a run that
-exits 0 and says nothing is a PASS if the artefact is genuinely fresh, and
-a run that exits 0 and says the right words is a FAIL if the artefact is
-stale, missing or empty. Each repo gets one `RESULT PASS`/`RESULT FAIL`
-line naming the reason; the script exits non-zero if any repo failed.
+**PASS or FAIL is decided from content by the runner, never from what the
+model said.** A repo passes only when every lane ran (the ledger, git and CI
+lanes; a repo with no Actions history counts as having run, and the report
+says so), the collector's digest was accepted, `claude` exited 0, the reply
+was the agreed JSON, every measured figure in the report equals the figure in
+the files the runner collected (ledger records, CI run counts, the raw
+escaped-defect count and the rest of the checked lines), the report holds no
+absolute path under `$HOME`, the repo or the per-run directory, every
+proposal-targets entry the session returned is one this run names, the two
+output paths are gitignored, and both files were placed. A report that merely
+looks like a report no longer passes: a heading and a section heading are not
+enough, and a report that says 0 ledger records beside a ledger the runner
+found to hold records is a FAIL that names both numbers. A lane that could not
+run for a reason outside the runner's control (for example `gh` not logged in)
+is a FAIL that names the lane and the mode; the report is still written with
+the other lanes' real figures and the missing lane says `Not measured`, so
+PASS always means every lane ran. When the result is not trusted nothing is
+placed and the last good report and sidecar stay as they were. **A run that is
+not scored PASS does not count as a dry cycle** for the cadence-decay rule
+above: only a PASS run's report can show a dry cycle. Each `RESULT` line
+carries `ledger=<collected>/<reported>`, `ci=<runs>` and `git=<commits>` (or
+`failed:<mode>`), and the digest's status, omission total and whether it was
+trimmed, as fixed tokens and integers only; the script exits non-zero if any
+repo failed.
 
 A configured repo path that does not exist on disk is a **configuration
 FAIL** (`RESULT FAIL ... reason="configured repo path does not exist"`),
@@ -1467,87 +1504,82 @@ anchored to that specific message, not a bare grep for the ceiling
 variable's name, which used to false-positive on any transcript merely
 mentioning it (this README does, right here).
 
-**Permission constraints on the unattended job -- an explicit allowlist, with
-the hooks left on.** `claude -p` runs here with `--allowedTools` naming every
-tool the optimiser needs (read-only git and gh queries, the two node helpers
-the workflow invokes, and `Edit` on exactly two scratch files, below) and
-`--permission-mode dontAsk`, which refuses every tool not on the list rather
-than prompting or auto-approving it, and `--setting-sources user`, so only the
-user's own settings load and an analysed repo's committed or local settings
-cannot widen the list or add hooks (the guard, snapshot and plan-guard hooks
-are registered at user level, so they stay). `--setting-sources user` also
-loads the operator's own `permissions.allow` rules from
-`~/.claude/settings.json`, and any such rule joins the unattended allowlist,
-so the list above is the boundary only when the operator has no user-level
-allow rules. Agents defined inside an analysed repo (`.claude/agents/`) are not
-loaded under `--setting-sources user`, and a built-in subagent started by the
-session was refused both a write outside the repo and an unlisted Bash
-command; agents the operator has installed at user level do load, and are
-trusted as the operator's own. `--disallowedTools` stays as a second,
-explicit refusal of `Bash(rm:*)`, `Bash(sudo:*)`, `Bash(git push:*)`,
-`Bash(git commit:*)`, `Bash(git reset:*)`, `Bash(gh pr merge:*)`,
-`Bash(gh pr create:*)`, `Bash(gh issue create:*)`,
-`Bash(gh release create:*)`, `Bash(gh workflow run:*)`, `Bash(curl:*)` and
-`Bash(wget:*)`, plus `git -c` in its `-C` form. The hooks are **not**
-disabled: the destructive-command guard and the snapshot hook stay active for
-the unattended session.
+**What the unattended session can do (as measured on Claude Code 2.1.322).** The
+session has no shell and no file write. The invocation passes exactly these
+flags and tool rules:
 
-**No allowed command may send data to a host the session chooses.** `Read`,
-`Grep` and `Glob` can read any file this user can read, so the boundary is
-egress, not readability. `gh repo view` is not on the list (the workflow never
-runs it, and with a `HOST/OWNER/REPO` argument it sends a request to any
-host), and `-R`, `--repo` and `--hostname` are denied on every `gh` command,
-in their attached and separate forms and inside a short-flag cluster
-(`Bash(gh * -R*)`, `Bash(gh * -*R*)`, `Bash(gh * --repo*)`,
-`Bash(gh * --hostname*)` and the same at the front of the command), as are the
-`GH_HOST=` and `GH_REPO=` prefixes. `gh run list` and `gh run view` therefore
-reach only the host the analysed repo's own remote names. `git -C` and the
-`optimise-report-ignore.mjs` helper (which writes `<root>/.git/info/exclude`
-and runs git there) are allowed only with `<root>` naming the analysed repo
-itself, never a wildcard path, because git run in a directory someone planted
-reads that directory's config, which can name a program git executes. A repo
-whose path a rule cannot name exactly gets no such rule, and the log says
-`NO-ROOTED-RULES <label>`. These are deny and prefix rules; whether the CLI
-matches every spelling is for a real headless run to show.
-`test/static-checks.test.js` pins the deny tokens and the allowlist flags in
-the script text, and `test/weekly-runner.test.js` captures the real argument
-list. The test suite still drives a stub `claude`. Real headless probes
-under the runner's flags were run by hand during review: the `gh`
-host-naming forms were refused, `git remote get-url origin` was allowed and
-`git remote set-url` refused, and `safe.bareRepository` reached the session's
-git. The full real weekly run is recorded in `docs/release-checklist.md` when
-it happens.
+- `--allowedTools "Workflow" "Read(//<the per-run directory>/**)"`: the
+  Workflow tool, and Read of the one per-run directory. Nothing else is
+  allowed.
+- `--disallowedTools Bash Write Edit NotebookEdit WebFetch WebSearch Grep
+  Glob`: each denied as a whole tool, by bare name with no pattern, so an
+  allow rule in the operator's own settings cannot hand the session a shell, a
+  file write, a network fetch or a search of the file system.
+- `--permission-mode dontAsk`: refuses every tool not on the allowed list
+  instead of prompting.
+- `--setting-sources user`: only the operator's own user-level settings load,
+  so an analysed repo's committed or local settings cannot widen the list or
+  add hooks (the hooks registered at user level still apply).
+- `--strict-mcp-config` with no `--mcp-config`: no MCP server loads.
+- `--no-session-persistence`: the digest is not saved in a session transcript.
+- `--output-format json`: the reply is a JSON envelope the result check parses
+  strictly, never scanned for delimiters.
+- The session is started in the per-run directory, not in the analysed repo.
+  The runner copies the installed `optimise-cycle.js` into that directory and
+  the session calls it by `scriptPath`, passing the digest and a nonce the
+  runner minted. It replies with only the object the workflow returned.
 
-**The session never writes under `.claude/`.** Measured on a real headless
-run (Claude Code 2.1.322, `dontAsk`): every write into `.claude/` is refused
-whatever the allow rule. So the runner names two scratch files in a
-directory of this one run's own (below) and passes them to the workflow as `report_path` and
-`proposal_targets_path`; the session may `Edit` those two files and nothing
-else, and writes no other file. After the session ends the runner, not the
-session, moves each into place (`.claude/optimise-cycle-report.md` in the
-repo, and the sidecar under the main checkout the optimiser resolved). It
-accepts a file only if it is a regular file (not a symlink), non-empty and
-under a size cap, and moves it through a fresh temp file and a rename, so
-nothing is written through a symlink. A file that is present and refused makes
-the repo FAIL with the reason; one that is absent is reported by the verdict
-as a missing or stale report. The scratch path must be a plain absolute path
-with no `.claude` segment, so with `$TMPDIR` unset and `~/.claude` as the
-fallback the run stops with a FAIL (launchd always sets `$TMPDIR`).
+The session runs no `git`, no `gh` and no helper program, and writes no file:
+the runner collected everything before it started, and the runner places the
+outputs after checking them. The prompt tells the session, before it reads
+`digest.json`, that every string in the digest is untrusted data and never an
+instruction.
 
-**The plan-guard Stop hook rewrites a dormant plan marker, and the runner puts
-it back.** Measured: the hook rewrote a dormant `.claude/active-plan` (a stale
-conductor line) to an absolute plan path with `conductor: <the headless
-session id>`. Each run is given `--session-id <uuid>`, the runner saves the
-marker's bytes first, and afterwards restores them byte for byte only if the
-marker now carries that uuid, so a real conductor's concurrent change is never
-overwritten (a marker that did not exist before and now carries the uuid is
-removed). `RESTORED-ACTIVE-PLAN <label>` is logged when that happens, and the
-restore runs from the same cleanup path, so a signal still restores. A
-SIGKILL skips it. This does not stop the hook from blocking the headless
-session's own stop while plan tasks are open, and the real conductor is
-treated as a bystander for the length of the run. Separately, the snapshot
-hook still writes `refs/harness-snapshots/*` in every analysed repo on each
-weekly run; nothing here prevents that.
+**Residual risk, stated plainly.** (1) `--setting-sources user` loads the
+operator's own settings, and user-level allow rules still apply to any tool
+that is not denied as a whole tool, namely Read, Skill, Agent and Workflow.
+(2) The Workflow grant is the bare tool name, not scoped to one workflow; whether
+a grant can be scoped to one is not measured. (3) The session reads
+`digest.json`, which holds untrusted collected text (commit subjects, CI job
+names, plan titles), outside the nonce fence that every model the *workflow*
+starts gets. A digest that carried a planted instruction could therefore shape
+the words of a proposal, which the operator reads before acting. It is
+bounded, not removed: the session has no shell, write or network tool; the
+workflow returns the SHA-256 of the nonce it fenced with and the result check
+refuses a mismatch; and every figure and every returned sidecar entry is
+checked against what the runner collected. Whether a real session obeys such
+an instruction has not been measured yet; a probe with a planted instruction is
+planned (`specs/harn-runner-2.md`, task T5). (4) Plugin hooks still see the session while it
+runs, though it is not saved to disk. The attended session is the operator's
+own, has a shell, and reads the digest unfenced in the same way.
+
+**Measured (2026-11-21, Claude Code 2.1.322), one headless run in a scratch
+repository under these flags:** the session was refused `git log -1`, and the
+agent the workflow started reported it had no shell tool; a Read outside the
+per-run directory was refused for both; a 19,703-character digest with quotes,
+backslashes and non-ASCII text, and a 7,036-character report, each crossed
+the session intact in that run (one run is not a guarantee, which is why the
+result check compares every figure). At this repository's real size the whole
+collected ledger (213,651 characters) could not cross the session, which is
+why the workflow takes a bounded digest (about 28 KB). **Not measured:**
+whether a bare `Bash` deny overrides an operator's own user-level allow rule;
+whether a refused shell call appears in the CLI's `permission_denials` list
+(the list was empty in the 2.1.322 run, and held one entry per refused Read in
+a later run on 2.1.330, so the runner logs `DENIED-TOOLS <label> <n>` as what
+the CLI said, or `unknown`, never as proof that nothing else was tried); and
+the first real weekly run under this runner, which `docs/release-checklist.md`
+records when it happens.
+`test/harn-runner-2-t3.test.js` captures the real argument list the runner
+passes to a stub `claude`; the test suite never makes a real model call.
+
+**The session does not start in an analysed repository.** It starts in the
+per-run directory, which has no `.claude/active-plan`, so the plan-guard Stop
+hook has no plan marker of a repository to rewrite, and the runner no longer
+saves or restores one. An earlier runner measured that the hook rewrote a
+dormant marker in the repository the session started in; that is why the
+session no longer starts there. Not measured under this runner: whether the
+snapshot hook writes anything into an analysed repository (an earlier runner's
+sessions started there and it did).
 
 **A FAIL is announced, and cleanup is the runner's job.** When any repo's
 verdict is FAIL, no repos are configured, or every configured path is skipped
@@ -1561,8 +1593,8 @@ and on SIGTERM or SIGINT, and a run that is stopped that way records FAIL and
 notifies like any other FAIL. Each invocation makes a directory of its own,
 `run.XXXXXX` (from `mktemp -d`), inside a mode-700 parent that only the runner
 writes to (`optimise-weekly-runner` under `$TMPDIR`, or under `~/.claude` when
-that is unset), and every per-run file (transcript, scratch report and sidecar,
-plan-marker snapshot, staleness clone) lives in it, so overlapping runs, or a
+that is unset), and every per-run file (the collected data and digest, the session's output,
+the result check's two output files, the staleness clone) lives in it, so overlapping runs, or a
 run overlapping a test, never share a file name. The run removes its own
 directory on exit, after the outputs are placed and the plan marker restored.
 The parent is checked after it is created (not a link, owned by this user, its
@@ -1571,17 +1603,19 @@ only stale `run.XXXXXX` directories: real directories (links are not followed)
 owned by this user and older than 24 hours, which is longer than any run can
 last (the 21-minute session timeout per repo), logging
 `REMOVED-STALE-RUN-DIR <name>`. A sibling's fresh directory is never touched.
-There is no lock. After a SIGKILL the dead run's directory therefore stays for
-up to 24 hours, and its plan-marker snapshot is not used to restore a marker
-that carries the dead session's id (the conductor's own six-hour staleness rule
-re-claims it). The next run also recognises a killed run's staged copy by a
-marker, removes it if git does not track it, and logs
-`REMOVED-LEFTOVER-STAGED <label>`. The outcome file reads `RUNNING` from the
-moment a run starts, so a run that dies without reporting leaves `RUNNING`,
-not last week's result, and a failed write of it is logged as
-`LAST-RESULT-WRITE-FAILED`. If the plan marker cannot be restored (the
-snapshot is missing or the write fails) it is left exactly as it was,
-`RESTORE-FAILED-ACTIVE-PLAN <label>` is logged and the repo FAILs.
+There is no overlap lock: runs are never refused and never wait on each other.
+The one lock is short and covers only the proposal-targets sidecar's read, merge
+and rename, because that file is the only copy of the map from a decided
+proposal's id to its target: a symlink named `optimise-sidecar.lock` in the
+main checkout's git directory, whose target names its owner. A lock whose owner
+process has gone, or that is older than 10 minutes, is taken over; a live fresh
+one is waited for up to about 30 seconds and then the repo FAILs with `could
+not take the sidecar lock`. Its code is in `workflows/lib/optimise-verify.mjs`
+and is shared by the runner and the attended run. After a SIGKILL the dead run's
+directory stays for up to 24 hours, until the next run's start-up sweep removes
+it. The outcome file reads `RUNNING` from the moment a run starts, so a run that
+dies without reporting leaves `RUNNING`, not last week's result, and a failed
+write of it is logged as `LAST-RESULT-WRITE-FAILED`.
 
 **Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
 and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
@@ -1589,15 +1623,18 @@ repo's `bin/`** after merging any change to them. Unlike the top-level
 workflow scripts above, copying these genuinely does deploy them: launchd
 spawns a fresh shell process per run, which reads the file at exec, so there
 is no snapshot and no restart step. **The runner also requires the matching
-`workflows/optimise-cycle.js`**: it passes the workflow arguments
-(`report_path`, `proposal_targets_path`) that an older installed workflow does
-not accept, so updating the runner without the workflow makes every repo
-FAIL. Run `bin/install.sh` (which installs `workflows/`) and confirm with
-`bin/install.sh --check`, as well as the copy commands below; a run that finds an installed `optimise-cycle.js`
-whose `WEEKLY_RUNNER_CONTRACT` constant is missing or lower than the runner's
-`REQUIRED_WORKFLOW_CONTRACT` stops with `installed optimise-cycle.js predates
-report_path; run bin/install.sh`. The `diff -q` lines below confirm the `bin/`
-copies only, so it is necessary but not sufficient on its own:
+`workflows/optimise-cycle.js` and `workflows/lib/`** (the collector, the
+reader, the result check and the report-ignore helper): the runner passes the
+workflow a digest and a nonce and checks the object it returns, which an older
+installed workflow neither accepts nor returns. Run `bin/install.sh` (which
+installs `workflows/`) and confirm with `bin/install.sh --check`, as well as the
+copy commands below. A run that finds an installed `optimise-cycle.js` whose
+`WEEKLY_RUNNER_CONTRACT` constant is missing or lower than the runner's
+`REQUIRED_WORKFLOW_CONTRACT` stops before any collection with `installed
+optimise-cycle.js is older than this runner requires; run bin/install.sh`, and
+one that finds a helper missing from the install fails the repo naming the
+file. The `diff -q` lines below confirm the `bin/` copies only, so they are
+necessary but not sufficient on their own:
 
 ```bash
 cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
@@ -1639,6 +1676,120 @@ repo list (a clean start/done log, exit 0, nothing to do) rather than
 crashing or falling back to any hardcoded path -- this public repo carries
 no private repo names or account paths in its own tracked files
 (`test/static-checks.test.js` guards `bin/` for exactly that).
+
+#### Runbook: every fixed FAIL reason
+
+Each repo's `RESULT FAIL` line in `~/.claude/logs/optimise-cycle-weekly.log`
+ends with `reason="..."` and, when the failure has a class, a `cause=` token. The
+reasons below are the fixed words the runner, the collector's digest and the
+result check can print (a placeholder such as `<n>` stands for a number or a
+fixed token the line fills in). Nothing the session said is ever in a reason.
+The first cell is the reason's leading words, so search the log for them. A
+test (`test/harn-runner-2-t4.test.js`) fails when the code can print a reason
+that has no row here, and when a row here names a reason the code no longer
+prints. Where a row says "re-run", start the job by hand with
+`~/.claude/bin/optimise-cycle-weekly.sh` after the fix, or wait for the next
+scheduled run.
+
+| Reason or token | What it means | What to check | What to do |
+|---|---|---|---|
+| `no repos configured` | The runner has no repository to analyse. | `~/.claude/optimise-weekly-repos` exists and lists one path per line. | Add the paths (see above), then re-run. |
+| `no repos checked (all skipped)` | Every configured path was skipped, so nothing was analysed. | Each path is a git repository and still exists. | Fix the list or the paths, then re-run. |
+| `configured repo path does not exist` | A configured path is not on disk. | The spelling of the line in `~/.claude/optimise-weekly-repos`, and that the volume is mounted. | Correct or remove the line. |
+| `cd into repo failed` | The runner could not enter the configured path. | Permissions on the directory. | Fix the permissions or remove the path. |
+| `could not create this run's temp directory` | The runner could not make its private per-run directory. | Free space and permissions under `$TMPDIR` (or `~/.claude` when `$TMPDIR` is unset). | Free space or fix permissions, then re-run. |
+| `could not capture a valid run start time` | The runner could not read the clock for this repo. | `date +%s` prints a number. | Re-run; if it repeats, fix the system's `date`. |
+| `installed optimise-cycle.js is older than this runner requires; run bin/install.sh` | The installed workflow predates this runner, so the run stopped before collecting anything. | `bin/install.sh --check` reports drift. | Run `bin/install.sh`, then `bin/install.sh --check`. |
+| `workflows/optimise-cycle.js is missing from the install; run bin/install.sh` | The installed workflow file is not there. | `ls ~/.claude/workflows/optimise-cycle.js`. | Run `bin/install.sh`. |
+| `workflows/lib/<file> is missing from the install; run bin/install.sh` | A helper program the runner needs is missing from the install. | The file named in the reason under `~/.claude/workflows/lib/`. | Run `bin/install.sh`, then `bin/install.sh --check`. |
+| `could not copy the installed workflow into the per-run directory` | The runner could not copy the workflow beside the digest for the session. | Free space and permissions on the per-run directory. | Free space, then re-run. |
+| `could not mint a containment nonce` | The runner could not make the random token that fences collected text. | That `openssl` or `node` runs from the job's PATH. | Fix the PATH or reinstall the tool, then re-run. |
+| `collector timed out after` | Collecting one repo's data took longer than its bound. | `gh` and `git` answer quickly by hand in that repo, and the network is up. | Fix the slow command, then re-run. |
+| `collector failed (exit <n>, <token>)` | The collector program crashed. | The token (a Node error code such as `ERR_MODULE_NOT_FOUND`), and `bin/install.sh --check`. | Run `bin/install.sh`; if it repeats, report the token. |
+| `collector failed (no result line)` | The collector finished without its one summary line. | `bin/install.sh --check`, then run the collector by hand on the repo. | Run `bin/install.sh`; if it repeats, report it. |
+| `collector failed (no digest field)` | The collector's summary line did not say whether the digest was made. | As above. | As above. |
+| `digest refused` | The collector made no usable digest for this repo (the `digest=failed:<mode>` token on the line says why; see the `failed:` rows). | The mode on the `RESULT` line. | Follow the row for that mode. |
+| `claude exited` | The headless session exited non-zero (the number follows). | `claude --version`, `claude auth status` or its equivalent, and the network. | Fix the sign-in or the network, then re-run. |
+| `timed out after` | The session ran past its limit and was stopped. | Whether the network or the model service was slow. | Re-run. If it repeats, the digest may be too large for one session. |
+| `killed after timeout grace` | The session ignored the polite stop and was killed. | As above. | As above. |
+| `background wait ceiling reached before completion` | The CLI stopped waiting for the workflow to finish. The CLI's own words follow. | As above. | Re-run; if it repeats, raise the ceiling in the runner (it is a constant in the script). |
+| `aborted before completion` | The runner itself ended early (a signal, or a script error). | `RESULT` lines above it, and whether the machine slept or was shut down. | Re-run. |
+| `could not take the sidecar lock` | Another run held the short lock on the proposal-targets file for about 30 seconds, or the repo has no ordinary git directory to hold it. | Another weekly or attended run in the same repo; `.git/` is a real directory in the main checkout. | Wait and re-run; if a lock is left by a crashed run it is taken over once its owner is gone or after 10 minutes. |
+| `repository is not a main checkout` | The attended check was given a linked worktree, or a layout it cannot resolve. | The path you passed is the main checkout. | Pass the main checkout's path. |
+| `the result check could not run` | The result check program crashed or was missing. | The `RESULT-CHECK-STATUS` line above it (exit code, bytes, error code). | Run `bin/install.sh`, then re-run. |
+| `the result check wrote no output` | The check said to place the result but left no files to place. | Free space in the per-run directory. | Free space, then re-run. |
+| `report path is not gitignored` | The report or the proposal-targets path is not ignored by git, so it was not written. | A tracked `.gitignore` in the repo that re-includes `.claude/` files. | Remove that rule, then re-run. |
+| `report-ignore helper failed` | The helper that makes the paths ignored crashed (the exit code and an error code follow). | `bin/install.sh --check`. | Run `bin/install.sh`, then re-run. |
+| `report rejected:` | The checked report could not be staged for placing (it was a link, empty, over the size cap or its folder was a link). The rest of the line says which. | `.claude/` in the repo is a real folder and `.claude/optimise-cycle-report.md` is not a link or folder. | Remove the link or folder, then re-run. |
+| `sidecar rejected:` | Same as above, for `.claude/optimise-proposal-targets.json` under the main checkout. | The same, for that file. | Same. |
+| `could not move the result into place` | The final rename failed. Nothing new was written (or only the proposal-targets file, which is always safe to keep). | Free space and permissions in the repo's `.claude/`. | Fix, then re-run. |
+| `session output: empty` | The session printed nothing. | The log's `claude exited` line, and the network. | Re-run. |
+| `session output: not a JSON envelope` | The session's output was not the agreed JSON. | Whether `claude` printed an error instead. | Re-run; if it repeats, report the CLI version. |
+| `session output: envelope has no result` | The envelope had no result, or said it was an error. | As above. | As above. |
+| `session output: result is not a JSON object` | The session returned something other than the workflow's object. | As above. | As above. |
+| `session output: result has no lanes` | The returned object lacks the lane statuses. | As above. | As above. |
+| `session output: result has no report` | The returned object lacks the report. | As above. | As above. |
+| `session output: report is not a string` | The report is not text. | As above. | As above. |
+| `session returned failed_step` | The workflow stopped at a step and said which (in brackets). | The step's name. | Re-run; report it if it repeats. |
+| `report does not start with a markdown heading` | The report is malformed. | Nothing to check on your side. | Re-run; report it if it repeats. |
+| `report contains a NUL byte` | The report holds a byte that never belongs in text. | As above. | As above. |
+| `report is not valid UTF-8` | The report is not valid text. | As above. | As above. |
+| `report is <n> bytes, over the <cap> cap` | The report is larger than 5,242,880 bytes. | The repo's ledger and CI history are not unusually large. | Report it; nothing was written. |
+| `sidecar missing` | The result carries no proposal-targets object. | Nothing to check on your side. | Re-run; report it if it repeats. |
+| `sidecar is not a JSON object` | The returned proposal-targets value is not an object. | As above. | As above. |
+| `sidecar is over the size cap` | The returned proposal-targets object is over 1,048,576 bytes. | As above. | As above. |
+| `sidecar is missing a proposal id the report names` | The report names a proposal that the returned map does not hold. | As above. | As above. |
+| `sidecar on disk cannot be read as a JSON object; left as it was` | The existing `.claude/optimise-proposal-targets.json` is damaged, a link, or too big. It is the only copy of decided targets, so it was not touched and nothing was placed. | Open it: is it valid JSON and a plain file? Restore it from backup if you have one. | Repair or restore the file by hand, then re-run. |
+| `returned sidecar has a key that is not a proposal id` | A returned proposal-targets entry has a key that is not 16 lower-case hex characters. Nothing was placed. | Nothing to check on your side. | Re-run; report it if it repeats. |
+| `returned sidecar has a target that is not the fixed shape` | A returned target does not have exactly the fixed fields. | As above. | As above. |
+| `returned sidecar has a target that does not hash to its id` | A returned target sits under another target's id. | As above. | As above. |
+| `returned sidecar has an id this run does not name` | A returned entry's id appears neither in the report nor in the ledger's recorded outcomes. | As above. | As above. |
+| `result carries no nonce hash` | The returned object lacks the hash of this run's nonce. | The session may have called another workflow copy. | Re-run; report it if it repeats. |
+| `result nonce hash does not match this run` | The hash does not match this run's nonce, so the result is not from this run's digest. | As above. | As above. |
+| `report holds an absolute path` | The report names a path under the home directory, the repo or the per-run directory. | Nothing to check on your side. | Re-run; report it if it repeats. |
+| `collected data unreadable` | A collected file the check needs could not be read. | The per-run directory and free space. | Re-run. |
+| `figure mismatch` | A figure in the report differs from the one the runner collected (the lane and both numbers follow). Nothing was placed and the last good report stands. | The two numbers in the reason. | Re-run; if it repeats, the data changed on the way or the report is wrong: report it. |
+| `lane could not run: <mode>` | The lane named before it could not run, so the report was written without it and the run is a FAIL by design. Follow the `failed:<mode>` row. | The mode. | See the `failed:` rows. |
+| `the reader failed for` | The reader program failed on a collected command. | `bin/install.sh --check`. | Run `bin/install.sh`. |
+| `the reader reported an error for` | The reader returned an error for this repo's data. | As above. | As above. |
+| `git <command> ...` | A git command in the collector failed or was not found. The rest of the line says how. | `git --version`, and `git -C <repo> log -1` by hand. | Fix git or the repo, then re-run. |
+| `git log returned no commits` | The repo has a history the collector could not read. | `git -C <repo> log -1`. | Fix the repo. |
+| `git toplevel does not match the repository root` | The configured path is inside another repository, not its root. | The configured path is the repository's top directory. | Configure the top directory. |
+| `the configured path is not a git repository` | The path is not a git repository. | `git -C <repo> rev-parse --show-toplevel`. | Fix the path. |
+| `git refused the repository because of its ownership` | Git refused the repo as owned by someone else (`safe.directory`). | Who owns the folder. | Fix the ownership; add it to `safe.directory` only if you trust it. |
+| `git refused a bare repository layout` | The path is a bare repository, which the collector refuses. | The path is a normal checkout. | Configure the checkout. |
+| `the repository has no commits` | There is nothing to analyse yet. | `git -C <repo> log -1`. | Wait until it has commits, or remove it from the list. |
+| `the ledger location could not be determined for this checkout layout` | The checkout uses a layout (a separate git directory, a submodule) the collector cannot place the ledger for. | How the repo was set up. | Configure the main checkout of an ordinary repo instead. |
+| `gh run list returned output that is not a JSON array` | `gh` printed something unexpected. | `gh run list --limit 1 --json databaseId` by hand in the repo. | Update `gh`, then re-run. |
+| `gh run list returned no run with a usable id` | `gh` listed runs but none had a usable id. | As above. | As above. |
+| `gh run list exited` | `gh run list` failed with a status other than the known ones. | The same command by hand. | Fix what it prints, then re-run. |
+| `gh run view failed for all` | Every per-run job fetch failed, so no CI job data was measured. | `gh auth status` and the network. | Fix the sign-in or the network. |
+| `ci lane budget exhausted` | The CI lane used up its overall time before every run's jobs were fetched. | How slow `gh` is. | Re-run; if it repeats, report it. |
+| `timeout: exceeded <n> ms` | The command named before it ran past its own limit. | That command by hand. | Fix the slow command. |
+| `the digest is over the` | Even with every list at its minimum the digest is over its size limit. | The size of the ledger and CI history. | Report it; the digest cannot be made for this repo yet. |
+| `a line of the digest is over` | One digest line is too long to carry. | A very long commit subject, job name or plan title. | Shorten it at the source, or report it. |
+| `cause=check_failed` | The result check itself could not run. | See `the result check could not run`. | Same. |
+| `cause=timeout` | The session or the collector ran past its bound. | See `timed out after`. | Same. |
+| `cause=exit` | The session exited non-zero. | See `claude exited`. | Same. |
+| `cause=abort` | The runner ended early for a reason that was not a signal. | See `aborted before completion`. | Same. |
+| `cause=signal` | The runner was stopped by a signal (a shutdown, a logout or a kill). | When it happened. | Re-run. |
+| `cause=empty` | The session printed nothing. | See `session output: empty`. | Same. |
+| `cause=malformed` | The session's output or result was not in the agreed shape. | See the `session output:` rows. | Same. |
+| `cause=nonce` | The returned nonce hash did not match. | See the two `nonce hash` rows. | Same. |
+| `cause=oversized` | The report or the proposal-targets object was over its size cap. | See the size rows. | Same. |
+| `cause=failed_step` | The workflow stopped at a step. | See `session returned failed_step`. | Same. |
+| `failed:timeout` | A lane's command ran past its limit. | The lane named on the line. | Fix the slow command, then re-run. |
+| `failed:absent_from_path` | `gh` is not on the job's PATH (launchd's PATH is short). | `command -v gh` from the job's environment. | Put `gh` where launchd can find it, then re-run. |
+| `failed:unauthenticated` | `gh` is not logged in for the job. | `gh auth status` as the job's user. | Run `gh auth login`, then re-run. |
+| `failed:rate_limited` | GitHub said to slow down (HTTP 403 or 429). | `gh api rate_limit` by hand. | Wait, then re-run. |
+| `failed:could_not_read` | The ledger file could not be read safely (a link, too big, not a file, or an unknown layout). | `.claude/harness-ledger.jsonl` is a plain file in the main checkout. | Fix the file. |
+| `failed:over_size` | The digest is over its limit with every list at its minimum. | See `the digest is over the`. | Same. |
+| `failed:line_too_long` | A digest line is too long. | See `a line of the digest is over`. | Same. |
+| `failed:missing` | The digest, or a lane file, was not produced. | The collector's output line. | Re-run; if it repeats, run `bin/install.sh`. |
+| `failed:other` | The lane failed for a reason with no name of its own (the reason text gives it). | The reason on the line. | Follow the matching row above, or report it. |
+
+`failed:no_history` is not a failure: a repo with no GitHub Actions history
+runs the CI lane, the report says there is none, and the repo can still PASS.
 
 #### Installing and rolling back the launchd job
 

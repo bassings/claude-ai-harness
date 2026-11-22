@@ -1062,29 +1062,41 @@ function shimDir(name, script) {
 
 const sidecarIds = (repo) => Object.keys(JSON.parse(fs.readFileSync(path.join(repo, SIDECAR_REL), 'utf8')))
 
-test('L1: both outputs are staged first and the sidecar is renamed before the report, so a failure between them never leaves a new report beside an old sidecar', () => {
-  // The report's rename fails: the sidecar (a strict superset of the old one) is already in place, and the old report stands.
-  const a = repoWith({ ledger: 5 })
-  seedDecided(a, decided(2))
-  marker(a, 'heading-unique')
-  const mvFailsOnReport = shimDir('mv', 'for a in "$@"; do last="$a"; done\ncase "$last" in *optimise-cycle-report.md) echo refused >&2; exit 1 ;; esac\nexec /bin/mv "$@"')
-  const resA = runRunner([a], { stubs: ghWith(), extraPath: mvFailsOnReport })
-  const [newId] = Object.keys(returnedResult(resA).proposal_targets)
-  assert.ok(newId, 'guard against vacuity: the stub returned a new entry')
-  assertFailedOnce(resA, a, /^could not move the result into place$/)
-  assert.equal(fs.readFileSync(path.join(a, REPORT_REL), 'utf8'), OLD_REPORT, 'the old report stands')
-  assert.ok(sidecarIds(a).includes(newId), 'the sidecar already holds the new entry, so no new report can sit beside an old sidecar')
+// The module's own placement, with the rename failed by an injected file system: a PATH shim for `mv` no longer reaches it, because
+// the runner and the attended entry now place through one module (T4) and not through bash.
+const VERIFY_MODULE = path.join(SB.ROOT, 'workflows', 'lib', 'optimise-verify.mjs')
+function placementFixture() {
+  const repo = repoWith({ ledger: 5 })
+  const seed = seedOutputs(repo)
+  const dir = freshDir('placement-')
+  fs.writeFileSync(path.join(dir, 'result-report.md'), '# A new report\n')
+  fs.writeFileSync(path.join(dir, 'result-sidecar.json'), '{"new":"entry"}\n')
+  return { repo, seed, dir }
+}
+const failingRename = (suffix) => ({ ...fs, renameSync: (from, to) => { if (String(to).endsWith(suffix)) throw new Error('refused'); return fs.renameSync(from, to) } })
+const strays = (repo) => fs.readdirSync(path.join(repo, '.claude')).filter((n) => n.startsWith('.optimise-output.'))
+
+test('L1: both outputs are staged first and the sidecar is renamed before the report, so a failure between them never leaves a new report beside an old sidecar', async () => {
+  const { placeOutputs } = await import(pathToFileURL(VERIFY_MODULE).href)
+  // The report's rename fails: the sidecar is already in place, and the old report stands.
+  const a = placementFixture()
+  const resA = placeOutputs({ dir: a.dir, repo: a.repo, sidecarRoot: a.repo }, failingRename(REPORT_REL))
+  assert.equal(resA.problem, 'could not move the result into place')
+  assert.equal(fs.readFileSync(path.join(a.repo, REPORT_REL), 'utf8'), fs.readFileSync(a.seed.report, 'utf8'))
+  assert.equal(sha(a.seed.report), a.seed.reportSha, 'the old report stands')
+  assert.equal(fs.readFileSync(path.join(a.repo, SIDECAR_REL), 'utf8'), '{"new":"entry"}\n', 'the sidecar is already the new one')
+  assert.deepEqual(strays(a.repo), [], 'no staged temp file is left behind')
   // The sidecar's rename fails: nothing is renamed at all.
-  const b = repoWith({ ledger: 5 })
-  seedDecided(b, decided(2))
-  const before = [sha(path.join(b, REPORT_REL)), sha(path.join(b, SIDECAR_REL))]
-  marker(b, 'heading-unique')
-  const mvFailsOnSidecar = shimDir('mv', 'for a in "$@"; do last="$a"; done\ncase "$last" in *optimise-proposal-targets.json) echo refused >&2; exit 1 ;; esac\nexec /bin/mv "$@"')
-  const resB = runRunner([b], { stubs: ghWith(), extraPath: mvFailsOnSidecar })
-  assert.ok(Object.keys(returnedResult(resB).proposal_targets).length === 1, 'guard against vacuity: the stub returned a new entry')
-  assertFailedOnce(resB, b, /^could not move the result into place$/)
-  assert.deepEqual([sha(path.join(b, REPORT_REL)), sha(path.join(b, SIDECAR_REL))], before, 'neither file changed')
-  assert.deepEqual(fs.readdirSync(path.join(b, '.claude')).filter((n) => n.startsWith('.optimise-output.')), [], 'no staged temp file is left behind')
+  const b = placementFixture()
+  const resB = placeOutputs({ dir: b.dir, repo: b.repo, sidecarRoot: b.repo }, failingRename(SIDECAR_REL))
+  assert.equal(resB.problem, 'could not move the result into place')
+  assertOutputsKept(b.seed)
+  assert.deepEqual(strays(b.repo), [], 'no staged temp file is left behind')
+  // And the rename that succeeds leaves both new and nothing staged.
+  const c = placementFixture()
+  assert.equal(placeOutputs({ dir: c.dir, repo: c.repo, sidecarRoot: c.repo }).problem, null)
+  assert.equal(fs.readFileSync(path.join(c.repo, REPORT_REL), 'utf8'), '# A new report\n')
+  assert.deepEqual(strays(c.repo), [])
 })
 
 test('L2: runners started together against one repository each add their own entry, and none is lost', async () => {
@@ -1142,10 +1154,17 @@ test('L4: the sidecar path and the report and sidecar size caps the runner uses 
 
 // ---- T3 fix round 2: a result check that crashes is a FAIL (M1), and one reached through a symlink works (M6) ----
 
-// An install whose result check is the given program in place of the real one.
+// An install whose result check is the given program in place of the real one. The forms the runner shares with the attended
+// entry (the sidecar lock and the placement) are the real module's: the program stands in for the result check only.
 function installWithVerifier(source) {
   const claudeHome = provisionInstall(freshDir('claudehome-'))
-  fs.writeFileSync(path.join(claudeHome, 'workflows', 'lib', 'optimise-verify.mjs'), source)
+  const lib = path.join(claudeHome, 'workflows', 'lib')
+  fs.copyFileSync(path.join(lib, 'optimise-verify.mjs'), path.join(lib, 'optimise-verify-real.mjs'))
+  fs.writeFileSync(path.join(lib, 'optimise-verify-stub.mjs'), source)
+  fs.writeFileSync(path.join(lib, 'optimise-verify.mjs'), `import { main } from './optimise-verify-real.mjs'
+if (['lock-try', 'unlock', 'place'].includes(process.argv[2])) await main(process.argv.slice(2))
+else await import('./optimise-verify-stub.mjs')
+`)
   return claudeHome
 }
 
@@ -1406,75 +1425,69 @@ test('L10: a result check that cannot load a module logs its exit status, the by
 })
 
 // ---- T3 fix round 3: L1, the sidecar lock is held by one runner at a time and only its holder can release it ----
+//
+// The lock's code is one copy, in the result check module, shared by the runner and the attended entry (T4). Two takers are
+// real processes started on a real repository, and the takeover race is forced by an injected file system.
 
-// The lock functions taken verbatim from the runner and run in their own bash processes, so two takers can be started on a
-// real repository and their interleaving forced with a shim, without a full run for each.
-function lockHarness(repo, name, { hold = 0, then = '' } = {}) {
-  const functions = ['lock_looks_stale', 'lock_sidecar', 'unlock_sidecar'].map((fn) => {
-    const m = RUNNER_TEXT.match(new RegExp(`^${fn}\\(\\) \\{\\n[\\s\\S]*?^\\}\\n`, 'm'))
-    return m ? m[0] : ''
-  }).join('\n')
-  assert.match(functions, /lock_sidecar\(\)/, 'the runner defines lock_sidecar')
-  const log = path.join(repo, 'lock-events.log')
-  return `#!/bin/bash
-LOCK_TRIES=100
-LOCK_STALE_MIN=10
-SIDECAR_LOCK=""
-SIDECAR_TOKEN=""
-${functions}
-if ! lock_sidecar ${JSON.stringify(repo)}; then echo "${name} failed" >> ${JSON.stringify(log)}; exit 1; fi
-echo "${name} acquired" >> ${JSON.stringify(log)}
-sleep ${hold}
-echo "${name} released" >> ${JSON.stringify(log)}
-${then}
-unlock_sidecar
+const lockScript = (repo, name, { hold = 0, release = true } = {}) => `import { acquireLock, unlock } from ${JSON.stringify(pathToFileURL(VERIFY_MODULE).href)}
+import fs from 'node:fs'
+const log = (what) => fs.appendFileSync(${JSON.stringify(path.join(repo, 'lock-events.log'))}, what + '\\n')
+const got = acquireLock(${JSON.stringify(repo)}, process.pid)
+if (got.status !== 'held') { log(${JSON.stringify(name)} + ' failed'); process.exit(1) }
+log(${JSON.stringify(name)} + ' acquired')
+await new Promise((resolve) => setTimeout(resolve, ${hold * 1000}))
+log(${JSON.stringify(name)} + ' released')
+${release ? 'unlock(' + JSON.stringify(repo) + ', got.token)' : 'process.kill(process.pid, "SIGKILL")'}
 `
-}
 
-function runLock(script, env = {}) {
-  const dir = freshDir('lockrun-')
-  const file = path.join(dir, 'run.sh')
-  fs.writeFileSync(file, script, { mode: 0o755 })
-  return spawn('/bin/bash', [file], { env: { ...process.env, ...env }, stdio: 'ignore' })
+function runLock(script) {
+  const file = path.join(freshDir('lockrun-'), 'run.mjs')
+  fs.writeFileSync(file, script)
+  return spawn(process.execPath, [file], { stdio: 'ignore' })
 }
 
 const exited = (child) => new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })))
 
-test('L1: a stale lock taken over by two runners at once is held by one of them at a time -- the second taker never removes the first taker\'s fresh lock', async () => {
+test('L1: a lock left by a killed taker is taken over, and two takers at once are held one at a time', async () => {
   const repo = repoWith()
   const events = path.join(repo, 'lock-events.log')
-  // A runner that takes the lock and is killed: the stale lock it leaves, in whatever form the runner keeps it.
-  const dead = runLock(lockHarness(repo, 'DEAD', { hold: 0, then: 'kill -9 $$' }).replace('unlock_sidecar\n', ''), {})
-  await exited(dead)
+  const dead = await exited(runLock(lockScript(repo, 'DEAD', { release: false })))
+  assert.equal(dead.signal, 'SIGKILL', 'guard against vacuity: the first taker was killed holding the lock')
+  assert.ok(fs.lstatSync(path.join(repo, '.git', 'optimise-sidecar.lock'), { throwIfNoEntry: false }), 'and its lock is still there')
   fs.writeFileSync(events, '')
-  const once = path.join(freshDir('once-'), 'seen')
-  const slowMv = shimDir('mv', `case "$*" in *.stale.*) if [ ! -e ${JSON.stringify(once)} ]; then : > ${JSON.stringify(once)}; sleep 2; fi ;; esac\nexec /bin/mv "$@"`)
-  // B reaches the stale lock first and is held up between judging it stale and taking it away.
-  const b = runLock(lockHarness(repo, 'B', { hold: 0 }), { PATH: `${slowMv}:${process.env.PATH}` })
-  assert.ok(await F.waitFor(() => fs.existsSync(once), 20000), 'guard against vacuity: B is held up inside its takeover')
-  // A comes later, takes the stale lock over properly and holds the new lock for a while.
-  const a = runLock(lockHarness(repo, 'A', { hold: 4 }))
+  const a = runLock(lockScript(repo, 'A', { hold: 2 }))
+  const b = runLock(lockScript(repo, 'B', { hold: 0 }))
   const [ra, rb] = await Promise.all([exited(a), exited(b)])
   assert.equal(ra.code, 0)
   assert.equal(rb.code, 0)
-  const order = fs.readFileSync(events, 'utf8').trim().split('\n').filter((l) => !l.startsWith('DEAD'))
-  assert.deepEqual(order, ['A acquired', 'A released', 'B acquired', 'B released'], 'B only acquires after A has released')
+  const order = fs.readFileSync(events, 'utf8').trim().split('\n')
+  assert.match(order.join(','), /^(A acquired,A released,B acquired,B released|B acquired,B released,A acquired,A released)$/, `one at a time: ${order}`)
+})
+
+test('L1: a taker that judged a lock stale but finds a fresh one when it comes to take it away puts the fresh one straight back', async () => {
+  const { breakStale } = await import(pathToFileURL(VERIFY_MODULE).href)
+  const repo = repoWith()
+  const lock = path.join(repo, '.git', 'optimise-sidecar.lock')
+  fs.symlinkSync('1:stale-owner', lock)
+  // Between judging 1:stale-owner stale and renaming it, another runner replaces it with its own fresh lock.
+  const swapped = { ...fs, renameSync: (from, to) => { fs.rmSync(from); fs.symlinkSync(`${process.pid}:fresh-owner`, from); return fs.renameSync(from, to) } }
+  assert.equal(breakStale(lock, '1:stale-owner', 'taker', swapped), true)
+  assert.equal(fs.readlinkSync(lock), `${process.pid}:fresh-owner`, 'the fresh lock is back, and still its owner\'s')
+  assert.deepEqual(fs.readdirSync(path.join(repo, '.git')).filter((n) => n.includes('.stale.')), [], 'and the taker\'s own name is gone')
 })
 
 test('L1: a runner that does not hold the lock cannot release it, and the holder still can', async () => {
+  const { tryLock, unlock } = await import(pathToFileURL(VERIFY_MODULE).href)
   const repo = repoWith()
-  const events = path.join(repo, 'lock-events.log')
-  fs.writeFileSync(events, '')
-  // The holder takes the lock and keeps it; the other process believes it holds a lock at the same path with a token of its own.
-  const holder = runLock(lockHarness(repo, 'HOLDER', { hold: 3 }))
-  assert.ok(await F.waitFor(() => fs.readFileSync(events, 'utf8').includes('HOLDER acquired'), 20000))
-  const lockPath = path.join(repo, '.git', 'optimise-sidecar.lock')
-  assert.ok(fs.existsSync(lockPath) || fs.lstatSync(lockPath, { throwIfNoEntry: false }), 'guard against vacuity: the lock is there')
-  const impostor = runLock(lockHarness(repo, 'IMPOSTOR', { hold: 0 }).replace(/if ! lock_sidecar[^\n]*\n/, `SIDECAR_LOCK=${JSON.stringify(lockPath)}; SIDECAR_TOKEN="999999:forged"\n`))
-  await exited(impostor)
-  assert.ok(fs.lstatSync(lockPath, { throwIfNoEntry: false }), 'the lock is still there after a non-owner\'s unlock')
-  await exited(holder)
-  assert.equal(fs.lstatSync(lockPath, { throwIfNoEntry: false }), undefined, 'and the holder\'s own unlock removed it')
+  const lock = path.join(repo, '.git', 'optimise-sidecar.lock')
+  const held = tryLock(repo, process.pid)
+  assert.equal(held.status, 'held')
+  assert.ok(fs.lstatSync(lock, { throwIfNoEntry: false }), 'guard against vacuity: the lock is there')
+  assert.equal(unlock(repo, '999999:aaaaaaaaaaaa'), true, 'the forger\'s call ran')
+  assert.equal(fs.readlinkSync(lock), held.token, 'the lock is still there after a non-owner\'s unlock, still the holder\'s')
+  assert.equal(tryLock(repo, process.pid).status, 'busy', 'and a second taker is still kept out')
+  unlock(repo, held.token)
+  assert.equal(fs.lstatSync(lock, { throwIfNoEntry: false }), undefined, 'the holder\'s own unlock removed it')
 })
 
 // ---- T3 fix round 3: L11, the reader's command-line form works through a symlinked path, output unchanged ----

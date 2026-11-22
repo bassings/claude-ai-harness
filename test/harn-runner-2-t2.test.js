@@ -225,24 +225,6 @@ test('AC-ARCH-9: the result carries the report, the sidecar and each lane\'s sta
   for (const gone of ['report_written', 'report_path', 'report_write_error', 'proposal_ids_computed']) assert.ok(!(gone in result), `${gone} must not be in the result`)
 })
 
-test('AC-ARCH-9: the attended path (no digest) runs its own scope and lane agents, no ids or report:write agent, and returns the same structured result', async () => {
-  const col = T.collection('moderate')
-  const { calls, result } = await runWorkflow(WORKFLOW, { args: {}, agent: T.attendedAgents(col) })
-  assert.deepEqual(calls.map((c) => c.opts.label).sort((a, b) => a.localeCompare(b)), ['lane:ci', 'lane:git', 'lane:ledger', 'scope:repos', 'synthesis:proposals'])
-  assert.equal(typeof result.report, 'string')
-  assert.equal(typeof result.proposal_targets, 'object')
-  for (const lane of ['ledger', 'git', 'ci']) assert.equal(result.lanes[lane].status, 'ran', lane)
-  for (const gone of ['report_written', 'report_path', 'report_write_error']) assert.ok(!(gone in result), gone)
-})
-
-test('AC-ARCH-9: on the attended path a lane whose agent returned nothing is reported failed with a non-empty reason', async () => {
-  const col = T.collection('moderate')
-  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: T.attendedAgents(col, { 'lane:ci': undefined }) })
-  assert.equal(result.lanes.ci.status, 'failed')
-  assert.ok(typeof result.lanes.ci.reason === 'string' && result.lanes.ci.reason.length > 0)
-  assert.equal(result.lanes.ledger.status, 'ran')
-})
-
 const failedLane = (reason) => ({ status: 'failed', mode: 'other', reason })
 
 test('AC-PROD-3: a failed ledger lane leaves the good git figure in the report, with the ledger lane named and its reason shown as Not measured', async () => {
@@ -351,19 +333,17 @@ test('AC-OPS-17: the never-failing section lists the rows carried and says how m
 const NOTE_RE = /^\d+ [^\n]*left out as insufficient data/
 const CI_COUNT_RE = /^CI runs: /
 
-// The report the workflow builds from the full lane results, and the one it builds from the digest of the same data,
-// must be equal apart from the documented reductions: the never-failing rows that are plain insufficient data (the
-// reader's own rule) and their count line, and the CI run-count line only the digest carries.
+// The report the workflow builds from the collector's digest and the one it builds from the same data with the FULL lane
+// results (nothing left out) must be equal: the digest's reductions (plain insufficient rows left out and counted) are the
+// workflow's own rule, applied to both, so the two reports state the same rows and the same count.
 async function assertEqualApartFromReductions(col, digest) {
   const reader = await loadReader()
-  const full = await runWorkflow(WORKFLOW, { args: {}, agent: T.attendedAgents(col) })
+  const full = await T.runDigest(T.fullLanesDigest(col))
   const fromDigest = await T.runDigest(digest)
   const plain = col.lanes.ledger.result.neverFailingAcs.filter(reader.isPlainInsufficientRow)
   assert.ok(plain.length > 0, 'precondition: the fixture has plain insufficient rows')
-  const plainPrefixes = plain.map((r) => `- ${r.repo}/${r.spec} ${r.ac_id}: `)
-  const expected = full.result.report.split('\n').filter((l) => !plainPrefixes.some((p) => l.startsWith(p)))
-  const actual = fromDigest.result.report.split('\n').filter((l) => !NOTE_RE.test(l) && !CI_COUNT_RE.test(l))
-  assert.deepEqual(actual, expected)
+  assert.ok(fromDigest.result.report.split('\n').some((l) => NOTE_RE.test(l)), 'precondition: the digest report counts the rows it left out')
+  assert.deepEqual(fromDigest.result.report.split('\n'), full.result.report.split('\n'))
 }
 
 test('AC-ARCH-13: the report built from the digest equals the report built from the full lane results, apart from the documented reductions', async () => {
@@ -484,17 +464,17 @@ async function annotatedRuns() {
   const agent = { 'synthesis:proposals': { proposals } }
   const digest = col.digest
   digest.ledger.proposalOutcomes = structuredClone(proposalOutcomes)
-  const attendedCol = T.collection('moderate')
-  attendedCol.lanes.ledger.result.proposalOutcomes = structuredClone(proposalOutcomes)
+  const fullCol = T.collection('moderate')
+  fullCol.lanes.ledger.result.proposalOutcomes = structuredClone(proposalOutcomes)
   const viaDigest = await T.runDigest(digest, { agent })
-  const attended = await runWorkflow(WORKFLOW, { args: {}, agent: T.attendedAgents(attendedCol, agent) })
-  return { ids, targets, seedId, seedTarget, viaDigest, attended }
+  const full = await T.runDigest(T.fullLanesDigest(fullCol), { agent })
+  return { ids, targets, seedId, seedTarget, viaDigest, full }
 }
 
-for (const entry of ['digest', 'attended']) {
-  test(`AC-SIMP-4: the ids, the annotations and the section each proposal lands in are as the reader's ids and the recorded outcomes dictate (${entry} entry point), and no ids agent is dispatched`, async () => {
+for (const entry of ['digest', 'full']) {
+  test(`AC-SIMP-4: the ids, the annotations and the section each proposal lands in are as the reader's ids and the recorded outcomes dictate (${entry === 'digest' ? 'the collector digest' : 'the full lane results'}), and no ids agent is dispatched`, async () => {
     const run = await annotatedRuns()
-    const { result, calls } = entry === 'digest' ? run.viaDigest : run.attended
+    const { result, calls } = entry === 'digest' ? run.viaDigest : run.full
     assert.ok(!calls.some((c) => c.opts.label === 'synthesis:ids'))
     const ranked = result.proposals_ranked
     assert.deepEqual(ranked.map((p) => p.proposal_id), [run.ids[0], run.ids[2], run.ids[3]], 'ranked by n: the rejected, the reverted-twice and the plain one; the adopted one is moved out')
@@ -516,20 +496,20 @@ for (const entry of ['digest', 'attended']) {
     assert.match(result.report, /Already adopted on 2026-07-02/)
   })
 
-  test(`AC-PROD-4/AC-SIMP-4: the sidecar maps every proposal id of this run, and every prior outcome's recorded target, to its target (${entry} entry point)`, async () => {
+  test(`AC-PROD-4/AC-SIMP-4: the sidecar maps every proposal id of this run, and every prior outcome's recorded target, to its target (${entry === 'digest' ? 'the collector digest' : 'the full lane results'})`, async () => {
     const run = await annotatedRuns()
-    const { result } = entry === 'digest' ? run.viaDigest : run.attended
+    const { result } = entry === 'digest' ? run.viaDigest : run.full
     const expected = { [run.seedId]: run.seedTarget }
     run.ids.forEach((id, i) => { expected[id] = run.targets[i] })
     assert.deepEqual(result.proposal_targets, expected)
   })
 }
 
-test('AC-SIMP-4/AC-PROD-5: the two entry points give identical proposal sections and identical annotated proposals for the same data', async () => {
+test('AC-SIMP-4/AC-PROD-5: the collector digest and the full lane results give identical proposal sections and identical annotated proposals', async () => {
   const run = await annotatedRuns()
   const section = (report) => report.split('## Proposals (ranked)')[1].split('## Filtering')[0]
-  assert.equal(section(run.viaDigest.result.report), section(run.attended.result.report))
-  for (const key of ['proposals_ranked', 'proposals_previously_adopted', 'proposals_insufficient_data', 'proposal_targets']) assert.deepEqual(run.viaDigest.result[key], run.attended.result[key], key)
+  assert.equal(section(run.viaDigest.result.report), section(run.full.result.report))
+  for (const key of ['proposals_ranked', 'proposals_previously_adopted', 'proposals_insufficient_data', 'proposal_targets']) assert.deepEqual(run.viaDigest.result[key], run.full.result[key], key)
 })
 
 // ======================================================================================
@@ -619,16 +599,6 @@ test('AC-SEC-6 (L1): the git result\'s repository label, used when the ledger la
   const { result } = await T.runDigest(col.digest)
   assert.match(result.report, /^Repos: demo/m, 'guard against vacuity: the Repos line rendered the label')
   assertLabelHarmless(result.report, 'digest, git label')
-})
-
-test('AC-SEC-6 (L1): the attended path\'s scope label is flattened and redacted in the report', async () => {
-  const col = T.collection('moderate')
-  const agents = T.attendedAgents(col)
-  agents['scope:repos'].resolved[0].label = FORGED_LABEL
-  agents['lane:ledger'].perRepo[0].root = 'demo'
-  const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: agents })
-  assert.match(result.report, /^Repos: demo/m, 'guard against vacuity: the Repos line rendered the label')
-  assertLabelHarmless(result.report, 'attended, scope label')
 })
 
 // ---- Fix round 1 (L3): the script's mirror of the reader's isPlainInsufficientRow ----
