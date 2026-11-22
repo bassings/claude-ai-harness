@@ -70,7 +70,9 @@ function main() {
   return ensureIgnored(root, relativePath)
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+// Compared by real path: import.meta.url is the real file, argv[1] may be reached through a symlink (an install whose
+// ~/.claude is a link), and a lexical comparison then silently runs nothing.
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(path.resolve(process.argv[1]))
 if (isMain) {
   const out = main()
   process.stdout.write(JSON.stringify(out) + '\n')

@@ -2016,7 +2016,7 @@ export function resolveLedgerRoot(root) {
 export const PROPOSAL_TARGETS_SIDECAR_RELATIVE_PATH = '.claude/optimise-proposal-targets.json'
 const SIDECAR_STRING_MAX = 200
 const SIDECAR_BOOLEAN_KEYS = ['touches_always_on_lens', 'security_purposed']
-function sidecarTargetOrReason(t) {
+export function sidecarTargetOrReason(t) {
   if (!t || typeof t !== 'object' || Array.isArray(t)) return { reason: 'sidecar entry is not an object' }
   const keys = Object.keys(t)
   const fixed = [...PROPOSAL_IDENTITY_KEYS, ...SIDECAR_BOOLEAN_KEYS]

@@ -271,6 +271,15 @@ test('HARN-RUNNER-2 T3 M3: a failed ledger lane prints no ledger record count at
   assert.match(ran.result.report, /^Ledger records in window: \d+ /m, 'control: a ledger that ran still prints its count')
 })
 
+test('HARN-RUNNER-2 T3 H2: the result carries the SHA-256 of the nonce the workflow fenced with, and never the nonce itself', async () => {
+  const { createHash } = require('node:crypto')
+  const { result } = await T.runDigest(T.collection('moderate').digest)
+  assert.equal(result.nonce_sha256, createHash('sha256').update(NONCE).digest('hex'))
+  assert.ok(!JSON.stringify(result).includes(NONCE), 'the nonce itself is nowhere in what the session relays')
+  const other = await T.runDigest(T.collection('moderate').digest, { nonce: T.OTHER_NONCE })
+  assert.equal(other.result.nonce_sha256, createHash('sha256').update(T.OTHER_NONCE).digest('hex'), 'it follows the nonce it was given')
+})
+
 test('AC-PROD-3: a failed ci lane and a failed git lane each show their fixed reason as Not measured and are returned as failed', async () => {
   const digest = T.collection('moderate').digest
   digest.ci = null

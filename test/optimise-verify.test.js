@@ -133,6 +133,37 @@ test('fitSidecar: a merged sidecar over the size cap loses its oldest entries un
   assert.deepEqual(fitSidecar({ a: 1, b: 2 }), { a: 1, b: 2 })
 })
 
+// ---- H1: the returned sidecar is validated before it touches the only copy of the decided map ----
+
+const WELL_FORMED = { kind: 'ci_demote', component: 'ci', concern: 'duration', lens: '', workflow: 'ci', job: 'a-job', touches_always_on_lens: false, security_purposed: false }
+const ID_A = '0123456789abcdef'
+
+test('validateReturnedSidecar: only a hex id whose target is the reader\'s fixed shape, hashes to that id and is named by this run is accepted', async () => {
+  const { validateReturnedSidecar, namedProposalIds } = await load()
+  const { stableProposalId } = await import(pathToFileURL(path.join(__dirname, '..', 'workflows', 'lib', 'optimise-read.mjs')).href)
+  const id = stableProposalId(WELL_FORMED)
+  const named = new Set([id])
+  assert.equal(validateReturnedSidecar({ [id]: WELL_FORMED }, named), null, 'control: a good entry is accepted')
+  assert.equal(validateReturnedSidecar({}, named), null, 'an empty sidecar is accepted')
+  assert.equal(validateReturnedSidecar({ 'not-hex': WELL_FORMED }, named), 'returned sidecar has a key that is not a proposal id')
+  assert.equal(validateReturnedSidecar(JSON.parse('{"__proto__": 1}'), named), 'returned sidecar has a key that is not a proposal id')
+  assert.equal(validateReturnedSidecar({ [id]: 'garbage' }, named), 'returned sidecar has a target that is not the fixed shape')
+  assert.equal(validateReturnedSidecar({ [id]: { ...WELL_FORMED, extra: 1 } }, named), 'returned sidecar has a target that is not the fixed shape')
+  assert.equal(validateReturnedSidecar({ [ID_A]: WELL_FORMED }, new Set([ID_A])), 'returned sidecar has a target that does not hash to its id')
+  assert.equal(validateReturnedSidecar({ [id]: WELL_FORMED }, new Set()), 'returned sidecar has an id this run does not name')
+  const report = `# R\n\n### ${id}: a proposal\n- ${ID_A}: an insufficient one (n=2)\n`
+  assert.deepEqual([...namedProposalIds(report, { digest: { ledger: { proposalOutcomes: { propX: {} } } } })].sort((a, b) => a.localeCompare(b)), [ID_A, id, 'propX'].sort((a, b) => a.localeCompare(b)), 'headings, bullets and the ledger\'s decided outcomes are named')
+})
+
+test('mergeSidecar: a returned entry evicts an on-disk one only when the file is full, and never more of them than it adds', async () => {
+  const { mergeSidecar, SIDECAR_CARRY_MAX } = await load()
+  const disk = Object.fromEntries(Array.from({ length: SIDECAR_CARRY_MAX }, (_, i) => [`d${String(i).padStart(15, '0')}`, { i }]))
+  const merged = mergeSidecar(disk, { aaaaaaaaaaaaaaaa: { n: 1 } })
+  const lost = Object.keys(disk).filter((k) => !(k in merged))
+  assert.deepEqual(lost, ['d000000000000000'], 'one new entry evicts exactly the one oldest on-disk entry')
+  assert.equal(Object.keys(mergeSidecar({ x: 1 }, { y: 2 })).length, 2, 'below the maximum nothing is evicted')
+})
+
 // ---- the figure rows ----
 
 // [class, what alters exactly one figure of that class by one, the reason it must give]
@@ -162,6 +193,16 @@ const ROW_ALTERATIONS = [
   ['an unattributable-runs count', (r) => bump(r, /(?<=unattributable runs=)\d+/), /^figure mismatch attribution counters: unattributable runs collected 0, reported 1$/],
   ['a dropped-values counter', (r) => bump(r, /(?<=invalid_fixed_ids_dropped \([^)\n]*\): )\d+/), /^figure mismatch dropped counters: dropped count collected 0, reported 1$/],
   ['an orphaned-runs count', (r) => bump(r, /(?<=terminal-only=)\d+/), /^figure mismatch orphaned runs: terminal-only collected 14, reported 15$/],
+  ['the total unterminated-waits count', (r) => bump(r, /(?<=^unterminated_waits: )\d+/m), /^figure mismatch wall-clock unterminated: unterminated waits collected 2, reported 3$/],
+  ['the findings-dropped count', (r) => bump(r, /(?<=findings_truncated=)\d+(?= \(findings the writer)/), /^figure mismatch rework counters: findings truncated differs from the collected one$/],
+  ['the no-spec review runs count', (r) => bump(r, /(?<=No-spec review runs in window: )\d+/), /^figure mismatch rework counters: no-spec review runs differs from the collected one$/],
+  ['the schema-v4 older-rows count', (r) => bump(r, /\d+(?= older rows excluded)/), /^figure mismatch rework counters: schema v4 older rows collected 12, reported 13$/],
+  ['the blocked-TDD unresolved count', (r) => bump(r, /(?<=resolution row\): )\d+/), /^figure mismatch blocked tdd: unresolved collected 1, reported 2$/],
+  ['the blocked-TDD reason-not-recorded count', (r) => bump(r, /(?<=not recorded \(pre-T5\): )\d+/), /^figure mismatch blocked tdd: not recorded collected 1, reported 2$/],
+  ['a suppression-share count', (r) => bump(r, /(?<=^ci_wait: )\d+(?=\/)/m), /^figure mismatch filtering: unmeasured collected 2, reported 3$/],
+  ['a suppression-share total', (r) => bump(r, /(?<=^agent_compute: \d+\/)\d+/m), /^figure mismatch filtering: total collected 14, reported 15$/],
+  ['the sources line', (r) => r.replace('ci_wait=ledger:conduct_plan_event', 'ci_wait=ledger:forged'), /^figure mismatch wall-clock sources: ci wait source differs from the collected one$/],
+  ['the by-kind breakdown on the orphaned line', (r) => r.replace('tdd_task: 2', 'tdd_task: 3'), /^figure mismatch orphaned runs: terminal-only by kind differs from the collected one$/],
 ]
 
 test('checkRows: the report the real workflow renders from the collected data passes every row check', async () => {
@@ -180,6 +221,18 @@ for (const [name, alter, reasonRe] of ROW_ALTERATIONS) {
   })
 }
 
+test('checkRows: the plan-label note is held to the digest\'s, a note the digest does not hold is no excuse for a different line, and a missing one is refused', async () => {
+  const { checkRows } = await load()
+  const col = T.collection('moderate')
+  col.digest.plan_labels_note = 'Plan labels: 3 of 5 plan titles were listed; the rest were left out.'
+  const { result } = await T.runDigest(col.digest)
+  const c = { lane: { ledger: col.lanes.ledger, git: col.lanes.git, ci: col.lanes.ci }, digest: col.digest }
+  assert.ok(result.report.includes(col.digest.plan_labels_note), 'guard against vacuity: the workflow printed the note')
+  assert.deepEqual(checkRows(result.report, c), [], 'control')
+  assert.deepEqual(checkRows(result.report.replace('3 of 5', '4 of 5'), c), ['figure mismatch plan labels: note differs from the collected one'])
+  assert.deepEqual(checkRows(result.report.replace(col.digest.plan_labels_note, ''), c), ['figure mismatch plan labels: note differs from the collected one'])
+})
+
 test('checkRows: a proposal\'s recorded adoption and rejection dates are held to the outcome the ledger holds for that id', async () => {
   const { checkRows } = await load()
   const { col, report } = await real()
@@ -189,4 +242,123 @@ test('checkRows: a proposal\'s recorded adoption and rejection dates are held to
   assert.match(checkRows(section('propCANARY0', 'Already adopted on 2020-01-01T00:00:00.000Z.'), col)[0], /^figure mismatch proposal outcome: adoption date/)
   assert.match(checkRows(section('propCANARY0', '**Previously rejected on 2020-01-01T00:00:00.000Z.**'), col)[0], /^figure mismatch proposal outcome: rejection date/)
   assert.match(checkRows(section('0123456789abcdef', `Already adopted on ${outcome.lastAdoptionTs}.`), col)[0], /^figure mismatch proposal outcome: an outcome the collected data does not hold/)
+})
+
+// ---- M4: nothing forces a new figure line to be checked, so a test does ----
+
+// Line shapes with a digit that are deliberately NOT held to the collected data, each with the reason. Narrow on purpose: a
+// broad pattern here would hide a new figure line, which is the thing this test exists to catch.
+const UNCHECKED_SHAPES = [
+  [/^Instrumented invocation routes: /, 'fixed prose that cites an acceptance criterion id'],
+  [/^Blocked TDD runs unresolved in window may include a task re-briefed/, 'fixed prose that cites a review round'],
+  [/^- \S+ specs\/\S+ .+: (?:not recorded|test_attempt_cap|implement_attempt_cap|tests_modified|test_defect)/, 'one blocked run: ledger free text (repository, spec, task, date) flattened, not a collected figure'],
+  [/^Repo \d{1,3} \(/, 'the roster position heading of the escaped-defect block'],
+  [/^Drafted: \d+\. Dropped \(/, 'bookkeeping of the session\'s own proposal drafting, not collected data'],
+  [/^Proposals rejected: malformed target: \d+/, 'bookkeeping of the session\'s own proposal drafting, not collected data'],
+  [/^### [0-9a-f]{16}: /, 'a proposal heading: session-drafted text'],
+  [/^n=\d+\. Motivating: /, 'a proposal\'s measurements as the session cites them: session-drafted text'],
+  [/^Target: /, 'a proposal\'s target words: session-drafted, held by the sidecar rules instead'],
+  [/^- [0-9a-f]{16}: .* \(n=\d+\)$/, 'an insufficient-data proposal: session-drafted text'],
+  [/^Reinstatement evidence: /, 'session-drafted proposal text'],
+]
+
+// A proposal the workflow ranks (its citations resolve), so the proposal sections are rendered and their lines exercised.
+const draftedProposal = () => ({ __bypassSchemaValidation: true, proposals: [{ target: { kind: 'ci_demote', component: 'ci', concern: 'duration', lens: '', workflow: 'ci', job: 'build-CANARY-job', touches_always_on_lens: false, security_purposed: false }, statement: 'Narrow a trigger glob', motivating_measurement: '3 of 5 runs were CLEAN (run-1..run-3)', confirming_measurement: 'accuracy improves', n: 6, citations: ['13', 'r16'], reinstatement_evidence: null }] })
+
+// Every (fixture, drafting) pair rendered at once; the report lines of each, with the collected data they must be held to.
+async function renderedReports() {
+  const pairs = ['moderate', 'rich'].flatMap((kind) => [{ proposals: [] }, draftedProposal()].map((drafted) => ({ kind, drafted })))
+  return Promise.all(pairs.map(async ({ kind, drafted }) => {
+    const col = T.collection(kind)
+    const { result } = await T.runDigest(col.digest, { agent: { 'synthesis:proposals': drafted } })
+    return { kind, lines: result.report.split('\n').filter((l) => /\d/.test(l)), col: { lane: { ledger: col.lanes.ledger, git: col.lanes.git, ci: col.lanes.ci }, digest: col.digest } }
+  }))
+}
+
+test('coverage: every line of the real report that carries a digit is checked by this module or on the explicit list of unchecked shapes', async () => {
+  const { isCheckedLine } = await load()
+  const unlisted = (await renderedReports()).flatMap(({ kind, lines, col }) => lines.filter((line) => !isCheckedLine(line, col) && !UNCHECKED_SHAPES.some(([shape]) => shape.test(line))).map((line) => `${kind}: ${line.slice(0, 140)}`))
+  assert.deepEqual([...new Set(unlisted)], [], 'a numeric line no check looks at and no list entry explains: check it in workflows/lib/optimise-verify.mjs or list it with a reason')
+})
+
+test('coverage: every entry of the unchecked list is shown to be needed, so the list cannot quietly become a place to hide a figure', async () => {
+  const { isCheckedLine } = await load()
+  const used = new Set()
+  for (const { lines, col } of await renderedReports()) {
+    for (const line of lines.filter((l) => !isCheckedLine(l, col))) UNCHECKED_SHAPES.forEach(([shape], i) => { if (shape.test(line)) used.add(i) })
+  }
+  const unused = UNCHECKED_SHAPES.filter((_, i) => !used.has(i)).map(([shape]) => String(shape))
+  const needOtherFixtures = [/^Target: /, /^- [0-9a-f]{16}: .* \(n=\d+\)$/, /^Reinstatement evidence: /].map(String)
+  assert.deepEqual(unused, needOtherFixtures, 'every listed shape is rendered by these fixtures except those that need a digit in a target, an insufficient-data proposal or a removal proposal')
+})
+
+// ---- M2: a report that drops a figure line altogether is refused, naming the figure ----
+
+const withoutLine = (report, re) => {
+  const kept = report.split('\n').filter((l) => !re.test(l))
+  assert.ok(kept.length < report.split('\n').length, `the fixture report has a line matching ${re}`)
+  return kept.join('\n')
+}
+
+test('checkFigures: a report with a figure line left out is refused with the exact "reported none" reason, one line at a time', async () => {
+  const { checkFigures, checkDigest } = await load()
+  const { col, report } = await real()
+  const lanes = { ledger: { status: 'ran' }, git: { status: 'ran' }, ci: { status: 'ran' } }
+  const reasonsFor = (text) => checkFigures({ lanes }, text, col).reasons
+  assert.deepEqual(reasonsFor(report), [], 'control')
+  assert.ok(reasonsFor(withoutLine(report, /^Ledger records in window: /)).includes('figure mismatch ledger: collected 18, reported none'))
+  assert.ok(reasonsFor(withoutLine(report, /^CI runs: /)).includes('figure mismatch ci: runs collected 3, reported none'))
+  assert.ok(reasonsFor(withoutLine(report, /^Raw \(unscoped\): /)).includes('figure mismatch git: count collected 3, reported none'))
+  assert.ok(reasonsFor(withoutLine(report, /^Scoped to product source /)).includes('figure mismatch git scoped: scoped counted collected 0, reported none'))
+  // the digest's own omission lines and trimmed flag
+  const dropped = { ...col.digest.dropped, ciByJob: 4, trimmedForSize: true }
+  const colDropped = { ...col, digest: { ...col.digest, dropped } }
+  assert.deepEqual(checkDigest(report, colDropped), ['figure mismatch digest: omitted ciByJob collected 4, reported none'])
+  const colTrimmed = { ...col, digest: { ...col.digest, dropped: { ...col.digest.dropped, trimmedForSize: true } } }
+  assert.deepEqual(checkDigest(report, colTrimmed), ['figure mismatch digest: trimmed flag'], 'the data says trimmed and the report does not')
+  assert.deepEqual(checkDigest(`${report}\nDigest trimmed for size: yes\n`, col), ['figure mismatch digest: trimmed flag'], 'the report says trimmed and the data does not')
+})
+
+// ---- M5: the returned report controls how many reasons there are, so how many are printed is bounded here ----
+
+test('formatVerdict: reasons are de-duplicated, only the first few are printed, the rest are counted as more_reasons:<n>, and each line is bounded', async () => {
+  const { formatVerdict, MAX_REASONS, MAX_REASON_CHARS } = await load()
+  assert.equal(MAX_REASONS, 8)
+  const many = Array.from({ length: 100000 }, (_, i) => `figure mismatch ci job: n collected 3, reported ${i}`)
+  const started = Date.now()
+  const out = formatVerdict({ tokens: 'ledger=1/1', denied: 'unknown', reasons: [...many, ...many], place: 'no' })
+  assert.ok(Date.now() - started < 1500, `took ${Date.now() - started} ms`)
+  const reasonLines = out.split('\n').filter((l) => l.startsWith('REASON '))
+  assert.equal(reasonLines.length, MAX_REASONS + 1)
+  assert.equal(reasonLines.at(-1), 'REASON more_reasons:99992', 'the 100000 distinct reasons, less the 8 shown')
+  assert.ok(out.length < 2000, `${out.length} bytes`)
+  const long = formatVerdict({ tokens: 't', denied: 'unknown', reasons: ['x'.repeat(10 * MAX_REASON_CHARS)], place: 'no' })
+  assert.ok(long.split('\n').find((l) => l.startsWith('REASON ')).length <= 'REASON '.length + MAX_REASON_CHARS)
+  assert.equal(formatVerdict({ tokens: 't', denied: 'unknown', reasons: ['a', 'a', 'b'], place: 'no' }), 'TOKENS t\nDENIED unknown\nREASON a\nREASON b\nPLACE no\n', 'duplicates collapse and nothing is added below the cap')
+})
+
+test('checkRows: a 5 MB report of well-formed rows that all disagree with the data is judged in well under a second', async () => {
+  const { checkRows } = await load()
+  const { col, report } = await real()
+  const key = report.split('\n').find((l) => l.includes('::ci::test: n=')).split(': n=')[0].slice(2)
+  const rows = Array.from({ length: 100000 }, (_, i) => `- ${key}: n=${i + 100}, failed=0, mean 60s`).join('\n')
+  const started = Date.now()
+  const reasons = checkRows(`${report}\n${rows}\n`, col)
+  assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`)
+  assert.ok(reasons.length >= 100000, 'the hostile report really does produce a reason per row')
+})
+
+// ---- H2: the nonce the session passed on ----
+
+test('nonceProblem: the result must carry the SHA-256 of this run\'s nonce; another nonce\'s hash, a missing hash, a hash of the empty string and a missing nonce are all refused', async () => {
+  const { nonceProblem } = await load()
+  const { createHash } = require('node:crypto')
+  const hash = (t) => createHash('sha256').update(t).digest('hex')
+  const nonce = '0123456789abcdef0123456789abcdef'
+  assert.equal(nonceProblem({ nonce_sha256: hash(nonce) }, nonce), null, 'control')
+  assert.equal(nonceProblem({ nonce_sha256: hash('f'.repeat(32)) }, nonce), 'result nonce hash does not match this run')
+  assert.equal(nonceProblem({}, nonce), 'result carries no nonce hash')
+  assert.equal(nonceProblem({ nonce_sha256: 42 }, nonce), 'result carries no nonce hash')
+  assert.equal(nonceProblem({ nonce_sha256: hash('') }, ''), 'result nonce hash does not match this run', 'a run given no nonce accepts nothing, not even the hash of nothing')
+  assert.equal(nonceProblem({ nonce_sha256: hash(nonce) }, undefined), 'result nonce hash does not match this run')
 })

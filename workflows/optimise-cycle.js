@@ -1281,6 +1281,9 @@ return {
   per_repo: ledgerAgg ? ledgerAgg.perRepo : [],
   // AC-ARCH-9: the report and the sidecar are RETURNED, never written here, and each lane says whether it ran.
   proposal_targets: proposalTargetsSidecar,
+  // HARN-RUNNER-2 T3 (H2): the SHA-256 of the nonce this run fenced collected text with, never the nonce itself, so the caller can
+  // check that the session passed on the nonce the runner minted.
+  nonce_sha256: typeof dataNonce === 'string' ? sha256Hex(dataNonce) : null,
   lanes,
   proposals_ranked: rankedNew,
   proposals_previously_adopted: previouslyAdopted,

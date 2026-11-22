@@ -19,10 +19,11 @@
 // helper (readRepoFile: no symlink, regular file, size cap), like the collector's reads of collected files, and a
 // static test fails if this file imports child_process or reads any other way.
 
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { isPlainInsufficientRow, readRepoFile } from './optimise-read.mjs'
+import { isPlainInsufficientRow, readRepoFile, sidecarTargetOrReason, stableProposalId } from './optimise-read.mjs'
 
 export const REPORT_CAP = 5242880
 export const SIDECAR_CAP = 1048576
@@ -473,7 +474,146 @@ const ORPHANED_RUNS = {
   rows: (col) => new Map([['orphaned', [numOrNull(wallTotals(col).agentComputeStartOnlyRuns), numOrNull(wallTotals(col).agentComputeTerminalOnlyRuns)]]]),
 }
 
-const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVER_FAILING_LEFT_OUT, LEDGER_REPOSITORY, LEDGER_SKIPPED, TRIGGER_ACCURACY, REWORK, EXCLUDED_FROM_ATTRIBUTION, DROPPED_COUNTER, ORPHANED_RUNS]
+// ---- the remaining figure lines: rework counters, blocked TDD runs, suppression shares, sources, the plan-label note ----
+
+// The workflow prints a count it was given as a number, `null`, or an "unavailable" marker for a reader that predates the field;
+// a split figure also prints `not recorded` for null. These are compared as the fixed words they are, never as session text.
+const COUNTISH = String.raw`(\d{1,15}|null|unavailable \([^)\n]{1,100}\))`
+const SPLITISH = String.raw`(\d{1,15}|not recorded|unavailable \([^)\n]{1,100}\))`
+const wordOf = (x) => (x.startsWith('unavailable') ? 'unavailable' : x)
+const fmtCount = (v) => (v === undefined ? 'unavailable' : String(v))
+function fmtSplit(v) {
+  if (v === undefined) return 'unavailable'
+  return v === null ? 'not recorded' : String(v)
+}
+const fmtV4 = (v) => (v === null || v === undefined ? 'not recorded' : String(v))
+const reworkOf = (col) => (isObject(ledgerDigest(col).rework) ? ledgerDigest(col).rework : null)
+
+const REWORK_FINDINGS_DROPPED = {
+  name: 'rework counters',
+  re: new RegExp(String.raw`^findings dropped from this tally: findings_truncated=${COUNTISH} \(findings the writer counted but could not fit on the line; the per-lens rows above are short by this many\), ac_verdicts_truncated=${COUNTISH}, unattributed \(lens value did not match a known lens\)=${COUNTISH}\.$`, 'gm'),
+  isRow: (l) => l.startsWith('findings dropped from this tally'),
+  names: ['findings truncated', 'ac verdicts truncated', 'unattributed findings'],
+  textual: true,
+  split: (m) => ({ key: 'dropped', got: m.slice(1, 4).map(wordOf) }),
+  rows: (col) => {
+    const r = reworkOf(col)
+    return r === null ? new Map() : new Map([['dropped', [fmtCount(r.findingsTruncated), fmtCount(r.acVerdictsTruncated), fmtCount(r.unattributedFindings)]]])
+  },
+}
+
+const REWORK_NO_SPEC = {
+  name: 'rework counters',
+  re: new RegExp(String.raw`^No-spec review runs in window: ${COUNTISH} \(conducted=${SPLITISH}, direct=${SPLITISH}, round not recorded=${SPLITISH}\) \(findings reclassified from spec_bug to open on those runs: ${COUNTISH}\)\. Completed review runs carrying a conductor round, any spec: ${SPLITISH}\.$`, 'gm'),
+  isRow: (l) => l.startsWith('No-spec review runs in window'),
+  names: ['no-spec review runs', 'conducted', 'direct', 'round not recorded', 'reclassified findings', 'review runs with a round'],
+  textual: true,
+  split: (m) => ({ key: 'no-spec', got: m.slice(1, 7).map(wordOf) }),
+  rows: (col) => {
+    const r = reworkOf(col)
+    return r === null ? new Map() : new Map([['no-spec', [fmtCount(r.noSpecReviewRuns), fmtSplit(r.noSpecReviewRunsConducted), fmtSplit(r.noSpecReviewRunsDirect), fmtSplit(r.noSpecReviewRunsRoundNotRecorded), fmtCount(r.noSpecFindingsReclassified), fmtSplit(r.reviewRunsWithRound)]]])
+  },
+}
+
+const V4 = String.raw`(\d{1,15}|not recorded)`
+const REWORK_SCHEMA_V4 = {
+  name: 'rework counters',
+  re: new RegExp(String.raw`^Completeness, schema_version >= 4 rows only(?: \(${COUNT} rows; ${COUNT} older rows excluded\): findings_truncated=${V4}, unattributed findings=${V4}, duplicate verdict groups collapsed=${V4}, no-spec review runs=${V4}, no-spec review runs conducted=${V4}, direct=${V4}, round not recorded=${V4}\. Completed review runs carrying a conductor round, any spec: ${V4}\.|: not recorded \(no such rows; ${COUNT} older rows excluded\)\.)$`, 'gm'),
+  isRow: (l) => l.startsWith('Completeness, schema_version >= 4'),
+  names: ['schema v4 rows', 'schema v4 older rows', 'findings truncated', 'unattributed findings', 'duplicate verdict groups', 'no-spec review runs', 'no-spec review runs conducted', 'direct', 'round not recorded', 'review runs with a round'],
+  textual: false,
+  split: (m) => (m[1] === undefined ? { key: 'v4', got: ['0', m[11]].map(String) } : { key: 'v4', got: m.slice(1, 11).map(String) }),
+  rows: (col) => {
+    const v4 = reworkOf(col)?.schemaV4
+    if (!isObject(v4)) return new Map()
+    const rows = isCount(v4.rows) && v4.rows > 0
+    const figures = rows ? [v4.findingsTruncated, v4.unattributedFindings, v4.duplicateVerdictPairs, v4.noSpecReviewRuns, v4.noSpecReviewRunsConducted, v4.noSpecReviewRunsDirect, v4.noSpecReviewRunsRoundNotRecorded, v4.reviewRunsWithRound].map(fmtV4) : []
+    return new Map([['v4', [String(rows ? v4.rows : 0), String(v4.excludedRows), ...figures]]])
+  },
+}
+
+const blockedOf = (col) => (isObject(ledgerDigest(col).blockedUnresolved) ? ledgerDigest(col).blockedUnresolved : null)
+const BLOCKED_COUNT = {
+  name: 'blocked tdd',
+  re: /^Blocked TDD runs unresolved in window \(upper bound: a task finished by hand leaves no resolution row\): (\d{1,15})$/gm,
+  isRow: (l) => l.startsWith('Blocked TDD runs unresolved in window (') && !/: not measured \((?:ledger unavailable|installed reader predates this metric)\)$/.test(l),
+  names: ['unresolved'],
+  split: (m) => ({ key: 'count', got: [Number(m[1])] }),
+  rows: (col) => (isCount(blockedOf(col)?.count) ? new Map([['count', [blockedOf(col).count]]]) : new Map()),
+}
+// The blocked runs whose reason was recorded: the sum of the per-reason counts, or `not recorded` when there are none to sum.
+function recordedReasons(byReason) {
+  if (!isObject(byReason)) return 'not recorded'
+  return Object.values(byReason).reduce((acc, v) => acc + (isCount(v) ? v : 0), 0)
+}
+const BLOCKED_REASONS = {
+  name: 'blocked tdd',
+  re: /^Blocked TDD runs unresolved, reason recorded \(post-T5\): (\d{1,15}|not recorded); not recorded \(pre-T5\): (\d{1,15}|not recorded)\.$/gm,
+  isRow: (l) => l.startsWith('Blocked TDD runs unresolved, reason recorded'),
+  names: ['reason recorded', 'not recorded'],
+  split: (m) => ({ key: 'reasons', got: [m[1], m[2]] }),
+  rows: (col) => {
+    const b = blockedOf(col)
+    if (!isCount(b?.count)) return new Map()
+    const recorded = recordedReasons(b.byReason)
+    return new Map([['reasons', [String(recorded), isCount(b.reasonNotRecorded) ? String(b.reasonNotRecorded) : 'not recorded']]])
+  },
+}
+
+const UNTERMINATED_TOTAL = {
+  name: 'wall-clock unterminated',
+  re: /^unterminated_waits: (\d{1,15})$/gm,
+  isRow: (l) => l.startsWith('unterminated_waits: '),
+  names: ['unterminated waits'],
+  split: (m) => ({ key: 'total', got: [Number(m[1])] }),
+  rows: (col) => (wallTotals(col).unterminatedWaits ? new Map([['total', [wallTotals(col).unterminatedWaits]]]) : new Map()),
+}
+
+const SEGMENTS = { ci_wait: 'ciWait', human_wait: 'humanWait', agent_compute: 'agentCompute' }
+const SUPPRESSION_SHARE = {
+  name: 'filtering',
+  re: /^(ci_wait|human_wait|agent_compute): (\d{1,15})\/(\d{1,15}) runs unmeasured \((\d{1,3})%\) -- (?:at\/above|below) the 20% suppression threshold(?:: wall-clock proposals citing this segment are suppressed)?$/gm,
+  isRow: (l) => /^(?:ci_wait|human_wait|agent_compute): /.test(l) && l.includes(' runs unmeasured '),
+  names: ['unmeasured', 'total', 'percent'],
+  split: (m) => ({ key: m[1], got: [Number(m[2]), Number(m[3]), Number(m[4])] }),
+  rows: (col) => {
+    const t = wallTotals(col)
+    return new Map(Object.entries(SEGMENTS).filter(([, p]) => isCount(t[`${p}UnmeasuredRuns`]) && isCount(t[`${p}MeasuredRuns`])).map(([seg, p]) => {
+      const unmeasured = t[`${p}UnmeasuredRuns`]
+      const total = unmeasured + t[`${p}MeasuredRuns`]
+      return [seg, [unmeasured, total, total > 0 ? Math.floor((unmeasured / total) * 100) : 0]]
+    }))
+  },
+}
+
+const WALL_CLOCK_SOURCES = {
+  name: 'wall-clock sources',
+  re: /^Sources: ci_wait=([^\n]{1,300}), human_wait=([^\n]{1,300}), agent_compute=([^\n]{1,300})\.$/gm,
+  isRow: (l) => l.startsWith('Sources: '),
+  names: ['ci wait source', 'human wait source', 'agent compute source'],
+  textual: true,
+  split: (m) => ({ key: 'sources', got: [m[1], m[2], m[3]] }),
+  rows: (col) => {
+    const src = ledgerDigest(col).wallClock?.source
+    return isObject(src) ? new Map([['sources', [String(src.ci_wait), String(src.human_wait), String(src.agent_compute)]]]) : new Map()
+  },
+}
+
+function formatByKind(byKind) {
+  const entries = entriesOf(byKind)
+  return entries.length > 0 ? entries.map(([k, n]) => `${k}: ${n}`).join(', ') : 'none'
+}
+const ORPHANED_KINDS = {
+  name: 'orphaned runs',
+  re: /^Orphaned agent-compute runs \(never silently collapsed into one number\): start-only=[^(\n]{1,120}(?:\([^)\n]{1,100}\))? \(by kind: ([^)\n]{1,300})\), terminal-only=[^(\n]{1,120}(?:\([^)\n]{1,100}\))? \(by kind: ([^)\n]{1,300})\)\.$/gm,
+  isRow: (l) => l.startsWith('Orphaned agent-compute runs'),
+  names: ['start-only by kind', 'terminal-only by kind'],
+  textual: true,
+  split: (m) => ({ key: 'kinds', got: [m[1], m[2]] }),
+  rows: (col) => new Map([['kinds', [formatByKind(wallTotals(col).agentComputeStartOnlyByKind), formatByKind(wallTotals(col).agentComputeTerminalOnlyByKind)]]]),
+}
+
+const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVER_FAILING_LEFT_OUT, LEDGER_REPOSITORY, LEDGER_SKIPPED, TRIGGER_ACCURACY, REWORK, EXCLUDED_FROM_ATTRIBUTION, DROPPED_COUNTER, ORPHANED_RUNS, ORPHANED_KINDS, REWORK_FINDINGS_DROPPED, REWORK_NO_SPEC, REWORK_SCHEMA_V4, BLOCKED_COUNT, BLOCKED_REASONS, UNTERMINATED_TOTAL, SUPPRESSION_SHARE, WALL_CLOCK_SOURCES]
 
 function checkRowClass(spec, report, col) {
   const wants = spec.rows(col)
@@ -490,7 +630,7 @@ function checkRowClass(spec, report, col) {
     }
     seen.add(key)
     const diff = firstDifference(spec.names, want, parsed.got)
-    if (diff) reasons.push(`figure mismatch ${spec.name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`)
+    if (diff) reasons.push(spec.textual ? `figure mismatch ${spec.name}: ${diff.name} differs from the collected one` : `figure mismatch ${spec.name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`)
   })
   for (const [key, want] of wants) if (!seen.has(key)) reasons.push(`figure mismatch ${spec.name}: ${spec.names[0]} collected ${want[0]}, reported none`)
   if (report.split('\n').filter(spec.isRow).length !== matches.length) reasons.push(`figure mismatch ${spec.name}: a row in a shape the check does not know`)
@@ -533,8 +673,28 @@ export function checkProposalOutcomes(report, col) {
   return reasons
 }
 
+// The note the collector wrote about plan labels it left out is printed verbatim (flattened); the report must carry exactly it.
+export function checkPlanLabelNote(report, col) {
+  const note = col.digest?.plan_labels_note
+  if (typeof note !== 'string' || note.trim() === '') return []
+  const expected = note.replaceAll(/\s+/g, ' ').slice(0, 400)
+  return report.split('\n').includes(expected) ? [] : ['figure mismatch plan labels: note differs from the collected one']
+}
+
+// The single-line figure shapes that are not row classes: each has its own check above.
+const SINGLE_LINE_SHAPES = [/^Ledger records in window: /, /^CI runs: /, /^Raw \(unscoped\): /, /^Scoped to product source /, /^Digest omitted /, /^Digest trimmed for size: /]
+
+// Whether some check in this module looks at the line (so a figure on it cannot change in transit unseen). The coverage test
+// in test/optimise-verify.test.js renders the real report and requires every line with a digit to be checked or to be on its
+// explicit list of deliberately unchecked shapes, so a new numeric line in the workflow fails that test until it is one or the other.
+export function isCheckedLine(line, col) {
+  if (SINGLE_LINE_SHAPES.some((shape) => shape.test(line)) || ROW_CLASSES.some((spec) => spec.isRow(line)) || dateClaimIn(line) !== null) return true
+  const note = col.digest?.plan_labels_note
+  return typeof note === 'string' && note.trim() !== '' && line === note.replaceAll(/\s+/g, ' ').slice(0, 400)
+}
+
 export function checkRows(report, col) {
-  return [...ROW_CLASSES.flatMap((spec) => checkRowClass(spec, report, col)), ...checkScoped(report, col), ...checkProposalOutcomes(report, col)]
+  return [...ROW_CLASSES.flatMap((spec) => checkRowClass(spec, report, col)), ...checkScoped(report, col), ...checkProposalOutcomes(report, col), ...checkPlanLabelNote(report, col)]
 }
 
 // { reasons, reportedLedger }: every figure in the report against the collected files.
@@ -583,6 +743,50 @@ export function readExistingSidecar(root) {
   }
 }
 
+// ---- the returned sidecar is session output: validated before it touches the on-disk one (H1) ----
+//
+// The on-disk sidecar is the only copy of the id-to-target map for decided proposals, so what the session returns is
+// admitted entry by entry, and one entry that fails any rule fails the run (nothing placed, the file untouched):
+//   1. the key is a proposal id, 16 lower-case hex characters (so `__proto__`, `constructor` and made-up words are out);
+//   2. the value is a target in the reader's fixed shape (the reader's own rule, imported, not copied);
+//   3. the value hashes, by the reader's stableProposalId, to its key (so a real target cannot sit under another id);
+//   4. the id is one this run names: a `### <id>:` heading or `- <id>:` bullet in its report, or an outcome the ledger
+//      holds. A flood of made-up ids, or a decided id's value swapped, therefore cannot get in.
+// Eviction follows from these rules: a returned entry can only be one of the ids rule 4 names, so the number of on-disk
+// entries it can push out (only when the file is already at SIDECAR_CARRY_MAX, oldest first) is at most the number of
+// such ids, and never more than the entries it adds (pinned in test/optimise-verify.test.js).
+const PROPOSAL_ID = /^[0-9a-f]{16}$/
+
+// The proposal ids this run names: report headings and bullets, and the ledger's recorded outcomes (carried through the digest).
+export function namedProposalIds(report, col) {
+  const ids = new Set([...report.matchAll(/^(?:### |- )([0-9a-f]{16}): /gm)].map((m) => m[1]))
+  const outcomes = ledgerDigest(col).proposalOutcomes
+  for (const id of isObject(outcomes) ? Object.keys(outcomes) : []) ids.add(id)
+  return ids
+}
+
+// null when every entry passes, else the one fixed reason for the first that does not.
+export function validateReturnedSidecar(targets, named) {
+  for (const [id, value] of Object.entries(targets)) {
+    if (!PROPOSAL_ID.test(id)) return 'returned sidecar has a key that is not a proposal id'
+    if (sidecarTargetOrReason(value).target === undefined) return 'returned sidecar has a target that is not the fixed shape'
+    if (stableProposalId(value) !== id) return 'returned sidecar has a target that does not hash to its id'
+    if (!named.has(id)) return 'returned sidecar has an id this run does not name'
+  }
+  return null
+}
+
+// ---- the nonce the session passed on (H2) ----
+
+// The result must carry the SHA-256 of the nonce the runner minted for this run (given to this process in its environment,
+// never in its arguments), so a session steered by text in the digest into passing another nonce, or a result that did not
+// come from a workflow run on this run's digest, is refused. null when it matches, else the one fixed reason.
+export function nonceProblem(result, nonce) {
+  if (typeof result.nonce_sha256 !== 'string') return 'result carries no nonce hash'
+  const want = createHash('sha256').update(typeof nonce === 'string' ? nonce : '').digest('hex')
+  return result.nonce_sha256 === want && typeof nonce === 'string' && nonce !== '' ? null : 'result nonce hash does not match this run'
+}
+
 // ---- the whole check ----
 
 function lanesThatCouldNotRun(col) {
@@ -596,42 +800,59 @@ function readSession(sessionPath) {
 }
 
 // What a session's reply amounts to: { reasons, cause, denied, reportedLedger, place, report, sidecar, targets }.
-function judgeSession(sessionPath, col, strict, bounded) {
+function judgeSession(sessionPath, col, strict, bounded, nonce) {
   const out = { reasons: [], denied: 'unknown', reportedLedger: null, place: 'no' }
   const read = readSession(sessionPath)
   const parsed = read.reason ? read : parseSession(read.text)
   if (parsed.reason) return { ...out, denied: parsed.denied ?? 'unknown', reasons: [parsed.reason], cause: parsed.cause }
   const checked = checkResult(parsed.result, strict, bounded)
   if (checked.reason) return { ...out, denied: parsed.denied, reasons: [checked.reason], cause: checked.cause }
+  const wrongNonce = nonceProblem(parsed.result, nonce)
+  if (wrongNonce !== null) return { ...out, denied: parsed.denied, reasons: [wrongNonce], cause: 'nonce' }
   const figures = checkFigures(parsed.result, checked.report, col)
   const reasons = figures.reasons.length === 0 ? lanesThatCouldNotRun(col) : figures.reasons
   return { ...out, denied: parsed.denied, reasons, reportedLedger: figures.reportedLedger, place: figures.reasons.length === 0 ? 'yes' : 'no', report: checked.report, sidecar: checked.sidecar, targets: checked.targets }
 }
 
-// A trusted result's sidecar is merged into the one on disk. One that cannot be read stops the run: nothing is placed.
-function withMergedSidecar(judged, sidecarRoot) {
-  if (judged.place !== 'yes' || !sidecarRoot || sidecarRoot === '-') return judged
+// A trusted result's sidecar is validated (H1), then merged into the one on disk. One that fails a rule, or an on-disk one
+// that cannot be read, stops the run: nothing is placed.
+function withMergedSidecar(judged, sidecarRoot, col) {
+  if (judged.place !== 'yes') return judged
+  const invalid = validateReturnedSidecar(judged.targets, namedProposalIds(judged.report, col))
+  if (invalid !== null) return { ...judged, reasons: [invalid], place: 'no' }
+  if (!sidecarRoot || sidecarRoot === '-') return judged
   const existing = readExistingSidecar(sidecarRoot)
   if (existing.reason) return { ...judged, reasons: [existing.reason], place: 'no' }
   return { ...judged, sidecar: sidecarText(fitSidecar(mergeSidecar(existing.entries, judged.targets))) }
 }
 
 // { tokens, denied, cause, reasons, place, report, sidecar }. `sessionPath` of '-' means no session ran.
-export function verifyRun({ dir, sessionPath, digestToken, repo, runTmp, home, sidecarRoot }) {
+export function verifyRun({ dir, sessionPath, digestToken, repo, runTmp, home, sidecarRoot, nonce }) {
   const col = loadCollected(dir)
   const strict = pathNeedles([home, dir, runTmp])
   const bounded = pathNeedles([repo])
-  const judged = sessionPath === '-' ? { reasons: [], denied: 'unknown', reportedLedger: null, place: 'no' } : withMergedSidecar(judgeSession(sessionPath, col, strict, bounded), sidecarRoot)
+  const judged = sessionPath === '-' ? { reasons: [], denied: 'unknown', reportedLedger: null, place: 'no' } : withMergedSidecar(judgeSession(sessionPath, col, strict, bounded, nonce), sidecarRoot, col)
   return { ...judged, tokens: tokensFor(col, digestToken, judged.reportedLedger) }
 }
 
+// The returned report decides how many reasons a bad result produces, so the number printed, and each one's length, are
+// bounded here: duplicates collapse, the first MAX_REASONS are printed, and the rest are counted as `more_reasons:<n>`.
+export const MAX_REASONS = 8
+export const MAX_REASON_CHARS = 300
+
+export function cappedReasons(reasons) {
+  const distinct = [...new Set(reasons)]
+  const shown = distinct.slice(0, MAX_REASONS).map((r) => r.slice(0, MAX_REASON_CHARS))
+  return distinct.length > MAX_REASONS ? [...shown, `more_reasons:${distinct.length - MAX_REASONS}`] : shown
+}
+
 export function formatVerdict(v) {
-  return [`TOKENS ${v.tokens}`, `DENIED ${v.denied}`, ...(v.cause ? [`CAUSE ${v.cause}`] : []), ...v.reasons.map((r) => `REASON ${r}`), `PLACE ${v.place}`].join('\n') + '\n'
+  return [`TOKENS ${v.tokens}`, `DENIED ${v.denied}`, ...(v.cause ? [`CAUSE ${v.cause}`] : []), ...cappedReasons(v.reasons).map((r) => `REASON ${r}`), `PLACE ${v.place}`].join('\n') + '\n'
 }
 
 function main(argv) {
   const [dir, sessionPath, digestToken, repo, runTmp, sidecarRoot] = argv
-  const v = verifyRun({ dir, sessionPath, digestToken, repo, runTmp, home: process.env.HOME, sidecarRoot })
+  const v = verifyRun({ dir, sessionPath, digestToken, repo, runTmp, home: process.env.HOME, sidecarRoot, nonce: process.env.OPTIMISE_VERIFY_NONCE })
   if (v.place === 'yes') {
     fs.writeFileSync(`${dir}/result-report.md`, v.report, { mode: 0o600 })
     fs.writeFileSync(`${dir}/result-sidecar.json`, v.sidecar, { mode: 0o600 })
@@ -639,5 +860,7 @@ function main(argv) {
   process.stdout.write(formatVerdict(v))
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+// Compared by real path: import.meta.url is the real file, argv[1] may be reached through a symlink (an install whose
+// ~/.claude is a link), and a lexical comparison then silently runs nothing.
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(path.resolve(process.argv[1]))
 if (isMain) main(process.argv.slice(2))

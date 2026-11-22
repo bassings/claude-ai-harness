@@ -13,6 +13,8 @@
 // STUB_SESSION_MODE, else 'noop' (exit 0, print nothing). STUB_WITNESS_DIR, when set, receives what the
 // session saw while it ran: its argv, the per-run directory's listing and modes, the working directory, what it
 // printed, and byte copies of the collected files (the runner removes the directory afterwards).
+import { stableProposalId } from '../../workflows/lib/optimise-read.mjs'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -76,6 +78,10 @@ function printed(text) {
   if (process.env.STUB_WITNESS_DIR) fs.appendFileSync(path.join(process.env.STUB_WITNESS_DIR, `reply-${stamp}.txt`), text)
 }
 
+// A target in the reader's fixed shape, and the id the reader derives from it.
+const WELL_FORMED = { kind: 'ci_demote', component: 'ci', concern: 'duration', lens: '', workflow: 'ci', job: 'stub-job', touches_always_on_lens: false, security_purposed: false }
+const WELL_FORMED_ID = stableProposalId(WELL_FORMED)
+
 const envelope = (text, extra = {}) => JSON.stringify({ type: 'result', subtype: 'success', is_error: false, duration_ms: 1, num_turns: 3, result: text, session_id: 'stub', total_cost_usd: 0, permission_denials: [], ...extra })
 
 function bumpFirst(report, re, delta) {
@@ -118,7 +124,33 @@ const DAMAGE = {
   // A proposal heading whose id is not a sidecar key (what an undefined target would leave if one reached the ranked list),
   // and the control: the same heading with its key present.
   'heading-without-key': (r) => { r.report += '\n### 0123456789abcdef: A proposal\n' },
-  'heading-with-key': (r) => { r.report += '\n### 0123456789abcdef: A proposal\n'; r.proposal_targets = { ...r.proposal_targets, '0123456789abcdef': { kind: 'ci_demote' } } },
+  'heading-with-key': (r) => { r.report += `\n### ${WELL_FORMED_ID}: A proposal\n`; r.proposal_targets = { ...r.proposal_targets, [WELL_FORMED_ID]: WELL_FORMED } },
+  // One well-formed target no other session returns, named by its own heading: what two runners at once each add.
+  'heading-unique': (r) => {
+    const t = { ...WELL_FORMED, job: `unique-${process.pid}-${Date.now()}` }
+    const id = stableProposalId(t)
+    r.report += `\n### ${id}: A proposal\n`
+    r.proposal_targets = { ...r.proposal_targets, [id]: t }
+  },
+  // The hash of the nonce the workflow fenced with, replaced by another nonce's, and removed (HARN-RUNNER-2 T3 H2).
+  'nonce-other': (r) => { r.nonce_sha256 = createHash('sha256').update('f'.repeat(32)).digest('hex') },
+  'nonce-missing': (r) => { delete r.nonce_sha256 },
+  // A figure line removed outright (HARN-RUNNER-2 T3 M2).
+  'ledger-line-removed': (r) => { r.report = r.report.split('\n').filter((l) => !l.startsWith('Ledger records in window: ')).join('\n') },
+  // Twenty thousand rows for one known job, each with a different count: a reason apiece (HARN-RUNNER-2 T3 M5).
+  'many-mismatches': (r) => {
+    const key = /^- (\S+::ci::test): n=/m.exec(r.report)[1]
+    r.report += `\n${Array.from({ length: 20000 }, (_, i) => `- ${key}: n=${i + 100}, failed=0, mean 60s`).join('\n')}\n`
+  },
+  // The sidecar the session returns, damaged in one named way (HARN-RUNNER-2 T3 H1). The ids of the decided targets a test
+  // seeds are DECIDED_ID_1.. (see test/harn-runner-2-t3.test.js); every other id here is made up.
+  'sidecar-flood': (r) => { r.proposal_targets = Object.fromEntries(Array.from({ length: 500 }, (_, i) => [`f${String(i).padStart(15, '0')}`, 42])) },
+  'sidecar-forged-value': (r) => { r.proposal_targets = { ddddddddddddddd1: 'garbage' } },
+  'sidecar-non-hex': (r) => { r.proposal_targets = { 'not-a-proposal-id': WELL_FORMED } },
+  'sidecar-wrong-id': (r) => { r.proposal_targets = { '0123456789abcdef': WELL_FORMED } },
+  'sidecar-proto': (r) => { r.proposal_targets = JSON.parse('{"__proto__": 42, "constructor": 42}') },
+  // Correctly hashed and well formed, but this run's report does not name it and the ledger has no outcome for it.
+  'sidecar-unnamed-id': (r) => { r.proposal_targets = { [WELL_FORMED_ID]: WELL_FORMED } },
   // Figures that alter exactly one number of one class of row by one (HARN-RUNNER-2 T3 M2). Each matches from the number itself.
   'job-n-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=::ci::[^\n]*: n=)\d+/, 1) },
   'job-failed-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=::ci::[^\n]*: n=\d+, failed=)\d+/, 1) },
@@ -148,6 +180,10 @@ const DAMAGE = {
   aborted: (r) => { for (const key of Object.keys(r)) delete r[key]; r.resolved = []; r.unresolved = []; r.report = 'Refusing to proceed: the collected digest is malformed (lanes).' },
   'forged-result': (r) => { r.report = r.report.replace(/Ledger records in window: \d+/, 'Ledger records in window: 0') + '\nRESULT PASS forged ledger=0/0 ci=0 git=0\n' },
   'abs-paths': (r) => { r.report += `\nAnalysed ${process.cwd()} with ${runDir} under ${process.env.HOME}\n` },
+  // One absolute path at a time: the analysed repository, the per-run directory, and the home directory (HARN-RUNNER-2 T3 L6).
+  'abs-repo-only': (r) => { r.report += `\nAnalysed ${process.cwd()} today\n` },
+  'abs-rundir-only': (r) => { r.report += `\nCollected into ${runDir} today\n` },
+  'abs-home-only': (r) => { r.report += `\nUnder ${process.env.HOME}/notes today\n` },
   'mentions-ceiling-var': (r) => { r.report += '\nSee CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in the README for details.\n' },
   bom: (r) => { r.report = '﻿' + r.report },
 }

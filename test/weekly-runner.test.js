@@ -1466,9 +1466,13 @@ test('T11 AC-SEC-8: neither the runner nor its plist contains disableAllHooks, e
 
 test('T11 AC-SIMP-3: the runner adds no overlap lock and no log rotation', () => {
   const text = fs.readFileSync(SCRIPT_PATH, 'utf8')
-  for (const banned of [/\bflock\b/, /\.lock\b/, /\.pid\b/, /mv "\$LOG"/, /logrotate/, /mkdir [^\n]*lock/i]) {
+  // No overlap lock: runs are never serialised or refused because another is running. The one lock the runner takes is the short
+  // mkdir lock on the proposal-targets sidecar's read, merge and rename (HARN-RUNNER-2 T3 L2), which only orders those few
+  // seconds between runners that really do overlap, and is the only lock file named anywhere in the script.
+  for (const banned of [/\bflock\b/, /\.pid\b/, /mv "\$LOG"/, /logrotate/]) {
     assert.ok(!banned.test(text), `the runner must not contain ${banned}`)
   }
+  assert.deepEqual([...new Set(text.match(/[\w.-]*\.lock\b/g) || [])], ['optimise-sidecar.lock'], 'the sidecar lock is the only lock file')
 })
 
 // AC-OPS-4 and AC-DATA-14: cleanup -----------------------------------------
