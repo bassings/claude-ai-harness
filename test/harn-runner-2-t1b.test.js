@@ -450,7 +450,7 @@ test('T1b digest: when nothing needs dropping the dropped counts are zero', () =
   const root = makeRepo({ ledger: validLedger(3), fix: 1 })
   const outDir = scratchDir()
   drive(stubs, { root, outDir })
-  assert.deepEqual(digestOf(outDir).dropped, { wallClockByPlan: 0, proposalOutcomes: 0, planLabels: 0, ciByJob: 0, ciFailedRunIds: 0, ciCitationPool: 0, ledgerCitationPool: 0, neverFailingAcs: 0, trimmedForSize: false })
+  assert.deepEqual(digestOf(outDir).dropped, { wallClockByPlan: 0, proposalOutcomes: 0, planLabels: 0, ciByJob: 0, ciFailedRunIds: 0, ciCitationPool: 0, ledgerCitationPool: 0, neverFailingAcs: 0, planLabelsUnmatched: 0, trimmedForSize: false })
 })
 
 // Stub gh with the given runs (by id) and, for each, the jobs its `gh run view` lists.
@@ -586,8 +586,9 @@ test('T1b digest M1: with every cap filled by realistic entries the digest is tr
   assert.ok(trimmed.length >= 2, `the fixture is far enough over the bound to trim several lists: ${trimmed}`)
   assert.ok(d.dropped.planLabels > 0 && total('planLabels') === 90, 'labels are counted against all 90 found')
   assert.equal(d.plan_labels_note, `${d.dropped.planLabels} of 90 task labels were left out to keep the digest within its size limit; plans with open tasks were kept first`, 'the note says the labels went for size, with the final count')
-  const logged = / digest=ran:bytes:(\d+),dropped:(\d+)$/.exec(out.line)
+  const logged = / digest=ran:bytes:(\d+),dropped:(\d+),trimmed:(yes|no)$/.exec(out.line)
   assert.ok(logged && Number(logged[2]) === Object.values(d.dropped).filter((v) => typeof v === 'number').reduce((a, b) => a + b, 0) && Number(logged[2]) > 0, `a trimmed digest is visible in the log: ${out.line}`)
+  assert.equal(logged[3], 'yes', 'a digest trimmed for size says so on the line')
   // Observable order: a list is only touched once every list before it is at its floor.
   const last = TRIM_ORDER.indexOf(trimmed.at(-1))
   for (const name of TRIM_ORDER.slice(0, last)) assert.equal(kept[name], Math.min(TRIM_FLOORS[name], total(name)), `${name} is at its floor before a later list is touched`)
@@ -774,9 +775,10 @@ test('T1b digest L2: an overlong string from a repository label, a CI job name o
   }
 })
 
-const LINE_SHAPE = /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+ ci_runs=fetched:3,not_fetched:0,timeout:0 digest=ran:bytes:(\d+),dropped:(\d+)$/
+const d_trimmed = (outDir) => digestOf(outDir).dropped.trimmedForSize
+const LINE_SHAPE = /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+ ci_runs=fetched:3,not_fetched:0,timeout:0 digest=ran:bytes:(\d+),dropped:(\d+),trimmed:(yes|no)$/
 
-test('T1b digest: a successful collection keeps every earlier field of the COLLECT line and ends with digest=ran:bytes:<n>,dropped:<total>, integers only', () => {
+test('T1b digest: a successful collection keeps every earlier field of the COLLECT line and ends with digest=ran:bytes:<n>,dropped:<total>,trimmed:<yes|no>', () => {
   const { out, outDir } = rich()
   assert.equal(out.lanes.digest.status, 'ran')
   const match = LINE_SHAPE.exec(out.line)
@@ -784,12 +786,15 @@ test('T1b digest: a successful collection keeps every earlier field of the COLLE
   assert.equal(Number(match[1]), sizeOf(path.join(outDir, 'digest.json')), 'bytes is the size of digest.json')
   const { dropped } = digestOf(outDir)
   assert.equal(Number(match[2]), Object.values(dropped).filter((v) => typeof v === 'number').reduce((a, b) => a + b, 0), 'dropped is the sum of every count in dropped, plan labels included')
+  assert.equal(match[3], d_trimmed(outDir) ? 'yes' : 'no', 'trimmed says whether the digest was shortened for size, not whether a cap dropped entries')
+  assert.equal(match[3], 'no', 'the rich fixture is within the bound after the entry caps, though its caps drop entries')
+  assert.ok(Number(match[2]) > 0, 'routine cap drops alone give a non-zero dropped total and trimmed:no')
   assert.ok(!out.line.includes('CANARY'), 'nothing collected is on the line')
 })
 
 test('T1b digest: the log line shows a zero dropped total for an untrimmed digest and a non-zero one for each kind of trimming', () => {
   const droppedOf = (out) => Number(LINE_SHAPE_ANY.exec(out.line)[1])
-  const LINE_SHAPE_ANY = / digest=ran:bytes:\d+,dropped:(\d+)$/
+  const LINE_SHAPE_ANY = / digest=ran:bytes:\d+,dropped:(\d+),trimmed:no$/
   const stubs = stubsWithRuns()
   const plain = drive(stubs, { root: makeRepo({ ledger: validLedger(3), fix: 1 }), outDir: scratchDir() })
   assert.equal(droppedOf(plain), 0, plain.line)
@@ -886,7 +891,7 @@ const STRUCTURAL_KEYS = new Set([
   'byLens', 'cleanWithZeroTrigger', 'cleanWithMatches', 'findingsWithMatches', 'cleanTriggerUnmeasured', 'total',
   'lastAdoptionTs', 'lastRejectionTs', 'target', 'kind', 'component', 'concern', 'lens', 'workflow', 'job',
   'ac_id', 'insufficient_data', 'unattributed_fail_in_window', 'unattributed_verdict_in_entry', 'truncated_in_window', 'never_failed', 'verdict_disagreements',
-  'wallClockByPlan', 'planLabels', 'ciByJob', 'ciFailedRunIds', 'ciCitationPool', 'ledgerCitationPool', 'trimmedForSize', 'task_id', 'title',
+  'wallClockByPlan', 'planLabels', 'ciByJob', 'ciFailedRunIds', 'ciCitationPool', 'ledgerCitationPool', 'planLabelsUnmatched', 'trimmedForSize', 'task_id', 'title',
   'adoptedCount', 'rejectedCount', 'revertedCount', 'revertedTwiceOrMore', 'targetUnavailableReason',
   'ciWaitMeasuredRuns', 'ciWaitUnmeasuredRuns', 'humanWaitMeasuredRuns', 'humanWaitUnmeasuredRuns', 'agentComputeMeasuredRuns', 'agentComputeUnmeasuredRuns', 'agentComputeAbortedSeconds', 'degradedUnattributedRuns', 'unattributableRuns', 'unattributableWaits',
   'ciWaitN', 'ciWaitUnmeasuredN', 'humanWaitN', 'humanWaitUnmeasuredN', 'agentComputeN', 'agentComputeUnmeasuredN', 'agentComputeAbortedN',
@@ -965,6 +970,32 @@ test('AC-SEC-6: a lane reason is fixed text and is never listed as free text', (
   const d = digestOf(outDir)
   const listed = new Set(d.freeTextPaths.flatMap((p) => denote(d, p)))
   for (const name of ['ledger', 'git', 'ci']) assert.equal(listed.has(['lanes', name, 'reason'].join('\u0000')), false, `lanes.${name}.reason is fixed text`)
+})
+
+// ---- L5: the reader cuts the log, the collector does not parse it ----
+
+test('T1b git L5: the reader\'s escapedDefectsFigures takes an optional maximum of commits and says whether more existed; without it nothing changes', async () => {
+  const { escapedDefectsFigures } = await loadReader()
+  const root = makeRepo({ ledger: validLedger(2), fix: 3 })
+  const rawLog = ['fix: a', 'feat: b', 'fix: c', 'fix: d'].map((subject, i) => `\u001e\u001f${subject}\nsrc/f${i}.js\n`).join('')
+  const base = { rawLog, toplevel: root, root, identity: 'id' }
+  const all = escapedDefectsFigures(base)
+  assert.equal(all.n_commits_examined, 4)
+  assert.ok(!('more' in all), 'without a maximum the result has no extra key, so the command-line output is unchanged')
+  const first = escapedDefectsFigures({ ...base, maxCommits: 3 })
+  assert.equal(first.n_commits_examined, 3, 'the figures are those of the first 3 records')
+  assert.equal(first.count, 2)
+  assert.equal(first.more, true)
+  assert.equal(escapedDefectsFigures({ ...base, maxCommits: 4 }).more, false, 'exactly the maximum is not more')
+  assert.equal(escapedDefectsFigures({ ...base, maxCommits: 9 }).more, false)
+  assert.equal(escapedDefectsFigures({ ...base, toplevel: path.dirname(root), maxCommits: 3 }).rejected, true, 'a rejected toplevel is still rejected')
+})
+
+test('T1b git L5: the collector holds no copy of the log record separator and does not split the log itself', () => {
+  const source = fs.readFileSync(COLLECTOR, 'utf8')
+  assert.ok(!/u001e|x1e(?!\w)/i.test(source.replaceAll('%x1e', '')), 'no record separator in the collector (the %x1e in the git format string is the command\'s)')
+  assert.ok(!/GIT_LOG_RECORD_SEP/.test(source))
+  assert.ok(!/\.split\(\s*GIT/.test(source) && !/firstCommits/.test(source))
 })
 
 // ---- 3. the git result's two fields ----
@@ -1103,6 +1134,56 @@ test('T1b plan labels: past the cap the labels kept favour plans with open tasks
   assert.deepEqual(t1.map((l) => l.spec).sort(byName), ['specs/a-finished.md', 'specs/z-active.md'], 'T1 of two plans is two distinct labels')
   const names = runs[0].plan_labels.map((l) => l.spec)
   assert.deepEqual(names, [...names].sort(byName), 'the kept labels come out in spec name order')
+})
+
+// A repository's own specs use more than one task-line shape; each is a label, and a checkbox line that is none of them is counted.
+function labelsFor(specText) {
+  const root = makeRepo({ ledger: validLedger(3), fix: 1 })
+  writeSpec(root, 'one.md', specText)
+  const outDir = scratchDir()
+  drive(stubsWithRuns(), { root, outDir })
+  return digestOf(outDir)
+}
+
+test('T1b plan labels L1: a spec saved with CRLF line endings is parsed, and no carriage return reaches a title', () => {
+  const d = labelsFor(['# Plan', '', '## Tasks', '', '- [x] T1: first thing', '- [ ] T2: second thing', '', '## Log', ''].join('\r\n'))
+  assert.deepEqual(d.plan_labels, [{ spec: 'specs/one.md', task_id: 'T1', title: 'first thing' }, { spec: 'specs/one.md', task_id: 'T2', title: 'second thing' }])
+  assert.equal(d.plan_labels_note, null)
+})
+
+test('T1b plan labels L1: the task-line shapes this repository\'s own specs use are labels: a [~] box, an id followed by a space and a parenthesis, an id directly followed by a parenthesis', () => {
+  const d = labelsFor(['## Tasks', '- [~] T2: Per-job CI decomposition -- state: dropped', '- [x] T5 (rule added 2026-10-11 from a review): the rule', '- [ ] T7(late) a task named with a bracket', '- [X] T1b: upper-case box', ''].join('\n'))
+  assert.deepEqual(d.plan_labels.map((l) => l.task_id), ['T2', 'T5', 'T7', 'T1b'])
+  assert.deepEqual(d.plan_labels.map((l) => l.title), ['Per-job CI decomposition -- state: dropped', '(rule added 2026-10-11 from a review): the rule', '(late) a task named with a bracket', 'upper-case box'])
+  assert.equal(d.plan_labels_note, null)
+  assert.equal(d.dropped.planLabelsUnmatched, 0)
+})
+
+test('T1b plan labels L1: checkbox lines under ## Tasks that are still not recognised are counted, said in the note with a fixed wording, counted under their own dropped key and in the log total', () => {
+  const stubs = stubsWithRuns()
+  const root = makeRepo({ ledger: validLedger(3), fix: 1 })
+  writeSpec(root, 'one.md', ['## Tasks', '- [ ] T1: recognised', '- [ ] no task id at all', '- [ ] 12: a number is not an id', '- [ ] T3:', '- [?] T4: an unknown box', '- not a checkbox line', '## Other', '- [ ] X9: outside the section', ''].join('\n'))
+  const outDir = scratchDir()
+  const out = drive(stubs, { root, outDir })
+  const d = digestOf(outDir)
+  assert.deepEqual(d.plan_labels.map((l) => l.task_id), ['T1'])
+  assert.equal(d.dropped.planLabelsUnmatched, 4, 'four checkbox lines under ## Tasks are not labels')
+  assert.equal(d.plan_labels_note, '4 checkbox lines under "## Tasks" were not recognised as tasks and were left out')
+  assert.match(out.line, / digest=ran:bytes:\d+,dropped:4,trimmed:no$/, 'the log total includes them')
+})
+
+test('T1b plan labels L3: only the first 200 spec files, by name, are read: the 201st contributes no label and the note says so', () => {
+  const stubs = stubsWithRuns()
+  const root = makeRepo({ ledger: validLedger(3), fix: 1 })
+  // s000..s198 have no tasks; s199 is the 200th file and s200 the 201st, each with one task.
+  for (let i = 0; i < 199; i++) writeSpec(root, `s${String(i).padStart(3, '0')}.md`, '## Tasks\n')
+  writeSpec(root, 's199.md', '## Tasks\n- [ ] T1: the 200th file\n')
+  writeSpec(root, 's200.md', '## Tasks\n- [ ] T1: the 201st file\n')
+  const outDir = scratchDir()
+  drive(stubs, { root, outDir })
+  const d = digestOf(outDir)
+  assert.deepEqual(d.plan_labels, [{ spec: 'specs/s199.md', task_id: 'T1', title: 'the 200th file' }])
+  assert.equal(d.plan_labels_note, 'only the first 200 spec files were read')
 })
 
 test('AC-SEC-11: a specs directory that is a symlink, and a spec file that is a symlink, are not read; the canary appears in no collected file', () => {

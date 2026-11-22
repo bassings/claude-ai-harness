@@ -1960,13 +1960,19 @@ function ledgerIdentityForRoot(root) {
 // entry; the root path itself is never echoed.
 // Pure: reads no ledger and runs nothing, so a caller that must not read the
 // ledger (the collector refuses a symlinked one) passes the identity in.
-export function escapedDefectsFigures({ rawLog, toplevel, root, identity }) {
+// maxCommits (optional, a positive integer): the figures are those of the first maxCommits records of the log, and
+// the result gains `more`, true when the log had a record beyond them. Without it the result is exactly as it was,
+// so the escaped-defects command's output does not change. All parsing of the log stays here.
+export function escapedDefectsFigures({ rawLog, toplevel, root, identity, maxCommits }) {
   let same = false
   if (typeof toplevel === 'string' && toplevel) {
     try { same = fs.realpathSync(toplevel) === fs.realpathSync(root) } catch (e) { same = false }
   }
   if (!same) return { rejected: true, reason: 'git toplevel is missing or does not match the roster root; the git log was not read from that repo', count: null, scoped_count: null, repo: identity }
-  return { ...countEscapedDefectCandidates(parseGitLogRaw(rawLog), resolveProductSourceExcludeGlobs(root)), repo: identity }
+  const commits = parseGitLogRaw(rawLog)
+  const counted = Number.isSafeInteger(maxCommits) && maxCommits > 0 ? commits.slice(0, maxCommits) : commits
+  const figures = { ...countEscapedDefectCandidates(counted, resolveProductSourceExcludeGlobs(root)), repo: identity }
+  return counted === commits ? figures : { ...figures, more: commits.length > counted.length }
 }
 
 // THE rule for where a repository's ledger lives, exported here as the single

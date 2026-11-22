@@ -77,7 +77,7 @@ test('AC-QA-1: K ledger lines, R gh runs and F fix commits are collected into th
   assert.equal(git.result.repo, 'demo', 'the git figure carries the ledger identity the ledger lane produced')
 
   for (const f of fs.readdirSync(outDir)) assert.equal(fs.statSync(path.join(outDir, f)).mode & 0o077, 0, `${f} must be 0600 or tighter`)
-  assert.match(res.stdout, /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+ ci_runs=fetched:3,not_fetched:0,timeout:0 digest=ran:bytes:\d+,dropped:\d+\n$/, `the log line: ${res.stdout}`)
+  assert.match(res.stdout, /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+ ci_runs=fetched:3,not_fetched:0,timeout:0 digest=ran:bytes:\d+,dropped:\d+,trimmed:(?:yes|no)\n$/, `the log line: ${res.stdout}`)
   assert.equal(res.stdout.trim().split('\n').length, 1, 'one line per repository')
   assert.deepEqual(treeListing(root), before, 'the collector must write nothing into the analysed repository')
 })
@@ -789,7 +789,7 @@ test('AC-OPS-4: a ci lane that runs out of budget keeps the runs already fetched
   assert.equal(ci.timeoutCount, 5 - ci.runCount)
   assert.equal(ci.reason, `ci lane budget exhausted: ${ci.runCount} of 5 runs fetched`)
   assert.equal(recorded(stubs, 'GH').filter((c) => c[2] === 'view').length, ci.runCount, 'no view call is made after the budget has run out')
-  assert.match(res.stdout, new RegExp(`ci_runs=fetched:${ci.runCount},not_fetched:${5 - ci.runCount},timeout:${5 - ci.runCount} digest=ran:bytes:\\d+,dropped:\\d+$`))
+  assert.match(res.stdout, new RegExp(`ci_runs=fetched:${ci.runCount},not_fetched:${5 - ci.runCount},timeout:${5 - ci.runCount} digest=ran:bytes:\\d+,dropped:\\d+,trimmed:(?:yes|no)$`))
 })
 
 test('AC-OPS-4: a budget that runs out before any run is fetched is a failed ci lane in mode timeout naming 0 runs done', () => {
@@ -1024,7 +1024,7 @@ test('AC-OPS-7: a ci lane where some views failed shows fetched and not-fetched 
   const root = makeRepo({ ledger: validLedger(1), fix: 1 })
   const { res } = collect(stubs, root)
   assert.match(res.stdout, / ci=ran calls=/)
-  assert.match(res.stdout, / ci_runs=fetched:1,not_fetched:2,timeout:0 digest=ran:bytes:\d+,dropped:\d+\n$/, res.stdout)
+  assert.match(res.stdout, / ci_runs=fetched:1,not_fetched:2,timeout:0 digest=ran:bytes:\d+,dropped:\d+,trimmed:(?:yes|no)\n$/, res.stdout)
 })
 
 // ---- AC-QA-17: repository isolation ----

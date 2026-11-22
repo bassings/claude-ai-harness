@@ -135,10 +135,14 @@ export const PLAN_LABEL_TITLE_MAX_CHARS = 80
 const SPECS_DIR = 'specs'
 const SPEC_FILE_MAX_BYTES = 1024 * 1024
 const SPEC_FILES_MAX = 200
-const TASK_LINE_RE = /^- \[([ xX])\] ([A-Za-z]{1,8}\d{1,4}[A-Za-z]{0,3}):(.*)$/
+// A task line: a box (open, done in either case, or `~` as this repository's own specs use for a dropped task), an id
+// of letters, digits and letters, then a colon, a space or an opening parenthesis and the rest. Every part is a bounded
+// run of its own class, so there is nothing for the match to backtrack over.
+const TASK_LINE_RE = /^- \[([ xX~])\] ([A-Za-z]{1,8}\d{1,4}[A-Za-z]{0,3})([: (].*)$/
+// Any checkbox-shaped line, so one under the Tasks heading that is not a task line can be counted.
+const CHECKBOX_LINE_RE = /^- \[[^\]]{0,2}\] /
 const GIT_WINDOW_NOTE = `the git log was cut at ${GIT_LOG_MAX_COMMITS} commits; older history was not examined`
 const GIT_FULL_HISTORY_NOTE = 'the full git history was examined'
-const GIT_LOG_RECORD_SEP = '\u001e'
 
 const GH_LIST_ARGV = ['run', 'list', '--limit', String(GH_RUN_LIMIT), '--json', 'databaseId,attempt,status,workflowName,startedAt']
 // One commit more than the cap is fetched, only as the signal that history goes further back.
@@ -341,20 +345,12 @@ async function gitCall(ctx, stats, argv) {
 // ledger, and a ledger that is a symlink or a directory must not be read. The
 // toplevel check is inside that function: git must have read this root's history,
 // not an enclosing repository's.
-// The log's first GIT_LOG_MAX_COMMITS commits, which are all the figures are computed from, and whether
-// there was a commit beyond them (records start at each record separator, as the reader splits them).
-function firstCommits(log) {
-  const blocks = log.split(GIT_LOG_RECORD_SEP)
-  const cut = blocks.length - 1 > GIT_LOG_MAX_COMMITS
-  return { rawLog: cut ? blocks.slice(0, GIT_LOG_MAX_COMMITS + 1).join(GIT_LOG_RECORD_SEP) : log, cut }
-}
-
 async function gitLane(ctx, stats, identity) {
   const log = await gitCall(ctx, stats, GIT_LOG_ARGV)
   if (log.length === 0) throw new LaneFailure('other', 'git log returned no commits')
   const toplevel = (await gitCall(ctx, stats, GIT_ROOT_ARGV)).trim()
-  const { rawLog, cut } = firstCommits(log)
-  const figures = escapedDefectsFigures({ rawLog, toplevel, root: ctx.root, identity })
+  // The reader cuts the log at the cap and says whether a commit lay beyond it (the 501st is only that signal).
+  const { more: cut, ...figures } = escapedDefectsFigures({ rawLog: log, toplevel, root: ctx.root, identity, maxCommits: GIT_LOG_MAX_COMMITS })
   if (figures.rejected) throw new LaneFailure('other', GIT_TOPLEVEL_REASON)
   // The one repository the collector is given is root 0. The note is a fixed string on every run, the cut wording only when a commit beyond the cap came back.
   return { result: { ...figures, root_index: 0, window_note: cut ? GIT_WINDOW_NOTE : GIT_FULL_HISTORY_NOTE } }
@@ -480,17 +476,21 @@ async function ciLane(ctx, stats) {
 // be read is said in a fixed note, never silently.
 function taskLabels(text, spec) {
   const labels = []
+  let unmatched = 0
   let inTasks = false
-  for (const line of text.split('\n')) {
+  for (const line of text.split(/\r?\n/)) {
     if (line.startsWith('#')) {
       inTasks = line.trim() === '## Tasks'
       continue
     }
-    const match = inTasks ? line.match(TASK_LINE_RE) : null
-    const title = match ? match[3].trim() : ''
+    if (!inTasks || !CHECKBOX_LINE_RE.test(line)) continue
+    const match = line.match(TASK_LINE_RE)
+    const rest = match ? match[3] : ''
+    const title = (rest.startsWith(':') ? rest.slice(1) : rest).trim()
     if (title) labels.push({ spec, task_id: match[2], title: title.slice(0, PLAN_LABEL_TITLE_MAX_CHARS), open: match[1] === ' ' })
+    else unmatched += 1
   }
-  return labels
+  return { labels, unmatched }
 }
 
 function listSpecFiles(root) {
@@ -501,10 +501,11 @@ function listSpecFiles(root) {
   return { names: names.slice(0, SPEC_FILES_MAX), overFileCap: names.length > SPEC_FILES_MAX }
 }
 
-function planLabelsNote({ note, refused, overFileCap, dropped, total, sizeTrimmed }) {
+function planLabelsNote({ note, refused, overFileCap, unmatched, dropped, total, sizeTrimmed }) {
   const parts = []
   if (refused > 0) parts.push(`${refused} spec files were not read (symlink, over the size limit or unreadable)`)
   if (overFileCap) parts.push(`only the first ${SPEC_FILES_MAX} spec files were read`)
+  if (unmatched > 0) parts.push(`${unmatched} checkbox lines under "## Tasks" were not recognised as tasks and were left out`)
   if (dropped > 0 && sizeTrimmed) parts.push(`${dropped} of ${total} task labels were left out to keep the digest within its size limit; plans with open tasks were kept first`)
   else if (dropped > 0) parts.push(`${dropped} of ${total} task labels were left out at the limit of ${PLAN_LABELS_MAX}; plans with open tasks were kept first`)
   return note ?? (parts.length > 0 ? parts.join('; ') : null)
@@ -534,13 +535,19 @@ function collectPlanLabels(root) {
   const { names, note, overFileCap } = listSpecFiles(root)
   const all = []
   let refused = 0
+  let unmatched = 0
   for (const name of names) {
     const spec = `${SPECS_DIR}/${name}`
     const file = readRepoFile(root, spec, SPEC_FILE_MAX_BYTES)
-    if (file.status === 'ok') all.push(...taskLabels(file.text, spec))
-    else refused += 1
+    if (file.status !== 'ok') {
+      refused += 1
+      continue
+    }
+    const parsed = taskLabels(file.text, spec)
+    all.push(...parsed.labels)
+    unmatched += parsed.unmatched
   }
-  return { ranked: rankLabels(all), noteInput: { note, refused, overFileCap } }
+  return { ranked: rankLabels(all), unmatched, noteInput: { note, refused, overFileCap, unmatched } }
 }
 
 // ---- the digest ----
@@ -702,7 +709,7 @@ function shapeLedger(base, kept) {
 }
 
 // Counts of what each list left out against what it was given, and whether any list is shorter than its ceiling.
-function droppedCounts(lists, counts, keptJobs) {
+function droppedCounts(lists, counts, keptJobs, unmatched) {
   const left = (name) => lists[name].length - counts[name]
   const trimmedForSize = DIGEST_TRIM_ORDER.some((name) => counts[name] < Math.min(lists[name].length, DIGEST_CEILINGS[name]))
   return {
@@ -714,6 +721,7 @@ function droppedCounts(lists, counts, keptJobs) {
     ciCitationPool: left('ciCitationPool'),
     ledgerCitationPool: left('ledgerCitationPool'),
     neverFailingAcs: left('neverFailingAcs'),
+    planLabelsUnmatched: unmatched,
     trimmedForSize,
   }
 }
@@ -723,7 +731,7 @@ function assemble(source, counts) {
   const { records, lists, planLabels } = source
   const [ledger, git, ci] = records
   const kept = Object.fromEntries(DIGEST_TRIM_ORDER.map((name) => [name, lists[name].slice(0, counts[name])]))
-  const dropped = droppedCounts(lists, counts, kept.ciByJob)
+  const dropped = droppedCounts(lists, counts, kept.ciByJob, planLabels.unmatched)
   const sizeTrimmed = counts.planLabels < Math.min(lists.planLabels.length, PLAN_LABELS_MAX)
   return {
     lanes: { ledger: laneDigest(ledger), git: laneDigest(git), ci: laneDigest(ci) },
@@ -800,7 +808,7 @@ function digestLane(ctx, records) {
     const digest = buildDigest(records, collectPlanLabels(ctx.root))
     const text = digestText(digest)
     writeDigestFile(ctx.outDir, text)
-    return { lane: 'digest', status: 'ran', bytes: Buffer.byteLength(text), dropped: droppedTotal(digest.dropped) }
+    return { lane: 'digest', status: 'ran', bytes: Buffer.byteLength(text), dropped: droppedTotal(digest.dropped), trimmed: digest.dropped.trimmedForSize }
   } catch (error) {
     fs.rmSync(path.join(ctx.outDir, 'digest.json'), { force: true })
     const record = failedRecord('digest', error)
@@ -883,7 +891,9 @@ function logLine(records, digest) {
   const ci = records.find((r) => r.lane === 'ci')
   const ciRuns = Number.isInteger(ci?.runCount) ? ` ci_runs=fetched:${ci.runCount},not_fetched:${ci.fetchFailedCount},timeout:${ci.timeoutCount}` : ''
   const digestCause = digest.cause ? `:${digest.cause}` : ''
-  const digestField = digest.status === 'failed' ? ` digest=failed:${digest.mode}${digestCause}` : ` digest=ran:bytes:${digest.bytes},dropped:${digest.dropped}`
+  const trimmed = digest.trimmed ? 'yes' : 'no'
+  const digestRan = ` digest=ran:bytes:${digest.bytes},dropped:${digest.dropped},trimmed:${trimmed}`
+  const digestField = digest.status === 'failed' ? ` digest=failed:${digest.mode}${digestCause}` : digestRan
   return `COLLECT ${records.map(laneToken).join(' ')} calls=${calls} wall_clock_s=${wall}${ciRuns}${digestField}`
 }
 
