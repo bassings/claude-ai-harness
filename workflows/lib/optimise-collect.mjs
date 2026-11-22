@@ -137,9 +137,12 @@ const SPEC_FILE_MAX_BYTES = 1024 * 1024
 const SPEC_FILES_MAX = 200
 const TASK_LINE_RE = /^- \[([ xX])\] ([A-Za-z]{1,8}\d{1,4}[A-Za-z]{0,3}):(.*)$/
 const GIT_WINDOW_NOTE = `the git log was cut at ${GIT_LOG_MAX_COMMITS} commits; older history was not examined`
+const GIT_FULL_HISTORY_NOTE = 'the full git history was examined'
+const GIT_LOG_RECORD_SEP = '\u001e'
 
 const GH_LIST_ARGV = ['run', 'list', '--limit', String(GH_RUN_LIMIT), '--json', 'databaseId,attempt,status,workflowName,startedAt']
-const GIT_LOG_ARGV = ['log', `--max-count=${GIT_LOG_MAX_COMMITS}`, '--name-only', '--pretty=format:%x1e%P%x1f%s']
+// One commit more than the cap is fetched, only as the signal that history goes further back.
+const GIT_LOG_ARGV = ['log', `--max-count=${GIT_LOG_MAX_COMMITS + 1}`, '--name-only', '--pretty=format:%x1e%P%x1f%s']
 const GIT_ROOT_ARGV = ['rev-parse', '--show-toplevel']
 
 const LEDGER_INPUT_FILES = [
@@ -338,14 +341,23 @@ async function gitCall(ctx, stats, argv) {
 // ledger, and a ledger that is a symlink or a directory must not be read. The
 // toplevel check is inside that function: git must have read this root's history,
 // not an enclosing repository's.
+// The log's first GIT_LOG_MAX_COMMITS commits, which are all the figures are computed from, and whether
+// there was a commit beyond them (records start at each record separator, as the reader splits them).
+function firstCommits(log) {
+  const blocks = log.split(GIT_LOG_RECORD_SEP)
+  const cut = blocks.length - 1 > GIT_LOG_MAX_COMMITS
+  return { rawLog: cut ? blocks.slice(0, GIT_LOG_MAX_COMMITS + 1).join(GIT_LOG_RECORD_SEP) : log, cut }
+}
+
 async function gitLane(ctx, stats, identity) {
   const log = await gitCall(ctx, stats, GIT_LOG_ARGV)
   if (log.length === 0) throw new LaneFailure('other', 'git log returned no commits')
   const toplevel = (await gitCall(ctx, stats, GIT_ROOT_ARGV)).trim()
-  const figures = escapedDefectsFigures({ rawLog: log, toplevel, root: ctx.root, identity })
+  const { rawLog, cut } = firstCommits(log)
+  const figures = escapedDefectsFigures({ rawLog, toplevel, root: ctx.root, identity })
   if (figures.rejected) throw new LaneFailure('other', GIT_TOPLEVEL_REASON)
-  // The one repository the collector is given is root 0; a log that reached the commit cap may have more behind it.
-  return { result: { ...figures, root_index: 0, window_note: figures.n_commits_examined >= GIT_LOG_MAX_COMMITS ? GIT_WINDOW_NOTE : null } }
+  // The one repository the collector is given is root 0. The note is a fixed string on every run, the cut wording only when a commit beyond the cap came back.
+  return { result: { ...figures, root_index: 0, window_note: cut ? GIT_WINDOW_NOTE : GIT_FULL_HISTORY_NOTE } }
 }
 
 // ---- ci lane ----
@@ -489,27 +501,31 @@ function listSpecFiles(root) {
   return { names: names.slice(0, SPEC_FILES_MAX), overFileCap: names.length > SPEC_FILES_MAX }
 }
 
-function planLabelsNote({ note, refused, overFileCap, dropped, total }) {
+function planLabelsNote({ note, refused, overFileCap, dropped, total, sizeTrimmed }) {
   const parts = []
   if (refused > 0) parts.push(`${refused} spec files were not read (symlink, over the size limit or unreadable)`)
   if (overFileCap) parts.push(`only the first ${SPEC_FILES_MAX} spec files were read`)
-  if (dropped > 0) parts.push(`${dropped} of ${total} task labels were left out at the limit of ${PLAN_LABELS_MAX}; plans with open tasks were kept first`)
+  if (dropped > 0 && sizeTrimmed) parts.push(`${dropped} of ${total} task labels were left out to keep the digest within its size limit; plans with open tasks were kept first`)
+  else if (dropped > 0) parts.push(`${dropped} of ${total} task labels were left out at the limit of ${PLAN_LABELS_MAX}; plans with open tasks were kept first`)
   return note ?? (parts.length > 0 ? parts.join('; ') : null)
 }
 
 const byText = (a, b) => a.localeCompare(b, 'en')
 
-// Which labels survive the cap: those of plans (specs) with an open task first, within
-// them the open tasks first, then by spec name and document order, so the same files
-// always give the same labels. The labels kept are returned in spec name and document
-// order, without the working `open` field.
-function selectLabels(all) {
+// Every label in priority order: those of plans (specs) with an open task first, within them the open
+// tasks first, then by spec name and document order, so the same files always give the same order. The
+// digest keeps a prefix of this list (the cap, then any trimming for size), so the labels of plans with
+// no open task are the first to go, then the finished tasks of plans that have one.
+function rankLabels(all) {
   const specsWithOpen = new Set(all.filter((label) => label.open).map((label) => label.spec))
-  const ranked = all
+  return all
     .map((label, index) => ({ label, index }))
     .sort((a, b) => Number(!specsWithOpen.has(a.label.spec)) - Number(!specsWithOpen.has(b.label.spec)) || Number(!a.label.open) - Number(!b.label.open) || byText(a.label.spec, b.label.spec) || a.index - b.index)
-    .slice(0, PLAN_LABELS_MAX)
-  return ranked
+}
+
+// The labels kept, in spec name and document order, without the working `open` field.
+function orderedLabels(ranked) {
+  return [...ranked]
     .sort((a, b) => byText(a.label.spec, b.label.spec) || a.index - b.index)
     .map(({ label: { spec, task_id, title } }) => ({ spec, task_id, title }))
 }
@@ -524,9 +540,7 @@ function collectPlanLabels(root) {
     if (file.status === 'ok') all.push(...taskLabels(file.text, spec))
     else refused += 1
   }
-  const labels = selectLabels(all)
-  const dropped = all.length - labels.length
-  return { labels, dropped, note: planLabelsNote({ note, refused, overFileCap, dropped, total: all.length }) }
+  return { ranked: rankLabels(all), noteInput: { note, refused, overFileCap } }
 }
 
 // ---- the digest ----
@@ -596,12 +610,6 @@ function cutStrings(value, max) {
   return value
 }
 
-// The last `cap` entries of an object (the most recently seen) and how many were left out.
-function capEntries(object, cap) {
-  const entries = Object.entries(object ?? {})
-  return { kept: Object.fromEntries(entries.slice(-cap)), dropped: Math.max(0, entries.length - cap) }
-}
-
 function laneDigest(record) {
   const base = { status: record.status, mode: record.mode ?? null, reason: record.reason ?? null }
   if (record.lane !== 'ci') return base
@@ -614,72 +622,156 @@ function neverFailingDigest(rows) {
   return { rows: kept.map((row) => Object.fromEntries(NEVER_FAILING_RENDER_KEYS.map((key) => [key, row[key]]))), insufficientCount: list.length - kept.length }
 }
 
-// What the workflow computes on or renders from the ledger result, and nothing else.
-function ledgerDigest(result) {
-  const byPlan = capEntries(result.wallClock?.byPlan, DIGEST_MAX_BYPLAN_ENTRIES)
-  const outcomes = capEntries(result.proposalOutcomes, DIGEST_MAX_PROPOSAL_OUTCOMES)
-  const neverFailing = neverFailingDigest(result.neverFailingAcs)
-  const digest = {
+// ---- trimming the digest to its size ----
+
+// The lists the digest may shorten, least important first. The entry caps are the starting ceilings; when the
+// document is still over DIGEST_MAX_BYTES the first list in this order is shortened (just as far as needed, or to
+// its floor if that is not enough) before the next is touched, and so on. A list is never shortened below its floor.
+// Why this order: the plan labels are only drafting hints; the two citation pools only need one valid id to remain
+// for the workflow's citation gate (a proposal needs a citation found in the pools it was shown) so each keeps
+// a few; CI jobs go from the lowest-ranked end (the ones without failures, with the fewest runs); the per-plan
+// wall-clock and the proposal outcomes go oldest first; the never-failing rows that carry a verdict are the
+// figures the report is about, so they are the last resort and go lowest run count first.
+export const DIGEST_TRIM_ORDER = ['planLabels', 'ciCitationPool', 'ledgerCitationPool', 'ciByJob', 'wallClockByPlan', 'proposalOutcomes', 'neverFailingAcs']
+export const DIGEST_TRIM_FLOORS = { planLabels: 5, ciCitationPool: 5, ledgerCitationPool: 10, ciByJob: 5, wallClockByPlan: 3, proposalOutcomes: 4, neverFailingAcs: 3 }
+// The starting ceilings (the entry caps); the two without a cap here are bounded by the reader already.
+const DIGEST_CEILINGS = { planLabels: PLAN_LABELS_MAX, ciCitationPool: CI_DIGEST_MAX_CITATIONS, ledgerCitationPool: Infinity, ciByJob: CI_DIGEST_MAX_JOBS, wallClockByPlan: DIGEST_MAX_BYPLAN_ENTRIES, proposalOutcomes: DIGEST_MAX_PROPOSAL_OUTCOMES, neverFailingAcs: Infinity }
+// A hard bound on one list's search for the length that fits (a binary search needs about ten steps for a list of 1,000).
+const TRIM_MAX_SEARCH_STEPS = 32
+
+const asArray = (value) => (Array.isArray(value) ? value : [])
+
+// Jobs in priority order: those with failures first (most failures first), then those with the most runs, then by
+// key, so the same data always gives the same jobs in the same order. A job keeps its true failureCount, and its
+// failedRunIds keep the LAST (most recent) ids, the ones the reader lists oldest first; the ids left out are counted with the job.
+function rankedJobs(byJob) {
+  const ranked = Object.entries(byJob ?? {}).sort(([keyA, a], [keyB, b]) => (b.failureCount ?? 0) - (a.failureCount ?? 0) || (b.n ?? 0) - (a.n ?? 0) || byText(keyA, keyB))
+  return ranked.map(([key, job]) => {
+    const ids = asArray(job.failedRunIds)
+    const idsDropped = Math.max(0, ids.length - CI_DIGEST_MAX_FAILED_RUN_IDS)
+    return { key, job: idsDropped > 0 ? { ...job, failedRunIds: ids.slice(-CI_DIGEST_MAX_FAILED_RUN_IDS) } : job, idsDropped }
+  })
+}
+
+// Verdict-carrying rows in priority order: the most runs first, then ledger order.
+function rankedRows(rows) {
+  return rows.map((row, index) => ({ row, index })).sort((a, b) => (b.row.n ?? 0) - (a.row.n ?? 0) || a.index - b.index)
+}
+
+// The lists, each in priority order (most important first, so a prefix is what is kept); the per-plan and outcome
+// lists are newest first and are put back in ledger order when the digest is made.
+function digestLists(records, planLabels) {
+  const [ledger, , ci] = records
+  const fromLedger = ledger.status === 'ran' && ledger.result ? ledger.result : null
+  const fromCi = ci.status === 'ran' && ci.result ? ci.result : null
+  return {
+    planLabels: planLabels.ranked,
+    ciCitationPool: asArray(fromCi?.citationPool),
+    ledgerCitationPool: asArray(fromLedger?.citationPool),
+    ciByJob: rankedJobs(fromCi?.byJob),
+    wallClockByPlan: Object.entries(fromLedger?.wallClock?.byPlan ?? {}).reverse(),
+    proposalOutcomes: Object.entries(fromLedger?.proposalOutcomes ?? {}).reverse(),
+    neverFailingAcs: rankedRows(neverFailingDigest(fromLedger?.neverFailingAcs).rows),
+  }
+}
+
+// What the workflow computes on or renders from the ledger result, and nothing else, less the lists above.
+function ledgerBase(result) {
+  return {
     n: result.n,
     windowTruncated: result.windowTruncated,
     windowDroppedCount: result.windowDroppedCount,
     perRepo: result.perRepo,
-    skippedCount: Array.isArray(result.skipped) ? result.skipped.length : 0,
+    skippedCount: asArray(result.skipped).length,
     rework: omitKey(result.rework, 'acVerdicts'),
     blockedUnresolved: cutStrings(omitKey(result.blockedUnresolved, 'byModel'), BLOCKED_STRING_MAX_CHARS),
-    wallClock: { totals: result.wallClock?.totals, byPlan: byPlan.kept, source: result.wallClock?.source },
+    wallClock: { totals: result.wallClock?.totals, source: result.wallClock?.source },
     triggerAccuracy: result.triggerAccuracy,
-    proposalOutcomes: outcomes.kept,
-    citationPool: result.citationPool,
-    neverFailingAcs: neverFailing.rows,
-    neverFailingInsufficientCount: neverFailing.insufficientCount,
+    neverFailingInsufficientCount: neverFailingDigest(result.neverFailingAcs).insufficientCount,
   }
-  return { digest, dropped: { wallClockByPlan: byPlan.dropped, proposalOutcomes: outcomes.dropped } }
 }
 
-// Jobs kept under the cap: those with failures first (most failures first), then those with the most
-// runs, then by key, so the same data always gives the same jobs in the same order. A kept job keeps its
-// true failureCount, and its failedRunIds keep the LAST (most recent) ids, the ones the reader lists oldest first.
-function rankedJobs(byJob) {
-  return Object.entries(byJob ?? {}).sort(([keyA, a], [keyB, b]) => (b.failureCount ?? 0) - (a.failureCount ?? 0) || (b.n ?? 0) - (a.n ?? 0) || byText(keyA, keyB))
+function shapeLedger(base, kept) {
+  return {
+    ...base,
+    wallClock: { ...base.wallClock, byPlan: Object.fromEntries([...kept.wallClockByPlan].reverse()) },
+    proposalOutcomes: Object.fromEntries([...kept.proposalOutcomes].reverse()),
+    citationPool: kept.ledgerCitationPool,
+    neverFailingAcs: [...kept.neverFailingAcs].sort((a, b) => a.index - b.index).map(({ row }) => row),
+  }
 }
 
-// The citation pool is already in the reader's priority order (failed runs first, then the newest), so
-// the first ones are kept.
-function ciDigest(result) {
-  const ranked = rankedJobs(result.byJob)
-  let droppedIds = 0
-  const kept = ranked.slice(0, CI_DIGEST_MAX_JOBS).map(([key, job]) => {
-    const ids = Array.isArray(job.failedRunIds) ? job.failedRunIds : []
-    droppedIds += Math.max(0, ids.length - CI_DIGEST_MAX_FAILED_RUN_IDS)
-    return [key, ids.length > CI_DIGEST_MAX_FAILED_RUN_IDS ? { ...job, failedRunIds: ids.slice(-CI_DIGEST_MAX_FAILED_RUN_IDS) } : job]
-  })
-  const pool = Array.isArray(result.citationPool) ? result.citationPool : []
-  const dropped = { ciByJob: ranked.length - kept.length, ciFailedRunIds: droppedIds, ciCitationPool: Math.max(0, pool.length - CI_DIGEST_MAX_CITATIONS) }
-  return { digest: { ...result, byJob: Object.fromEntries(kept), citationPool: pool.slice(0, CI_DIGEST_MAX_CITATIONS) }, dropped }
+// Counts of what each list left out against what it was given, and whether any list is shorter than its ceiling.
+function droppedCounts(lists, counts, keptJobs) {
+  const left = (name) => lists[name].length - counts[name]
+  const trimmedForSize = DIGEST_TRIM_ORDER.some((name) => counts[name] < Math.min(lists[name].length, DIGEST_CEILINGS[name]))
+  return {
+    wallClockByPlan: left('wallClockByPlan'),
+    proposalOutcomes: left('proposalOutcomes'),
+    planLabels: left('planLabels'),
+    ciByJob: left('ciByJob'),
+    ciFailedRunIds: keptJobs.reduce((sum, { idsDropped }) => sum + idsDropped, 0),
+    ciCitationPool: left('ciCitationPool'),
+    ledgerCitationPool: left('ledgerCitationPool'),
+    neverFailingAcs: left('neverFailingAcs'),
+    trimmedForSize,
+  }
 }
 
-function buildDigest(records, planLabels) {
+// The digest for a given length of each list.
+function assemble(source, counts) {
+  const { records, lists, planLabels } = source
   const [ledger, git, ci] = records
-  const fromLedger = ledger.status === 'ran' && ledger.result ? ledgerDigest(ledger.result) : null
-  const fromCi = ci.status === 'ran' && ci.result ? ciDigest(ci.result) : null
+  const kept = Object.fromEntries(DIGEST_TRIM_ORDER.map((name) => [name, lists[name].slice(0, counts[name])]))
+  const dropped = droppedCounts(lists, counts, kept.ciByJob)
+  const sizeTrimmed = counts.planLabels < Math.min(lists.planLabels.length, PLAN_LABELS_MAX)
   return {
     lanes: { ledger: laneDigest(ledger), git: laneDigest(git), ci: laneDigest(ci) },
-    ledger: fromLedger ? fromLedger.digest : null,
+    ledger: source.ledgerBase ? shapeLedger(source.ledgerBase, kept) : null,
     git: git.status === 'ran' ? git.result : null,
-    ci: fromCi ? fromCi.digest : null,
-    plan_labels: planLabels.labels,
-    plan_labels_note: planLabels.note,
-    dropped: { wallClockByPlan: fromLedger?.dropped.wallClockByPlan ?? 0, proposalOutcomes: fromLedger?.dropped.proposalOutcomes ?? 0, planLabels: planLabels.dropped, ciByJob: fromCi?.dropped.ciByJob ?? 0, ciFailedRunIds: fromCi?.dropped.ciFailedRunIds ?? 0, ciCitationPool: fromCi?.dropped.ciCitationPool ?? 0 },
+    ci: ci.status === 'ran' && ci.result ? { ...ci.result, byJob: Object.fromEntries(kept.ciByJob.map(({ key, job }) => [key, job])), citationPool: kept.ciCitationPool } : null,
+    plan_labels: orderedLabels(kept.planLabels),
+    plan_labels_note: planLabelsNote({ ...planLabels.noteInput, dropped: dropped.planLabels, total: lists.planLabels.length, sizeTrimmed }),
+    dropped,
     freeTextPaths: FREE_TEXT_PATHS,
   }
 }
 
-// Pretty printed, so no line grows with the data; a document that is still over a
-// bound is a failure of the digest, never a cut-down document.
+const digestBytes = (digest) => Buffer.byteLength(JSON.stringify(digest, null, 2) + '\n')
+
+// The largest length of one list, between its floor and its present length, at which the digest fits; the floor
+// if none does. Fewer entries is never a bigger document, so a binary search finds it, in a bounded number of steps.
+function fittingLength(source, counts, name) {
+  const floor = Math.min(DIGEST_TRIM_FLOORS[name], counts[name])
+  let low = floor
+  let high = counts[name] - 1
+  let best = floor
+  for (let step = 0; step < TRIM_MAX_SEARCH_STEPS && low <= high; step++) {
+    const middle = Math.floor((low + high) / 2)
+    if (digestBytes(assemble(source, { ...counts, [name]: middle })) <= DIGEST_MAX_BYTES) {
+      best = middle
+      low = middle + 1
+    } else high = middle - 1
+  }
+  return best
+}
+
+function buildDigest(records, planLabels) {
+  const ledger = records[0]
+  const source = { records, planLabels, lists: digestLists(records, planLabels), ledgerBase: ledger.status === 'ran' && ledger.result ? ledgerBase(ledger.result) : null }
+  const counts = Object.fromEntries(DIGEST_TRIM_ORDER.map((name) => [name, Math.min(source.lists[name].length, DIGEST_CEILINGS[name])]))
+  for (const name of DIGEST_TRIM_ORDER) {
+    if (digestBytes(assemble(source, counts)) <= DIGEST_MAX_BYTES) break
+    counts[name] = fittingLength(source, counts, name)
+  }
+  return assemble(source, counts)
+}
+
+// Pretty printed, so no line grows with the data; a document that is still over a bound with every list at its
+// floor is a failure of the digest, never a cut-down document.
 function digestText(digest) {
   const text = JSON.stringify(digest, null, 2) + '\n'
-  if (Buffer.byteLength(text) > DIGEST_MAX_BYTES) throw new LaneFailure('over_size', `the digest is over the ${DIGEST_MAX_BYTES}-byte size limit after the entry caps were applied`)
+  if (Buffer.byteLength(text) > DIGEST_MAX_BYTES) throw new LaneFailure('over_size', `the digest is over the ${DIGEST_MAX_BYTES}-byte size limit with every list at its minimum`)
   if (text.split('\n').some((line) => line.length > DIGEST_MAX_LINE_CHARS)) throw new LaneFailure('line_too_long', `a line of the digest is over ${DIGEST_MAX_LINE_CHARS} characters`)
   return text
 }
@@ -697,13 +789,18 @@ function writeDigestFile(outDir, text) {
   }
 }
 
-// Not a lane that runs a command: { lane: 'digest', status: 'ran' } once digest.json is
-// written, otherwise a failed record with a fixed reason and no digest.json (a stale
-// one from an earlier run in the same directory is removed, so it cannot be mistaken for this run's).
+const droppedTotal = (dropped) => Object.values(dropped).reduce((sum, value) => sum + (typeof value === 'number' ? value : 0), 0)
+
+// Not a lane that runs a command: { lane: 'digest', status: 'ran', bytes, dropped } once digest.json is
+// written (bytes its size, dropped the sum of every count left out, both integers), otherwise a failed record
+// with a fixed reason and no digest.json (a stale one from an earlier run in the same directory is removed, so
+// it cannot be mistaken for this run's).
 function digestLane(ctx, records) {
   try {
-    writeDigestFile(ctx.outDir, digestText(buildDigest(records, collectPlanLabels(ctx.root))))
-    return { lane: 'digest', status: 'ran' }
+    const digest = buildDigest(records, collectPlanLabels(ctx.root))
+    const text = digestText(digest)
+    writeDigestFile(ctx.outDir, text)
+    return { lane: 'digest', status: 'ran', bytes: Buffer.byteLength(text), dropped: droppedTotal(digest.dropped) }
   } catch (error) {
     fs.rmSync(path.join(ctx.outDir, 'digest.json'), { force: true })
     const record = failedRecord('digest', error)
@@ -786,8 +883,8 @@ function logLine(records, digest) {
   const ci = records.find((r) => r.lane === 'ci')
   const ciRuns = Number.isInteger(ci?.runCount) ? ` ci_runs=fetched:${ci.runCount},not_fetched:${ci.fetchFailedCount},timeout:${ci.timeoutCount}` : ''
   const digestCause = digest.cause ? `:${digest.cause}` : ''
-  const digestFailed = digest.status === 'failed' ? ` digest=failed:${digest.mode}${digestCause}` : ''
-  return `COLLECT ${records.map(laneToken).join(' ')} calls=${calls} wall_clock_s=${wall}${ciRuns}${digestFailed}`
+  const digestField = digest.status === 'failed' ? ` digest=failed:${digest.mode}${digestCause}` : ` digest=ran:bytes:${digest.bytes},dropped:${digest.dropped}`
+  return `COLLECT ${records.map(laneToken).join(' ')} calls=${calls} wall_clock_s=${wall}${ciRuns}${digestField}`
 }
 
 const isWindow = (value) => Number.isSafeInteger(value) && value > 0

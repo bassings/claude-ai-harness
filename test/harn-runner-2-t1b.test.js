@@ -450,7 +450,7 @@ test('T1b digest: when nothing needs dropping the dropped counts are zero', () =
   const root = makeRepo({ ledger: validLedger(3), fix: 1 })
   const outDir = scratchDir()
   drive(stubs, { root, outDir })
-  assert.deepEqual(digestOf(outDir).dropped, { wallClockByPlan: 0, proposalOutcomes: 0, planLabels: 0, ciByJob: 0, ciFailedRunIds: 0, ciCitationPool: 0 })
+  assert.deepEqual(digestOf(outDir).dropped, { wallClockByPlan: 0, proposalOutcomes: 0, planLabels: 0, ciByJob: 0, ciFailedRunIds: 0, ciCitationPool: 0, ledgerCitationPool: 0, neverFailingAcs: 0, trimmedForSize: false })
 })
 
 // Stub gh with the given runs (by id) and, for each, the jobs its `gh run view` lists.
@@ -520,44 +520,164 @@ test('T1b digest: the failed run ids of a job and the citation pool are capped, 
   assert.equal(d.dropped.ciCitationPool, source.citationPool.length - mod.CI_DIGEST_MAX_CITATIONS)
 })
 
-// The names are the one thing the caps do not shorten, so a fixture of capped-size CI data with long names is a digest
-// the caps cannot fix: 40 jobs of about 700 characters each is over the bound whatever else is dropped.
-test('T1b digest: a digest the caps cannot bring under the byte bound is not written, and the lane status says so with a fixed reason', async () => {
+// The printed wall-clock seconds in the digest would otherwise vary from run to run and move its size by a byte or two,
+// so the size tests run the collector with a frozen clock.
+const frozenClock = (() => {
+  let file = null
+  return () => {
+    if (file === null) {
+      file = path.join(scratchDir(), 'frozen-clock.cjs')
+      fs.writeFileSync(file, 'Date.now = () => 1_700_000_000_000\n')
+    }
+    return { NODE_OPTIONS: `--require=${file}` }
+  }
+})()
+
+// The documented order in which the digest is shortened when it is over the byte bound, and the floor of each list,
+// held here as literals so a change to either has to change this test too.
+const TRIM_ORDER = ['planLabels', 'ciCitationPool', 'ledgerCitationPool', 'ciByJob', 'wallClockByPlan', 'proposalOutcomes', 'neverFailingAcs']
+const TRIM_FLOORS = { planLabels: 5, ciCitationPool: 5, ledgerCitationPool: 10, ciByJob: 5, wallClockByPlan: 3, proposalOutcomes: 4, neverFailingAcs: 3 }
+
+// How many entries of each trimmable list a digest holds.
+const keptIn = (d) => ({
+  planLabels: d.plan_labels.length,
+  ciCitationPool: d.ci.citationPool.length,
+  ledgerCitationPool: d.ledger.citationPool.length,
+  ciByJob: Object.keys(d.ci.byJob).length,
+  wallClockByPlan: Object.keys(d.ledger.wallClock.byPlan).length,
+  proposalOutcomes: Object.keys(d.ledger.proposalOutcomes).length,
+  neverFailingAcs: d.ledger.neverFailingAcs.length,
+})
+
+// A ledger whose digest is over the bound with every list at the ceiling: bigLedger's 120 plans and 120 proposals,
+// plus 40 criteria with enough runs to carry a verdict.
+function fullLedger() {
+  const lines = [bigLedger().trimEnd()]
+  for (let r = 0; r < 6; r++) {
+    const verdicts = Array.from({ length: 40 }, (_, a) => ({ ac_id: `AC-V-${a + 1}`, verdict: 'PASS' }))
+    lines.push(ledgerLine(5000 + r, { repo: 'demo-CANARY', kind: 'review_cycle', spec: 'specs/verd-CANARY.md', round_key: `v${r}`, findings: [], ac_verdicts: verdicts }))
+  }
+  return lines.join('\n') + '\n'
+}
+
+// Sixty CI jobs, half of which fail in each of 25 runs (so each carries ten failed run ids), and 90 plan labels.
+function fullCollection(extraLedgerLines = '') {
+  const stubs = stubsForJobs(Array.from({ length: 25 }, (_, i) => 100 + i), () => Array.from({ length: 60 }, (_, j) => job(`ci-job-${String(j).padStart(2, '0')}`, j % 2 === 0 ? 'failure' : 'success')))
+  const root = makeRepo({ ledger: fullLedger() + extraLedgerLines, fix: 2, other: 1 })
+  for (const name of ['p1.md', 'p2.md', 'p3.md']) writeSpec(root, name, ['## Tasks', ...Array.from({ length: 30 }, (_, t) => `- [ ] T${t}: ${'a task title of a realistic length '.repeat(2)}${t}`), ''].join('\n'))
+  const outDir = scratchDir()
+  const out = drive(stubs, { root, outDir, window: 5000 }, frozenClock())
+  return { out, outDir, stubs, root }
+}
+
+test('T1b digest M1: with every cap filled by realistic entries the digest is trimmed to fit, in the documented order, and every figure left equals the lane file\'s', async () => {
   const mod = await loadCollector()
-  const stubs = stubsForJobs([21, 22, 23], (id) => Array.from({ length: mod.CI_DIGEST_MAX_JOBS }, (_, j) => job(`job-${id}-${j}-${'x'.repeat(700)}`)).slice(0, mod.CI_DIGEST_MAX_JOBS))
-  const root = makeRepo({ ledger: validLedger(3), fix: 1 })
+  assert.deepEqual(mod.DIGEST_TRIM_ORDER, TRIM_ORDER, 'the documented trimming order')
+  assert.deepEqual(mod.DIGEST_TRIM_FLOORS, TRIM_FLOORS, 'the documented floors')
+  const { out, outDir } = fullCollection()
+  assert.equal(out.lanes.digest.status, 'ran', out.line)
+  const d = digestOf(outDir)
+  assert.ok(sizeOf(path.join(outDir, 'digest.json')) <= mod.DIGEST_MAX_BYTES)
+  assert.equal(d.dropped.trimmedForSize, true, 'the size trimming is marked, apart from the cap drops')
+  const kept = keptIn(d)
+  const ceilings = { planLabels: mod.PLAN_LABELS_MAX, ciCitationPool: mod.CI_DIGEST_MAX_CITATIONS, ledgerCitationPool: Infinity, ciByJob: mod.CI_DIGEST_MAX_JOBS, wallClockByPlan: mod.DIGEST_MAX_BYPLAN_ENTRIES, proposalOutcomes: mod.DIGEST_MAX_PROPOSAL_OUTCOMES, neverFailingAcs: Infinity }
+  const total = (name) => kept[name] + d.dropped[name]
+  const trimmed = TRIM_ORDER.filter((name) => kept[name] < Math.min(total(name), ceilings[name]))
+  assert.ok(trimmed.length >= 2, `the fixture is far enough over the bound to trim several lists: ${trimmed}`)
+  assert.ok(d.dropped.planLabels > 0 && total('planLabels') === 90, 'labels are counted against all 90 found')
+  assert.equal(d.plan_labels_note, `${d.dropped.planLabels} of 90 task labels were left out to keep the digest within its size limit; plans with open tasks were kept first`, 'the note says the labels went for size, with the final count')
+  const logged = / digest=ran:bytes:(\d+),dropped:(\d+)$/.exec(out.line)
+  assert.ok(logged && Number(logged[2]) === Object.values(d.dropped).filter((v) => typeof v === 'number').reduce((a, b) => a + b, 0) && Number(logged[2]) > 0, `a trimmed digest is visible in the log: ${out.line}`)
+  // Observable order: a list is only touched once every list before it is at its floor.
+  const last = TRIM_ORDER.indexOf(trimmed.at(-1))
+  for (const name of TRIM_ORDER.slice(0, last)) assert.equal(kept[name], Math.min(TRIM_FLOORS[name], total(name)), `${name} is at its floor before a later list is touched`)
+  for (const name of TRIM_ORDER) assert.ok(kept[name] >= Math.min(TRIM_FLOORS[name], total(name)), `${name} is not below its floor`)
+  // Every figure that remains is the lane file's.
+  const L = lane(outDir, 'ledger').result
+  const C = lane(outDir, 'ci').result
+  for (const [k, v] of Object.entries(d.ledger.wallClock.byPlan)) assert.deepEqual(v, L.wallClock.byPlan[k], `plan ${k}`)
+  for (const [k, v] of Object.entries(d.ledger.proposalOutcomes)) assert.deepEqual(v, L.proposalOutcomes[k], `outcome ${k}`)
+  assert.deepEqual(d.ledger.citationPool, L.citationPool.slice(0, d.ledger.citationPool.length))
+  assert.deepEqual(d.ci.citationPool, C.citationPool.slice(0, d.ci.citationPool.length))
+  for (const [k, v] of Object.entries(d.ci.byJob)) assert.deepEqual({ ...v, failedRunIds: undefined }, { ...C.byJob[k], failedRunIds: undefined }, `job ${k}`)
+  const sourceRows = new Map(L.neverFailingAcs.map((r) => [`${r.spec} ${r.ac_id}`, r]))
+  for (const row of d.ledger.neverFailingAcs) {
+    const source = sourceRows.get(`${row.spec} ${row.ac_id}`)
+    assert.deepEqual(row, Object.fromEntries(Object.keys(row).map((key) => [key, source[key]])), `row ${row.ac_id}`)
+  }
+  assert.equal(d.ledger.n, L.n)
+  assert.deepEqual(d.ledger.rework.lensDispositionCounts, L.rework.lensDispositionCounts)
+})
+
+test('T1b digest M1: trimming is deterministic: two runs of the same inputs give byte-identical digests', () => {
+  const first = fullCollection()
+  assert.equal(first.out.lanes.digest.status, 'ran')
+  const outDir = scratchDir()
+  drive(first.stubs, { root: first.root, outDir, window: 5000 }, frozenClock())
+  const read = (dir) => fs.readFileSync(path.join(dir, 'digest.json'))
+  assert.ok(read(first.outDir).equals(read(outDir)), 'byte-identical digests for the same repository and clock')
+})
+
+// A ledger of blocked tasks no list can shorten (the digest carries each, cut to 120 characters, and all share one run
+// id so the citation pool stays under its floor): `count` tasks whose text is a short index and `totalPad` characters of
+// padding spread over them.
+function blockedLedger(count, totalPad) {
+  const padOf = (i) => Math.floor(totalPad / count) + (i < totalPad % count ? 1 : 0)
+  return Array.from({ length: count }, (_, i) => ledgerLine(i, { run_id: 'one-run', kind: 'tdd_task', outcome: 'blocked', spec: 'specs/irr.md', task: `irr-${String(i).padStart(3, '0')}-${'p'.repeat(padOf(i))}` })).join('\n') + '\n'
+}
+
+function collectBlocked(count, totalPad) {
+  const outDir = scratchDir()
+  const out = drive(stubsWithRuns(), { root: makeRepo({ ledger: blockedLedger(count, totalPad), fix: 1 }), outDir }, frozenClock())
+  return { out, outDir, file: path.join(outDir, 'digest.json') }
+}
+
+test('T1b digest M1: a digest with every list at its floor that is still over the bound is not written, with a fixed reason, and an earlier digest.json is removed', () => {
   const outDir = scratchDir()
   fs.writeFileSync(path.join(outDir, 'digest.json'), '{"stale":"an earlier run"}\n')
-  const out = drive(stubs, { root, outDir })
-  const source = lane(outDir, 'ci').result
-  assert.ok(Object.keys(source.byJob).length > mod.CI_DIGEST_MAX_JOBS, 'the fixture has more jobs than the cap, so the cap is applied')
-  assert.equal(fs.existsSync(path.join(outDir, 'digest.json')), false, 'no digest, no truncated one, and an earlier run\'s digest.json is removed rather than left to be read as this run\'s')
-  assert.equal(out.lanes.digest.lane, 'digest')
+  const out = drive(stubsWithRuns(), { root: makeRepo({ ledger: blockedLedger(200, 200 * 100), fix: 1 }), outDir }, frozenClock())
   assert.equal(out.lanes.digest.status, 'failed')
   assert.equal(out.lanes.digest.mode, 'over_size')
   assert.match(out.lanes.digest.reason, /32768/)
-  assert.ok(!/job-2\d-/.test(out.lanes.digest.reason), 'the reason is fixed text, never collected data')
+  assert.ok(!/irr-/.test(out.lanes.digest.reason), 'the reason is fixed text, never collected data')
   assert.ok(out.line.endsWith(' digest=failed:over_size'), `the log line: ${out.line}`)
+  assert.equal(fs.existsSync(path.join(outDir, 'digest.json')), false, 'no digest, and the earlier run\'s digest.json is removed')
   assert.deepEqual(fs.readdirSync(outDir).sort(byName), ['ci.json', 'git.json', 'ledger.json'], 'the lane files are still there')
 })
 
-// Exactly at the bound is written and one byte over is refused. Two things set the size: forty job names of padded
-// length (each name is in the digest twice, as a key and as a field) and one plan-label title (once), so any byte count is reachable.
-test('T1b digest: a digest of exactly the byte bound is written and one of a byte over is refused after the caps', async () => {
+test('T1b digest M1: the byte bound is exact: a digest of exactly the bound is written whole, one byte over is trimmed, and where nothing can be trimmed one byte over is refused', async () => {
+  const mod = await loadCollector()
+  const bound = mod.DIGEST_MAX_BYTES
+  // Irreducible content: count tasks, and the size of the digest by a probe at two counts, to find how many fit with room to spare.
+  const sizeOf2 = (count) => sizeOf(collectBlocked(count, count * 10).file)
+  const small = sizeOf2(40)
+  const slope = sizeOf2(41) - small
+  const count = 40 + Math.floor((bound - 3000 - small) / slope)
+  const base = sizeOf(collectBlocked(count, count * 10).file)
+  const room = bound - base
+  assert.ok(room > 0 && room < count * 90, `the bound is reachable by padding: room ${room} over ${count} tasks`)
+  const exact = collectBlocked(count, count * 10 + room)
+  assert.equal(exact.out.lanes.digest.status, 'ran', exact.out.line)
+  assert.equal(sizeOf(exact.file), bound, 'the fixture lands on the bound exactly')
+  assert.equal(digestOf(exact.outDir).dropped.trimmedForSize, false, 'nothing is trimmed at the bound')
+  const over = collectBlocked(count, count * 10 + room + 1)
+  assert.equal(over.out.lanes.digest.status, 'failed')
+  assert.equal(over.out.lanes.digest.mode, 'over_size')
+  assert.equal(fs.existsSync(over.file), false)
+})
+
+test('T1b digest M1: a digest one byte over the bound with a list that can be shortened is trimmed, not refused, and one at the bound is left whole', async () => {
   const mod = await loadCollector()
   const jobCount = mod.CI_DIGEST_MAX_JOBS
-  // The digest carries the ci lane's wall-clock seconds, whose printed length would otherwise vary from run to run and
-  // move the size by a byte or two; a collector whose clock is frozen prints the same figure every time.
-  const frozenClock = path.join(scratchDir(), 'frozen-clock.cjs')
-  fs.writeFileSync(frozenClock, 'Date.now = () => 1_700_000_000_000\n')
-  // totalPad characters of padding are spread over the jobCount names, the first totalPad % jobCount names one longer.
+  // totalPad characters of padding are spread over the jobCount names (each name is in the digest twice, as a key and a field).
+  // The plan-label title appears once, so any byte count is reachable.
   const sizeFor = (totalPad, titleLength) => {
     const padOf = (j) => Math.floor(totalPad / jobCount) + (j < totalPad % jobCount ? 1 : 0)
     const stubs = stubsForJobs([41, 42], () => Array.from({ length: jobCount }, (_, j) => job(`bound-${String(j).padStart(2, '0')}-${'p'.repeat(padOf(j))}`)))
     const root = makeRepo({ ledger: validLedger(3), fix: 1 })
     writeSpec(root, 'bound.md', `## Tasks\n- [ ] T1: ${'t'.repeat(titleLength)}\n`)
     const outDir = scratchDir()
-    const out = drive(stubs, { root, outDir }, { NODE_OPTIONS: `--require=${frozenClock}` })
+    const out = drive(stubs, { root, outDir }, frozenClock())
     return { out, outDir, file: path.join(outDir, 'digest.json') }
   }
   const probe = sizeFor(400, 2)
@@ -571,10 +691,45 @@ test('T1b digest: a digest of exactly the byte bound is written and one of a byt
   const exact = sizeFor(totalPad, titleLength)
   assert.equal(exact.out.lanes.digest.status, 'ran', exact.out.line)
   assert.equal(sizeOf(exact.file), mod.DIGEST_MAX_BYTES, 'the fixture lands on the bound exactly')
+  const whole = digestOf(exact.outDir)
+  assert.equal(whole.dropped.trimmedForSize, false, 'at the bound nothing is trimmed')
+  assert.equal(Object.keys(whole.ci.byJob).length, jobCount)
   const over = sizeFor(totalPad, titleLength + 1)
-  assert.equal(over.out.lanes.digest.status, 'failed')
-  assert.equal(over.out.lanes.digest.mode, 'over_size')
-  assert.equal(fs.existsSync(over.file), false)
+  assert.equal(over.out.lanes.digest.status, 'ran', 'one byte over is trimmed to fit, not refused')
+  const trimmed = digestOf(over.outDir)
+  assert.equal(trimmed.dropped.trimmedForSize, true)
+  assert.equal(trimmed.dropped.ciByJob, 1, 'one byte over costs one job, not more: the list is shortened just as far as needed')
+  assert.equal(Object.keys(trimmed.ci.byJob).length, jobCount - 1)
+  assert.ok(sizeOf(over.file) <= mod.DIGEST_MAX_BYTES)
+})
+
+test('T1b digest M1: no list is shortened below its floor: a digest that fits only below the floors is refused', () => {
+  // Grow irreducible content until the digest is refused, by a binary search over the count, and look at the largest one written.
+  const attempt = (count) => {
+    const outDir = scratchDir()
+    const stubs = stubsForJobs(Array.from({ length: 25 }, (_, i) => 100 + i), () => Array.from({ length: 60 }, (_, j) => job(`ci-job-${String(j).padStart(2, '0')}`, j % 2 === 0 ? 'failure' : 'success')))
+    const root = makeRepo({ ledger: fullLedger() + blockedLedger(count, count * 100), fix: 2, other: 1 })
+    for (const name of ['p1.md', 'p2.md', 'p3.md']) writeSpec(root, name, ['## Tasks', ...Array.from({ length: 30 }, (_, t) => `- [ ] T${t}: ${'a task title of a realistic length '.repeat(2)}${t}`), ''].join('\n'))
+    const out = drive(stubs, { root, outDir, window: 5000 }, frozenClock())
+    return { out, outDir }
+  }
+  let low = 0
+  let high = 200
+  let written = null
+  for (let step = 0; step < 8 && low < high; step++) {
+    const middle = Math.floor((low + high + 1) / 2)
+    const result = attempt(middle)
+    if (result.out.lanes.digest.status === 'ran') {
+      low = middle
+      written = result
+    } else high = middle - 1
+  }
+  assert.ok(written, 'some count is written')
+  const d = digestOf(written.outDir)
+  const kept = keptIn(d)
+  for (const name of TRIM_ORDER) assert.ok(kept[name] >= Math.min(TRIM_FLOORS[name], kept[name] + d.dropped[name]), `${name} (${kept[name]}) is not below its floor ${TRIM_FLOORS[name]}`)
+  const refused = attempt(low + 1)
+  assert.equal(refused.out.lanes.digest.mode, 'over_size', 'the next count is refused')
 })
 
 test('T1b digest: an unexpected failure to write the digest keeps a fixed cause token on the command line, and no error text or path', () => {
@@ -595,26 +750,58 @@ test('T1b digest: an unexpected failure to write the digest keeps a fixed cause 
   }
 })
 
-test('T1b digest: a hostile free-text value 5,000 characters long never produces a long line or an over-size file', async () => {
-  const stubs = stubsWithRuns()
-  const root = makeRepo({ ledger: validLedger(4, { repo: `CANARY-${'r'.repeat(5000)}` }), fix: 1 })
-  const outDir = scratchDir()
-  const out = drive(stubs, { root, outDir })
+// A single string that makes one printed line longer than DIGEST_MAX_LINE_CHARS fails the digest closed, whichever
+// part of the digest it comes from: no digest.json, and the fixed failure token on the log line.
+test('T1b digest L2: an overlong string from a repository label, a CI job name or a plan key gives line_too_long, no digest.json and the exact log token', async () => {
   const mod = await loadCollector()
-  const file = path.join(outDir, 'digest.json')
-  if (fs.existsSync(file)) {
-    const text = fs.readFileSync(file, 'utf8')
-    assert.ok(Math.max(...text.split('\n').map((l) => l.length)) <= mod.DIGEST_MAX_LINE_CHARS)
-    assert.ok(sizeOf(file) <= mod.DIGEST_MAX_BYTES)
-  } else {
-    assert.equal(out.lanes.digest.status, 'failed', 'either the digest holds short lines or the lane says it was not written')
+  const long = 'z'.repeat(mod.DIGEST_MAX_LINE_CHARS + 500)
+  const stubs = stubsWithRuns()
+  const origins = {
+    'repository label (perRepo.root)': () => ({ stubs, root: makeRepo({ ledger: validLedger(4, { repo: `CANARY-${long}` }), fix: 1 }) }),
+    'CI job name (ci.byJob key)': () => ({ stubs: stubsForJobs([61, 62, 63], () => [job(long), job('test')]), root: makeRepo({ ledger: validLedger(3), fix: 1 }) }),
+    'plan key (wallClock.byPlan key, from a spec path)': () => ({ stubs, root: makeRepo({ ledger: ledgerLine(0, { kind: 'conduct_plan_event', event: 'ci_wait_started', spec: `specs/${long}.md`, event_key: `specs/${long}.md:T1:ci_wait_started:1` }) + '\n', fix: 1 }) }),
+  }
+  for (const [origin, build] of Object.entries(origins)) {
+    const { stubs: s2, root } = build()
+    const outDir = scratchDir()
+    fs.writeFileSync(path.join(outDir, 'digest.json'), '{"stale":true}\n')
+    const out = drive(s2, { root, outDir })
+    assert.equal(out.lanes.digest.status, 'failed', origin)
+    assert.equal(out.lanes.digest.mode, 'line_too_long', origin)
+    assert.equal(fs.existsSync(path.join(outDir, 'digest.json')), false, `${origin}: no digest.json, and the stale one is removed`)
+    assert.ok(out.line.endsWith(' digest=failed:line_too_long'), `${origin}: ${out.line}`)
+    assert.ok(!out.line.includes('zzzz') && !out.lanes.digest.reason.includes('zzzz'), `${origin}: nothing collected on the line or in the reason`)
   }
 })
 
-test('T1b digest: a successful collection leaves the COLLECT line exactly as before and reports the digest lane as ran', () => {
-  const { out } = rich()
+const LINE_SHAPE = /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+ ci_runs=fetched:3,not_fetched:0,timeout:0 digest=ran:bytes:(\d+),dropped:(\d+)$/
+
+test('T1b digest: a successful collection keeps every earlier field of the COLLECT line and ends with digest=ran:bytes:<n>,dropped:<total>, integers only', () => {
+  const { out, outDir } = rich()
   assert.equal(out.lanes.digest.status, 'ran')
-  assert.match(out.line, /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+ ci_runs=fetched:3,not_fetched:0,timeout:0$/)
+  const match = LINE_SHAPE.exec(out.line)
+  assert.ok(match, `the line: ${out.line}`)
+  assert.equal(Number(match[1]), sizeOf(path.join(outDir, 'digest.json')), 'bytes is the size of digest.json')
+  const { dropped } = digestOf(outDir)
+  assert.equal(Number(match[2]), Object.values(dropped).filter((v) => typeof v === 'number').reduce((a, b) => a + b, 0), 'dropped is the sum of every count in dropped, plan labels included')
+  assert.ok(!out.line.includes('CANARY'), 'nothing collected is on the line')
+})
+
+test('T1b digest: the log line shows a zero dropped total for an untrimmed digest and a non-zero one for each kind of trimming', () => {
+  const droppedOf = (out) => Number(LINE_SHAPE_ANY.exec(out.line)[1])
+  const LINE_SHAPE_ANY = / digest=ran:bytes:\d+,dropped:(\d+)$/
+  const stubs = stubsWithRuns()
+  const plain = drive(stubs, { root: makeRepo({ ledger: validLedger(3), fix: 1 }), outDir: scratchDir() })
+  assert.equal(droppedOf(plain), 0, plain.line)
+  // Plan labels only: 41 task labels against a cap of 40.
+  const labelled = makeRepo({ ledger: validLedger(3), fix: 1 })
+  writeSpec(labelled, 'many.md', ['## Tasks', ...Array.from({ length: 41 }, (_, t) => `- [ ] T${t}: task ${t}`), ''].join('\n'))
+  const byLabels = drive(stubs, { root: labelled, outDir: scratchDir() })
+  assert.equal(droppedOf(byLabels), 1, byLabels.line)
+  // CI jobs only: 45 distinct jobs against a cap of 40.
+  const jobs = stubsForJobs([51, 52], () => Array.from({ length: 45 }, (_, j) => job(`j-${j}`)))
+  const byJobs = drive(jobs, { root: makeRepo({ ledger: validLedger(3), fix: 1 }), outDir: scratchDir() })
+  assert.equal(droppedOf(byJobs), 5, byJobs.line)
 })
 
 // ---- the free-text paths (AC-SEC-6) ----
@@ -699,7 +886,7 @@ const STRUCTURAL_KEYS = new Set([
   'byLens', 'cleanWithZeroTrigger', 'cleanWithMatches', 'findingsWithMatches', 'cleanTriggerUnmeasured', 'total',
   'lastAdoptionTs', 'lastRejectionTs', 'target', 'kind', 'component', 'concern', 'lens', 'workflow', 'job',
   'ac_id', 'insufficient_data', 'unattributed_fail_in_window', 'unattributed_verdict_in_entry', 'truncated_in_window', 'never_failed', 'verdict_disagreements',
-  'wallClockByPlan', 'planLabels', 'ciByJob', 'ciFailedRunIds', 'ciCitationPool', 'task_id', 'title',
+  'wallClockByPlan', 'planLabels', 'ciByJob', 'ciFailedRunIds', 'ciCitationPool', 'ledgerCitationPool', 'trimmedForSize', 'task_id', 'title',
   'adoptedCount', 'rejectedCount', 'revertedCount', 'revertedTwiceOrMore', 'targetUnavailableReason',
   'ciWaitMeasuredRuns', 'ciWaitUnmeasuredRuns', 'humanWaitMeasuredRuns', 'humanWaitUnmeasuredRuns', 'agentComputeMeasuredRuns', 'agentComputeUnmeasuredRuns', 'agentComputeAbortedSeconds', 'degradedUnattributedRuns', 'unattributableRuns', 'unattributableWaits',
   'ciWaitN', 'ciWaitUnmeasuredN', 'humanWaitN', 'humanWaitUnmeasuredN', 'agentComputeN', 'agentComputeUnmeasuredN', 'agentComputeAbortedN',
@@ -782,36 +969,73 @@ test('AC-SEC-6: a lane reason is fixed text and is never listed as free text', (
 
 // ---- 3. the git result's two fields ----
 
-test('T1b git: the result carries root_index 0 and a null window_note when the log was not cut short', () => {
+const WINDOW_CUT = 'the git log was cut at 500 commits; older history was not examined'
+const WINDOW_FULL = 'the full git history was examined'
+
+test('T1b git: the result carries root_index 0 and a fixed full-history window_note when the log was not cut short', () => {
   const stubs = stubsWithRuns()
   const root = makeRepo({ ledger: validLedger(3), fix: 2, other: 1 })
   const outDir = scratchDir()
   drive(stubs, { root, outDir })
   const git = lane(outDir, 'git').result
   assert.equal(git.root_index, 0)
-  assert.equal(git.window_note, null)
+  assert.equal(git.window_note, WINDOW_FULL)
   assert.equal(digestOf(outDir).git.root_index, 0)
+  assert.equal(digestOf(outDir).git.window_note, WINDOW_FULL)
 })
 
-test('T1b git: a history longer than the commit cap gets fixed window_note text naming the cap, and 499 commits do not', () => {
+// The base repository has one commit, so addCommits(n) gives n + 1.
+test('T1b git: window_note is the cut wording only when more than 500 commits exist: 499 and exactly 500 are full history, 501 and 520 are cut, and the figures are those of the first 500', () => {
   const stubs = stubsWithRuns()
-  const long = makeRepo({ ledger: validLedger(3) })
-  addCommits(long, 520)
-  const outLong = scratchDir()
-  drive(stubs, { root: long, outDir: outLong })
-  const gitLong = lane(outLong, 'git').result
-  assert.equal(gitLong.n_commits_examined, 500, 'the log is cut at 500 commits')
-  assert.equal(typeof gitLong.window_note, 'string')
-  assert.match(gitLong.window_note, /\b500\b/)
-  assert.ok(gitLong.window_note.length < 200, 'fixed text, not data')
-  const short = makeRepo({ ledger: validLedger(3) })
-  addCommits(short, 498)
-  const outShort = scratchDir()
-  drive(stubs, { root: short, outDir: outShort })
-  const gitShort = lane(outShort, 'git').result
-  assert.equal(gitShort.n_commits_examined, 499)
-  assert.equal(gitShort.window_note, null)
+  const cases = [[498, 499, WINDOW_FULL], [499, 500, WINDOW_FULL], [500, 500, WINDOW_CUT], [519, 500, WINDOW_CUT]]
+  for (const [added, examined, note] of cases) {
+    const root = makeRepo({ ledger: validLedger(3) })
+    addCommits(root, added)
+    const outDir = scratchDir()
+    drive(stubs, { root, outDir })
+    const git = lane(outDir, 'git').result
+    assert.equal(git.n_commits_examined, examined, `${added + 1} commits in the history`)
+    assert.equal(git.window_note, note, `${added + 1} commits in the history`)
+    // The 501st commit is only the signal: the figures equal the reader's own over the same 500-commit log.
+    const rawLog = spawnSync(REAL_GIT, ['-C', root, 'log', '--max-count=500', '--name-only', '--pretty=format:%x1e%P%x1f%s'], { encoding: 'utf8', env: sanitizedGitEnv() }).stdout
+    const viaCli = JSON.parse(spawnSync(process.execPath, [READER, 'escaped-defects'], { input: JSON.stringify({ git_log_raw: rawLog, toplevel: root, root }), encoding: 'utf8' }).stdout)
+    const { root_index: rootIndex, window_note: windowNote, ...figures } = git
+    assert.equal(rootIndex, 0)
+    assert.equal(typeof windowNote, 'string')
+    assert.deepEqual(figures, viaCli, `${added + 1} commits: the figures are the reader's for the first 500`)
+  }
 })
+
+// The workflow's own schema for a git lane entry, read from its source (a workflow script cannot be imported).
+function workflowGitSchema() {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'workflows', 'optimise-cycle.js'), 'utf8')
+  const start = source.indexOf('const GIT_LANE_ENTRY_SCHEMA = {')
+  assert.ok(start >= 0, 'GIT_LANE_ENTRY_SCHEMA is in the workflow')
+  const end = source.indexOf('\n}\n', start)
+  return new Function(`return ${source.slice(start + 'const GIT_LANE_ENTRY_SCHEMA = '.length, end + 2)}`)()
+}
+
+test('T1b git: the collector\'s git result, as the lane file and as the digest carries it, is valid against the workflow\'s GIT_LANE_ENTRY_SCHEMA, with window_note a string in every case', async () => {
+  const { validateEntry } = await import(pathToFileURL(path.join(__dirname, '..', 'workflows', 'lib', 'ledger-append.mjs')).href)
+  const schema = workflowGitSchema()
+  assert.ok(schema.required.includes('window_note') && schema.properties.window_note.type === 'string', 'the schema still requires a string window_note')
+  const stubs = stubsWithRuns()
+  for (const added of [2, 499, 519]) {
+    const root = makeRepo({ ledger: validLedger(3), fix: 1 })
+    addCommits(root, added)
+    const outDir = scratchDir()
+    drive(stubs, { root, outDir })
+    assert.deepEqual(validateEntry(lane(outDir, 'git').result, schema), [], `lane file, ${added + 1} commits`)
+    assert.deepEqual(validateEntry(digestOf(outDir).git, schema), [], `digest, ${added + 1} commits`)
+  }
+  assert.ok(validateEntry({ ...lane(scratchDirWithGit(stubs), 'git').result, window_note: null }, schema).length > 0, 'a null window_note is refused by the schema, so the check can fail')
+})
+
+function scratchDirWithGit(stubs) {
+  const outDir = scratchDir()
+  drive(stubs, { root: makeRepo({ ledger: validLedger(3), fix: 1 }), outDir })
+  return outDir
+}
 
 // ---- 4. the plan labels ----
 
@@ -854,7 +1078,7 @@ test('T1b plan labels: no specs directory is an empty list with no note; a title
   assert.equal(d.plan_labels.length, mod.PLAN_LABELS_MAX)
   assert.equal(d.dropped.planLabels, 91 - mod.PLAN_LABELS_MAX)
   assert.deepEqual(d.plan_labels[0], { spec: 'specs/long.md', task_id: 'T1', title: long.slice(0, mod.PLAN_LABEL_TITLE_MAX_CHARS) })
-  assert.match(d.plan_labels_note, new RegExp(`\\b${91 - mod.PLAN_LABELS_MAX}\\b`), 'the drop is said in the note, with its count')
+  assert.equal(d.plan_labels_note, `${91 - mod.PLAN_LABELS_MAX} of 91 task labels were left out at the limit of ${mod.PLAN_LABELS_MAX}; plans with open tasks were kept first`, 'the drop is said in the note, exactly')
 })
 
 test('T1b plan labels: past the cap the labels kept favour plans with open tasks, are the same on every run, and the same task id in two plans is told apart by spec', () => {
@@ -874,7 +1098,7 @@ test('T1b plan labels: past the cap the labels kept favour plans with open tasks
   assert.deepEqual(active.map((l) => l.task_id), ['T1', 'T2', 'T3'], 'the plan with open tasks is kept whole, in document order')
   assert.equal(runs[0].plan_labels.length, 40)
   assert.equal(runs[0].dropped.planLabels, 63 - 40)
-  assert.match(runs[0].plan_labels_note, /23/)
+  assert.equal(runs[0].plan_labels_note, '23 of 63 task labels were left out at the limit of 40; plans with open tasks were kept first')
   const t1 = runs[0].plan_labels.filter((l) => l.task_id === 'T1')
   assert.deepEqual(t1.map((l) => l.spec).sort(byName), ['specs/a-finished.md', 'specs/z-active.md'], 'T1 of two plans is two distinct labels')
   const names = runs[0].plan_labels.map((l) => l.spec)
@@ -892,8 +1116,9 @@ test('AC-SEC-11: a specs directory that is a symlink, and a spec file that is a 
   drive(stubs, { root: linkedDir, outDir: outA })
   const a = digestOf(outA)
   assert.deepEqual(a.plan_labels, [])
-  assert.equal(typeof a.plan_labels_note, 'string', 'a refused specs directory is said, not silent')
-  assert.ok(a.plan_labels_note.length > 0 && !a.plan_labels_note.includes(outside))
+  // The directory-level guard, not the per-file one behind it: the note names the directory, not a count of refused files.
+  assert.equal(a.plan_labels_note, 'the specs directory is a symlink or could not be read, so no plan labels were collected')
+  assert.ok(!a.plan_labels_note.includes(outside))
 
   const linkedFile = makeRepo({ ledger: validLedger(3), fix: 1 })
   writeSpec(linkedFile, 'ok.md', '## Tasks\n- [ ] T1: real one\n')
@@ -901,6 +1126,7 @@ test('AC-SEC-11: a specs directory that is a symlink, and a spec file that is a 
   const outB = scratchDir()
   drive(stubs, { root: linkedFile, outDir: outB })
   assert.deepEqual(digestOf(outB).plan_labels, [{ spec: 'specs/ok.md', task_id: 'T1', title: 'real one' }])
+  assert.equal(digestOf(outB).plan_labels_note, '1 spec files were not read (symlink, over the size limit or unreadable)')
 
   for (const dir of [outA, outB]) for (const f of fs.readdirSync(dir)) assert.ok(!fs.readFileSync(path.join(dir, f), 'utf8').includes('OUTSIDE-CANARY-TOKEN'), `${f} must not hold the canary`)
 })
@@ -913,6 +1139,7 @@ test('AC-SEC-11: an oversize spec file is not read', () => {
   const outDir = scratchDir()
   drive(stubs, { root, outDir })
   assert.deepEqual(digestOf(outDir).plan_labels, [{ spec: 'specs/small.md', task_id: 'T2', title: 'small one' }])
+  assert.equal(digestOf(outDir).plan_labels_note, '1 spec files were not read (symlink, over the size limit or unreadable)')
 })
 
 // ---- 5. the six sites the clean-up found with no failing test ----

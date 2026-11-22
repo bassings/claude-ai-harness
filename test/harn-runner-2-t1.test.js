@@ -77,7 +77,7 @@ test('AC-QA-1: K ledger lines, R gh runs and F fix commits are collected into th
   assert.equal(git.result.repo, 'demo', 'the git figure carries the ledger identity the ledger lane produced')
 
   for (const f of fs.readdirSync(outDir)) assert.equal(fs.statSync(path.join(outDir, f)).mode & 0o077, 0, `${f} must be 0600 or tighter`)
-  assert.match(res.stdout, /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+ ci_runs=fetched:3,not_fetched:0,timeout:0\n$/, `the log line: ${res.stdout}`)
+  assert.match(res.stdout, /^COLLECT ledger=ran git=ran ci=ran calls=ledger:\d+,git:\d+,ci:\d+ wall_clock_s=ledger:[\d.]+,git:[\d.]+,ci:[\d.]+ ci_runs=fetched:3,not_fetched:0,timeout:0 digest=ran:bytes:\d+,dropped:\d+\n$/, `the log line: ${res.stdout}`)
   assert.equal(res.stdout.trim().split('\n').length, 1, 'one line per repository')
   assert.deepEqual(treeListing(root), before, 'the collector must write nothing into the analysed repository')
 })
@@ -90,7 +90,7 @@ test('AC-SEC-8: git is invoked only as the two fixed forms under safe.bareReposi
   const root = makeRepo({ ledger: validLedger(2), fix: 2, author: 'canary-author@example.invalid' })
   const { outDir, res } = collect(stubs, root)
 
-  const log = ['log', '--max-count=500', '--name-only', '--pretty=format:%x1e%P%x1f%s']
+  const log = ['log', '--max-count=501', '--name-only', '--pretty=format:%x1e%P%x1f%s']
   const revParse = ['rev-parse', '--show-toplevel']
   const calls = recorded(stubs, 'GIT')
   assert.ok(calls.length >= 2, 'expected the log and rev-parse calls')
@@ -789,7 +789,7 @@ test('AC-OPS-4: a ci lane that runs out of budget keeps the runs already fetched
   assert.equal(ci.timeoutCount, 5 - ci.runCount)
   assert.equal(ci.reason, `ci lane budget exhausted: ${ci.runCount} of 5 runs fetched`)
   assert.equal(recorded(stubs, 'GH').filter((c) => c[2] === 'view').length, ci.runCount, 'no view call is made after the budget has run out')
-  assert.match(res.stdout, new RegExp(`ci_runs=fetched:${ci.runCount},not_fetched:${5 - ci.runCount},timeout:${5 - ci.runCount}$`))
+  assert.match(res.stdout, new RegExp(`ci_runs=fetched:${ci.runCount},not_fetched:${5 - ci.runCount},timeout:${5 - ci.runCount} digest=ran:bytes:\\d+,dropped:\\d+$`))
 })
 
 test('AC-OPS-4: a budget that runs out before any run is fetched is a failed ci lane in mode timeout naming 0 runs done', () => {
@@ -1024,7 +1024,7 @@ test('AC-OPS-7: a ci lane where some views failed shows fetched and not-fetched 
   const root = makeRepo({ ledger: validLedger(1), fix: 1 })
   const { res } = collect(stubs, root)
   assert.match(res.stdout, / ci=ran calls=/)
-  assert.match(res.stdout, / ci_runs=fetched:1,not_fetched:2,timeout:0\n$/, res.stdout)
+  assert.match(res.stdout, / ci_runs=fetched:1,not_fetched:2,timeout:0 digest=ran:bytes:\d+,dropped:\d+\n$/, res.stdout)
 })
 
 // ---- AC-QA-17: repository isolation ----
@@ -1122,7 +1122,7 @@ test('AC-ARCH-5: the reader\'s escaped-defects command and the collector return 
   // reader's command does not emit (T1b); the figures are everything else.
   const { root_index: rootIndex, window_note: windowNote, ...figures } = lane(outDir, 'git').result
   assert.equal(rootIndex, 0)
-  assert.equal(windowNote, null)
+  assert.equal(windowNote, 'the full git history was examined')
   assert.deepEqual(figures, viaCli)
 })
 
