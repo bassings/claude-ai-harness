@@ -1,5 +1,5 @@
 # Analyser rules table
-derived: 2026-11-21T15:58:21Z revision: unknown analyser: SonarQube window: 2026-10-22..2026-11-21 new-issues: 65 previous: 2026-11-21T14:10:42Z since-previous: 0 on-listed: 0 open-total: 134 rules: 20 of 27
+derived: 2026-11-22T02:11:08Z revision: unknown analyser: SonarQube window: 2026-10-23..2026-11-22 new-issues: 65 previous: 2026-11-21T15:58:21Z since-previous: 0 on-listed: 0 open-total: 134 rules: 20 of 27
 
 | rule | guidance | open | recent-new |
 |---|---|---|---|
