@@ -148,7 +148,7 @@ test('F3: a line in a shape the script never writes is named by its 1-based line
   const altered = insertAt(insertAt(report, 4, 'An ordinary sentence the script never writes, holding a <secret>.'), 9, 'Another one.')
   const reasons = checkFigures({ lanes: LANES_RAN }, altered, col).reasons
   assert.ok(reasons.includes(FIXED_REASONS.UNKNOWN_LINE), `the fixed reason itself stays: ${reasons}`)
-  assert.deepEqual(reasons.filter((r) => r.startsWith(`${FIXED_REASONS.UNKNOWN_LINE}: `)), [`${FIXED_REASONS.UNKNOWN_LINE}: 4`, `${FIXED_REASONS.UNKNOWN_LINE}: 9`])
+  assert.deepEqual(reasons.filter((r) => r.startsWith(`${FIXED_REASONS.UNKNOWN_LINE}: `)), [`${FIXED_REASONS.UNKNOWN_LINE}: 4, 9`])
   assert.ok(!reasons.some((r) => r.includes('secret') || r.includes('ordinary')), 'no line content is in any reason')
 })
 
@@ -164,11 +164,16 @@ test('F3: a line with an odd number of backticks is named by its 1-based line nu
   assert.ok(reasons.includes(`${FIXED_REASONS.ODD_BACKTICKS}: ${repos}`), `${reasons}`)
 })
 
-test('F3: at most three numbered lines per kind, so a wholly foreign report cannot crowd out the other reasons', async () => {
-  const { checkFigures, FIXED_REASONS } = await loadVerify()
+test('F3: at most three numbered lines per kind, in one reason per kind, so odd-backtick and foreign lines together cannot crowd out the other reasons', async () => {
+  const { checkFigures, cappedReasons, FIXED_REASONS } = await loadVerify()
   const { col, report } = await moderateReport()
-  const reasons = checkFigures({ lanes: LANES_RAN }, `${report}\n${Array.from({ length: 50 }, (_, i) => `junk ${i}`).join('\n')}`, col).reasons
-  assert.equal(reasons.filter((r) => r.startsWith(`${FIXED_REASONS.UNKNOWN_LINE}: `)).length, 3)
+  const foreign = [...Array.from({ length: 50 }, (_, i) => `junk ${i}`), ...Array.from({ length: 50 }, (_, i) => `odd \` ${i}`)].join('\n')
+  const reasons = checkFigures({ lanes: LANES_RAN }, `${report.replace(/^(Ledger records in window: )\d+/m, '$1999')}\n${foreign}`, col).reasons
+  const numbered = reasons.filter((r) => r.startsWith('report has a line ') && /: \d+(?:, \d+)*$/.test(r))
+  assert.equal(numbered.length, 2, `one numbered reason per kind: ${numbered}`)
+  for (const r of numbered) assert.match(r, /: \d+, \d+, \d+$/, `three integers, commas only: ${r}`)
+  assert.ok(reasons.includes(FIXED_REASONS.UNKNOWN_LINE) && reasons.includes(FIXED_REASONS.ODD_BACKTICKS))
+  assert.ok(cappedReasons(reasons).some((r) => r.startsWith('figure mismatch ledger: ')), `the figure mismatch is shown within the cap: ${cappedReasons(reasons)}`)
 })
 
 // A figure written with more decimal places than the pattern reads: the row is there, it just does not parse.

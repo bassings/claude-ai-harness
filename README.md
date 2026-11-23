@@ -1589,6 +1589,16 @@ could); on the attended path the session has a shell and could compute it, so th
 the digest guards against accident, not against a steered session. A second,
 independent layer refuses any report in which a proposal would remove an always-on
 lens, and a third refuses a report with any line in a shape the script never writes.
+A proposal that would remove an always-on lens, named in its statement or target or,
+when its statement has a removal verb such as "retire", "stop" or "skip", anywhere
+else in the proposal, is never shown: it is counted in the report's Filtering section
+(`Dropped (always-on security lens removal, never permitted): <n>`). That includes an
+ordinary proposal such as "Stop running the docs job twice; lens-qa findings
+unaffected", which is the accepted cost. **Known limit:** the rule matches the lens
+names `lens-security` and `lens-qa` (other hyphen characters, such as U+2011, read as
+a hyphen; case ignored) and the phrases "security lens" and "qa lens"; a removal that names the lens
+only by another description, such as "the security reviewer", is not caught by either
+layer, because matching such a phrase on its own would refuse ordinary text.
 **Proposal ids:** an id is hashed from the target as it is stored, with
 absolute-path-looking text redacted and whitespace collapsed first, so two targets
 that differ only in text that redacts to the same marker (for example two slash
@@ -1762,10 +1772,11 @@ that comes from the data itself, and the weekly runner deletes its per-run
 directory on a FAIL, so the report it judged is gone. To see what tripped it,
 run the attended cycle once (`/optimise-cycle`, the steps in
 `skills/optimise-cycle/SKILL.md`) on the same repository. Its check prints the
-same `REASON` lines, and the two line-shape reasons are followed by
-`: <line>`, the 1-based number of the offending line of the report (the first
-three such lines; the number only, never the line's text). Before the run
-directory is removed (step 10), read that line of the returned report with
+same `REASON` lines, and each of the two line-shape reasons is followed by one
+more `REASON`: the same words, then `: <line>, <line>, <line>`, the 1-based
+numbers of the first three offending lines of the report (integers and commas
+only, never the lines' text). Before the run directory is removed (step 10),
+read each such line of the returned report with
 `node -e "const r = require(process.argv[1]); console.log(r.report.split('\n')[Number(process.argv[2]) - 1])" <run dir>/result.json <line>`.
 It shows the line on your screen only; nothing is written to a log. A
 `figure mismatch <class>: a row did not parse` reason means that row is in the
@@ -1840,8 +1851,8 @@ the line-shape reason numbers.
 | `result carries no mac` | The returned object has no keyed digest (`result_mac`), or it is not a 64-character hash. | `bin/install.sh --check`: the installed workflow may predate the result check. | Run `bin/install.sh`, then re-run; report it if it repeats. |
 | `result mac does not match this run` | The keyed digest does not match the nonce and the reply's report, targets and lane statuses, so the reply was edited after the workflow returned it (or came from another run). Nothing was placed. | Nothing to check on your side. | Re-run; report it if it repeats. |
 | `report proposes removing an always-on lens` | A proposal in the report would remove `lens-security` or `lens-qa` from the always-on roster, which the workflow itself never lets through. Nothing was placed. | The report text in the session's reply, if you have it. | Re-run; report it if it repeats. |
-| `report has a line with an odd number of backticks` | A line of the report has an unpaired backtick. The script writes backticks only in pairs, around text from a repository or a model, so the report was altered after the workflow produced it. Nothing was placed. The same reason followed by `: <line>` names the 1-based number of each of the first three such lines. | Nothing to check on your side. | Re-run; if it repeats, follow "A failure that fails the same way every run" above. |
-| `report has a line in a shape the check does not know` | A line of the report, read with its code-formatted text set aside, is not one of the lines the script writes, so text was added or changed outside code formatting after the workflow produced it, the installed workflow and result check are out of step, or the data produced a line the check cannot read. Nothing was placed. The same reason followed by `: <line>` names the 1-based number of each of the first three such lines. | `bin/install.sh --check`. | Run `bin/install.sh` if it reports drift, then re-run; if it repeats, follow "A failure that fails the same way every run" above and report the line. |
+| `report has a line with an odd number of backticks` | A line of the report has an unpaired backtick. The script writes backticks only in pairs, around text from a repository or a model, so the report was altered after the workflow produced it. Nothing was placed. The same reason followed by `: <line>, <line>, <line>` (one reason, at most three integers) names the 1-based numbers of the first three such lines. | Nothing to check on your side. | Re-run; if it repeats, follow "A failure that fails the same way every run" above. |
+| `report has a line in a shape the check does not know` | A line of the report, read with its code-formatted text set aside, is not one of the lines the script writes, so text was added or changed outside code formatting after the workflow produced it, the installed workflow and result check are out of step, or the data produced a line the check cannot read. Nothing was placed. The same reason followed by `: <line>, <line>, <line>` (one reason, at most three integers) names the 1-based numbers of the first three such lines. | `bin/install.sh --check`. | Run `bin/install.sh` if it reports drift, then re-run; if it repeats, follow "A failure that fails the same way every run" above and report the line. |
 | `report contains an invisible or direction-control character` | The report holds a zero-width or text-direction character, which can make a line read differently from how it is stored. | Nothing to check on your side. | Re-run; report it if it repeats. |
 | `result carries no nonce hash` | The returned object lacks the hash of this run's nonce. | The session may have called another workflow copy. | Re-run; report it if it repeats. |
 | `result nonce hash does not match this run` | The hash does not match this run's nonce, so the result is not from this run's digest. | As above. | As above. |

@@ -153,11 +153,29 @@ function proposalText(p) {
 // deliberately the most conservative of the three layers, since a false
 // positive here just costs a human re-raising a benign proposal, while a
 // false negative defeats the containment AC-SEC-10 exists for.
+//
+// HARN-RUNNER-2 final round (adversarial check of whole-branch round 4): a removal stated BY REFERENCE ("Retire the reviewer identified in
+// the motivating measurement", with the lens named only there) passed both layers. So a proposal is also an always-on removal when its
+// STATEMENT has a removal verb (REMOVAL_VERBS_RE) and an always-on lens name or phrase appears anywhere in the same proposal: statement,
+// either measurement, any citation, the reinstatement evidence or any target field. A proposal with no removal verb in its statement that
+// merely names a lens in its evidence is kept. The owner accepted the cost: a statement such as "Stop running the docs job twice; lens-qa
+// findings unaffected" is dropped too, and counted in the report's Filtering section. Every field is matched as the report would show it
+// (inertChars: the encoder's own character steps), with the hyphen look-alikes folded to a hyphen, so this rule and the result check's
+// second layer (optimise-verify.mjs, proposesRemovingAlwaysOnLens, which reads the rendered report) decide on the same text.
+const ALWAYS_ON_HYPHENS_RE = /[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/g
+const alwaysOnMatchText = (value) => inertChars(value).replaceAll(ALWAYS_ON_HYPHENS_RE, '-')
+function alwaysOnProposalText(p) {
+  const target = p.target && typeof p.target === 'object' ? p.target : {}
+  const fields = [p.statement, p.motivating_measurement, p.confirming_measurement, ...(Array.isArray(p.citations) ? p.citations : []), p.reinstatement_evidence, ...PROPOSAL_TARGET_STRING_KEYS.map((k) => target[k])]
+  return fields.map(alwaysOnMatchText).join(' ')
+}
 function isAlwaysOnSecurityRemoval(p) {
   const target = p && p.target
   if (target && SECURITY_LENS_NAMES.includes(target.lens)) return true
   if (target && target.touches_always_on_lens === true) return true
-  return SECURITY_LENS_PHRASE_RE.test(proposalText(p))
+  const statement = alwaysOnMatchText(p?.statement)
+  if (SECURITY_LENS_PHRASE_RE.test(`${statement} ${alwaysOnMatchText(target ? JSON.stringify(target) : '')}`)) return true
+  return REMOVAL_VERBS_RE.test(statement) && SECURITY_LENS_PHRASE_RE.test(alwaysOnProposalText(p))
 }
 
 // A proposal that removes/demotes/skips ANYTHING is required to carry
@@ -1039,13 +1057,18 @@ const INERT_CUT = ' [cut]'
 const INERT_EMPTY = '(empty)'
 const INERT_BREAKS_RE = /[\t\n\v\f\r\u0085\u2028\u2029]/g
 const INERT_REMOVED_RE = /[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}\ufe00-\ufe0f]/gu
-function inert(value) {
-  const text = (typeof value === 'string' ? value : String(value ?? ''))
+// The character steps alone (one line, the removals, backticks to apostrophes, white space collapsed), with no bound and no span: the
+// always-on rule (isAlwaysOnSecurityRemoval) decides on this text, so it sees what the rendered report shows (HARN-RUNNER-2 final round).
+function inertChars(value) {
+  return (typeof value === 'string' ? value : String(value ?? ''))
     .replaceAll(INERT_BREAKS_RE, ' ')
     .replaceAll(INERT_REMOVED_RE, '')
     .replaceAll('`', "'")
     .replaceAll(/\s+/g, ' ')
     .trim()
+}
+function inert(value) {
+  const text = inertChars(value)
   const chars = Array.from(text)
   const bounded = chars.length > INERT_MAX ? `${chars.slice(0, INERT_MAX).join('')}${INERT_CUT}` : text
   return `\`${bounded === '' ? INERT_EMPTY : bounded}\``

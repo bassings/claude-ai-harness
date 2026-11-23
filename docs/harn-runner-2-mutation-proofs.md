@@ -537,3 +537,25 @@ the code and are shown load-bearing below.
 
 **Not proved by mutation.** F4 is not fixed (see the report of this round): the shared pattern is left as it was. The README and skill text for
 reading a numbered line from `result.json` is held by R4's attended test, which checks the words are there, not that an operator follows them.
+
+## HARN-RUNNER-2 final round (adversarial check of round 4: an always-on removal stated by reference; L2 to L4)
+
+Same method. R5 is `test/harn-runner-2-round5.test.js`, R4 is `test/harn-runner-2-round4.test.js`. Seen red before the fix: the seven
+first-layer by-reference cases failed on "the proposal is absent from the report" (the review's three probes reproduced: each proposal was kept
+and the run PASSed), and the four second-layer forgeries naming the lens in a measurement, a citation or the reinstatement evidence were
+placed with VERDICT PASS; the L2 test failed with four separate numbered reasons; the README tests failed on the missing sentences. The target
+cases, the owner's control and the L3 test passed before the fix (the first two through the existing statement-plus-target clause; L3 because
+the rounding already existed and is shown load-bearing below).
+
+| Row | Guard | Mutation | Tests that failed |
+|---|---|---|---|
+| M1 | first layer: removal verb in the statement and the lens anywhere in the proposal | the new clause in `isAlwaysOnSecurityRemoval` to `return false` | R5 seven first-layer tests |
+| M2 | second layer: the same on the rendered block | the new clause in `removesAlwaysOnLens` to `return false` | R5 six second-layer tests |
+| M3 | each field the first layer searches | the motivating measurement, the confirming measurement, the citations, the reinstatement evidence dropped from `alwaysOnProposalText` in turn | R5 three, two, one and one first-layer tests respectively. **Survived by design:** dropping the statement or the target fields, which the older statement-plus-target clause also reads |
+| M4 | each line the second layer searches | the measurements line (`n=`), the reinstatement line dropped from the block in turn | R5 five and one second-layer tests. **Survived by design:** dropping the Target line, which the older clause also reads |
+| M5 | both layers decide on the same text | first layer: `inertChars` removed (raw text); the hyphen fold removed. Second layer: the encoder removals removed; the hyphen fold removed | R5 "a soft hyphen inside the lens name"; "a non-breaking hyphen (U+2011)"; the second-layer soft-hyphen forgery; the second-layer U+2011 forgery |
+| L2 | the line numbers are one reason per kind | the numbers split into one reason each again | R5 "L2: odd-backtick and unknown lines together ..."; R4 "F3: at most three numbered lines per kind, in one reason per kind ..." |
+| L3a, L3b | `roundedSeconds` rounds to three places | `Math.round(value)`; then six places | R5 "L3: roundedSeconds rounds to exactly three decimal places" (each) |
+| L4a | "did not parse" needs the shape's literal lead | `presentButUnparsed` to `true` | R4 three F3 tests |
+| L4b | the same, the lead itself | the `skeleton.startsWith(lead)` condition removed | **survived at first**; R5 "L4: a missing figure line beside a foreign line that only shares its first word ..." was added and fails |
+| L4c, L4d, L4e | `literalLead` | returns `''`; escapes not read as their characters; stops not honoured | R4 five F3 tests; R5 L4 (it survived R4 at first); R4 five F3 tests |

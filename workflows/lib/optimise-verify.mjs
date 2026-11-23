@@ -947,8 +947,9 @@ const KNOWN_SHAPES = [...Object.values(SHAPES).map((shape) => shape.re), ...ROW_
 const isKnownShape = (skeleton) => FIXED_LINES.has(skeleton) || KNOWN_SHAPES.some((re) => re.test(skeleton))
 
 // One fixed reason for any line with an odd number of backticks, and one for any line whose skeleton is not a shape the script writes, each
-// followed (whole-branch review round 4, F3) by the same reason with the 1-based line number of each of the first NUMBERED_LINES such lines, as
-// an integer and nothing else, so an operator can find the line without the report's text ever reaching a log.
+// followed (whole-branch review round 4, F3) by ONE more reason per kind: the same reason with the 1-based line numbers of the first
+// NUMBERED_LINES such lines, integers separated by ", " and nothing else, so an operator can find the lines without the report's text ever
+// reaching a log, and two kinds take four of the reason cap's eight places at most (final round).
 const NUMBERED_LINES = 3
 export function checkLineShapes(report) {
   const found = { [F.ODD_BACKTICKS]: [], [F.UNKNOWN_LINE]: [] }
@@ -956,7 +957,7 @@ export function checkLineShapes(report) {
     if (backtickCount(line) % 2 === 1) found[F.ODD_BACKTICKS].push(index + 1)
     else if (!isKnownShape(skeleton)) found[F.UNKNOWN_LINE].push(index + 1)
   })
-  return Object.entries(found).filter(([, numbers]) => numbers.length > 0).flatMap(([reason, numbers]) => [reason, ...numbers.slice(0, NUMBERED_LINES).map((n) => `${reason}: ${n}`)])
+  return Object.entries(found).filter(([, numbers]) => numbers.length > 0).flatMap(([reason, numbers]) => [reason, `${reason}: ${numbers.slice(0, NUMBERED_LINES).join(', ')}`])
 }
 
 // ---- recorded proposal outcomes and the plan-label note ----
@@ -1173,34 +1174,51 @@ export function macProblem(result, nonce) {
 // ---- a proposal that removes an always-on lens is refused, whoever signed the report (M2, second layer) ----
 //
 // The workflow's own rule (isAlwaysOnSecurityRemoval in workflows/optimise-cycle.js) drops such a proposal, so none can be in a report the
-// workflow produced. These two values are that rule's, held to the workflow's by a parity test (a script cannot be imported). This layer reads
-// what that rule reads and nothing more (whole-branch review round 4, F2): of each proposal block, its heading line (the script's id and label,
-// then the statement) and its Target line, with the target the reply returned for that id. A lens named only in a measurement, a citation or
-// the reinstatement evidence is ordinary optimiser output, and the workflow keeps such a proposal, so it is not refused here either.
+// workflow produced. These values are that rule's, held to the workflow's by a parity test and by behavioural tests through both layers (a
+// script cannot be imported). This layer reads what that rule reads, on the rendered report (whole-branch review round 4, F2, and the final
+// round): of each proposal block, its heading line (the script's id and label, then the statement) and its Target line, with the target the
+// reply returned for that id; and, only when the statement has a removal verb, every line of the block (both measurements, the citations, the
+// reinstatement evidence, the target), since a removal may name the lens by reference. The encoder's removals and the hyphen fold are applied
+// first, as the workflow applies them.
 export const ALWAYS_ON_LENS_NAMES = ['lens-security', 'lens-qa']
 export const ALWAYS_ON_LENS_PHRASE_RE = /\b(lens-security|lens-qa|security lens|qa lens)\b/i
+export const ALWAYS_ON_REMOVAL_VERBS_RE = /\b(remove|removing|demote|demoting|skip|skipping|disable|disabling|drop|dropping|delete|deleting|move|moving|retire|retiring|exclude|excluding|omit|omitting|eliminate|eliminating|stop|stopping|cut|cutting|prune|pruning)\b/i
+export const ALWAYS_ON_HYPHENS_RE = /[\u2010-\u2015\u2212\ufe58\ufe63\uff0d]/g
+// The rendered text has had the encoder's character steps applied, but a reply altered after the workflow returned it has not, so the same
+// steps (line breaks to spaces, then the encoder mirror's INERT_REMOVED_RE) are applied again before the hyphen fold.
+const foldHyphens = (text) => text.replaceAll(INERT_BREAKS_RE, ' ').replaceAll(INERT_REMOVED_RE, '').replaceAll(ALWAYS_ON_HYPHENS_RE, '-')
 const PROPOSAL_SECTION_RE = /^## Proposals (?:\(ranked\)|previously adopted|\(insufficient data)/
 const PROPOSAL_START_RE = /^(?:### |- )([0-9a-f]{16}): /
 
-// Each proposal block in the three proposal sections: the id that starts it, and the text the workflow's rule reads (its heading line, which
-// holds the statement, and its Target line).
+// Each proposal block in the three proposal sections: the id that starts it, its statement (the heading's code span, or the heading itself
+// when it has none), the text the workflow's rule reads first (the heading line and the Target line) and every line of the block.
 function proposalBlocks(report) {
   const blocks = []
   let inSection = false
   for (const line of report.split('\n')) {
     if (line.startsWith('## ')) inSection = PROPOSAL_SECTION_RE.test(line)
     const start = inSection ? PROPOSAL_START_RE.exec(line) : null
-    if (start) blocks.push({ id: start[1], text: line })
-    else if (inSection && blocks.length > 0 && line.startsWith('Target: ')) blocks.at(-1).text += `\n${line}`
+    if (start) blocks.push({ id: start[1], statement: parseLine(line).spans[0] ?? line, text: line, whole: line })
+    else if (inSection && blocks.length > 0) addToBlock(blocks.at(-1), line)
   }
   return blocks
 }
+function addToBlock(block, line) {
+  block.whole += `\n${line}`
+  if (line.startsWith('Target: ')) block.text += `\n${line}`
+}
+
+function removesAlwaysOnLens({ statement, text, whole }, target) {
+  const targetText = target === null ? '' : JSON.stringify(target)
+  if (ALWAYS_ON_LENS_PHRASE_RE.test(foldHyphens(`${text} ${targetText}`))) return true
+  return ALWAYS_ON_REMOVAL_VERBS_RE.test(foldHyphens(statement)) && ALWAYS_ON_LENS_PHRASE_RE.test(foldHyphens(`${whole} ${targetText}`))
+}
 
 export function proposesRemovingAlwaysOnLens(report, targets) {
-  return proposalBlocks(report).some(({ id, text }) => {
-    const target = isObject(targets) && Object.hasOwn(targets, id) ? targets[id] : null
+  return proposalBlocks(report).some((block) => {
+    const target = isObject(targets) && Object.hasOwn(targets, block.id) ? targets[block.id] : null
     const named = isObject(target) && (ALWAYS_ON_LENS_NAMES.includes(target.lens) || target.touches_always_on_lens === true)
-    return named || ALWAYS_ON_LENS_PHRASE_RE.test(`${text} ${target === null ? '' : JSON.stringify(target)}`)
+    return named || removesAlwaysOnLens(block, target)
   })
 }
 
