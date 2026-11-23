@@ -907,7 +907,7 @@ test('M2: the control -- a repository with every kind of row PASSes unaltered, w
   const res = runRunner([repo], { stubs: ghWith() })
   assert.equal(res.status, 0, res.logContents)
   const report = fs.readFileSync(path.join(repo, REPORT_REL), 'utf8')
-  for (const [what, re] of [['a per-job CI row', /::ci::build: n=3, failed=0/], ['the scoped line', /Scoped to product source/], ['a per-repository CI row', /runs not completed/], ['a gh calls row', /gh calls/], ['a per-plan wall-clock row', /: ci_wait=\d+s \(n=/], ['the wall-clock totals', /^Totals: /m], ['a never-failing row', /AC-QA-1: n=6/], ['rows left out', /criteria rows left out/], ['a per-repository ledger row', /record\(s\) in window/], ['a trigger row', /total=\d+/], ['a rework row', /open=\d+/]]) assert.match(report, re, `guard against vacuity: the report has ${what}`)
+  for (const [what, re] of [['a per-job CI row', /::ci::build`: n=3, failed=0/], ['the scoped line', /Scoped to product source/], ['a per-repository CI row', /runs not completed/], ['a gh calls row', /gh calls/], ['a per-plan wall-clock row', /: ci_wait=\d+s \(n=/], ['the wall-clock totals', /^Totals: /m], ['a never-failing row', /AC-QA-1`: n=6/], ['rows left out', /criteria rows left out/], ['a per-repository ledger row', /record\(s\) in window/], ['a trigger row', /total=\d+/], ['a rework row', /open=\d+/]]) assert.match(report, re, `guard against vacuity: the report has ${what}`)
 })
 
 const ROW_MISMATCHES = [

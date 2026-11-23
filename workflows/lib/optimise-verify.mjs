@@ -85,8 +85,9 @@ export const FIXED_REASONS = Object.freeze({
   NO_MAC: 'result carries no mac',
   MAC_MISMATCH: 'result mac does not match this run',
   ALWAYS_ON_PROPOSAL: 'report proposes removing an always-on lens',
-  HTML_COMMENT: 'report contains an HTML comment',
   INVISIBLE: 'report contains an invisible or direction-control character',
+  ODD_BACKTICKS: 'report has a line with an odd number of backticks',
+  UNKNOWN_LINE: 'report has a line in a shape the check does not know',
   ABSOLUTE_PATH: 'report holds an absolute path (the home directory, the repository or the per-run directory)',
   UNREADABLE: 'collected data unreadable',
   FIGURE_MISMATCH: 'figure mismatch',
@@ -301,7 +302,6 @@ function checkReportText(report) {
   if (typeof report !== 'string') return failure(F.REPORT_NOT_STRING, 'malformed')
   if (!startsWithHeading(report)) return failure(F.NO_HEADING, 'malformed')
   if (report.includes('\u0000')) return failure(F.NUL_BYTE, 'malformed')
-  if (report.includes('<!--')) return failure(F.HTML_COMMENT, 'malformed')
   if (INVISIBLE_RE.test(report.replace(/^\ufeff/, ''))) return failure(F.INVISIBLE, 'malformed')
   if (Buffer.from(report, 'utf8').toString('utf8') !== report) return failure(F.NOT_UTF8, 'malformed')
   const bytes = Buffer.byteLength(report, 'utf8')
@@ -348,88 +348,145 @@ export function checkLanes(said, col) {
   return reasons
 }
 
-// ---- the headline figure lines: script-written, matched exactly, and the only lines that carry a headline label (whole-branch review round 2, M1) ----
+// ---- the report's lines: script text, with every untrusted string inside a code span (whole-branch review round 3; owner decision 2026-11-23) ----
 //
-// The workflow confines everything a model wrote to one line and renders it inside a fixed envelope (see its model-text confinement block), so
-// a measured figure can only be on a line the script wrote. This check holds the report to that, positively:
-//   - for each headline label, the report holds exactly as many lines of the script's own anchored shape as the collected data calls for, and each
-//     agrees with the collected figure;
-//   - no OTHER line contains a headline label's skeleton anywhere (case folded, everything that is not a letter or a digit removed, character
-//     references removed, and the Cyrillic and Greek look-alikes of the Latin letters mapped), so a figure line cannot be hidden in a table cell, a
-//     link, a list item, a quotation or behind a look-alike letter. That includes a model-text line: a proposal has no need to quote a headline line,
-//     so one that does is refused rather than allowed;
-//   - a line that carries the model-text marker must be exactly one of the envelope shapes below.
-// The report is normalised first (normaliseReport: NFKC, every Unicode space folded to a space, one line at a time). HTML comments and invisible
-// characters never reach here: checkReportText refuses them. A closed grammar for every static prose line of the report is not built: those lines are
-// the script's, the only text that is not is confined and enveloped, and the figures are held as above.
-const SPACES_RE = /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/g
-export const normaliseLine = (line) => line.normalize('NFKC').replaceAll(SPACES_RE, ' ')
-export const normaliseReport = (report) => report.split('\n').map(normaliseLine).join('\n')
+// The workflow renders every string that came from a repository or a model through ONE encoder (inert, in workflows/optimise-cycle.js),
+// which shows it as a Markdown inline code span: one backtick, the text with every backtick turned into an apostrophe and every line break
+// into a space, one backtick. Inside a code span a Markdown viewer interprets nothing, so that text is literal: it cannot become a line of its
+// own, a heading, a link, inline HTML or a measured figure. The script writes no backtick for any other purpose, so this check holds the
+// report to that structurally, and positively, instead of looking for disguises:
+//   - every line holds an even number of backticks (an odd count means a line was altered after the encoder ran);
+//   - the SKELETON of a line is the line with each code span replaced by SPAN_TOKEN; every line's skeleton must be exactly one of the shapes
+//     the script writes (FIXED_LINES, LINE_SHAPES, the headline SHAPES and the ROW_CLASSES), so anything outside a span that the script did
+//     not write, an angle bracket, an ampersand, a link or a forged figure line included, fails as a line in a shape the check does not know;
+//   - each headline figure is on exactly the expected number of lines of its shape, and agrees with the collected data;
+//   - a row's key is read from inside its span and held to the collected data through the encoder's mirror (inertText).
+// Text inside a span is never a measured figure, so a proposal may quote a headline label freely: it is shown as literal text.
+
+// BEGIN untrusted-text encoding mirror
+// The workflow's inert() without the two backticks it adds (a parity test holds the two together over a table of hostile strings).
+const INERT_MAX = 300
+const INERT_CUT = ' [cut]'
+const INERT_EMPTY = '(empty)'
+const INERT_BREAKS_RE = /[\t\n\v\f\r\u0085\u2028\u2029]/g
+const INERT_REMOVED_RE = /[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}\ufe00-\ufe0f]/gu
+export function inertText(value) {
+  const text = (typeof value === 'string' ? value : String(value ?? ''))
+    .replaceAll(INERT_BREAKS_RE, ' ')
+    .replaceAll(INERT_REMOVED_RE, '')
+    .replaceAll('\u0060', "'")
+    .replaceAll(/\s+/g, ' ')
+    .trim()
+  const chars = Array.from(text)
+  const bounded = chars.length > INERT_MAX ? `${chars.slice(0, INERT_MAX).join('')}${INERT_CUT}` : text
+  return bounded === '' ? INERT_EMPTY : bounded
+}
+// END untrusted-text encoding mirror
+
+const BACKTICK = '\u0060'
+export const SPAN_TOKEN = BACKTICK + BACKTICK
+const SPAN_RE = new RegExp(`${BACKTICK}[^${BACKTICK}]*${BACKTICK}`, 'g')
+// A shape is written as a regular expression in which ¤ stands for one code span.
+const sp = (re) => new RegExp(re.source.replaceAll('¤', SPAN_TOKEN), re.flags)
+
+// { line, skeleton, spans }: the line, the line with each code span replaced by SPAN_TOKEN, and the text inside each span in order.
+export function parseLine(line) {
+  const spans = []
+  const skeleton = line.replaceAll(SPAN_RE, (span) => {
+    spans.push(span.slice(1, -1))
+    return SPAN_TOKEN
+  })
+  return { line, skeleton, spans }
+}
+// A leading byte-order mark is not part of the first line (checkReportText allows one there, and only there).
+const parsedLines = (report) => (Array.isArray(report) ? report : report.replace(/^\ufeff/, '').split('\n').map(parseLine))
+const backtickCount = (line) => line.split(BACKTICK).length - 1
+
 const UNKNOWN_SHAPE = 'a line in a shape the check does not know'
 const unknownShape = (name) => `${F.FIGURE_MISMATCH} ${name}: ${UNKNOWN_SHAPE}`
 
+// The headline figure lines.
 const SHAPES = {
   ledger: { re: /^Ledger records in window: (\d{1,15}) \(minimum for harness-side proposals: \d{1,15}\)\.$/ },
   ci: { re: /^CI runs: (\d{1,15}) fetched, (\d{1,15}) not fetched, (\d{1,15}) timed out$/ },
-  git: { re: /^Raw \(unscoped\): (\d{1,15}) of (\d{1,15}) examined commits matched the heuristic\.(?: [^\n]{0,600})?$/ },
-  scoped: { re: /^Scoped to product source \(config: [^)\n]{0,200}\): (\d{1,15}) counted, (\d{1,15}) excluded as pipeline\/tooling-only, (\d{1,15}) unavailable \(changed paths could not be determined\)\.(?: [^\n]{0,600})?$/ },
+  git: { re: sp(/^Raw \(unscoped\): (\d{1,15}) of (\d{1,15}) examined commits matched the heuristic\. ¤$/) },
+  scoped: { re: sp(/^Scoped to product source \(config: ¤\): (\d{1,15}) counted, (\d{1,15}) excluded as pipeline\/tooling-only, (\d{1,15}) unavailable \(changed paths could not be determined\)\. ¤$/) },
 }
 const DIGEST_OMITTED_RE = /^Digest omitted ([A-Za-z]{1,40}): (\d{1,15})$/
 const DIGEST_TRIMMED_LINE = 'Digest trimmed for size: yes'
+const PLAN_LABELS_NOTE_RE = sp(/^Plan labels note: ¤$/)
+const ADOPTED_RE = sp(/^Already adopted on ¤\.$/)
+const REJECTED_RE = sp(/^\*\*Previously rejected on ¤\.\*\*$/)
 
-// The model-text envelope: every line that carries the marker is one of these (the workflow writes them; its confinement block lists them too).
-const MODEL_TEXT_MARK = '(model text)'
-const ENVELOPES = [
-  /^(?:### |- )(?:[0-9a-f]{16}|\(no id\)): Proposal statement \(model text\): [^\n]*$/,
-  /^n=[^\n]*\. Motivating \(model text\): [^\n]*\. Confirming \(model text\): [^\n]*\. Citations \(model text\): [^\n]*\.$/,
-  /^Reinstatement evidence \(model text\): [^\n]*$/,
+// Every line the script writes with no figure the check compares: fixed prose, and lines whose only variable parts are code spans, the
+// script's own proposal ids, its drafting bookkeeping and fixed words.
+const FIXED_LINES = new Set([
+  '',
+  '# Delivery optimiser report',
+  '## Sample completeness',
+  '**Ledger analysis unavailable**: the ledger lane failed to run (e.g. optimise-read.mjs may not be resolvable yet -- see the rollout\'s global-mirror step). This is NOT the same as an empty ledger: a fixed install may already show real data.',
+  'Ledger window was truncated to the most recent records; older history was not read (AC-ARCH-14 bound).',
+  'Instrumented invocation routes: conducted runs and every direct invocation of the harness\'s other workflows write the ledger identically (AC-ARCH-4); conduct-plan wait/PR events are conductor-only.',
+  DIGEST_TRIMMED_LINE,
+  '## Wall-clock decomposition (source: ledger)',
+  'No wall-clock data in window.',
+  'No wall-clock data (ledger unavailable).',
+  '## Rework attribution (source: ledger)',
+  'No lens findings recorded in window.',
+  'No rework data (ledger unavailable).',
+  'Blocked TDD runs unresolved in window may include a task re-briefed after a block and then finished (see the hint on each line); two briefs identical in their first 500 bytes can falsely clear each other (round 3 F4).',
+  'Blocked TDD runs unresolved in window (upper bound: a task finished by hand leaves no resolution row): not measured (ledger unavailable)',
+  'Blocked TDD runs unresolved in window (upper bound: a task finished by hand leaves no resolution row): not measured (installed reader predates this metric)',
+  '## Never-failing acceptance criteria (source: ledger)',
+  '## Trigger accuracy (source: ledger)',
+  'No trigger data in window.',
+  'No trigger data (ledger unavailable).',
+  '## CI section (source: gh)',
+  'No CI data available.',
+  '## Escaped-defect counter-metric',
+  'Escaped defects are not currently captured (git-lane unavailable).',
+  '## Proposals (ranked)',
+  '## Proposals previously adopted (not ranked as new)',
+  '## Proposals (insufficient data, excluded from ranking)',
+  'None.',
+  '**Flagged: security-purposed check removal/demotion.**',
+  '**Flagged: adopted and reverted at least twice previously (§12: keep the original).**',
+  '## Filtering',
+])
+
+const SEGMENT_DETAIL = /(?:ci_wait|human_wait|agent_compute) \((?:reader field unavailable|[\w.-]{1,24} unmeasured runs)\)/.source
+const LINE_SHAPES = [
+  sp(/^Repos: ¤$/),
+  sp(/^Not measured: ¤$/),
+  /^\*\*Insufficient data\*\*: harness-side \(rework\/wall-clock\/trigger\) proposals are suppressed until the ledger holds at least \d{1,15} records\.$/,
+  sp(/^- ¤: \*\*uninstrumented\*\* \(no ledger file found -- not \x22no activity\x22; the harness has never written a ledger here\)$/),
+  PLAN_LABELS_NOTE_RE,
+  /^None recorded \(invalid_ac_ids_dropped in window: (?:\d{1,15}|null|unavailable \(installed optimise-read\.mjs predates this field\))\)\.$/,
+  sp(/^- ¤ ¤ ¤: ¤(?: \(a later done run exists for this spec at ¤; under a multi-task plan this may be another task\))?$/),
+  sp(/^- gh unavailable for ¤: ¤ \(¤\): ¤$/),
+  sp(/^Repo \d{1,15} \(¤\):$/),
+  sp(/^Scoped figure unavailable: ¤$/),
+  sp(/^### (?:[0-9a-f]{16}|\(no id\)): Proposal statement \(model text\): ¤$/),
+  sp(/^- (?:[0-9a-f]{16}|\(no id\)): Proposal statement \(model text\): ¤ \(n=¤\)$/),
+  sp(/^n=¤\. Motivating \(model text\): ¤\. Confirming \(model text\): ¤\. Citations \(model text\): (?:¤(?:, ¤)*)?\.$/),
+  sp(/^Target: kind=¤ component=¤ concern=¤ lens=¤ workflow=¤ job=¤$/),
+  sp(/^Reinstatement evidence \(model text\): ¤$/),
+  ADOPTED_RE,
+  REJECTED_RE,
+  /^(?:ci_wait|human_wait|agent_compute): unavailable \(installed optimise-read\.mjs predates this field\)$/,
+  new RegExp(String.raw`^Drafted: \d{1,15}\. Dropped \(no resolvable citation\): \d{1,15}\. Dropped \(always-on security lens removal, never permitted\): \d{1,15}\. Dropped \(removal without reinstatement evidence\): \d{1,15}\. Dropped \(motivating wall-clock segment has unmeasured runs(?: -- ${SEGMENT_DETAIL}(?:, ${SEGMENT_DETAIL})*)?\): \d{1,15}\. Dropped \(cited CI job has no settled never-failed verdict; see the CI section qualifiers\): \d{1,15}\.$`),
+  sp(/^Proposals rejected: malformed target: \d{1,15}(?: \(¤(?: \| ¤)*\))?$/),
+  DIGEST_OMITTED_RE,
 ]
-const isEnveloped = (line) => ENVELOPES.some((re) => re.test(line))
-
-// The labels whose lines carry a measured figure, by the family each is named under in a reason.
-const HEADLINE_LABELS = [
-  ['ledger', 'Ledger records in window'],
-  ['ci', 'CI runs'],
-  ['git', 'Raw (unscoped)'],
-  ['git scoped', 'Scoped to product source'],
-  ['digest', 'Digest omitted'],
-  ['digest', 'Digest trimmed for size'],
-  ['proposal outcome', 'Already adopted on'],
-  ['proposal outcome', 'Previously rejected on'],
-]
-// Look-alikes folded to one Latin letter (the letters the labels use): Cyrillic and Greek letters, and the characters that pass for l, o and i.
-const CONFUSABLES = new Map([...'\u0430a \u0441c \u0435e \u043eo \u0440p \u0445x \u0443y \u0456l \u0458j \u0455s \u0501d \u04bbh \u043ak \u043cm \u043fn \u0442t \u0432b \u04cfl \u03b1a \u03bfo \u03c1p \u03b5e \u03b9l \u03bdv \u03c5u \u03bak \u03c4t \u03c7x \u03c9w \u03b3y \u0131l 1l |l 0o il'.split(' ').map((pair) => [pair[0], pair.slice(1)])])
-export function skeletonOf(text) {
-  const plain = text.normalize('NFKC').replaceAll(/&#?\w{1,12};/g, '').toLowerCase()
-  return Array.from(plain, (ch) => CONFUSABLES.get(ch) ?? ch).join('').replaceAll(/[^\p{L}\p{N}]/gu, '')
-}
-const LABEL_SKELETONS = HEADLINE_LABELS.map(([family, label]) => [family, skeletonOf(label)])
-
-const isScriptHeadline = (line) => Object.values(SHAPES).some((shape) => shape.re.test(line)) || DIGEST_OMITTED_RE.test(line) || line === DIGEST_TRIMMED_LINE || dateClaimIn(line) !== null
-
-// The reasons for every line that is not a script-written headline line (nor a row of a row class, which is held to the collected rows) and yet carries a
-// headline label's skeleton, or carries the model-text marker outside an envelope.
-export function checkHeadlineLines(report) {
-  const reasons = new Set()
-  for (const line of report.split('\n')) {
-    const enveloped = isEnveloped(line)
-    if (!enveloped && (isScriptHeadline(line) || ROW_CLASSES.some((spec) => spec.isRow(line)))) continue
-    if (!enveloped && line.includes(MODEL_TEXT_MARK)) reasons.add(unknownShape('model text'))
-    const skeleton = skeletonOf(line)
-    for (const [family, folded] of LABEL_SKELETONS) if (skeleton.includes(folded)) reasons.add(unknownShape(family))
-  }
-  return [...reasons]
-}
-
-// The figures on every line of the script's anchored shape.
-const figuresOn = (report, shape) => report.split('\n').map((line) => shape.re.exec(line)).filter((m) => m !== null).map((m) => m.slice(1).map(Number))
 
 // { reasons, reported }: reported is the figure the report states for the ledger, for the RESULT line. A record
 // count printed beside a ledger lane that has no collected figure is refused, whatever the number: it can only be a
 // default zero standing for a lane that did not run.
+const figuresOn = (lines, shape) => lines.map(({ skeleton }) => shape.re.exec(skeleton)).filter((m) => m !== null).map((m) => m.slice(1).map(Number))
+
 export function checkLedger(report, col) {
   const want = collectedLedger(col)
-  const found = figuresOn(report, SHAPES.ledger)
+  const found = figuresOn(parsedLines(report), SHAPES.ledger)
   const first = found[0]?.[0]
   if (want === null) return { reasons: found.length > 0 ? [`${F.FIGURE_MISMATCH} ledger: collected none, reported ${first}`] : [], reported: null }
   if (found.length === 0) return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported none`], reported: null }
@@ -440,7 +497,7 @@ export function checkLedger(report, col) {
 
 // A lane with a figure the report must show: exactly one line carries the label and it equals the figure. A lane with none: no line does.
 export function checkLine(name, report, shape, names, want) {
-  const found = figuresOn(report, shape)
+  const found = figuresOn(parsedLines(report), shape)
   if (want === null) return found.length > 0 ? [`${F.FIGURE_MISMATCH} ${name}: collected none, reported ${found[0][0]}`] : []
   if (found.length === 0) return [`${F.FIGURE_MISMATCH} ${name}: ${names[0]} collected ${want[0]}, reported none`]
   for (const got of found) {
@@ -471,37 +528,39 @@ export function checkScoped(report, col) {
   return checkLine('git scoped', report, SHAPES.scoped, ['scoped counted', 'scoped excluded', 'scoped unavailable'], want)
 }
 
+// The first problem with the digest's omission lines, or null: each names a key the digest holds, with its figure, once.
+function omissionProblem(lines, dropped) {
+  const seen = new Set()
+  for (const m of lines.map(({ skeleton }) => DIGEST_OMITTED_RE.exec(skeleton)).filter((found) => found !== null)) {
+    const [, key, n] = m
+    if (!Object.hasOwn(dropped, key) || !isCount(dropped[key])) return `${F.FIGURE_MISMATCH} digest: an omission line the digest does not hold, reported ${n}`
+    if (Number(n) !== dropped[key]) return `${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${dropped[key]}, reported ${n}`
+    if (seen.has(key)) return unknownShape('digest')
+    seen.add(key)
+  }
+  const missing = Object.entries(dropped).find(([key, value]) => isCount(value) && value > 0 && !seen.has(key))
+  return missing ? `${F.FIGURE_MISMATCH} digest: omitted ${missing[0]} collected ${missing[1]}, reported none` : null
+}
+
 export function checkDigest(report, col) {
   const { digest } = col
   if (!isObject(digest) || !isObject(digest.dropped)) return [`${F.UNREADABLE}: digest`]
-  const dropped = digest.dropped
-  const seen = new Set()
-  for (const m of report.split('\n').map((line) => DIGEST_OMITTED_RE.exec(line)).filter((found) => found !== null)) {
-    const [, key, n] = m
-    if (!Object.hasOwn(dropped, key) || !isCount(dropped[key])) return [`${F.FIGURE_MISMATCH} digest: an omission line the digest does not hold, reported ${n}`]
-    if (Number(n) !== dropped[key]) return [`${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${dropped[key]}, reported ${n}`]
-    if (seen.has(key)) return [unknownShape('digest')]
-    seen.add(key)
-  }
-  for (const [key, value] of Object.entries(dropped)) {
-    if (isCount(value) && value > 0 && !seen.has(key)) return [`${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${value}, reported none`]
-  }
-  const trimmedLines = report.split('\n').filter((line) => line === DIGEST_TRIMMED_LINE)
-  return (dropped.trimmedForSize === true) !== (trimmedLines.length > 0) || trimmedLines.length > 1 ? [`${F.FIGURE_MISMATCH} digest: trimmed flag`] : []
+  const lines = parsedLines(report)
+  const problem = omissionProblem(lines, digest.dropped)
+  if (problem !== null) return [problem]
+  const trimmedLines = lines.filter(({ skeleton }) => skeleton === DIGEST_TRIMMED_LINE).length
+  return (digest.dropped.trimmedForSize === true) !== (trimmedLines > 0) || trimmedLines > 1 ? [`${F.FIGURE_MISMATCH} digest: trimmed flag`] : []
 }
 
 // ---- the number-bearing rows the workflow renders from the digest ----
 //
-// Each class of row is held to the digest the runner collected (on disk, out of the session's reach). A row is a line
-// the class's pattern matches; its key (a job, a repository, a plan, an acceptance criterion) must be one the digest
-// holds, every figure on it must equal the digest's, and every key the digest holds must be rendered. A line that looks
-// like the class but does not match the exact pattern is refused as a shape the check does not know, so a row cannot
-// escape the check by being written differently. Reasons name the class and the figure, never a key or a session word.
+// Each class of row is held to the digest the runner collected (on disk, out of the session's reach). A row is a line whose skeleton the
+// class's pattern matches; its key (a job, a repository, a plan, an acceptance criterion) is the text of its first code span, which must be
+// the encoder's rendering of a key the digest holds; every figure on it must equal the digest's, and every key the digest holds must be
+// rendered. A line in any other shape is refused by checkLineShapes. Reasons name the class and the figure, never a key or a session word.
 
-// The workflow prints a CI job or repository key through its flattener: absolute-path-looking text redacted, whitespace
-// collapsed, 120 characters. A job named `build</UNTRUSTED...` has a `/UNTRUSTED...` that looks like a path, so the
-// printed key is not the collected one until it goes through the same steps. The pattern and marker are the
-// workflow's own (a parity test holds them equal).
+// The workflow prints a CI job or repository key through its flattener (absolute-path-looking text redacted, whitespace collapsed, 120
+// characters) before the encoder. The pattern and marker are the workflow's own (a parity test holds them equal).
 export { ABSOLUTE_PATH_RE, REDACTED_PATH_MARKER }
 const flat = (v) => String(v).replaceAll(ABSOLUTE_PATH_RE, (whole, prefix) => `${prefix}${REDACTED_PATH_MARKER}`).replaceAll(/\s+/g, ' ').slice(0, 120)
 const countText = (x) => (x === 'n/a' ? null : Number(x))
@@ -509,52 +568,51 @@ const numOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null
 const secondsOf = (s) => (s === 'unmeasured (null)' ? null : Number(s.slice(0, -1)))
 const SEC = String.raw`(-?\d{1,15}(?:\.\d{1,9})?s)`
 const COUNT = String.raw`(\d{1,15})`
+const NUMBER = String.raw`-?\d{1,15}(?:\.\d{1,9})?`
+const UNAVAILABLE = String.raw`unavailable \(installed optimise-read\.mjs predates this field\)`
 const ledgerDigest = (col) => (isObject(col.digest?.ledger) ? col.digest.ledger : {})
 const ciDigest = (col) => (isObject(col.digest?.ci) ? col.digest.ci : {})
 const entriesOf = (v) => (isObject(v) ? Object.entries(v) : [])
 const orNull = (v) => (v === undefined ? null : v)
+const spanKey = (spans) => spans[0]
 
+const CI_QUALIFIER = '(?:insufficient data|window truncated|rename suspect|re-run|jobs partially fetched|never failed in this window)'
 const CI_JOB = {
   name: 'ci job',
-  re: /^- ([^\n]{1,500}?): n=(\d{1,15}|n\/a), failed=(\d{1,15}|n\/a)(?=,| |$)/gm,
-  isRow: (l) => l.startsWith('- ') && l.includes(': n=') && l.includes(', failed='),
+  re: sp(new RegExp(String.raw`^- ¤: n=(\d{1,15}|n/a), failed=(\d{1,15}|n/a)(?:, not settled=(?:${NUMBER}|n/a) \(skipped, cancelled or neutral\))?(?: \(run ids \d{1,20}(?:, \d{1,20}){0,9}(?:, \+\d{1,15} more)?\))?, mean (?:-?\d{1,15}s|n/a)(?: \(${CI_QUALIFIER}(?:, ${CI_QUALIFIER}){0,5}\))?$`)),
   names: ['n', 'failed'],
-  split: (m) => ({ key: m[1], got: [countText(m[2]), countText(m[3])] }),
-  rows: (col) => new Map(entriesOf(ciDigest(col).byJob).map(([k, j]) => [flat(k), [numOrNull(j?.n), numOrNull(j?.failureCount)]])),
+  split: (m, spans) => ({ key: spanKey(spans), got: [countText(m[1]), countText(m[2])] }),
+  rows: (col) => new Map(entriesOf(ciDigest(col).byJob).map(([k, j]) => [inertText(flat(k)), [numOrNull(j?.n), numOrNull(j?.failureCount)]])),
 }
 
 const CI_REPOSITORY = {
   name: 'ci repository',
-  re: new RegExp(String.raw`^- ([^\n]{1,500}?): ${COUNT} runs not completed \(left out\); per-run fetch failures \(incl\. attempt-1\): rate_limited ${COUNT}, unauthenticated ${COUNT}, other ${COUNT}; attempt-1 jobs not fetched: (\d{1,15}|n/a); runs past attempt 2 or with an unreadable attempt \(not qualifiable\): (\d{1,15}|n/a)$`, 'gm'),
-  isRow: (l) => l.startsWith('- ') && l.includes('runs not completed'),
+  re: sp(new RegExp(String.raw`^- ¤: ${COUNT} runs not completed \(left out\); per-run fetch failures \(incl\. attempt-1\): rate_limited ${COUNT}, unauthenticated ${COUNT}, other ${COUNT}; attempt-1 jobs not fetched: (\d{1,15}|n/a); runs past attempt 2 or with an unreadable attempt \(not qualifiable\): (\d{1,15}|n/a)$`)),
   names: ['not completed', 'rate limited', 'unauthenticated', 'other', 'attempt-1 unfetched', 'past attempt 2'],
-  split: (m) => ({ key: m[1], got: m.slice(2).map(countText) }),
-  rows: (col) => new Map(entriesOf(ciDigest(col).repoStats).map(([k, st]) => [flat(k), [st?.notCompleted || 0, st?.fetchFailures?.rate_limited || 0, st?.fetchFailures?.unauthenticated || 0, st?.fetchFailures?.other || 0, numOrNull(st?.attempt1Unfetched), numOrNull(st?.pastAttempt2)]])),
+  split: (m, spans) => ({ key: spanKey(spans), got: m.slice(1).map(countText) }),
+  rows: (col) => new Map(entriesOf(ciDigest(col).repoStats).map(([k, st]) => [inertText(flat(k)), [st?.notCompleted || 0, st?.fetchFailures?.rate_limited || 0, st?.fetchFailures?.unauthenticated || 0, st?.fetchFailures?.other || 0, numOrNull(st?.attempt1Unfetched), numOrNull(st?.pastAttempt2)]])),
 }
 
 const GH_CALLS = {
   name: 'gh calls',
-  re: /^- ([^\n]{1,500}?): wall-clock (\d{1,15}(?:\.\d{1,9})?|n\/a)s, (\d{1,15}|n\/a) gh calls$/gm,
-  isRow: (l) => l.startsWith('- ') && l.includes('gh calls'),
+  re: sp(/^- ¤: wall-clock (\d{1,15}(?:\.\d{1,9})?|n\/a)s, (\d{1,15}|n\/a) gh calls$/),
   names: ['wall-clock seconds', 'calls'],
-  split: (m) => ({ key: m[1], got: [countText(m[2]), countText(m[3])] }),
-  rows: (col) => new Map((Array.isArray(ciDigest(col).ghStats) ? ciDigest(col).ghStats : []).map((g) => [flat(g?.repo), [numOrNull(g?.wall_clock_s), numOrNull(g?.gh_calls)]])),
+  split: (m, spans) => ({ key: spanKey(spans), got: [countText(m[1]), countText(m[2])] }),
+  rows: (col) => new Map((Array.isArray(ciDigest(col).ghStats) ? ciDigest(col).ghStats : []).map((g) => [inertText(flat(g?.repo)), [numOrNull(g?.wall_clock_s), numOrNull(g?.gh_calls)]])),
 }
 
 const WALL_CLOCK_PLAN = {
   name: 'wall-clock plan',
-  re: new RegExp(String.raw`^- ([^\n]{1,500}?): ci_wait=${SEC} \(n=${COUNT}\), human_wait=${SEC} \(n=${COUNT}\), agent_compute=${SEC} \(n=${COUNT}\)(?:, aborted=${SEC} \(n=${COUNT}\))?(?:, unterminated_waits: ${COUNT})?$`, 'gm'),
-  isRow: (l) => l.startsWith('- ') && l.includes(': ci_wait='),
+  re: sp(new RegExp(String.raw`^- ¤: ci_wait=${SEC} \(n=${COUNT}\), human_wait=${SEC} \(n=${COUNT}\), agent_compute=${SEC} \(n=${COUNT}\)(?:, aborted=${SEC} \(n=${COUNT}\))?(?:, unterminated_waits: ${COUNT})?$`)),
   names: ['ci wait seconds', 'ci wait runs', 'human wait seconds', 'human wait runs', 'agent compute seconds', 'agent compute runs', 'aborted seconds', 'aborted runs', 'unterminated waits'],
-  split: (m) => ({ key: m[1], got: [secondsOf(m[2]), Number(m[3]), secondsOf(m[4]), Number(m[5]), secondsOf(m[6]), Number(m[7]), m[8] === undefined ? 0 : secondsOf(m[8]), Number(m[9] ?? 0), Number(m[10] ?? 0)] }),
-  rows: (col) => new Map(entriesOf(ledgerDigest(col).wallClock?.byPlan).map(([k, b]) => [k, [orNull(b?.ciWaitSeconds), orNull(b?.ciWaitN), orNull(b?.humanWaitSeconds), orNull(b?.humanWaitN), orNull(b?.agentComputeSeconds), orNull(b?.agentComputeN), b?.agentComputeAbortedN ? orNull(b.agentComputeAbortedSeconds) : 0, b?.agentComputeAbortedN || 0, b?.unterminatedWaits || 0]])),
+  split: (m, spans) => ({ key: spanKey(spans), got: [secondsOf(m[1]), Number(m[2]), secondsOf(m[3]), Number(m[4]), secondsOf(m[5]), Number(m[6]), m[7] === undefined ? 0 : secondsOf(m[7]), Number(m[8] ?? 0), Number(m[9] ?? 0)] }),
+  rows: (col) => new Map(entriesOf(ledgerDigest(col).wallClock?.byPlan).map(([k, b]) => [inertText(k), [orNull(b?.ciWaitSeconds), orNull(b?.ciWaitN), orNull(b?.humanWaitSeconds), orNull(b?.humanWaitN), orNull(b?.agentComputeSeconds), orNull(b?.agentComputeN), b?.agentComputeAbortedN ? orNull(b.agentComputeAbortedSeconds) : 0, b?.agentComputeAbortedN || 0, b?.unterminatedWaits || 0]])),
 }
 
 const SEG = String.raw`(unmeasured \(null\)|-?\d{1,15}(?:\.\d{1,9})?s)`
 const WALL_CLOCK_TOTALS = {
   name: 'wall-clock totals',
-  re: new RegExp(String.raw`^Totals: ci_wait=${SEG} \(measured n=${COUNT}, unmeasured n=${COUNT}\), human_wait=${SEG} \(measured n=${COUNT}, unmeasured n=${COUNT}\), agent_compute=${SEG} \(measured n=${COUNT}, unmeasured n=${COUNT}, aborted n=(\d{1,15}|[^)\n]{1,200})(?: \[[^\]\n]{1,40}\])?\)\.$`, 'gm'),
-  isRow: (l) => l.startsWith('Totals: '),
+  re: new RegExp(String.raw`^Totals: ci_wait=${SEG} \(measured n=${COUNT}, unmeasured n=${COUNT}\), human_wait=${SEG} \(measured n=${COUNT}, unmeasured n=${COUNT}\), agent_compute=${SEG} \(measured n=${COUNT}, unmeasured n=${COUNT}, aborted n=(\d{1,15}|null|${UNAVAILABLE})(?: \[(?:unmeasured \(null\)|${NUMBER}s)\])?\)\.$`),
   names: ['ci wait seconds', 'ci wait measured runs', 'ci wait unmeasured runs', 'human wait seconds', 'human wait measured runs', 'human wait unmeasured runs', 'agent compute seconds', 'agent compute measured runs', 'agent compute unmeasured runs', 'agent compute aborted pairs'],
   split: (m) => ({ key: 'totals', got: [secondsOf(m[1]), Number(m[2]), Number(m[3]), secondsOf(m[4]), Number(m[5]), Number(m[6]), secondsOf(m[7]), Number(m[8]), Number(m[9]), /^\d+$/.test(m[10]) ? Number(m[10]) : null] }),
   rows: (col) => {
@@ -574,20 +632,20 @@ const neverFailingText = (a) => {
 }
 const carriedNeverFailing = (col) => (Array.isArray(ledgerDigest(col).neverFailingAcs) ? ledgerDigest(col).neverFailingAcs : [])
 const shownNeverFailing = (col) => carriedNeverFailing(col).filter((a) => !isPlainInsufficientRow(a))
+const neverFailingKey = (a) => [a.repo, a.spec, a.ac_id].map(inertText).join('\n')
 
+const NEVER_FAILING_REASON = '(?:insufficient data|unattributed FAIL in window -- see invalid_ac_ids_dropped|unattributed verdict for this criterion -- see invalid_record_values_dropped|truncated ac_verdicts in window -- see ac_verdicts_truncated)'
 const NEVER_FAILING = {
   name: 'never-failing',
-  re: /^- ([^\n]{1,500}?): n=(\d{1,15})(?: \([^)\n]{1,200}\))?(?:, never_failed=(true|false|null))?(?:, verdict_disagreements=(\d{1,15}|not measured|null))?$/gm,
-  isRow: (l) => l.startsWith('- ') && /: n=\d{1,15}(?: \(|, never_failed|, verdict_disagreements)/.test(l),
+  re: sp(new RegExp(String.raw`^- ¤/¤ ¤: n=(\d{1,15})(?: \(${NEVER_FAILING_REASON}\))?(?:, never_failed=(true|false|null))?(?:, verdict_disagreements=(\d{1,15}|not measured|null))?$`)),
   names: ['n', 'never failed', 'verdict disagreements'],
-  split: (m) => ({ key: m[1], got: [Number(m[2]), m[3] ?? '', m[4] ?? ''] }),
-  rows: (col) => new Map(shownNeverFailing(col).map((a) => [`${a.repo}/${a.spec} ${a.ac_id}`, neverFailingText(a)])),
+  split: (m, spans) => ({ key: spans.slice(0, 3).join('\n'), got: [Number(m[1]), m[2] ?? '', m[3] ?? ''] }),
+  rows: (col) => new Map(shownNeverFailing(col).map((a) => [neverFailingKey(a), neverFailingText(a)])),
 }
 
 const NEVER_FAILING_LEFT_OUT = {
   name: 'never-failing',
-  re: /^(\d{1,15}) criteria rows left out as insufficient data$/gm,
-  isRow: (l) => /^\S{1,20} criteria rows left out/.test(l),
+  re: /^(\d{1,15}) criteria rows left out as insufficient data$/,
   names: ['rows left out'],
   split: (m) => ({ key: 'left out', got: [Number(m[1])] }),
   rows: (col) => {
@@ -600,18 +658,16 @@ const NEVER_FAILING_LEFT_OUT = {
 const instrumentedRepos = (col) => (Array.isArray(ledgerDigest(col).perRepo) ? ledgerDigest(col).perRepo : []).filter((e) => !e?.uninstrumented)
 const LEDGER_REPOSITORY = {
   name: 'ledger repository',
-  re: /^- ([^\n]{1,500}?): (\d{1,15}) record\(s\) in window, skipped=(\d{1,15}), /gm,
-  isRow: (l) => l.startsWith('- ') && l.includes(' record(s) in window'),
+  re: sp(/^- ¤: (\d{1,15}) record\(s\) in window, skipped=(\d{1,15}), schema_version mix: \{(?:none|¤: \d{1,15}(?:, ¤: \d{1,15})*)\}, truncated final line: (?:true|false)$/),
   names: ['records', 'skipped'],
   byPosition: true,
-  split: (m) => ({ got: [Number(m[2]), Number(m[3])] }),
+  split: (m) => ({ got: [Number(m[1]), Number(m[2])] }),
   rows: (col) => new Map(instrumentedRepos(col).map((e, i) => [String(i), [e.recordCount, e.skippedCount ?? 0]])),
 }
 
 const LEDGER_SKIPPED = {
   name: 'ledger repository',
-  re: /^(\d{1,15}) ledger line\(s\) were skipped as unparseable/gm,
-  isRow: (l) => /^\S{1,20} ledger line\(s\) were skipped/.test(l),
+  re: /^(\d{1,15}) ledger line\(s\) were skipped as unparseable or missing a required field; see raw skip reasons in the agent transcript\.$/,
   names: ['skipped'],
   split: (m) => ({ key: 'skipped', got: [Number(m[1])] }),
   rows: (col) => (ledgerDigest(col).skippedCount > 0 ? new Map([['skipped', [ledgerDigest(col).skippedCount]]]) : new Map()),
@@ -619,20 +675,18 @@ const LEDGER_SKIPPED = {
 
 const TRIGGER_ACCURACY = {
   name: 'trigger accuracy',
-  re: /^- ([^\n]{1,500}?): clean_zero_trigger=(\d{1,15}), clean_with_matches=(\d{1,15}), findings=(\d{1,15}), clean_trigger_unmeasured=(\d{1,15}), total=(\d{1,15})$/gm,
-  isRow: (l) => l.startsWith('- ') && l.includes(': clean_zero_trigger='),
+  re: sp(/^- ¤: clean_zero_trigger=(\d{1,15}), clean_with_matches=(\d{1,15}), findings=(\d{1,15}), clean_trigger_unmeasured=(\d{1,15}), total=(\d{1,15})$/),
   names: ['clean zero trigger', 'clean with matches', 'findings', 'clean trigger unmeasured', 'total'],
-  split: (m) => ({ key: m[1], got: m.slice(2).map(Number) }),
-  rows: (col) => new Map(entriesOf(ledgerDigest(col).triggerAccuracy?.byLens).map(([k, b]) => [k, [b?.cleanWithZeroTrigger, b?.cleanWithMatches, b?.findingsWithMatches, b?.cleanTriggerUnmeasured || 0, b?.total]])),
+  split: (m, spans) => ({ key: spanKey(spans), got: m.slice(1).map(Number) }),
+  rows: (col) => new Map(entriesOf(ledgerDigest(col).triggerAccuracy?.byLens).map(([k, b]) => [inertText(k), [b?.cleanWithZeroTrigger, b?.cleanWithMatches, b?.findingsWithMatches, b?.cleanTriggerUnmeasured || 0, b?.total]])),
 }
 
 const REWORK = {
   name: 'rework',
-  re: /^- ([^\n]{1,500}?): fixed=(\d{1,15}), rejected=(\d{1,15}), spec_bug=(\d{1,15}), open=(\d{1,15})$/gm,
-  isRow: (l) => l.startsWith('- ') && /: fixed=\d/.test(l),
+  re: sp(/^- ¤: fixed=(\d{1,15}), rejected=(\d{1,15}), spec_bug=(\d{1,15}), open=(\d{1,15})$/),
   names: ['fixed', 'rejected', 'spec bug', 'open'],
-  split: (m) => ({ key: m[1], got: m.slice(2).map(Number) }),
-  rows: (col) => new Map(entriesOf(ledgerDigest(col).rework?.lensDispositionCounts).map(([k, c]) => [k, [c?.fixed, c?.rejected, c?.spec_bug, c?.open]])),
+  split: (m, spans) => ({ key: spanKey(spans), got: m.slice(1).map(Number) }),
+  rows: (col) => new Map(entriesOf(ledgerDigest(col).rework?.lensDispositionCounts).map(([k, c]) => [inertText(k), [c?.fixed, c?.rejected, c?.spec_bug, c?.open]])),
 }
 
 const rework = (col) => (isObject(ledgerDigest(col).rework) ? ledgerDigest(col).rework : {})
@@ -640,8 +694,7 @@ const wallTotals = (col) => (isObject(ledgerDigest(col).wallClock?.totals) ? led
 
 const EXCLUDED_FROM_ATTRIBUTION = {
   name: 'attribution counters',
-  re: new RegExp(String.raw`^Excluded from attribution \(never silently dropped\): unattributable runs=${COUNT}, degraded-unattributed runs=${COUNT}, unattributable ci_wait/human_wait observations=${COUNT}, unattributable rework records=${COUNT}\.$`, 'gm'),
-  isRow: (l) => l.startsWith('Excluded from attribution'),
+  re: new RegExp(String.raw`^Excluded from attribution \(never silently dropped\): unattributable runs=${COUNT}, degraded-unattributed runs=${COUNT}, unattributable ci_wait/human_wait observations=${COUNT}, unattributable rework records=${COUNT}\.$`),
   names: ['unattributable runs', 'degraded-unattributed runs', 'unattributable waits', 'unattributable rework records'],
   split: (m) => ({ key: 'excluded', got: m.slice(1).map(Number) }),
   rows: (col) => new Map([['excluded', [wallTotals(col).unattributableRuns ?? 0, wallTotals(col).degradedUnattributedRuns ?? 0, wallTotals(col).unattributableWaits ?? 0, rework(col).unattributableCount ?? 0]]]),
@@ -658,19 +711,18 @@ const DROPPED_COUNTERS = {
 }
 const DROPPED_COUNTER = {
   name: 'dropped counters',
-  re: /^(invalid_ac_ids_dropped|invalid_record_values_dropped|invalid_fixed_ids_dropped|duplicate_fixed_ids_dropped|duplicate fixed confirmations across rounds|invalid_prior_ids_dropped) \([^)\n]{1,300}\): (\d{1,15}|null|unavailable \([^)\n]{1,100}\))\.$/gm,
-  isRow: (l) => /^(?:invalid_\w{1,40}_dropped|duplicate_fixed_ids_dropped|duplicate fixed confirmations)/.test(l),
+  re: new RegExp(String.raw`^(invalid_ac_ids_dropped(?= \(sanitised, non-conforming AC ids from lens findings/verdicts\))|invalid_record_values_dropped(?= \(sanitised, non-conforming values elsewhere -- verdicts/ac_verdicts\.verdict/lenses_run entries\))|invalid_fixed_ids_dropped(?= \(a fixed_findings confirmation that did not match a genuinely open prior finding\))|duplicate_fixed_ids_dropped(?= \(the same confirmed finding listed more than once in one round\))|duplicate fixed confirmations across rounds(?= \(the same finding id recorded fixed again in a later round\))|invalid_prior_ids_dropped(?= \(a supplied prior_findings id that did not match its own recomputed content -- mistyped, stale or fabricated\))) \([^)\n\u0060]{1,120}\): (\d{1,15}|null|${UNAVAILABLE})\.$`),
   names: ['dropped count'],
   split: (m) => ({ key: m[1], got: [/^\d+$/.test(m[2]) ? Number(m[2]) : null] }),
   rows: (col) => new Map(Object.entries(DROPPED_COUNTERS).map(([label, field]) => [label, [numOrNull(rework(col)[field])]])),
 }
 
+const ORPHANED_LINE = sp(new RegExp(String.raw`^Orphaned agent-compute runs \(never silently collapsed into one number\): start-only=(\d{1,15}|null|${UNAVAILABLE}) \(by kind: (none|¤: \d{1,15}(?:, ¤: \d{1,15})*)\), terminal-only=(\d{1,15}|null|${UNAVAILABLE}) \(by kind: (none|¤: \d{1,15}(?:, ¤: \d{1,15})*)\)\.$`))
 const ORPHANED_RUNS = {
   name: 'orphaned runs',
-  re: new RegExp(String.raw`^Orphaned agent-compute runs \(never silently collapsed into one number\): start-only=(\d{1,15}|unavailable \([^)\n]{1,100}\)) \(by kind: [^)\n]{1,300}\), terminal-only=(\d{1,15}|unavailable \([^)\n]{1,100}\)) \(by kind: [^)\n]{1,300}\)\.$`, 'gm'),
-  isRow: (l) => l.startsWith('Orphaned agent-compute runs'),
+  re: ORPHANED_LINE,
   names: ['start-only', 'terminal-only'],
-  split: (m) => ({ key: 'orphaned', got: [m[1], m[2]].map((x) => (/^\d+$/.test(x) ? Number(x) : null)) }),
+  split: (m) => ({ key: 'orphaned', got: [m[1], m[3]].map((x) => (/^\d+$/.test(x) ? Number(x) : null)) }),
   rows: (col) => new Map([['orphaned', [numOrNull(wallTotals(col).agentComputeStartOnlyRuns), numOrNull(wallTotals(col).agentComputeTerminalOnlyRuns)]]]),
 }
 
@@ -678,8 +730,8 @@ const ORPHANED_RUNS = {
 
 // The workflow prints a count it was given as a number, `null`, or an "unavailable" marker for a reader that predates the field;
 // a split figure also prints `not recorded` for null. These are compared as the fixed words they are, never as session text.
-const COUNTISH = String.raw`(\d{1,15}|null|unavailable \([^)\n]{1,100}\))`
-const SPLITISH = String.raw`(\d{1,15}|not recorded|unavailable \([^)\n]{1,100}\))`
+const COUNTISH = String.raw`(\d{1,15}|null|${UNAVAILABLE})`
+const SPLITISH = String.raw`(\d{1,15}|not recorded|${UNAVAILABLE})`
 const wordOf = (x) => (x.startsWith('unavailable') ? 'unavailable' : x)
 const fmtCount = (v) => (v === undefined ? 'unavailable' : String(v))
 function fmtSplit(v) {
@@ -691,8 +743,7 @@ const reworkOf = (col) => (isObject(ledgerDigest(col).rework) ? ledgerDigest(col
 
 const REWORK_FINDINGS_DROPPED = {
   name: 'rework counters',
-  re: new RegExp(String.raw`^findings dropped from this tally: findings_truncated=${COUNTISH} \(findings the writer counted but could not fit on the line; the per-lens rows above are short by this many\), ac_verdicts_truncated=${COUNTISH}, unattributed \(lens value did not match a known lens\)=${COUNTISH}\.$`, 'gm'),
-  isRow: (l) => l.startsWith('findings dropped from this tally'),
+  re: new RegExp(String.raw`^findings dropped from this tally: findings_truncated=${COUNTISH} \(findings the writer counted but could not fit on the line; the per-lens rows above are short by this many\), ac_verdicts_truncated=${COUNTISH}, unattributed \(lens value did not match a known lens\)=${COUNTISH}\.$`),
   names: ['findings truncated', 'ac verdicts truncated', 'unattributed findings'],
   textual: true,
   split: (m) => ({ key: 'dropped', got: m.slice(1, 4).map(wordOf) }),
@@ -704,8 +755,7 @@ const REWORK_FINDINGS_DROPPED = {
 
 const REWORK_NO_SPEC = {
   name: 'rework counters',
-  re: new RegExp(String.raw`^No-spec review runs in window: ${COUNTISH} \(conducted=${SPLITISH}, direct=${SPLITISH}, round not recorded=${SPLITISH}\) \(findings reclassified from spec_bug to open on those runs: ${COUNTISH}\)\. Completed review runs carrying a conductor round, any spec: ${SPLITISH}\.$`, 'gm'),
-  isRow: (l) => l.startsWith('No-spec review runs in window'),
+  re: new RegExp(String.raw`^No-spec review runs in window: ${COUNTISH} \(conducted=${SPLITISH}, direct=${SPLITISH}, round not recorded=${SPLITISH}\) \(findings reclassified from spec_bug to open on those runs: ${COUNTISH}\)\. Completed review runs carrying a conductor round, any spec: ${SPLITISH}\.$`),
   names: ['no-spec review runs', 'conducted', 'direct', 'round not recorded', 'reclassified findings', 'review runs with a round'],
   textual: true,
   split: (m) => ({ key: 'no-spec', got: m.slice(1, 7).map(wordOf) }),
@@ -718,8 +768,7 @@ const REWORK_NO_SPEC = {
 const V4 = String.raw`(\d{1,15}|not recorded)`
 const REWORK_SCHEMA_V4 = {
   name: 'rework counters',
-  re: new RegExp(String.raw`^Completeness, schema_version >= 4 rows only(?: \(${COUNT} rows; ${COUNT} older rows excluded\): findings_truncated=${V4}, unattributed findings=${V4}, duplicate verdict groups collapsed=${V4}, no-spec review runs=${V4}, no-spec review runs conducted=${V4}, direct=${V4}, round not recorded=${V4}\. Completed review runs carrying a conductor round, any spec: ${V4}\.|: not recorded \(no such rows; ${COUNT} older rows excluded\)\.)$`, 'gm'),
-  isRow: (l) => l.startsWith('Completeness, schema_version >= 4'),
+  re: new RegExp(String.raw`^Completeness, schema_version >= 4 rows only(?: \(${COUNT} rows; ${COUNT} older rows excluded\): findings_truncated=${V4}, unattributed findings=${V4}, duplicate verdict groups collapsed=${V4}, no-spec review runs=${V4}, no-spec review runs conducted=${V4}, direct=${V4}, round not recorded=${V4}\. Completed review runs carrying a conductor round, any spec: ${V4}\.|: not recorded \(no such rows; ${COUNT} older rows excluded\)\.)$`),
   names: ['schema v4 rows', 'schema v4 older rows', 'findings truncated', 'unattributed findings', 'duplicate verdict groups', 'no-spec review runs', 'no-spec review runs conducted', 'direct', 'round not recorded', 'review runs with a round'],
   textual: false,
   split: (m) => (m[1] === undefined ? { key: 'v4', got: ['0', m[11]].map(String) } : { key: 'v4', got: m.slice(1, 11).map(String) }),
@@ -735,8 +784,7 @@ const REWORK_SCHEMA_V4 = {
 const blockedOf = (col) => (isObject(ledgerDigest(col).blockedUnresolved) ? ledgerDigest(col).blockedUnresolved : null)
 const BLOCKED_COUNT = {
   name: 'blocked tdd',
-  re: /^Blocked TDD runs unresolved in window \(upper bound: a task finished by hand leaves no resolution row\): (\d{1,15})$/gm,
-  isRow: (l) => l.startsWith('Blocked TDD runs unresolved in window (') && !/: not measured \((?:ledger unavailable|installed reader predates this metric)\)$/.test(l),
+  re: /^Blocked TDD runs unresolved in window \(upper bound: a task finished by hand leaves no resolution row\): (\d{1,15})$/,
   names: ['unresolved'],
   split: (m) => ({ key: 'count', got: [Number(m[1])] }),
   rows: (col) => (isCount(blockedOf(col)?.count) ? new Map([['count', [blockedOf(col).count]]]) : new Map()),
@@ -748,8 +796,7 @@ function recordedReasons(byReason) {
 }
 const BLOCKED_REASONS = {
   name: 'blocked tdd',
-  re: /^Blocked TDD runs unresolved, reason recorded \(post-T5\): (\d{1,15}|not recorded); not recorded \(pre-T5\): (\d{1,15}|not recorded)\.$/gm,
-  isRow: (l) => l.startsWith('Blocked TDD runs unresolved, reason recorded'),
+  re: /^Blocked TDD runs unresolved, reason recorded \(post-T5\): (\d{1,15}|not recorded); not recorded \(pre-T5\): (\d{1,15}|not recorded)\.$/,
   names: ['reason recorded', 'not recorded'],
   split: (m) => ({ key: 'reasons', got: [m[1], m[2]] }),
   rows: (col) => {
@@ -762,8 +809,7 @@ const BLOCKED_REASONS = {
 
 const UNTERMINATED_TOTAL = {
   name: 'wall-clock unterminated',
-  re: /^unterminated_waits: (\d{1,15})$/gm,
-  isRow: (l) => l.startsWith('unterminated_waits: '),
+  re: /^unterminated_waits: (\d{1,15})$/,
   names: ['unterminated waits'],
   split: (m) => ({ key: 'total', got: [Number(m[1])] }),
   rows: (col) => (wallTotals(col).unterminatedWaits ? new Map([['total', [wallTotals(col).unterminatedWaits]]]) : new Map()),
@@ -772,8 +818,7 @@ const UNTERMINATED_TOTAL = {
 const SEGMENTS = { ci_wait: 'ciWait', human_wait: 'humanWait', agent_compute: 'agentCompute' }
 const SUPPRESSION_SHARE = {
   name: 'filtering',
-  re: /^(ci_wait|human_wait|agent_compute): (\d{1,15})\/(\d{1,15}) runs unmeasured \((\d{1,3})%\) -- (?:at\/above|below) the 20% suppression threshold(?:: wall-clock proposals citing this segment are suppressed)?$/gm,
-  isRow: (l) => /^(?:ci_wait|human_wait|agent_compute): /.test(l) && l.includes(' runs unmeasured '),
+  re: /^(ci_wait|human_wait|agent_compute): (\d{1,15})\/(\d{1,15}) runs unmeasured \((\d{1,3})%\) -- (?:at\/above the 20% suppression threshold: wall-clock proposals citing this segment are suppressed|below the 20% suppression threshold)$/,
   names: ['unmeasured', 'total', 'percent'],
   split: (m) => ({ key: m[1], got: [Number(m[2]), Number(m[3]), Number(m[4])] }),
   rows: (col) => {
@@ -788,59 +833,89 @@ const SUPPRESSION_SHARE = {
 
 const WALL_CLOCK_SOURCES = {
   name: 'wall-clock sources',
-  re: /^Sources: ci_wait=([^\n]{1,300}), human_wait=([^\n]{1,300}), agent_compute=([^\n]{1,300})\.$/gm,
-  isRow: (l) => l.startsWith('Sources: '),
+  re: sp(/^Sources: ci_wait=¤, human_wait=¤, agent_compute=¤\.$/),
   names: ['ci wait source', 'human wait source', 'agent compute source'],
   textual: true,
-  split: (m) => ({ key: 'sources', got: [m[1], m[2], m[3]] }),
+  split: (m, spans) => ({ key: 'sources', got: spans.slice(0, 3) }),
   rows: (col) => {
     const src = ledgerDigest(col).wallClock?.source
-    return isObject(src) ? new Map([['sources', [String(src.ci_wait), String(src.human_wait), String(src.agent_compute)]]]) : new Map()
+    return isObject(src) ? new Map([['sources', [inertText(src.ci_wait), inertText(src.human_wait), inertText(src.agent_compute)]]]) : new Map()
   },
 }
 
+// The by-kind breakdown as the workflow renders it: each kind in a code span with its count, or `none`.
 function formatByKind(byKind) {
   const entries = entriesOf(byKind)
-  return entries.length > 0 ? entries.map(([k, n]) => `${k}: ${n}`).join(', ') : 'none'
+  return entries.length > 0 ? entries.map(([k, n]) => `${BACKTICK}${inertText(k)}${BACKTICK}: ${n}`).join(', ') : 'none'
 }
+// A fragment of a skeleton with its tokens filled back in from the spans, the first one being spans[offset].
+function refill(fragment, spans, offset) {
+  let next = offset
+  return fragment.replaceAll(SPAN_TOKEN, () => {
+    const span = spans[next] ?? ''
+    next += 1
+    return `${BACKTICK}${span}${BACKTICK}`
+  })
+}
+const tokensIn = (fragment) => fragment.split(SPAN_TOKEN).length - 1
 const ORPHANED_KINDS = {
   name: 'orphaned runs',
-  re: /^Orphaned agent-compute runs \(never silently collapsed into one number\): start-only=[^(\n]{1,120}(?:\([^)\n]{1,100}\))? \(by kind: ([^)\n]{1,300})\), terminal-only=[^(\n]{1,120}(?:\([^)\n]{1,100}\))? \(by kind: ([^)\n]{1,300})\)\.$/gm,
-  isRow: (l) => l.startsWith('Orphaned agent-compute runs'),
+  re: ORPHANED_LINE,
   names: ['start-only by kind', 'terminal-only by kind'],
   textual: true,
-  split: (m) => ({ key: 'kinds', got: [m[1], m[2]] }),
+  split: (m, spans) => ({ key: 'kinds', got: [refill(m[2], spans, 0), refill(m[4], spans, tokensIn(m[2]))] }),
   rows: (col) => new Map([['kinds', [formatByKind(wallTotals(col).agentComputeStartOnlyByKind), formatByKind(wallTotals(col).agentComputeTerminalOnlyByKind)]]]),
 }
 
 export const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVER_FAILING_LEFT_OUT, LEDGER_REPOSITORY, LEDGER_SKIPPED, TRIGGER_ACCURACY, REWORK, EXCLUDED_FROM_ATTRIBUTION, DROPPED_COUNTER, ORPHANED_RUNS, ORPHANED_KINDS, REWORK_FINDINGS_DROPPED, REWORK_NO_SPEC, REWORK_SCHEMA_V4, BLOCKED_COUNT, BLOCKED_REASONS, UNTERMINATED_TOTAL, SUPPRESSION_SHARE, WALL_CLOCK_SOURCES]
 
-// The collected figures and keys as the normalised report prints them: the report is normalised line by line before it is checked.
-const normaliseWant = (v) => (typeof v === 'string' ? normaliseLine(v) : v)
-const normalisedWants = (rows) => new Map([...rows].map(([key, want]) => [normaliseLine(key), want.map(normaliseWant)]))
+function rowReason(spec, want, got) {
+  const diff = firstDifference(spec.names, want, got)
+  if (!diff) return null
+  return spec.textual ? `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} differs from the collected one` : `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`
+}
 
-function checkRowClass(spec, report, col) {
-  const wants = normalisedWants(spec.rows(col))
+function checkRowClass(spec, lines, col) {
+  const wants = spec.rows(col)
   const reasons = []
   const seen = new Set()
-  const matches = [...report.matchAll(spec.re)]
-  matches.forEach((m, index) => {
-    const parsed = spec.split(m)
+  let index = 0
+  for (const { skeleton, spans } of lines) {
+    const m = spec.re.exec(skeleton)
+    if (m === null) continue
+    const parsed = spec.split(m, spans)
     const key = spec.byPosition ? String(index) : parsed.key
+    index += 1
     const want = wants.get(key)
     if (want === undefined) {
       reasons.push(`${F.FIGURE_MISMATCH} ${spec.name}: a row the collected data does not hold`)
-      return
+      continue
     }
     if (seen.has(key)) reasons.push(unknownShape(spec.name))
     seen.add(key)
-    const diff = firstDifference(spec.names, want, parsed.got)
-    if (diff) reasons.push(spec.textual ? `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} differs from the collected one` : `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`)
-  })
+    const problem = rowReason(spec, want, parsed.got)
+    if (problem !== null) reasons.push(problem)
+  }
   for (const [key, want] of wants) if (!seen.has(key)) reasons.push(`${F.FIGURE_MISMATCH} ${spec.name}: ${spec.names[0]} collected ${want[0]}, reported none`)
-  if (report.split('\n').filter(spec.isRow).length !== matches.length) reasons.push(`${F.FIGURE_MISMATCH} ${spec.name}: a row in a shape the check does not know`)
   return reasons
 }
+
+// ---- the shape of every line ----
+
+const KNOWN_SHAPES = [...Object.values(SHAPES).map((shape) => shape.re), ...ROW_CLASSES.map((spec) => spec.re), ...LINE_SHAPES]
+const isKnownShape = (skeleton) => FIXED_LINES.has(skeleton) || KNOWN_SHAPES.some((re) => re.test(skeleton))
+
+// One fixed reason for any line with an odd number of backticks, and one for any line whose skeleton is not a shape the script writes.
+export function checkLineShapes(report) {
+  const reasons = new Set()
+  for (const { line, skeleton } of parsedLines(report)) {
+    if (backtickCount(line) % 2 === 1) reasons.add(F.ODD_BACKTICKS)
+    else if (!isKnownShape(skeleton)) reasons.add(F.UNKNOWN_LINE)
+  }
+  return [...reasons]
+}
+
+// ---- recorded proposal outcomes and the plan-label note ----
 
 // The proposal a line belongs to: a `### <id>: ...` heading or a `- <id>: ...` bullet starts one, a `## ` heading ends it.
 function proposalIdAfter(line, current) {
@@ -849,17 +924,15 @@ function proposalIdAfter(line, current) {
   return heading ? heading[1] : current
 }
 
-// The adoption or rejection date an annotation line states, or null for any other line.
-function dateClaimIn(line) {
-  const adopted = /^Already adopted on (.{1,64})\.$/.exec(line)
-  if (adopted) return { kind: 'adoption', ts: adopted[1] }
-  const rejected = /^\*\*Previously rejected on (.{1,64})\.\*\*$/.exec(line)
-  return rejected ? { kind: 'rejection', ts: rejected[1] } : null
+// The adoption or rejection date an annotation line states (the text of its code span), or null for any other line.
+function dateClaimIn({ skeleton, spans }) {
+  if (ADOPTED_RE.test(skeleton)) return { kind: 'adoption', ts: spans[0] }
+  return REJECTED_RE.test(skeleton) ? { kind: 'rejection', ts: spans[0] } : null
 }
 
 function outcomeProblem(claim, outcome) {
   const held = claim.kind === 'adoption' ? outcome.lastAdoptionTs : outcome.lastRejectionTs
-  return held === claim.ts ? null : `${F.FIGURE_MISMATCH} proposal outcome: ${claim.kind} date differs from the collected one`
+  return inertText(held) === claim.ts ? null : `${F.FIGURE_MISMATCH} proposal outcome: ${claim.kind} date differs from the collected one`
 }
 
 // The recorded adoption and rejection dates a proposal's annotation shows, held to the outcome the ledger holds for that id.
@@ -867,9 +940,9 @@ export function checkProposalOutcomes(report, col) {
   const outcomes = ledgerDigest(col).proposalOutcomes
   const reasons = []
   let id = null
-  for (const line of report.split('\n')) {
-    id = proposalIdAfter(line, id)
-    const claim = dateClaimIn(line)
+  for (const parsed of parsedLines(report)) {
+    id = proposalIdAfter(parsed.line, id)
+    const claim = dateClaimIn(parsed)
     if (claim === null) continue
     const held = id !== null && isObject(outcomes) && Object.hasOwn(outcomes, id) ? outcomes[id] : null
     const problem = held === null ? `${F.FIGURE_MISMATCH} proposal outcome: an outcome the collected data does not hold` : outcomeProblem(claim, held)
@@ -878,23 +951,25 @@ export function checkProposalOutcomes(report, col) {
   return reasons
 }
 
-// The note the collector wrote about plan labels it left out is printed verbatim (flattened); the report must carry exactly it.
+// The note the collector wrote about plan labels it left out is shown (flattened, inert) after a fixed label; the report must carry exactly it.
 export function checkPlanLabelNote(report, col) {
   const note = col.digest?.plan_labels_note
   if (typeof note !== 'string' || note.trim() === '') return []
-  const expected = normaliseLine(note.replaceAll(/\s+/g, ' ').slice(0, 400))
-  return report.split('\n').filter((line) => line === expected).length === 1 ? [] : [`${F.FIGURE_MISMATCH} plan labels: note differs from the collected one`]
+  const expected = inertText(note.replaceAll(/\s+/g, ' ').slice(0, 400))
+  const shown = parsedLines(report).filter(({ skeleton, spans }) => PLAN_LABELS_NOTE_RE.test(skeleton) && spans[0] === expected)
+  return shown.length === 1 ? [] : [`${F.FIGURE_MISMATCH} plan labels: note differs from the collected one`]
 }
 
 export function checkRows(report, col) {
-  return [...ROW_CLASSES.flatMap((spec) => checkRowClass(spec, report, col)), ...checkScoped(report, col), ...checkProposalOutcomes(report, col), ...checkPlanLabelNote(report, col)]
+  const lines = parsedLines(report)
+  return [...ROW_CLASSES.flatMap((spec) => checkRowClass(spec, lines, col)), ...checkScoped(lines, col), ...checkProposalOutcomes(lines, col), ...checkPlanLabelNote(lines, col)]
 }
 
-// { reasons, reportedLedger }: every figure in the report against the collected files.
-export function checkFigures(result, rawReport, col) {
-  const report = normaliseReport(rawReport)
-  const ledger = checkLedger(report, col)
-  const reasons = [...checkLanes(result.lanes, col), ...checkHeadlineLines(report), ...ledger.reasons, ...checkCi(report, col), ...checkGit(report, col), ...checkDigest(report, col), ...checkRows(report, col)]
+// { reasons, reportedLedger }: every line's shape, and every figure in the report against the collected files.
+export function checkFigures(result, report, col) {
+  const lines = parsedLines(report)
+  const ledger = checkLedger(lines, col)
+  const reasons = [...checkLanes(result.lanes, col), ...checkLineShapes(lines), ...ledger.reasons, ...checkCi(lines, col), ...checkGit(lines, col), ...checkDigest(lines, col), ...checkRows(lines, col)]
   return { reasons, reportedLedger: ledger.reported }
 }
 

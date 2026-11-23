@@ -44,7 +44,7 @@ async function renderNeverFailing(rows) {
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses(rows) })
   const lines = result.report.split('\n')
   const found = rows.map((row) => {
-    const own = lines.filter((line) => line.startsWith(`- ${row.repo}/${row.spec} ${row.ac_id}:`))
+    const own = lines.filter((line) => line.startsWith(`- \`${row.repo}\`/\`${row.spec}\` \`${row.ac_id}\`:`))
     if (own.length > 1) throw new Error(`expected at most one report line for ${row.ac_id}, found ${own.length}`)
     return own[0] ?? null
   })

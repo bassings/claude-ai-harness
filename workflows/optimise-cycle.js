@@ -281,9 +281,20 @@ const PROPOSAL_ID_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'j
 // key, and workflows/lib/optimise-read.mjs does the same (a parity test). Two targets that differ only in text that redacts to the same marker share one id.
 const ID_ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
 const ID_REDACTED_MARKER = '<redacted-path>'
+// Then bounded to ID_VALUE_MAX UTF-16 units by whole characters and trimmed again (whole-branch review round 3, L3): unchanged within the bound.
+const ID_VALUE_MAX = 200
+function boundedIdValue(text) {
+  if (text.length <= ID_VALUE_MAX) return text
+  let cut = ''
+  for (const ch of text) {
+    if (cut.length + ch.length > ID_VALUE_MAX) break
+    cut += ch
+  }
+  return cut.trim()
+}
 function idValue(v) {
   const text = typeof v === 'string' ? v : String(v ?? '')
-  return text.replace(ID_ABSOLUTE_PATH_RE, (whole, prefix) => prefix + ID_REDACTED_MARKER).replace(/\s+/g, ' ').trim().toLowerCase()
+  return boundedIdValue(text.replaceAll(ID_ABSOLUTE_PATH_RE, (whole, prefix) => prefix + ID_REDACTED_MARKER).replaceAll(/\s+/g, ' ').trim().toLowerCase())
 }
 function stableProposalId(target) {
   const t = target && typeof target === 'object' ? target : {}
@@ -434,7 +445,7 @@ function ciRunCountLine(lane) {
 function digestNoteLines(digest) {
   const lines = DIGEST_DROPPED_COUNT_KEYS.filter((k) => digest.dropped[k] > 0).map((k) => `Digest omitted ${k}: ${digest.dropped[k]}`)
   if (digest.dropped.trimmedForSize) lines.push('Digest trimmed for size: yes')
-  if (digest.plan_labels_note) lines.push(String(digest.plan_labels_note).replace(/\s+/g, ' ').slice(0, 400))
+  if (digest.plan_labels_note) lines.push(`Plan labels note: ${inert(String(digest.plan_labels_note).replaceAll(/\s+/g, ' ').slice(0, 400))}`)
   return lines
 }
 
@@ -499,6 +510,18 @@ const PROPOSAL_TARGET_SCHEMA = {
     touches_always_on_lens: { type: 'boolean' },
     security_purposed: { type: 'boolean' },
   },
+}
+
+// Whole-branch review round 3, L3: the reader accepts a stored identity field of at most ID_VALUE_MAX UTF-16 units, and a target is stored
+// redacted, which can lengthen it. A field longer than that once redacted is replaced, before the id is computed and before the target is
+// stored, by its identity value (idValue: redacted, collapsed, lower-cased and bounded), which is what both id implementations hash it to anyway.
+// So the stored target is within the limit and hashes to the same id as the drafted one, and one over-long field no longer fails the run. A field
+// within the bound is left exactly as drafted.
+function boundedTargetField(value, redact) {
+  return typeof value !== 'string' || redact(value).length <= ID_VALUE_MAX ? value : idValue(value)
+}
+function boundedTarget(target, redact) {
+  return { ...target, ...Object.fromEntries(PROPOSAL_TARGET_STRING_KEYS.map((k) => [k, boundedTargetField(target[k], redact)])) }
 }
 
 // ---- Synthesis: drafting, the mechanical gates and the report ----
@@ -812,6 +835,9 @@ ranked.sort((a, b) => (b.n || 0) - (a.n || 0))
 // AC-DATA-10, AC-SIMP-4: stable proposal ids, derived from `target` (never wording) by this script's own
 // stableProposalId (the proposal-id block above), the same value workflows/lib/optimise-read.mjs computes. No agent
 // step, so an id can never be missing: every target here already passed malformedTargetReason.
+// Whole-branch review round 3, L3: each over-long target field is bounded (boundedTarget, beside the target schema) before the id is computed
+// and before the target is stored.
+for (const p of [...ranked, ...insufficientDataProposals]) p.target = boundedTarget(p.target, redact)
 const idByIndex = [...ranked, ...insufficientDataProposals].map((p) => stableProposalId(p.target))
 ranked.forEach((p, i) => { p.proposal_id = idByIndex[i] })
 insufficientDataProposals.forEach((p, i) => { p.proposal_id = idByIndex[ranked.length + i] })
@@ -981,9 +1007,9 @@ async function run() {
   return analyse(collectFromDigest(opts.digest, opts.nonce))
 }
 
-// A lane's fixed reason as one bounded line (it is shown after "Not measured: ").
+// A lane's reason as one bounded line (it is shown after "Not measured: "). It travels in the digest, so it is shown inert.
 function laneReasonLine(reason, flatten) {
-  return (flatten || ((v) => String(v).replace(/\s+/g, ' ').slice(0, 120)))(reason)
+  return inert((flatten || ((v) => String(v).replaceAll(/\s+/g, ' ').slice(0, 120)))(reason))
 }
 
 function fmtPct(n, d) {
@@ -994,44 +1020,43 @@ function fmtSeconds(v) {
   return v === null ? 'unmeasured (null)' : `${v}s`
 }
 
-// BEGIN model-text confinement
-// Everything a model wrote that reaches the report is confined by ONE function and rendered inside a fixed envelope the script writes, so no model
-// text can ever begin a report line, and a measured figure can only be on a line this script wrote (whole-branch review round 2, M1; owner decision A).
-// The fields that go through it: each proposal's statement, motivating_measurement, confirming_measurement and reinstatement_evidence, each of its
-// citations, each of the six target fields as printed, its n as printed, and the key names in a malformed-target reason. Nothing else a model returns is rendered.
-// confineModelText: every line terminator and vertical or form-feed character, every other control character, U+2028 and U+2029 become a space; zero-width,
-// bidirectional and other format characters are removed; an `&` that starts a character reference is rendered `&amp;` so it cannot be read as one; the
-// result is one line, trimmed, and cut at MODEL_TEXT_MAX characters with MODEL_TEXT_CUT when longer.
-// The envelope shapes (the result check, workflows/lib/optimise-verify.mjs, holds each enveloped line to exactly one of them):
-//   ranked and previously adopted:  "### <id>: Proposal statement (model text): <statement>"
-//   insufficient data:              "- <id>: Proposal statement (model text): <statement> (n=<n>)"
-//   measurements:                   "n=<n>. Motivating (model text): <text>. Confirming (model text): <text>. Citations (model text): <ids>."
-//   reinstatement:                  "Reinstatement evidence (model text): <text>"
-//   target:                         "Target: kind=<v> component=<v> concern=<v> lens=<v> workflow=<v> job=<v>"
-//   malformed targets:              "Proposals rejected: malformed target: <count> (<reasons>)"
-// where <id> is the script's own id or "(no id)", and every <...> other than <id> and <count> is confined model text.
-const MODEL_TEXT_MAX = 300
-const MODEL_TEXT_CUT = ' [cut]'
-const MODEL_TEXT_CONTROLS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g
-const MODEL_TEXT_FORMAT_RE = /[\p{Cf}\ufe00-\ufe0f]/gu
-const MODEL_TEXT_ENTITY_RE = /&(?=#|[A-Za-z][A-Za-z0-9]*;)/g
-function confineModelText(value) {
+// BEGIN untrusted-text encoding
+// Every string that came from a repository (collected data: CI job names, repository labels, plan keys, spec paths, criterion ids, lens
+// names, ledger free text, the collector's notes and lane reasons) or from a model (a proposal's statement, measurements, citations,
+// reinstatement evidence, target words and n, and the key names in a malformed-target reason) reaches the report through inert() and
+// nowhere else (owner decision 2026-11-23, whole-branch review round 3). inert() returns a Markdown inline code span: one backtick, the
+// text, one backtick. Inside a code span CommonMark and GFM interpret nothing (no inline HTML, character reference, emphasis, link,
+// autolink or hard break), so the text is shown literally and cannot become a line of its own however a viewer renders the report.
+// Before wrapping, the text is made one line: every line terminator and vertical or form-feed character (U+0085, U+2028 and U+2029
+// included) and every tab becomes a space; every other control character, every format character (zero-width, bidirectional, soft
+// hyphen, byte-order mark), every variation selector and any unpaired surrogate is removed; every backtick becomes an apostrophe, so
+// the span cannot be closed early; runs of white space become one space; the result is trimmed and cut at INERT_MAX characters with
+// INERT_CUT when longer, and INERT_EMPTY stands in for text that is empty, so a span is never empty or all space. The script itself
+// writes no backtick anywhere else in the report, so a line holds an even number of backticks and "inside a span" is decidable by
+// counting them. The result check (workflows/lib/optimise-verify.mjs, inertSpan) mirrors this function, held to it by a parity test.
+const INERT_MAX = 300
+const INERT_CUT = ' [cut]'
+const INERT_EMPTY = '(empty)'
+const INERT_BREAKS_RE = /[\t\n\v\f\r\u0085\u2028\u2029]/g
+const INERT_REMOVED_RE = /[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}\ufe00-\ufe0f]/gu
+function inert(value) {
   const text = (typeof value === 'string' ? value : String(value ?? ''))
-    .replace(MODEL_TEXT_CONTROLS_RE, ' ')
-    .replace(MODEL_TEXT_FORMAT_RE, '')
-    .replace(MODEL_TEXT_ENTITY_RE, '&amp;')
-    .replace(/\s+/g, ' ')
+    .replaceAll(INERT_BREAKS_RE, ' ')
+    .replaceAll(INERT_REMOVED_RE, '')
+    .replaceAll('`', "'")
+    .replaceAll(/\s+/g, ' ')
     .trim()
   const chars = Array.from(text)
-  return chars.length > MODEL_TEXT_MAX ? `${chars.slice(0, MODEL_TEXT_MAX).join('')}${MODEL_TEXT_CUT}` : text
+  const bounded = chars.length > INERT_MAX ? `${chars.slice(0, INERT_MAX).join('')}${INERT_CUT}` : text
+  return `\`${bounded === '' ? INERT_EMPTY : bounded}\``
 }
-// END model-text confinement
+// END untrusted-text encoding
 
 function buildReport(d) {
   const lines = []
   lines.push('# Delivery optimiser report')
   lines.push('')
-  lines.push(`Repos: ${d.reposLabel || 'none resolved'}`)
+  lines.push(`Repos: ${inert(d.reposLabel || 'none resolved')}`)
   lines.push('')
 
   // H1 / AC-OPS-11: sample completeness, per repo, with an uninstrumented
@@ -1062,7 +1087,7 @@ function buildReport(d) {
     // The one repository's own label (the ledger's derived, non-identifying one, never the raw path), else the reader's.
     const label = (d.perRepo.length === 1 && d.repoLabels?.[0]) || entry.root
     if (entry.uninstrumented) {
-      lines.push(`- ${label}: **uninstrumented** (no ledger file found -- not "no activity"; the harness has never written a ledger here)`)
+      lines.push(`- ${inert(label)}: **uninstrumented** (no ledger file found -- not "no activity"; the harness has never written a ledger here)`)
     } else {
       // Review round-2 M-6: skippedCount previously rendered only when
       // truthy (a clean repo showed NO line at all, not a real zero), and
@@ -1074,10 +1099,10 @@ function buildReport(d) {
       // a real corruption signal (an interrupted append mid-write), stated
       // positively (true/false) so it cannot be mistaken for absence.
       const schemaMix = entry.schemaVersionsSeen && Object.keys(entry.schemaVersionsSeen).length
-        ? Object.entries(entry.schemaVersionsSeen).map(([v, n]) => `${v}: ${n}`).join(', ')
+        ? Object.entries(entry.schemaVersionsSeen).map(([v, n]) => `${inert(v)}: ${n}`).join(', ')
         : 'none'
       lines.push(
-        `- ${label}: ${entry.recordCount} record(s) in window, skipped=${entry.skippedCount ?? 0}, ` +
+        `- ${inert(label)}: ${entry.recordCount} record(s) in window, skipped=${entry.skippedCount ?? 0}, ` +
         `schema_version mix: {${schemaMix}}, truncated final line: ${entry.truncatedFinalLine ? 'true' : 'false'}`
       )
     }
@@ -1166,7 +1191,7 @@ function buildReport(d) {
   // always attempts a terminal write).
   function formatByKind(byKind) {
     const entries = Object.entries(byKind || {})
-    return entries.length ? entries.map(([k, n]) => `${k}: ${n}`).join(', ') : 'none'
+    return entries.length ? entries.map(([k, n]) => `${inert(k)}: ${n}`).join(', ') : 'none'
   }
   lines.push(
     `Orphaned agent-compute runs (never silently collapsed into one number): start-only=${fmtCountOrUnavailable(wallTotalsForExclusions.agentComputeStartOnlyRuns)} ` +
@@ -1192,7 +1217,7 @@ function buildReport(d) {
       // crashing). Rendered only when non-zero, matching the existing
       // unterminated_waits convention on this same line.
       lines.push(
-        `- ${key}: ci_wait=${b.ciWaitSeconds}s (n=${b.ciWaitN}), human_wait=${b.humanWaitSeconds}s (n=${b.humanWaitN}), ` +
+        `- ${inert(key)}: ci_wait=${b.ciWaitSeconds}s (n=${b.ciWaitN}), human_wait=${b.humanWaitSeconds}s (n=${b.humanWaitN}), ` +
         `agent_compute=${b.agentComputeSeconds}s (n=${b.agentComputeN})` +
         (b.agentComputeAbortedN ? `, aborted=${b.agentComputeAbortedSeconds}s (n=${b.agentComputeAbortedN})` : '') +
         (b.unterminatedWaits ? `, unterminated_waits: ${b.unterminatedWaits}` : '')
@@ -1218,7 +1243,7 @@ function buildReport(d) {
       `).`
     )
     if (t.unterminatedWaits) lines.push(`unterminated_waits: ${t.unterminatedWaits}`)
-    if (d.wallClock.source) lines.push(`Sources: ci_wait=${d.wallClock.source.ci_wait}, human_wait=${d.wallClock.source.human_wait}, agent_compute=${d.wallClock.source.agent_compute}.`)
+    if (d.wallClock.source) lines.push(`Sources: ci_wait=${inert(d.wallClock.source.ci_wait)}, human_wait=${inert(d.wallClock.source.human_wait)}, agent_compute=${inert(d.wallClock.source.agent_compute)}.`)
   } else {
     lines.push('No wall-clock data (ledger unavailable).')
   }
@@ -1231,7 +1256,7 @@ function buildReport(d) {
     if (!lensNames.length) lines.push('No lens findings recorded in window.')
     for (const lens of lensNames) {
       const c = d.rework.lensDispositionCounts[lens]
-      lines.push(`- ${lens}: fixed=${c.fixed}, rejected=${c.rejected}, spec_bug=${c.spec_bug}, open=${c.open}`)
+      lines.push(`- ${inert(lens)}: fixed=${c.fixed}, rejected=${c.rejected}, spec_bug=${c.spec_bug}, open=${c.open}`)
     }
     // H3 (round 3 review, AC-PROD-7): a section that can be reduced by
     // discarded or reclassified data must name, in the SAME section, how
@@ -1304,9 +1329,9 @@ function buildReport(d) {
     for (const u of Array.isArray(bu.unresolved) ? bu.unresolved : []) {
       // Round 1 M1: non-clearing hint for a re-briefed retry.
       const hint = u.laterDoneSameSpec === true
-        ? ` (a later done run exists for this spec at ${oneLine(u.laterDoneSameSpecTs)}; under a multi-task plan this may be another task)`
+        ? ` (a later done run exists for this spec at ${inert(oneLine(u.laterDoneSameSpecTs))}; under a multi-task plan this may be another task)`
         : ''
-      lines.push(`- ${oneLine(u.repo)} ${oneLine(u.spec)} ${oneLine(u.task)}: ${oneLine(u.reason)}${hint}`)
+      lines.push(`- ${inert(oneLine(u.repo))} ${inert(oneLine(u.spec))} ${inert(oneLine(u.task))}: ${inert(oneLine(u.reason))}${hint}`)
     }
   } else if (d.ledgerLaneFailed) {
     // Round 1 L3: a missing ledger lane is not a stale reader.
@@ -1346,7 +1371,8 @@ function buildReport(d) {
       // AC-PROD-3: runs where this criterion's own verdicts disagreed, a
       // figure of its own beside the never-failed claim.
       const disagreements = a.verdict_disagreements === undefined ? '' : `, verdict_disagreements=${a.verdict_disagreements === null ? 'not measured' : a.verdict_disagreements}`
-      lines.push(`- ${a.repo}/${a.spec} ${a.ac_id}: n=${a.n}${reasonSuffix}${disagreements}`)
+      // Three spans, so a long repository or spec cannot push the criterion id past the encoder's bound and make two rows read alike.
+      lines.push(`- ${inert(a.repo)}/${inert(a.spec)} ${inert(a.ac_id)}: n=${a.n}${reasonSuffix}${disagreements}`)
     }
   } else if (!(d.neverFailingLeftOut > 0)) {
     // H3 (round 3 review, AC-PROD-7): "None recorded." on its own reads
@@ -1367,7 +1393,7 @@ function buildReport(d) {
     if (!lensNames.length) lines.push('No trigger data in window.')
     for (const lens of lensNames) {
       const b = d.triggerAccuracy.byLens[lens]
-      lines.push(`- ${lens}: clean_zero_trigger=${b.cleanWithZeroTrigger}, clean_with_matches=${b.cleanWithMatches}, findings=${b.findingsWithMatches}, clean_trigger_unmeasured=${b.cleanTriggerUnmeasured || 0}, total=${b.total}`)
+      lines.push(`- ${inert(lens)}: clean_zero_trigger=${b.cleanWithZeroTrigger}, clean_with_matches=${b.cleanWithMatches}, findings=${b.findingsWithMatches}, clean_trigger_unmeasured=${b.cleanTriggerUnmeasured || 0}, total=${b.total}`)
     }
   } else {
     lines.push('No trigger data (ledger unavailable).')
@@ -1399,16 +1425,19 @@ function buildReport(d) {
     const ids = (Array.isArray(j.failedRunIds) ? j.failedRunIds : []).map(String).filter((x) => /^[0-9]+$/.test(x))
     const idText = ids.length ? ` (run ids ${ids.slice(0, 10).join(', ')}${ids.length > 10 ? `, +${ids.length - 10} more` : ''})` : ''
     const mean = typeof j.meanDurationS === 'number' ? `${Math.round(j.meanDurationS)}s` : 'n/a'
-    lines.push(`- ${ciFlat(key)}: n=${ciNum(j.n)}, failed=${j.failureCount == null ? 'n/a' : ciNum(j.failureCount)}${j.skipped ? `, not settled=${ciNum(j.skipped)} (skipped, cancelled or neutral)` : ''}${idText}, mean ${mean}${qualifiers.length ? ` (${qualifiers.join(', ')})` : ''}`)
+    const failed = j.failureCount == null ? 'n/a' : ciNum(j.failureCount)
+    const notSettled = j.skipped ? `, not settled=${ciNum(j.skipped)} (skipped, cancelled or neutral)` : ''
+    const qualifierText = qualifiers.length ? ` (${qualifiers.join(', ')})` : ''
+    lines.push(`- ${inert(ciFlat(key))}: n=${ciNum(j.n)}, failed=${failed}${notSettled}${idText}, mean ${mean}${qualifierText}`)
   }
   // AC-OPS-10, AC-OPS-11: per repo, runs left out as not completed and failed per-run fetches by mode.
   for (const [repo, st] of Object.entries(d.ciRepoStats || {})) {
     const ff = (st && st.fetchFailures) || {}
-    lines.push(`- ${ciFlat(repo)}: ${ciNum((st && st.notCompleted) || 0)} runs not completed (left out); per-run fetch failures (incl. attempt-1): rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}; attempt-1 jobs not fetched: ${st && typeof st.attempt1Unfetched === 'number' ? ciNum(st.attempt1Unfetched) : 'n/a'}; runs past attempt 2 or with an unreadable attempt (not qualifiable): ${st && typeof st.pastAttempt2 === 'number' ? ciNum(st.pastAttempt2) : 'n/a'}`)  // T7 review F5 and round 2 L2: a reader that never reported a field prints n/a, never 0
+    lines.push(`- ${inert(ciFlat(repo))}: ${ciNum(st?.notCompleted || 0)} runs not completed (left out); per-run fetch failures (incl. attempt-1): rate_limited ${ciNum(ff.rate_limited || 0)}, unauthenticated ${ciNum(ff.unauthenticated || 0)}, other ${ciNum(ff.other || 0)}; attempt-1 jobs not fetched: ${typeof st?.attempt1Unfetched === 'number' ? ciNum(st.attempt1Unfetched) : 'n/a'}; runs past attempt 2 or with an unreadable attempt (not qualifiable): ${typeof st?.pastAttempt2 === 'number' ? ciNum(st.pastAttempt2) : 'n/a'}`)  // T7 review F5 and round 2 L2: a reader that never reported a field prints n/a, never 0
   }
   // AC-QA-32: the lane's own cost, so the first run after shipping records the baseline.
-  for (const g of d.ciGhStats || []) lines.push(`- ${ciFlat(g.repo)}: wall-clock ${g.wall_clock_s == null ? 'n/a' : ciNum(g.wall_clock_s)}s, ${g.gh_calls == null ? 'n/a' : ciNum(g.gh_calls)} gh calls`)
-  for (const f of d.ciFailures || []) lines.push(`- gh unavailable for ${ciFlat(f.repo)}: ${ciFlat(f.mode)} (${ciFlat(f.command)}): ${ciFlat(f.error || 'n/a')}`)
+  for (const g of d.ciGhStats || []) lines.push(`- ${inert(ciFlat(g.repo))}: wall-clock ${g.wall_clock_s == null ? 'n/a' : ciNum(g.wall_clock_s)}s, ${g.gh_calls == null ? 'n/a' : ciNum(g.gh_calls)} gh calls`)
+  for (const f of d.ciFailures || []) lines.push(`- gh unavailable for ${inert(ciFlat(f.repo))}: ${inert(ciFlat(f.mode))} (${inert(ciFlat(f.command))}): ${inert(ciFlat(f.error || 'n/a'))}`)
   lines.push('')
   lines.push('## Escaped-defect counter-metric')
   // HARN-OPT-4 T6 (AC-DATA-11, AC-PROD-7, AC-SEC-10): one block per roster
@@ -1422,20 +1451,20 @@ function buildReport(d) {
   const gitRepos = Array.isArray(d.escapedDefects) ? d.escapedDefects : []
   if (!gitRepos.length) lines.push('Escaped defects are not currently captured (git-lane unavailable).')
   gitRepos.forEach((g, i) => {
-    lines.push(`Repo ${i + 1} (${flattenLabel(g.label)}):`)
+    lines.push(`Repo ${i + 1} (${inert(flattenLabel(g.label))}):`)
     const f = g.figures
     if (g.status !== 'ok' || !f || typeof f.count !== 'number') {
-      lines.push(`Not measured: ${oneLine(g.reason || 'git lane unavailable')}`)
+      lines.push(`Not measured: ${inert(oneLine(g.reason || 'git lane unavailable'))}`)
       return
     }
-    lines.push(`Raw (unscoped): ${f.count} of ${f.n_commits_examined} examined commits matched the heuristic. ${oneLine(f.method)}`)
+    lines.push(`Raw (unscoped): ${f.count} of ${f.n_commits_examined} examined commits matched the heuristic. ${inert(oneLine(f.method))}`)
     // AC-2/AC-4: the scoped figure is reported alongside the raw one, never
     // in place of it, and is stated as unavailable rather than guessed at
     // when the config could not be resolved (scoped_count null).
     if (typeof f.scoped_count === 'number') {
-      lines.push(`Scoped to product source (config: ${f.scoped_config_source}): ${f.scoped_count} counted, ${f.scoped_excluded_count} excluded as pipeline/tooling-only, ${f.scoped_unavailable_count} unavailable (changed paths could not be determined). ${oneLine(f.scoped_method)}`)
+      lines.push(`Scoped to product source (config: ${inert(oneLine(f.scoped_config_source))}): ${f.scoped_count} counted, ${f.scoped_excluded_count} excluded as pipeline/tooling-only, ${f.scoped_unavailable_count} unavailable (changed paths could not be determined). ${inert(oneLine(f.scoped_method))}`)
     } else {
-      lines.push(`Scoped figure unavailable: ${oneLine(f.scoped_method || 'no reason given by the git lane')}`)
+      lines.push(`Scoped figure unavailable: ${inert(oneLine(f.scoped_method || 'no reason given by the git lane'))}`)
     }
   })
   lines.push('')
@@ -1448,34 +1477,34 @@ function buildReport(d) {
   const flatten = d.flatten || oneLine
   const TARGET_FIELDS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
   const annotationLines = (p) => {
-    const targetFields = TARGET_FIELDS.map((k) => `${k}=${flatten(confineModelText(p.target?.[k] ?? ''))}`).join(' ')
+    const targetFields = TARGET_FIELDS.map((k) => `${k}=${inert(flatten(p.target?.[k] ?? ''))}`).join(' ')
     const out = [`Target: ${targetFields}`]
-    if (p.reinstatement_evidence) out.push(`Reinstatement evidence (model text): ${confineModelText(p.reinstatement_evidence)}`)
+    if (p.reinstatement_evidence) out.push(`Reinstatement evidence (model text): ${inert(p.reinstatement_evidence)}`)
     if (p.category === 'security_removal_flagged') out.push('**Flagged: security-purposed check removal/demotion.**')
-    if (p.prior_adoption_ts) out.push(`Already adopted on ${p.prior_adoption_ts}.`)
-    if (p.prior_rejection_ts) out.push(`**Previously rejected on ${p.prior_rejection_ts}.**`)
+    if (p.prior_adoption_ts) out.push(`Already adopted on ${inert(p.prior_adoption_ts)}.`)
+    if (p.prior_rejection_ts) out.push(`**Previously rejected on ${inert(p.prior_rejection_ts)}.**`)
     if (p.reverted_twice) out.push('**Flagged: adopted and reverted at least twice previously (§12: keep the original).**')
     return out
   }
   lines.push('## Proposals (ranked)')
   if (!d.ranked.length) lines.push('None.')
   for (const p of d.ranked) {
-    lines.push(`### ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${confineModelText(p.statement)}`)
-    lines.push(`n=${confineModelText(p.n)}. Motivating (model text): ${confineModelText(p.motivating_measurement)}. Confirming (model text): ${confineModelText(p.confirming_measurement)}. Citations (model text): ${(p.citations || []).map(confineModelText).join(', ')}.`)
+    lines.push(`### ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${inert(p.statement)}`)
+    lines.push(`n=${inert(p.n)}. Motivating (model text): ${inert(p.motivating_measurement)}. Confirming (model text): ${inert(p.confirming_measurement)}. Citations (model text): ${(p.citations || []).map(inert).join(', ')}.`)
     lines.push(...annotationLines(p))
   }
   lines.push('')
   lines.push('## Proposals previously adopted (not ranked as new)')
   if (!(d.previouslyAdopted || []).length) lines.push('None.')
   for (const p of d.previouslyAdopted || []) {
-    lines.push(`### ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${confineModelText(p.statement)}`)
+    lines.push(`### ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${inert(p.statement)}`)
     lines.push(...annotationLines(p))
   }
   lines.push('')
   lines.push('## Proposals (insufficient data, excluded from ranking)')
   if (!d.insufficientDataProposals.length) lines.push('None.')
   for (const p of d.insufficientDataProposals) {
-    lines.push(`- ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${confineModelText(p.statement)} (n=${confineModelText(p.n)})`)
+    lines.push(`- ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${inert(p.statement)} (n=${inert(p.n)})`)
     lines.push(...annotationLines(p))
   }
   lines.push('')
@@ -1530,7 +1559,7 @@ function buildReport(d) {
   // HARN-OPT-4 T6 (AC-QA-20): named, not merely counted. Round 1 F6: this used
   // a dead /\\s+/g (a literal backslash-s), so multi-line reasons passed through.
   const malformed = d.malformedTargetReasons || []
-  const malformedDetail = malformed.length ? ` (${malformed.map((r) => oneLine(confineModelText(r))).join(' | ')})` : ''
+  const malformedDetail = malformed.length ? ` (${malformed.map(inert).join(' | ')})` : ''
   lines.push(`Proposals rejected: malformed target: ${malformed.length}${malformedDetail}`)
   return lines.join('\n')
 }

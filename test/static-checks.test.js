@@ -1110,7 +1110,7 @@ test('static: README.md documents the launchd rollback for com.local.optimise-cy
 // closes that coverage gap mechanically, so a future edit cannot silently
 // drop either control without a red test naming exactly which token
 // vanished.
-test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh passes the allowlist, the bare-tool denies and the closed permission mode, holds no Bash, Edit or Write rule, and does not disable hooks -- every test drives a stub `claude`, never the real flags, so deleting any of these previously shipped the suite green (HARN-RUNNER-2 T3, AC-SEC-1, AC-SEC-2, AC-SEC-4, AC-SEC-16)', () => {
+test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh passes the allowlist, the bare-tool denies and the closed permission mode, holds no Bash, Edit or Write rule, and does not override settings -- every test drives a stub `claude`, never the real flags, so deleting any of these previously shipped the suite green (HARN-RUNNER-2 T3, AC-SEC-1, AC-SEC-2, AC-SEC-4, AC-SEC-16)', () => {
   const script = readAll('bin', 'optimise-cycle-weekly.sh')
   const lines = script.split('\n')
   // Scoped to the ACTUAL invocation block, not the whole file: a whole-file .includes() check was itself vacuous --
@@ -1129,7 +1129,7 @@ test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh pas
   assert.ok(!callSite.includes('--session-id'), 'no session id is needed: the session cannot touch a repository plan marker')
   assert.ok(callSite.includes('--setting-sources user'), 'the claude -p call site must load user settings only, so a repo cannot widen the allowlist')
   assert.ok(callSite.includes('--output-format json'), 'the claude -p call site must ask for the JSON envelope the runner parses')
-  assert.ok(!callSite.includes('--settings'), 'the claude -p call site must not override settings: the guard and snapshot hooks stay on')
+  assert.ok(!callSite.includes('--settings'), 'the claude -p call site must not override settings: the allowlist and the denies come from the flags alone (the hooks are off under safe mode)')
   // `claude --help` (2.1.330): "--strict-mcp-config  Only use MCP servers from --mcp-config, ignoring all other MCP configurations",
   // and with no --mcp-config no MCP server loads at all; "--no-session-persistence  Don't save sessions to disk; they can't be
   // resumed (only works with --print)", so collected data is not left in a saved transcript.

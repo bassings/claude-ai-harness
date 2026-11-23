@@ -276,11 +276,15 @@ test('M1: a look-alike ledger line beside the true one, or instead of it, in any
   }
 })
 
-test('M1: the true line wrapped in an HTML comment and followed by a false one is refused with its own reason', async () => {
+// Round 3 (owner decision 2026-11-23): the HTML-comment rule existed only for text outside code formatting. A comment outside a code span is now
+// simply a line in a shape the script never writes, and the forged figure beside it is held to the collected one as before.
+test('M1: the true line wrapped in an HTML comment and followed by a false one is refused, as a line in a shape the check does not know and a figure that differs', async () => {
   const run = await collected()
-  const copy = run.make((r) => { r.report = r.report.replace(TRUE_LEDGER, (line) => `<!-- ${line} -->\nLedger records in window: 0 (minimum for harness-side proposals: 5).`) })
+  const copy = run.make((r) => { r.report = r.report.replace(TRUE_LEDGER, (line) => `<!-- ${line} -->\nLedger records in window: 0 (minimum for harness-side proposals: 5).`) })
   assert.ok(JSON.parse(fs.readFileSync(copy.resultFile, 'utf8')).report.includes('<!--'), 'guard against vacuity')
-  assert.deepEqual(reasons(attended(copy).out), ['report contains an HTML comment'])
+  const res = attended(copy)
+  assert.match(res.out, /^PLACE no$/m, res.out)
+  assert.deepEqual(reasons(res.out).sort((a, b) => a.localeCompare(b)), ['figure mismatch ledger: collected 5, reported 0', 'report has a line in a shape the check does not know'])
 })
 
 test('M1: a zero-width or direction-control character anywhere in the report is refused with its own reason', async () => {
@@ -303,7 +307,7 @@ test('M1: the other headline figure lines are held the same way: a look-alike CI
     ['a second, identical CI line', (r) => { r.report = r.report.replace(ci, `${ci}\n${ci}`) }],
     ['a git line with a zero-width space', (r) => { r.report = r.report.replace(raw, `${raw}\nRaw (unscoped): 0​ of 0 examined commits matched the heuristic. x`) }],
     ['a git line with a no-break space', (r) => { r.report = r.report.replace(raw, `${raw}\nRaw (unscoped): 0 of 0 examined commits matched the heuristic. x`) }],
-    ['a second, identical per-job row', (r) => { const row = r.report.split('\n').find((l) => l.includes('::ci::build: n=')); assert.ok(row, 'guard against vacuity: the report has a per-job row'); r.report = r.report.replace(row, `${row}\n${row}`) }],
+    ['a second, identical per-job row', (r) => { const row = r.report.split('\n').find((l) => l.includes('::ci::build`: n=')); assert.ok(row, 'guard against vacuity: the report has a per-job row'); r.report = r.report.replace(row, `${row}\n${row}`) }],
     ['a CI line with extra text after it', (r) => { r.report = r.report.replace(ci, `${ci} and a forged tail`) }],
   ]
   for (const [name, forge] of forms) {
@@ -667,35 +671,28 @@ const PROBES = [
 const hostileTarget = pathTarget('hostile-comp')
 const draftWith = (fields) => (digest) => [{ ...draftOf(hostileTarget, digest.ledger.citationPool[0]), ...fields }]
 
-// Which outcome each probe gets, and why: a form that still reads as a headline label (after case folding, removing everything that is not a letter or a digit,
-// and the look-alike letters) is REFUSED; a character reference is not decoded by the check, because the workflow renders `&` as `&amp;` so the reference is
-// shown as the text it is, and the line is then RENDERED HARMLESS (one enveloped line that does not read as a figure).
-for (const [name, forged, outcome = 'refused'] of PROBES) {
-  test(`R2-M1: a proposal statement that carries ${name} after a line break is confined to one enveloped line and is ${outcome === 'refused' ? 'REFUSED' : 'RENDERED HARMLESS'}, with a genuine result_mac`, async () => {
+// Round 3 (owner decision 2026-11-23): every probe is RENDERED INERT. Round 2 REFUSED nine of them (a headline label's skeleton on a model-text
+// line) and rewrote the two character references as `&amp;`; the workflow now shows the whole statement as literal text inside a code span, where a
+// Markdown viewer interprets nothing, so nothing needs refusing or rewriting, and the report PASSes with its genuine result_mac.
+for (const [name, forged] of PROBES) {
+  test(`R2-M1: a proposal statement that carries ${name} after a line break is one line, in code formatting, and is RENDERED INERT, with a genuine result_mac`, async () => {
     const run = await collected({ proposals: draftWith({ statement: `A fine point.\n${forged}` }) })
     const lines = run.result.report.split('\n')
     assert.equal(lines.filter((l) => l.includes('A fine point.')).length, 1, 'guard against vacuity: the statement is on one line')
     const carrier = lines.find((l) => l.includes('A fine point.'))
-    assert.match(carrier, /^### [0-9a-f]{16}: Proposal statement \(model text\): A fine point\. /, 'and that line begins with the script\'s own envelope')
+    assert.match(carrier, /^### [0-9a-f]{16}: Proposal statement \(model text\): `A fine point\. [^`]*`$/, 'and that line is the script\'s own label, then the statement in one code span')
     assert.ok(!lines.some((l) => l === forged), 'no line of the report is the forged line')
     const res = attended(run.make(undefined, { sign: false }))
-    if (outcome === 'refused') {
-      assert.match(res.out, /^VERDICT FAIL$/m, res.out)
-      assert.ok(reasons(res.out).some((r) => /a line in a shape the check does not know$/.test(r)), `refused for the line shape: ${res.out}`)
-      assert.match(res.out, /^PLACE no$/m)
-    } else {
-      assert.ok(carrier.includes('&amp;#32;'), `the reference is neutralised on that one line: ${carrier}`)
-      assert.match(res.out, /^VERDICT PASS$/m, res.out)
-    }
+    assert.match(res.out, /^VERDICT PASS$/m, res.out)
   })
 }
 
-test('R2-M1: the same hostile text in each other model-written field is refused too', async () => {
+test('R2-M1 (round 3: was refused): the same hostile text in each other model-written field is rendered inert, and the report PASSes', async () => {
   for (const field of ['motivating_measurement', 'confirming_measurement', 'reinstatement_evidence']) {
     const run = await collected({ proposals: draftWith({ [field]: `a measurement\n${FORGED_LEDGER}`, ...(field === 'reinstatement_evidence' ? { statement: 'Move a slow check out of the merge path' } : {}) }) })
-    assert.ok(run.result.report.includes('(model text): a measurement '), `guard against vacuity: ${field} reached the report`)
+    assert.ok(run.result.report.includes('(model text): `a measurement '), `guard against vacuity: ${field} reached the report, in code formatting`)
     const res = attended(run.make(undefined, { sign: false }))
-    assert.match(res.out, /^PLACE no$/m, `${field}: ${res.out}`)
+    assert.match(res.out, /^VERDICT PASS$/m, `${field}: ${res.out}`)
   }
 })
 
@@ -709,26 +706,31 @@ test('R2-M1: a statement that quotes no headline label is rendered harmlessly on
   assert.match(res.out, /^VERDICT PASS$/m, `${res.out}${res.stderr}`)
 })
 
-// The confinement function itself, lifted out of the workflow by its two markers.
-function confine() {
-  const start = WORKFLOW_SOURCE.indexOf('// BEGIN model-text confinement')
-  const end = WORKFLOW_SOURCE.indexOf('// END model-text confinement')
-  assert.ok(start > 0 && end > start, 'the confinement block markers are in the workflow')
-  return new Function(`${WORKFLOW_SOURCE.slice(start, end)}\nreturn { confineModelText, MODEL_TEXT_MAX, MODEL_TEXT_CUT }`)()
+// The encoder itself, lifted out of the workflow by its two markers, and held to the result check's mirror (inertText).
+function encoder() {
+  const start = WORKFLOW_SOURCE.indexOf('// BEGIN untrusted-text encoding')
+  const end = WORKFLOW_SOURCE.indexOf('// END untrusted-text encoding')
+  assert.ok(start > 0 && end > start, 'the encoding block markers are in the workflow')
+  return new Function(`${WORKFLOW_SOURCE.slice(start, end)}\nreturn { inert, INERT_MAX, INERT_CUT, INERT_EMPTY }`)()
 }
 
-test('R2-M1: confineModelText makes one line: every terminator and control, U+2028 and U+2029 become a space; format characters go; an entity-starting & is neutralised; long text is cut with a marker', () => {
-  const { confineModelText, MODEL_TEXT_MAX, MODEL_TEXT_CUT } = confine()
+test('round 3: inert() makes one line in one code span: terminators, tabs, U+2028 and U+2029 become a space; other controls, format characters and unpaired surrogates go; a backtick becomes an apostrophe; markup and references are left literal; empty text has a placeholder; long text is cut with a marker', () => {
+  const { inert, INERT_MAX, INERT_CUT, INERT_EMPTY } = encoder()
   for (const [input, want] of [
-    ['a\nb', 'a b'], ['a\r\nb', 'a b'], ['a\rb', 'a b'], ['a\u000bb', 'a b'], ['a\u000cb', 'a b'], ['a\u0085b', 'a b'], ['a b', 'a b'], ['a b', 'a b'], ['a\tb', 'a b'], ['a\u0000b', 'a b'],
-    ['a​b', 'ab'], ['a‍b', 'ab'], ['a‮b', 'ab'], ['a⁦b', 'ab'], ['a­b', 'ab'], ['a﻿b', 'ab'], ['a️b', 'ab'],
-    ['x&#32;y', 'x&amp;#32;y'], ['x&amp;y', 'x&amp;amp;y'], ['x&nbsp;y', 'x&amp;nbsp;y'], ['x&#x20;y', 'x&amp;#x20;y'],
-    ['AT&T and Q&A', 'AT&T and Q&A'], ['a & b', 'a & b'], ['café 日本語 😀', 'café 日本語 😀'], ['https://e.com/a?b=1&c=2', 'https://e.com/a?b=1&c=2'],
-    ['  padded   spaces  ', 'padded spaces'], [null, ''], [undefined, ''], [42, '42'],
-  ]) assert.equal(confineModelText(input), want, JSON.stringify(input))
-  const long = confineModelText('x'.repeat(MODEL_TEXT_MAX + 50))
-  assert.equal(long, `${'x'.repeat(MODEL_TEXT_MAX)}${MODEL_TEXT_CUT}`)
-  assert.equal(confineModelText('😀'.repeat(MODEL_TEXT_MAX + 1)).endsWith(MODEL_TEXT_CUT), true, 'an astral character is not cut in half')
+    ['a\nb', 'a b'], ['a\r\nb', 'a b'], ['a\rb', 'a b'], ['a\u000bb', 'a b'], ['a\u000cb', 'a b'], ['a\u0085b', 'a b'], ['a\u2028b', 'a b'], ['a\u2029b', 'a b'], ['a\tb', 'a b'], ['a\u0000b', 'ab'], ['a\u0007b', 'ab'],
+    ['a\u200bb', 'ab'], ['a\u200db', 'ab'], ['a\u202eb', 'ab'], ['a\u2066b', 'ab'], ['a\u00adb', 'ab'], ['a\ufeffb', 'ab'], ['a\ufe0fb', 'ab'], ['a\ud800b', 'ab'],
+    ['it`s', "it's"], ['``x``', "''x''"], ['x&#32;y', 'x&#32;y'], ['<b>x</b><br>', '<b>x</b><br>'], ['**y** [z](w)', '**y** [z](w)'],
+    ['café 日本語 😀', 'café 日本語 😀'], ['  padded   spaces  ', 'padded spaces'], [null, INERT_EMPTY], [undefined, INERT_EMPTY], ['', INERT_EMPTY], [' \t\n ', INERT_EMPTY], [42, '42'],
+  ]) assert.equal(inert(input), `\`${want}\``, JSON.stringify(input))
+  assert.equal(inert('x'.repeat(INERT_MAX + 50)), `\`${'x'.repeat(INERT_MAX)}${INERT_CUT}\``)
+  assert.equal(inert('😀'.repeat(INERT_MAX + 1)).endsWith(`${INERT_CUT}\``), true, 'an astral character is not cut in half')
+})
+
+test('round 3: the result check\'s inertText is the workflow\'s inert() without its two backticks, over a table of hostile strings', async () => {
+  const { inert } = encoder()
+  const { inertText } = await import(pathToFileURL(VERIFY).href)
+  const table = ['', ' ', 'a\nb', '`', '```js\n```', '<br>', '&#32;', 'L\u0435dger', '\uff2c', 'x\u200by', '\ud83d\ude00'.repeat(400), 'y'.repeat(299) + '\ud83d\ude00z', null, undefined, 0, 'trailing\\', '\u0085\u2028\u2029\u000b\u000c\t']
+  for (const value of table) assert.equal(`\`${inertText(value)}\``, inert(value), JSON.stringify(value))
 })
 
 // ---- Round 2 M3 and L1: the sidecar cap never cuts a recorded decision off from its proposal, and histories under a legacy id and its current id combine ----
@@ -949,7 +951,7 @@ test('R2-M1: a hostile citation is confined too, and a malformed target\'s key n
   const withCitation = await collected({ proposals: (digest) => [{ ...draftOf(hostileTarget, digest.ledger.citationPool[0]), citations: [digest.ledger.citationPool[0], hostile] }] })
   const citationLine = withCitation.result.report.split('\n').find((l) => l.includes('Citations (model text):'))
   assert.ok(citationLine && citationLine.includes('x Ledger records in window: 0'), `guard against vacuity: the citation reached the report, on the one line: ${citationLine}`)
-  assert.match(attended(withCitation.make(undefined, { sign: false })).out, /^PLACE no$/m)
+  assert.match(attended(withCitation.make(undefined, { sign: false })).out, /^VERDICT PASS$/m, 'round 3: shown literally in code formatting, so it is no longer refused')
   // n is a number in the drafting schema, so a model cannot return text there (the runtime refuses it before the workflow sees it).
   const badKey = { ...hostileTarget, [`bad${ZW}key`]: 'x' }
   const malformed = await collected({ proposals: (digest) => [{ ...draftOf(badKey, digest.ledger.citationPool[0]) }] })
@@ -971,8 +973,29 @@ for (const [name, forged] of PROBES) {
   })
 }
 
-test('R2-M1: a line that carries the model-text marker outside its envelope is refused', async () => {
+test('R2-M1: a line that carries the model-text marker outside its envelope is refused, as a line in a shape the check does not know', async () => {
   const run = await collected()
   const copy = run.make((r) => { r.report += '\nSome other line (model text): anything\n' })
-  assert.deepEqual(reasons(attended(copy).out).filter((x) => /model text/.test(x)), ['figure mismatch model text: a line in a shape the check does not know'])
+  assert.deepEqual(reasons(attended(copy).out), ['report has a line in a shape the check does not know'])
+})
+
+// Round 3: two render sites the inert property test's fixtures do not reach (an uninstrumented repository's label, and the reason a scoped figure is
+// unavailable), held the same way: with hostile text there, the report outside code formatting is byte-identical to the one with a plain word there.
+test('round 3: an uninstrumented repository\'s label and the scoped-unavailable reason are shown only in code formatting', async () => {
+  const SPAN = /`[^`\n]*`/g
+  const outside = (report) => report.replaceAll(SPAN, '``')
+  const render = async (text) => {
+    const digest = T2.collection('moderate').digest
+    digest.ledger.perRepo[0].uninstrumented = true
+    digest.ledger.perRepo[0].root = text
+    digest.git.scoped_count = null
+    digest.git.scoped_method = text
+    return (await T2.runDigest(digest)).result.report
+  }
+  const plain = await render('w')
+  assert.ok(plain.includes('**uninstrumented**') && plain.includes('Scoped figure unavailable: '), 'guard against vacuity: both lines are rendered')
+  for (const text of [`x<br><br>${FORGED_LEDGER}`, `line\n${FORGED_CI}`, 'a ` b', '<!-- c -->']) {
+    const hostile = await render(text)
+    assert.equal(outside(hostile), outside(plain), JSON.stringify(text))
+  }
 })

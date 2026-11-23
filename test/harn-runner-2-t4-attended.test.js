@@ -96,7 +96,7 @@ async function uniqueEntry(label) {
   const target = { kind: 'ci_demote', component: 'ci', concern: 'duration', lens: '', workflow: 'ci', job: `entry-${label}`, touches_always_on_lens: false, security_purposed: false }
   const id = reader.stableProposalId(target)
   const alter = (r) => {
-    r.report += `\n### ${id}: A proposal\n`
+    r.report += `\n### ${id}: Proposal statement (model text): \`A proposal\`\n`
     r.proposal_targets = { ...r.proposal_targets, [id]: target }
   }
   return { id, target, alter }

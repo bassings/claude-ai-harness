@@ -624,7 +624,7 @@ test('T7 redaction: numeric fields, failed run ids and repo stats from a confuse
   assert.ok(!report.includes(ALPHA), 'no roster root anywhere in the report')
   assert.ok(!/Injected/.test(report), 'no injected text anywhere in the report')
   assert.ok(!report.includes('\n## Injected'), 'no heading started by a lane value')
-  const line = ciSection(report).split('\n').find((l) => l.startsWith('- ') && l.includes('test:'))
+  const line = ciSection(report).split('\n').find((l) => l.startsWith('- ') && l.includes('test`:'))
   assert.ok(line, 'precondition: the row line rendered')
   assert.match(line, /n=n\/a/)
   assert.match(line, /205/, 'a clean digits-only id survives')

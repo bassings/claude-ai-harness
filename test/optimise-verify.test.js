@@ -22,6 +22,8 @@ async function real() {
   return { col: { lane: { ledger: col.lanes.ledger, git: col.lanes.git, ci: col.lanes.ci }, digest: col.digest }, report: result.report }
 }
 
+const LANES_RAN = { ledger: { status: 'ran' }, git: { status: 'ran' }, ci: { status: 'ran' } }
+
 const bump = (report, re, delta = 1) => {
   assert.ok(re.test(report), `the fixture report has a line matching ${re}`)
   return report.replace(re, (n) => String(Number(n) + delta))
@@ -106,25 +108,28 @@ test('flattening parity: the module prints a key through the same redaction the 
   assert.match(SOURCE, /import \{[^}]*\bABSOLUTE_PATH_RE\b[^}]*\bREDACTED_PATH_MARKER\b[^}]*\} from '\.\/ledger-append\.mjs'/)
 })
 
-test('checkRows: a row written in a shape the check does not know is refused, so a row cannot escape its class by being written differently', async () => {
-  const { checkRows } = await load()
+// Round 3: a row in a shape no class knows is refused by the line-shape rule, which holds every line of the report to the script's own shapes,
+// and the row it should have been is then missing from its class.
+test('checkFigures: a row written in a shape the check does not know is refused, so a row cannot escape its class by being written differently', async () => {
+  const { checkRows, checkFigures } = await load()
   const { col, report } = await real()
   const plan = report.split('\n').find((l) => l.includes(': ci_wait=') && l.startsWith('- '))
   const reshaped = report.replace(plan, plan.replace('), human_wait=', ') human_wait='))
   assert.notEqual(reshaped, report)
-  assert.ok(checkRows(reshaped, col).includes('figure mismatch wall-clock plan: a row in a shape the check does not know'))
+  assert.ok(checkFigures({ lanes: LANES_RAN }, reshaped, col).reasons.includes('report has a line in a shape the check does not know'))
+  assert.ok(checkRows(reshaped, col).some((r) => r.startsWith('figure mismatch wall-clock plan: ') && r.endsWith('reported none')), 'and the row is missing from its class')
   const job = report.split('\n').find((l) => l.includes('::ci::') && l.includes(': n='))
   const jobReshaped = report.replace(job, job.replace(': n=', ': runs=').replace(', failed=', ', failures='))
   assert.ok(checkRows(jobReshaped.replace('::ci::', '::ci::'), col).length >= 1, 'a job row with its figures renamed is not silently ignored')
 })
 
-test('checkRows: a hostile report of one enormous line of row-shaped text is refused, never a hang', async () => {
-  const { checkRows } = await load()
+test('checkFigures: a hostile report of one enormous line of row-shaped text is refused, never a hang', async () => {
+  const { checkFigures } = await load()
   const { col, report } = await real()
   const hostile = '- ' + ': n=1, failed='.repeat(200000)
   const started = Date.now()
-  const reasons = checkRows(`${report}\n${hostile}\n`, col)
-  assert.ok(reasons.some((r) => r.startsWith('figure mismatch ci job:')), 'the over-long row is refused, not ignored')
+  const reasons = checkFigures({ lanes: LANES_RAN }, `${report}\n${hostile}\n`, col).reasons
+  assert.ok(reasons.includes('report has a line in a shape the check does not know'), 'the over-long row is refused, not ignored')
   // The one place a duration is compared with a constant: only elapsed time can show catastrophic regex backtracking. 60 s is some two hundred times
   // the ordinary 0.3 s, so no machine load reaches it, and an exponential pattern passes it by orders of magnitude.
   assert.ok(Date.now() - started < 60000, `a hang guard: took ${Date.now() - started} ms`)
@@ -201,10 +206,10 @@ test('mergeSidecar: a returned entry evicts an on-disk one only when the file is
 
 // [class, what alters exactly one figure of that class by one, the reason it must give]
 const ROW_ALTERATIONS = [
-  ['a per-job CI count n', (r) => bump(r, /(?<=::ci::[^\n]*: n=)\d+/), /^figure mismatch ci job: n collected 3, reported 4$/],
-  ['a per-job CI failed count', (r) => bump(r, /(?<=::ci::[^\n]*: n=\d+, failed=)\d+/), /^figure mismatch ci job: failed collected \d+, reported \d+$/],
-  ['a per-job row whose key the data does not hold', (r) => r.replace('::ci::test:', '::ci::forged:'), /^figure mismatch ci job: a row the collected data does not hold/],
-  ['a per-job row left out', (r) => r.split('\n').filter((l) => !l.includes('::ci::test:')).join('\n'), /^figure mismatch ci job: .*collected .*reported none/],
+  ['a per-job CI count n', (r) => bump(r, /(?<=::ci::[^\n]*`: n=)\d+/), /^figure mismatch ci job: n collected 3, reported 4$/],
+  ['a per-job CI failed count', (r) => bump(r, /(?<=::ci::[^\n]*`: n=\d+, failed=)\d+/), /^figure mismatch ci job: failed collected \d+, reported \d+$/],
+  ['a per-job row whose key the data does not hold', (r) => r.replace('::ci::test`:', '::ci::forged`:'), /^figure mismatch ci job: a row the collected data does not hold/],
+  ['a per-job row left out', (r) => r.split('\n').filter((l) => !l.includes('::ci::test`:')).join('\n'), /^figure mismatch ci job: .*collected .*reported none/],
   ['the scoped count', (r) => bump(r, /(?<=Scoped to product source \(config: [^)]*\): )\d+(?= counted)/), /^figure mismatch git scoped: scoped counted collected 0, reported 1$/],
   ['the scoped excluded count', (r) => bump(r, /\d+(?= excluded as pipeline)/), /^figure mismatch git scoped: scoped excluded collected 3, reported 4$/],
   ['the scoped unavailable count', (r) => bump(r, /\d+(?= unavailable \(changed paths)/), /^figure mismatch git scoped: scoped unavailable collected 0, reported 1$/],
@@ -216,10 +221,10 @@ const ROW_ALTERATIONS = [
   ['a per-plan run count', (r) => bump(r, /(?<=human_wait=\d+s \(n=)\d+/), /^figure mismatch wall-clock plan: human wait runs collected 0, reported 1$/],
   ['a per-plan unterminated-waits count', (r) => bump(r, /(?<=unterminated_waits: )\d+/), /^figure mismatch wall-clock plan: unterminated waits collected 1, reported 2$/],
   ['a wall-clock totals count', (r) => bump(r, /(?<=\(measured n=)\d+/), /^figure mismatch wall-clock totals: /],
-  ['a never-failing row run count', (r) => bump(r, /(?<=AC-QA-1: n=)\d+/), /^figure mismatch never-failing: n collected 6, reported 7$/],
-  ['a never-failing row disagreement count', (r) => bump(r, /(?<=AC-DIS-1: n=1 \(insufficient data\), verdict_disagreements=)\d+/), /^figure mismatch never-failing: verdict disagreements collected 1, reported 2$/],
+  ['a never-failing row run count', (r) => bump(r, /(?<=AC-QA-1`: n=)\d+/), /^figure mismatch never-failing: n collected 6, reported 7$/],
+  ['a never-failing row disagreement count', (r) => bump(r, /(?<=AC-DIS-1`: n=1 \(insufficient data\), verdict_disagreements=)\d+/), /^figure mismatch never-failing: verdict disagreements collected 1, reported 2$/],
   ['the criteria-rows-left-out count', (r) => bump(r, /\d+(?= criteria rows left out)/), /^figure mismatch never-failing: rows left out collected 16, reported 17$/],
-  ['a per-repository ledger record count', (r) => bump(r, /(?<=^- demo-CANARY: )\d+(?= record\(s\) in window)/m), /^figure mismatch ledger repository: records collected 18, reported 19$/],
+  ['a per-repository ledger record count', (r) => bump(r, /(?<=^- `demo-CANARY`: )\d+(?= record\(s\) in window)/m), /^figure mismatch ledger repository: records collected 18, reported 19$/],
   ['the skipped-lines count', (r) => bump(r, /^\d+(?= ledger line\(s\) were skipped)/m), /^figure mismatch ledger repository: skipped collected 1, reported 2$/],
   ['a trigger-accuracy count', (r) => bump(r, /(?<=total=)\d+/), /^figure mismatch trigger accuracy: total collected 1, reported 2$/],
   ['a rework disposition count', (r) => bump(r, /(?<=open=)\d+/), /^figure mismatch rework: open collected 1, reported 2$/],
@@ -234,8 +239,8 @@ const ROW_ALTERATIONS = [
   ['the blocked-TDD reason-not-recorded count', (r) => bump(r, /(?<=not recorded \(pre-T5\): )\d+/), /^figure mismatch blocked tdd: not recorded collected 1, reported 2$/],
   ['a suppression-share count', (r) => bump(r, /(?<=^ci_wait: )\d+(?=\/)/m), /^figure mismatch filtering: unmeasured collected 2, reported 3$/],
   ['a suppression-share total', (r) => bump(r, /(?<=^agent_compute: \d+\/)\d+/m), /^figure mismatch filtering: total collected 14, reported 15$/],
-  ['the sources line', (r) => r.replace('ci_wait=ledger:conduct_plan_event', 'ci_wait=ledger:forged'), /^figure mismatch wall-clock sources: ci wait source differs from the collected one$/],
-  ['the by-kind breakdown on the orphaned line', (r) => r.replace('tdd_task: 2', 'tdd_task: 3'), /^figure mismatch orphaned runs: terminal-only by kind differs from the collected one$/],
+  ['the sources line', (r) => r.replace('ci_wait=`ledger:conduct_plan_event', 'ci_wait=`ledger:forged'), /^figure mismatch wall-clock sources: ci wait source differs from the collected one$/],
+  ['the by-kind breakdown on the orphaned line', (r) => r.replace('`tdd_task`: 2', '`tdd_task`: 3'), /^figure mismatch orphaned runs: terminal-only by kind differs from the collected one$/],
 ]
 
 test('checkRows: the report the real workflow renders from the collected data passes every row check', async () => {
@@ -271,10 +276,10 @@ test('checkRows: a proposal\'s recorded adoption and rejection dates are held to
   const { col, report } = await real()
   const outcome = col.digest.ledger.proposalOutcomes.propCANARY0
   const section = (id, line) => `${report}\n### ${id}: A proposal\n${line}\n`
-  assert.deepEqual(checkRows(section('propCANARY0', `Already adopted on ${outcome.lastAdoptionTs}.`), col), [], 'control: the true date passes')
-  assert.match(checkRows(section('propCANARY0', 'Already adopted on 2020-01-01T00:00:00.000Z.'), col)[0], /^figure mismatch proposal outcome: adoption date/)
-  assert.match(checkRows(section('propCANARY0', '**Previously rejected on 2020-01-01T00:00:00.000Z.**'), col)[0], /^figure mismatch proposal outcome: rejection date/)
-  assert.match(checkRows(section('0123456789abcdef', `Already adopted on ${outcome.lastAdoptionTs}.`), col)[0], /^figure mismatch proposal outcome: an outcome the collected data does not hold/)
+  assert.deepEqual(checkRows(section('propCANARY0', `Already adopted on \`${outcome.lastAdoptionTs}\`.`), col), [], 'control: the true date passes')
+  assert.match(checkRows(section('propCANARY0', 'Already adopted on `2020-01-01T00:00:00.000Z`.'), col)[0], /^figure mismatch proposal outcome: adoption date/)
+  assert.match(checkRows(section('propCANARY0', '**Previously rejected on `2020-01-01T00:00:00.000Z`.**'), col)[0], /^figure mismatch proposal outcome: rejection date/)
+  assert.match(checkRows(section('0123456789abcdef', `Already adopted on \`${outcome.lastAdoptionTs}\`.`), col)[0], /^figure mismatch proposal outcome: an outcome the collected data does not hold/)
 })
 
 // ---- AC-ARCH-14 (whole-branch review round 2, L5): the coverage test drives the checks that actually run ----
@@ -286,18 +291,19 @@ test('checkRows: a proposal\'s recorded adoption and rejection dates are held to
 
 // Line shapes with a digit that are deliberately NOT held to the collected data, each with the reason. Narrow on purpose: a
 // broad pattern here would hide a new figure line, which is the thing this test exists to catch.
+// Round 3: a line of fixed prose is no longer listed here. Every line must be one of the script's own shapes, so a changed digit in fixed prose (an
+// acceptance criterion id, a review round) is refused as a line in a shape the check does not know. What is left is a digit in a script-written
+// number the check does not hold, or a digit inside code formatting, which is literal text from a repository or a model and never a figure.
 const UNCHECKED_SHAPES = [
-  [/^Instrumented invocation routes: /, 'fixed prose that cites an acceptance criterion id'],
-  [/^Blocked TDD runs unresolved in window may include a task re-briefed/, 'fixed prose that cites a review round'],
-  [/^- \S+ specs\/\S+ .+: (?:not recorded|test_attempt_cap|implement_attempt_cap|tests_modified|test_defect)/, 'one blocked run: ledger free text (repository, spec, task, date) flattened, not a collected figure'],
+  [/^- `[^`]*` `[^`]*` `[^`]*`: `/, 'one blocked run: ledger free text (repository, spec, task, reason, date), each in code formatting, not a collected figure'],
   [/^Repo \d{1,3} \(/, 'the roster position heading of the escaped-defect block'],
   [/^Drafted: \d+\. Dropped \(/, 'bookkeeping of the session\'s own proposal drafting, not collected data'],
   [/^Proposals rejected: malformed target: \d+/, 'bookkeeping of the session\'s own proposal drafting, not collected data'],
-  [/^### [0-9a-f]{16}: Proposal statement \(model text\): /, 'a proposal heading: the script\'s id and label, then confined model text'],
-  [/^n=\d+\. Motivating \(model text\): /, 'a proposal\'s measurements as the model cites them: confined model text, never a measured figure'],
-  [/^Target: /, 'a proposal\'s target words: confined model text, held by the sidecar rules instead'],
-  [/^- [0-9a-f]{16}: Proposal statement \(model text\): .* \(n=\d+\)$/, 'an insufficient-data proposal: confined model text'],
-  [/^Reinstatement evidence \(model text\): /, 'confined model text'],
+  [/^### [0-9a-f]{16}: Proposal statement \(model text\): `/, 'a proposal heading: the script\'s id and label, then model text in code formatting'],
+  [/^n=`[^`]*`\. Motivating \(model text\): `/, 'a proposal\'s n and measurements as the model cites them, in code formatting: never a measured figure'],
+  [/^Target: /, 'a proposal\'s target words, in code formatting: held by the sidecar rules instead'],
+  [/^- [0-9a-f]{16}: Proposal statement \(model text\): `.*` \(n=`[^`]*`\)$/, 'an insufficient-data proposal: model text in code formatting'],
+  [/^Reinstatement evidence \(model text\): `/, 'model text in code formatting'],
 ]
 
 // A proposal the workflow ranks (its citations resolve), so the proposal sections are rendered and their lines exercised.
@@ -313,7 +319,6 @@ async function renderedReports() {
   }))
 }
 
-const LANES_RAN = { ledger: { status: 'ran' }, git: { status: 'ran' }, ci: { status: 'ran' } }
 // The numeric lines of a report whose first number, changed by one, the real checkFigures does NOT notice.
 async function undetectedNumericLines(checkFigures) {
   const out = []
@@ -342,7 +347,7 @@ test('coverage: every entry of the unchecked list is shown to be needed, so the 
   const used = new Set()
   for (const { line } of await undetectedNumericLines(checkFigures)) UNCHECKED_SHAPES.forEach(([shape], i) => { if (shape.test(line)) used.add(i) })
   const unused = UNCHECKED_SHAPES.filter((_, i) => !used.has(i)).map(([shape]) => String(shape))
-  const needOtherFixtures = [/^Target: /, /^- [0-9a-f]{16}: Proposal statement \(model text\): .* \(n=\d+\)$/, /^Reinstatement evidence \(model text\): /].map(String)
+  const needOtherFixtures = [/^Target: /, /^- [0-9a-f]{16}: Proposal statement \(model text\): `.*` \(n=`[^`]*`\)$/, /^Reinstatement evidence \(model text\): `/].map(String)
   assert.deepEqual(unused, needOtherFixtures, 'every listed shape is rendered by these fixtures except those that need a digit in a target, an insufficient-data proposal or a removal proposal')
 })
 
@@ -399,19 +404,19 @@ test('formatVerdict: reasons are de-duplicated, only the first few are printed, 
 test('checkRows: a 5 MB report of well-formed rows that all disagree with the data grows no faster than its size', async () => {
   const { checkRows } = await load()
   const { col, report } = await real()
-  const key = report.split('\n').find((l) => l.includes('::ci::test: n=')).split(': n=')[0].slice(2)
+  const key = report.split('\n').find((l) => l.includes('::ci::test`: n=')).split(': n=')[0].slice(2)
   const rowsOf = (n) => Array.from({ length: n }, (_, i) => `- ${key}: n=${i + 100}, failed=0, mean 60s`).join('\n')
   const reasons = checkRows(`${report}\n${rowsOf(100000)}\n`, col)
   assert.ok(reasons.length >= 100000, 'the hostile report really does produce a reason per row')
   const { ROW_CLASSES } = await load()
   const callsFor = (n) => {
     let calls = 0
-    const originals = ROW_CLASSES.map((spec) => spec.isRow)
-    ROW_CLASSES.forEach((spec, i) => { spec.isRow = (line) => { calls += 1; return originals[i](line) } })
+    const originals = ROW_CLASSES.map((spec) => spec.re)
+    ROW_CLASSES.forEach((spec, i) => { spec.re = { exec: (line) => { calls += 1; return originals[i].exec(line) } } })
     try {
       checkRows(`${report}\n${rowsOf(n)}\n`, col)
     } finally {
-      ROW_CLASSES.forEach((spec, i) => { spec.isRow = originals[i] })
+      ROW_CLASSES.forEach((spec, i) => { spec.re = originals[i] })
     }
     return calls
   }
@@ -481,4 +486,14 @@ test('checkLanes and checkDigest: collected data that cannot be read is named, n
   const broken = { lane: { ...col.lane, ledger: null }, digest: col.digest }
   assert.ok(checkLanes({ ledger: { status: 'ran' }, git: { status: 'ran' }, ci: { status: 'ran' } }, broken).includes('collected data unreadable: ledger'))
   assert.deepEqual(checkDigest('# R', { lane: col.lane, digest: null }), ['collected data unreadable: digest'])
+})
+
+// Round 3: a headline figure is on exactly one line. A second, identical true ledger line is a script shape with the true figure, so only the
+// uniqueness rule refuses it.
+test('checkLedger: a second, identical true ledger line is refused as a line in a shape the check does not know', async () => {
+  const { checkLedger } = await load()
+  const { col, report } = await real()
+  const line = report.split('\n').find((l) => l.startsWith('Ledger records in window: '))
+  assert.deepEqual(checkLedger(report, col).reasons, [], 'control')
+  assert.deepEqual(checkLedger(`${report}\n${line}\n`, col).reasons, ['figure mismatch ledger: a line in a shape the check does not know'])
 })

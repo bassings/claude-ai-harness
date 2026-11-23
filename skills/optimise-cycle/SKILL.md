@@ -79,7 +79,10 @@ inside the repository being analysed.
    This is the same result check the weekly runner uses. It first checks that
    `<main root>` is the main checkout of `<repository root>` (the repository
    itself, or the one a linked worktree belongs to; anything else is refused),
-   then checks every figure in the report against the collected lane files,
+   then checks that every line of the report is one the script writes (text from
+   a repository or a model is shown as literal text in code formatting, so job
+   names and proposals look like code samples and are never read as figures)
+   and every figure in it against the collected lane files,
    every returned proposal-targets entry against what this run names (a key that
    is not a proposal id, a target of the wrong shape or under the wrong id, or an
    id this run does not name is refused), and the keyed digest (the result must

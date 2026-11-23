@@ -1838,7 +1838,20 @@ export const PROPOSAL_IDENTITY_KEYS = ['kind', 'component', 'concern', 'lens', '
 // target before it writes it to the sidecar), whitespace runs collapsed (as the sidecar read collapses them), trimmed and lower-cased. So a stored
 // target always hashes to its own key. Deliberate consequence (owner decision 2026-11-23, M3): two targets that differ only in text that redacts to
 // the same marker share one id, and are one proposal as far as history goes. The workflow's proposal-id block does the same (a parity test).
-const identityValue = (v) => (typeof v === 'string' ? v : String(v ?? '')).replace(ABSOLUTE_PATH_RE, (whole, prefix) => prefix + REDACTED_PATH_MARKER).replaceAll(/\s+/g, ' ').trim().toLowerCase()
+// Whole-branch review round 3, L3: the value is then bounded to IDENTITY_VALUE_MAX UTF-16 units (the sidecar's limit for a stored field), by whole
+// characters, and trimmed again. A value within the bound is unchanged, so no existing id moves; the workflow stores an over-long field as exactly
+// this value, so the stored target hashes to the same id as the drafted one. Two targets that differ only past the bound share one id.
+const IDENTITY_VALUE_MAX = 200
+function boundedIdentity(text) {
+  if (text.length <= IDENTITY_VALUE_MAX) return text
+  let cut = ''
+  for (const ch of text) {
+    if (cut.length + ch.length > IDENTITY_VALUE_MAX) break
+    cut += ch
+  }
+  return cut.trim()
+}
+const identityValue = (v) => boundedIdentity((typeof v === 'string' ? v : String(v ?? '')).replace(ABSOLUTE_PATH_RE, (whole, prefix) => prefix + REDACTED_PATH_MARKER).replaceAll(/\s+/g, ' ').trim().toLowerCase())
 
 // A stable proposal id derived from the TARGET a proposal is about (never
 // its prose wording), so the same target re-proposed across cycles is
@@ -2087,8 +2100,9 @@ function attachSidecarTargets(outcomes, roots) {
 
 // An outcome recorded under an id computed before the identity value was redacted and normalised (the old id of a path-shaped or multi-space
 // target) is also reachable under the id its stored target hashes to now, so a proposal re-raised today finds its prior rejection or adoption.
-// The old entry is left exactly as it is (nothing is renamed, dropped or rewritten); an id that already has an outcome of its own is not replaced.
-// When both ids have a history it is COMBINED (counts added, the later date kept, reverted twice counted across both), and both ids show the combined view.
+// The old entry is left exactly as it is on disk (nothing is renamed, dropped or rewritten). Every legacy id that maps to one current id, and the
+// current id's own outcome when it has one, are COMBINED into one outcome (counts added, the later date kept, reverted twice counted across all of
+// them), and every id in that group shows the combined view (whole-branch review round 3, M3: a second legacy id was left out before).
 const laterTs = (a, b) => {
   if (a === null || a === undefined) return b ?? null
   if (b === null || b === undefined) return a
@@ -2109,18 +2123,24 @@ function combineOutcomes(legacy, current) {
     target: current.target ?? legacy.target,
   }
 }
-function withLegacyAliases(outcomes) {
-  const changes = []
+// Each current id with the legacy ids whose stored target hashes to it, in ledger order.
+function legacyGroups(outcomes) {
+  const groups = new Map()
   for (const [id, o] of Object.entries(outcomes)) {
     if (!o.target || !/^[0-9a-f]{16}$/.test(id)) continue
     const current = stableProposalId(o.target)
-    if (current === id || changes.some(([, taken]) => taken === current)) continue
-    changes.push([id, current])
+    if (current === id) continue
+    if (!groups.has(current)) groups.set(current, [])
+    groups.get(current).push(id)
   }
-  for (const [id, current] of changes) {
-    const combined = Object.hasOwn(outcomes, current) ? combineOutcomes(outcomes[id], outcomes[current]) : { ...outcomes[id] }
+  return groups
+}
+function withLegacyAliases(outcomes) {
+  for (const [current, legacyIds] of legacyGroups(outcomes)) {
+    const own = Object.hasOwn(outcomes, current) ? outcomes[current] : null
+    const combined = legacyIds.reduce((acc, id) => (acc === null ? { ...outcomes[id] } : combineOutcomes(outcomes[id], acc)), own)
     outcomes[current] = combined
-    outcomes[id] = { ...combined }
+    for (const id of legacyIds) outcomes[id] = { ...combined }
   }
   return outcomes
 }

@@ -235,7 +235,7 @@ test('AC-PROD-3: a failed ledger lane leaves the good git figure in the report, 
   assert.match(result.report, new RegExp(`^Raw \\(unscoped\\): ${digest.git.count} of ${digest.git.n_commits_examined} examined`, 'm'), 'the git figure is kept')
   assert.ok(!/Unmatched git result|ledger identity unavailable/.test(result.report), 'the figure is not discarded for want of a ledger identity')
   assert.match(result.report, /Ledger analysis unavailable/)
-  assert.ok(result.report.includes('Not measured: FIXED-LEDGER-REASON the ledger could not be read'))
+  assert.ok(result.report.includes('Not measured: `FIXED-LEDGER-REASON the ledger could not be read`'))
   assert.equal(result.lanes.ledger.status, 'failed')
   assert.equal(result.lanes.ledger.reason, 'FIXED-LEDGER-REASON the ledger could not be read')
   assert.equal(result.lanes.git.status, 'ran')
@@ -248,7 +248,7 @@ test('HARN-RUNNER-2 T3 M3: a failed ledger lane prints no ledger record count at
   const { result } = await T.runDigest(digest)
   assert.ok(!/Ledger records in window/.test(result.report), 'no record count line while the ledger lane failed')
   assert.ok(!/minimum for harness-side proposals/.test(result.report), 'nor its minimum')
-  assert.ok(result.report.includes('Not measured: FIXED-LEDGER-REASON the ledger could not be read'), 'the lane\'s reason is shown instead')
+  assert.ok(result.report.includes('Not measured: `FIXED-LEDGER-REASON the ledger could not be read`'), 'the lane\'s reason is shown instead')
   const ran = await T.runDigest(T.collection('moderate').digest)
   assert.match(ran.result.report, /^Ledger records in window: \d+ /m, 'control: a ledger that ran still prints its count')
 })
@@ -269,8 +269,8 @@ test('AC-PROD-3: a failed ci lane and a failed git lane each show their fixed re
   digest.git = null
   digest.lanes.git = failedLane('FIXED-GIT-REASON no commits')
   const { result } = await T.runDigest(digest)
-  assert.ok(result.report.includes('Not measured: FIXED-CI-REASON gh is not signed in'))
-  assert.ok(result.report.includes('Not measured: FIXED-GIT-REASON no commits'))
+  assert.ok(result.report.includes('Not measured: `FIXED-CI-REASON gh is not signed in`'))
+  assert.ok(result.report.includes('Not measured: `FIXED-GIT-REASON no commits`'))
   assert.ok(!/^Raw \(unscoped\)/m.test(result.report), 'no escaped-defect count of 0 or any figure')
   assert.equal(result.lanes.ci.status, 'failed')
   assert.equal(result.lanes.git.status, 'failed')
@@ -491,9 +491,9 @@ for (const entry of ['digest', 'full']) {
     for (const id of run.ids.slice(0, 4)) assert.ok(result.report.includes(`### ${id}: `), `a heading for ${id}`)
     assert.ok(result.report.includes(`- ${run.ids[4]}: `), 'the insufficient-data proposal is a list line')
     assert.ok(!result.report.includes(`### ${run.ids[4]}: `), 'and not a heading')
-    assert.match(result.report, /Previously rejected on 2026-07-01/)
+    assert.match(result.report, /Previously rejected on `2026-07-01/)
     assert.match(result.report, /reverted at least twice/)
-    assert.match(result.report, /Already adopted on 2026-07-02/)
+    assert.match(result.report, /Already adopted on `2026-07-02/)
   })
 
   test(`AC-PROD-4/AC-SIMP-4: the sidecar maps every proposal id of this run, and every prior outcome's recorded target, to its target (${entry === 'digest' ? 'the collector digest' : 'the full lane results'})`, async () => {
@@ -588,7 +588,7 @@ test('AC-SEC-6 (L1): a newline, a forged heading and a forged RESULT line in the
   const col = T.collection('moderate')
   col.digest.ledger.perRepo[0].root = FORGED_LABEL
   const { result } = await T.runDigest(col.digest)
-  assert.match(result.report, /^Repos: demo/m, 'guard against vacuity: the Repos line rendered the label')
+  assert.match(result.report, /^Repos: `demo/m, 'guard against vacuity: the Repos line rendered the label, in code formatting')
   assertLabelHarmless(result.report, 'digest, ledger label')
 })
 
@@ -597,7 +597,7 @@ test('AC-SEC-6 (L1): the git result\'s repository label, used when the ledger la
   col.digest.lanes.ledger = { status: 'failed', mode: null, reason: 'ledger lane failed' }
   col.digest.git.repo = FORGED_LABEL
   const { result } = await T.runDigest(col.digest)
-  assert.match(result.report, /^Repos: demo/m, 'guard against vacuity: the Repos line rendered the label')
+  assert.match(result.report, /^Repos: `demo/m, 'guard against vacuity: the Repos line rendered the label, in code formatting')
   assertLabelHarmless(result.report, 'digest, git label')
 })
 

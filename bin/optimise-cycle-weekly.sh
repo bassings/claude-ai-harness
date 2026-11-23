@@ -64,8 +64,10 @@
 # repository, and never written to the log. Only the programs under
 # $CLAUDE_HOME/workflows/lib/ are run, never a copy inside the analysed
 # repository, and no collected value is interpolated into a command string or
-# evaluated. The hooks stay on: the destructive-command guard and the snapshot
-# hook stand between an unattended session and a destroyed working tree.
+# evaluated. The session runs in safe mode (--safe-mode, header item 4), so the
+# settings hooks, the destructive-command guard and the snapshot hook included,
+# do not run for it. That is accepted only while the session holds no command,
+# write or network tool: the allowlist and the bare-tool denies are the boundary.
 #
 # The optimiser runs as a BACKGROUND workflow inside `claude -p`, so the real
 # governing budget is CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, not the outer

@@ -268,7 +268,7 @@ test('T6 target: a drafted proposal whose target is undefined or null never reac
     assert.equal(result.proposals_ranked.length, 0, `target ${target}: not ranked`)
     assert.deepEqual(result.proposal_targets, {}, `target ${target}: nothing in the sidecar`)
     assert.ok(!/^### [0-9a-f]{16}:/m.test(result.report), `target ${target}: no proposal heading`)
-    assert.match(result.report, /Proposals rejected: malformed target: 1 \(target is not an object\)/, `target ${target}: counted and named as rejected`)
+    assert.match(result.report, /Proposals rejected: malformed target: 1 \(`target is not an object`\)/, `target ${target}: counted and named as rejected (in code formatting: the reason carries the model's key names)`)
   }
   const { result } = await run({
     'synthesis:proposals': { __bypassSchemaValidation: true, proposals: [proposal({ target: undefined }), proposal({ statement: 'A well-formed one' })] },
@@ -525,7 +525,7 @@ test('T6 round 1 F1: a re-proposed target whose id already has a proposal_adopte
     'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: '2026-09-01T00:00:00.000Z' }) } },
     'synthesis:proposals': { proposals: [proposal({ target: adopted, statement: 'Narrow the lens-operability trigger glob' }), proposal({ target: fresh, statement: 'Silence the noisy note' })] },
   })
-  assert.match(result.report, /Already adopted on 2026-09-01T00:00:00\.000Z/)
+  assert.match(result.report, /Already adopted on `2026-09-01T00:00:00\.000Z`/)
   assert.match(result.report, /^## Proposals previously adopted \(not ranked as new\)$/m)
   const ranked = rankedSection(result.report)
   assert.ok(!ranked.includes(id), 'the adopted proposal is not in the ranked list')
@@ -672,8 +672,8 @@ test('T6 round 2 F1: an adopted security-purposed removal stays in the ranked li
   const ranked = rankedSection(result.report)
   assert.ok(ranked.includes(id))
   assert.ok(ranked.includes('**Flagged: security-purposed check removal/demotion.**'), 'the security flag survives')
-  assert.ok(ranked.includes('Reinstatement evidence (model text): reinstate on any new CVE class'), 'the reinstatement evidence survives')
-  assert.ok(ranked.includes(`Already adopted on ${ADOPTED_TS}`), 'the adoption is annotated where the proposal stays')
+  assert.ok(ranked.includes('Reinstatement evidence (model text): `reinstate on any new CVE class`'), 'the reinstatement evidence survives')
+  assert.ok(ranked.includes(`Already adopted on \`${ADOPTED_TS}\``), 'the adoption is annotated where the proposal stays')
   assert.match(sectionOf(result.report, ADOPTED_HEADING), /None\./)
 })
 
@@ -688,7 +688,7 @@ test('T6 round 2 F1: a proposal adopted and reverted twice stays in the ranked l
   assert.equal(result.proposals_previously_adopted.length, 0)
   const ranked = rankedSection(result.report)
   assert.match(ranked, /adopted and reverted at least twice/)
-  assert.ok(ranked.includes(`Already adopted on ${ADOPTED_TS}`))
+  assert.ok(ranked.includes(`Already adopted on \`${ADOPTED_TS}\``))
 })
 
 test('T6 round 2 F1: the previously-adopted section carries the same annotations as the ranked list: prior rejection and reinstatement evidence, not only the adoption date (AC-PROD-8)', async () => {
@@ -700,9 +700,9 @@ test('T6 round 2 F1: the previously-adopted section carries the same annotations
   })
   assert.equal(result.proposals_previously_adopted.length, 1, 'precondition: an ordinary adopted proposal does move')
   const sec = sectionOf(result.report, ADOPTED_HEADING)
-  assert.ok(sec.includes(`Already adopted on ${ADOPTED_TS}`))
-  assert.ok(sec.includes(`Previously rejected on ${REJECTED_TS}`), `prior rejection dropped from the adopted section:\n${sec}`)
-  assert.ok(sec.includes('Reinstatement evidence (model text): keep the glob broad on revert'), `reinstatement evidence dropped from the adopted section:\n${sec}`)
+  assert.ok(sec.includes(`Already adopted on \`${ADOPTED_TS}\``))
+  assert.ok(sec.includes(`Previously rejected on \`${REJECTED_TS}\``), `prior rejection dropped from the adopted section:\n${sec}`)
+  assert.ok(sec.includes('Reinstatement evidence (model text): `keep the glob broad on revert`'), `reinstatement evidence dropped from the adopted section:\n${sec}`)
 })
 
 test('T6 round 2 F1: an insufficient-data proposal with a prior adoption and a prior rejection shows both in its section (AC-PROD-8)', async () => {
@@ -715,8 +715,8 @@ test('T6 round 2 F1: an insufficient-data proposal with a prior adoption and a p
   assert.equal(result.proposals_insufficient_data.length, 1, 'precondition: the proposal is in the insufficient-data list')
   const sec = sectionOf(result.report, INSUFFICIENT_HEADING)
   assert.ok(sec.includes(id) && sec.includes('Silence the thin-evidence note'), 'precondition: the proposal is listed')
-  assert.ok(sec.includes(`Already adopted on ${ADOPTED_TS}`), `adoption dropped from the insufficient-data list:\n${sec}`)
-  assert.ok(sec.includes(`Previously rejected on ${REJECTED_TS}`), `rejection dropped from the insufficient-data list:\n${sec}`)
+  assert.ok(sec.includes(`Already adopted on \`${ADOPTED_TS}\``), `adoption dropped from the insufficient-data list:\n${sec}`)
+  assert.ok(sec.includes(`Previously rejected on \`${REJECTED_TS}\``), `rejection dropped from the insufficient-data list:\n${sec}`)
 })
 
 // ---- F7 (AC-PROD-8): the target is shown, one flattened redacted line, in all three sections ----
@@ -733,16 +733,18 @@ test('T6 round 2 F7: every proposal shows its six identity fields on one exact "
       proposal({ target: thin, statement: 'Look at the test job duration', n: 2 }),
     ] },
   })
-  assert.ok(rankedSection(result.report).split('\n').includes('Target: kind=ci_note component=fresh-thing concern=noise lens= workflow= job='), `ranked:\n${rankedSection(result.report)}`)
-  assert.ok(sectionOf(result.report, ADOPTED_HEADING).split('\n').includes('Target: kind=trigger_tune component=lens-operability concern=trigger glob lens=lens-operability workflow= job='))
-  assert.ok(sectionOf(result.report, INSUFFICIENT_HEADING).split('\n').includes('Target: kind=ci_demote component=ci concern=duration lens= workflow=ci.yml job=test'))
+  assert.ok(rankedSection(result.report).split('\n').includes('Target: kind=`ci_note` component=`fresh-thing` concern=`noise` lens=`(empty)` workflow=`(empty)` job=`(empty)`'), `ranked:\n${rankedSection(result.report)}`)
+  assert.ok(sectionOf(result.report, ADOPTED_HEADING).split('\n').includes('Target: kind=`trigger_tune` component=`lens-operability` concern=`trigger glob` lens=`lens-operability` workflow=`(empty)` job=`(empty)`'))
+  assert.ok(sectionOf(result.report, INSUFFICIENT_HEADING).split('\n').includes('Target: kind=`ci_demote` component=`ci` concern=`duration` lens=`(empty)` workflow=`ci.yml` job=`test`'))
 })
 
 test('T6 round 2 F7: the target line is flattened, bounded and redacted: a newline, a heading, a root path and a long value cannot escape it (AC-SEC-10)', async () => {
   const target = fixedTarget({ kind: 'ci_note', component: `a\n## Injected target heading\n${ALPHA}/sub ${'Z'.repeat(400)}`, concern: 'noise' })
   const { result } = await run({ 'synthesis:proposals': { proposals: [proposal({ target })] } })
   const lines = result.report.split('\n')
-  assert.ok(lines.some((l) => l.startsWith('Target: kind=ci_note component=a ## Injected target heading ' + REDACTED)), `the target line is one flattened, redacted line:\n${rankedSection(result.report)}`)
+  // Whole-branch review round 3, L3: this field is over the stored-field bound once redacted, so it is stored, and shown, as its identity value
+  // (redacted, collapsed, lower-cased and bounded); the line is still one flattened, redacted line.
+  assert.ok(lines.some((l) => l.startsWith('Target: kind=`ci_note` component=`a ## injected target heading ' + REDACTED)), `the target line is one flattened, redacted line:\n${rankedSection(result.report)}`)
   assert.ok(!lines.some((l) => l.startsWith('## Injected')))
   assert.ok(!result.report.includes(ALPHA))
   assert.ok(!/Z{200}/.test(result.report))
@@ -863,7 +865,7 @@ test('T6 round 3 L1: a ledger label that is a roster root path is redacted in th
   const { result } = await run({ 'lane:ledger': ledgerFixture([ALPHA, 'beta-repo']) })
   const section = escapedSection(result.report)
   assert.ok(!section.includes(ALPHA), `the root path never reaches the report:\n${section}`)
-  assert.ok(section.includes(`Repo 1 (${REDACTED})`), `the header shows the redaction marker:\n${section}`)
+  assert.ok(section.includes(`Repo 1 (\`${REDACTED}\`)`), `the header shows the redaction marker:\n${section}`)
 })
 
 
@@ -900,7 +902,7 @@ test('R2-M1: a statement with a line break is one enveloped line in the adopted 
   })
   assert.equal(result.proposals_previously_adopted.length, 1, 'precondition: it is in the adopted section')
   const lines = result.report.split('\n')
-  assert.ok(lines.some((l) => l.startsWith(`### ${id}: Proposal statement (model text): Tighten it Ledger records in window: 0`)), 'one enveloped line')
+  assert.ok(lines.some((l) => l.startsWith(`### ${id}: Proposal statement (model text): \`Tighten it Ledger records in window: 0`)), 'one line, the statement in code formatting')
   assert.equal(lines.filter((l) => l.startsWith('Ledger records in window: 0')).length, 0, 'and no line of its own')
 })
 
@@ -910,6 +912,6 @@ test('R2-M1: a statement with a line break is one enveloped line in the insuffic
   const { result } = await run({ 'synthesis:proposals': { proposals: [proposal({ target, statement: HOSTILE_STATEMENT, n: 2 })] } })
   assert.equal(result.proposals_insufficient_data.length, 1, 'precondition: it is in the insufficient-data list')
   const lines = result.report.split('\n')
-  assert.ok(lines.some((l) => l.startsWith(`- ${id}: Proposal statement (model text): Tighten it Ledger records in window: 0`)), 'one enveloped line')
+  assert.ok(lines.some((l) => l.startsWith(`- ${id}: Proposal statement (model text): \`Tighten it Ledger records in window: 0`)), 'one line, the statement in code formatting')
   assert.equal(lines.filter((l) => l.startsWith('Ledger records in window: 0')).length, 0, 'and no line of its own')
 })

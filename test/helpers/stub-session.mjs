@@ -120,10 +120,13 @@ function bumpFirst(report, re, delta) {
   return report.replace(re, (all, n) => (typeof n === 'string' ? all.replace(n, String(Math.max(0, Number(n) + delta))) : String(Math.max(0, Number(all) + delta))))
 }
 
+// Padded with one line the workflow could have written: a lane reason in code formatting, so the padding is literal text, never a line in a
+// shape the result check does not know (whole-branch review round 3).
 function padTo(report, bytes) {
-  const have = Buffer.byteLength(report, 'utf8')
+  const line = '\nNot measured: ``'
+  const have = Buffer.byteLength(report + line, 'utf8')
   if (have > bytes) throw new Error(`stub-session: the report is already ${have} bytes`)
-  return report + 'a'.repeat(bytes - have)
+  return `${report}\nNot measured: \`${'a'.repeat(bytes - have)}\``
 }
 
 // The workflow's returned object for the digest the runner collected; `change` may alter the digest first.
@@ -159,13 +162,13 @@ const DAMAGE = {
   'no-sidecar': (r) => { delete r.proposal_targets },
   // A proposal heading whose id is not a sidecar key (what an undefined target would leave if one reached the ranked list),
   // and the control: the same heading with its key present.
-  'heading-without-key': (r) => { r.report += '\n### 0123456789abcdef: A proposal\n' },
-  'heading-with-key': (r) => { r.report += `\n### ${WELL_FORMED_ID}: A proposal\n`; r.proposal_targets = { ...r.proposal_targets, [WELL_FORMED_ID]: WELL_FORMED } },
+  'heading-without-key': (r) => { r.report += '\n### 0123456789abcdef: Proposal statement (model text): `A proposal`\n' },
+  'heading-with-key': (r) => { r.report += `\n### ${WELL_FORMED_ID}: Proposal statement (model text): \`A proposal\`\n`; r.proposal_targets = { ...r.proposal_targets, [WELL_FORMED_ID]: WELL_FORMED } },
   // One well-formed target no other session returns, named by its own heading: what two runners at once each add.
   'heading-unique': (r) => {
     const t = { ...WELL_FORMED, job: `unique-${process.pid}-${Date.now()}` }
     const id = stableProposalId(t)
-    r.report += `\n### ${id}: A proposal\n`
+    r.report += `\n### ${id}: Proposal statement (model text): \`A proposal\`\n`
     r.proposal_targets = { ...r.proposal_targets, [id]: t }
   },
   // The hash of the nonce the workflow fenced with, replaced by another nonce's, and removed (HARN-RUNNER-2 T3 H2).
@@ -181,8 +184,8 @@ const DAMAGE = {
   'ledger-line-removed': (r) => { r.report = r.report.split('\n').filter((l) => !l.startsWith('Ledger records in window: ')).join('\n') },
   // Twenty thousand rows for one known job, each with a different count: a reason apiece (HARN-RUNNER-2 T3 M5).
   'many-mismatches': (r) => {
-    const key = /^- (\S+::ci::test): n=/m.exec(r.report)[1]
-    r.report += `\n${Array.from({ length: 20000 }, (_, i) => `- ${key}: n=${i + 100}, failed=0, mean 60s`).join('\n')}\n`
+    const key = /^- `([^`\n]+::ci::test)`: n=/m.exec(r.report)[1]
+    r.report += `\n${Array.from({ length: 20000 }, (_, i) => `- \`${key}\`: n=${i + 100}, failed=0, mean 60s`).join('\n')}\n`
   },
   // The sidecar the session returns, damaged in one named way (HARN-RUNNER-2 T3 H1). The ids of the decided targets a test
   // seeds are DECIDED_ID_1.. (see test/harn-runner-2-t3.test.js); every other id here is made up.
@@ -196,13 +199,13 @@ const DAMAGE = {
   // Figures that alter exactly one number of one class of row by one (HARN-RUNNER-2 T3 M2). Each matches from the number itself.
   'job-n-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=::ci::[^\n]*: n=)\d+/, 1) },
   'job-failed-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=::ci::[^\n]*: n=\d+, failed=)\d+/, 1) },
-  'job-forged-row': (r) => { r.report = r.report.replace(/::ci::build:/, '::ci::forged-job:') },
+  'job-forged-row': (r) => { r.report = r.report.replace(/::ci::build`:/, '::ci::forged-job`:') },
   'scoped-excluded-plus1': (r) => { r.report = bumpFirst(r.report, /\d+(?= excluded as pipeline)/, 1) },
   'repostats-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=rate_limited )\d+/, 1) },
   'ghcalls-plus1': (r) => { r.report = bumpFirst(r.report, /\d+(?= gh calls)/, 1) },
   'plan-wait-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=: ci_wait=)\d+(?=s \(n=)/, 1) },
   'totals-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=\(measured n=)\d+/, 1) },
-  'neverfailing-n-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=AC-QA-1: n=)\d+/, 1) },
+  'neverfailing-n-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=AC-QA-1`: n=)\d+/, 1) },
   'leftout-plus1': (r) => { r.report = bumpFirst(r.report, /\d+(?= criteria rows left out)/, 1) },
   'ledgerrow-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=^- [^\n]+: )\d+(?= record\(s\) in window)/m, 1) },
   'trigger-plus1': (r) => { r.report = bumpFirst(r.report, /(?<=total=)\d+/, 1) },
@@ -226,7 +229,7 @@ const DAMAGE = {
   'abs-repo-only': (r) => { r.report += `\nAnalysed ${repoDir()} today\n` },
   'abs-rundir-only': (r) => { r.report += `\nCollected into ${runDir} today\n` },
   'abs-home-only': (r) => { r.report += `\nUnder ${process.env.HOME}/notes today\n` },
-  'mentions-ceiling-var': (r) => { r.report += '\nSee CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in the README for details.\n' },
+  'mentions-ceiling-var': (r) => { r.report += '\nNot measured: `See CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in the README for details.`\n' },
   bom: (r) => { r.report = '﻿' + r.report },
 }
 

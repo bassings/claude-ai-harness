@@ -310,8 +310,8 @@ test('optimise-cycle: the report\'s Sample completeness section renders start-on
   assert.ok(line, `expected a line starting with "Orphaned agent-compute runs", report was: ${result.report}`)
   assert.ok(line.includes('start-only=4'), `got: ${line}`)
   assert.ok(line.includes('terminal-only=2'), `got: ${line}`)
-  assert.ok(line.includes('review_cycle: 4'), `start-only by-kind breakdown missing, got: ${line}`)
-  assert.ok(line.includes('review_cycle: 1') && line.includes('tdd_task: 1'), `terminal-only by-kind breakdown missing, got: ${line}`)
+  assert.ok(line.includes('`review_cycle`: 4'), `start-only by-kind breakdown missing, got: ${line}`)
+  assert.ok(line.includes('`review_cycle`: 1') && line.includes('`tdd_task`: 1'), `terminal-only by-kind breakdown missing, got: ${line}`)
 })
 
 test('optimise-cycle: the report renders real ZEROS for the orphan counts on a clean fixture, never omitting the line entirely -- a missing line means the check stopped running, never that nothing is wrong (H2, AC-OPS-2)', async () => {
@@ -1622,7 +1622,7 @@ test('optimise-cycle: a proposal whose target matches a prior proposal_rejected 
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
   assert.equal(result.proposals_ranked.length, 1)
   assert.equal(result.proposals_ranked[0].prior_rejection_ts, '2026-07-01T00:00:00.000Z')
-  assert.match(result.report, /previously rejected on 2026-07-01/i)
+  assert.match(result.report, /previously rejected on `2026-07-01/i)
 })
 
 test('optimise-cycle: a proposal whose target matches a proposal_reverted at least twice is flagged reverted_twice (M7, §12)', async () => {
@@ -1666,7 +1666,7 @@ test('optimise-cycle: the never-failing AC section renders verdict_disagreements
   const row = { key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, never_failed: false, verdict_disagreements: 2 }
   const responses = baseResponses({ 'lane:ledger': ledgerFixture({ neverFailingAcs: [row] }) })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  const line = result.report.split('\n').find((l) => l.includes('specs/a.md AC-QA-1'))
+  const line = result.report.split('\n').find((l) => l.includes('`specs/a.md` `AC-QA-1`'))
   assert.ok(line, `expected the AC line, report was: ${result.report}`)
   assert.ok(line.includes('verdict_disagreements=2'), `got: ${line}`)
 })
@@ -1698,7 +1698,7 @@ test('optimise-cycle: a never-failing AC whose verdict array was truncated rende
   const row = { key: 'demo|specs/a.md|AC-QA-1', repo: 'demo', spec: 'specs/a.md', ac_id: 'AC-QA-1', n: 6, insufficient_data: false, truncated_in_window: true, never_failed: null, verdict_disagreements: null }
   const responses = baseResponses({ 'lane:ledger': ledgerFixture({ neverFailingAcs: [row] }) })
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: responses })
-  const line = result.report.split('\n').find((l) => l.includes('specs/a.md AC-QA-1'))
+  const line = result.report.split('\n').find((l) => l.includes('`specs/a.md` `AC-QA-1`'))
   assert.ok(line, `expected the AC line, report was: ${result.report}`)
   assert.ok(line.includes('verdict_disagreements=not measured'), `got: ${line}`)
   assert.ok(!/verdict_disagreements=(0|null)\b/.test(line), `got: ${line}`)
@@ -1895,7 +1895,7 @@ test('optimise-cycle (HARN-OPT-4 T5, round 1 M1): an entry with laterDoneSameSpe
   const lines = result.report.split('\n')
   const hit = lines.filter((l) => l.includes('BUG-018 brief'))
   assert.equal(hit.length, 1, `report was:\n${result.report}`)
-  assert.ok(hit[0].includes('(a later done run exists for this spec at 2026-10-11T23:08:00.000Z; under a multi-task plan this may be another task)'), `got: ${hit[0]}`)
+  assert.ok(hit[0].includes('(a later done run exists for this spec at `2026-10-11T23:08:00.000Z`; under a multi-task plan this may be another task)'), `got: ${hit[0]}`)
   const miss = lines.filter((l) => l.includes('OTHER-001 brief'))
   assert.equal(miss.length, 1)
   assert.ok(!miss[0].includes('a later done run exists'), `got: ${miss[0]}`)
@@ -1953,9 +1953,9 @@ test('optimise-cycle (HARN-OPT-4 T5, round 2 L1): a 2000-character task is cut s
   const hostile = 'T' + 'y'.repeat(1999)
   const bu = { count: 1, unresolved: [{ repo: 'demo', spec: 'specs/a.md', task: hostile, reason: 'tests_modified', laterDoneSameSpec: false, laterDoneSameSpecTs: null }], byReason: { test_attempt_cap: 0, implement_attempt_cap: 0, tests_modified: 1 }, reasonNotRecorded: 0 }
   const { result } = await runWorkflow(WORKFLOW, { args: {}, agent: baseResponses({ 'lane:ledger': ledgerFixture({ blockedUnresolved: bu }) }) })
-  const line = result.report.split('\n').find((l) => l.startsWith('- demo specs/a.md '))
+  const line = result.report.split('\n').find((l) => l.startsWith('- `demo` `specs/a.md` '))
   assert.ok(line, `report was:\n${result.report}`)
-  const seg = line.slice('- demo specs/a.md '.length, line.lastIndexOf(': tests_modified'))
+  const seg = line.slice('- `demo` `specs/a.md` `'.length, line.lastIndexOf('`: `tests_modified`'))
   assert.ok(seg.startsWith('Tyyy'), `got: ${seg.slice(0, 20)}`)
   assert.ok(seg.length <= 120, `task segment was ${seg.length} characters`)
 })

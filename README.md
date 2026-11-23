@@ -1315,16 +1315,19 @@ analysed repository.
 **What the report guarantees.** Every measured figure in it is on a line the script wrote, in
 a fixed shape, and the result check matched that line to the data it collected (the ledger record
 count, the CI run counts, the escaped-defect counts, the digest's omissions, the per-row tables and
-the recorded adoption and rejection dates). Everything a model wrote (a proposal's statement,
-its measurements, its citations, its reinstatement evidence and the words of its target) is
-confined to one line, stripped of control, invisible and direction characters, and has any
-character reference neutralised; it is always on a marked line (`(model text)` after a fixed
-label, or after `Target:`), and it is never a measured figure. The check refuses a report in which
-any line other than the script's own figure line carries a headline figure's label, however it is
-spelled (in a list item, a table cell, a link, behind a look-alike letter or a character reference),
-**including inside a proposal's own text: a proposal has no need to quote a headline line, so one that
-does is refused, not allowed.** A report is not guaranteed to be free of misleading prose in a
-proposal's wording: that is read by the operator before anything is acted on.
+the recorded adoption and rejection dates). Every piece of text that came from a repository (a CI
+job name, a repository label, a plan key, a spec path, a criterion id, a lens name, ledger free
+text, the collector's notes) or from a model (a proposal's statement, its measurements, its
+citations, its reinstatement evidence and the words of its target) is shown as literal text in
+code formatting: one line, with control, invisible and direction characters removed and any
+backtick turned into an apostrophe, inside a Markdown code span that a viewer never interprets.
+So it can never become a line of its own, a heading, a link, inline HTML or a measured figure,
+however the report is rendered, and proposals and job names therefore look like code samples.
+The check holds the report to that structurally: every line must be one of the shapes the script
+writes, with an even number of backticks, so text outside code formatting that the script did not
+write fails the run. A proposal may quote a headline label or cite a figure in its own words; that
+text is shown literally and is never read as a figure. A report is not guaranteed to be free of
+misleading prose in a proposal's wording: that is read by the operator before anything is acted on.
 
 **Retention (F12, round-7 review)**: the report is a SECOND artefact
 derived from the ledger (plan keys, run ids, per-plan seconds, orphan
@@ -1585,7 +1588,7 @@ text it altered (T5 probes whether the Workflow tool would run an inline script 
 could); on the attended path the session has a shell and could compute it, so there
 the digest guards against accident, not against a steered session. A second,
 independent layer refuses any report in which a proposal would remove an always-on
-lens, and a third refuses a report with a look-alike or hidden headline figure line.
+lens, and a third refuses a report with any line in a shape the script never writes.
 **Proposal ids:** an id is hashed from the target as it is stored, with
 absolute-path-looking text redacted and whitespace collapsed first, so two targets
 that differ only in text that redacts to the same marker (for example two slash
@@ -1822,7 +1825,8 @@ scheduled run.
 | `result carries no mac` | The returned object has no keyed digest (`result_mac`), or it is not a 64-character hash. | `bin/install.sh --check`: the installed workflow may predate the result check. | Run `bin/install.sh`, then re-run; report it if it repeats. |
 | `result mac does not match this run` | The keyed digest does not match the nonce and the reply's report, targets and lane statuses, so the reply was edited after the workflow returned it (or came from another run). Nothing was placed. | Nothing to check on your side. | Re-run; report it if it repeats. |
 | `report proposes removing an always-on lens` | A proposal in the report would remove `lens-security` or `lens-qa` from the always-on roster, which the workflow itself never lets through. Nothing was placed. | The report text in the session's reply, if you have it. | Re-run; report it if it repeats. |
-| `report contains an HTML comment` | The report holds `<!--`, which can hide a line that is not shown. | Nothing to check on your side. | Re-run; report it if it repeats. |
+| `report has a line with an odd number of backticks` | A line of the report has an unpaired backtick. The script writes backticks only in pairs, around text from a repository or a model, so the report was altered after the workflow produced it. Nothing was placed. | Nothing to check on your side. | Re-run; report it if it repeats. |
+| `report has a line in a shape the check does not know` | A line of the report, read with its code-formatted text set aside, is not one of the lines the script writes, so text was added or changed outside code formatting after the workflow produced it, or the installed workflow and result check are out of step. Nothing was placed. | `bin/install.sh --check`. | Run `bin/install.sh` if it reports drift, then re-run; report it if it repeats. |
 | `report contains an invisible or direction-control character` | The report holds a zero-width or text-direction character, which can make a line read differently from how it is stored. | Nothing to check on your side. | Re-run; report it if it repeats. |
 | `result carries no nonce hash` | The returned object lacks the hash of this run's nonce. | The session may have called another workflow copy. | Re-run; report it if it repeats. |
 | `result nonce hash does not match this run` | The hash does not match this run's nonce, so the result is not from this run's digest. | As above. | As above. |
