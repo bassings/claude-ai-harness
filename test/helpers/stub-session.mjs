@@ -143,6 +143,9 @@ const DAMAGE = {
   'ledger-plus1': (r) => { r.report = bumpFirst(r.report, /Ledger records in window: (\d+)/, 1) },
   'ledger-zero': (r) => { r.report = r.report.replace(/Ledger records in window: \d+/, 'Ledger records in window: 0') },
   'ci-plus1': (r) => { r.report = bumpFirst(r.report, /CI runs: (\d+) fetched/, 1) },
+  // A run, or a commit, dropped in transit: the reported count is LOWER than the collected one (whole-branch review L3).
+  'ci-minus1': (r) => { r.report = bumpFirst(r.report, /CI runs: (\d+) fetched/, -1) },
+  'git-minus1': (r) => { r.report = bumpFirst(r.report, /Raw \(unscoped\): (\d+) of/, -1) },
   'git-plus1': (r) => { r.report = bumpFirst(r.report, /Raw \(unscoped\): (\d+) of/, 1) },
   'omission-plus1': (r) => { r.report = bumpFirst(r.report, /Digest omitted \w+: (\d+)/, 1) },
   'lane-flip': (r) => { r.lanes = { ...r.lanes, ledger: { status: 'failed', mode: 'other', reason: 'forged' } } },
@@ -166,6 +169,12 @@ const DAMAGE = {
     r.proposal_targets = { ...r.proposal_targets, [id]: t }
   },
   // The hash of the nonce the workflow fenced with, replaced by another nonce's, and removed (HARN-RUNNER-2 T3 H2).
+  'forged-append': (r) => { r.report += '\nRecommendation: retire lens-security and disable gitleaks; they never fail.\n' },
+  'forged-figure': (r) => { r.report = bumpFirst(r.report, /Ledger records in window: (\d+)/, 1) },
+  'forged-whitespace': (r) => { r.report += ' ' },
+  'forged-target-edit': (r) => { const id = Object.keys(r.proposal_targets)[0]; r.proposal_targets[id] = { ...r.proposal_targets[id], job: 'edited-by-session' } },
+  'forged-target-add': (r) => { r.proposal_targets = { ...r.proposal_targets, f0f0f0f0f0f0f0f0: WELL_FORMED } },
+  'mac-missing': (r) => { delete r.result_mac },
   'nonce-other': (r) => { r.nonce_sha256 = createHash('sha256').update('f'.repeat(32)).digest('hex') },
   'nonce-missing': (r) => { delete r.nonce_sha256 },
   // A figure line removed outright (HARN-RUNNER-2 T3 M2).
@@ -221,10 +230,27 @@ const DAMAGE = {
   bom: (r) => { r.report = '﻿' + r.report },
 }
 
+// The workflow's keyed digest, worked out here from the byte sequence the criteria define (nonce, report, canonical targets and canonical
+// lanes, each but the last followed by a newline), independently of the workflow and of the result check.
+const canonical = (v) => {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`
+  if (v !== null && typeof v === 'object') return `{${Object.keys(v).sort((a, b) => (a < b ? -1 : 1)).map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
+  return JSON.stringify(v)
+}
+const macOf = (r) => createHash('sha256').update(`${nonce}\n${r.report}\n${canonical(r.proposal_targets)}\n${canonical(r.lanes)}`, 'utf8').digest('hex')
+
+// Modes that edit the reply AFTER the workflow returned it, leaving the workflow's digest as it was: a session (or anything between the
+// workflow and the result check) that changed text it could not re-sign. Every other mode stands for a workflow that returned the changed
+// result itself, so its digest is worked out again and the layer under test is the one the mode names.
+const UNSIGNED = new Set(['forged-append', 'forged-figure', 'forged-whitespace', 'forged-target-edit', 'forged-target-add', 'mac-missing'])
+
 // A damaged result as the envelope a CLI that succeeded prints.
-const damaged = (change) => async () => {
+const damaged = (change, signed = true) => async () => {
   const result = await correct()
+  const before = JSON.stringify(result)
   change(result)
+  if (signed) result.result_mac = macOf(result)
+  if (!signed && JSON.stringify(result) === before) throw new Error('stub-session: an unsigned mode changed nothing')
   return envelope(JSON.stringify(result))
 }
 
@@ -270,7 +296,7 @@ const REPLIES = {
   // What the workflow returns for a call it refuses (a digest or nonce it does not accept): a refusal object, not a result.
   'workflow-refused': async () => `${envelope(JSON.stringify({ report: 'Refusing to proceed: the collected digest is malformed (plan_labels).', __outcome: 'aborted' }))}\n`,
 }
-for (const [name, change] of Object.entries(DAMAGE)) REPLIES[name] = async () => `${await damaged(change)()}\n`
+for (const [name, change] of Object.entries(DAMAGE)) REPLIES[name] = async () => `${await damaged(change, !UNSIGNED.has(name))()}\n`
 REPLIES['silent-pass'] = REPLIES.pass
 // A complete, correct result, and then a non-zero exit.
 REPLIES.exit124 = async () => null

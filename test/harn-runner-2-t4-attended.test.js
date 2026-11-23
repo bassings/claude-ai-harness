@@ -13,6 +13,7 @@ const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { cleanupTempRepos, sanitizedGitEnv } = require('./helpers/temp-repo.js')
 const SB = require('./helpers/weekly-sandbox.js')
 const T2 = require('./helpers/t2-fixtures.js')
+const { resign } = require('./helpers/result-mac.js')
 
 const { F, ROOT, REPORT_REL, SIDECAR_REL, freshDir, marker } = SB
 const VERIFY = path.join(ROOT, 'workflows', 'lib', 'optimise-verify.mjs')
@@ -48,6 +49,7 @@ async function collectedRun(repo, { stubs = ghStubs(), collectFrom = repo } = {}
       fs.cpSync(outDir, perRun, { recursive: true })
       const copy = structuredClone(result)
       if (alter) alter(copy)
+      resign(copy, T2.NONCE)
       const resultFile = path.join(perRun, 'result.json')
       fs.writeFileSync(resultFile, JSON.stringify(copy), { mode: 0o600 })
       return { repo, perRun, resultFile, result: copy }
@@ -65,17 +67,16 @@ function verifyCli(args, env = {}, cwd = freshDir('cwd-')) {
 }
 // The attended entry as the skill runs it: the per-run directory, the saved result, the checkout the operator is in and the main
 // checkout the skill resolved.
-const attendedCli = (run, { repo = run.repo, root = run.repo, cwd } = {}) => verifyCli(['attended', run.perRun, run.resultFile, repo, root], { OPTIMISE_VERIFY_NONCE: T2.NONCE }, cwd)
-
-// What the skill's own commands do before the attended form runs: make both output paths ignored in the main checkout with the
-// report-ignore helper, then confirm each with git itself.
-function ignoreAsTheSkillDoes(root) {
-  return [REPORT_REL, SIDECAR_REL].map((rel) => {
-    const helper = spawnSync(process.execPath, [IGNORE_HELPER, root, rel], { encoding: 'utf8' })
-    assert.equal(helper.status, 0, helper.stderr)
-    return spawnSync(F.REAL_GIT, ['-C', root, 'check-ignore', '-q', '--', rel], { env: sanitizedGitEnv() }).status
-  })
+// The ignore step the skill runs first: the one command that decides the main checkout and the ignore rule and writes the proof the check needs.
+function prove(run, repo = run.repo) {
+  const res = spawnSync(process.execPath, [IGNORE_HELPER, 'prepare', repo, run.perRun], { encoding: 'utf8' })
+  assert.equal(JSON.parse(res.stdout).ok, true, `the ignore step: ${res.stdout}${res.stderr}`)
 }
+const attendedCli = (run, { repo = run.repo, root = run.repo, cwd, skipProof = false } = {}) => {
+  if (!skipProof) prove(run, repo)
+  return verifyCli(['attended', run.perRun, run.resultFile, repo, root], { OPTIMISE_VERIFY_NONCE: T2.NONCE }, cwd)
+}
+
 
 const lockOf = (root) => path.join(root, '.git', 'optimise-sidecar.lock')
 const gone = (p) => fs.lstatSync(p, { throwIfNoEntry: false }) === undefined
@@ -118,7 +119,8 @@ async function worktreeRun() {
 
 test('D3: an attended run from a linked worktree PASSes, places both outputs in the main checkout, leaves the worktree clean and holds the lock in the main checkout\'s git directory', async () => {
   const { repo, worktree, run } = await worktreeRun()
-  assert.deepEqual(ignoreAsTheSkillDoes(repo), [0, 0], 'the skill\'s own ignore and confirm commands succeed for the main checkout')
+  prove({ perRun: run.perRun, repo }, worktree)
+  for (const rel of [REPORT_REL, SIDECAR_REL]) assert.equal(spawnSync(F.REAL_GIT, ['-C', repo, 'check-ignore', '-q', '--', rel], { env: sanitizedGitEnv() }).status, 0, `${rel} is ignored in the main checkout`)
   const res = attendedCli(run, { repo: worktree, root: repo })
   assert.match(res.out, /^VERDICT PASS$/m, `${res.out}${res.stderr}`)
   assert.match(res.out, /^PLACE yes$/m, res.out)
@@ -133,8 +135,10 @@ test('D3: an attended run from a linked worktree PASSes, places both outputs in 
 test('D3: the lock a worktree run takes is the main checkout\'s own, held while the sidecar is renamed, and not one in the worktree\'s git directory', async () => {
   const { attendedRun: attendedInProcess } = await load()
   const { repo, worktree, run } = await worktreeRun()
+  prove(run, worktree)
   const seen = []
   const ops = { ...fs, renameSync: (from, to) => { seen.push([String(to).endsWith('optimise-proposal-targets.json'), fs.lstatSync(lockOf(repo), { throwIfNoEntry: false })?.isSymbolicLink() === true]); return fs.renameSync(from, to) } }
+  prove(run, worktree)
   const v = await attendedInProcess({ dir: run.perRun, resultFile: run.resultFile, repo: worktree, root: repo, home: freshDir('home-'), nonce: T2.NONCE, wait: () => {} }, ops)
   assert.deepEqual(v.reasons, [])
   assert.deepEqual(seen.filter(([isSidecar]) => isSidecar), [[true, true]], 'the main checkout\'s lock exists at the moment the sidecar is renamed')
@@ -174,7 +178,6 @@ for (const [name, pick] of HOSTILE_ROOTS) {
 
 test('D3: the main checkout itself, given as its own root, is accepted', async () => {
   const run = await attendedRun()
-  ignoreAsTheSkillDoes(run.repo)
   const res = attendedCli(run)
   assert.match(res.out, /^VERDICT PASS$/m, `${res.out}${res.stderr}`)
 })
@@ -196,12 +199,15 @@ test('D3: a checkout whose .git pointer names another repository\'s worktree dir
   assert.equal(fs.existsSync(path.join(repo, REPORT_REL)), false)
 })
 
-test('D3: the ignore commands the skill gives stop a run whose report path a tracked .gitignore re-includes, before the attended form is called', async () => {
+test('D3: the ignore step stops a run whose report path a tracked .gitignore re-includes, and the attended form then places nothing', async () => {
   const run = await attendedRun()
   fs.writeFileSync(path.join(run.repo, '.gitignore'), '!.claude/optimise-cycle-report.md\n!.claude/optimise-proposal-targets.json\n')
-  const [report, sidecar] = ignoreAsTheSkillDoes(run.repo)
-  assert.notEqual(report, 0, 'git still shows the report path, so the skill\'s confirm command fails and the skill stops')
-  assert.notEqual(sidecar, 0, 'and the sidecar path too')
+  const step = spawnSync(process.execPath, [IGNORE_HELPER, 'prepare', run.repo, run.perRun], { encoding: 'utf8' })
+  assert.equal(JSON.parse(step.stdout).ok, false, 'git still shows the report path, so the step fails and the skill stops')
+  const before = seed(run.repo)
+  const res = attendedCli(run, { skipProof: true })
+  assert.match(res.out, /^REASON the output paths were not confirmed ignored for this checkout$/m, res.out)
+  keptAs(run.repo, before)
 })
 
 test('attended: a result file that is a symlink is not read, and nothing is placed', async () => {
@@ -268,6 +274,7 @@ test('M3: an entry a second writer adds while this run waits for the lock is in 
     fs.writeFileSync(path.join(run.repo, SIDECAR_REL), `${JSON.stringify({ [b.id]: b.target })}\n`)
     assert.equal(unlock(run.repo, held.token), true)
   }
+  prove(run, run.repo)
   const v = await attendedInProcess({ dir: run.perRun, resultFile: run.resultFile, repo: run.repo, root: run.repo, home: freshDir('home-'), nonce: T2.NONCE, wait })
   assert.equal(waits, 1, 'guard against vacuity: the run really waited once')
   assert.deepEqual(v.reasons, [])
@@ -280,6 +287,7 @@ test('M3: a lock held by a live run past the wait is a refusal with its own fixe
   const before = seed(run.repo)
   const held = tryLock(run.repo, process.pid)
   assert.equal(held.status, 'held')
+  prove(run, run.repo)
   const v = await attendedInProcess({ dir: run.perRun, resultFile: run.resultFile, repo: run.repo, root: run.repo, home: freshDir('home-'), nonce: T2.NONCE, wait: () => {}, tries: 2 })
   assert.deepEqual(v.reasons, ['could not take the sidecar lock'])
   assert.equal(v.place, 'no')
@@ -292,6 +300,7 @@ test('M3: a main checkout with no git directory to hold a lock, or a lock that c
   const run = await attendedRun()
   const before = seed(run.repo)
   const noSymlinks = { ...fs, symlinkSync: () => { throw Object.assign(new Error('read-only'), { code: 'EROFS' }) } }
+  prove(run, run.repo)
   const v = await attendedInProcess({ dir: run.perRun, resultFile: run.resultFile, repo: run.repo, root: run.repo, home: freshDir('home-'), nonce: T2.NONCE, wait: () => {} }, noSymlinks)
   assert.deepEqual(v.reasons, ['the sidecar lock path is not usable'])
   assert.equal(v.place, 'no')
@@ -303,6 +312,7 @@ test('M3: a lock step that throws is refused with its own fixed reason, nothing 
   const run = await attendedRun()
   const before = seed(run.repo)
   const held = tryLock(run.repo, process.pid)
+  prove(run, run.repo)
   const v = await attendedInProcess({ dir: run.perRun, resultFile: run.resultFile, repo: run.repo, root: run.repo, home: freshDir('home-'), nonce: T2.NONCE, wait: () => { throw new Error('the waiter failed') }, tries: 3 })
   assert.deepEqual(v.reasons, ['the sidecar lock helper failed'])
   keptAs(run.repo, before)
@@ -318,6 +328,7 @@ test('M3: an attended run and weekly runners started together on one repository 
   const stubs = ghStubs()
   const tmpdir = freshDir('shared-tmp-')
   const runners = [0, 1].map(() => SB.startRunner([repo], { stubs, tmpdir }))
+  runs.forEach((run) => prove(run))
   const attended = runs.map((run) => new Promise((resolve) => {
     const child = spawn(process.execPath, [VERIFY, 'attended', run.perRun, run.resultFile, repo, repo], { env: { ...process.env, HOME: freshDir('home-'), OPTIMISE_VERIFY_NONCE: T2.NONCE }, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
@@ -430,6 +441,68 @@ test('a fresh lock that was taken away by mistake and cannot be put back is repo
   assert.deepEqual(drainNotices(), [], 'draining empties it')
 })
 
+// ---- L2 (whole-branch review): a stale-lock takeover must never leave two runs believing they hold the lock ----
+
+test('L2: the review\'s three-party interleaving (a taker renames a lock aside that another taker has just made fresh, and a third takes the empty path before the put-back) ends with one owner on the path and the displaced run no longer holding it', async () => {
+  const { tryLock, drainNotices, holdsLock } = await load()
+  const repo = newRepo()
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid
+  const [tokenC, tokenB] = [`${process.pid}:cccccccccccc`, `${process.pid}:bbbbbbbbbbbb`] // live owners, so neither lock looks stale
+  fs.symlinkSync(`${dead}:aaaaaaaaaaaa`, lockOf(repo))
+  let step = 0
+  const opsD = {
+    ...fs,
+    renameSync: (from, to) => {
+      if (step === 0 && String(to).includes('.stale.')) {
+        step = 1
+        fs.rmSync(lockOf(repo))
+        fs.symlinkSync(tokenC, lockOf(repo)) // C has taken the stale lock over and is the holder, just before D renames it aside
+      }
+      return fs.renameSync(from, to)
+    },
+    symlinkSync: (target, p) => {
+      if (step === 1 && target === tokenC) {
+        step = 2
+        fs.symlinkSync(tokenB, p) // B takes the path D has just emptied, before D can put C's lock back
+      }
+      return fs.symlinkSync(target, p)
+    },
+  }
+  drainNotices()
+  tryLock(repo, process.pid, opsD)
+  assert.equal(step, 2, 'guard against vacuity: the whole interleaving really happened')
+  assert.equal(fs.readlinkSync(lockOf(repo)), tokenB, 'B owns the path')
+  assert.deepEqual(drainNotices(), ['lock-restore-failed'], 'and the failed put-back was noticed')
+  assert.equal(holdsLock(repo, tokenB), true)
+  assert.equal(holdsLock(repo, tokenC), false, 'C, whose lock was taken, no longer holds it')
+})
+
+test('L2: a run whose lock is taken from it while it stages its outputs does not place, fails with the lock reason, and leaves the last good files and nothing staged', async () => {
+  const { attendedRun: attendedInProcess } = await load()
+  const run = await attendedRun()
+  const before = seed(run.repo)
+  prove(run)
+  let stolen = false
+  const ops = {
+    ...fs,
+    writeFileSync: (file, ...rest) => {
+      if (!stolen && String(file).includes('.optimise-output.') && String(rest[0] ?? '').includes('{')) {
+        stolen = true
+        fs.rmSync(lockOf(run.repo), { force: true })
+        fs.symlinkSync(`${process.pid}:dddddddddddd`, lockOf(run.repo)) // another run (a live one) now owns the lock
+      }
+      return fs.writeFileSync(file, ...rest)
+    },
+  }
+  const v = await attendedInProcess({ dir: run.perRun, resultFile: run.resultFile, repo: run.repo, root: run.repo, home: freshDir('home-'), nonce: T2.NONCE, wait: () => {} }, ops)
+  assert.equal(stolen, true, 'guard against vacuity: the lock really was taken while the sidecar was staged')
+  assert.deepEqual(v.reasons, ['the sidecar lock path is not usable'])
+  assert.equal(v.place, 'no')
+  keptAs(run.repo, before)
+  assert.deepEqual(stagedIn(run.repo), [], 'no staged file is left')
+  assert.equal(fs.readlinkSync(lockOf(run.repo)), `${process.pid}:dddddddddddd`, 'and the other run\'s lock is left alone')
+})
+
 // ---- the placement: signals, leftover staged files ----
 
 function childScript(body) {
@@ -441,9 +514,10 @@ function childScript(body) {
 test('L4: a SIGTERM that arrives between staging the outputs and renaming them leaves nothing staged, the lock released and both outputs placed or both left as they were', async () => {
   const run = await attendedRun()
   const before = seed(run.repo)
+  prove(run)
   const script = childScript(`
 const ops = { ...fs, renameSync: (from, to) => { if (String(to).endsWith('optimise-proposal-targets.json')) process.kill(process.pid, 'SIGTERM'); return fs.renameSync(from, to) } }
-await settleRun({ dir: ${JSON.stringify(run.perRun)}, sessionPath: ${JSON.stringify(run.resultFile)}, digestToken: 'ran', repo: ${JSON.stringify(run.repo)}, runTmp: ${JSON.stringify(run.perRun)}, home: ${JSON.stringify(freshDir('home-'))}, sidecarRoot: ${JSON.stringify(run.repo)}, nonce: ${JSON.stringify(T2.NONCE)}, attended: true, ignored: true }, ops)
+await settleRun({ dir: ${JSON.stringify(run.perRun)}, sessionPath: ${JSON.stringify(run.resultFile)}, digestToken: 'ran', repo: ${JSON.stringify(run.repo)}, runTmp: ${JSON.stringify(run.perRun)}, home: ${JSON.stringify(freshDir('home-'))}, sidecarRoot: ${JSON.stringify(run.repo)}, nonce: ${JSON.stringify(T2.NONCE)}, attended: true, place: 'place', analysedRepo: ${JSON.stringify(run.repo)} }, ops)
 await new Promise((resolve) => setTimeout(resolve, 3000))
 process.stdout.write('SURVIVED\\n')
 `)

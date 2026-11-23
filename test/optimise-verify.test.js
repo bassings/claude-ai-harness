@@ -29,6 +29,24 @@ const bump = (report, re, delta = 1) => {
 
 // ---- the rules of the module that are not rows ----
 
+// How long an input of `size` takes, as the best of three runs. The tests below assert how the time GROWS between a size and four times that
+// (linear work is about four times as long, quadratic about sixteen), never an absolute number of milliseconds, so a busy machine, which slows
+// both sizes alike, cannot fail them and a super-linear blow-up still does (whole-branch review M5).
+function timeOf(run) {
+  let best = Infinity
+  for (let i = 0; i < 3; i += 1) {
+    const started = process.hrtime.bigint()
+    run()
+    best = Math.min(best, Number(process.hrtime.bigint() - started) / 1e6)
+  }
+  return best
+}
+const SCALING_LIMIT = 10
+function assertScalesLinearly(label, small, large) {
+  const [a, b] = [timeOf(small), timeOf(large)]
+  assert.ok(b <= SCALING_LIMIT * Math.max(a, 20), `${label}: four times the input took ${b.toFixed(1)} ms against ${a.toFixed(1)} ms, which is more than linear work`)
+}
+
 test('static: the module is spawn-free and reads only through the reader\'s guarded helper', () => {
   assert.ok(!/child_process|\bspawn|(?<![.\w])exec(File)?(Sync)?\(/.test(CODE), 'no child process of any kind')
   for (const banned of ['readFileSync', 'openSync', 'createReadStream', 'readSync']) assert.ok(!CODE.includes(banned), `no ${banned}: reads go through readRepoFile`)
@@ -96,14 +114,13 @@ test('checkRows: a row written in a shape the check does not know is refused, so
   assert.ok(checkRows(jobReshaped.replace('::ci::', '::ci::'), col).length >= 1, 'a job row with its figures renamed is not silently ignored')
 })
 
-test('checkRows: a hostile report of one enormous line of row-shaped text is judged in well under a second and refused, never a hang', async () => {
+test('checkRows: a hostile report of one enormous line of row-shaped text is refused, never a hang, and its cost grows no faster than its size', async () => {
   const { checkRows } = await load()
   const { col, report } = await real()
-  const hostile = '- ' + ': n=1, failed='.repeat(200000)
-  const started = Date.now()
-  const reasons = checkRows(`${report}\n${hostile}\n`, col)
-  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`)
+  const hostileOf = (n) => '- ' + ': n=1, failed='.repeat(n)
+  const reasons = checkRows(`${report}\n${hostileOf(50000)}\n`, col)
   assert.ok(reasons.some((r) => r.startsWith('figure mismatch ci job:')), 'the over-long row is refused, not ignored')
+  assertScalesLinearly('one enormous row-shaped line', () => checkRows(`${report}\n${hostileOf(50000)}\n`, col), () => checkRows(`${report}\n${hostileOf(200000)}\n`, col))
 })
 
 // ---- the sidecar merge ----
@@ -333,10 +350,10 @@ test('checkFigures: a report with a figure line left out is refused with the exa
 test('formatVerdict: reasons are de-duplicated, only the first few are printed, the rest are counted as more_reasons:<n>, and each line is bounded', async () => {
   const { formatVerdict, MAX_REASONS, MAX_REASON_CHARS } = await load()
   assert.equal(MAX_REASONS, 8)
-  const many = Array.from({ length: 100000 }, (_, i) => `figure mismatch ci job: n collected 3, reported ${i}`)
-  const started = Date.now()
+  const manyOf = (n) => Array.from({ length: n }, (_, i) => `figure mismatch ci job: n collected 3, reported ${i}`)
+  const many = manyOf(100000)
   const out = formatVerdict({ tokens: 'ledger=1/1', denied: 'unknown', reasons: [...many, ...many], place: 'no' })
-  assert.ok(Date.now() - started < 1500, `took ${Date.now() - started} ms`)
+  assertScalesLinearly('reasons', () => formatVerdict({ tokens: 't', denied: 'unknown', reasons: manyOf(20000), place: 'no' }), () => formatVerdict({ tokens: 't', denied: 'unknown', reasons: manyOf(80000), place: 'no' }))
   const reasonLines = out.split('\n').filter((l) => l.startsWith('REASON '))
   assert.equal(reasonLines.length, MAX_REASONS + 1)
   assert.equal(reasonLines.at(-1), 'REASON more_reasons:99992', 'the 100000 distinct reasons, less the 8 shown')
@@ -346,15 +363,14 @@ test('formatVerdict: reasons are de-duplicated, only the first few are printed, 
   assert.equal(formatVerdict({ tokens: 't', denied: 'unknown', reasons: ['a', 'a', 'b'], place: 'no' }), 'TOKENS t\nDENIED unknown\nREASON a\nREASON b\nPLACE no\n', 'duplicates collapse and nothing is added below the cap')
 })
 
-test('checkRows: a 5 MB report of well-formed rows that all disagree with the data is judged in well under a second', async () => {
+test('checkRows: a 5 MB report of well-formed rows that all disagree with the data grows no faster than its size', async () => {
   const { checkRows } = await load()
   const { col, report } = await real()
   const key = report.split('\n').find((l) => l.includes('::ci::test: n=')).split(': n=')[0].slice(2)
-  const rows = Array.from({ length: 100000 }, (_, i) => `- ${key}: n=${i + 100}, failed=0, mean 60s`).join('\n')
-  const started = Date.now()
-  const reasons = checkRows(`${report}\n${rows}\n`, col)
-  assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`)
+  const rowsOf = (n) => Array.from({ length: n }, (_, i) => `- ${key}: n=${i + 100}, failed=0, mean 60s`).join('\n')
+  const reasons = checkRows(`${report}\n${rowsOf(100000)}\n`, col)
   assert.ok(reasons.length >= 100000, 'the hostile report really does produce a reason per row')
+  assertScalesLinearly('well-formed rows that all disagree', () => checkRows(`${report}\n${rowsOf(20000)}\n`, col), () => checkRows(`${report}\n${rowsOf(80000)}\n`, col))
 })
 
 // ---- H2: the nonce the session passed on ----

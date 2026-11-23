@@ -57,15 +57,57 @@ export function ensureIgnored(root, relativePath) {
     return { ignored: false, error: 'could not update .git/info/exclude: ' + e.message }
   }
   try {
-    execFileSync('git', ['check-ignore', '-q', relativePath], { cwd: root })
+    execFileSync('git', ['-c', 'safe.bareRepository=explicit', 'check-ignore', '-q', relativePath], { cwd: root })
   } catch (e) {
     return { ignored: false, error: 'the path is not actually gitignored (a tracked .gitignore may re-include it with a negation pattern) -- refusing to write' }
   }
   return { ignored: true, error: null }
 }
 
-function main() {
-  const [root, relativePath] = process.argv.slice(2)
+// ---- the one place that decides where the optimiser's two outputs go and whether their paths are ignored (HARN-RUNNER-2 whole-branch M4) ----
+//
+// Both entry points (the weekly runner and the attended skill) call this and nothing else for the decision, and the result check
+// (optimise-verify.mjs, which spawns nothing) places only when it is handed the proof `prepare` writes:
+//   root <repository>                 prints the main checkout of the repository (itself, or the main checkout of a linked worktree), or nothing
+//   prepare <repository> <per-run dir> resolves that main checkout, makes both output paths ignored there, confirms each with git,
+//                                      and writes ignore-proof.json into the per-run directory; prints {"ok":true,"root":...} or {"ok":false,...}
+// Both outputs are placed in the main checkout, where the sidecar, the ledger and the lock already live. Accepted risk (owner, 2026-11-23): a
+// roster entry that names a linked worktree replaces the main checkout's report with one analysed from that worktree's branch; the runner
+// logs one fixed NOTICE (linked-worktree) when that is what it is analysing so it is visible.
+export const OUTPUT_RELS = ['.claude/optimise-cycle-report.md', '.claude/optimise-proposal-targets.json']
+export const PROOF_NAME = 'ignore-proof.json'
+
+export function resolveMainRoot(repo) {
+  try {
+    const common = execFileSync('git', ['-c', 'safe.bareRepository=explicit', '-C', repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    return path.basename(common) === '.git' ? path.dirname(common) : null
+  } catch {
+    return null
+  }
+}
+
+// { ok: true, root } after both paths are confirmed ignored and the proof written, else { ok: false, reason } and no proof.
+export function prepareOutputs(repo, dir) {
+  const root = resolveMainRoot(repo)
+  if (root === null) return { ok: false, reason: 'main-checkout' }
+  if (!OUTPUT_RELS.every((rel) => ensureIgnored(root, rel).ignored)) return { ok: false, reason: 'not-ignored' }
+  try {
+    const proof = path.join(dir, PROOF_NAME)
+    fs.rmSync(proof, { force: true })
+    fs.writeFileSync(proof, JSON.stringify({ root: fs.realpathSync(root), report: OUTPUT_RELS[0], sidecar: OUTPUT_RELS[1], at: Date.now() }), { flag: 'wx', mode: 0o600 })
+  } catch {
+    return { ok: false, reason: 'proof-not-written' }
+  }
+  return { ok: true, root }
+}
+
+function main(argv) {
+  if (argv[0] === 'root') {
+    process.stdout.write(`${resolveMainRoot(argv[1] ?? '') ?? ''}\n`)
+    return null
+  }
+  if (argv[0] === 'prepare') return prepareOutputs(argv[1] ?? '', argv[2] ?? '')
+  const [root, relativePath] = argv
   if (!root || !relativePath) return { ignored: false, error: 'usage: optimise-report-ignore.mjs <root> <relativePath>' }
   return ensureIgnored(root, relativePath)
 }
@@ -81,7 +123,7 @@ function isMainModule() {
 }
 const isMain = isMainModule()
 if (isMain) {
-  const out = main()
-  process.stdout.write(JSON.stringify(out) + '\n')
+  const out = main(process.argv.slice(2))
+  if (out !== null) process.stdout.write(JSON.stringify(out) + '\n')
   process.exit(0)
 }

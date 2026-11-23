@@ -1867,7 +1867,7 @@ test('T11 R2: a result with no sidecar FAILs naming the sidecar, and no report i
   assert.equal(fs.existsSync(path.join(repo, FINAL_SIDECAR_REL)), false)
 })
 
-test('T11 R2: for a linked worktree the report lands in the worktree and the sidecar in the main checkout, where the optimiser reads it', () => {
+test('T11 R2 (whole-branch M4, decision A): for a linked worktree the report and the sidecar both land in the main checkout, where the optimiser reads them, and the worktree gets neither', () => {
   const main = makeTempRepo()
   fs.writeFileSync(path.join(main, 'f'), 'x\n')
   sh('git add f', main)
@@ -1876,8 +1876,9 @@ test('T11 R2: for a linked worktree the report lands in the worktree and the sid
   sh(`git worktree add -q ${JSON.stringify(wt)}`, main)
   const res = runWeeklyScript([wt], { extraPath: scratchClaude(WRITE_VALID) })
   assert.equal(res.status, 0, res.logContents)
-  assert.equal(fs.existsSync(path.join(wt, REPORT_REL)), true)
-  assert.equal(fs.existsSync(path.join(main, FINAL_SIDECAR_REL)), true, 'the sidecar belongs under the roster root the workflow resolves')
+  assert.equal(fs.existsSync(path.join(main, REPORT_REL)), true, 'the report is in the main checkout, which is where the sidecar, the ledger and the lock already live')
+  assert.equal(fs.existsSync(path.join(main, FINAL_SIDECAR_REL)), true, 'and so is the sidecar')
+  assert.equal(fs.existsSync(path.join(wt, REPORT_REL)), false, 'the worktree, which is deleted when its task merges, holds no report')
   assert.equal(fs.existsSync(path.join(wt, FINAL_SIDECAR_REL)), false)
 })
 

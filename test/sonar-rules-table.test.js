@@ -1094,7 +1094,7 @@ test('generator: every unhappy server path exits non-zero in bounded time with o
 const hooked = (url, over) => envFor(url, { NODE_OPTIONS: `--require=${JSON.stringify(HOOK)}`, ...over })
 const SEED = PREV_HEADER + '| js:S1 | Remove unused imports | 1 | 0 |\n'
 
-test('generator: two runs started together against a slow server always leave one complete table from one run, never an interleaving, and no temporary file (AC-QA-10)', async () => {
+test('generator: two runs held together at a rendezvous mid-write and before the rename always leave one complete table from one run, never an interleaving, and no temporary file (AC-QA-10)', async () => {
   const issues = [...mk('js:S1', 2, '2026-11-10T00:00:00+0000'), ...mk('js:S2', 1, '2026-11-11T00:00:00+0000')]
   const NOW_A = '2026-11-21T10:30:00Z'
   const NOW_B = '2026-11-22T11:45:00Z'
@@ -1112,18 +1112,23 @@ test('generator: two runs started together against a slow server always leave on
   const expectA = await solo(NOW_A)
   const expectB = await solo(NOW_B)
   assert.notEqual(expectA, expectB, 'the two runs must be distinguishable')
-  const fake = await startFake({ issues, delayMs: 30 })
+  // The two runs are held at a rendezvous, once with half a table written and once just before the rename, so they are certain to overlap there
+  // whatever else the machine is doing: the overlap is not left to a delay that a busy machine can make too short or the server too slow.
+  const fake = await startFake({ issues })
   try {
     for (let i = 0; i < 20; i++) {
       const repo = makeTempRepo()
       seedTable(repo, SEED)
-      const over = { HOOK_RENAME_DELAY_MS: '120', HOOK_SPLIT_WRITE_MS: '80' }
+      const barrier = fs.mkdtempSync(path.join(SUITE_TMPDIR, 'barrier-'))
+      const over = { HOOK_RENAME_DELAY_MS: '1', HOOK_SPLIT_WRITE_MS: '1', HOOK_BARRIER_DIR: barrier, HOOK_BARRIER_COUNT: '2' }
       const [a, b] = await Promise.all([run({ cwd: repo, env: hooked(fake.url, { ...over, SONAR_RULES_NOW: NOW_A }) }), run({ cwd: repo, env: hooked(fake.url, { ...over, SONAR_RULES_NOW: NOW_B }) })])
       assert.equal(a.code, 0, `repetition ${i}: run A: ${a.stderr}`)
       assert.equal(b.code, 0, `repetition ${i}: run B: ${b.stderr}`)
       const got = read(tablePath(repo))
       assert.ok(got === expectA || got === expectB, `repetition ${i}: the table is neither complete run`)
       assert.deepEqual(fs.readdirSync(path.join(repo, '.claude')), [path.basename(TABLE_REL)], `repetition ${i}: a temporary file was left`)
+      assert.deepEqual(fs.readdirSync(barrier).filter((n) => n.startsWith('half.')).length, 2, `repetition ${i}: guard against vacuity: both runs really were mid-write together`)
+      assert.deepEqual(fs.readdirSync(barrier).filter((n) => n.startsWith('rename.')).length, 2, `repetition ${i}: and both were about to rename together`)
     }
   } finally {
     await fake.close()

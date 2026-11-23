@@ -1076,23 +1076,19 @@ test('static: AC-QA-9 -- the number of terminating `return` statements (any form
 // (~/.claude/bin/) outside version control, and without a guard pinning the
 // exact re-sync commands, a fix landed in the repo can silently never reach
 // the copy launchd actually runs.
-test('static: README.md names the exact re-sync commands for bin/optimise-cycle-weekly.sh AND bin/redact-transcript.mjs, and gives a diff command that confirms the installed copies match the repo (T3 Group 7, mirrors AC-OPS-4)', () => {
+test('static: README.md names the exact re-sync command for bin/optimise-cycle-weekly.sh and does not send the weekly job to bin/redact-transcript.mjs (the runner writes no transcript), and gives a diff command that confirms the installed copies match the repo (T3 Group 7, mirrors AC-OPS-4)', () => {
   const readme = readAll('README.md')
   assert.ok(
     /cp claude-ai-harness\/bin\/optimise-cycle-weekly\.sh ~\/\.claude\/bin\/optimise-cycle-weekly\.sh/.test(readme),
     'README.md must give the exact re-sync command for bin/optimise-cycle-weekly.sh'
   )
   assert.ok(
-    /cp claude-ai-harness\/bin\/redact-transcript\.mjs ~\/\.claude\/bin\/redact-transcript\.mjs/.test(readme),
-    'README.md must give the exact re-sync command for bin/redact-transcript.mjs -- verdict_repo silently falls back to an unredacted transcript if this file is missing from the installed mirror'
+    !/cp claude-ai-harness\/bin\/redact-transcript\.mjs ~\/\.claude\/bin\/redact-transcript\.mjs/.test(readme),
+    'the weekly runner writes no transcript and runs no redactor (whole-branch review L1), so the weekly sync step does not copy bin/redact-transcript.mjs'
   )
   assert.ok(
     /diff -q claude-ai-harness\/bin\/optimise-cycle-weekly\.sh ~\/\.claude\/bin\/optimise-cycle-weekly\.sh/.test(readme),
     'README.md must give an exact command that confirms the installed optimise-cycle-weekly.sh matches the repo'
-  )
-  assert.ok(
-    /diff -q claude-ai-harness\/bin\/redact-transcript\.mjs ~\/\.claude\/bin\/redact-transcript\.mjs/.test(readme),
-    'README.md must give an exact command that confirms the installed redact-transcript.mjs matches the repo'
   )
 })
 

@@ -113,6 +113,7 @@ REASON_NO_REPOS="no repos configured"
 REASON_ALL_SKIPPED="no repos checked (all skipped)"
 REASON_PATH_MISSING="configured repo path does not exist"
 REASON_CD_FAILED="cd into repo failed"
+REASON_GIT_UNREADABLE="git could not read the configured repository"
 REASON_TMP_PARENT="runner temp directory is not a directory this user owns"
 REASON_TMP_DIR="could not create this run's temp directory"
 REASON_TMP_PATH="runner temp directory path cannot be given to the optimiser (plain characters only, no .claude segment)"
@@ -147,7 +148,9 @@ CAUSE_MALFORMED="malformed"
 CAUSE_FAILED_STEP="failed_step"
 CAUSE_OVERSIZED="oversized"
 CAUSE_NONCE="nonce"
+CAUSE_MAC="mac"
 CAUSE_REFUSED="refused"
+NOTICE_LINKED_WORKTREE="linked-worktree"
 MODE_MISSING="missing"
 MODE_OTHER="other"
 # END FIXED REASONS
@@ -429,29 +432,44 @@ stderr_token() {
   printf '%s' "$tok"
 }
 
-# Makes the report and sidecar paths gitignored (the report-ignore helper, once
-# per path, before either file is written), then confirms both with git itself
-# rather than taking the helper's word: a negation in a tracked .gitignore beats
-# .git/info/exclude. $1 is the repo and $2 the root whose .git/info/exclude the
-# helper edits, which is the main checkout (the one shared exclude file) for a
-# linked worktree. Returns 0 only when both paths are confirmed ignored.
-ensure_ignored() {
-  local repo="$1" root="$2" rel err status
-  IGNORE_FAILURE=""
-  for rel in "$REPORT_REL" "$SIDECAR_REL"; do
-    err="$(node "$IGNORE_SCRIPT" "$root" "$rel" 2>&1 >/dev/null)"
-    status=$?
-    if [ "$status" -ne 0 ]; then
-      # The helper crashed: that is its own outcome, never "not gitignored". Exit status and one fixed-shape token only.
-      IGNORE_FAILURE="$(fill_reason "$REASON_IGNORE_HELPER" n "$status" token "$(stderr_token "$err")")"
-      return 1
-    fi
-  done
-  git -c safe.bareRepository=explicit -C "$repo" check-ignore -q -- "$REPORT_REL" 2>/dev/null \
-    && git -c safe.bareRepository=explicit -C "$root" check-ignore -q -- "$SIDECAR_REL" 2>/dev/null
+# Where the two outputs go and whether their paths are ignored are decided once, by workflows/lib/optimise-report-ignore.mjs, and
+# this script runs no git of its own for either. `root` names the main checkout (the repository itself, or the main checkout of a linked
+# worktree), where both outputs are placed; `prepare` makes both paths ignored there, confirms them with git and writes the proof the result
+# check requires before it places anything. Accepted risk (owner, 2026-11-23): a roster entry that names a linked worktree replaces the
+# main checkout's report with one analysed from that worktree's branch; a NOTICE logs when that is the case.
+main_root_of() {
+  local root
+  root="$(node "$IGNORE_SCRIPT" root "$1" 2>/dev/null)"
+  if [ -z "$root" ] || [ ! -d "$root" ]; then
+    root="$1"
+  fi
+  printf '%s' "$root"
 }
 
-# (Now used only for a repository where no session ran, to print its figures: a session's reply goes through settle_run below.)
+# Runs `prepare` for the repository, into the per-run directory. Returns 0 only when it printed ok. IGNORE_FAILURE names a crashed helper
+# (its exit status and one fixed-shape token), and stays empty when the helper ran and said the paths are not ignored.
+prepare_outputs() {
+  local out status
+  IGNORE_FAILURE=""
+  out="$(node "$IGNORE_SCRIPT" prepare "$1" "$RUN_REAL" 2> "$RUNNER_TMP/ignore.err")"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    IGNORE_FAILURE="$(fill_reason "$REASON_IGNORE_HELPER" n "$status" token "$(stderr_token "$(head -c 4000 "$RUNNER_TMP/ignore.err" 2>/dev/null)")")"
+    return 1
+  fi
+  case "$out" in
+    *'"ok":true'*) return 0 ;;
+  esac
+  return 1
+}
+
+# Drops the reasons recorded after the first $1 of them (the first settle call's, when it is called again).
+truncate_reasons() {
+  while [ "${#reasons[@]}" -gt "$1" ]; do
+    unset "reasons[$((${#reasons[@]} - 1))]"
+  done
+}
+
 # Checks what the session returned, against the files this script collected, by
 # running the installed result check (workflows/lib/optimise-verify.mjs), which
 # prints fixed-vocabulary lines only: TOKENS (the figures for the RESULT line),
@@ -480,18 +498,6 @@ verify_run() {
 # (both output paths confirmed ignored, so a trusted result is placed) or `withheld` (it is checked and merged but nothing is placed).
 settle_run() {
   OPTIMISE_VERIFY_NONCE="${nonce:-}" node "$VERIFY_SCRIPT" settle "$RUN_REAL" "$1" "$2" "$3" "$RUNNER_TMP" "$4" "$5" 2> "$RUNNER_TMP/verify.err"
-}
-
-# The root whose .claude/ holds the sidecar: the main checkout (the one shared
-# git directory's parent) for a linked worktree, else the repository itself.
-sidecar_root_of() {
-  local root
-  root="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
-  root="${root%/*}"
-  if [ -z "$root" ] || [ ! -d "$root" ]; then
-    root="$1"
-  fi
-  printf '%s' "$root"
 }
 
 # ---- AC-OPS-1..5: consumer-install staleness check -
@@ -747,6 +753,7 @@ read_verify() {
   VERIFY_TOOLS="none"
   VERIFY_PLACE="no"
   VERIFY_PLACED="no"
+  VERIFY_HELD=""
   VERIFY_CAUSE=""
   while IFS= read -r vline; do
     if [ "$seen_place" -eq 1 ] && [ "$vline" != "PLACED yes" ]; then
@@ -760,6 +767,7 @@ read_verify() {
       "NOTICE "*) log_notice "${vline#NOTICE }" ;;
       "PLACE "*) VERIFY_PLACE="${vline#PLACE }"; seen_place=1 ;;
       "PLACED yes") VERIFY_PLACED=yes ;;
+      "HELD "*) VERIFY_HELD="${vline#HELD }" ;;
       "REASON "*) reasons+=("${vline#REASON }") ;;
       *) malformed=1 ;;
     esac
@@ -774,7 +782,7 @@ read_verify() {
     ''|*[!A-Za-z,]*) VERIFY_TOOLS="none" ;;
   esac
   case "$VERIFY_CAUSE" in
-    "$CAUSE_EMPTY"|"$CAUSE_MALFORMED"|"$CAUSE_FAILED_STEP"|"$CAUSE_OVERSIZED"|"$CAUSE_NONCE"|"$CAUSE_REFUSED") ;;
+    "$CAUSE_EMPTY"|"$CAUSE_MALFORMED"|"$CAUSE_FAILED_STEP"|"$CAUSE_OVERSIZED"|"$CAUSE_NONCE"|"$CAUSE_MAC"|"$CAUSE_REFUSED") ;;
     *) VERIFY_CAUSE="" ;;
   esac
   case "$VERIFY_PLACE" in
@@ -813,6 +821,12 @@ process_repo() {
   # own .git is a FILE, not a directory) the same as an ordinary checkout,
   # so a worktree is processed normally rather than skipped.
   if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+    # A path with a .git that git cannot resolve (it refused the repository for its ownership, or the .git is damaged) is a configured
+    # repository that is broken, and fails; only a path with no .git at all is the deliberate skip.
+    if [ -e "$repo/.git" ]; then
+      fail_repo "$repo_label" "$REASON_GIT_UNREADABLE"
+      return 0
+    fi
     echo "SKIP $repo_label (not a git repo)" >> "$LOG"
     return 0
   fi
@@ -1014,25 +1028,35 @@ process_repo() {
   # ---- check and place: the session's reply is parsed strictly, never scanned, and every figure in it is compared with the lane
   # files collected above; a result that passes (or whose one problem is a lane that could not run) is placed. All of it, with the
   # sidecar lock it needs, is one command of the result check module (settle_run), so this script holds no lock and no
-  # sequence of its own. The output paths are made ignored, and confirmed so with git itself, before that command runs; a result
-  # is placed only when they are (`ignored`), else it is checked and held (`withheld`), as it is when the CLI hit its ceiling. A
-  # session that did not exit 0 is not parsed at all. Anything but a well-formed answer is a FAIL, never a PASS by default.
-  local sidecar_root settle_mode=ignored ignore_failed=0
+  # sequence of its own. Where the outputs go (the main checkout) and whether their paths are ignored are decided by the report-ignore
+  # helper (main_root_of, prepare_outputs), and the check places only when it is handed the helper's proof; a result is `withheld`
+  # (checked and merged, not placed) when the CLI hit its ceiling. A session that did not exit 0 is not parsed at all. Anything but a well-formed answer is a FAIL, never a PASS by default.
+  local main_root settle_mode=place reasons_before=${#reasons[@]}
   if [ "$claude_exit" -eq 0 ]; then
-    sidecar_root="$(sidecar_root_of "$repo")"
+    main_root="$(main_root_of "$repo")"
+    if [ "$(cd -P "$repo" && pwd -P)" != "$(cd -P "$main_root" && pwd -P)" ]; then
+      log_notice "$NOTICE_LINKED_WORKTREE"
+    fi
     if [ "$ceiling_hit" != 0 ]; then
       settle_mode=withheld
-    elif ! ensure_ignored "$repo" "$sidecar_root"; then
-      settle_mode=withheld
-      ignore_failed=1
     fi
-    verify_out="$(settle_run "$session_out" "$digest_token" "$repo" "$sidecar_root" "$settle_mode" 2>/dev/null)"
+    verify_out="$(settle_run "$session_out" "$digest_token" "$repo" "$main_root" "$settle_mode" 2>/dev/null)"
+    verify_status=$?
+    read_verify "$verify_out" "$verify_status"
+    # A trusted result that is about to be placed: only now are the output paths made ignored (a run that is not trusted edits no
+    # exclude file), and the check is called again, which finds the proof and places.
+    if [ "$VERIFY_HELD" = ignore-proof ] && [ "$VERIFY_PLACE" = yes ] && prepare_outputs "$repo"; then
+      truncate_reasons "$reasons_before"
+      verify_out="$(settle_run "$session_out" "$digest_token" "$repo" "$main_root" "$settle_mode" 2>/dev/null)"
+      verify_status=$?
+      read_verify "$verify_out" "$verify_status"
+    fi
   else
     verify_out="$(verify_run - "$digest_token" "$repo" - 2>/dev/null)"
+    verify_status=$?
+    read_verify "$verify_out" "$verify_status"
   fi
-  verify_status=$?
   nonce=""
-  read_verify "$verify_out" "$verify_status"
   if [ "$VERIFY_PLACE" != yes ] && [ ${#reasons[@]} -eq 0 ]; then
     VERIFY_CAUSE="$CAUSE_CHECK_FAILED"
     reasons+=("$REASON_CHECK_CRASH")
@@ -1045,7 +1069,7 @@ process_repo() {
   # A trusted result must be confirmed placed by the check itself (its PLACED yes line, printed only after both renames), so a check
   # that says PLACE yes and places nothing is a FAIL. The files are not compared here: another run may have merged into them since.
   if [ "$VERIFY_PLACE" = yes ] && [ "$claude_exit" -eq 0 ] && [ "$ceiling_hit" = 0 ]; then
-    if [ "$ignore_failed" -eq 1 ]; then
+    if [ "$VERIFY_HELD" = ignore-proof ]; then
       reasons+=("${IGNORE_FAILURE:-$REASON_NOT_IGNORED}")
     elif [ "$VERIFY_PLACED" != yes ]; then
       reasons+=("$REASON_NO_OUTPUT")

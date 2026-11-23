@@ -1258,7 +1258,7 @@ const TRUNCATABLE_FIELDS = ['task', 'spec', 'spec_raw', 'round_key', 'event', 'e
 // GitHub-style https URL survives untouched.
 // Review round 1 L3: '+' is a prefix too, so 'lens-qa+<path>' (a compound
 // label with no space) and 'AC-QA-1+<path>' redact like any other boundary.
-const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+export const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
 
 // The fixed marker for a path that cannot be safely recorded: an absolute
 // path outside the repo root, or (HARN-OPT-2 PR1, AC-SEC-1 case d) a

@@ -30,6 +30,7 @@ const { runWorkflow } = require('./helpers/fake-runtime.js')
 const { cleanupTempRepos } = require('./helpers/temp-repo.js')
 const SB = require('./helpers/weekly-sandbox.js')
 const T2 = require('./helpers/t2-fixtures.js')
+const { resign } = require('./helpers/result-mac.js')
 
 const { F, ROOT, REPORT_REL, SIDECAR_REL, freshDir, runRunner, marker } = SB
 const VERIFY = path.join(ROOT, 'workflows', 'lib', 'optimise-verify.mjs')
@@ -59,7 +60,7 @@ function ghStubs(runIds = [11, 12, 13]) {
 
 // A repository with K ledger lines and F `fix:` commits, collected by the REAL collector into a private per-run directory, as
 // the skill has the operator's session do. The workflow's returned object for that digest is saved unchanged beside it.
-async function attendedRun({ ledger = 5, ledgerText = null, fix = 2, stubs = ghStubs(), alter, proposals = [] } = {}) {
+async function attendedRun({ ledger = 5, ledgerText = null, fix = 2, stubs = ghStubs(), alter, proposals = [], sign = true } = {}) {
   const repo = F.makeRepo({ ledger: ledgerText ?? F.validLedger(ledger), fix, other: 1, author: AUTHOR })
   const { outDir } = F.collect(stubs, repo)
   const perRun = freshDir('attended-')
@@ -68,12 +69,14 @@ async function attendedRun({ ledger = 5, ledgerText = null, fix = 2, stubs = ghS
   const digest = JSON.parse(fs.readFileSync(path.join(perRun, 'digest.json'), 'utf8'))
   const { result } = await runWorkflow(WORKFLOW, { args: { digest, nonce: T2.NONCE }, agent: { 'synthesis:proposals': { proposals: typeof proposals === 'function' ? proposals(digest) : proposals } } })
   if (alter) alter(result)
+  if (sign) resign(result, T2.NONCE)
   const resultFile = path.join(perRun, 'result.json')
   fs.writeFileSync(resultFile, JSON.stringify(result), { mode: 0o600 })
   return { repo, perRun, resultFile, result, stubs, digest }
 }
 
 function runAttended(run, { nonce = T2.NONCE, home = freshDir('home-') } = {}) {
+  ignoreAsTheSkillDoes(run)
   const res = spawnSync(process.execPath, [VERIFY, 'attended', run.perRun, run.resultFile, run.repo, run.repo], {
     encoding: 'utf8',
     timeout: 60000,
@@ -91,8 +94,9 @@ const lockGone = (repo) => fs.lstatSync(lockPath(repo), { throwIfNoEntry: false 
 // The skill's own commands, which the attended form relies on having been run: the report-ignore helper for each output path,
 // then git's own confirmation.
 const IGNORE_HELPER = path.join(ROOT, 'workflows', 'lib', 'optimise-report-ignore.mjs')
-function ignoreAsTheSkillDoes(root) {
-  for (const rel of [REPORT_REL, SIDECAR_REL]) assert.equal(spawnSync(process.execPath, [IGNORE_HELPER, root, rel], { encoding: 'utf8' }).status, 0)
+function ignoreAsTheSkillDoes(run) {
+  const res = spawnSync(process.execPath, [IGNORE_HELPER, 'prepare', run.repo, run.perRun], { encoding: 'utf8' })
+  assert.equal(JSON.parse(res.stdout).ok, true, `the ignore step: ${res.stdout}${res.stderr}`)
 }
 
 // A last good report and sidecar of known bytes, so a run that rewrites either is seen.
@@ -188,7 +192,6 @@ test('D2: the refusal for a call with no digest names the removed arguments when
 
 test('AC-DATA-2: the attended mode of the result check places the report and the sidecar in the repository, both ignored (by the skill\'s own commands, run first), and holds no lock afterwards', async () => {
   const run = await attendedRun()
-  ignoreAsTheSkillDoes(run.repo)
   const res = runAttended(run)
   assert.equal(res.status, 0, res.stderr)
   assert.match(res.out, /^PLACE yes$/m, res.out)
@@ -261,7 +264,7 @@ test('L3: a workflow refusal reaches the operator as its own fixed reason and ca
     for (const key of Object.keys(r)) delete r[key]
     r.report = 'Refusing to proceed: the collected digest is malformed (plan_labels).'
     r.__outcome = 'aborted'
-  } })
+  }, sign: false })
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(run.resultFile, 'utf8'))).sort((a, b) => a.localeCompare(b)), ['__outcome', 'report'], 'guard against vacuity: the saved result is a refusal')
   const seed = seedOutputs(run.repo)
   const res = runAttended(run)
@@ -353,7 +356,9 @@ test('AC-PROD-5 (L6): for the same repository, ledger, gh data and drafted propo
 
 // ---- AC-SEC-6, AC-PROD-8, AC-SEC-18: the skill and the README say what is built ----
 
-const REMOVED = [/report_path/, /proposal_targets_path/, /report:write/, /synthesis:ids/, /\bids step\b/, /rooted_rules|REPO_ALLOWED|IGNORE_HELPERS|edit_rule/, /Edit\(\/\//, /fans out to three/i, /\blane agents?\b/i, /\bscope agent\b/i]
+// The names of what the optimiser no longer is (whole-branch review L1): the in-workflow lanes and report write, the staged workflow copy, the transcript
+// and its redaction in the weekly job, and a nonce minted by openssl. A reader auditing the attack surface from the README must not be sent to them.
+const REMOVED = [/three parallel lanes/i, /report persistence/i, /\.optimise-cycle\.js\.staged/, /transcript temp file/i, /\bopenssl\b/, /invoked by `optimise-cycle\.js`/, /staged `optimise-cycle\.js`/, /bin\/redact-transcript\.mjs ~\/\.claude\/bin/, /~\/\.claude\/bin\/redact-transcript/, /report_path/, /proposal_targets_path/, /report:write/, /synthesis:ids/, /\bids step\b/, /rooted_rules|REPO_ALLOWED|IGNORE_HELPERS|edit_rule/, /Edit\(\/\//, /fans out to three/i, /\blane agents?\b/i, /\bscope agent\b/i]
 for (const [name, text] of [['skills/optimise-cycle/SKILL.md', SKILL], ['README.md', README]]) {
   test(`AC-SEC-18/AC-PROD-8: ${name} describes none of the removed mechanisms (report-path arguments, the in-session ids step, the removed grants, the lane and scope agents)`, () => {
     for (const re of REMOVED) {
@@ -399,8 +404,8 @@ test('AC-DATA-2/AC-SEC-6: the skill drives the attended run step by step with ex
     assert.ok(m, `the skill has ${re}`)
     return m.index
   }
-  const order = [/mktemp -d/, /optimise-collect\.mjs/, /git rev-parse --path-format=absolute --git-common-dir/, /optimise-report-ignore\.mjs/, /git -C <main root> check-ignore/, /randomBytes\(16\)|openssl rand -hex 16/, /[Uu]se the Read tool on/, /Workflow[^\n]*optimise-cycle/, /optimise-verify\.mjs attended/, /rm -rf <run dir>/].map(at)
-  assert.deepEqual(order, [...order].sort((a, b) => a - b), 'the steps are in the order: directory, collect, main checkout, ignore, confirm, nonce, read, workflow, check and place, clean up')
+  const order = [/mktemp -d/, /optimise-collect\.mjs/, /optimise-report-ignore\.mjs prepare/, /randomBytes\(16\)|openssl rand -hex 16/, /[Uu]se the Read tool on/, /Workflow[^\n]*optimise-cycle/, /optimise-verify\.mjs attended/, /rm -rf <run dir>/].map(at)
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), 'the steps are in the order: directory, collect, main checkout and ignore (one command), nonce, read, workflow, check and place, clean up')
   assert.match(FLAT_SKILL, /chmod 700|0700/, 'the per-run directory is private')
   assert.match(FLAT_SKILL, /digest[^\n]{0,80}nonce/, 'the workflow is called with the digest and the nonce')
   assert.match(FLAT_SKILL, /never writes the report or the sidecar by hand/i, 'no second writer')
@@ -474,11 +479,11 @@ const BLOCK = /# BEGIN FIXED REASONS\n([\s\S]*?)# END FIXED REASONS/
 function runnerRegistry() {
   const block = BLOCK.exec(RUNNER)?.[1]
   assert.ok(block, 'the runner has one block between BEGIN FIXED REASONS and END FIXED REASONS')
-  const entries = [...block.matchAll(/^(REASON|CAUSE|MODE)_([A-Z\d_]+)="([^"\n]*)"$/gm)].map((m) => ({ kind: m[1], name: m[2], value: m[3] }))
+  const entries = [...block.matchAll(/^(REASON|CAUSE|MODE|NOTICE)_([A-Z\d_]+)="([^"\n]*)"$/gm)].map((m) => ({ kind: m[1], name: m[2], value: m[3] }))
   const lines = block.split('\n').filter((l) => l.trim() !== '' && !l.trim().startsWith('#'))
-  assert.equal(entries.length, lines.length, `every non-comment line of the runner's block is a REASON_, CAUSE_ or MODE_ assignment: ${lines.filter((l) => !/^(REASON|CAUSE|MODE)_[A-Z\d_]+="[^"\n]*"$/.test(l)).join(' | ')}`)
+  assert.equal(entries.length, lines.length, `every non-comment line of the runner's block is a REASON_, CAUSE_ or MODE_ assignment: ${lines.filter((l) => !/^(REASON|CAUSE|MODE|NOTICE)_[A-Z\d_]+="[^"\n]*"$/.test(l)).join(' | ')}`)
   const of = (kind) => entries.filter((e) => e.kind === kind).map((e) => e.value)
-  return { reasons: of('REASON'), causes: of('CAUSE'), modes: of('MODE') }
+  return { reasons: of('REASON'), causes: of('CAUSE'), modes: of('MODE'), notices: of('NOTICE') }
 }
 
 async function registries() {
@@ -492,7 +497,7 @@ async function registries() {
     reasons: [...Object.values(verify.FIXED_REASONS), ...Object.values(collect.FIXED_REASONS), ...runner.reasons],
     causes: [...new Set([...verify.CAUSE_TOKENS, ...runner.causes])],
     modes: [...new Set([...collect.FAILURE_MODES, ...runner.modes])],
-    notices: [...verify.NOTICE_TOKENS],
+    notices: [...new Set([...verify.NOTICE_TOKENS, ...runner.notices])],
   }
 }
 
@@ -569,7 +574,7 @@ function literalLeads(source) {
 }
 
 // Labels the result check prints inside a figure line, command text, and report-line patterns: none of them is a reason of its own.
-const VERIFY_NOT_REASONS = new Set(['not fetched', 'timed out', 'git scoped', 'scoped counted', 'scoped excluded', 'scoped unavailable', 'runs not completed', 'gh calls', 'not measured', 'left out', 'duplicate fixed confirmations across rounds', 'not recorded', 'findings dropped from this tally'])
+const VERIFY_NOT_REASONS = new Set(['a line in a shape the check does not know', 'proposal outcome', 'not fetched', 'timed out', 'git scoped', 'scoped counted', 'scoped excluded', 'scoped unavailable', 'runs not completed', 'gh calls', 'not measured', 'left out', 'duplicate fixed confirmations across rounds', 'not recorded', 'findings dropped from this tally'])
 // The collector's command strings, labels and report notes: none of them is a reason of its own.
 const COLLECT_NOT_REASONS = new Set(['gh run list', 'gh run view', 'git log', 'git rev-parse', 'ci lane', 'the git log was cut at', 'the full git history was examined', 'output over the size limit', 'the specs directory is a symlink or could not be read, so no plan labels were collected', 'only the first'])
 

@@ -1278,8 +1278,9 @@ repository; run `workflows/lib/optimise-collect.mjs` into it for the
 repository; resolve the repository's main checkout (the repository itself, or
 the main checkout of a linked worktree, with `git rev-parse
 --path-format=absolute --git-common-dir`) and make the two output paths
-ignored there with the report-ignore helper, confirming each with `git
-check-ignore`; mint a nonce; read `digest.json`; call the `optimise-cycle`
+ignored there, both done by one command of the report-ignore helper
+(`optimise-report-ignore.mjs prepare`), which confirms each path with git and
+writes the proof the check needs before it will place anything; mint a nonce; read `digest.json`; call the `optimise-cycle`
 workflow with `{digest, nonce}`; save the object it returns, unchanged; then
 run `workflows/lib/optimise-verify.mjs attended` on it, giving it the
 repository and the main checkout. That last step is the same result check the
@@ -1297,10 +1298,14 @@ placement. A call to the workflow with no digest, with a nonce that is not 32
 lower-case hex characters, or with a `repos`, `window` or `digests` argument,
 is refused before any model runs.
 
-**Report**: written to `.claude/optimise-cycle-report.md` in the repo that was
-analysed, by the result check (never by a model) after it has checked the
-report. The path is gitignored through `.git/info/exclude` and confirmed with
-`git check-ignore -q` before either output is written, and the write is
+**Report**: written to `.claude/optimise-cycle-report.md` in the main checkout of the repo that
+was analysed (the repo itself, or the main checkout of a linked worktree; a roster entry that
+names a worktree therefore replaces the main checkout's report with one analysed from that
+worktree's branch, and the weekly run logs a `NOTICE ... linked-worktree` line when that is
+so), by the result check (never by a model) after it has checked the
+report. The paths are gitignored through `.git/info/exclude` and confirmed with
+git by `optimise-report-ignore.mjs` (which also decides the location) before either output
+is written, and the result check places only when it is handed that step's proof; the write is
 refused if that check fails (`workflows/lib/optimise-report-ignore.mjs`,
 mirroring `ledger-append.mjs`'s own discipline). The proposal-targets sidecar,
 `.claude/optimise-proposal-targets.json`, is placed beside it under the main
@@ -1514,7 +1519,7 @@ anchored to that specific message, not a bare grep for the ceiling
 variable's name, which used to false-positive on any transcript merely
 mentioning it (this README does, right here).
 
-**What the unattended session can do (as measured on Claude Code 2.1.322).** The
+**What the unattended session can do (as measured on Claude Code 2.1.322, and for the workflow's `scriptPath` on 2.1.330).** The
 session has no shell and no file write. The invocation passes exactly these
 flags and tool rules:
 
@@ -1555,9 +1560,24 @@ names, plan titles), outside the nonce fence that every model the *workflow*
 starts gets. A digest that carried a planted instruction could therefore shape
 the words of a proposal, which the operator reads before acting. It is
 bounded, not removed: the session has no shell, write or network tool; the
-workflow returns the SHA-256 of the nonce it fenced with and the result check
-refuses a mismatch; and every figure and every returned sidecar entry is
-checked against what the runner collected. Whether a real session obeys such
+workflow returns a keyed digest (`result_mac`: SHA-256 of the nonce, the report,
+the proposal-targets and the lane statuses) and the result check works it out
+again and refuses a mismatch; and every figure and every returned sidecar entry is
+checked against what the runner collected. What the digest shows is that the
+reply is the object a workflow run on this run's nonce returned; it does not show
+who computed it. **Assumption, not measured:** on the unattended path the session
+has no tool that can compute a SHA-256, so it cannot produce a matching digest for
+text it altered (T5 probes whether the Workflow tool would run an inline script that
+could); on the attended path the session has a shell and could compute it, so there
+the digest guards against accident, not against a steered session. A second,
+independent layer refuses any report in which a proposal would remove an always-on
+lens, and a third refuses a report with a look-alike or hidden headline figure line.
+**Proposal ids:** an id is hashed from the target as it is stored, with
+absolute-path-looking text redacted and whitespace collapsed first, so two targets
+that differ only in text that redacts to the same marker (for example two slash
+commands in the same field) share one id and are one proposal as far as history
+goes. That is deliberate (owner decision 2026-11-23); the pattern is also broader than
+real paths, and matches any slash-led word such as `/review-cycle`. Whether a real session obeys such
 an instruction has not been measured yet; a probe with a planted instruction is
 planned (`specs/harn-runner-2.md`, task T5). (4) Plugin hooks still see the session while it
 runs, though it is not saved to disk. The attended session is the operator's own, has a shell, and reads the digest outside any fence. It is told before
@@ -1602,7 +1622,8 @@ notification naming the failing repo labels and the first reason, and writes
 one line to `~/.claude/logs/optimise-cycle-weekly.last-result` (UTC timestamp,
 PASS or FAIL, labels, reasons) that stays until the next run overwrites it. A
 notifier that fails leaves `NOTIFY-FAILED <exit code>` in the run log. The
-transcript temp file and the staged `optimise-cycle.js` are removed on exit
+per-run directory (the collected data, the digest, the session's output and the
+copy of the workflow the session runs) is removed on exit
 and on SIGTERM or SIGINT, and a run that is stopped that way records FAIL and
 notifies like any other FAIL. Each invocation makes a directory of its own,
 `run.XXXXXX` (from `mktemp -d`), inside a mode-700 parent that only the runner
@@ -1636,7 +1657,7 @@ it. The outcome file reads `RUNNING` from the moment a run starts, so a run that
 dies without reporting leaves `RUNNING`, not last week's result, and a failed
 write of it is logged as `LAST-RESULT-WRITE-FAILED`.
 
-**Keep `~/.claude/bin/optimise-cycle-weekly.sh`, `~/.claude/bin/redact-transcript.mjs`
+**Keep `~/.claude/bin/optimise-cycle-weekly.sh`
 and `~/.claude/bin/com.local.optimise-cycle-weekly.plist` copied from this
 repo's `bin/`** after merging any change to them. Unlike the top-level
 workflow scripts above, copying these genuinely does deploy them: launchd
@@ -1657,11 +1678,9 @@ necessary but not sufficient on their own:
 
 ```bash
 cp claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
-cp claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
 cp claude-ai-harness/bin/sonar-rules-table.mjs ~/.claude/bin/sonar-rules-table.mjs
 chmod +x ~/.claude/bin/optimise-cycle-weekly.sh
 diff -q claude-ai-harness/bin/optimise-cycle-weekly.sh ~/.claude/bin/optimise-cycle-weekly.sh
-diff -q claude-ai-harness/bin/redact-transcript.mjs ~/.claude/bin/redact-transcript.mjs
 diff -q claude-ai-harness/bin/sonar-rules-table.mjs ~/.claude/bin/sonar-rules-table.mjs
 ```
 
@@ -1715,6 +1734,7 @@ scheduled run.
 | `no repos configured` | The runner has no repository to analyse. | `~/.claude/optimise-weekly-repos` exists and lists one path per line. | Add the paths (see above), then re-run. |
 | `no repos checked (all skipped)` | Every configured path was skipped, so nothing was analysed. | Each path is a git repository and still exists. | Fix the list or the paths, then re-run. |
 | `configured repo path does not exist` | A configured path is not on disk. | The spelling of the line in `~/.claude/optimise-weekly-repos`, and that the volume is mounted. | Correct or remove the line. |
+| `git could not read the configured repository` | The path has a `.git` but git could not resolve it: git refused the repository for its ownership (`safe.directory`), or the `.git` is damaged. It is a FAIL, not a skip. | `git -C <repo> rev-parse --git-dir` by hand as the job's user; who owns the folder. | Fix the ownership (add it to `safe.directory` only if you trust it) or repair the repository. |
 | `cd into repo failed` | The runner could not enter the configured path. | Permissions on the directory. | Fix the permissions or remove the path. |
 | `could not create this run's temp directory` | The runner could not make its private per-run directory. | Free space and permissions under `$TMPDIR` (or `~/.claude` when `$TMPDIR` is unset). | Free space or fix permissions, then re-run. |
 | `could not capture a valid run start time` | The runner could not read the clock for this repo. | `date +%s` prints a number. | Re-run; if it repeats, fix the system's `date`. |
@@ -1722,7 +1742,7 @@ scheduled run.
 | `workflows/optimise-cycle.js is missing from the install; run bin/install.sh` | The installed workflow file is not there. | `ls ~/.claude/workflows/optimise-cycle.js`. | Run `bin/install.sh`. |
 | `workflows/lib/<file> is missing from the install; run bin/install.sh` | A helper program the runner needs is missing from the install. | The file named in the reason under `~/.claude/workflows/lib/`. | Run `bin/install.sh`, then `bin/install.sh --check`. |
 | `could not copy the installed workflow into the per-run directory` | The runner could not copy the workflow beside the digest for the session. | Free space and permissions on the per-run directory. | Free space, then re-run. |
-| `could not mint a containment nonce` | The runner could not make the random token that fences collected text. | That `openssl` or `node` runs from the job's PATH. | Fix the PATH or reinstall the tool, then re-run. |
+| `could not mint a containment nonce` | The runner could not make the random token that fences collected text. | That `node` runs from the job's PATH. | Fix the PATH or reinstall the tool, then re-run. |
 | `collector timed out after` | Collecting one repo's data took longer than its bound. | `gh` and `git` answer quickly by hand in that repo, and the network is up. | Fix the slow command, then re-run. |
 | `collector failed (exit <n>, <token>)` | The collector program crashed. | The token (a Node error code such as `ERR_MODULE_NOT_FOUND`), and `bin/install.sh --check`. | Run `bin/install.sh`; if it repeats, report the token. |
 | `collector failed (no result line)` | The collector finished without its one summary line. | `bin/install.sh --check`, then run the collector by hand on the repo. | Run `bin/install.sh`; if it repeats, report it. |
@@ -1736,6 +1756,7 @@ scheduled run.
 | `could not take the sidecar lock` | Another run held the short lock on the proposal-targets file for about 30 seconds. | Another weekly or attended run in the same repo. | Wait and re-run; if a lock is left by a crashed run it is taken over once its owner is gone or after 10 minutes. |
 | `the sidecar lock path is not usable` | The main checkout has no ordinary git directory to hold the lock, or a lock link could not be made there (permissions, or a read-only disk). | `.git/` is a real directory in the main checkout and can be written to. | Fix the permissions, or run it in the main checkout. |
 | `the sidecar lock helper failed` | The lock step itself failed in a way it does not name. | The `RESULT-CHECK-STATUS` line above it, and `bin/install.sh --check`. | Run `bin/install.sh`, then re-run; report it if it repeats. |
+| `the output paths were not confirmed ignored for this checkout` | The check had no proof, or a stale, used or other-checkout proof, that the report and sidecar paths are ignored in the main checkout, so it placed nothing. For an attended run it means the ignore step (`optimise-report-ignore.mjs prepare`) was skipped. | That step ran for this run directory and printed `"ok":true`. | Run the step, then run the check again. |
 | `main checkout does not match the repository` | The attended check was given a main-checkout path that is not this repository's own: another repository, a link, a relative path or one that does not exist. | The path is what `git rev-parse --path-format=absolute --git-common-dir` printed for this repository, without the trailing `/.git`. | Pass that path. |
 | `workflow refused to run` | The workflow returned a refusal (a digest or nonce it does not accept), not a result. | `bin/install.sh --check`: the installed workflow and result check may not match the runner or the collector. | Run `bin/install.sh`, then re-run; report it if it repeats. |
 | `the result check could not run` | The result check program crashed or was missing. | The `RESULT-CHECK-STATUS` line above it (exit code, bytes, error code). | Run `bin/install.sh`, then re-run. |
@@ -1769,6 +1790,11 @@ scheduled run.
 | `returned sidecar has a target that is not the fixed shape` | A returned target does not have exactly the fixed fields. | As above. | As above. |
 | `returned sidecar has a target that does not hash to its id` | A returned target sits under another target's id. | As above. | As above. |
 | `returned sidecar has an id this run does not name` | A returned entry's id appears neither in the report nor in the ledger's recorded outcomes. | As above. | As above. |
+| `result carries no mac` | The returned object has no keyed digest (`result_mac`), or it is not a 64-character hash. | `bin/install.sh --check`: the installed workflow may predate the result check. | Run `bin/install.sh`, then re-run; report it if it repeats. |
+| `result mac does not match this run` | The keyed digest does not match the nonce and the reply's report, targets and lane statuses, so the reply was edited after the workflow returned it (or came from another run). Nothing was placed. | Nothing to check on your side. | Re-run; report it if it repeats. |
+| `report proposes removing an always-on lens` | A proposal in the report would remove `lens-security` or `lens-qa` from the always-on roster, which the workflow itself never lets through. Nothing was placed. | The report text in the session's reply, if you have it. | Re-run; report it if it repeats. |
+| `report contains an HTML comment` | The report holds `<!--`, which can hide a line that is not shown. | Nothing to check on your side. | Re-run; report it if it repeats. |
+| `report contains an invisible or direction-control character` | The report holds a zero-width or text-direction character, which can make a line read differently from how it is stored. | Nothing to check on your side. | Re-run; report it if it repeats. |
 | `result carries no nonce hash` | The returned object lacks the hash of this run's nonce. | The session may have called another workflow copy. | Re-run; report it if it repeats. |
 | `result nonce hash does not match this run` | The hash does not match this run's nonce, so the result is not from this run's digest. | As above. | As above. |
 | `report holds an absolute path` | The report names a path under the home directory, the repo or the per-run directory. | Nothing to check on your side. | Re-run; report it if it repeats. |
@@ -1807,6 +1833,8 @@ scheduled run.
 | `cause=signal` | The runner was stopped by a signal (a shutdown, a logout or a kill). | When it happened. | Re-run. |
 | `cause=empty` | The session printed nothing. | See `session output: empty`. | Same. |
 | `cause=malformed` | The session's output or result was not in the agreed shape. | See the `session output:` rows. | Same. |
+| `notice=linked-worktree` | The weekly run analysed a linked worktree, so its report replaces the main checkout's report with one analysed from that worktree's branch (a `NOTICE <repo> linked-worktree` line in the log). | Whether the roster entry should name the main checkout instead. | Change the roster entry if that is not what you want. |
+| `cause=mac` | The returned keyed digest was missing or did not match. | See the two `result ... mac` rows. | Same. |
 | `cause=nonce` | The returned nonce hash did not match. | See the two `nonce hash` rows. | Same. |
 | `cause=oversized` | The report or the proposal-targets object was over its size cap. | See the size rows. | Same. |
 | `cause=failed_step` | The workflow stopped at a step. | See `session returned failed_step`. | Same. |
@@ -1854,12 +1882,13 @@ rm ~/Library/LaunchAgents/com.local.optimise-cycle-weekly.plist
 
 To reinstate it later, re-run the two-line `sed`/`bootstrap` install above.
 
-If the job was ever killed with SIGKILL before the rollback, also delete
-`.claude/workflows/.optimise-cycle.js.staged` in each configured repo, and
-`.claude/workflows/optimise-cycle.js` there if it is byte-identical to that
-marker and untracked. The pre-T11 runner knows nothing of the marker and reads
-any existing workflow file as the repo's own, so a stale copy would otherwise
-stay pinned and override later global updates with no log line.
+The runner stages nothing in an analysed repository (the copy of the workflow the
+session runs lives in the per-run directory under `$TMPDIR/optimise-weekly-runner`),
+so a rollback leaves nothing to delete there. A run killed with SIGKILL leaves its
+per-run directory, which the next run's start-up removes after 24 hours. Rolling the
+runner back means booting the job out (above); copying an older runner over a newer
+installed workflow, or the reverse, makes every repo FAIL until `bin/install.sh` and
+the runner copy are brought level, so do both.
 
 **This rollback has been executed, not merely documented** (2026-08-18, per
 CLAUDE.md §11: a documented rollback nobody has run is an assumption). The
@@ -1879,46 +1908,21 @@ durable record of whether the weekly job has been firing; the log file is.
 #### Log retention
 
 The log is appended to indefinitely; nothing in this repo rotates or
-prunes it. Measured: ~640 bytes per run (two repos), roughly 33 KB/year at
-the weekly cadence -- rotation is deliberately **not** implemented, since
+prunes it. Each run writes a header line, the staleness check's line, and for each
+repository a `COLLECT` line (the collector's fixed figures), a `TIMING` line, a
+`DENIED-TOOLS` line, any `NOTICE` line, and one `RESULT` line (capped near 2 KB, fixed
+tokens and integers only). **No session text is ever in it**: the session's reply is
+checked, never logged, and no transcript is written. The earlier figure of about 640
+bytes per run was measured for the pre-change runner and is superseded; the new figure
+is measured in the real run recorded under T5. Rotation is deliberately **not** implemented, since
 it would risk truncating the only place a real run's `RESULT` lines live,
 for a growth rate too small to justify the risk. **Delete it** with
 `rm ~/.claude/logs/optimise-cycle-weekly.log` -- the next scheduled run
-recreates it automatically. The transcript portion of each entry is
-redacted (`bin/redact-transcript.mjs`, reusing `workflows/lib/ledger-append.mjs`'s
-`redactPaths`) and every line this script itself writes uses the repo's
+recreates it automatically. Every line this script itself writes uses the repo's
 basename rather than its absolute filesystem path, so the log carries no
 `/Users/`, `/Volumes/`, `/home/` path or account name -- the same standard
 the ledger and report already hold themselves to (AC-SEC-3 in
 `specs/optimise-cycle.md`).
-
-**Two redaction fixes landed in the T3 subtraction round (conductor log
-tick 46), against a real leaked line**, not a synthetic one: an archived
-2026-08-16 log line naming a real delivery repo's report path, fed through
-the redactor as it shipped, came through **completely unchanged**, because
-Claude formats a path in backticks by default and `ABSOLUTE_PATH_RE`'s
-prefix class did not recognise one.
-
-- `ABSOLUTE_PATH_RE` (`workflows/lib/ledger-append.mjs`) now also anchors
-  on a backtick, `` = ``, `[`, `<` or `,` immediately before a path, and on
-  `:` when not immediately followed by `//` (so a `https://`/`http://` URL
-  in ordinary prose is never mistaken for a path and mangled -- proven
-  both ways in `test/ledger-append.test.js`).
-- `bin/redact-transcript.mjs` adds a second, belt-and-braces pass **after**
-  the regex: a plain literal-substring replacement of this process's own
-  `os.homedir()` and `os.userInfo().username`. This catches every form a
-  regex over free-text prose can miss, including a bare `$(whoami)` leak
-  with no path shape at all to anchor on (proven separately, in a stub
-  that printed the account name with no surrounding path).
-
-Separately: the redaction-failure fallback message (when
-`redact-transcript.mjs` is missing or fails) now names the script by its
-**relative** path (`bin/redact-transcript.mjs`), not `$REDACT_SCRIPT`'s
-absolute one -- the earlier form put this operator's own account path into
-the very fallback message that exists to protect against exactly that
-leak, and that branch was live: the installed mirror had no
-`redact-transcript.mjs` at all until the copy step documented above was
-added.
 
 ## Analyser rules table
 
@@ -2012,9 +2016,11 @@ invoking real subagents.
 | `workflows/review-cycle.js` | Review orchestration: scope + SHA pin, deterministic triggering, parallel worktree-isolated lenses, synthesis |
 | `workflows/tdd-task.js` | Script-enforced TDD for one scoped change: implement is unreachable until RED is verified for the right reason; commit refused if tests changed between RED and GREEN |
 | `workflows/lib/ledger-append.mjs` | Real-Node script (invoked via Bash, never imported: workflow scripts cannot import) owning the ledger envelope schema, path resolution, `.git/info/exclude` ignore-ensure and the atomic single-line append; invoked by all three workflows above |
-| `workflows/optimise-cycle.js` | Delivery optimiser orchestration: three parallel lanes (ledger, gh, git), mechanical proposal gates (citation, insufficient-data, security-removal, sample-size), report persistence |
-| `workflows/lib/optimise-read.mjs` | Real-Node script owning ledger parsing/aggregation, gh/CI aggregation, the escaped-defect heuristic and stable proposal ids; invoked by `optimise-cycle.js`, read-only |
-| `workflows/lib/optimise-report-ignore.mjs` | Real-Node script ensuring the optimiser's report path is gitignored before every write, mirroring `ledger-append.mjs`'s own discipline; the one narrowly-scoped exception to `optimise-read.mjs`'s read-only contract, kept in a separate file on purpose |
+| `workflows/optimise-cycle.js` | Delivery optimiser analysis: takes the collector's digest and a nonce, runs the mechanical proposal gates (citation, insufficient-data, security-removal, sample-size) and returns the report, the proposal-targets sidecar, each lane's status and a keyed digest of them; it runs no lane, reads no file and writes none |
+| `workflows/lib/optimise-read.mjs` | Real-Node script owning ledger parsing/aggregation, gh/CI aggregation, the escaped-defect heuristic and stable proposal ids; run by the collector (`optimise-collect.mjs`), read-only |
+| `workflows/lib/optimise-report-ignore.mjs` | Real-Node script that decides, once, where the optimiser's two outputs go (the main checkout) and whether their paths are ignored (it makes them so, confirms with git, and writes the proof the result check needs before it places); mirrors `ledger-append.mjs`'s own discipline and is the one place that runs git for that decision, kept in a separate file on purpose |
+| `workflows/lib/optimise-collect.mjs` | Real-Node collector: the one program that runs `gh` and `git` for the optimiser; collects the ledger, git and CI data into a private per-run directory and writes the bounded digest |
+| `workflows/lib/optimise-verify.mjs` | Real-Node, spawn-free result check shared by the weekly runner and the attended run: holds the reply to the collected files and to its keyed digest, validates and merges the sidecar under the one lock, and places both outputs |
 | `skills/conduct-plan/` | Controller-loop skill for executing multi-PR plans without stalling; also logs task-level wait/PR events to the ledger |
 | `skills/optimise-cycle/` | Usage, cadence, report format and the proposal-decision recording protocol for the delivery optimiser |
 | `hooks/plan-guard-stop.py` | Stop hook enforcing the no-stall invariant during conducted plans |

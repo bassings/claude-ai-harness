@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, wasNoSpecInPlay, BLOCKED_REASONS, MODEL_PATTERN_STR } from './ledger-append.mjs'
+import { ABSOLUTE_PATH_RE, LEDGER_RELATIVE_PATH, canonicalPlanKey, REDACTED_PATH_MARKER, NO_SPEC_PLAN_KEY, LENS_PATTERN_STR, AC_ID_PATTERN_STR, wasNoSpecInPlay, BLOCKED_REASONS, MODEL_PATTERN_STR } from './ledger-append.mjs'
 
 // Round-7 review F1 (§12 reframe, corrected a second time): round-6's
 // isNeutralised(obj, field) asked a SHAPE question -- "is this value null
@@ -1818,7 +1818,7 @@ export function countEscapedDefectCandidates(commits, options = {}) {
 // identically as a result. Recurses and sorts keys at EVERY level instead,
 // so nested content is never silently dropped and key order never matters
 // at any depth.
-function canonicalJson(value) {
+export function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
   if (value !== null && typeof value === 'object') {
     const keys = Object.keys(value).sort()
@@ -1834,7 +1834,11 @@ function canonicalJson(value) {
 // is deliberately not identity, so a rejection recorded in one roster repo is
 // found for the same target proposed in another (the skill documents this).
 export const PROPOSAL_IDENTITY_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
-const identityValue = (v) => (typeof v === 'string' ? v : v === null || v === undefined ? '' : String(v)).trim().toLowerCase()
+// The identity value is the value as it is STORED: redacted (an absolute-path-looking string becomes the marker, exactly as the workflow redacts a
+// target before it writes it to the sidecar), whitespace runs collapsed (as the sidecar read collapses them), trimmed and lower-cased. So a stored
+// target always hashes to its own key. Deliberate consequence (owner decision 2026-11-23, M3): two targets that differ only in text that redacts to
+// the same marker share one id, and are one proposal as far as history goes. The workflow's proposal-id block does the same (a parity test).
+const identityValue = (v) => (typeof v === 'string' ? v : String(v ?? '')).replace(ABSOLUTE_PATH_RE, (whole, prefix) => prefix + REDACTED_PATH_MARKER).replaceAll(/\s+/g, ' ').trim().toLowerCase()
 
 // A stable proposal id derived from the TARGET a proposal is about (never
 // its prose wording), so the same target re-proposed across cycles is
@@ -2078,6 +2082,20 @@ function attachSidecarTargets(outcomes, roots) {
     }
     o.targetUnavailableReason = reason
   }
+  return withLegacyAliases(outcomes)
+}
+
+// An outcome recorded under an id computed before the identity value was redacted and normalised (the old id of a path-shaped or multi-space
+// target) is also reachable under the id its stored target hashes to now, so a proposal re-raised today finds its prior rejection or adoption.
+// The old entry is left exactly as it is (nothing is renamed, dropped or rewritten); an id that already has an outcome of its own is not replaced.
+function withLegacyAliases(outcomes) {
+  const aliases = []
+  for (const [id, o] of Object.entries(outcomes)) {
+    if (!o.target || !/^[0-9a-f]{16}$/.test(id)) continue
+    const current = stableProposalId(o.target)
+    if (current !== id && !Object.hasOwn(outcomes, current) && !aliases.some(([taken]) => taken === current)) aliases.push([current, o])
+  }
+  for (const [current, o] of aliases) outcomes[current] = { ...o }
   return outcomes
 }
 
@@ -2255,6 +2273,8 @@ export function main() {
     }
     return runCiCommand(payload)
   }
+  // Kept for operators and for the tests that pin its output; nothing in the optimiser's own run calls it any more (the collector calls
+  // escapedDefectsFigures in process), and nothing here depends on it.
   if (command === 'escaped-defects') {
     const raw = readStdin()
     let payload

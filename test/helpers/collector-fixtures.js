@@ -75,7 +75,7 @@ fail_with() {
     forbidden) echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1 ;;
     other) echo 'gh: something unexpected happened' >&2; exit 1 ;;
     detach) detach_holder; exit 0 ;;
-    huge) head -c 70000000 /dev/zero | tr '\\0' 'a'; exit 0 ;;
+    huge) printf 'HUGE\\tstarted\\n' >> "${log}"; head -c 70000000 /dev/zero | tr '\\0' 'a'; printf 'HUGE\\tfinished\\n' >> "${log}"; exit 0 ;;
   esac
 }
 mode=$(cat "${dir}/gh-mode" 2>/dev/null || echo ok)

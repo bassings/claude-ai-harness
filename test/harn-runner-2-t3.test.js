@@ -373,6 +373,8 @@ process.stdout.write(out.replace(/digest=ran:\\S+/, 'digest=failed:too_large'))
 const MISMATCHES = [
   ['ledger record count', 'ledger-plus1', /^figure mismatch ledger: collected 6, reported 7$/, [/\b6\b/, /\b7\b/]],
   ['CI run count', 'ci-plus1', /^figure mismatch ci: runs collected 4, reported 5$/, [/\b4\b/, /\b5\b/]],
+  ['CI run count dropped in transit (the reported count is lower)', 'ci-minus1', /^figure mismatch ci: runs collected 4, reported 3$/, [/\b4\b/, /\b3\b/]],
+  ['escaped-defect raw count dropped in transit', 'git-minus1', /^figure mismatch git: count collected 2, reported 1$/, [/\b2\b/, /\b1\b/]],
   ['escaped-defect raw count', 'git-plus1', /^figure mismatch git: count collected 2, reported 3$/, [/\b2\b/, /\b3\b/]],
   ['hollow report (0 ledger records beside a ledger of 6) -- the 2026-11-13 shape', 'ledger-zero', /^figure mismatch ledger: collected 6, reported 0$/, [/\b6\b/, /\b0\b/]],
   ['hollow report built by the real workflow from a ledger emptied in transit', 'ledger-emptied', /^figure mismatch ledger: collected 6, reported 0(;|$)/, [/\b6\b/, /\b0\b/]],
@@ -680,6 +682,7 @@ test('AC-SEC-12: a SIGTERM while the session runs removes the per-run directory 
 
 test('AC-QA-21: two runners started together against one repository each log a RESULT line, use different directories, and leave one complete returned report in place', async () => {
   const repo = repoWith({ ledger: 5 })
+  marker(repo, 'heading-unique')
   const stubs = ghWith()
   const tmpdir = freshDir('shared-tmp-')
   const a = startRunner([repo], { stubs, tmpdir })
@@ -694,6 +697,7 @@ test('AC-QA-21: two runners started together against one repository each log a R
     return JSON.parse(JSON.parse(fs.readFileSync(path.join(r.witness, reply), 'utf8')).result).report
   })
   const placed = fs.readFileSync(path.join(repo, REPORT_REL), 'utf8')
+  assert.notEqual(returned[0], returned[1], 'guard against vacuity: the two runs returned different reports, so "one of them, never a mix" can fail')
   assert.ok(new Set(returned).has(placed), 'the placed report is one run\'s complete returned report, never a mix')
   assert.deepEqual(runDirsOf(tmpdir), [])
 })

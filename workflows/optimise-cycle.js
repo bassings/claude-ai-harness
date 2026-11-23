@@ -276,15 +276,28 @@ function canonicalJson(value) {
 }
 // The six identity keys, in the reader's order (PROPOSAL_IDENTITY_KEYS there); the two gate booleans are not identity.
 const PROPOSAL_ID_KEYS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
+// The identity value is the value as it is STORED (owner decision 2026-11-23, M3): an absolute-path-looking string redacted to the marker, exactly as a
+// target is redacted before it is written to the sidecar; whitespace runs collapsed; trimmed; lower-cased. So a stored target always hashes to its own
+// key, and workflows/lib/optimise-read.mjs does the same (a parity test). Two targets that differ only in text that redacts to the same marker share one id.
+const ID_ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+const ID_REDACTED_MARKER = '<redacted-path>'
 function idValue(v) {
-  if (typeof v === 'string') return v.trim().toLowerCase()
-  const text = v === null || v === undefined ? '' : String(v)
-  return text.trim().toLowerCase()
+  const text = typeof v === 'string' ? v : String(v ?? '')
+  return text.replace(ID_ABSOLUTE_PATH_RE, (whole, prefix) => prefix + ID_REDACTED_MARKER).replace(/\s+/g, ' ').trim().toLowerCase()
 }
 function stableProposalId(target) {
   const t = target && typeof target === 'object' ? target : {}
   if (!PROPOSAL_ID_KEYS.some((k) => k in t)) return sha256Hex(canonicalJson(target)).slice(0, 16)
   return sha256Hex(canonicalJson(PROPOSAL_ID_KEYS.map((k) => idValue(t[k])))).slice(0, 16)
+}
+// The keyed digest of what this workflow returns (result_mac): SHA-256 of this exact byte sequence, UTF-8:
+//   <nonce> "\n" <report text exactly as returned> "\n" <canonicalJson(proposal_targets)> "\n" <canonicalJson(lanes)>
+// The result check (workflows/lib/optimise-verify.mjs, resultMac) works the same value out again from the reply it is handed and the nonce it
+// holds, and places nothing when they differ, so a reply edited after this workflow returned it is refused. A parity test holds the two
+// implementations together. It shows the reply is this workflow's output for this run's nonce; it does not show who computed it: the
+// unattended session has no tool that can compute a SHA-256 (an assumption T5 probes), the attended one has a shell.
+function resultMacOf(nonce, report, proposalTargets, lanes) {
+  return sha256Hex(`${nonce}\n${report}\n${canonicalJson(proposalTargets)}\n${canonicalJson(lanes)}`)
 }
 // END proposal-id block
 
@@ -844,7 +857,9 @@ const previouslyAdopted = ranked.filter(isAdoptedElsewhere)
 // there is one eviction rule, not two with opposite orders (HARN-RUNNER-2 T3 L12).
 const proposalTargetsSidecar = {}
 for (const [id, o] of Object.entries(ledgerAgg?.proposalOutcomes || {})) {
-  if (o && o.target && typeof o.target === 'object' && /^[0-9a-f]{16}$/.test(id)) proposalTargetsSidecar[id] = redactDeep(o.target)
+  // Only an entry that hashes to its own key is returned: an old-style entry (its id computed before the identity value was normalised) stays on disk
+  // through the merge and is reachable under the id its target hashes to now, which is the one returned here.
+  if (o && o.target && typeof o.target === 'object' && /^[0-9a-f]{16}$/.test(id) && stableProposalId(o.target) === id) proposalTargetsSidecar[id] = redactDeep(o.target)
 }
 for (const p of [...ranked, ...insufficientDataProposals]) if (p.proposal_id) proposalTargetsSidecar[p.proposal_id] = redactDeep(p.target)
 
@@ -922,6 +937,8 @@ const reportMarkdown = buildReport({
   flatten: flat,
 })
 
+const resultMac = typeof dataNonce === 'string' ? resultMacOf(dataNonce, reportMarkdown, proposalTargetsSidecar, lanes) : null
+
 return {
   ledger_sufficient: ledgerSufficient,
   ledger_n: ledgerN,
@@ -935,6 +952,8 @@ return {
   // HARN-RUNNER-2 T3 (H2): the SHA-256 of the nonce this run fenced collected text with, never the nonce itself, so the caller can
   // check that the session passed on the nonce the runner minted.
   nonce_sha256: typeof dataNonce === 'string' ? sha256Hex(dataNonce) : null,
+  // Over the report, the targets and the lanes below, with the nonce (see resultMacOf).
+  result_mac: resultMac,
   lanes,
   proposals_ranked: rankedNew,
   proposals_previously_adopted: previouslyAdopted,

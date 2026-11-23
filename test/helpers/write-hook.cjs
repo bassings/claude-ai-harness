@@ -18,12 +18,28 @@
 //   HOOK_RENAME_DELAY_MS=n   stall n ms before renaming onto the table, so two
 //                            runs started together are both between write and
 //                            rename at once.
+//   HOOK_BARRIER_DIR=dir     (with HOOK_BARRIER_COUNT=n, default 2) make that overlap certain
+//                            instead of likely: a run that has written half of the table, and again
+//                            a run that is about to rename onto it, waits until n runs have reached
+//                            the same point, however loaded the machine is. A wait that is not met
+//                            in two minutes gives up, so a lone run cannot hang forever.
 const fs = require('node:fs')
+const path = require('node:path')
 
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 const names = (p) => String(p).includes('analyser-rules')
 const write = fs.writeFileSync
 const rename = fs.renameSync
+
+// A rendezvous that does not depend on how fast anything runs: this process leaves a marker for `point` and waits until `count` markers are there.
+function rendezvous(point) {
+  const dir = process.env.HOOK_BARRIER_DIR
+  if (!dir) return
+  const want = Number(process.env.HOOK_BARRIER_COUNT || 2)
+  write.call(fs, path.join(dir, `${point}.${process.pid}`), '')
+  const giveUp = Date.now() + 120000
+  while (fs.readdirSync(dir).filter((n) => n.startsWith(`${point}.`)).length < want && Date.now() < giveUp) sleep(10)
+}
 
 if (process.env.HOOK_PARTIAL_WRITE === '1') {
   fs.writeFileSync = function (p, data, opts) {
@@ -42,6 +58,7 @@ if (process.env.HOOK_SPLIT_WRITE_MS) {
     const half = buf.length >> 1
     write.call(this, p, buf.subarray(0, half), opts)
     sleep(Number(process.env.HOOK_SPLIT_WRITE_MS))
+    rendezvous('half')
     // The original writer, not appendFileSync, which calls the patched one.
     write.call(this, p, buf.subarray(half), { flag: 'a' })
   }
@@ -69,6 +86,7 @@ if (process.env.HOOK_RENAME_THROW) {
 if (process.env.HOOK_RENAME_DELAY_MS) {
   fs.renameSync = function (from, to) {
     if (names(to)) sleep(Number(process.env.HOOK_RENAME_DELAY_MS))
+    if (names(to)) rendezvous('rename')
     return rename.apply(this, arguments)
   }
 }

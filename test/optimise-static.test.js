@@ -134,7 +134,7 @@ test('static: skills/optimise-cycle/SKILL.md names WHO writes a proposal adoptio
 test('static: skills/optimise-cycle/SKILL.md states the escaped-defect metric is a heuristic, not a verified causal attribution, and names who/what computes it', () => {
   const skill = readAll('skills', 'optimise-cycle', 'SKILL.md')
   assert.ok(/heuristic/i.test(skill))
-  assert.ok(/escaped-defects/.test(skill))
+  assert.ok(/escapedDefectsFigures/.test(skill), 'names the code that computes it: the collector, through the reader\'s escapedDefectsFigures (the reader\'s escaped-defects command has no caller in the optimiser\'s own run)')
 })
 
 // ---- AC-6: the scoped figure is documented alongside the raw one, with

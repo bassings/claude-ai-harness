@@ -9,9 +9,11 @@
 // and the other forms, which the runner and the attended /optimise-cycle share so that neither has a second copy of the
 // lock or of the placement (HARN-RUNNER-2 T4, AC-DATA-2):
 //   (when the outputs were placed it prints PLACED yes after PLACE yes, which the runner requires before it believes a placement)
-//   optimise-verify.mjs settle <per-run dir> <session reply file> <digest token> <repository> <runner temp dir> <sidecar root> <ignored|withheld>
+//   optimise-verify.mjs settle <per-run dir> <session reply file> <digest token> <repository> <runner temp dir> <main checkout> <place|withheld>
 //        the runner's whole critical section in one run: wait for the sidecar lock, read, validate and merge the sidecar, place the
-//        two outputs (unless withheld because the caller could not confirm the output paths are ignored) and release the lock
+//        two outputs in the main checkout (not when withheld) and release the lock. It places only when the per-run directory holds the
+//        proof `optimise-report-ignore.mjs prepare` wrote for this main checkout (ignore-proof.json, consumed when used); a trusted
+//        result with no proof is printed as `HELD ignore-proof` (the runner then prepares and calls again) and is a FAIL for the attended entry
 //   OPTIMISE_VERIFY_NONCE=<nonce> optimise-verify.mjs attended <per-run dir> <result file> <repository> <main checkout>
 //        the attended entry: the same critical section (settleRun), for the object the Workflow tool returned, saved unchanged.
 //        <main checkout> is the root the skill resolved for <repository> (the repository itself, or the main checkout of a linked
@@ -37,7 +39,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { isPlainInsufficientRow, readRepoFile, REPO_FILE_CAPS, resolveLedgerRoot, sidecarTargetOrReason, stableProposalId } from './optimise-read.mjs'
+import { canonicalJson, isPlainInsufficientRow, readRepoFile, REPO_FILE_CAPS, resolveLedgerRoot, sidecarTargetOrReason, stableProposalId } from './optimise-read.mjs'
 
 export const REPORT_CAP = 5242880
 export const SIDECAR_CAP = 1048576
@@ -79,6 +81,11 @@ export const FIXED_REASONS = Object.freeze({
   RETURNED_UNNAMED: 'returned sidecar has an id this run does not name',
   NO_NONCE_HASH: 'result carries no nonce hash',
   NONCE_MISMATCH: 'result nonce hash does not match this run',
+  NO_MAC: 'result carries no mac',
+  MAC_MISMATCH: 'result mac does not match this run',
+  ALWAYS_ON_PROPOSAL: 'report proposes removing an always-on lens',
+  HTML_COMMENT: 'report contains an HTML comment',
+  INVISIBLE: 'report contains an invisible or direction-control character',
   ABSOLUTE_PATH: 'report holds an absolute path (the home directory, the repository or the per-run directory)',
   UNREADABLE: 'collected data unreadable',
   FIGURE_MISMATCH: 'figure mismatch',
@@ -87,6 +94,7 @@ export const FIXED_REASONS = Object.freeze({
   SIDECAR_REJECTED: 'sidecar rejected:',
   MOVE_FAILED: 'could not move the result into place',
   MAIN_CHECKOUT: 'main checkout does not match the repository',
+  IGNORE_PROOF: 'the output paths were not confirmed ignored for this checkout',
   LOCK_BUSY: 'could not take the sidecar lock',
   LOCK_UNUSABLE: 'the sidecar lock path is not usable',
   LOCK_HELPER_FAILED: 'the sidecar lock helper failed',
@@ -102,7 +110,7 @@ export const REASON_DETAILS = Object.freeze({
   NO_STAGING: 'could not stage it',
 })
 // The class of a session failure, printed as CAUSE <token>.
-export const CAUSE_TOKENS = Object.freeze(['empty', 'malformed', 'failed_step', 'oversized', 'nonce', 'refused'])
+export const CAUSE_TOKENS = Object.freeze(['empty', 'malformed', 'failed_step', 'oversized', 'nonce', 'mac', 'refused'])
 // Fixed tokens the lock code raises for the caller to print as NOTICE <token>.
 export const NOTICE_TOKENS = Object.freeze(['lock-restore-failed'])
 // END FIXED REASONS
@@ -284,10 +292,16 @@ function checkSidecar(result, report) {
   return { sidecar, targets: result.proposal_targets }
 }
 
+// Characters that show nothing (zero-width, word joiner, byte-order mark) or reorder what is shown (direction controls): a report may hold none,
+// because text that reads one way and is stored another is how a line is made to look true (M1).
+const INVISIBLE_RE = /[\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/u
+
 function checkReportText(report) {
   if (typeof report !== 'string') return failure(F.REPORT_NOT_STRING, 'malformed')
   if (!startsWithHeading(report)) return failure(F.NO_HEADING, 'malformed')
   if (report.includes('\u0000')) return failure(F.NUL_BYTE, 'malformed')
+  if (report.includes('<!--')) return failure(F.HTML_COMMENT, 'malformed')
+  if (INVISIBLE_RE.test(report.replace(/^\ufeff/, ''))) return failure(F.INVISIBLE, 'malformed')
   if (Buffer.from(report, 'utf8').toString('utf8') !== report) return failure(F.NOT_UTF8, 'malformed')
   const bytes = Buffer.byteLength(report, 'utf8')
   return bytes > REPORT_CAP ? failure(fill(F.OVER_CAP, { n: bytes, cap: REPORT_CAP }), 'oversized') : null
@@ -312,8 +326,6 @@ export function checkResult(result, strict, bounded = []) {
 
 // ---- the figure checks: what the report says against what the collector wrote ----
 
-const numbersIn = (report, re) => [...report.matchAll(re)].map((m) => m.slice(1).map(Number))
-
 function firstDifference(names, want, got) {
   const i = want.findIndex((w, k) => w !== got[k])
   return i < 0 ? null : { name: names[i], want: want[i], got: got[i] }
@@ -335,43 +347,76 @@ export function checkLanes(said, col) {
   return reasons
 }
 
+// ---- the headline figure lines: each held to an anchored shape, and to exactly the number of lines the collected data calls for ----
+//
+// The report is normalised before any of this (normaliseReport: NFKC, every Unicode space folded to a space, one line at a time), so a
+// look-alike in a no-break space or a fullwidth digit is the line it looks like and is held to the data. A line "carries" a label when,
+// with leading spaces and quoting or emphasis marks removed, it starts with it. Every such line must match the anchored shape exactly and
+// agree with the collected figure, and there must be exactly as many as the data calls for: a hidden, second or reworded line is a line in
+// a shape the check does not know. (HTML comments and invisible characters never reach here: checkReportText refuses them.)
+const SPACES_RE = /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/g
+export const normaliseLine = (line) => line.normalize('NFKC').replaceAll(SPACES_RE, ' ')
+export const normaliseReport = (report) => report.split('\n').map(normaliseLine).join('\n')
+const UNKNOWN_SHAPE = 'a line in a shape the check does not know'
+const unknownShape = (name) => `${F.FIGURE_MISMATCH} ${name}: ${UNKNOWN_SHAPE}`
+const LEAD_MARKS_RE = /^[\s>*_#\u0060-]+/
+
+const SHAPES = {
+  ledger: { label: 'Ledger records in window:', re: /^Ledger records in window: (\d{1,15}) \(minimum for harness-side proposals: \d{1,15}\)\.$/ },
+  ci: { label: 'CI runs:', re: /^CI runs: (\d{1,15}) fetched, (\d{1,15}) not fetched, (\d{1,15}) timed out$/ },
+  git: { label: 'Raw (unscoped):', re: /^Raw \(unscoped\): (\d{1,15}) of (\d{1,15}) examined commits matched the heuristic\.(?: [^\n]{0,600})?$/ },
+  scoped: { label: 'Scoped to product source', re: /^Scoped to product source \(config: [^)\n]{0,200}\): (\d{1,15}) counted, (\d{1,15}) excluded as pipeline\/tooling-only, (\d{1,15}) unavailable \(changed paths could not be determined\)\.(?: [^\n]{0,600})?$/ },
+}
+
+// Runs of spaces are read as one, as a page shows them, so `CI  runs:` is a line that carries `CI runs:`.
+const squeezed = (line) => line.replace(LEAD_MARKS_RE, '').replaceAll(/\s+/g, ' ')
+const carries = (line, label) => squeezed(line).startsWith(label)
+const linesCarrying = (report, label) => report.split('\n').filter((line) => carries(line, label))
+// The figures on every line that carries the label, or null when one of them is not in the anchored shape.
+function figuresOn(report, shape) {
+  const found = linesCarrying(report, shape.label).map((line) => shape.re.exec(line))
+  return found.some((m) => m === null) ? null : found.map((m) => m.slice(1).map(Number))
+}
+
 // { reasons, reported }: reported is the figure the report states for the ledger, for the RESULT line. A record
 // count printed beside a ledger lane that has no collected figure is refused, whatever the number: it can only be a
 // default zero standing for a lane that did not run.
 export function checkLedger(report, col) {
   const want = collectedLedger(col)
-  const found = numbersIn(report, /Ledger records in window: (\d{1,15})/g).map(([n]) => n)
-  if (want === null) return { reasons: found.length > 0 ? [`${F.FIGURE_MISMATCH} ledger: collected none, reported ${found[0]}`] : [], reported: null }
+  const found = figuresOn(report, SHAPES.ledger)
+  if (found === null) return { reasons: [unknownShape('ledger')], reported: null }
+  const first = found[0]?.[0]
+  if (want === null) return { reasons: found.length > 0 ? [`${F.FIGURE_MISMATCH} ledger: collected none, reported ${first}`] : [], reported: null }
   if (found.length === 0) return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported none`], reported: null }
-  const wrong = found.find((n) => n !== want)
-  if (wrong === undefined) return { reasons: [], reported: want }
-  return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported ${wrong}`], reported: wrong }
+  const wrong = found.find(([n]) => n !== want)
+  if (wrong !== undefined) return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported ${wrong[0]}`], reported: wrong[0] }
+  return { reasons: found.length === 1 ? [] : [unknownShape('ledger')], reported: want }
 }
 
-// A lane with a figure the report must show: every line of that shape in the report equals it. A lane with none:
-// the report shows no such line.
-export function checkLine(name, report, re, names, want) {
-  const found = numbersIn(report, re)
+// A lane with a figure the report must show: exactly one line carries the label and it equals the figure. A lane with none: no line does.
+export function checkLine(name, report, shape, names, want) {
+  const found = figuresOn(report, shape)
+  if (found === null) return [unknownShape(name)]
   if (want === null) return found.length > 0 ? [`${F.FIGURE_MISMATCH} ${name}: collected none, reported ${found[0][0]}`] : []
   if (found.length === 0) return [`${F.FIGURE_MISMATCH} ${name}: ${names[0]} collected ${want[0]}, reported none`]
   for (const got of found) {
     const diff = firstDifference(names, want, got)
     if (diff) return [`${F.FIGURE_MISMATCH} ${name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`]
   }
-  return []
+  return found.length === 1 ? [] : [unknownShape(name)]
 }
 
 export function checkCi(report, col) {
   const c = col.lane.ci
   const measured = laneState(col, 'ci') === 'ran' && isCount(c.runCount) && isCount(c.fetchFailedCount) && isCount(c.timeoutCount)
   const want = measured ? [c.runCount, c.fetchFailedCount, c.timeoutCount] : null
-  return checkLine('ci', report, /CI runs: (\d{1,15}) fetched, (\d{1,15}) not fetched, (\d{1,15}) timed out/g, ['runs', 'not fetched', 'timed out'], want)
+  return checkLine('ci', report, SHAPES.ci, ['runs', 'not fetched', 'timed out'], want)
 }
 
 export function checkGit(report, col) {
   const g = resultOf(col, 'git')
   const measured = laneState(col, 'git') === 'ran' && isCount(g.count) && isCount(g.n_commits_examined)
-  return checkLine('git', report, /Raw \(unscoped\): (\d{1,15}) of (\d{1,15}) examined commits/g, ['count', 'examined'], measured ? [g.count, g.n_commits_examined] : null)
+  return checkLine('git', report, SHAPES.git, ['count', 'examined'], measured ? [g.count, g.n_commits_examined] : null)
 }
 
 // The scoped escaped-defect line, against the git lane's scoped counts.
@@ -379,7 +424,7 @@ export function checkScoped(report, col) {
   const g = resultOf(col, 'git')
   const measured = laneState(col, 'git') === 'ran' && isCount(g.scoped_count) && isCount(g.scoped_excluded_count) && isCount(g.scoped_unavailable_count)
   const want = measured ? [g.scoped_count, g.scoped_excluded_count, g.scoped_unavailable_count] : null
-  return checkLine('git scoped', report, /Scoped to product source \(config: [^)\n]{0,200}\): (\d{1,15}) counted, (\d{1,15}) excluded as pipeline\/tooling-only, (\d{1,15}) unavailable/g, ['scoped counted', 'scoped excluded', 'scoped unavailable'], want)
+  return checkLine('git scoped', report, SHAPES.scoped, ['scoped counted', 'scoped excluded', 'scoped unavailable'], want)
 }
 
 export function checkDigest(report, col) {
@@ -387,15 +432,21 @@ export function checkDigest(report, col) {
   if (!isObject(digest) || !isObject(digest.dropped)) return [`${F.UNREADABLE}: digest`]
   const dropped = digest.dropped
   const seen = new Set()
-  for (const [, key, n] of report.matchAll(/Digest omitted ([A-Za-z]{1,40}): (\d{1,15})/g)) {
+  for (const line of linesCarrying(report, 'Digest omitted')) {
+    const m = /^Digest omitted ([A-Za-z]{1,40}): (\d{1,15})$/.exec(line)
+    if (m === null) return [unknownShape('digest')]
+    const [, key, n] = m
     if (!Object.hasOwn(dropped, key) || !isCount(dropped[key])) return [`${F.FIGURE_MISMATCH} digest: an omission line the digest does not hold, reported ${n}`]
-    seen.add(key)
     if (Number(n) !== dropped[key]) return [`${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${dropped[key]}, reported ${n}`]
+    if (seen.has(key)) return [unknownShape('digest')]
+    seen.add(key)
   }
   for (const [key, value] of Object.entries(dropped)) {
     if (isCount(value) && value > 0 && !seen.has(key)) return [`${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${value}, reported none`]
   }
-  return (dropped.trimmedForSize === true) !== report.includes('Digest trimmed for size: yes') ? [`${F.FIGURE_MISMATCH} digest: trimmed flag`] : []
+  const trimmedLines = linesCarrying(report, 'Digest trimmed for size:')
+  if (trimmedLines.some((line) => line !== 'Digest trimmed for size: yes')) return [unknownShape('digest')]
+  return (dropped.trimmedForSize === true) !== (trimmedLines.length > 0) || trimmedLines.length > 1 ? [`${F.FIGURE_MISMATCH} digest: trimmed flag`] : []
 }
 
 // ---- the number-bearing rows the workflow renders from the digest ----
@@ -724,8 +775,12 @@ const ORPHANED_KINDS = {
 
 const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVER_FAILING_LEFT_OUT, LEDGER_REPOSITORY, LEDGER_SKIPPED, TRIGGER_ACCURACY, REWORK, EXCLUDED_FROM_ATTRIBUTION, DROPPED_COUNTER, ORPHANED_RUNS, ORPHANED_KINDS, REWORK_FINDINGS_DROPPED, REWORK_NO_SPEC, REWORK_SCHEMA_V4, BLOCKED_COUNT, BLOCKED_REASONS, UNTERMINATED_TOTAL, SUPPRESSION_SHARE, WALL_CLOCK_SOURCES]
 
+// The collected figures and keys as the normalised report prints them: the report is normalised line by line before it is checked.
+const normaliseWant = (v) => (typeof v === 'string' ? normaliseLine(v) : v)
+const normalisedWants = (rows) => new Map([...rows].map(([key, want]) => [normaliseLine(key), want.map(normaliseWant)]))
+
 function checkRowClass(spec, report, col) {
-  const wants = spec.rows(col)
+  const wants = normalisedWants(spec.rows(col))
   const reasons = []
   const seen = new Set()
   const matches = [...report.matchAll(spec.re)]
@@ -737,6 +792,7 @@ function checkRowClass(spec, report, col) {
       reasons.push(`${F.FIGURE_MISMATCH} ${spec.name}: a row the collected data does not hold`)
       return
     }
+    if (seen.has(key)) reasons.push(unknownShape(spec.name))
     seen.add(key)
     const diff = firstDifference(spec.names, want, parsed.got)
     if (diff) reasons.push(spec.textual ? `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} differs from the collected one` : `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`)
@@ -752,6 +808,9 @@ function proposalIdAfter(line, current) {
   const heading = /^(?:### |- )(\w{1,64}): /.exec(line)
   return heading ? heading[1] : current
 }
+
+// A line that carries an annotation's label but is not the exact shape dateClaimIn recognises is a look-alike.
+const DATE_CLAIM_LABEL_RE = /^(?:Already adopted on|Previously rejected on)/
 
 // The adoption or rejection date an annotation line states, or null for any other line.
 function dateClaimIn(line) {
@@ -774,7 +833,10 @@ export function checkProposalOutcomes(report, col) {
   for (const line of report.split('\n')) {
     id = proposalIdAfter(line, id)
     const claim = dateClaimIn(line)
-    if (claim === null) continue
+    if (claim === null) {
+      if (DATE_CLAIM_LABEL_RE.test(squeezed(line))) reasons.push(unknownShape('proposal outcome'))
+      continue
+    }
     const held = id !== null && isObject(outcomes) && Object.hasOwn(outcomes, id) ? outcomes[id] : null
     const problem = held === null ? `${F.FIGURE_MISMATCH} proposal outcome: an outcome the collected data does not hold` : outcomeProblem(claim, held)
     if (problem !== null) reasons.push(problem)
@@ -786,8 +848,8 @@ export function checkProposalOutcomes(report, col) {
 export function checkPlanLabelNote(report, col) {
   const note = col.digest?.plan_labels_note
   if (typeof note !== 'string' || note.trim() === '') return []
-  const expected = note.replaceAll(/\s+/g, ' ').slice(0, 400)
-  return report.split('\n').includes(expected) ? [] : [`${F.FIGURE_MISMATCH} plan labels: note differs from the collected one`]
+  const expected = normaliseLine(note.replaceAll(/\s+/g, ' ').slice(0, 400))
+  return report.split('\n').filter((line) => line === expected).length === 1 ? [] : [`${F.FIGURE_MISMATCH} plan labels: note differs from the collected one`]
 }
 
 // The single-line figure shapes that are not row classes: each has its own check above.
@@ -807,7 +869,8 @@ export function checkRows(report, col) {
 }
 
 // { reasons, reportedLedger }: every figure in the report against the collected files.
-export function checkFigures(result, report, col) {
+export function checkFigures(result, rawReport, col) {
+  const report = normaliseReport(rawReport)
   const ledger = checkLedger(report, col)
   const reasons = [...checkLanes(result.lanes, col), ...ledger.reasons, ...checkCi(report, col), ...checkGit(report, col), ...checkDigest(report, col), ...checkRows(report, col)]
   return { reasons, reportedLedger: ledger.reported }
@@ -896,6 +959,58 @@ export function nonceProblem(result, nonce) {
   return result.nonce_sha256 === want && typeof nonce === 'string' && nonce !== '' ? null : F.NONCE_MISMATCH
 }
 
+// ---- the keyed digest the workflow returns over what it produced (M2) ----
+//
+// result_mac is SHA-256, as 64 lower-case hex characters, of this exact byte sequence (UTF-8):
+//   <nonce> "\n" <report text exactly as returned> "\n" <canonicalJson(proposal_targets)> "\n" <canonicalJson(lanes)>
+// where canonicalJson sorts object keys at every depth (the reader's own, the one the proposal-id block uses). The report and the targets are
+// what is placed; the lanes are what this check reads to decide placement. workflows/optimise-cycle.js computes it with its own pure-JS
+// SHA-256 (resultMacOf, inside its proposal-id block) and a parity test holds the two together over many inputs. What it proves: the reply
+// the check was handed is the object a workflow run on this run's nonce returned. What it does not prove: who computed it. On the
+// unattended path the session has no tool that can compute a SHA-256, which is an assumption (T5 probes whether the Workflow tool would
+// run an inline script that could); on the attended path the session has a shell, so there it guards against accident, not a steered session.
+export function resultMac(result, nonce) {
+  const bytes = `${nonce}\n${result.report}\n${canonicalJson(result.proposal_targets)}\n${canonicalJson(result.lanes)}`
+  return createHash('sha256').update(bytes, 'utf8').digest('hex')
+}
+
+// null when the reply's digest is the one this run's nonce and this reply's text give, else the one fixed reason.
+export function macProblem(result, nonce) {
+  if (typeof result.result_mac !== 'string' || !/^[0-9a-f]{64}$/.test(result.result_mac)) return F.NO_MAC
+  if (typeof nonce !== 'string' || nonce === '') return F.MAC_MISMATCH
+  return result.result_mac === resultMac(result, nonce) ? null : F.MAC_MISMATCH
+}
+
+// ---- a proposal that removes an always-on lens is refused, whoever signed the report (M2, second layer) ----
+//
+// The workflow's own rule (isAlwaysOnSecurityRemoval in workflows/optimise-cycle.js) drops such a proposal, so none can be in a report the
+// workflow produced. These two values are that rule's, held to the workflow's by a parity test (a script cannot be imported).
+export const ALWAYS_ON_LENS_NAMES = ['lens-security', 'lens-qa']
+export const ALWAYS_ON_LENS_PHRASE_RE = /\b(lens-security|lens-qa|security lens|qa lens)\b/i
+const PROPOSAL_SECTION_RE = /^## Proposals (?:\(ranked\)|previously adopted|\(insufficient data)/
+const PROPOSAL_START_RE = /^(?:### |- )([0-9a-f]{16}): /
+
+// The text of each proposal block in the three proposal sections, with the id that starts it.
+function proposalBlocks(report) {
+  const blocks = []
+  let inSection = false
+  for (const line of report.split('\n')) {
+    if (line.startsWith('## ')) inSection = PROPOSAL_SECTION_RE.test(line)
+    const start = inSection ? PROPOSAL_START_RE.exec(line) : null
+    if (start) blocks.push({ id: start[1], text: line })
+    else if (inSection && blocks.length > 0) blocks.at(-1).text += `\n${line}`
+  }
+  return blocks
+}
+
+export function proposesRemovingAlwaysOnLens(report, targets) {
+  return proposalBlocks(report).some(({ id, text }) => {
+    const target = isObject(targets) && Object.hasOwn(targets, id) ? targets[id] : null
+    const named = isObject(target) && (ALWAYS_ON_LENS_NAMES.includes(target.lens) || target.touches_always_on_lens === true)
+    return named || ALWAYS_ON_LENS_PHRASE_RE.test(`${text} ${target === null ? '' : JSON.stringify(target)}`)
+  })
+}
+
 // ---- the whole check ----
 
 function lanesThatCouldNotRun(col) {
@@ -918,6 +1033,9 @@ function judgeSession(sessionPath, col, strict, bounded, nonce, parse = parseSes
   if (checked.reason) return { ...out, denied: parsed.denied, tools: parsed.tools, reasons: [checked.reason], cause: checked.cause }
   const wrongNonce = nonceProblem(parsed.result, nonce)
   if (wrongNonce !== null) return { ...out, denied: parsed.denied, tools: parsed.tools, reasons: [wrongNonce], cause: 'nonce' }
+  const wrongMac = macProblem(parsed.result, nonce)
+  if (wrongMac !== null) return { ...out, denied: parsed.denied, tools: parsed.tools, reasons: [wrongMac], cause: 'mac' }
+  if (proposesRemovingAlwaysOnLens(checked.report, checked.targets)) return { ...out, denied: parsed.denied, tools: parsed.tools, reasons: [F.ALWAYS_ON_PROPOSAL], cause: 'malformed' }
   const figures = checkFigures(parsed.result, checked.report, col)
   const reasons = figures.reasons.length === 0 ? lanesThatCouldNotRun(col) : figures.reasons
   return { ...out, denied: parsed.denied, tools: parsed.tools, reasons, reportedLedger: figures.reportedLedger, place: figures.reasons.length === 0 ? 'yes' : 'no', report: checked.report, sidecar: checked.sidecar, targets: checked.targets }
@@ -1104,6 +1222,14 @@ export function tryLock(root, pid, ops = fs) {
   return { status: 'busy' }
 }
 
+// Whether the lock path still names this token. A takeover can displace a live holder when it takes a fresh lock by mistake and then cannot put it
+// back (another taker having filled the path first); the holder finds out here, just before it commits, and gives up (L2). The window between this
+// look and the rename that follows is the length of one system call.
+export function holdsLock(root, token) {
+  const lockPath = lockPathOf(root)
+  return lockPath !== null && readlinkOrNull(lockPath) === token
+}
+
 // Releases the lock this token holds, and only that one: a lock that carries another token is put straight back.
 export function unlock(root, token, ops = fs) {
   const lockPath = lockPathOf(root)
@@ -1172,7 +1298,7 @@ const rejection = (what, problem) => `${what === 'report' ? F.REPORT_REJECTED : 
 // before the report's rename leaves the old report beside a sidecar that still maps every id it names, never a new report
 // beside an old sidecar. { problem } is null when both are in place; a failure leaves no staged temp file behind. The caller holds
 // the sidecar lock.
-export function placeOutputs({ dir, repo, sidecarRoot }, ops = fs) {
+export function placeOutputs({ dir, repo, sidecarRoot, stillHolds }, ops = fs) {
   const parts = [
     { what: 'report', name: 'result-report.md', cap: REPORT_CAP, dest: path.join(repo, REPORT_REL) },
     { what: 'sidecar', name: 'result-sidecar.json', cap: SIDECAR_CAP, dest: path.join(sidecarRoot, SIDECAR_REL) },
@@ -1188,6 +1314,10 @@ export function placeOutputs({ dir, repo, sidecarRoot }, ops = fs) {
       return { problem: rejection(part.what, got.problem) }
     }
     staged.push(got.tmp)
+  }
+  if (stillHolds && !stillHolds()) {
+    discard()
+    return { problem: F.LOCK_UNUSABLE }
   }
   const moved = (tmp, dest) => {
     try {
@@ -1226,6 +1356,7 @@ export function formatVerdict(v) {
   if (v.cause) lines.push(`CAUSE ${v.cause}`)
   for (const token of v.notices ?? []) lines.push(`NOTICE ${token}`)
   for (const reason of cappedReasons(v.reasons)) lines.push(`REASON ${reason}`)
+  if (v.held) lines.push(`HELD ${v.held}`)
   lines.push(`PLACE ${v.place}`)
   if (v.placed === true) lines.push('PLACED yes')
   return `${lines.join('\n')}\n`
@@ -1235,6 +1366,30 @@ export function formatVerdict(v) {
 // could not run places the report and is still a FAIL), then the lines above.
 export function formatAttended(v) {
   return `VERDICT ${v.place === 'yes' && v.reasons.length === 0 ? 'PASS' : 'FAIL'}\n${formatVerdict(v)}`
+}
+
+// ---- the proof that the output paths are ignored (written by optimise-report-ignore.mjs prepare, which may spawn git; this module may not) ----
+//
+// Placement needs it: a short-lived file in the per-run directory naming the main checkout, both output paths and when it was made.
+// It is checked against the main checkout this run places in and consumed when used, so an operator who skipped the step, a proof for
+// another checkout, a stale one or a used one all come to the same fixed FAIL. The per-run directory is private to the run.
+export const PROOF_NAME = 'ignore-proof.json'
+export const PROOF_MAX_AGE_MS = 2 * 3600 * 1000
+function takeIgnoreProof(dir, root) {
+  const got = readRepoFile(dir, PROOF_NAME, 4096)
+  if (got.status !== 'ok') return false
+  let proof
+  try {
+    proof = JSON.parse(got.text)
+  } catch {
+    return false
+  }
+  const age = Date.now() - proof?.at
+  const fresh = Number.isFinite(age) && age < PROOF_MAX_AGE_MS && age > -60000
+  const named = isObject(proof) && proof.report === REPORT_REL && proof.sidecar === SIDECAR_REL && typeof proof.root === 'string' && realPathOrNull(proof.root) === realPathOrNull(root)
+  if (!fresh || !named || realPathOrNull(root) === null) return false
+  removeFile(path.join(dir, PROOF_NAME))
+  return true
 }
 
 // ---- the critical section: the runner's settle form and the attended entry both come through here ----
@@ -1257,12 +1412,14 @@ function writeResultFiles(dir, v) {
   fs.writeFileSync(`${dir}/result-sidecar.json`, v.sidecar, { mode: 0o600 })
 }
 
-// A trusted result is placed when the caller confirmed the output paths are ignored; otherwise it is only held (PLACE yes, nothing
-// written), and the caller says why.
-function placeTrusted(v, { dir, repo, sidecarRoot, ignored }, ops) {
-  if (v.place !== 'yes' || !ignored) return v
+// A trusted result is placed when the per-run directory holds the proof that the output paths are ignored in this main checkout, and is
+// not placed when the caller withheld it. With no proof the attended entry FAILs with the fixed reason; the runner's result is held
+// (HELD ignore-proof, PLACE yes, nothing written) so it can make the paths ignored only now that it is about to place, and call again.
+function placeTrusted(v, { dir, repo, sidecarRoot, place, attended }, ops, stillHolds) {
+  if (v.place !== 'yes' || place === 'withheld') return v
+  if (!takeIgnoreProof(dir, sidecarRoot)) return attended ? { ...v, reasons: [...v.reasons, F.IGNORE_PROOF], place: 'no' } : { ...v, held: 'ignore-proof' }
   writeResultFiles(dir, v)
-  const placed = placeOutputs({ dir, repo, sidecarRoot }, ops)
+  const placed = placeOutputs({ dir, repo, sidecarRoot, stillHolds }, ops)
   return placed.problem === null ? { ...v, placed: true } : { ...v, reasons: [...v.reasons, placed.problem], place: 'no' }
 }
 
@@ -1275,7 +1432,7 @@ async function criticalSection(opts, ops) {
   if (lock.status !== 'held') return { ...verifyRun({ ...opts, sessionPath: '-' }), reasons: [lockReasons[lock.status]], place: 'no' }
   guardSignals()
   try {
-    return placeTrusted(verifyRun(opts), opts, ops)
+    return placeTrusted(verifyRun(opts), opts, ops, () => holdsLock(sidecarRoot, lock.token))
   } finally {
     unlock(sidecarRoot, lock.token, ops)
   }
@@ -1284,6 +1441,7 @@ async function criticalSection(opts, ops) {
 export async function settleRun(opts, ops = fs) {
   let verdict
   try {
+    if (opts.analysedRepo !== undefined && !isMainCheckoutOf(opts.analysedRepo, opts.sidecarRoot)) return { ...verifyRun({ ...opts, sessionPath: '-' }), reasons: [F.MAIN_CHECKOUT], place: 'no', notices: [] }
     verdict = await criticalSection(opts, ops)
   } catch {
     verdict = { ...verifyRun({ ...opts, sessionPath: '-' }), reasons: [F.LOCK_HELPER_FAILED], place: 'no' }
@@ -1317,14 +1475,15 @@ export function isMainCheckoutOf(repo, root) {
   if (!lstatOrNull(root)?.isDirectory() || !lstatOrNull(path.join(root, '.git'))?.isDirectory()) return false
   const resolved = resolveLedgerRoot(repo)
   const want = realPathOrNull(root)
-  if (resolved.unresolved || want === null || realPathOrNull(resolved.root) !== want) return false
-  return realPathOrNull(repo) === want || pointsBackAtRepo(repo)
+  if (want === null) return false
+  // A layout the reader cannot resolve (a submodule, a separate git directory) is only its own root, as before.
+  if (resolved.unresolved) return realPathOrNull(repo) === want
+  return realPathOrNull(resolved.root) === want && (realPathOrNull(repo) === want || pointsBackAtRepo(repo))
 }
 
 export async function attendedRun({ dir, resultFile, repo, root, home, nonce, wait, tries }, ops = fs) {
   const base = { dir, digestToken: 'ran', repo: root, boundedPaths: [repo, root], runTmp: dir, home, nonce, attended: true }
-  if (!isMainCheckoutOf(repo, root)) return { ...verifyRun({ ...base, repo, boundedPaths: [repo], sessionPath: '-' }), reasons: [F.MAIN_CHECKOUT], place: 'no', notices: [] }
-  return settleRun({ ...base, sessionPath: resultFile, sidecarRoot: root, ignored: true, wait, tries }, ops)
+  return settleRun({ ...base, sessionPath: resultFile, sidecarRoot: root, analysedRepo: repo, place: 'place', wait, tries }, ops)
 }
 
 // ---- command line ----
@@ -1338,7 +1497,7 @@ function verifyMain(argv) {
 
 async function settleMain(argv) {
   const [dir, sessionPath, digestToken, repo, runTmp, sidecarRoot, mode] = argv
-  const v = await settleRun({ dir, sessionPath, digestToken, repo, runTmp, home: process.env.HOME, sidecarRoot, nonce: process.env.OPTIMISE_VERIFY_NONCE, ignored: mode === 'ignored' })
+  const v = await settleRun({ dir, sessionPath, digestToken, repo: sidecarRoot, boundedPaths: [repo, sidecarRoot], runTmp, home: process.env.HOME, sidecarRoot, analysedRepo: repo, nonce: process.env.OPTIMISE_VERIFY_NONCE, place: mode === 'place' ? 'place' : 'withheld' })
   process.stdout.write(formatVerdict(v))
 }
 

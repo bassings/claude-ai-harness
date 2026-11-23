@@ -378,3 +378,39 @@ result check wrote both files) now mutates the runner's PLACED confirmation: row
 **Not proved by mutation.** A lock symlink whose target is a directory is never followed: that is how `symlinkSync` behaves, no edit
 of this code makes it write inside the directory, so the test is a behaviour check. The attended-plus-runner stress test is
 probabilistic; G5 killed it, but removing the lock altogether was not tried.
+
+## HARN-RUNNER-2 whole-branch review round 1 (M1 to M6, L1, L2, L3, L6, L7)
+
+Same method as above (one-place edit refused unless the text occurs exactly once, named tests run, file restored and compared by hash; every row
+`landed=true`, `restored=true`). Tests are in `test/harn-runner-2-whole-r1.test.js` (W) unless named. Two probes of the review were reproduced against the
+code first, with the old tests: a sentence appended to a returned report was placed as PASS (`result_mac` did not exist), and a look-alike ledger line
+beside the true one (no-break space, double space, fullwidth zero, zero-width space, `**0**`, an HTML comment wrapper) was placed as PASS (the new M1 tests were
+red for exactly that reason before the fix). A first run of one row survived and led to a stronger test: N7 (the ledger line's end anchor) survived until a
+form with the true figure followed by forged text was added.
+
+| Row | Guard | Mutation | Tests that failed |
+|---|---|---|---|
+| N1 | the keyed digest is compared | `return result.result_mac === resultMac(...) ? null : F.MAC_MISMATCH` to `return null` | seven M2 tests in W (the forgeries, through the runner too) |
+| N2, N3, N4 | the digest covers the report, the targets and the lanes | the report, then the targets, then the lanes, left out of the bytes in `resultMac` | the parity test and twelve more in W (an untouched reply no longer matches) |
+| N5 | a proposal removing an always-on lens is refused | `if (proposesRemovingAlwaysOnLens(...))` to `if (false)` | "M2 (second layer): a signed report whose proposal block proposes retiring lens-security" |
+| N6 | the report is normalised before it is checked | `normaliseReport(rawReport)` to `rawReport` | "M1: a date-claim line and a row in a look-alike form" |
+| N7 | the ledger line is anchored at its end | the `$` removed from the ledger shape | "M1: a look-alike ledger line beside the true one ... or instead of it" (after the forged-tail form was added) |
+| N8, N13 | exactly the expected number of lines, and no row twice | the count rule in `checkLine`, the duplicate-row rule in `checkRowClass` | "M1: the other headline figure lines are held the same way" |
+| N9, N10 | an HTML comment, and an invisible or direction-control character, are refused | each refusal removed from `checkReportText` | "M1: the true line wrapped in an HTML comment", "M1: a zero-width or direction-control character" |
+| N11, N12 | a look-alike date-claim line is refused, runs of spaces read as one | the unknown-shape push removed; the squeeze removed | "M1: a date-claim line and a row in a look-alike form" |
+| N14 | nothing is placed without the ignore proof | `if (!takeIgnoreProof(...))` to `if (false)` | two M4 tests (the skipped step places) |
+| N15, N16, N17 | the proof names this main checkout, is fresh, and is consumed | the root comparison, the age rule, the removal of the proof | "M4: an attended run that skips the ignore step FAILs ... a proof for another checkout, a stale one and a used one" |
+| N18, N19 | the main checkout is where both outputs go, and a worktree is noticed | `main_root_of` made to return the repository; the `log_notice` removed | "M4: a weekly run from a linked worktree places ... in the main checkout" |
+| N20, N21 | the id is hashed from the redacted, normalised target | the redaction removed from the workflow's `idValue`, and from the reader's | four M3 tests (parity, end to end, existing data, collision) |
+| N22, N23 | an old id is still found, and old-style entries are not returned | the alias line removed; the `stableProposalId(o.target) === id` filter removed | "M3 (existing data)" |
+| N24, N25 | a lock holder checks it still holds before it commits | `if (stillHolds && !stillHolds())` to `if (false)`; `holdsLock` to `return true` | "L2: a run whose lock is taken from it while it stages", "L2: the review's three-party interleaving" |
+| N26 | a configured path with a broken `.git` is a FAIL | `if [ -e "$repo/.git" ]` to `if false` | "L6: a configured path that has a .git but that git cannot resolve" |
+| N27, N28 | a CI run or a commit dropped in transit is caught | `checkCi` / `checkGit` removed from `checkFigures` | the two new `dropped in transit` rows in T3 |
+| N29 | the removed mechanisms' names stay out of the README | `report persistence` added to the README | "AC-SEC-18/AC-PROD-8: README.md describes none of the removed mechanisms" |
+| M5a | the collector stops reading at the stdout cap and kills the child | `abort()` removed after `out.tooLarge = true` | "AC-QA-19: a gh run list over the 64 MiB stdout cap" (it asserts the stub never finished, no clock) |
+| M5b, M5c | the verify tests assert scaling, not milliseconds | a quadratic de-duplication in `cappedReasons`; `unshift` for `push` in `checkRowClass` | "formatVerdict: reasons are de-duplicated ..." (196 s to fail, as intended), "checkRows: a 5 MB report of well-formed rows" |
+| M5d | the generator writes the table atomically (and the test holds two runs at a rendezvous) | the temp-file-and-rename replaced by a direct write | "generator: two runs held together at a rendezvous" |
+| M6 | AC-QA-21's "never a mix" | a report placement that appends to the existing report; and, separately, the `heading-unique` marker removed from the test | "AC-QA-21: two runners started together" both times (the second by its `notEqual` vacuity guard) |
+
+**Not proved by mutation.** The L2 pre-commit check narrows the window in which two runs can both believe they hold the lock to one system call; it does not
+remove it, and no test can place a fault inside a single call. The path pattern's breadth (it matches any slash-led word) is stated in the README, not guarded.

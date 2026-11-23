@@ -848,14 +848,18 @@ test('AC-QA-6: a gh run list whose output is not a JSON array is a failed ci lan
   assert.equal(lane(outDir, 'ci').reason, 'gh run list returned output that is not a JSON array')
 })
 
-test('AC-QA-19: a gh run list over the 64 MiB stdout cap is a failed ci lane in mode other, promptly, and does not hold the output in memory', () => {
+test('AC-QA-19: a gh run list over the 64 MiB stdout cap is a failed ci lane in mode other, the collector stops reading at the cap and the child is killed before it has written what it had, and the output is not held in memory', () => {
   const stubs = makeStubs()
   setGhMode(stubs, 'huge')
   const root = makeRepo({ ledger: validLedger(1), fix: 1 })
-  const started = Date.now()
   const { outDir } = collect(stubs, root)
-  assert.ok(Date.now() - started < 30000)
   assertFailedCi(lane(outDir, 'ci'), 'other')
+  // The mechanism, seen through the stub and not through a clock: the stub has 70,000,000 bytes to write and the collector's cap is 64 MiB
+  // (67,108,864), so a collector that stops reading at the cap leaves the stub blocked on a full pipe with bytes still to write, and kills
+  // it, so it never gets as far as saying it finished. How long that takes does not matter.
+  const log = fs.readFileSync(stubs.log, 'utf8')
+  assert.match(log, /^HUGE\tstarted$/m, 'guard against vacuity: the stub really started writing the oversized answer')
+  assert.doesNotMatch(log, /^HUGE\tfinished$/m, 'the child was killed before it finished writing')
 })
 
 test('AC-QA-19: a git log over the 64 MiB stdout cap fails the git lane with the fixed size-limit reason', () => {
