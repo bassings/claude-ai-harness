@@ -26,14 +26,14 @@
 // When the result is trusted (or the only problem is a lane that could not run) it writes result-report.md and
 // result-sidecar.json into the per-run directory, ready for the runner to place. The sidecar it writes is the
 // returned one MERGED into the one on disk: the sidecar is the only copy of the id-to-target map for decided
-// proposals, so a run never loses an entry from it (mergeSidecar).
+// proposals, so a run never loses an entry from it (mergeSidecarDetailed).
 //
 // Spawn-free, and read-only toward everything but those two files: every read goes through the reader's guarded
 // helper (readRepoFile: no symlink, regular file, size cap), like the collector's reads of collected files, and a
 // static test fails if this file imports child_process or reads any other way. The result check itself writes only
 // those two files. The critical section (settleRun, which the runner's settle form and the attended entry both call) also
 // writes the sidecar lock, the staged temp files and the two outputs. It runs no git: making the two output paths ignored, and
-// confirming it, is the caller's step before it is called (the runner's ensure_ignored, the skill's own commands).
+// confirming it, is the caller's step before it is called (the runner's prepare_outputs, the skill's step 3).
 
 import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
@@ -114,7 +114,7 @@ export const REASON_DETAILS = Object.freeze({
 // The class of a session failure, printed as CAUSE <token>.
 export const CAUSE_TOKENS = Object.freeze(['empty', 'malformed', 'failed_step', 'oversized', 'nonce', 'mac', 'refused'])
 // Fixed tokens the lock code raises for the caller to print as NOTICE <token>.
-export const NOTICE_TOKENS = Object.freeze(['lock-restore-failed', 'sidecar-referenced-evicted'])
+export const NOTICE_TOKENS = Object.freeze(['lock-restore-failed', 'sidecar-referenced-evicted', 'sidecar-eviction-unprotected'])
 // END FIXED REASONS
 
 const F = FIXED_REASONS
@@ -479,6 +479,32 @@ const LINE_SHAPES = [
   DIGEST_OMITTED_RE,
 ]
 
+// Whole-branch review round 4, F3: a figure line or row that is in the report but does not parse is said to be so, with a fixed phrase,
+// instead of reading as its first figure missing. A line "is there" when its shape is unknown and it starts with the literal text the shape
+// starts with (and, for a row keyed by a code span, carries that key). A shape that starts with no literal text is never matched this way.
+function literalLead(re) {
+  const source = re.source.replace(/^\^/, '')
+  let lead = ''
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i]
+    if (ch === '\\' && /[^A-Za-z0-9]/.test(source[i + 1] ?? 'a')) {
+      lead += source[i + 1]
+      i += 1
+    } else if (ch === '\\' || '()[]{}*+?|.$'.includes(ch)) {
+      break
+    } else {
+      lead += ch
+    }
+  }
+  return lead
+}
+const unknownLines = (lines) => lines.filter(({ skeleton }) => !isKnownShape(skeleton))
+function presentButUnparsed(re, unparsed, carriesKey = () => true) {
+  const lead = literalLead(re)
+  return lead.length >= 3 && unparsed.some(({ skeleton, spans }) => skeleton.startsWith(lead) && carriesKey(spans))
+}
+const didNotParse = (name) => `${F.FIGURE_MISMATCH} ${name}: a row did not parse`
+
 // { reasons, reported }: reported is the figure the report states for the ledger, for the RESULT line. A record
 // count printed beside a ledger lane that has no collected figure is refused, whatever the number: it can only be a
 // default zero standing for a lane that did not run.
@@ -486,10 +512,11 @@ const figuresOn = (lines, shape) => lines.map(({ skeleton }) => shape.re.exec(sk
 
 export function checkLedger(report, col) {
   const want = collectedLedger(col)
-  const found = figuresOn(parsedLines(report), SHAPES.ledger)
+  const lines = parsedLines(report)
+  const found = figuresOn(lines, SHAPES.ledger)
   const first = found[0]?.[0]
   if (want === null) return { reasons: found.length > 0 ? [`${F.FIGURE_MISMATCH} ledger: collected none, reported ${first}`] : [], reported: null }
-  if (found.length === 0) return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported none`], reported: null }
+  if (found.length === 0) return { reasons: [presentButUnparsed(SHAPES.ledger.re, unknownLines(lines)) ? didNotParse('ledger') : `${F.FIGURE_MISMATCH} ledger: collected ${want}, reported none`], reported: null }
   const wrong = found.find(([n]) => n !== want)
   if (wrong !== undefined) return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported ${wrong[0]}`], reported: wrong[0] }
   return { reasons: found.length === 1 ? [] : [unknownShape('ledger')], reported: want }
@@ -497,9 +524,10 @@ export function checkLedger(report, col) {
 
 // A lane with a figure the report must show: exactly one line carries the label and it equals the figure. A lane with none: no line does.
 export function checkLine(name, report, shape, names, want) {
-  const found = figuresOn(parsedLines(report), shape)
+  const lines = parsedLines(report)
+  const found = figuresOn(lines, shape)
   if (want === null) return found.length > 0 ? [`${F.FIGURE_MISMATCH} ${name}: collected none, reported ${found[0][0]}`] : []
-  if (found.length === 0) return [`${F.FIGURE_MISMATCH} ${name}: ${names[0]} collected ${want[0]}, reported none`]
+  if (found.length === 0) return [presentButUnparsed(shape.re, unknownLines(lines)) ? didNotParse(name) : `${F.FIGURE_MISMATCH} ${name}: ${names[0]} collected ${want[0]}, reported none`]
   for (const got of found) {
     const diff = firstDifference(names, want, got)
     if (diff) return [`${F.FIGURE_MISMATCH} ${name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`]
@@ -578,6 +606,7 @@ const spanKey = (spans) => spans[0]
 
 const CI_QUALIFIER = '(?:insufficient data|window truncated|rename suspect|re-run|jobs partially fetched|never failed in this window)'
 const CI_JOB = {
+  keyOf: spanKey,
   name: 'ci job',
   re: sp(new RegExp(String.raw`^- ¤: n=(\d{1,15}|n/a), failed=(\d{1,15}|n/a)(?:, not settled=(?:${NUMBER}|n/a) \(skipped, cancelled or neutral\))?(?: \(run ids \d{1,20}(?:, \d{1,20}){0,9}(?:, \+\d{1,15} more)?\))?, mean (?:-?\d{1,15}s|n/a)(?: \(${CI_QUALIFIER}(?:, ${CI_QUALIFIER}){0,5}\))?$`)),
   names: ['n', 'failed'],
@@ -586,6 +615,7 @@ const CI_JOB = {
 }
 
 const CI_REPOSITORY = {
+  keyOf: spanKey,
   name: 'ci repository',
   re: sp(new RegExp(String.raw`^- ¤: ${COUNT} runs not completed \(left out\); per-run fetch failures \(incl\. attempt-1\): rate_limited ${COUNT}, unauthenticated ${COUNT}, other ${COUNT}; attempt-1 jobs not fetched: (\d{1,15}|n/a); runs past attempt 2 or with an unreadable attempt \(not qualifiable\): (\d{1,15}|n/a)$`)),
   names: ['not completed', 'rate limited', 'unauthenticated', 'other', 'attempt-1 unfetched', 'past attempt 2'],
@@ -594,6 +624,7 @@ const CI_REPOSITORY = {
 }
 
 const GH_CALLS = {
+  keyOf: spanKey,
   name: 'gh calls',
   re: sp(/^- ¤: wall-clock (\d{1,15}(?:\.\d{1,9})?|n\/a)s, (\d{1,15}|n\/a) gh calls$/),
   names: ['wall-clock seconds', 'calls'],
@@ -602,6 +633,7 @@ const GH_CALLS = {
 }
 
 const WALL_CLOCK_PLAN = {
+  keyOf: spanKey,
   name: 'wall-clock plan',
   re: sp(new RegExp(String.raw`^- ¤: ci_wait=${SEC} \(n=${COUNT}\), human_wait=${SEC} \(n=${COUNT}\), agent_compute=${SEC} \(n=${COUNT}\)(?:, aborted=${SEC} \(n=${COUNT}\))?(?:, unterminated_waits: ${COUNT})?$`)),
   names: ['ci wait seconds', 'ci wait runs', 'human wait seconds', 'human wait runs', 'agent compute seconds', 'agent compute runs', 'aborted seconds', 'aborted runs', 'unterminated waits'],
@@ -636,6 +668,7 @@ const neverFailingKey = (a) => [a.repo, a.spec, a.ac_id].map(inertText).join('\n
 
 const NEVER_FAILING_REASON = '(?:insufficient data|unattributed FAIL in window -- see invalid_ac_ids_dropped|unattributed verdict for this criterion -- see invalid_record_values_dropped|truncated ac_verdicts in window -- see ac_verdicts_truncated)'
 const NEVER_FAILING = {
+  keyOf: (spans) => spans.slice(0, 3).join('\n'),
   name: 'never-failing',
   re: sp(new RegExp(String.raw`^- ¤/¤ ¤: n=(\d{1,15})(?: \(${NEVER_FAILING_REASON}\))?(?:, never_failed=(true|false|null))?(?:, verdict_disagreements=(\d{1,15}|not measured|null))?$`)),
   names: ['n', 'never failed', 'verdict disagreements'],
@@ -674,6 +707,7 @@ const LEDGER_SKIPPED = {
 }
 
 const TRIGGER_ACCURACY = {
+  keyOf: spanKey,
   name: 'trigger accuracy',
   re: sp(/^- ¤: clean_zero_trigger=(\d{1,15}), clean_with_matches=(\d{1,15}), findings=(\d{1,15}), clean_trigger_unmeasured=(\d{1,15}), total=(\d{1,15})$/),
   names: ['clean zero trigger', 'clean with matches', 'findings', 'clean trigger unmeasured', 'total'],
@@ -682,6 +716,7 @@ const TRIGGER_ACCURACY = {
 }
 
 const REWORK = {
+  keyOf: spanKey,
   name: 'rework',
   re: sp(/^- ¤: fixed=(\d{1,15}), rejected=(\d{1,15}), spec_bug=(\d{1,15}), open=(\d{1,15})$/),
   names: ['fixed', 'rejected', 'spec bug', 'open'],
@@ -875,7 +910,13 @@ function rowReason(spec, want, got) {
   return spec.textual ? `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} differs from the collected one` : `${F.FIGURE_MISMATCH} ${spec.name}: ${diff.name} collected ${diff.want}, reported ${diff.got}`
 }
 
-function checkRowClass(spec, lines, col) {
+// The reason for a row the collected data holds and the report does not show: it is there but does not parse, or it is missing.
+function missingRowReason(spec, key, want, unparsed) {
+  const carriesKey = spec.keyOf ? (spans) => spec.keyOf(spans) === key : undefined
+  return presentButUnparsed(spec.re, unparsed(), carriesKey) ? didNotParse(spec.name) : `${F.FIGURE_MISMATCH} ${spec.name}: ${spec.names[0]} collected ${want[0]}, reported none`
+}
+
+function checkRowClass(spec, lines, col, unparsed = () => unknownLines(lines)) {
   const wants = spec.rows(col)
   const reasons = []
   const seen = new Set()
@@ -896,7 +937,7 @@ function checkRowClass(spec, lines, col) {
     const problem = rowReason(spec, want, parsed.got)
     if (problem !== null) reasons.push(problem)
   }
-  for (const [key, want] of wants) if (!seen.has(key)) reasons.push(`${F.FIGURE_MISMATCH} ${spec.name}: ${spec.names[0]} collected ${want[0]}, reported none`)
+  for (const [key, want] of wants) if (!seen.has(key)) reasons.push(missingRowReason(spec, key, want, unparsed))
   return reasons
 }
 
@@ -905,14 +946,17 @@ function checkRowClass(spec, lines, col) {
 const KNOWN_SHAPES = [...Object.values(SHAPES).map((shape) => shape.re), ...ROW_CLASSES.map((spec) => spec.re), ...LINE_SHAPES]
 const isKnownShape = (skeleton) => FIXED_LINES.has(skeleton) || KNOWN_SHAPES.some((re) => re.test(skeleton))
 
-// One fixed reason for any line with an odd number of backticks, and one for any line whose skeleton is not a shape the script writes.
+// One fixed reason for any line with an odd number of backticks, and one for any line whose skeleton is not a shape the script writes, each
+// followed (whole-branch review round 4, F3) by the same reason with the 1-based line number of each of the first NUMBERED_LINES such lines, as
+// an integer and nothing else, so an operator can find the line without the report's text ever reaching a log.
+const NUMBERED_LINES = 3
 export function checkLineShapes(report) {
-  const reasons = new Set()
-  for (const { line, skeleton } of parsedLines(report)) {
-    if (backtickCount(line) % 2 === 1) reasons.add(F.ODD_BACKTICKS)
-    else if (!isKnownShape(skeleton)) reasons.add(F.UNKNOWN_LINE)
-  }
-  return [...reasons]
+  const found = { [F.ODD_BACKTICKS]: [], [F.UNKNOWN_LINE]: [] }
+  parsedLines(report).forEach(({ line, skeleton }, index) => {
+    if (backtickCount(line) % 2 === 1) found[F.ODD_BACKTICKS].push(index + 1)
+    else if (!isKnownShape(skeleton)) found[F.UNKNOWN_LINE].push(index + 1)
+  })
+  return Object.entries(found).filter(([, numbers]) => numbers.length > 0).flatMap(([reason, numbers]) => [reason, ...numbers.slice(0, NUMBERED_LINES).map((n) => `${reason}: ${n}`)])
 }
 
 // ---- recorded proposal outcomes and the plan-label note ----
@@ -962,7 +1006,9 @@ export function checkPlanLabelNote(report, col) {
 
 export function checkRows(report, col) {
   const lines = parsedLines(report)
-  return [...ROW_CLASSES.flatMap((spec) => checkRowClass(spec, lines, col)), ...checkScoped(lines, col), ...checkProposalOutcomes(lines, col), ...checkPlanLabelNote(lines, col)]
+  let unparsed = null
+  const unparsedOnce = () => (unparsed ??= unknownLines(lines))
+  return [...ROW_CLASSES.flatMap((spec) => checkRowClass(spec, lines, col, unparsedOnce)), ...checkScoped(lines, col), ...checkProposalOutcomes(lines, col), ...checkPlanLabelNote(lines, col)]
 }
 
 // { reasons, reportedLedger }: every line's shape, and every figure in the report against the collected files.
@@ -1027,7 +1073,6 @@ export function mergeSidecarDetailed(existing, returned, max = SIDECAR_CARRY_MAX
   return { entries: Object.fromEntries(merged), evictedReferenced }
 }
 
-export const mergeSidecar = (existing, returned, max = SIDECAR_CARRY_MAX, referenced = new Set()) => mergeSidecarDetailed(existing, returned, max, referenced).entries
 
 // The merged sidecar, shrunk in the same order until it fits the size cap (it cannot be placed over it). { entries, evictedReferenced }.
 export function fitSidecarDetailed(merged, referenced = new Set()) {
@@ -1035,13 +1080,15 @@ export function fitSidecarDetailed(merged, referenced = new Set()) {
   const evictedReferenced = evictUntil(kept, referenced, () => Buffer.byteLength(sidecarText(Object.fromEntries(kept)), 'utf8') <= SIDECAR_CAP)
   return { entries: Object.fromEntries(kept), evictedReferenced }
 }
-export const fitSidecar = (merged, referenced = new Set()) => fitSidecarDetailed(merged, referenced).entries
 
-// The proposal ids the ledger records an outcome for (every window, not the digest's capped few), read through the guarded read; none when the ledger
-// is absent or cannot be read (nothing is then protected, and eviction is oldest first as it always was).
+// { ids, unreadable }: the proposal ids the ledger records an outcome for (every window, not the digest's capped few), read through the guarded
+// read. An absent ledger records nothing, so no id is protected and eviction is oldest first as it always was. A ledger that exists but cannot be
+// read (not a regular file, a symlink, over the size cap, unreadable) is a different case (whole-branch review round 4, F5): its decisions are
+// unknown, so `unreadable` is true and the caller evicts nothing in that run.
 export function recordedOutcomeIds(root) {
   const got = readRepoFile(root, LEDGER_RELATIVE_PATH, FILE_CAP)
-  return got.status === 'ok' ? new Set(aggregateProposalOutcomes(parseLedgerContent(got.text).records).keys()) : new Set()
+  if (got.status === 'ok') return { ids: new Set(aggregateProposalOutcomes(parseLedgerContent(got.text).records).keys()), unreadable: false }
+  return { ids: new Set(), unreadable: got.status !== 'absent' }
 }
 
 // { entries } the sidecar on disk (an absent one is empty), or { reason } when it exists and cannot be read as a JSON object.
@@ -1126,13 +1173,17 @@ export function macProblem(result, nonce) {
 // ---- a proposal that removes an always-on lens is refused, whoever signed the report (M2, second layer) ----
 //
 // The workflow's own rule (isAlwaysOnSecurityRemoval in workflows/optimise-cycle.js) drops such a proposal, so none can be in a report the
-// workflow produced. These two values are that rule's, held to the workflow's by a parity test (a script cannot be imported).
+// workflow produced. These two values are that rule's, held to the workflow's by a parity test (a script cannot be imported). This layer reads
+// what that rule reads and nothing more (whole-branch review round 4, F2): of each proposal block, its heading line (the script's id and label,
+// then the statement) and its Target line, with the target the reply returned for that id. A lens named only in a measurement, a citation or
+// the reinstatement evidence is ordinary optimiser output, and the workflow keeps such a proposal, so it is not refused here either.
 export const ALWAYS_ON_LENS_NAMES = ['lens-security', 'lens-qa']
 export const ALWAYS_ON_LENS_PHRASE_RE = /\b(lens-security|lens-qa|security lens|qa lens)\b/i
 const PROPOSAL_SECTION_RE = /^## Proposals (?:\(ranked\)|previously adopted|\(insufficient data)/
 const PROPOSAL_START_RE = /^(?:### |- )([0-9a-f]{16}): /
 
-// The text of each proposal block in the three proposal sections, with the id that starts it.
+// Each proposal block in the three proposal sections: the id that starts it, and the text the workflow's rule reads (its heading line, which
+// holds the statement, and its Target line).
 function proposalBlocks(report) {
   const blocks = []
   let inSection = false
@@ -1140,7 +1191,7 @@ function proposalBlocks(report) {
     if (line.startsWith('## ')) inSection = PROPOSAL_SECTION_RE.test(line)
     const start = inSection ? PROPOSAL_START_RE.exec(line) : null
     if (start) blocks.push({ id: start[1], text: line })
-    else if (inSection && blocks.length > 0) blocks.at(-1).text += `\n${line}`
+    else if (inSection && blocks.length > 0 && line.startsWith('Target: ')) blocks.at(-1).text += `\n${line}`
   }
   return blocks
 }
@@ -1192,8 +1243,10 @@ function withMergedSidecar(judged, sidecarRoot, col) {
   if (!sidecarRoot || sidecarRoot === '-') return judged
   const existing = readExistingSidecar(sidecarRoot)
   if (existing.reason) return { ...judged, reasons: [existing.reason], place: 'no' }
-  const referenced = recordedOutcomeIds(sidecarRoot)
-  const merged = mergeSidecarDetailed(existing.entries, judged.targets, SIDECAR_CARRY_MAX, referenced)
+  const { ids: referenced, unreadable } = recordedOutcomeIds(sidecarRoot)
+  // A ledger that cannot be read: nothing is evicted for count in this run (only the byte cap can still force it), and the run says so.
+  if (unreadable) raiseNotice('sidecar-eviction-unprotected')
+  const merged = mergeSidecarDetailed(existing.entries, judged.targets, unreadable ? Infinity : SIDECAR_CARRY_MAX, referenced)
   const fitted = fitSidecarDetailed(merged.entries, referenced)
   if (merged.evictedReferenced + fitted.evictedReferenced > 0) raiseNotice(`sidecar-referenced-evicted=${merged.evictedReferenced + fitted.evictedReferenced}`)
   return { ...judged, sidecar: sidecarText(fitted.entries) }

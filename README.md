@@ -1757,6 +1757,21 @@ prints. Where a row says "re-run", start the job by hand with
 `~/.claude/bin/optimise-cycle-weekly.sh` after the fix, or wait for the next
 scheduled run.
 
+**A failure that fails the same way every run.** Re-running cannot clear a FAIL
+that comes from the data itself, and the weekly runner deletes its per-run
+directory on a FAIL, so the report it judged is gone. To see what tripped it,
+run the attended cycle once (`/optimise-cycle`, the steps in
+`skills/optimise-cycle/SKILL.md`) on the same repository. Its check prints the
+same `REASON` lines, and the two line-shape reasons are followed by
+`: <line>`, the 1-based number of the offending line of the report (the first
+three such lines; the number only, never the line's text). Before the run
+directory is removed (step 10), read that line of the returned report with
+`node -e "const r = require(process.argv[1]); console.log(r.report.split('\n')[Number(process.argv[2]) - 1])" <run dir>/result.json <line>`.
+It shows the line on your screen only; nothing is written to a log. A
+`figure mismatch <class>: a row did not parse` reason means that row is in the
+report but its figures are not in the shape the check reads, which is the line
+the line-shape reason numbers.
+
 | Reason or token | What it means | What to check | What to do |
 |---|---|---|---|
 | `no repos configured` | The runner has no repository to analyse. | `~/.claude/optimise-weekly-repos` exists and lists one path per line. | Add the paths (see above), then re-run. |
@@ -1825,14 +1840,14 @@ scheduled run.
 | `result carries no mac` | The returned object has no keyed digest (`result_mac`), or it is not a 64-character hash. | `bin/install.sh --check`: the installed workflow may predate the result check. | Run `bin/install.sh`, then re-run; report it if it repeats. |
 | `result mac does not match this run` | The keyed digest does not match the nonce and the reply's report, targets and lane statuses, so the reply was edited after the workflow returned it (or came from another run). Nothing was placed. | Nothing to check on your side. | Re-run; report it if it repeats. |
 | `report proposes removing an always-on lens` | A proposal in the report would remove `lens-security` or `lens-qa` from the always-on roster, which the workflow itself never lets through. Nothing was placed. | The report text in the session's reply, if you have it. | Re-run; report it if it repeats. |
-| `report has a line with an odd number of backticks` | A line of the report has an unpaired backtick. The script writes backticks only in pairs, around text from a repository or a model, so the report was altered after the workflow produced it. Nothing was placed. | Nothing to check on your side. | Re-run; report it if it repeats. |
-| `report has a line in a shape the check does not know` | A line of the report, read with its code-formatted text set aside, is not one of the lines the script writes, so text was added or changed outside code formatting after the workflow produced it, or the installed workflow and result check are out of step. Nothing was placed. | `bin/install.sh --check`. | Run `bin/install.sh` if it reports drift, then re-run; report it if it repeats. |
+| `report has a line with an odd number of backticks` | A line of the report has an unpaired backtick. The script writes backticks only in pairs, around text from a repository or a model, so the report was altered after the workflow produced it. Nothing was placed. The same reason followed by `: <line>` names the 1-based number of each of the first three such lines. | Nothing to check on your side. | Re-run; if it repeats, follow "A failure that fails the same way every run" above. |
+| `report has a line in a shape the check does not know` | A line of the report, read with its code-formatted text set aside, is not one of the lines the script writes, so text was added or changed outside code formatting after the workflow produced it, the installed workflow and result check are out of step, or the data produced a line the check cannot read. Nothing was placed. The same reason followed by `: <line>` names the 1-based number of each of the first three such lines. | `bin/install.sh --check`. | Run `bin/install.sh` if it reports drift, then re-run; if it repeats, follow "A failure that fails the same way every run" above and report the line. |
 | `report contains an invisible or direction-control character` | The report holds a zero-width or text-direction character, which can make a line read differently from how it is stored. | Nothing to check on your side. | Re-run; report it if it repeats. |
 | `result carries no nonce hash` | The returned object lacks the hash of this run's nonce. | The session may have called another workflow copy. | Re-run; report it if it repeats. |
 | `result nonce hash does not match this run` | The hash does not match this run's nonce, so the result is not from this run's digest. | As above. | As above. |
 | `report holds an absolute path` | The report names a path under the home directory, the repo or the per-run directory. | Nothing to check on your side. | Re-run; report it if it repeats. |
 | `collected data unreadable` | A collected file the check needs could not be read. | The per-run directory and free space. | Re-run. |
-| `figure mismatch` | A figure in the report differs from the one the runner collected (the lane and both numbers follow). Nothing was placed and the last good report stands. | The two numbers in the reason. | Re-run; if it repeats, the data changed on the way or the report is wrong: report it. |
+| `figure mismatch` | A figure in the report differs from the one the runner collected (the lane and both numbers follow), or, ending `a row did not parse`, the row is there but its figures are not in a shape the check reads. Nothing was placed and the last good report stands. | The two numbers in the reason, or the numbered line of the line-shape reason beside it. | Re-run; if it repeats, the data changed on the way or the report is wrong: follow "A failure that fails the same way every run" above and report it. |
 | `lane could not run: <mode>` | The lane named before it could not run, so the report was written without it and the run is a FAIL by design. Follow the `failed:<mode>` row. | The mode. | See the `failed:` rows. |
 | `the reader failed for` | The reader program failed on a collected command. | `bin/install.sh --check`. | Run `bin/install.sh`. |
 | `the reader reported an error for` | The reader returned an error for this repo's data. | As above. | As above. |
@@ -1867,6 +1882,7 @@ scheduled run.
 | `cause=empty` | The session printed nothing. | See `session output: empty`. | Same. |
 | `cause=malformed` | The session's output or result was not in the agreed shape. | See the `session output:` rows. | Same. |
 | `notice=sidecar-referenced-evicted` | The proposal-targets file was at its 500-entry cap and every entry that could go was one the ledger still records an outcome for, so some recorded decisions lost the target text behind them (`NOTICE <repo> sidecar-referenced-evicted=<n>`: n entries). Unreferenced entries always go first. | How many recorded decisions you expect to keep; the ledger window. | Archive old decisions' targets elsewhere, or raise the cap in a change; the next run shows those proposals as new. |
+| `notice=sidecar-eviction-unprotected` | The ledger exists but could not be read (a symlink, not a regular file, over its size cap, or unreadable), so the result check could not tell which proposal-targets entries back a recorded decision. It evicted nothing for count in that run (only the 1 MiB file cap can still force an eviction), so the file may hold more than 500 entries until a run reads the ledger again (`NOTICE <repo> sidecar-eviction-unprotected`). | `ls -l <repo>/.claude/harness-ledger.jsonl`: is it a regular file you own, under 64 MiB? | Restore the ledger as a regular file; the next run evicts back to 500 with decided entries protected. |
 | `notice=linked-worktree` | The weekly run analysed a linked worktree, so its report replaces the main checkout's report with one analysed from that worktree's branch (a `NOTICE <repo> linked-worktree` line in the log). | Whether the roster entry should name the main checkout instead. | Change the roster entry if that is not what you want. |
 | `cause=mac` | The returned keyed digest was missing or did not match. | See the two `result ... mac` rows. | Same. |
 | `cause=nonce` | The returned nonce hash did not match. | See the two `nonce hash` rows. | Same. |

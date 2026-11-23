@@ -947,6 +947,18 @@ function ensurePlan(byPlan, key, repo, plan) {
 // resolved analysis root, used only to lexically relativise an absolute
 // historical spec/event_key plan segment via the shared canonicalPlanKey --
 // never touched by any fs call here.
+// Whole-branch review round 4, F1: a duration is a whole number of milliseconds over 1000, so every true sum has at most three decimal
+// places, but a sum of them in binary floating point does not (0.1 + 0.2 is 0.30000000000000004, and this repository's real ledger summed to
+// 5876.967000000001). The report prints these values as given and the result check reads them back with a bounded number pattern, so every
+// seconds value is rounded to three places here, once, where the reader emits it.
+const SECONDS_FIELDS = ['ciWaitSeconds', 'humanWaitSeconds', 'agentComputeSeconds', 'agentComputeAbortedSeconds']
+export function roundedSeconds(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.round(value * 1000) / 1000 : value
+}
+function withRoundedSeconds(entry) {
+  return { ...entry, ...Object.fromEntries(SECONDS_FIELDS.filter((k) => Object.hasOwn(entry, k)).map((k) => [k, roundedSeconds(entry[k])])) }
+}
+
 export function aggregateWallClock(records, { root = '' } = {}) {
   const byPlan = new Map()
 
@@ -1284,11 +1296,15 @@ export function aggregateWallClock(records, { root = '' } = {}) {
   // merges or re-orders records (a multi-repo aggregate, a resumed read)
   // would produce a differently-ordered report. Sorted by key here, the
   // single place byPlan is ever returned, rather than at each call site.
-  const sortedByPlan = new Map([...byPlan.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+  const byCodeUnit = ([a], [b]) => {
+    if (a === b) return 0
+    return a < b ? -1 : 1
+  }
+  const sortedByPlan = new Map([...byPlan.entries()].sort(byCodeUnit).map(([key, bucket]) => [key, withRoundedSeconds(bucket)]))
 
   return {
     byPlan: sortedByPlan,
-    totals,
+    totals: withRoundedSeconds(totals),
     source: {
       ci_wait: 'ledger:conduct_plan_event',
       human_wait: 'ledger:conduct_plan_event',

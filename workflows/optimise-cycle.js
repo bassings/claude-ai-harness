@@ -70,16 +70,16 @@ const UNMEASURED_SEGMENT_SUPPRESSION_THRESHOLD = 0.2
 // `<`, `>` or `/`, so a hostile field containing the literal string
 // `</UNTRUSTED-DATA>` could close the block early and have its remaining
 // text read as free prose outside any containment at all -- proven by
-// direct reproduction. Framing the tag name itself with a per-run random
-// nonce (`UNTRUSTED-DATA-<nonce>`) closes this: the nonce is generated
-// fresh each run by a Bash step (workflow scripts cannot call
-// Math.random()/Date.now(), both statically rejected, so there is no way
-// to generate it here), so content authored before this run started --
-// which is every realistic attack surface here, a planted job name or
-// commit message -- cannot possibly predict or reproduce it. A literal
-// `</UNTRUSTED-DATA>` (the OLD, un-nonced form) appearing inside hostile
-// content is therefore just inert text: it does not match the real
-// closing tag and cannot end the block early.
+// direct reproduction. The containment is the escaping in wrapAsData below:
+// every `<` that opens a fence-shaped tag (`<UNTRUSTED-DATA-...` or
+// `</UNTRUSTED-DATA-...`, any nonce, any case) inside the data is written
+// as its JSON escape, so no string in the data can spell a closing tag or
+// open another block. The tag also carries the caller's nonce (minted by
+// the weekly runner, or by the operator's session in the attended skill,
+// and passed in as an argument: a workflow script cannot generate one), but
+// the nonce is NOT secret from the data (a digest string may carry it), so
+// its unpredictability is not what holds the fence; the escaping is, and it
+// must not be weakened as redundant.
 const FENCE_TAG_RE = /<(\/?UNTRUSTED-DATA-)/gi
 function wrapAsData(nonce, label, value) {
   // HARN-RUNNER-2 T2 (AC-SEC-5, AC-SEC-6): the nonce is the runner's, so it is not secret from the data (a digest string
@@ -314,7 +314,7 @@ function resultMacOf(nonce, report, proposalTargets, lanes) {
 
 // ---- HARN-RUNNER-2 T2, T4: the digest every call carries ----
 
-// Every path-shaped string and every roster root an agent or the digest supplied is redacted BEFORE it is flattened,
+// Every path-shaped string and every roster root the digest supplied is redacted BEFORE it is flattened,
 // bounded or echoed (Round 1 F4, AC-SEC-10): a root becomes the marker the reader uses for an unidentified repo, and so
 // does any absolute path. ABSOLUTE_PATH_RE mirrors the one in workflows/lib/ledger-append.mjs (a workflow script cannot
 // import it). Redacting before the 120-character slice stops a truncation leaving a root half-visible. The digest path
@@ -533,7 +533,7 @@ phase('Synthesis')
 const ledgerN = ledgerAgg && typeof ledgerAgg.n === 'number' ? ledgerAgg.n : 0
 const ledgerSufficient = ledgerN >= MIN_RECORDS_FOR_PROPOSALS
 const ledgerCitations = new Set((ledgerAgg && ledgerAgg.citationPool) || [])
-// Round 1 L2 (AC-SEC-10): the CI aggregate is agent-supplied, so the copy that
+// Round 1 L2 (AC-SEC-10): the CI aggregate is collected repository data (it arrives in the digest), so the copy that
 // reaches the synthesis prompt and the report is redacted, keys included
 // (redactDeep leaves keys alone, and the key carries the repo and job name; see
 // makeRedactors). The brake below keeps reading the raw ciAgg: it only compares,
@@ -879,7 +879,7 @@ const previouslyAdopted = ranked.filter(isAdoptedElsewhere)
 // reader supplied this run, then overlaid with this run's proposals, so a
 // decided target survives cycles in which the drafter does not re-raise it.
 // An outcome without a target is skipped. How many entries the sidecar FILE keeps is not decided here: the result check
-// (workflows/lib/optimise-verify.mjs mergeSidecar) owns retention, so this carries every outcome the digest holds and
+// (workflows/lib/optimise-verify.mjs mergeSidecarDetailed) owns retention, so this carries every outcome the digest holds and
 // there is one eviction rule, not two with opposite orders (HARN-RUNNER-2 T3 L12).
 const proposalTargetsSidecar = {}
 for (const [id, o] of Object.entries(ledgerAgg?.proposalOutcomes || {})) {
@@ -1064,9 +1064,9 @@ function buildReport(d) {
   // of a quiet week but because the ledger was never written there at all,
   // and that difference must never disappear into a summed count.
   lines.push('## Sample completeness')
-  // Round-2 L4 (spec bug, no AC): a ledger-lane CRASH (the agent step
-  // itself failed, e.g. optimise-read.mjs not yet resolvable before the
-  // T3 global-mirror rollout) previously degraded through the exact same
+  // Round-2 L4 (spec bug, no AC): a ledger lane that did not run (since
+  // HARN-RUNNER-2 the collector's ledger lane, reported through the digest's
+  // lanes.ledger status; the in-workflow lane agent is gone) previously degraded through the exact same
   // `ledgerAgg ? ... : 0/[]` defaults as a genuinely empty, successfully-
   // read ledger -- both rendered as "0 records ... insufficient data",
   // indistinguishable to the operator. AC-OPS-11 already separates
@@ -1120,9 +1120,8 @@ function buildReport(d) {
   // Review round-2 H-1 (High): `?? 0` cannot tell "the reader computed a
   // real zero" apart from "this field does not exist on the object at
   // all" -- the latter is the NORMAL post-merge state whenever the
-  // installed mirror at ~/.claude/workflows/lib/optimise-read.mjs (which
-  // the ledger lane prefers, see the scope prompt below) is stale or a
-  // field gets renamed, and it is worse than the pre-PR2 state, where the
+  // installed copy of workflows/lib/optimise-read.mjs that the collector
+  // runs is stale or a field gets renamed, and it is worse than the pre-PR2 state, where the
   // operator at least saw a single combined `unmeasured=6`. `undefined` now
   // renders an explicit, unmissable marker instead of a confident 0.
   // Defined here (before its first use, a few lines below) rather than

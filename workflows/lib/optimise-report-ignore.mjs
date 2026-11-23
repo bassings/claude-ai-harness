@@ -14,9 +14,11 @@
 // IS this ignore-ensure step. This file makes that claim true, without
 // touching ledger-append.mjs (a PR1 file): it is a deliberately SEPARATE,
 // small, single-purpose script, parameterised by path and root rather than
-// hardcoded to the ledger's own constant. Its one caller is the weekly
-// runner's ensure_ignored (bin/optimise-cycle-weekly.sh), which runs it once
-// per output path before either file is written; no session is given it.
+// hardcoded to the ledger's own constant. Its callers are the weekly
+// runner's prepare_outputs (bin/optimise-cycle-weekly.sh) and step 3 of the
+// attended skill (skills/optimise-cycle/SKILL.md), each through its
+// `prepare` command, which makes both output paths ignored in the main
+// checkout before either file is written; no unattended session is given it.
 //
 // Kept OUT of workflows/lib/optimise-read.mjs on purpose: that file is
 // read-only by construction and mutation-proven never to invoke git or

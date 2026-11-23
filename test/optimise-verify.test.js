@@ -117,7 +117,7 @@ test('checkFigures: a row written in a shape the check does not know is refused,
   const reshaped = report.replace(plan, plan.replace('), human_wait=', ') human_wait='))
   assert.notEqual(reshaped, report)
   assert.ok(checkFigures({ lanes: LANES_RAN }, reshaped, col).reasons.includes('report has a line in a shape the check does not know'))
-  assert.ok(checkRows(reshaped, col).some((r) => r.startsWith('figure mismatch wall-clock plan: ') && r.endsWith('reported none')), 'and the row is missing from its class')
+  assert.ok(checkRows(reshaped, col).includes('figure mismatch wall-clock plan: a row did not parse'), 'and the row is reported as there but not parsing (round 4, F3), not as its first figure missing')
   const job = report.split('\n').find((l) => l.includes('::ci::') && l.includes(': n='))
   const jobReshaped = report.replace(job, job.replace(': n=', ': runs=').replace(', failed=', ', failures='))
   assert.ok(checkRows(jobReshaped.replace('::ci::', '::ci::'), col).length >= 1, 'a job row with its figures renamed is not silently ignored')
@@ -137,8 +137,9 @@ test('checkFigures: a hostile report of one enormous line of row-shaped text is 
 
 // ---- the sidecar merge ----
 
-test('mergeSidecar: every prior entry the returned sidecar lacks is kept, returned entries are added or replace the prior one, and the newest come last', async () => {
-  const { mergeSidecar } = await load()
+test('mergeSidecarDetailed: every prior entry the returned sidecar lacks is kept, returned entries are added or replace the prior one, and the newest come last', async () => {
+  const { mergeSidecarDetailed } = await load()
+  const mergeSidecar = (...args) => mergeSidecarDetailed(...args).entries
   const merged = mergeSidecar({ a: { v: 1 }, b: { v: 2 }, c: { v: 3 } }, { b: { v: 20 }, d: { v: 4 } })
   assert.deepEqual(merged, { a: { v: 1 }, c: { v: 3 }, b: { v: 20 }, d: { v: 4 } })
   assert.deepEqual(Object.keys(merged), ['a', 'c', 'b', 'd'], 'insertion order: a returned entry counts as the newest')
@@ -146,8 +147,9 @@ test('mergeSidecar: every prior entry the returned sidecar lacks is kept, return
   assert.deepEqual(mergeSidecar({ a: 1 }, {}), { a: 1 }, 'a returned sidecar with nothing in it removes nothing')
 })
 
-test('mergeSidecar: past the carry maximum the oldest entries go first, never the newest, and never before the maximum is passed', async () => {
-  const { mergeSidecar, SIDECAR_CARRY_MAX } = await load()
+test('mergeSidecarDetailed: past the carry maximum the oldest entries go first, never the newest, and never before the maximum is passed', async () => {
+  const { mergeSidecarDetailed, SIDECAR_CARRY_MAX } = await load()
+  const mergeSidecar = (...args) => mergeSidecarDetailed(...args).entries
   assert.equal(SIDECAR_CARRY_MAX, 500, 'the carry maximum, owned here')
   const workflow = fs.readFileSync(T.WORKFLOW, 'utf8')
   assert.ok(!/SIDECAR_CARRY_MAX|\.slice\(0, 500\)/.test(workflow), 'the workflow decides no retention of its own (L12): it carries every outcome the digest holds and the merge here owns what is kept')
@@ -160,8 +162,9 @@ test('mergeSidecar: past the carry maximum the oldest entries go first, never th
   assert.deepEqual(keys.slice(-2), ['new1', 'new2'])
 })
 
-test('fitSidecar: a merged sidecar over the size cap loses its oldest entries until it fits, and one under the cap loses none', async () => {
-  const { fitSidecar, SIDECAR_CAP } = await load()
+test('fitSidecarDetailed: a merged sidecar over the size cap loses its oldest entries until it fits, and one under the cap loses none', async () => {
+  const { fitSidecarDetailed, SIDECAR_CAP } = await load()
+  const fitSidecar = (...args) => fitSidecarDetailed(...args).entries
   const big = (i) => ({ pad: `${i}`.padEnd(200000, 'x') })
   const merged = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`e${i}`, big(i)]))
   const fitted = fitSidecar(merged)
@@ -193,8 +196,9 @@ test('validateReturnedSidecar: only a hex id whose target is the reader\'s fixed
   assert.deepEqual([...namedProposalIds(report, { digest: { ledger: { proposalOutcomes: { propX: {} } } } })].sort((a, b) => a.localeCompare(b)), [ID_A, id, 'propX'].sort((a, b) => a.localeCompare(b)), 'headings, bullets and the ledger\'s decided outcomes are named')
 })
 
-test('mergeSidecar: a returned entry evicts an on-disk one only when the file is full, and never more of them than it adds', async () => {
-  const { mergeSidecar, SIDECAR_CARRY_MAX } = await load()
+test('mergeSidecarDetailed: a returned entry evicts an on-disk one only when the file is full, and never more of them than it adds', async () => {
+  const { mergeSidecarDetailed, SIDECAR_CARRY_MAX } = await load()
+  const mergeSidecar = (...args) => mergeSidecarDetailed(...args).entries
   const disk = Object.fromEntries(Array.from({ length: SIDECAR_CARRY_MAX }, (_, i) => [`d${String(i).padStart(15, '0')}`, { i }]))
   const merged = mergeSidecar(disk, { aaaaaaaaaaaaaaaa: { n: 1 } })
   const lost = Object.keys(disk).filter((k) => !(k in merged))

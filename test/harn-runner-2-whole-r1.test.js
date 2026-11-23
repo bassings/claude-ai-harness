@@ -236,14 +236,9 @@ test('M2 (second layer): a signed report whose proposal block proposes retiring 
   assert.ok(!reasons(attended(tables).out).includes('report proposes removing an always-on lens'), 'a lens named in a table outside the proposal sections is not a proposal')
 })
 
-test('M2 (second layer): the always-on rule is the workflow\'s own, held by a parity test, not a second opinion', async () => {
-  const { ALWAYS_ON_LENS_NAMES, ALWAYS_ON_LENS_PHRASE_RE } = await load()
-  const names = /const SECURITY_LENS_NAMES = (\[[^\]]*\])/.exec(WORKFLOW_SOURCE)?.[1]
-  const phrase = /const SECURITY_LENS_PHRASE_RE = (\/.*\/[a-z]*)$/m.exec(WORKFLOW_SOURCE)?.[1]
-  assert.ok(names && phrase, 'the workflow declares both')
-  assert.deepEqual(ALWAYS_ON_LENS_NAMES, new Function(`return ${names}`)())
-  assert.equal(String(ALWAYS_ON_LENS_PHRASE_RE), phrase)
-})
+// Whole-branch review round 4, F2: the constants-only parity test that stood here is replaced by behavioural tests over real buildReport
+// output in test/harn-runner-2-round4.test.js (a lens named only in a measurement or citation PASSes both layers; a removal in a statement or
+// target is refused by both), because two equal constants did not stop the two layers reading different text.
 
 // ---- M1: forged headline figures ----
 
@@ -284,7 +279,9 @@ test('M1: the true line wrapped in an HTML comment and followed by a false one i
   assert.ok(JSON.parse(fs.readFileSync(copy.resultFile, 'utf8')).report.includes('<!--'), 'guard against vacuity')
   const res = attended(copy)
   assert.match(res.out, /^PLACE no$/m, res.out)
-  assert.deepEqual(reasons(res.out).sort((a, b) => a.localeCompare(b)), ['figure mismatch ledger: collected 5, reported 0', 'report has a line in a shape the check does not know'])
+  // Round 4 (F3): the line-shape reason is followed by the same reason numbering the line.
+  const line = JSON.parse(fs.readFileSync(copy.resultFile, 'utf8')).report.split('\n').findIndex((l) => l.startsWith('<!-- ')) + 1
+  assert.deepEqual(reasons(res.out).sort((a, b) => a.localeCompare(b)), ['figure mismatch ledger: collected 5, reported 0', 'report has a line in a shape the check does not know', `report has a line in a shape the check does not know: ${line}`])
 })
 
 test('M1: a zero-width or direction-control character anywhere in the report is refused with its own reason', async () => {
@@ -976,7 +973,8 @@ for (const [name, forged] of PROBES) {
 test('R2-M1: a line that carries the model-text marker outside its envelope is refused, as a line in a shape the check does not know', async () => {
   const run = await collected()
   const copy = run.make((r) => { r.report += '\nSome other line (model text): anything\n' })
-  assert.deepEqual(reasons(attended(copy).out), ['report has a line in a shape the check does not know'])
+  const line = JSON.parse(fs.readFileSync(copy.resultFile, 'utf8')).report.split('\n').indexOf('Some other line (model text): anything') + 1
+  assert.deepEqual(reasons(attended(copy).out), ['report has a line in a shape the check does not know', `report has a line in a shape the check does not know: ${line}`], 'round 4 (F3): and the line is numbered')
 })
 
 // Round 3: two render sites the inert property test's fixtures do not reach (an uninstrumented repository's label, and the reason a scoped figure is
