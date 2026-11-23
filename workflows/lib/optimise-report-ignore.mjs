@@ -54,12 +54,12 @@ export function ensureIgnored(root, relativePath) {
       fs.appendFileSync(excludePath, sep + relativePath + '\n')
     }
   } catch (e) {
-    return { ignored: false, error: 'could not update .git/info/exclude: ' + e.message }
+    return { ignored: false, cause: 'exclude-unwritable', error: 'could not update .git/info/exclude: ' + e.message }
   }
   try {
     execFileSync('git', ['-c', 'safe.bareRepository=explicit', 'check-ignore', '-q', relativePath], { cwd: root })
   } catch (e) {
-    return { ignored: false, error: 'the path is not actually gitignored (a tracked .gitignore may re-include it with a negation pattern) -- refusing to write' }
+    return { ignored: false, cause: 'not-ignored', error: 'the path is not actually gitignored (a tracked .gitignore may re-include it with a negation pattern) -- refusing to write' }
   }
   return { ignored: true, error: null }
 }
@@ -71,7 +71,8 @@ export function ensureIgnored(root, relativePath) {
 //   root <repository>                 prints the main checkout of the repository (itself, or the main checkout of a linked worktree), or nothing
 //   prepare <repository> <per-run dir> resolves that main checkout, makes both output paths ignored there, confirms each with git,
 //                                      and writes ignore-proof.json into the per-run directory; prints {"ok":true,"root":...} or {"ok":false,...}
-// Both outputs are placed in the main checkout, where the sidecar, the ledger and the lock already live. Accepted risk (owner, 2026-11-23): a
+// A failure is named by its token: main-checkout (no main checkout could be found), not-ignored (a tracked rule re-includes a path), exclude-unwritable
+// (the repository's exclude file could not be written) or proof-not-written. Both outputs are placed in the main checkout, where the sidecar, the ledger and the lock already live. Accepted risk (owner, 2026-11-23): a
 // roster entry that names a linked worktree replaces the main checkout's report with one analysed from that worktree's branch; the runner
 // logs one fixed NOTICE (linked-worktree) when that is what it is analysing so it is visible.
 export const OUTPUT_RELS = ['.claude/optimise-cycle-report.md', '.claude/optimise-proposal-targets.json']
@@ -90,7 +91,10 @@ export function resolveMainRoot(repo) {
 export function prepareOutputs(repo, dir) {
   const root = resolveMainRoot(repo)
   if (root === null) return { ok: false, reason: 'main-checkout' }
-  if (!OUTPUT_RELS.every((rel) => ensureIgnored(root, rel).ignored)) return { ok: false, reason: 'not-ignored' }
+  for (const rel of OUTPUT_RELS) {
+    const made = ensureIgnored(root, rel)
+    if (!made.ignored) return { ok: false, reason: made.cause ?? 'not-ignored' }
+  }
   try {
     const proof = path.join(dir, PROOF_NAME)
     fs.rmSync(proof, { force: true })

@@ -29,22 +29,24 @@ const bump = (report, re, delta = 1) => {
 
 // ---- the rules of the module that are not rows ----
 
-// How long an input of `size` takes, as the best of three runs. The tests below assert how the time GROWS between a size and four times that
-// (linear work is about four times as long, quadratic about sixteen), never an absolute number of milliseconds, so a busy machine, which slows
-// both sizes alike, cannot fail them and a super-linear blow-up still does (whole-branch review M5).
-function timeOf(run) {
-  let best = Infinity
-  for (let i = 0; i < 3; i += 1) {
-    const started = process.hrtime.bigint()
-    run()
-    best = Math.min(best, Number(process.hrtime.bigint() - started) / 1e6)
-  }
-  return best
+// Work, not time (whole-branch review round 2, M4). A duration compared with a constant, or even a ratio of two durations, fails at random on a busy
+// machine: it did, in four independent loaded runs, with the code close to linear. These assertions count what the code does, through a counter that
+// no load can move, and assert the ORDER: four times the input does about four times the work, never sixteen.
+const WORK_RATIO_LIMIT = 6
+
+// An array whose element reads are counted, however they are made (an iterator, indexOf, a loop): a linear pass reads each element once, a quadratic
+// one reads each element once per element.
+function countedArray(items) {
+  const counter = { reads: 0 }
+  const proxy = new Proxy(items, { get(target, key, receiver) {
+    if (typeof key === 'string' && /^\d+$/.test(key)) counter.reads += 1
+    return Reflect.get(target, key, receiver)
+  } })
+  return { proxy, counter }
 }
-const SCALING_LIMIT = 10
-function assertScalesLinearly(label, small, large) {
-  const [a, b] = [timeOf(small), timeOf(large)]
-  assert.ok(b <= SCALING_LIMIT * Math.max(a, 20), `${label}: four times the input took ${b.toFixed(1)} ms against ${a.toFixed(1)} ms, which is more than linear work`)
+function assertLinearWork(label, small, large) {
+  assert.ok(small > 0, `${label}: guard against vacuity: the smaller input did some work`)
+  assert.ok(large <= WORK_RATIO_LIMIT * small, `${label}: four times the input did ${large} units of work against ${small}, which is more than linear`)
 }
 
 test('static: the module is spawn-free and reads only through the reader\'s guarded helper', () => {
@@ -100,6 +102,8 @@ test('flattening parity: the module prints a key through the same redaction the 
   const workflow = fs.readFileSync(T.WORKFLOW, 'utf8')
   assert.ok(workflow.includes(`const ABSOLUTE_PATH_RE = ${ABSOLUTE_PATH_RE.toString()}`), 'the pattern is the workflow\'s own, character for character')
   assert.ok(workflow.includes(`const REDACTED_PATH_MARKER = '${REDACTED_PATH_MARKER}'`))
+  assert.ok(!/const (ABSOLUTE_PATH_RE|REDACTED_PATH_MARKER) =/.test(SOURCE), 'the module defines neither: it imports them from the ledger writer, the one definition a module can share (L6)')
+  assert.match(SOURCE, /import \{[^}]*\bABSOLUTE_PATH_RE\b[^}]*\bREDACTED_PATH_MARKER\b[^}]*\} from '\.\/ledger-append\.mjs'/)
 })
 
 test('checkRows: a row written in a shape the check does not know is refused, so a row cannot escape its class by being written differently', async () => {
@@ -114,13 +118,16 @@ test('checkRows: a row written in a shape the check does not know is refused, so
   assert.ok(checkRows(jobReshaped.replace('::ci::', '::ci::'), col).length >= 1, 'a job row with its figures renamed is not silently ignored')
 })
 
-test('checkRows: a hostile report of one enormous line of row-shaped text is refused, never a hang, and its cost grows no faster than its size', async () => {
+test('checkRows: a hostile report of one enormous line of row-shaped text is refused, never a hang', async () => {
   const { checkRows } = await load()
   const { col, report } = await real()
-  const hostileOf = (n) => '- ' + ': n=1, failed='.repeat(n)
-  const reasons = checkRows(`${report}\n${hostileOf(50000)}\n`, col)
+  const hostile = '- ' + ': n=1, failed='.repeat(200000)
+  const started = Date.now()
+  const reasons = checkRows(`${report}\n${hostile}\n`, col)
   assert.ok(reasons.some((r) => r.startsWith('figure mismatch ci job:')), 'the over-long row is refused, not ignored')
-  assertScalesLinearly('one enormous row-shaped line', () => checkRows(`${report}\n${hostileOf(50000)}\n`, col), () => checkRows(`${report}\n${hostileOf(200000)}\n`, col))
+  // The one place a duration is compared with a constant: only elapsed time can show catastrophic regex backtracking. 60 s is some two hundred times
+  // the ordinary 0.3 s, so no machine load reaches it, and an exponential pattern passes it by orders of magnitude.
+  assert.ok(Date.now() - started < 60000, `a hang guard: took ${Date.now() - started} ms`)
 })
 
 // ---- the sidecar merge ----
@@ -270,7 +277,12 @@ test('checkRows: a proposal\'s recorded adoption and rejection dates are held to
   assert.match(checkRows(section('0123456789abcdef', `Already adopted on ${outcome.lastAdoptionTs}.`), col)[0], /^figure mismatch proposal outcome: an outcome the collected data does not hold/)
 })
 
-// ---- M4: nothing forces a new figure line to be checked, so a test does ----
+// ---- AC-ARCH-14 (whole-branch review round 2, L5): the coverage test drives the checks that actually run ----
+//
+// Every line of a real report that carries a digit has its first number changed by one, and the REAL checkFigures judges the report. A line whose
+// change no check notices is a line no check looks at, and it must be on the explicit list below with its reason. Because this goes through the
+// real checkFigures, removing any checker from it leaves the lines that checker held undetected, and the test fails: there is no second, hand-kept
+// list of what is checked to fall out of step.
 
 // Line shapes with a digit that are deliberately NOT held to the collected data, each with the reason. Narrow on purpose: a
 // broad pattern here would hide a new figure line, which is the thing this test exists to catch.
@@ -281,40 +293,56 @@ const UNCHECKED_SHAPES = [
   [/^Repo \d{1,3} \(/, 'the roster position heading of the escaped-defect block'],
   [/^Drafted: \d+\. Dropped \(/, 'bookkeeping of the session\'s own proposal drafting, not collected data'],
   [/^Proposals rejected: malformed target: \d+/, 'bookkeeping of the session\'s own proposal drafting, not collected data'],
-  [/^### [0-9a-f]{16}: /, 'a proposal heading: session-drafted text'],
-  [/^n=\d+\. Motivating: /, 'a proposal\'s measurements as the session cites them: session-drafted text'],
-  [/^Target: /, 'a proposal\'s target words: session-drafted, held by the sidecar rules instead'],
-  [/^- [0-9a-f]{16}: .* \(n=\d+\)$/, 'an insufficient-data proposal: session-drafted text'],
-  [/^Reinstatement evidence: /, 'session-drafted proposal text'],
+  [/^### [0-9a-f]{16}: Proposal statement \(model text\): /, 'a proposal heading: the script\'s id and label, then confined model text'],
+  [/^n=\d+\. Motivating \(model text\): /, 'a proposal\'s measurements as the model cites them: confined model text, never a measured figure'],
+  [/^Target: /, 'a proposal\'s target words: confined model text, held by the sidecar rules instead'],
+  [/^- [0-9a-f]{16}: Proposal statement \(model text\): .* \(n=\d+\)$/, 'an insufficient-data proposal: confined model text'],
+  [/^Reinstatement evidence \(model text\): /, 'confined model text'],
 ]
 
 // A proposal the workflow ranks (its citations resolve), so the proposal sections are rendered and their lines exercised.
 const draftedProposal = () => ({ __bypassSchemaValidation: true, proposals: [{ target: { kind: 'ci_demote', component: 'ci', concern: 'duration', lens: '', workflow: 'ci', job: 'build-CANARY-job', touches_always_on_lens: false, security_purposed: false }, statement: 'Narrow a trigger glob', motivating_measurement: '3 of 5 runs were CLEAN (run-1..run-3)', confirming_measurement: 'accuracy improves', n: 6, citations: ['13', 'r16'], reinstatement_evidence: null }] })
 
-// Every (fixture, drafting) pair rendered at once; the report lines of each, with the collected data they must be held to.
+// Every (fixture, drafting) pair rendered at once, with the collected data each report must be held to.
 async function renderedReports() {
   const pairs = ['moderate', 'rich'].flatMap((kind) => [{ proposals: [] }, draftedProposal()].map((drafted) => ({ kind, drafted })))
   return Promise.all(pairs.map(async ({ kind, drafted }) => {
     const col = T.collection(kind)
     const { result } = await T.runDigest(col.digest, { agent: { 'synthesis:proposals': drafted } })
-    return { kind, lines: result.report.split('\n').filter((l) => /\d/.test(l)), col: { lane: { ledger: col.lanes.ledger, git: col.lanes.git, ci: col.lanes.ci }, digest: col.digest } }
+    return { kind, report: result.report, col: { lane: { ledger: col.lanes.ledger, git: col.lanes.git, ci: col.lanes.ci }, digest: col.digest } }
   }))
 }
 
-test('coverage: every line of the real report that carries a digit is checked by this module or on the explicit list of unchecked shapes', async () => {
-  const { isCheckedLine } = await load()
-  const unlisted = (await renderedReports()).flatMap(({ kind, lines, col }) => lines.filter((line) => !isCheckedLine(line, col) && !UNCHECKED_SHAPES.some(([shape]) => shape.test(line))).map((line) => `${kind}: ${line.slice(0, 140)}`))
+const LANES_RAN = { ledger: { status: 'ran' }, git: { status: 'ran' }, ci: { status: 'ran' } }
+// The numeric lines of a report whose first number, changed by one, the real checkFigures does NOT notice.
+async function undetectedNumericLines(checkFigures) {
+  const out = []
+  for (const { kind, report, col } of await renderedReports()) {
+    assert.deepEqual(checkFigures({ lanes: LANES_RAN }, report, col).reasons, [], `control: the unaltered ${kind} report passes`)
+    const lines = report.split('\n')
+    const seen = new Set()
+    lines.forEach((line, i) => {
+      if (!/\d/.test(line) || seen.has(line)) return
+      seen.add(line)
+      const altered = lines.map((l, j) => (j === i ? l.replace(/\d+/, (n) => String(Number(n) + 1)) : l)).join('\n')
+      if (checkFigures({ lanes: LANES_RAN }, altered, col).reasons.length === 0) out.push({ kind, line })
+    })
+  }
+  return out
+}
+
+test('coverage: every numeric line of the real report is noticed by the real checkFigures when its figure changes, or is on the explicit list of unchecked shapes', async () => {
+  const { checkFigures } = await load()
+  const unlisted = (await undetectedNumericLines(checkFigures)).filter(({ line }) => !UNCHECKED_SHAPES.some(([shape]) => shape.test(line))).map(({ kind, line }) => `${kind}: ${line.slice(0, 140)}`)
   assert.deepEqual([...new Set(unlisted)], [], 'a numeric line no check looks at and no list entry explains: check it in workflows/lib/optimise-verify.mjs or list it with a reason')
 })
 
 test('coverage: every entry of the unchecked list is shown to be needed, so the list cannot quietly become a place to hide a figure', async () => {
-  const { isCheckedLine } = await load()
+  const { checkFigures } = await load()
   const used = new Set()
-  for (const { lines, col } of await renderedReports()) {
-    for (const line of lines.filter((l) => !isCheckedLine(l, col))) UNCHECKED_SHAPES.forEach(([shape], i) => { if (shape.test(line)) used.add(i) })
-  }
+  for (const { line } of await undetectedNumericLines(checkFigures)) UNCHECKED_SHAPES.forEach(([shape], i) => { if (shape.test(line)) used.add(i) })
   const unused = UNCHECKED_SHAPES.filter((_, i) => !used.has(i)).map(([shape]) => String(shape))
-  const needOtherFixtures = [/^Target: /, /^- [0-9a-f]{16}: .* \(n=\d+\)$/, /^Reinstatement evidence: /].map(String)
+  const needOtherFixtures = [/^Target: /, /^- [0-9a-f]{16}: Proposal statement \(model text\): .* \(n=\d+\)$/, /^Reinstatement evidence \(model text\): /].map(String)
   assert.deepEqual(unused, needOtherFixtures, 'every listed shape is rendered by these fixtures except those that need a digit in a target, an insufficient-data proposal or a removal proposal')
 })
 
@@ -353,7 +381,12 @@ test('formatVerdict: reasons are de-duplicated, only the first few are printed, 
   const manyOf = (n) => Array.from({ length: n }, (_, i) => `figure mismatch ci job: n collected 3, reported ${i}`)
   const many = manyOf(100000)
   const out = formatVerdict({ tokens: 'ledger=1/1', denied: 'unknown', reasons: [...many, ...many], place: 'no' })
-  assertScalesLinearly('reasons', () => formatVerdict({ tokens: 't', denied: 'unknown', reasons: manyOf(20000), place: 'no' }), () => formatVerdict({ tokens: 't', denied: 'unknown', reasons: manyOf(80000), place: 'no' }))
+  const readsFor = (n) => {
+    const { proxy, counter } = countedArray(manyOf(n))
+    formatVerdict({ tokens: 't', denied: 'unknown', reasons: proxy, place: 'no' })
+    return counter.reads
+  }
+  assertLinearWork('reasons read', readsFor(20000), readsFor(80000))
   const reasonLines = out.split('\n').filter((l) => l.startsWith('REASON '))
   assert.equal(reasonLines.length, MAX_REASONS + 1)
   assert.equal(reasonLines.at(-1), 'REASON more_reasons:99992', 'the 100000 distinct reasons, less the 8 shown')
@@ -370,7 +403,19 @@ test('checkRows: a 5 MB report of well-formed rows that all disagree with the da
   const rowsOf = (n) => Array.from({ length: n }, (_, i) => `- ${key}: n=${i + 100}, failed=0, mean 60s`).join('\n')
   const reasons = checkRows(`${report}\n${rowsOf(100000)}\n`, col)
   assert.ok(reasons.length >= 100000, 'the hostile report really does produce a reason per row')
-  assertScalesLinearly('well-formed rows that all disagree', () => checkRows(`${report}\n${rowsOf(20000)}\n`, col), () => checkRows(`${report}\n${rowsOf(80000)}\n`, col))
+  const { ROW_CLASSES } = await load()
+  const callsFor = (n) => {
+    let calls = 0
+    const originals = ROW_CLASSES.map((spec) => spec.isRow)
+    ROW_CLASSES.forEach((spec, i) => { spec.isRow = (line) => { calls += 1; return originals[i](line) } })
+    try {
+      checkRows(`${report}\n${rowsOf(n)}\n`, col)
+    } finally {
+      ROW_CLASSES.forEach((spec, i) => { spec.isRow = originals[i] })
+    }
+    return calls
+  }
+  assertLinearWork('row-class line tests', callsFor(20000), callsFor(80000))
 })
 
 // ---- H2: the nonce the session passed on ----
@@ -419,6 +464,15 @@ test('checkResult: a report that is not valid UTF-8 (a lone surrogate) is refuse
   const { checkResult } = await load()
   assert.equal(checkResult({ lanes: {}, report: '# R\n\ud800\n', proposal_targets: {} }, [], []).reason, 'report is not valid UTF-8')
   assert.ok(checkResult({ lanes: {}, report: '# R\nplain\n', proposal_targets: {} }, [], []).report, 'control')
+})
+
+test('checkFigures runs checkLanes: a lane the session reports differently from the one collected is a figure mismatch', async () => {
+  const { checkFigures } = await load()
+  const { col, report } = await real()
+  const agreeing = { ledger: { status: 'ran' }, git: { status: 'ran' }, ci: { status: 'ran' } }
+  assert.deepEqual(checkFigures({ lanes: agreeing }, report, col).reasons.filter((r) => /lane reported/.test(r)), [], 'precondition: the true lanes raise no lane reason')
+  const said = { ...agreeing, ci: { status: 'failed', mode: 'timed out' } }
+  assert.ok(checkFigures({ lanes: said }, report, col).reasons.some((r) => r.startsWith('figure mismatch ci: lane reported failed, collected ran')), 'a forged lane status is refused')
 })
 
 test('checkLanes and checkDigest: collected data that cannot be read is named, never treated as a lane that ran', async () => {

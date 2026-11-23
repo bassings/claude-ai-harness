@@ -30,7 +30,12 @@
 # digest.json, which holds untrusted collected text, outside the nonce fence, so
 # it can be steered to shape the words of a proposal (every figure, every
 # sidecar entry and the nonce are checked against what this script collected);
-# (4) plugin hooks see the session while it runs, though it is not saved to disk.
+# (4) plugin hooks may store the prompt, the collected data and the report: --setting-sources user loads
+# the operator's enabled plugins, and a plugin's hooks (a memory plugin's, for example) see the prompt, the whole of digest.json and the
+# report the workflow returns. --no-session-persistence stops only the CLI's own transcript. The session is seen by the user's own
+# settings.json hooks (the destructive-command guard among them) and by those plugin hooks; no supported way was found to turn plugins off for one
+# invocation while leaving settings.json hooks on (`claude --help` 2.1.330: --bare and --safe-mode remove hooks altogether, --restricted ignores
+# user settings), so the call is left as it is.
 #
 # The verdict is decided per repository from content, never from what claude
 # said. PASS means every one of these held: the collector ran and its digest was
@@ -136,6 +141,10 @@ REASON_CHECK_CRASH="the result check could not run"
 REASON_NO_OUTPUT="the result check wrote no output"
 REASON_IGNORE_HELPER="report-ignore helper failed (exit <n>, <token>)"
 REASON_NOT_IGNORED="report path is not gitignored"
+REASON_EXCLUDE_UNWRITABLE="the repository's exclude file could not be written"
+REASON_PROOF_MISSING="the ignore proof was missing or stale when the check placed"
+REASON_ROOT_REFUSED="the main checkout could not be resolved for the output paths"
+REASON_PROOF_UNWRITABLE="the ignore proof could not be written"
 REASON_ABORTED="aborted before completion (exit status <n>)"
 REASON_SIGNAL="killed by signal <n>"
 CAUSE_TIMEOUT="timeout"
@@ -447,7 +456,8 @@ main_root_of() {
 }
 
 # Runs `prepare` for the repository, into the per-run directory. Returns 0 only when it printed ok. IGNORE_FAILURE names a crashed helper
-# (its exit status and one fixed-shape token), and stays empty when the helper ran and said the paths are not ignored.
+# (its exit status and one fixed-shape token); when the helper ran and said no, it holds the reason for the token it named (a tracked rule that
+# re-includes a path, an exclude file that cannot be written, no main checkout, a proof that could not be written).
 prepare_outputs() {
   local out status
   IGNORE_FAILURE=""
@@ -459,6 +469,10 @@ prepare_outputs() {
   fi
   case "$out" in
     *'"ok":true'*) return 0 ;;
+    *'"reason":"exclude-unwritable"'*) IGNORE_FAILURE="$REASON_EXCLUDE_UNWRITABLE" ;;
+    *'"reason":"main-checkout"'*) IGNORE_FAILURE="$REASON_ROOT_REFUSED" ;;
+    *'"reason":"proof-not-written"'*) IGNORE_FAILURE="$REASON_PROOF_UNWRITABLE" ;;
+    *) IGNORE_FAILURE="$REASON_NOT_IGNORED" ;;
   esac
   return 1
 }
@@ -733,7 +747,7 @@ record_result() {
 # is dropped, so nothing but a lower-case token with hyphens reaches the log.
 log_notice() {
   case "$1" in
-    ''|*[!a-z-]*) return 0 ;;
+    ''|*[!a-z0-9=-]*) return 0 ;;
   esac
   echo "NOTICE $repo_label $1" >> "$LOG"
 }
@@ -971,7 +985,7 @@ process_repo() {
   #      and tool_input (which holds paths, so it is never logged). Whether a refused SHELL
   #      call appears there is NOT measured here: an earlier measurement found the list empty
   #      for refused shell calls.
-  # Assumed, not measured: that the hooks stay on and plugin hooks see the session.
+  # Assumed, not measured: that the hooks stay on and plugin hooks see the session and store it (a T5 probe checks the memory plugin's store).
   #
   # The hooks stay ON: the destructive-command guard and the snapshot hook are what stand
   # between an unattended session and a destroyed working tree, so nothing here switches them
@@ -1070,7 +1084,7 @@ process_repo() {
   # that says PLACE yes and places nothing is a FAIL. The files are not compared here: another run may have merged into them since.
   if [ "$VERIFY_PLACE" = yes ] && [ "$claude_exit" -eq 0 ] && [ "$ceiling_hit" = 0 ]; then
     if [ "$VERIFY_HELD" = ignore-proof ]; then
-      reasons+=("${IGNORE_FAILURE:-$REASON_NOT_IGNORED}")
+      reasons+=("${IGNORE_FAILURE:-$REASON_PROOF_MISSING}")
     elif [ "$VERIFY_PLACED" != yes ]; then
       reasons+=("$REASON_NO_OUTPUT")
     fi

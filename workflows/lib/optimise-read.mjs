@@ -2088,14 +2088,40 @@ function attachSidecarTargets(outcomes, roots) {
 // An outcome recorded under an id computed before the identity value was redacted and normalised (the old id of a path-shaped or multi-space
 // target) is also reachable under the id its stored target hashes to now, so a proposal re-raised today finds its prior rejection or adoption.
 // The old entry is left exactly as it is (nothing is renamed, dropped or rewritten); an id that already has an outcome of its own is not replaced.
+// When both ids have a history it is COMBINED (counts added, the later date kept, reverted twice counted across both), and both ids show the combined view.
+const laterTs = (a, b) => {
+  if (a === null || a === undefined) return b ?? null
+  if (b === null || b === undefined) return a
+  const [x, y] = [Date.parse(a), Date.parse(b)]
+  const later = Number.isFinite(x) && Number.isFinite(y) ? y > x : b > a
+  return later ? b : a
+}
+function combineOutcomes(legacy, current) {
+  const revertedCount = (legacy.revertedCount ?? 0) + (current.revertedCount ?? 0)
+  return {
+    ...current,
+    adoptedCount: (legacy.adoptedCount ?? 0) + (current.adoptedCount ?? 0),
+    rejectedCount: (legacy.rejectedCount ?? 0) + (current.rejectedCount ?? 0),
+    revertedCount,
+    lastRejectionTs: laterTs(legacy.lastRejectionTs, current.lastRejectionTs),
+    lastAdoptionTs: laterTs(legacy.lastAdoptionTs, current.lastAdoptionTs),
+    revertedTwiceOrMore: revertedCount >= 2,
+    target: current.target ?? legacy.target,
+  }
+}
 function withLegacyAliases(outcomes) {
-  const aliases = []
+  const changes = []
   for (const [id, o] of Object.entries(outcomes)) {
     if (!o.target || !/^[0-9a-f]{16}$/.test(id)) continue
     const current = stableProposalId(o.target)
-    if (current !== id && !Object.hasOwn(outcomes, current) && !aliases.some(([taken]) => taken === current)) aliases.push([current, o])
+    if (current === id || changes.some(([, taken]) => taken === current)) continue
+    changes.push([id, current])
   }
-  for (const [current, o] of aliases) outcomes[current] = { ...o }
+  for (const [id, current] of changes) {
+    const combined = Object.hasOwn(outcomes, current) ? combineOutcomes(outcomes[id], outcomes[current]) : { ...outcomes[id] }
+    outcomes[current] = combined
+    outcomes[id] = { ...combined }
+  }
   return outcomes
 }
 

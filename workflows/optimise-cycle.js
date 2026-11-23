@@ -994,6 +994,39 @@ function fmtSeconds(v) {
   return v === null ? 'unmeasured (null)' : `${v}s`
 }
 
+// BEGIN model-text confinement
+// Everything a model wrote that reaches the report is confined by ONE function and rendered inside a fixed envelope the script writes, so no model
+// text can ever begin a report line, and a measured figure can only be on a line this script wrote (whole-branch review round 2, M1; owner decision A).
+// The fields that go through it: each proposal's statement, motivating_measurement, confirming_measurement and reinstatement_evidence, each of its
+// citations, each of the six target fields as printed, its n as printed, and the key names in a malformed-target reason. Nothing else a model returns is rendered.
+// confineModelText: every line terminator and vertical or form-feed character, every other control character, U+2028 and U+2029 become a space; zero-width,
+// bidirectional and other format characters are removed; an `&` that starts a character reference is rendered `&amp;` so it cannot be read as one; the
+// result is one line, trimmed, and cut at MODEL_TEXT_MAX characters with MODEL_TEXT_CUT when longer.
+// The envelope shapes (the result check, workflows/lib/optimise-verify.mjs, holds each enveloped line to exactly one of them):
+//   ranked and previously adopted:  "### <id>: Proposal statement (model text): <statement>"
+//   insufficient data:              "- <id>: Proposal statement (model text): <statement> (n=<n>)"
+//   measurements:                   "n=<n>. Motivating (model text): <text>. Confirming (model text): <text>. Citations (model text): <ids>."
+//   reinstatement:                  "Reinstatement evidence (model text): <text>"
+//   target:                         "Target: kind=<v> component=<v> concern=<v> lens=<v> workflow=<v> job=<v>"
+//   malformed targets:              "Proposals rejected: malformed target: <count> (<reasons>)"
+// where <id> is the script's own id or "(no id)", and every <...> other than <id> and <count> is confined model text.
+const MODEL_TEXT_MAX = 300
+const MODEL_TEXT_CUT = ' [cut]'
+const MODEL_TEXT_CONTROLS_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g
+const MODEL_TEXT_FORMAT_RE = /[\p{Cf}\ufe00-\ufe0f]/gu
+const MODEL_TEXT_ENTITY_RE = /&(?=#|[A-Za-z][A-Za-z0-9]*;)/g
+function confineModelText(value) {
+  const text = (typeof value === 'string' ? value : String(value ?? ''))
+    .replace(MODEL_TEXT_CONTROLS_RE, ' ')
+    .replace(MODEL_TEXT_FORMAT_RE, '')
+    .replace(MODEL_TEXT_ENTITY_RE, '&amp;')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const chars = Array.from(text)
+  return chars.length > MODEL_TEXT_MAX ? `${chars.slice(0, MODEL_TEXT_MAX).join('')}${MODEL_TEXT_CUT}` : text
+}
+// END model-text confinement
+
 function buildReport(d) {
   const lines = []
   lines.push('# Delivery optimiser report')
@@ -1415,8 +1448,9 @@ function buildReport(d) {
   const flatten = d.flatten || oneLine
   const TARGET_FIELDS = ['kind', 'component', 'concern', 'lens', 'workflow', 'job']
   const annotationLines = (p) => {
-    const out = [`Target: ${TARGET_FIELDS.map((k) => `${k}=${flatten(p.target && p.target[k] != null ? p.target[k] : '')}`).join(' ')}`]
-    if (p.reinstatement_evidence) out.push(`Reinstatement evidence: ${p.reinstatement_evidence}`)
+    const targetFields = TARGET_FIELDS.map((k) => `${k}=${flatten(confineModelText(p.target?.[k] ?? ''))}`).join(' ')
+    const out = [`Target: ${targetFields}`]
+    if (p.reinstatement_evidence) out.push(`Reinstatement evidence (model text): ${confineModelText(p.reinstatement_evidence)}`)
     if (p.category === 'security_removal_flagged') out.push('**Flagged: security-purposed check removal/demotion.**')
     if (p.prior_adoption_ts) out.push(`Already adopted on ${p.prior_adoption_ts}.`)
     if (p.prior_rejection_ts) out.push(`**Previously rejected on ${p.prior_rejection_ts}.**`)
@@ -1426,22 +1460,22 @@ function buildReport(d) {
   lines.push('## Proposals (ranked)')
   if (!d.ranked.length) lines.push('None.')
   for (const p of d.ranked) {
-    lines.push(`### ${p.proposal_id || '(no id)'}: ${p.statement}`)
-    lines.push(`n=${p.n}. Motivating: ${p.motivating_measurement}. Confirming: ${p.confirming_measurement}. Citations: ${(p.citations || []).join(', ')}.`)
+    lines.push(`### ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${confineModelText(p.statement)}`)
+    lines.push(`n=${confineModelText(p.n)}. Motivating (model text): ${confineModelText(p.motivating_measurement)}. Confirming (model text): ${confineModelText(p.confirming_measurement)}. Citations (model text): ${(p.citations || []).map(confineModelText).join(', ')}.`)
     lines.push(...annotationLines(p))
   }
   lines.push('')
   lines.push('## Proposals previously adopted (not ranked as new)')
   if (!(d.previouslyAdopted || []).length) lines.push('None.')
   for (const p of d.previouslyAdopted || []) {
-    lines.push(`### ${p.proposal_id || '(no id)'}: ${p.statement}`)
+    lines.push(`### ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${confineModelText(p.statement)}`)
     lines.push(...annotationLines(p))
   }
   lines.push('')
   lines.push('## Proposals (insufficient data, excluded from ranking)')
   if (!d.insufficientDataProposals.length) lines.push('None.')
   for (const p of d.insufficientDataProposals) {
-    lines.push(`- ${p.proposal_id || '(no id)'}: ${p.statement} (n=${p.n})`)
+    lines.push(`- ${p.proposal_id || '(no id)'}: Proposal statement (model text): ${confineModelText(p.statement)} (n=${confineModelText(p.n)})`)
     lines.push(...annotationLines(p))
   }
   lines.push('')
@@ -1495,7 +1529,9 @@ function buildReport(d) {
   )
   // HARN-OPT-4 T6 (AC-QA-20): named, not merely counted. Round 1 F6: this used
   // a dead /\\s+/g (a literal backslash-s), so multi-line reasons passed through.
-  lines.push(`Proposals rejected: malformed target: ${(d.malformedTargetReasons || []).length}${(d.malformedTargetReasons || []).length ? ` (${d.malformedTargetReasons.map((r) => oneLine(r)).join(' | ')})` : ''}`)
+  const malformed = d.malformedTargetReasons || []
+  const malformedDetail = malformed.length ? ` (${malformed.map((r) => oneLine(confineModelText(r))).join(' | ')})` : ''
+  lines.push(`Proposals rejected: malformed target: ${malformed.length}${malformedDetail}`)
   return lines.join('\n')
 }
 

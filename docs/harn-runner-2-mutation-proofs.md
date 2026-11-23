@@ -397,7 +397,7 @@ form with the true figure followed by forged text was added.
 | N7 | the ledger line is anchored at its end | the `$` removed from the ledger shape | "M1: a look-alike ledger line beside the true one ... or instead of it" (after the forged-tail form was added) |
 | N8, N13 | exactly the expected number of lines, and no row twice | the count rule in `checkLine`, the duplicate-row rule in `checkRowClass` | "M1: the other headline figure lines are held the same way" |
 | N9, N10 | an HTML comment, and an invisible or direction-control character, are refused | each refusal removed from `checkReportText` | "M1: the true line wrapped in an HTML comment", "M1: a zero-width or direction-control character" |
-| N11, N12 | a look-alike date-claim line is refused, runs of spaces read as one | the unknown-shape push removed; the squeeze removed | "M1: a date-claim line and a row in a look-alike form" |
+| N11, N12 (superseded by round 2: the unknown-shape push and the squeeze no longer exist, replaced by the skeleton rule, rows R2-S1 to R2-S4) | a look-alike date-claim line is refused, runs of spaces read as one | the unknown-shape push removed; the squeeze removed | "M1: a date-claim line and a row in a look-alike form" |
 | N14 | nothing is placed without the ignore proof | `if (!takeIgnoreProof(...))` to `if (false)` | two M4 tests (the skipped step places) |
 | N15, N16, N17 | the proof names this main checkout, is fresh, and is consumed | the root comparison, the age rule, the removal of the proof | "M4: an attended run that skips the ignore step FAILs ... a proof for another checkout, a stale one and a used one" |
 | N18, N19 | the main checkout is where both outputs go, and a worktree is noticed | `main_root_of` made to return the repository; the `log_notice` removed | "M4: a weekly run from a linked worktree places ... in the main checkout" |
@@ -408,9 +408,53 @@ form with the true figure followed by forged text was added.
 | N27, N28 | a CI run or a commit dropped in transit is caught | `checkCi` / `checkGit` removed from `checkFigures` | the two new `dropped in transit` rows in T3 |
 | N29 | the removed mechanisms' names stay out of the README | `report persistence` added to the README | "AC-SEC-18/AC-PROD-8: README.md describes none of the removed mechanisms" |
 | M5a | the collector stops reading at the stdout cap and kills the child | `abort()` removed after `out.tooLarge = true` | "AC-QA-19: a gh run list over the 64 MiB stdout cap" (it asserts the stub never finished, no clock) |
-| M5b, M5c | the verify tests assert scaling, not milliseconds | a quadratic de-duplication in `cappedReasons`; `unshift` for `push` in `checkRowClass` | "formatVerdict: reasons are de-duplicated ..." (196 s to fail, as intended), "checkRows: a 5 MB report of well-formed rows" |
+| M5b, M5c (superseded by round 2: the tests now count work, rows R2-W1 to R2-W3) | the verify tests assert scaling, not milliseconds | a quadratic de-duplication in `cappedReasons`; `unshift` for `push` in `checkRowClass` | "formatVerdict: reasons are de-duplicated ..." (196 s to fail, as intended), "checkRows: a 5 MB report of well-formed rows" |
 | M5d | the generator writes the table atomically (and the test holds two runs at a rendezvous) | the temp-file-and-rename replaced by a direct write | "generator: two runs held together at a rendezvous" |
 | M6 | AC-QA-21's "never a mix" | a report placement that appends to the existing report; and, separately, the `heading-unique` marker removed from the test | "AC-QA-21: two runners started together" both times (the second by its `notEqual` vacuity guard) |
 
 **Not proved by mutation.** The L2 pre-commit check narrows the window in which two runs can both believe they hold the lock to one system call; it does not
 remove it, and no test can place a fault inside a single call. The path pattern's breadth (it matches any slash-led word) is stated in the README, not guarded.
+
+## HARN-RUNNER-2 whole-branch review round 2 (M1 to M5, L1, L2, L3, L5, L6)
+
+Same method: `mut2.py` makes a one-line edit (it refuses unless the old text is on the named line), runs the named test files, restores, and checks the
+file's hash (every row `restored=true`). Tests are in `test/harn-runner-2-whole-r1.test.js` (W), `test/optimise-verify.test.js` (V) and
+`test/harn-opt-4-t6.test.js` (T6). **Red-first caveat for M1:** the probe tests were written after the confinement was implemented, so they passed on first
+run; the rows below are the demonstration that they fail when the confinement is removed. M3 and L1 were seen red against the old code first (the review's
+case evicted the legacy entry; `mergeSidecarDetailed` did not exist; reverted twice was not combined). Three rows survived at first and led to stronger
+tests: the adopted and insufficient-data statements (T6 tests added), the pair grouping and the notice (W tests rewritten to drive eviction and the CLI),
+the full-width fold (a probe added), and `checkLanes` inside `checkFigures` (a V test added).
+
+| Row | Guard | Mutation | Tests that failed |
+|---|---|---|---|
+| R2-C1 | the proposal statement (ranked section) is confined | `confineModelText(p.statement)` to `p.statement` | twelve W probe tests (a look-alike or a character reference after a line break) |
+| R2-C2, R2-C3 | the same in the adopted and insufficient-data sections | the same edit on each line | the two new T6 tests, one each |
+| R2-C4, R2-C5 | motivating and confirming measurement | each wrapper removed | "invisible and direction characters in any model-written field", "the same hostile text in each other model-written field" |
+| R2-C6 | each citation | `.map(confineModelText)` removed | "a hostile citation is confined too" |
+| R2-C7 | reinstatement evidence | wrapper removed | the same two W tests |
+| R2-C8 | each target field | `flatten(confineModelText(` to `flatten((` | "invisible and direction characters ..." |
+| R2-C9 | malformed-target reasons | `oneLine(confineModelText(r))` to `oneLine(r)` | "a hostile citation is confined too, and a malformed target's key names are" |
+| R2-C10 | `n` | wrapper removed | **survived, by design**: `n` is a number in the drafting schema, so the runtime refuses text there before the workflow sees it (the test says so); the wrapper is kept as depth |
+| R2-E1 | the envelope label | `Proposal statement (model text):` to `Proposal statement:` | thirteen W tests |
+| R2-E2, R2-E3, R2-E4 | controls, invisible characters and character references are neutralised | each regex replaced by one that never matches | "confineModelText makes one line ...", the same plus two, and the two entity probes |
+| R2-S1 | the skeleton maps Cyrillic and Greek look-alikes | `CONFUSABLES.get(ch) ?? ch` to `ch` | the Cyrillic probes (confined and forged) |
+| R2-S2 | the skeleton folds compatibility forms (full-width) | `text.normalize('NFKC')` to `text` | twenty-six tests (after the full-width probe was added; it survived before) |
+| R2-S3 | character references are removed | the removal dropped | the two reference probes forged as lines of their own |
+| R2-S4 | punctuation is dropped | the non-letter strip dropped | four tests |
+| R2-H1 | the headline rule is part of `checkFigures` | `...checkHeadlineLines(report)` removed | twenty-five tests |
+| R2-M3a | referenced entries are evicted last | the two filters swapped | the executed case and three more |
+| R2-M3b | entries this run returns are protected | `new Set([...referenced, ...returned])` to `referenced` | the unit test |
+| R2-M3c | a legacy pair is kept or dropped together | `group.referenced ||= referenced.has(key)` to `false` | the unit test (after the pair was put older than the filler) |
+| R2-M3d | the notice and its count are raised | the condition replaced by `false` | "when a referenced entry has to go the run says so" (after the test was made to drive 500 referenced entries through the CLI) |
+| R2-L1 | histories under both ids are combined | the combine branch replaced by `false` | "R2-L1: histories recorded under a legacy id and under its current id" |
+| R2-M5 | each ignore failure has its own token | `made.cause ?? 'not-ignored'` to `'not-ignored'` | the attended token test and the runner exclude-unwritable test |
+| R2-M2 | the plugin-hooks statement is in all three documents | the README sentence changed | "R2-M2: the runner header, the README and the skill say plugin hooks may store ..." |
+| R2-L3 | the README's numbers match the runner | `1,410 minutes (23.5 hours)` to `24 hours` | "README.md describes none of the removed mechanisms" (the `older than 24 hours` pattern) |
+| R2-L5 | the coverage test drives the real `checkFigures` | each of `checkLedger` reasons, `checkCi`, `checkGit`, `checkDigest`, `checkRows` removed in turn | V "coverage: every numeric line ..." and "a report with a figure line left out" (three or one test each) |
+| R2-L5b | `checkLanes` is part of `checkFigures` | removed | the new V test "checkFigures runs checkLanes" (it survived before) |
+| R2-L6 | the workflow's redaction marker equals the verify module's | `'<redacted-path>'` to `'<redacted-dir>'` in the workflow | six tests including the parity test |
+| R2-W1 | the de-duplication in `cappedReasons` is linear | `[...new Set(reasons)]` to an `indexOf` filter | "formatVerdict: reasons are de-duplicated ..." (the counted reads blow past the limit of 6 times) |
+| R2-W2 | the row-class line tests are linear | a nested `a.filter(spec.isRow)` inside the filter in `checkRowClass` | **not a clean failure**: the test process had not finished after six minutes and was killed (the work count is quadratic, so the counter test never got to assert); the file was restored (hash checked). The mutant is detected only as a hang, which is stated here rather than claimed as an assertion failure |
+
+**Not proved by mutation.** The one wall-clock assertion left in the changed tests is a 60 s hang guard on a hostile 5 MB line (V); a catastrophic pattern
+passes it by orders of magnitude and ordinary load does not reach it. The sonar test's two bounded poll loops wait for output and are not assertions on speed.

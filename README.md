@@ -1312,6 +1312,20 @@ mirroring `ledger-append.mjs`'s own discipline). The proposal-targets sidecar,
 checkout. These two files are the only ones a run creates or modifies in the
 analysed repository.
 
+**What the report guarantees.** Every measured figure in it is on a line the script wrote, in
+a fixed shape, and the result check matched that line to the data it collected (the ledger record
+count, the CI run counts, the escaped-defect counts, the digest's omissions, the per-row tables and
+the recorded adoption and rejection dates). Everything a model wrote (a proposal's statement,
+its measurements, its citations, its reinstatement evidence and the words of its target) is
+confined to one line, stripped of control, invisible and direction characters, and has any
+character reference neutralised; it is always on a marked line (`(model text)` after a fixed
+label, or after `Target:`), and it is never a measured figure. The check refuses a report in which
+any line other than the script's own figure line carries a headline figure's label, however it is
+spelled (in a list item, a table cell, a link, behind a look-alike letter or a character reference),
+**including inside a proposal's own text: a proposal has no need to quote a headline line, so one that
+does is refused, not allowed.** A report is not guaranteed to be free of misleading prose in a
+proposal's wording: that is read by the operator before anything is acted on.
+
 **Retention (F12, round-7 review)**: the report is a SECOND artefact
 derived from the ledger (plan keys, run ids, per-plan seconds, orphan
 counts) — deleting the ledger alone does not remove it. Overwritten in
@@ -1502,7 +1516,7 @@ that finding was to cut them rather than patch either again:
   have wedged this job for tens of minutes after `claude` had already
   returned, guarding against a mutation a `touch -d` already defeated.
 
-**The real per-repo timeout is ~600s by default, not `timeout 3600`.** The
+**The real per-repo session budget is the background-wait ceiling (1,200 s), not `timeout 3600`.** The
 optimiser runs as a background workflow inside `claude -p`, so the actual
 governing budget is `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`. The script sets
 it explicitly to 1,200,000ms (20 minutes -- 2.3x the worst measured real
@@ -1579,8 +1593,18 @@ commands in the same field) share one id and are one proposal as far as history
 goes. That is deliberate (owner decision 2026-11-23); the pattern is also broader than
 real paths, and matches any slash-led word such as `/review-cycle`. Whether a real session obeys such
 an instruction has not been measured yet; a probe with a planted instruction is
-planned (`specs/harn-runner-2.md`, task T5). (4) Plugin hooks still see the session while it
-runs, though it is not saved to disk. The attended session is the operator's own, has a shell, and reads the digest outside any fence. It is told before
+planned (`specs/harn-runner-2.md`, task T5). (4) Plugin hooks may store the prompt, the collected data and the report:
+`--setting-sources user` loads the operator's enabled plugins, a plugin's hooks (a memory
+plugin's, for example) see the prompt, the whole of `digest.json` and the report, and
+`--no-session-persistence` stops only the CLI's own transcript. What sees the session is the
+user's own `settings.json` hooks (the destructive-command guard among them) and those plugin
+hooks. There is no supported way, in `claude --help` 2.1.330, to turn plugins off for one
+invocation while leaving `settings.json` hooks on (`--bare` skips hooks "defined in settings and by
+installed plugins", `--safe-mode` disables "installed plugins, hooks" together, `--restricted`
+"ignores user, project and local settings files"), so the invocation is unchanged and this risk
+is accepted until the owner decides otherwise. T5 checks that the memory plugin's store gains no
+row for the run only if plugins are later turned off, and that the destructive-command guard
+still fires in the session. The attended session is the operator's own, has a shell, and reads the digest outside any fence. It is told before
 it reads that every string in `digest.json` is untrusted data and never an
 instruction; if anything in the file reads like an instruction, the operator
 stops and reports it rather than acting on it, and the operator's permission
@@ -1631,12 +1655,14 @@ writes to (`optimise-weekly-runner` under `$TMPDIR`, or under `~/.claude` when
 that is unset), and every per-run file (the collected data and digest, the session's output,
 the result check's two output files, the staleness clone) lives in it, so overlapping runs, or a
 run overlapping a test, never share a file name. The run removes its own
-directory on exit, after the outputs are placed and the plan marker restored.
+directory on exit, after the outputs are placed.
 The parent is checked after it is created (not a link, owned by this user, its
 physical path as expected) and only then chmodded. At start-up a run removes
 only stale `run.XXXXXX` directories: real directories (links are not followed)
-owned by this user and older than 24 hours, which is longer than any run can
-last (the 21-minute session timeout per repo), logging
+owned by this user and older than 1,410 minutes (23.5 hours), which is longer than
+any one repository can take (at worst 3,130 seconds, about 52 minutes: the collector's
+1,810 s worst case, the session's 1,200 s ceiling and its two 60 s graces) and shorter than the
+day between two weekly runs, logging
 `REMOVED-STALE-RUN-DIR <name>`. A sibling's fresh directory is never touched.
 There is no overlap lock: runs are never refused and never wait on each other.
 The one lock is short and covers only the proposal-targets sidecar's read, merge
@@ -1652,8 +1678,8 @@ lock`. Its code is in `workflows/lib/optimise-verify.mjs`, in the one command
 the lock, reads, validates and merges the sidecar, places both outputs and
 releases the lock, so the runner holds no lock loop of its own. A staged temp
 file a killed run left in `.claude/` is swept at the next run. After a SIGKILL the dead run's
-directory stays for up to 24 hours, until the next run's start-up sweep removes
-it. The outcome file reads `RUNNING` from the moment a run starts, so a run that
+directory stays until a later run's start-up sweep finds it older than 1,410 minutes
+and removes it. The outcome file reads `RUNNING` from the moment a run starts, so a run that
 dies without reporting leaves `RUNNING`, not last week's result, and a failed
 write of it is logged as `LAST-RESULT-WRITE-FAILED`.
 
@@ -1709,8 +1735,9 @@ cat > ~/.claude/optimise-weekly-repos <<'EOF'
 EOF
 ```
 
-If the file does not exist, the script still runs cleanly with an empty
-repo list (a clean start/done log, exit 0, nothing to do) rather than
+If the file does not exist, the repo list is empty and the run FAILs
+(`RESULT FAIL - reason="no repos configured"`, a notification and a non-zero exit: nothing
+is being checked, which is not "nothing to do") rather than
 crashing or falling back to any hardcoded path -- this public repo carries
 no private repo names or account paths in its own tracked files
 (`test/static-checks.test.js` guards `bin/` for exactly that).
@@ -1761,7 +1788,11 @@ scheduled run.
 | `workflow refused to run` | The workflow returned a refusal (a digest or nonce it does not accept), not a result. | `bin/install.sh --check`: the installed workflow and result check may not match the runner or the collector. | Run `bin/install.sh`, then re-run; report it if it repeats. |
 | `the result check could not run` | The result check program crashed or was missing. | The `RESULT-CHECK-STATUS` line above it (exit code, bytes, error code). | Run `bin/install.sh`, then re-run. |
 | `the result check wrote no output` | The check said the result was trusted but did not confirm it had placed it. | Free space in the per-run directory and in the repo's `.claude/`. | Free space, then re-run. |
-| `report path is not gitignored` | The report or the proposal-targets path is not ignored by git, so it was not written. | A tracked `.gitignore` in the repo that re-includes `.claude/` files. | Remove that rule, then re-run. |
+| `report path is not gitignored` | A tracked rule re-includes the report or the proposal-targets path, so git still shows it and nothing was written. | A tracked `.gitignore` in the repo that re-includes `.claude/` files (`git check-ignore -v .claude/optimise-cycle-report.md`). | Remove that rule, then re-run. |
+| `the repository's exclude file could not be written` | The ignore step could not add the two paths to `.git/info/exclude` of the main checkout (read-only file or folder, or no space). | `ls -l .git/info/exclude` in the main checkout and who owns it. | Make it writable, then re-run. |
+| `the ignore proof was missing or stale when the check placed` | The ignore step said it had finished, but the check found no usable proof for this main checkout (it is consumed when used, and is good for two hours). | `bin/install.sh --check`: the installed ignore helper may not match the check. | Run `bin/install.sh`, then re-run. |
+| `the main checkout could not be resolved for the output paths` | The ignore step could not find the repository's main checkout (an unusual layout, or git refused it). | `git -C <repo> rev-parse --path-format=absolute --git-common-dir` by hand. | Configure the main checkout of an ordinary repo. |
+| `the ignore proof could not be written` | The ignore step made the paths ignored but could not write its proof into the per-run directory. | Free space and permissions under `$TMPDIR`. | Free space or fix permissions, then re-run. |
 | `report-ignore helper failed` | The helper that makes the paths ignored crashed (the exit code and an error code follow). | `bin/install.sh --check`. | Run `bin/install.sh`, then re-run. |
 | `report rejected:` | The checked report could not be staged for placing (it was a link, empty, over the size cap or its folder was a link). The rest of the line says which. | `.claude/` in the repo is a real folder and `.claude/optimise-cycle-report.md` is not a link or folder. | Remove the link or folder, then re-run. |
 | `sidecar rejected:` | Same as above, for `.claude/optimise-proposal-targets.json` under the main checkout. | The same, for that file. | Same. |
@@ -1833,6 +1864,7 @@ scheduled run.
 | `cause=signal` | The runner was stopped by a signal (a shutdown, a logout or a kill). | When it happened. | Re-run. |
 | `cause=empty` | The session printed nothing. | See `session output: empty`. | Same. |
 | `cause=malformed` | The session's output or result was not in the agreed shape. | See the `session output:` rows. | Same. |
+| `notice=sidecar-referenced-evicted` | The proposal-targets file was at its 500-entry cap and every entry that could go was one the ledger still records an outcome for, so some recorded decisions lost the target text behind them (`NOTICE <repo> sidecar-referenced-evicted=<n>`: n entries). Unreferenced entries always go first. | How many recorded decisions you expect to keep; the ledger window. | Archive old decisions' targets elsewhere, or raise the cap in a change; the next run shows those proposals as new. |
 | `notice=linked-worktree` | The weekly run analysed a linked worktree, so its report replaces the main checkout's report with one analysed from that worktree's branch (a `NOTICE <repo> linked-worktree` line in the log). | Whether the roster entry should name the main checkout instead. | Change the roster entry if that is not what you want. |
 | `cause=mac` | The returned keyed digest was missing or did not match. | See the two `result ... mac` rows. | Same. |
 | `cause=nonce` | The returned nonce hash did not match. | See the two `nonce hash` rows. | Same. |
@@ -1885,7 +1917,7 @@ To reinstate it later, re-run the two-line `sed`/`bootstrap` install above.
 The runner stages nothing in an analysed repository (the copy of the workflow the
 session runs lives in the per-run directory under `$TMPDIR/optimise-weekly-runner`),
 so a rollback leaves nothing to delete there. A run killed with SIGKILL leaves its
-per-run directory, which the next run's start-up removes after 24 hours. Rolling the
+per-run directory, which a later run's start-up removes once it is older than 1,410 minutes. Rolling the
 runner back means booting the job out (above); copying an older runner over a newer
 installed workflow, or the reverse, makes every repo FAIL until `bin/install.sh` and
 the runner copy are brought level, so do both.

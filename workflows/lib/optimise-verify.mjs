@@ -39,7 +39,8 @@ import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { canonicalJson, isPlainInsufficientRow, readRepoFile, REPO_FILE_CAPS, resolveLedgerRoot, sidecarTargetOrReason, stableProposalId } from './optimise-read.mjs'
+import { ABSOLUTE_PATH_RE, LEDGER_RELATIVE_PATH, REDACTED_PATH_MARKER } from './ledger-append.mjs'
+import { aggregateProposalOutcomes, canonicalJson, isPlainInsufficientRow, parseLedgerContent, readRepoFile, REPO_FILE_CAPS, resolveLedgerRoot, sidecarTargetOrReason, stableProposalId } from './optimise-read.mjs'
 
 export const REPORT_CAP = 5242880
 export const SIDECAR_CAP = 1048576
@@ -112,7 +113,7 @@ export const REASON_DETAILS = Object.freeze({
 // The class of a session failure, printed as CAUSE <token>.
 export const CAUSE_TOKENS = Object.freeze(['empty', 'malformed', 'failed_step', 'oversized', 'nonce', 'mac', 'refused'])
 // Fixed tokens the lock code raises for the caller to print as NOTICE <token>.
-export const NOTICE_TOKENS = Object.freeze(['lock-restore-failed'])
+export const NOTICE_TOKENS = Object.freeze(['lock-restore-failed', 'sidecar-referenced-evicted'])
 // END FIXED REASONS
 
 const F = FIXED_REASONS
@@ -347,36 +348,81 @@ export function checkLanes(said, col) {
   return reasons
 }
 
-// ---- the headline figure lines: each held to an anchored shape, and to exactly the number of lines the collected data calls for ----
+// ---- the headline figure lines: script-written, matched exactly, and the only lines that carry a headline label (whole-branch review round 2, M1) ----
 //
-// The report is normalised before any of this (normaliseReport: NFKC, every Unicode space folded to a space, one line at a time), so a
-// look-alike in a no-break space or a fullwidth digit is the line it looks like and is held to the data. A line "carries" a label when,
-// with leading spaces and quoting or emphasis marks removed, it starts with it. Every such line must match the anchored shape exactly and
-// agree with the collected figure, and there must be exactly as many as the data calls for: a hidden, second or reworded line is a line in
-// a shape the check does not know. (HTML comments and invisible characters never reach here: checkReportText refuses them.)
+// The workflow confines everything a model wrote to one line and renders it inside a fixed envelope (see its model-text confinement block), so
+// a measured figure can only be on a line the script wrote. This check holds the report to that, positively:
+//   - for each headline label, the report holds exactly as many lines of the script's own anchored shape as the collected data calls for, and each
+//     agrees with the collected figure;
+//   - no OTHER line contains a headline label's skeleton anywhere (case folded, everything that is not a letter or a digit removed, character
+//     references removed, and the Cyrillic and Greek look-alikes of the Latin letters mapped), so a figure line cannot be hidden in a table cell, a
+//     link, a list item, a quotation or behind a look-alike letter. That includes a model-text line: a proposal has no need to quote a headline line,
+//     so one that does is refused rather than allowed;
+//   - a line that carries the model-text marker must be exactly one of the envelope shapes below.
+// The report is normalised first (normaliseReport: NFKC, every Unicode space folded to a space, one line at a time). HTML comments and invisible
+// characters never reach here: checkReportText refuses them. A closed grammar for every static prose line of the report is not built: those lines are
+// the script's, the only text that is not is confined and enveloped, and the figures are held as above.
 const SPACES_RE = /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/g
 export const normaliseLine = (line) => line.normalize('NFKC').replaceAll(SPACES_RE, ' ')
 export const normaliseReport = (report) => report.split('\n').map(normaliseLine).join('\n')
 const UNKNOWN_SHAPE = 'a line in a shape the check does not know'
 const unknownShape = (name) => `${F.FIGURE_MISMATCH} ${name}: ${UNKNOWN_SHAPE}`
-const LEAD_MARKS_RE = /^[\s>*_#\u0060-]+/
 
 const SHAPES = {
-  ledger: { label: 'Ledger records in window:', re: /^Ledger records in window: (\d{1,15}) \(minimum for harness-side proposals: \d{1,15}\)\.$/ },
-  ci: { label: 'CI runs:', re: /^CI runs: (\d{1,15}) fetched, (\d{1,15}) not fetched, (\d{1,15}) timed out$/ },
-  git: { label: 'Raw (unscoped):', re: /^Raw \(unscoped\): (\d{1,15}) of (\d{1,15}) examined commits matched the heuristic\.(?: [^\n]{0,600})?$/ },
-  scoped: { label: 'Scoped to product source', re: /^Scoped to product source \(config: [^)\n]{0,200}\): (\d{1,15}) counted, (\d{1,15}) excluded as pipeline\/tooling-only, (\d{1,15}) unavailable \(changed paths could not be determined\)\.(?: [^\n]{0,600})?$/ },
+  ledger: { re: /^Ledger records in window: (\d{1,15}) \(minimum for harness-side proposals: \d{1,15}\)\.$/ },
+  ci: { re: /^CI runs: (\d{1,15}) fetched, (\d{1,15}) not fetched, (\d{1,15}) timed out$/ },
+  git: { re: /^Raw \(unscoped\): (\d{1,15}) of (\d{1,15}) examined commits matched the heuristic\.(?: [^\n]{0,600})?$/ },
+  scoped: { re: /^Scoped to product source \(config: [^)\n]{0,200}\): (\d{1,15}) counted, (\d{1,15}) excluded as pipeline\/tooling-only, (\d{1,15}) unavailable \(changed paths could not be determined\)\.(?: [^\n]{0,600})?$/ },
+}
+const DIGEST_OMITTED_RE = /^Digest omitted ([A-Za-z]{1,40}): (\d{1,15})$/
+const DIGEST_TRIMMED_LINE = 'Digest trimmed for size: yes'
+
+// The model-text envelope: every line that carries the marker is one of these (the workflow writes them; its confinement block lists them too).
+const MODEL_TEXT_MARK = '(model text)'
+const ENVELOPES = [
+  /^(?:### |- )(?:[0-9a-f]{16}|\(no id\)): Proposal statement \(model text\): [^\n]*$/,
+  /^n=[^\n]*\. Motivating \(model text\): [^\n]*\. Confirming \(model text\): [^\n]*\. Citations \(model text\): [^\n]*\.$/,
+  /^Reinstatement evidence \(model text\): [^\n]*$/,
+]
+const isEnveloped = (line) => ENVELOPES.some((re) => re.test(line))
+
+// The labels whose lines carry a measured figure, by the family each is named under in a reason.
+const HEADLINE_LABELS = [
+  ['ledger', 'Ledger records in window'],
+  ['ci', 'CI runs'],
+  ['git', 'Raw (unscoped)'],
+  ['git scoped', 'Scoped to product source'],
+  ['digest', 'Digest omitted'],
+  ['digest', 'Digest trimmed for size'],
+  ['proposal outcome', 'Already adopted on'],
+  ['proposal outcome', 'Previously rejected on'],
+]
+// Look-alikes folded to one Latin letter (the letters the labels use): Cyrillic and Greek letters, and the characters that pass for l, o and i.
+const CONFUSABLES = new Map([...'\u0430a \u0441c \u0435e \u043eo \u0440p \u0445x \u0443y \u0456l \u0458j \u0455s \u0501d \u04bbh \u043ak \u043cm \u043fn \u0442t \u0432b \u04cfl \u03b1a \u03bfo \u03c1p \u03b5e \u03b9l \u03bdv \u03c5u \u03bak \u03c4t \u03c7x \u03c9w \u03b3y \u0131l 1l |l 0o il'.split(' ').map((pair) => [pair[0], pair.slice(1)])])
+export function skeletonOf(text) {
+  const plain = text.normalize('NFKC').replaceAll(/&#?\w{1,12};/g, '').toLowerCase()
+  return Array.from(plain, (ch) => CONFUSABLES.get(ch) ?? ch).join('').replaceAll(/[^\p{L}\p{N}]/gu, '')
+}
+const LABEL_SKELETONS = HEADLINE_LABELS.map(([family, label]) => [family, skeletonOf(label)])
+
+const isScriptHeadline = (line) => Object.values(SHAPES).some((shape) => shape.re.test(line)) || DIGEST_OMITTED_RE.test(line) || line === DIGEST_TRIMMED_LINE || dateClaimIn(line) !== null
+
+// The reasons for every line that is not a script-written headline line (nor a row of a row class, which is held to the collected rows) and yet carries a
+// headline label's skeleton, or carries the model-text marker outside an envelope.
+export function checkHeadlineLines(report) {
+  const reasons = new Set()
+  for (const line of report.split('\n')) {
+    const enveloped = isEnveloped(line)
+    if (!enveloped && (isScriptHeadline(line) || ROW_CLASSES.some((spec) => spec.isRow(line)))) continue
+    if (!enveloped && line.includes(MODEL_TEXT_MARK)) reasons.add(unknownShape('model text'))
+    const skeleton = skeletonOf(line)
+    for (const [family, folded] of LABEL_SKELETONS) if (skeleton.includes(folded)) reasons.add(unknownShape(family))
+  }
+  return [...reasons]
 }
 
-// Runs of spaces are read as one, as a page shows them, so `CI  runs:` is a line that carries `CI runs:`.
-const squeezed = (line) => line.replace(LEAD_MARKS_RE, '').replaceAll(/\s+/g, ' ')
-const carries = (line, label) => squeezed(line).startsWith(label)
-const linesCarrying = (report, label) => report.split('\n').filter((line) => carries(line, label))
-// The figures on every line that carries the label, or null when one of them is not in the anchored shape.
-function figuresOn(report, shape) {
-  const found = linesCarrying(report, shape.label).map((line) => shape.re.exec(line))
-  return found.some((m) => m === null) ? null : found.map((m) => m.slice(1).map(Number))
-}
+// The figures on every line of the script's anchored shape.
+const figuresOn = (report, shape) => report.split('\n').map((line) => shape.re.exec(line)).filter((m) => m !== null).map((m) => m.slice(1).map(Number))
 
 // { reasons, reported }: reported is the figure the report states for the ledger, for the RESULT line. A record
 // count printed beside a ledger lane that has no collected figure is refused, whatever the number: it can only be a
@@ -384,7 +430,6 @@ function figuresOn(report, shape) {
 export function checkLedger(report, col) {
   const want = collectedLedger(col)
   const found = figuresOn(report, SHAPES.ledger)
-  if (found === null) return { reasons: [unknownShape('ledger')], reported: null }
   const first = found[0]?.[0]
   if (want === null) return { reasons: found.length > 0 ? [`${F.FIGURE_MISMATCH} ledger: collected none, reported ${first}`] : [], reported: null }
   if (found.length === 0) return { reasons: [`${F.FIGURE_MISMATCH} ledger: collected ${want}, reported none`], reported: null }
@@ -396,7 +441,6 @@ export function checkLedger(report, col) {
 // A lane with a figure the report must show: exactly one line carries the label and it equals the figure. A lane with none: no line does.
 export function checkLine(name, report, shape, names, want) {
   const found = figuresOn(report, shape)
-  if (found === null) return [unknownShape(name)]
   if (want === null) return found.length > 0 ? [`${F.FIGURE_MISMATCH} ${name}: collected none, reported ${found[0][0]}`] : []
   if (found.length === 0) return [`${F.FIGURE_MISMATCH} ${name}: ${names[0]} collected ${want[0]}, reported none`]
   for (const got of found) {
@@ -432,9 +476,7 @@ export function checkDigest(report, col) {
   if (!isObject(digest) || !isObject(digest.dropped)) return [`${F.UNREADABLE}: digest`]
   const dropped = digest.dropped
   const seen = new Set()
-  for (const line of linesCarrying(report, 'Digest omitted')) {
-    const m = /^Digest omitted ([A-Za-z]{1,40}): (\d{1,15})$/.exec(line)
-    if (m === null) return [unknownShape('digest')]
+  for (const m of report.split('\n').map((line) => DIGEST_OMITTED_RE.exec(line)).filter((found) => found !== null)) {
     const [, key, n] = m
     if (!Object.hasOwn(dropped, key) || !isCount(dropped[key])) return [`${F.FIGURE_MISMATCH} digest: an omission line the digest does not hold, reported ${n}`]
     if (Number(n) !== dropped[key]) return [`${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${dropped[key]}, reported ${n}`]
@@ -444,8 +486,7 @@ export function checkDigest(report, col) {
   for (const [key, value] of Object.entries(dropped)) {
     if (isCount(value) && value > 0 && !seen.has(key)) return [`${F.FIGURE_MISMATCH} digest: omitted ${key} collected ${value}, reported none`]
   }
-  const trimmedLines = linesCarrying(report, 'Digest trimmed for size:')
-  if (trimmedLines.some((line) => line !== 'Digest trimmed for size: yes')) return [unknownShape('digest')]
+  const trimmedLines = report.split('\n').filter((line) => line === DIGEST_TRIMMED_LINE)
   return (dropped.trimmedForSize === true) !== (trimmedLines.length > 0) || trimmedLines.length > 1 ? [`${F.FIGURE_MISMATCH} digest: trimmed flag`] : []
 }
 
@@ -461,8 +502,7 @@ export function checkDigest(report, col) {
 // collapsed, 120 characters. A job named `build</UNTRUSTED...` has a `/UNTRUSTED...` that looks like a path, so the
 // printed key is not the collected one until it goes through the same steps. The pattern and marker are the
 // workflow's own (a parity test holds them equal).
-export const REDACTED_PATH_MARKER = '<redacted-path>'
-export const ABSOLUTE_PATH_RE = /(^|[\s'"(`=[<,+]|:(?!\/\/))([A-Za-z]:\\[^\s'")]+|\/[^\s'")]+)/g
+export { ABSOLUTE_PATH_RE, REDACTED_PATH_MARKER }
 const flat = (v) => String(v).replaceAll(ABSOLUTE_PATH_RE, (whole, prefix) => `${prefix}${REDACTED_PATH_MARKER}`).replaceAll(/\s+/g, ' ').slice(0, 120)
 const countText = (x) => (x === 'n/a' ? null : Number(x))
 const numOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
@@ -773,7 +813,7 @@ const ORPHANED_KINDS = {
   rows: (col) => new Map([['kinds', [formatByKind(wallTotals(col).agentComputeStartOnlyByKind), formatByKind(wallTotals(col).agentComputeTerminalOnlyByKind)]]]),
 }
 
-const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVER_FAILING_LEFT_OUT, LEDGER_REPOSITORY, LEDGER_SKIPPED, TRIGGER_ACCURACY, REWORK, EXCLUDED_FROM_ATTRIBUTION, DROPPED_COUNTER, ORPHANED_RUNS, ORPHANED_KINDS, REWORK_FINDINGS_DROPPED, REWORK_NO_SPEC, REWORK_SCHEMA_V4, BLOCKED_COUNT, BLOCKED_REASONS, UNTERMINATED_TOTAL, SUPPRESSION_SHARE, WALL_CLOCK_SOURCES]
+export const ROW_CLASSES = [CI_JOB, CI_REPOSITORY, GH_CALLS, WALL_CLOCK_PLAN, WALL_CLOCK_TOTALS, NEVER_FAILING, NEVER_FAILING_LEFT_OUT, LEDGER_REPOSITORY, LEDGER_SKIPPED, TRIGGER_ACCURACY, REWORK, EXCLUDED_FROM_ATTRIBUTION, DROPPED_COUNTER, ORPHANED_RUNS, ORPHANED_KINDS, REWORK_FINDINGS_DROPPED, REWORK_NO_SPEC, REWORK_SCHEMA_V4, BLOCKED_COUNT, BLOCKED_REASONS, UNTERMINATED_TOTAL, SUPPRESSION_SHARE, WALL_CLOCK_SOURCES]
 
 // The collected figures and keys as the normalised report prints them: the report is normalised line by line before it is checked.
 const normaliseWant = (v) => (typeof v === 'string' ? normaliseLine(v) : v)
@@ -809,9 +849,6 @@ function proposalIdAfter(line, current) {
   return heading ? heading[1] : current
 }
 
-// A line that carries an annotation's label but is not the exact shape dateClaimIn recognises is a look-alike.
-const DATE_CLAIM_LABEL_RE = /^(?:Already adopted on|Previously rejected on)/
-
 // The adoption or rejection date an annotation line states, or null for any other line.
 function dateClaimIn(line) {
   const adopted = /^Already adopted on (.{1,64})\.$/.exec(line)
@@ -833,10 +870,7 @@ export function checkProposalOutcomes(report, col) {
   for (const line of report.split('\n')) {
     id = proposalIdAfter(line, id)
     const claim = dateClaimIn(line)
-    if (claim === null) {
-      if (DATE_CLAIM_LABEL_RE.test(squeezed(line))) reasons.push(unknownShape('proposal outcome'))
-      continue
-    }
+    if (claim === null) continue
     const held = id !== null && isObject(outcomes) && Object.hasOwn(outcomes, id) ? outcomes[id] : null
     const problem = held === null ? `${F.FIGURE_MISMATCH} proposal outcome: an outcome the collected data does not hold` : outcomeProblem(claim, held)
     if (problem !== null) reasons.push(problem)
@@ -852,18 +886,6 @@ export function checkPlanLabelNote(report, col) {
   return report.split('\n').filter((line) => line === expected).length === 1 ? [] : [`${F.FIGURE_MISMATCH} plan labels: note differs from the collected one`]
 }
 
-// The single-line figure shapes that are not row classes: each has its own check above.
-const SINGLE_LINE_SHAPES = [/^Ledger records in window: /, /^CI runs: /, /^Raw \(unscoped\): /, /^Scoped to product source /, /^Digest omitted /, /^Digest trimmed for size: /]
-
-// Whether some check in this module looks at the line (so a figure on it cannot change in transit unseen). The coverage test
-// in test/optimise-verify.test.js renders the real report and requires every line with a digit to be checked or to be on its
-// explicit list of deliberately unchecked shapes, so a new numeric line in the workflow fails that test until it is one or the other.
-export function isCheckedLine(line, col) {
-  if (SINGLE_LINE_SHAPES.some((shape) => shape.test(line)) || ROW_CLASSES.some((spec) => spec.isRow(line)) || dateClaimIn(line) !== null) return true
-  const note = col.digest?.plan_labels_note
-  return typeof note === 'string' && note.trim() !== '' && line === note.replaceAll(/\s+/g, ' ').slice(0, 400)
-}
-
 export function checkRows(report, col) {
   return [...ROW_CLASSES.flatMap((spec) => checkRowClass(spec, report, col)), ...checkScoped(report, col), ...checkProposalOutcomes(report, col), ...checkPlanLabelNote(report, col)]
 }
@@ -872,7 +894,7 @@ export function checkRows(report, col) {
 export function checkFigures(result, rawReport, col) {
   const report = normaliseReport(rawReport)
   const ledger = checkLedger(report, col)
-  const reasons = [...checkLanes(result.lanes, col), ...ledger.reasons, ...checkCi(report, col), ...checkGit(report, col), ...checkDigest(report, col), ...checkRows(report, col)]
+  const reasons = [...checkLanes(result.lanes, col), ...checkHeadlineLines(report), ...ledger.reasons, ...checkCi(report, col), ...checkGit(report, col), ...checkDigest(report, col), ...checkRows(report, col)]
   return { reasons, reportedLedger: ledger.reported }
 }
 
@@ -881,25 +903,70 @@ export function checkFigures(result, rawReport, col) {
 // The returned sidecar merged into the one on disk, so no entry is ever lost: every prior entry the returned one lacks is
 // kept, a returned entry is added or replaces the prior one and counts as the newest, and only past `max` do the oldest
 // go. The file carries no age, so age is insertion order: the order of the keys in the JSON file.
-export function mergeSidecar(existing, returned, max = SIDECAR_CARRY_MAX) {
+// Eviction (whole-branch review round 2, M3): an entry the ledger's recorded outcomes still reference is the only copy of the target text behind a
+// recorded decision, so it goes last. `referenced` is the set of proposal ids the ledger records an outcome for. An entry is referenced when its key is
+// in the set or the id its stored target hashes to now is (so a legacy-id entry and its current-id entry, which share one target, are one group and are
+// kept or evicted together). Groups go unreferenced first and oldest first (a group's age is its newest member's position), then referenced ones, oldest
+// first, only while still over the limit; how many referenced entries had to go is returned so the run can say so.
+function evictionGroups(merged, referenced) {
+  const groups = new Map()
+  let index = 0
+  for (const [key, value] of merged) {
+    const current = isObject(value) && sidecarTargetOrReason(value).target !== undefined ? stableProposalId(value) : key
+    const group = groups.get(current) ?? { keys: [], last: 0, referenced: referenced.has(current) }
+    group.keys.push(key)
+    group.last = index
+    group.referenced ||= referenced.has(key)
+    groups.set(current, group)
+    index += 1
+  }
+  const byAge = (x, y) => x.last - y.last
+  const all = [...groups.values()]
+  return [...all.filter((g) => !g.referenced).sort(byAge), ...all.filter((g) => g.referenced).sort(byAge)]
+}
+
+// Drops whole groups, in that order, until `fits()` says the map is small enough. Returns the number of referenced entries dropped.
+function evictUntil(merged, referenced, fits) {
+  let evictedReferenced = 0
+  for (const group of evictionGroups(merged, referenced)) {
+    if (fits()) break
+    for (const key of group.keys) merged.delete(key)
+    if (group.referenced) evictedReferenced += group.keys.length
+  }
+  return evictedReferenced
+}
+
+const sidecarText = (obj) => JSON.stringify(obj, null, 2) + '\n'
+
+// The returned sidecar merged into the one on disk, so no entry is ever lost to the merge itself: every prior entry the returned one lacks is kept, a
+// returned entry is added or replaces the prior one and counts as the newest, and only past `max` do entries go, in the order above. The file carries no
+// age, so age is insertion order: the order of the keys in the JSON file. { entries, evictedReferenced }.
+export function mergeSidecarDetailed(existing, returned, max = SIDECAR_CARRY_MAX, referenced = new Set()) {
   const merged = new Map(Object.entries(existing))
   for (const [id, target] of Object.entries(returned)) {
     merged.delete(id)
     merged.set(id, target)
   }
-  const keys = [...merged.keys()]
-  return Object.fromEntries(keys.slice(Math.max(0, keys.length - max)).map((k) => [k, merged.get(k)]))
+  // The ids this run returns are named by the report it is placing, so they are protected like recorded ones.
+  const evictedReferenced = evictUntil(merged, new Set([...referenced, ...Object.keys(returned)]), () => merged.size <= max)
+  return { entries: Object.fromEntries(merged), evictedReferenced }
 }
 
-const sidecarText = (obj) => JSON.stringify(obj, null, 2) + '\n'
+export const mergeSidecar = (existing, returned, max = SIDECAR_CARRY_MAX, referenced = new Set()) => mergeSidecarDetailed(existing, returned, max, referenced).entries
 
-// The merged sidecar, shrunk oldest-first until it fits the size cap (it cannot be placed over it).
-export function fitSidecar(merged) {
-  const keys = Object.keys(merged)
-  const from = (n) => Object.fromEntries(keys.slice(n).map((k) => [k, merged[k]]))
-  let n = 0
-  while (n < keys.length && Buffer.byteLength(sidecarText(from(n)), 'utf8') > SIDECAR_CAP) n += 1
-  return from(n)
+// The merged sidecar, shrunk in the same order until it fits the size cap (it cannot be placed over it). { entries, evictedReferenced }.
+export function fitSidecarDetailed(merged, referenced = new Set()) {
+  const kept = new Map(Object.entries(merged))
+  const evictedReferenced = evictUntil(kept, referenced, () => Buffer.byteLength(sidecarText(Object.fromEntries(kept)), 'utf8') <= SIDECAR_CAP)
+  return { entries: Object.fromEntries(kept), evictedReferenced }
+}
+export const fitSidecar = (merged, referenced = new Set()) => fitSidecarDetailed(merged, referenced).entries
+
+// The proposal ids the ledger records an outcome for (every window, not the digest's capped few), read through the guarded read; none when the ledger
+// is absent or cannot be read (nothing is then protected, and eviction is oldest first as it always was).
+export function recordedOutcomeIds(root) {
+  const got = readRepoFile(root, LEDGER_RELATIVE_PATH, FILE_CAP)
+  return got.status === 'ok' ? new Set(aggregateProposalOutcomes(parseLedgerContent(got.text).records).keys()) : new Set()
 }
 
 // { entries } the sidecar on disk (an absent one is empty), or { reason } when it exists and cannot be read as a JSON object.
@@ -1050,7 +1117,11 @@ function withMergedSidecar(judged, sidecarRoot, col) {
   if (!sidecarRoot || sidecarRoot === '-') return judged
   const existing = readExistingSidecar(sidecarRoot)
   if (existing.reason) return { ...judged, reasons: [existing.reason], place: 'no' }
-  return { ...judged, sidecar: sidecarText(fitSidecar(mergeSidecar(existing.entries, judged.targets))) }
+  const referenced = recordedOutcomeIds(sidecarRoot)
+  const merged = mergeSidecarDetailed(existing.entries, judged.targets, SIDECAR_CARRY_MAX, referenced)
+  const fitted = fitSidecarDetailed(merged.entries, referenced)
+  if (merged.evictedReferenced + fitted.evictedReferenced > 0) raiseNotice(`sidecar-referenced-evicted=${merged.evictedReferenced + fitted.evictedReferenced}`)
+  return { ...judged, sidecar: sidecarText(fitted.entries) }
 }
 
 // { tokens, denied, cause, reasons, place, report, sidecar }. `sessionPath` of '-' means no session ran; `attended` reads the

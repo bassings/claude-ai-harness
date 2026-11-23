@@ -42,8 +42,11 @@ inside the repository being analysed.
    worktree), makes `.claude/optimise-cycle-report.md` and
    `.claude/optimise-proposal-targets.json` ignored there, confirms each with git itself, and
    writes a short-lived proof into `<run dir>`. It prints `{"ok":true,"root":"<main root>"}`:
-   call that `root` value `<main root>`. If it prints `"ok":false`, stop (a tracked `.gitignore`
-   is re-including a path, and a report placed there could be committed). The check in step 8
+   call that `root` value `<main root>`. If it prints `"ok":false`, stop: its `reason` names the
+   cause. `not-ignored` means a tracked `.gitignore` is re-including a path, so a report placed
+   there could be committed; `exclude-unwritable` means the main checkout's `.git/info/exclude`
+   could not be written; `main-checkout` means no main checkout could be found for the
+   repository; `proof-not-written` means the proof could not be written into `<run dir>`. The check in step 8
    runs no git and places nothing without that proof, so skipping this step is a FAIL, not a
    silent placement. Both outputs are placed in the main checkout, as the weekly runner places them.
 4. **Mint a nonce.** Run
@@ -238,21 +241,32 @@ exactly `kind`, `component`, `concern`, `lens`, `workflow`, `job`,
 target with a key missing or an extra key is rejected before any gate reads
 it or any id is minted, and the report names the keys under "Proposals
 rejected: malformed target". The `proposal_id` is derived from the six
-string fields only, each case-folded and trimmed, in that fixed order, so
-key order, letter case and stray spacing cannot mint a second id for one
-target. The two booleans are inputs to the security gates, not part of
+string fields only, each as it is stored (an absolute-path-looking string
+replaced by `<redacted-path>`, runs of whitespace collapsed to one space),
+trimmed and case-folded, in that fixed order, so key order, letter case and stray
+spacing cannot mint a second id for one target, and a stored target always
+hashes to its own key. Two targets that differ only in text that redacts to the
+same marker (two slash commands in the same field, say) therefore share one id
+and are one proposal as far as history goes: that is deliberate. The two
+booleans are inputs to the security gates, not part of
 identity. A run analyses one repository, so a rejection recorded in one
 repository is not seen when another is analysed. The workflow computes the
 id itself, with a second implementation of the reader's hash that a test holds
-to the reader's; to map an older free-shape target onto the new id (the
+to the reader's. To map an older free-shape target onto the new id (the
 conductor does this once, when it re-records outcome events), pipe
 `{"legacy_targets": [...]}` into `optimise-read.mjs ids` by hand: each comes
 back with its new id, or null and the fields the fixed set cannot hold, plus a
-`sidecar_entry` in the fixed key set. When re-recording, merge each
-`sidecar_entry` under its new id into `.claude/optimise-proposal-targets.json`
-in the main checkout of the repository a run analyses (create
-the file if absent, keep existing entries), so the first cycle after the change
-shows the drafter those prior targets rather than bare ids.
+`sidecar_entry` in the fixed key set. **Record the outcome events under the new
+id and stop there: the proposal-targets file is never edited by hand.** It has
+one writer, the result check, which merges under the one lock and validates every
+entry (a hand edit is a second writer with no lock, and a malformed one fails every
+later run). An id recorded before the identity value was redacted and
+normalised (a path-shaped or multi-space target) is found through the entry the
+file already holds, which is reachable under both ids, and its history and the
+current id's are combined; the file keeps the old entry, and the next run that
+re-raises the proposal adds it under the id it hashes to now. An entry the ledger
+still records an outcome for is the last to be dropped when the file reaches its
+500-entry cap.
 
 ## The escaped-defect counter-metric
 
@@ -489,7 +503,11 @@ user-level allow rules still apply to any tool that is not denied as a whole
 tool, namely Read, Skill, Agent and Workflow; the Workflow grant is not scoped
 to one workflow; and the unattended session reads the digest outside any fence,
 as the attended one does, with the bounds above (the attended session's bound is
-the one in step 5: it has a shell, and the operator is present). Measured on Claude Code 2.1.322
+the one in step 5: it has a shell, and the operator is present). **Plugin hooks may store
+the prompt, the collected data and the report** for the unattended session (`--no-session-persistence`
+alone stops only the CLI's own transcript; the session is seen by the user's own `settings.json` hooks and
+by any enabled plugin's hooks, and no supported per-invocation way to turn plugins off was found), and the
+attended session is recorded by the same hooks. Measured on Claude Code 2.1.322
 (2026-11-21): a shell call and a read outside the per-run directory were refused
 for the session and for the agent a workflow starts; not measured: whether a bare
 `Bash` deny overrides a user-level allow rule.

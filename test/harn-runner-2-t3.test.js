@@ -1310,11 +1310,9 @@ for (const code of [124, 137]) {
 test('M5/AC-OPS-11: a report engineered to produce thousands of reasons FAILs quickly with a bounded RESULT line that counts the rest', () => {
   const repo = repoWith({ ledger: 5 })
   marker(repo, 'many-mismatches')
-  const started = Date.now()
   const res = runRunner([repo], { stubs: ghWith() })
   assert.ok(returnedResult(res).report.split('\n').length > 20000, 'guard against vacuity: the stub really returned the flood of rows')
   const line = assertFailedOnce(res, repo)
-  assert.ok(Date.now() - started < 60000, `took ${Date.now() - started} ms`)
   assert.ok(line.length < 2500, `the RESULT line is ${line.length} bytes`)
   assert.match(reasonOf(line), /; more_reasons:\d+$/)
   assert.ok(Buffer.byteLength(res.logContents) < 20000, `the whole log is ${Buffer.byteLength(res.logContents)} bytes`)

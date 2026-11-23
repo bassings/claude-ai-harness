@@ -39,7 +39,7 @@ const WORKFLOW_SOURCE = fs.readFileSync(WORKFLOW, 'utf8')
 const SKILL = fs.readFileSync(path.join(ROOT, 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
 const README = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8')
 // The skill and the README are hard-wrapped, so a sentence is matched with its line breaks read as spaces.
-const flat = (text) => text.replace(/\s+/g, ' ')
+const flat = (text) => text.replaceAll(/\s+/g, ' ')
 const FLAT_SKILL = flat(SKILL)
 const FLAT_README = flat(README)
 const AUTHOR = 'canary-author@example.invalid'
@@ -358,7 +358,7 @@ test('AC-PROD-5 (L6): for the same repository, ledger, gh data and drafted propo
 
 // The names of what the optimiser no longer is (whole-branch review L1): the in-workflow lanes and report write, the staged workflow copy, the transcript
 // and its redaction in the weekly job, and a nonce minted by openssl. A reader auditing the attack surface from the README must not be sent to them.
-const REMOVED = [/three parallel lanes/i, /report persistence/i, /\.optimise-cycle\.js\.staged/, /transcript temp file/i, /\bopenssl\b/, /invoked by `optimise-cycle\.js`/, /staged `optimise-cycle\.js`/, /bin\/redact-transcript\.mjs ~\/\.claude\/bin/, /~\/\.claude\/bin\/redact-transcript/, /report_path/, /proposal_targets_path/, /report:write/, /synthesis:ids/, /\bids step\b/, /rooted_rules|REPO_ALLOWED|IGNORE_HELPERS|edit_rule/, /Edit\(\/\//, /fans out to three/i, /\blane agents?\b/i, /\bscope agent\b/i]
+const REMOVED = [/plan marker restored/i, /21-minute/, /older than 24 hours/, /~600s by default/, /exit 0, nothing to do/, /three parallel lanes/i, /report persistence/i, /\.optimise-cycle\.js\.staged/, /transcript temp file/i, /\bopenssl\b/, /invoked by `optimise-cycle\.js`/, /staged `optimise-cycle\.js`/, /bin\/redact-transcript\.mjs ~\/\.claude\/bin/, /~\/\.claude\/bin\/redact-transcript/, /report_path/, /proposal_targets_path/, /report:write/, /synthesis:ids/, /\bids step\b/, /rooted_rules|REPO_ALLOWED|IGNORE_HELPERS|edit_rule/, /Edit\(\/\//, /fans out to three/i, /\blane agents?\b/i, /\bscope agent\b/i]
 for (const [name, text] of [['skills/optimise-cycle/SKILL.md', SKILL], ['README.md', README]]) {
   test(`AC-SEC-18/AC-PROD-8: ${name} describes none of the removed mechanisms (report-path arguments, the in-session ids step, the removed grants, the lane and scope agents)`, () => {
     for (const re of REMOVED) {
@@ -574,7 +574,7 @@ function literalLeads(source) {
 }
 
 // Labels the result check prints inside a figure line, command text, and report-line patterns: none of them is a reason of its own.
-const VERIFY_NOT_REASONS = new Set(['a line in a shape the check does not know', 'proposal outcome', 'not fetched', 'timed out', 'git scoped', 'scoped counted', 'scoped excluded', 'scoped unavailable', 'runs not completed', 'gh calls', 'not measured', 'left out', 'duplicate fixed confirmations across rounds', 'not recorded', 'findings dropped from this tally'])
+const VERIFY_NOT_REASONS = new Set(['a line in a shape the check does not know', 'proposal outcome', 'model text', 'not fetched', 'timed out', 'git scoped', 'scoped counted', 'scoped excluded', 'scoped unavailable', 'runs not completed', 'gh calls', 'not measured', 'left out', 'duplicate fixed confirmations across rounds', 'not recorded', 'findings dropped from this tally'])
 // The collector's command strings, labels and report notes: none of them is a reason of its own.
 const COLLECT_NOT_REASONS = new Set(['gh run list', 'gh run view', 'git log', 'git rev-parse', 'ci lane', 'the git log was cut at', 'the full git history was examined', 'output over the size limit', 'the specs directory is a symlink or could not be read, so no plan labels were collected', 'only the first'])
 

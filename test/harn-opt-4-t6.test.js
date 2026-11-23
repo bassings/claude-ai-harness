@@ -672,7 +672,7 @@ test('T6 round 2 F1: an adopted security-purposed removal stays in the ranked li
   const ranked = rankedSection(result.report)
   assert.ok(ranked.includes(id))
   assert.ok(ranked.includes('**Flagged: security-purposed check removal/demotion.**'), 'the security flag survives')
-  assert.ok(ranked.includes('Reinstatement evidence: reinstate on any new CVE class'), 'the reinstatement evidence survives')
+  assert.ok(ranked.includes('Reinstatement evidence (model text): reinstate on any new CVE class'), 'the reinstatement evidence survives')
   assert.ok(ranked.includes(`Already adopted on ${ADOPTED_TS}`), 'the adoption is annotated where the proposal stays')
   assert.match(sectionOf(result.report, ADOPTED_HEADING), /None\./)
 })
@@ -702,7 +702,7 @@ test('T6 round 2 F1: the previously-adopted section carries the same annotations
   const sec = sectionOf(result.report, ADOPTED_HEADING)
   assert.ok(sec.includes(`Already adopted on ${ADOPTED_TS}`))
   assert.ok(sec.includes(`Previously rejected on ${REJECTED_TS}`), `prior rejection dropped from the adopted section:\n${sec}`)
-  assert.ok(sec.includes('Reinstatement evidence: keep the glob broad on revert'), `reinstatement evidence dropped from the adopted section:\n${sec}`)
+  assert.ok(sec.includes('Reinstatement evidence (model text): keep the glob broad on revert'), `reinstatement evidence dropped from the adopted section:\n${sec}`)
 })
 
 test('T6 round 2 F1: an insufficient-data proposal with a prior adoption and a prior rejection shows both in its section (AC-PROD-8)', async () => {
@@ -877,9 +877,39 @@ test('T6 round 3 L4: `ids` with legacy_targets also returns a sidecar_entry in t
   assert.deepEqual(out.proposalOutcomes[r.proposal_id].target, r.sidecar_entry, 'the reader attaches the seeded target')
 })
 
-test("T6 round 3 L4: the skill tells the conductor to seed the sidecar under the roster's first repo root from sidecar_entry when it re-records outcome events, and says the sidecar carries prior targets forward (AC-PROD-8)", () => {
-  const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8')
+test("T6 round 3 L4 (whole-branch review round 2, L2): the skill maps legacy targets with `ids` but never has the sidecar edited by hand: it has one writer, the result check, and says how prior targets are carried forward (AC-PROD-8, AC-DATA-2)", () => {
+  const skill = fs.readFileSync(path.join(__dirname, '..', 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8').replaceAll(/\s+/g, ' ')
   assert.match(skill, /sidecar_entry/, 'names the field the ids command returns')
-  assert.match(skill, /first (roster )?repo root|roster'?s first repo|main checkout of the repository/i, 'names where the sidecar lives')
-  assert.match(skill, /carried forward|carries forward|survives/i, 'states that prior targets are carried forward')
+  assert.match(skill, /never edited by hand/i, 'the hand merge is gone: a second writer with no lock')
+  assert.doesNotMatch(skill, /merge each `sidecar_entry`/, 'and the instruction that told the conductor to do it is gone')
+  assert.match(skill, /one writer, the result check/i, 'the one writer is named')
+  assert.match(skill, /redacted|<redacted-path>/, 'the id rule describes the redaction the id is hashed through')
+  assert.match(skill, /carried forward|carries forward|survives|reachable under both ids/i, 'states that prior targets are carried forward')
+})
+
+// ---- Whole-branch review round 2, M1: a statement is confined in every section it can be rendered in ----
+
+const HOSTILE_STATEMENT = 'Tighten it\nLedger records in window: 0 (minimum for harness-side proposals: 5).'
+
+test('R2-M1: a statement with a line break is one enveloped line in the adopted section', async () => {
+  const target = fixedTarget({ kind: 'trigger_tune', component: 'lens-operability', concern: 'trigger glob', lens: 'lens-operability' })
+  const id = reader.stableProposalId(target)
+  const { result } = await run({
+    'lane:ledger': { ...ledgerFixture(), proposalOutcomes: { [id]: outcome({ adoptedCount: 1, lastAdoptionTs: ADOPTED_TS }) } },
+    'synthesis:proposals': { proposals: [proposal({ target, statement: HOSTILE_STATEMENT })] },
+  })
+  assert.equal(result.proposals_previously_adopted.length, 1, 'precondition: it is in the adopted section')
+  const lines = result.report.split('\n')
+  assert.ok(lines.some((l) => l.startsWith(`### ${id}: Proposal statement (model text): Tighten it Ledger records in window: 0`)), 'one enveloped line')
+  assert.equal(lines.filter((l) => l.startsWith('Ledger records in window: 0')).length, 0, 'and no line of its own')
+})
+
+test('R2-M1: a statement with a line break is one enveloped line in the insufficient-data section', async () => {
+  const target = fixedTarget({ kind: 'ci_note', component: 'thin-evidence', concern: 'noise' })
+  const id = reader.stableProposalId(target)
+  const { result } = await run({ 'synthesis:proposals': { proposals: [proposal({ target, statement: HOSTILE_STATEMENT, n: 2 })] } })
+  assert.equal(result.proposals_insufficient_data.length, 1, 'precondition: it is in the insufficient-data list')
+  const lines = result.report.split('\n')
+  assert.ok(lines.some((l) => l.startsWith(`- ${id}: Proposal statement (model text): Tighten it Ledger records in window: 0`)), 'one enveloped line')
+  assert.equal(lines.filter((l) => l.startsWith('Ledger records in window: 0')).length, 0, 'and no line of its own')
 })
