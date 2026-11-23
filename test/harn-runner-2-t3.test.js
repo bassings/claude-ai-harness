@@ -179,6 +179,7 @@ test('AC-SEC-1/AC-SEC-2/AC-SEC-4: the session is given exactly the Workflow tool
   }
   assert.ok(argv.includes('--strict-mcp-config') && !argv.includes('--mcp-config'), 'no MCP server loads: --strict-mcp-config with no --mcp-config (M2)')
   assert.ok(argv.includes('--no-session-persistence'), 'the session is not saved to disk (L3)')
+  assert.ok(argv.includes('--safe-mode'), 'the unattended session runs in the CLI\'s safe mode: no CLAUDE.md, plugins or hooks (whole-branch M2, owner decision 2026-11-23)')
   const allowed = flag(argv, '--allowedTools').join(' ')
   for (const gone of ['git', 'gh', 'node', 'openssl', 'optimise-read', 'optimise-report-ignore', 'Grep', 'Glob', 'Skill', 'Agent']) assert.ok(!allowed.includes(gone), `${gone} is not granted`)
 })

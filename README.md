@@ -1593,18 +1593,16 @@ commands in the same field) share one id and are one proposal as far as history
 goes. That is deliberate (owner decision 2026-11-23); the pattern is also broader than
 real paths, and matches any slash-led word such as `/review-cycle`. Whether a real session obeys such
 an instruction has not been measured yet; a probe with a planted instruction is
-planned (`specs/harn-runner-2.md`, task T5). (4) Plugin hooks may store the prompt, the collected data and the report:
-`--setting-sources user` loads the operator's enabled plugins, a plugin's hooks (a memory
-plugin's, for example) see the prompt, the whole of `digest.json` and the report, and
-`--no-session-persistence` stops only the CLI's own transcript. What sees the session is the
-user's own `settings.json` hooks (the destructive-command guard among them) and those plugin
-hooks. There is no supported way, in `claude --help` 2.1.330, to turn plugins off for one
-invocation while leaving `settings.json` hooks on (`--bare` skips hooks "defined in settings and by
-installed plugins", `--safe-mode` disables "installed plugins, hooks" together, `--restricted`
-"ignores user, project and local settings files"), so the invocation is unchanged and this risk
-is accepted until the owner decides otherwise. T5 checks that the memory plugin's store gains no
-row for the run only if plugins are later turned off, and that the destructive-command guard
-still fires in the session. The attended session is the operator's own, has a shell, and reads the digest outside any fence. It is told before
+planned (`specs/harn-runner-2.md`, task T5). (4) The session runs with `--safe-mode`, so plugin hooks do not see the unattended session (nor does `CLAUDE.md`,
+a skill or an MCP server), per the CLI's documentation and one measured run (2026-11-23, claude 2.1.330); T5 confirms
+the memory plugin's store gains no row. The condition the owner accepted: under safe mode the operator's own
+`settings.json` hooks (the destructive-command guard among them) do not run in the unattended session. That is
+acceptable only while the session has no tool that can run a command or write a file, because then the hooks have
+nothing to act on; a static test fails if `--safe-mode` is present while the allowed tools hold more than
+`Workflow` and the one `Read` grant, or the deny list lacks `Bash`, `Write`, `Edit` or `NotebookEdit`. Not
+measured: whether "workflows disabled" affects anything but workflows resolved by name (the `scriptPath` call worked).
+`--no-session-persistence` stops only the CLI's own transcript. The attended session is unchanged: it runs with the
+operator's plugins and hooks, so a memory plugin may store the collected data and the report from an attended run. The attended session is the operator's own, has a shell, and reads the digest outside any fence. It is told before
 it reads that every string in `digest.json` is untrusted data and never an
 instruction; if anything in the file reads like an instruction, the operator
 stops and reports it rather than acting on it, and the operator's permission

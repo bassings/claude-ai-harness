@@ -30,12 +30,13 @@
 # digest.json, which holds untrusted collected text, outside the nonce fence, so
 # it can be steered to shape the words of a proposal (every figure, every
 # sidecar entry and the nonce are checked against what this script collected);
-# (4) plugin hooks may store the prompt, the collected data and the report: --setting-sources user loads
-# the operator's enabled plugins, and a plugin's hooks (a memory plugin's, for example) see the prompt, the whole of digest.json and the
-# report the workflow returns. --no-session-persistence stops only the CLI's own transcript. The session is seen by the user's own
-# settings.json hooks (the destructive-command guard among them) and by those plugin hooks; no supported way was found to turn plugins off for one
-# invocation while leaving settings.json hooks on (`claude --help` 2.1.330: --bare and --safe-mode remove hooks altogether, --restricted ignores
-# user settings), so the call is left as it is.
+# (4) the session runs in the CLI's safe mode (--safe-mode), so plugin hooks do not see the unattended session, and neither do
+# CLAUDE.md, skills or MCP servers: per the CLI's documentation and one measured run (2026-11-23, claude 2.1.330; T5 confirms the memory plugin's store gains no row).
+# The condition the owner accepted: under safe mode the operator's own settings.json hooks (the destructive-command guard among them) do not run
+# in the unattended session. That is acceptable only while the session has no tool that can run a command or write a file, because then the hooks
+# have nothing to act on; a static test fails if --safe-mode is present while the allowed list holds more than Workflow and the one Read grant, or
+# the deny list lacks Bash, Write, Edit or NotebookEdit. --no-session-persistence stops only the CLI's own transcript. The attended session is
+# unchanged: it runs with the operator's plugins and hooks, so a memory plugin may store the collected data and the report from an attended run.
 #
 # The verdict is decided per repository from content, never from what claude
 # said. PASS means every one of these held: the collector ran and its digest was
@@ -985,11 +986,21 @@ process_repo() {
   #      and tool_input (which holds paths, so it is never logged). Whether a refused SHELL
   #      call appears there is NOT measured here: an earlier measurement found the list empty
   #      for refused shell calls.
-  # Assumed, not measured: that the hooks stay on and plugin hooks see the session and store it (a T5 probe checks the memory plugin's store).
+  # Measured on 2026-11-23 with claude 2.1.330 (owner decision, whole-branch M2): two real headless sessions in a private per-run directory
+  # under the flags below, one with --safe-mode and one without. With it: the Read worked, the Workflow tool ran a script by scriptPath, an
+  # agent() call inside that workflow returned its text, and the session reported it was shown NO CLAUDE.md or memory instructions (cost US$0.42,
+  # cache read 17,461 tokens). Without it: the same results, but the session WAS shown the operator's global CLAUDE.md (US$0.88, cache read
+  # 42,885 tokens). `claude --help` says --safe-mode starts "with all customizations (CLAUDE.md, skills, installed plugins, hooks, MCP servers,
+  # custom commands and agents, output styles, workflows ...) disabled", while admin-managed policy settings and the hooks of managed plugins
+  # still apply and auth, model, built-in tools and permissions work normally.
+  # NOT measured, assumed from that documentation: that a memory plugin's store gains no row under safe mode (T5 checks it); and that "workflows
+  # disabled" affects only workflows resolved by name (the scriptPath call worked).
+  # The condition accepted with it: the operator's own settings.json hooks (the destructive-command guard) do not run in this session. That is
+  # acceptable only while the session has no tool that can run a command or write a file, because then the hooks have nothing to act on. The
+  # allowed list below is Workflow and one Read grant and the four tools Bash, Write, Edit and NotebookEdit are denied; a static test
+  # (test/static-checks.test.js) fails if --safe-mode is present while that stops being true.
   #
-  # The hooks stay ON: the destructive-command guard and the snapshot hook are what stand
-  # between an unattended session and a destroyed working tree, so nothing here switches them
-  # off. --permission-mode dontAsk refuses everything not listed instead of prompting (nobody
+  # The hooks the session would have had are off by design (--safe-mode). --permission-mode dontAsk refuses everything not listed instead of prompting (nobody
   # is there) or auto-approving it. The eight whole tools are denied by bare name so a
   # user-level allow rule cannot hand the session one. --setting-sources user loads only the
   # user's own settings, so an analysed repo's committed or local settings can neither widen
@@ -1008,7 +1019,8 @@ process_repo() {
     --disallowedTools Bash Write Edit NotebookEdit WebFetch WebSearch Grep Glob \
     --output-format json \
     --strict-mcp-config \
-    --no-session-persistence ) \
+    --no-session-persistence \
+    --safe-mode ) \
     > "$session_out" 2> "$session_err" &
   # Backgrounded and waited on, so a SIGTERM or SIGINT to this script is
   # handled at once (on_signal) rather than after claude finishes.

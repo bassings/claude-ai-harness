@@ -615,23 +615,33 @@ test('L6: a configured path that has a .git but that git cannot resolve (a refus
 // "ignores user, project and local settings files", and `--plugin-dir` only adds plugins. So the invocation is left as it is, and the documents say
 // what that means: an enabled plugin's hooks see the prompt, the collected data and the report, and may store them.
 
-test('R2-M2: the runner header, the README and the skill say plugin hooks may store the prompt, the collected data and the report, and name what does and does not see the session', () => {
+test('R2-M2 (owner decision 2026-11-23): the runner header, the README and the skill say plugin hooks do NOT see the unattended session (safe mode disables them), per the CLI documentation and one measured run, that T5 confirms the memory store, and that an attended run is still recorded', () => {
   const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8').replaceAll(/\s+/g, ' ')
   const skill = fs.readFileSync(path.join(ROOT, 'skills', 'optimise-cycle', 'SKILL.md'), 'utf8').replaceAll(/\s+/g, ' ')
   const header = fs.readFileSync(SB.SCRIPT_PATH, 'utf8').split('\n').filter((l) => l.startsWith('#')).map((l) => l.replace(/^#\s?/, '')).join(' ').replaceAll(/\s+/g, ' ')
   for (const [name, text] of [['the runner header', header], ['README.md', readme], ['SKILL.md', skill]]) {
-    assert.match(text, /plugin hooks[^.]{0,200}(may )?(store|persist)[^.]{0,120}prompt[^.]{0,120}(collected data|digest)[^.]{0,120}report/i, `${name} says plugin hooks may store the prompt, the collected data and the report`)
-    assert.match(text, /--no-session-persistence[^.]{0,160}(only|alone)/i, `${name} says the flag stops only the CLI's own transcript`)
-    assert.match(text, /`?settings\.json`? hooks/i, `${name} names the user's own settings.json hooks as what still sees the session`)
-    assert.doesNotMatch(text, /though it is not saved to disk/i, `${name} no longer says the session is not saved`)
+    assert.match(text, /plugin hooks do not see the unattended session/i, `${name} says plugin hooks do not see the unattended session`)
+    assert.match(text, /--safe-mode/, `${name} names the flag`)
+    assert.match(text, /per the CLI's documentation and one measured run/i, `${name} says what the claim rests on`)
+    assert.match(text, /T5 confirms the memory plugin's store gains no row/i, `${name} says T5 confirms it`)
+    assert.match(text, /`?settings\.json`? hooks[^.]{0,200}do not run/i, `${name} says the operator's own settings.json hooks do not run in the unattended session`)
+    assert.match(text, /no tool that can run a command or write a file/i, `${name} states the condition the owner accepted`)
+    assert.doesNotMatch(text, /plugin hooks may store the prompt/i, `${name} no longer says the unattended session is stored by plugin hooks`)
   }
-  assert.match(readme, /no supported way[\s\S]{0,200}?turn plugins off/i, 'the README says no supported per-invocation way was found')
+  assert.match(skill, /attended[^.]{0,200}memory plugin may store the collected data and the report/i, 'the skill says an attended run may be stored by a memory plugin')
 })
 
-test('R2-M2: the call site uses none of the flags that would remove the user\'s own hooks, because none of them can leave the destructive-command guard on', () => {
+test('R2-M2: the call site runs in safe mode and uses neither --bare nor --restricted', () => {
   const callSite = fs.readFileSync(SB.SCRIPT_PATH, 'utf8').split('\n').filter((l) => !/^\s*#/.test(l)).join('\n')
-  for (const flag of ['--bare', '--safe-mode', '--restricted']) assert.ok(!callSite.includes(flag), `${flag} removes hooks or settings that the guard needs`)
+  assert.match(callSite, /--safe-mode/)
+  for (const flag of ['--bare', '--restricted']) assert.ok(!callSite.includes(flag), `${flag} is not used`)
   assert.match(callSite, /--setting-sources user/)
+})
+
+test('R2-M2: the workflow starts one agent and names no agent type, so nothing safe mode switches off (custom agents, user skills) is relied on', () => {
+  const code = fs.readFileSync(path.join(ROOT, 'workflows', 'optimise-cycle.js'), 'utf8').split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n')
+  assert.equal((code.match(/\bagent\(/g) || []).length, 1, 'exactly one agent() call')
+  assert.ok(!/agentType|subagent_type/.test(code), 'no agentType')
 })
 
 // ---- Round 2 M1: model text is confined and enveloped, and no other line may carry a headline label ----

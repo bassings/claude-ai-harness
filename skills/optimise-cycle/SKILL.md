@@ -503,11 +503,8 @@ user-level allow rules still apply to any tool that is not denied as a whole
 tool, namely Read, Skill, Agent and Workflow; the Workflow grant is not scoped
 to one workflow; and the unattended session reads the digest outside any fence,
 as the attended one does, with the bounds above (the attended session's bound is
-the one in step 5: it has a shell, and the operator is present). **Plugin hooks may store
-the prompt, the collected data and the report** for the unattended session (`--no-session-persistence`
-alone stops only the CLI's own transcript; the session is seen by the user's own `settings.json` hooks and
-by any enabled plugin's hooks, and no supported per-invocation way to turn plugins off was found), and the
-attended session is recorded by the same hooks. Measured on Claude Code 2.1.322
+the one in step 5: it has a shell, and the operator is present). **Plugin hooks do not see the unattended session**: it runs with `--safe-mode`, per the CLI's documentation and one measured run (T5 confirms the memory plugin's store gains no row), and under it the operator's own `settings.json` hooks do not run either, which is acceptable only while the session has no tool that can run a command or write a file, because then the hooks have nothing to act on (`--no-session-persistence` alone stops only the CLI's own transcript). The attended session is unchanged: it runs with the operator's plugins and hooks, and a memory plugin may store the collected data and the report from an attended run.
+Measured on Claude Code 2.1.322
 (2026-11-21): a shell call and a read outside the per-run directory were refused
 for the session and for the agent a workflow starts; not measured: whether a bare
 `Bash` deny overrides a user-level allow rule.

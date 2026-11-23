@@ -1135,8 +1135,34 @@ test('static: the real `claude -p` call site in bin/optimise-cycle-weekly.sh pas
   // resumed (only works with --print)", so collected data is not left in a saved transcript.
   assert.ok(/--strict-mcp-config(\s|$)/.test(callSite) && !callSite.includes('--mcp-config'), 'no MCP server may load in the unattended session: --strict-mcp-config and no --mcp-config')
   assert.ok(/--no-session-persistence(\s|$)/.test(callSite), 'the session is not saved to disk')
+  assert.ok(/--safe-mode(\s|$)/.test(callSite), 'the unattended session runs in safe mode (no CLAUDE.md, plugins or hooks): whole-branch M2, owner decision 2026-11-23')
   for (const gone of ['Bash(', 'Edit(', 'Write(', 'dangerously-skip-permissions', 'bypassPermissions']) {
     assert.ok(!callSite.includes(gone), `the claude -p call site must not contain ${gone}`)
+  }
+})
+
+// The owner accepted safe mode on one condition: under it the operator's own settings.json hooks (the destructive-command guard among them) do
+// not run in the unattended session, which is acceptable only while the session has no tool that can run a command or write a file, because then
+// the hooks have nothing to act on. This test makes widening the session's reach meet that condition.
+test('static: --safe-mode is present only while the session holds nothing but Workflow and one Read grant and the four command and write tools are denied', () => {
+  const script = readAll('bin', 'optimise-cycle-weekly.sh')
+  const lines = script.split('\n')
+  const start = lines.findIndex((l) => l.includes('claude -p '))
+  let end = start
+  while (end >= 0 && lines[end].trimEnd().endsWith('\\')) end += 1
+  const callSite = lines.slice(start, end + 1).join('\n')
+  const listAfter = (flagName) => {
+    const m = new RegExp(`${flagName}\\s+((?:"[^"]*"|[^\\s\\\\-][^\\s\\\\]*)(?:\\s+(?:"[^"]*"|[^\\s\\\\-][^\\s\\\\]*))*)`).exec(callSite)
+    return m ? m[1].match(/"[^"]*"|\S+/g).map((x) => x.replaceAll('"', '')) : null
+  }
+  const allowed = listAfter('--allowedTools')
+  const denied = listAfter('--disallowedTools')
+  assert.ok(allowed && denied, 'guard against vacuity: both lists were read from the call site')
+  if (/--safe-mode(\s|$)/.test(callSite)) {
+    assert.equal(allowed.length, 2, `safe mode needs the allowed list to be Workflow and one Read grant: ${allowed}`)
+    assert.equal(allowed[0], 'Workflow')
+    assert.match(allowed[1], /^Read\(\//)
+    for (const tool of ['Bash', 'Write', 'Edit', 'NotebookEdit']) assert.ok(denied.includes(tool), `safe mode needs ${tool} denied: ${denied}`)
   }
 })
 
